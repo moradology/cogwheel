@@ -125,6 +125,86 @@ impl<'a> BandSource<'a> {
         }
     }
 
+    /// Fast 2×2 bilinear quad fetch when all 4 taps `(ux0..=ux0+1, uy0..=uy0+1)` are in-bounds.
+    /// For the 99.6% interior case where all 4 taps lie in the same internal COG block, performs
+    /// only 1 block lookup and 1 `BandData` dispatch instead of 4!
+    #[inline(always)]
+    pub fn sample_quad_inbounds(&self, ux0: u32, uy0: u32) -> (f32, f32, f32, f32) {
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (ux0 >> s, ux0 & self.mask_x),
+            None => (ux0 / self.tile_w, ux0 % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (uy0 >> s, uy0 & self.mask_y),
+            None => (uy0 / self.tile_h, uy0 % self.tile_h),
+        };
+        if lx + 1 < self.tile_w && ly + 1 < self.tile_h {
+            let gx = tx.wrapping_sub(self.tx0);
+            let gy = ty.wrapping_sub(self.ty0);
+            if gx < self.grid_w && gy < self.grid_h {
+                let bidx = (gy * self.grid_w + gx) as usize;
+                return match unsafe { *self.blocks.get_unchecked(bidx) } {
+                    Some(blk) => {
+                        let tw = self.tile_w as usize;
+                        let p00 = (ly as usize) * tw + (lx as usize);
+                        let p01 = p00 + tw;
+                        match &blk.data {
+                            cogzilla_codec::BandData::F32(s) => {
+                                let sl = s.as_slice();
+                                unsafe {
+                                    (
+                                        *sl.get_unchecked(p00),
+                                        *sl.get_unchecked(p00 + 1),
+                                        *sl.get_unchecked(p01),
+                                        *sl.get_unchecked(p01 + 1),
+                                    )
+                                }
+                            }
+                            cogzilla_codec::BandData::U16 { data, nodata } => unsafe {
+                                let a = *data.get_unchecked(p00);
+                                let b = *data.get_unchecked(p00 + 1);
+                                let c = *data.get_unchecked(p01);
+                                let d = *data.get_unchecked(p01 + 1);
+                                match *nodata {
+                                    None => (a as f32, b as f32, c as f32, d as f32),
+                                    Some(nd) => (
+                                        if a == nd { f32::NAN } else { a as f32 },
+                                        if b == nd { f32::NAN } else { b as f32 },
+                                        if c == nd { f32::NAN } else { c as f32 },
+                                        if d == nd { f32::NAN } else { d as f32 },
+                                    ),
+                                }
+                            },
+                            cogzilla_codec::BandData::U8 { data, nodata } => unsafe {
+                                let a = *data.get_unchecked(p00);
+                                let b = *data.get_unchecked(p00 + 1);
+                                let c = *data.get_unchecked(p01);
+                                let d = *data.get_unchecked(p01 + 1);
+                                match *nodata {
+                                    None => (a as f32, b as f32, c as f32, d as f32),
+                                    Some(nd) => (
+                                        if a == nd { f32::NAN } else { a as f32 },
+                                        if b == nd { f32::NAN } else { b as f32 },
+                                        if c == nd { f32::NAN } else { c as f32 },
+                                        if d == nd { f32::NAN } else { d as f32 },
+                                    ),
+                                }
+                            },
+                        }
+                    }
+                    None => (f32::NAN, f32::NAN, f32::NAN, f32::NAN),
+                };
+            }
+            return (f32::NAN, f32::NAN, f32::NAN, f32::NAN);
+        }
+        (
+            self.sample_inbounds(ux0, uy0),
+            self.sample_inbounds(ux0 + 1, uy0),
+            self.sample_inbounds(ux0, uy0 + 1),
+            self.sample_inbounds(ux0 + 1, uy0 + 1),
+        )
+    }
+
     /// Fast-path check: true if all pixel bounds `(c0..=c1, r0..=r1)` lie strictly inside `[0..ifd_w, 0..ifd_h]`
     /// and every intersecting block has `no_nodata == true`.
     #[inline(always)]

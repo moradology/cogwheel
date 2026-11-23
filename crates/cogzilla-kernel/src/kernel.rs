@@ -282,22 +282,26 @@ fn sample_bilinear<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f
     let (y0, fy) = fast_floor_i32(v);
 
     if CLEAN {
-        let ux0 = x0 as u32;
-        let uy0 = y0 as u32;
-        let ux1 = ux0 + 1;
-        let uy1 = uy0 + 1;
-        let v00 = src.sample_inbounds(ux0, uy0);
-        let v10 = src.sample_inbounds(ux1, uy0);
-        let v01 = src.sample_inbounds(ux0, uy1);
-        let v11 = src.sample_inbounds(ux1, uy1);
+        let (v00, v10, v01, v11) = src.sample_quad_inbounds(x0 as u32, y0 as u32);
         let top = v00 + (v10 - v00) * fx;
         let bot = v01 + (v11 - v01) * fx;
         top + (bot - top) * fy
     } else {
-        let v00 = src.sample_checked(x0, y0);
-        let v10 = src.sample_checked(x0 + 1, y0);
-        let v01 = src.sample_checked(x0, y0 + 1);
-        let v11 = src.sample_checked(x0 + 1, y0 + 1);
+        let (v00, v10, v01, v11) = if x0 >= 0
+            && y0 >= 0
+            && x0 + 1 < src.ifd_w
+            && y0 + 1 < src.ifd_h
+            && src.nodata_override.is_none()
+        {
+            src.sample_quad_inbounds(x0 as u32, y0 as u32)
+        } else {
+            (
+                src.sample_checked(x0, y0),
+                src.sample_checked(x0 + 1, y0),
+                src.sample_checked(x0, y0 + 1),
+                src.sample_checked(x0 + 1, y0 + 1),
+            )
+        };
 
         let w00 = (1.0 - fx) * (1.0 - fy);
         let w10 = fx * (1.0 - fy);
