@@ -83,6 +83,10 @@ CASES = [
     ("EPSG:26986 Massachusetts mainland (m)", "EPSG:26986", -71.5, 42.3, 10),
     ("EPSG:2056 Swiss LV95", "EPSG:2056", 8.2, 46.8, 10),
     ("EPSG:28992 Dutch RD New", "EPSG:28992", 5.3, 52.1, 10),
+    ("EPSG:6931 EASE-Grid 2.0 North", "EPSG:6931", 20.0, 78.0, 100),
+    ("EPSG:6932 EASE-Grid 2.0 South", "EPSG:6932", 166.7, -77.8, 100),
+    ("EPSG:9311 US National Atlas LAEA", "EPSG:9311", -96.0, 39.0, 30),
+    ("EPSG:3857 at high latitude", "EPSG:3857", 20.0, 78.0, 30),
     # --- user-defined CRSs (written as GeoKey parameters, not a code) -----------
     ("custom TM, lat_0=49 k=0.9996", "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996 +x_0=400000 +y_0=-100000 +ellps=GRS80 +units=m", -1.5, 53.0, 10),
     ("custom LCC 2SP (Canada-like)", "+proj=lcc +lat_1=49 +lat_2=77 +lat_0=49 +lon_0=-95 +x_0=0 +y_0=0 +ellps=GRS80 +units=m", -95.0, 55.0, 30),
@@ -96,6 +100,10 @@ CASES = [
     ("custom LAEA on WGS84", "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m", 10.0, 50.0, 30),
     ("custom Mercator on WGS84", "+proj=merc +lon_0=0 +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m", 10.0, 50.0, 30),
     ("MODIS sinusoidal", "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m", 10.0, 50.0, 30),
+    ("MODIS sinusoidal, far from centre", "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m", -122.3, 47.6, 30),
+    ("sinusoidal on WGS84, lon_0=-60", "+proj=sinu +lon_0=-60 +x_0=0 +y_0=0 +ellps=WGS84 +units=m", -45.0, -23.0, 30),
+    ("custom LAEA on a sphere", "+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +R=6370997 +units=m", -96.0, 39.0, 30),
+    ("custom polar LAEA on WGS84", "+proj=laea +lat_0=90 +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +units=m", 20.0, 78.0, 100),
     ("custom TM on Clarke 1866 (NAD27)", "+proj=tmerc +lat_0=0 +lon_0=-123 +k=0.9996 +x_0=500000 +y_0=0 +datum=NAD27 +units=m", -122.3, 47.6, 10),
     ("custom equirectangular", "+proj=eqc +lat_ts=0 +lat_0=0 +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +units=m", 10.0, 50.0, 30),
 ]

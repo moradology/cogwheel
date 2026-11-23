@@ -43,13 +43,13 @@
 
 A source file is served only if `cogzilla` can place it correctly. Anything else returns `400` with the reason, rather than a picture in the wrong location.
 
-- **By EPSG code**: `3857`, WGS84 UTM (`32601`–`32660`, `32701`–`32760`), NAD83 UTM (`26901`–`26923`), CONUS Albers (`5070`), California Albers (`3310`), Lambert-93 (`2154`), and polar stereographic `3413` and `3031`.
-- **Geographic, in degrees**: WGS84 (`4326`), NAD83 (`4269`), ETRS89 (`4258`), GDA94, GDA2020 and the other datums listed below.
-- **User-defined** (parameters stored in the file, no EPSG code): Transverse Mercator, Lambert Conformal Conic with one or two standard parallels, Albers Equal Area, and polar stereographic with either a latitude of true scale or a scale factor at the pole. Units may be metres, feet or US survey feet.
-- **Datums**: no datum shift is applied, so only WGS84 and datums that agree with it to about two metres are accepted: NAD83 and its realizations, ETRS89, GDA94, GDA2020, NZGD2000, SIRGAS, JGD2000, JGD2011, Hartebeesthoek94, RGF93 and SWEREF99. NAD27, OSGB36 and other older datums are refused.
-- **Not supported**: any other EPSG code (including ETRS89 UTM, MGA, state plane and national grids, even where the projection method is one of the above), and the Lambert azimuthal equal-area, Mercator variants other than `3857`, sinusoidal, equirectangular, cylindrical equal-area and oblique projections.
+- **By EPSG code**: `3857` and 3,260 projected codes from PROJ's EPSG database. That is every code that uses a supported method on a supported datum, including WGS84, NAD83 and ETRS89 UTM, Australian MGA, SIRGAS UTM, NZTM2000, SWEREF99, NAD83 state plane (metres and feet), Canada Atlas Lambert, the Alaska, British Columbia, Australian and CONUS Albers grids, ETRS89 LAEA Europe (`3035`), EASE-Grid 2.0 North and South, UPS and the NSIDC polar grids.
+- **Geographic, in degrees**: WGS84 (`4326`), NAD83 (`4269`), ETRS89 (`4258`), GDA94, GDA2020 and 267 other geographic codes on a supported datum.
+- **User-defined** (parameters stored in the file, no EPSG code): Transverse Mercator, Lambert Conformal Conic with one or two standard parallels, Albers Equal Area, polar stereographic with either a latitude of true scale or a scale factor at the pole, Lambert azimuthal equal-area, and sinusoidal (including the MODIS sphere). Units may be metres, feet or US survey feet.
+- **Datums**: no datum shift is applied, so a coordinate system is accepted only when its ellipsoid is WGS84 or GRS80 and PROJ's own transformation to WGS84 moves points by less than 2 m anywhere in its area of use. NAD27, OSGB36 and other older datums are refused. The two equal-area world projections are also accepted on a sphere, whose latitude and longitude are taken as WGS84's, as PROJ and GDAL do.
+- **Not supported**: Mercator variants other than `3857`, equirectangular, cylindrical equal-area (EASE-Grid 2.0 global, `6933`), oblique projections (Swiss, Dutch and Czech grids), and anything needing a datum shift (British National Grid, NAD27).
 
-The projection math is checked against PROJ to one millimetre at 323 reference points (`crates/cogzilla-proj/tests/proj_reference.rs`), and `benches/projection_oracle.py` checks 55 coordinate systems end to end through real GeoTIFFs.
+The EPSG table is generated from PROJ's database by `benches/gen_epsg_table.py`, and every entry is checked against PROJ to one millimetre at five points in its area of use (`crates/cogzilla-proj/tests/epsg_table.rs`). A further 496 reference points cover wide-area and user-defined cases (`tests/proj_reference.rs`), and `benches/projection_oracle.py` checks 64 coordinate systems end to end through real GeoTIFFs.
 
 ## Example requests
 

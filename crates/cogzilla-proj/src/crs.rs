@@ -2,7 +2,8 @@ use cogzilla_tiff::{Affine2D, GeoKeys};
 use thiserror::Error;
 
 use crate::ellipsoid::{
-    AlbersEqualArea, Ellipsoid, LambertConformalConic, PolarStereographic, TransverseMercator,
+    AlbersEqualArea, Ellipsoid, LambertAzimuthalEqualArea, LambertConformalConic,
+    PolarStereographic, Sinusoidal, TransverseMercator,
 };
 use crate::mercator::{
     ORIGIN_SHIFT, TileCoord, lonlat_deg_to_mercator, mercator_to_lonlat_deg,
@@ -29,6 +30,8 @@ pub enum CrsModel {
     Albers(AlbersEqualArea),
     LambertConformalConic(LambertConformalConic),
     PolarStereographic(PolarStereographic),
+    Laea(LambertAzimuthalEqualArea),
+    Sinusoidal(Sinusoidal),
 }
 
 impl CrsModel {
@@ -51,71 +54,25 @@ impl CrsModel {
             return Err(unsupported("angular units other than degrees"));
         }
 
-        // 1. Well-known ProjectedCSTypeGeoKey EPSG codes. These fix the datum,
-        //    projection and units by definition, so no other key is consulted.
+        // 1. ProjectedCSTypeGeoKey EPSG codes. A code fixes the datum, projection
+        //    and units by definition, so no other key is consulted. The table is
+        //    generated from PROJ's database and holds only codes whose datum is
+        //    within about 2 m of WGS84.
         match gk.projected_cs_type {
             Some(3857 | 3785) => return Ok(Self::Epsg3857),
-            // WGS84 UTM north and south, zones 1..60
-            Some(code @ 32601..=32660) => {
-                return Ok(Self::TransverseMercator(TransverseMercator::utm(
-                    Ellipsoid::WGS84,
-                    (code - 32600) as u8,
-                    false,
-                )));
-            }
-            Some(code @ 32701..=32760) => {
-                return Ok(Self::TransverseMercator(TransverseMercator::utm(
-                    Ellipsoid::WGS84,
-                    (code - 32700) as u8,
-                    true,
-                )));
-            }
-            // NAD83 UTM north, zones 1..23
-            Some(code @ 26901..=26923) => {
-                return Ok(Self::TransverseMercator(TransverseMercator::utm(
-                    Ellipsoid::GRS80,
-                    (code - 26900) as u8,
-                    false,
-                )));
-            }
-            // NAD83 CONUS Albers. (EPSG:5069 is the NAD27 version and is not accepted.)
-            Some(5070) => {
-                return Ok(Self::Albers(AlbersEqualArea::new(
-                    Ellipsoid::GRS80, 29.5, 45.5, 23.0, -96.0, 0.0, 0.0,
-                )));
-            }
-            // California Albers
-            Some(3310) => {
-                return Ok(Self::Albers(AlbersEqualArea::new(
-                    Ellipsoid::GRS80, 34.0, 40.5, 0.0, -120.0, 0.0, -4_000_000.0,
-                )));
-            }
-            // RGF93 Lambert-93
-            Some(2154) => {
-                return Ok(Self::LambertConformalConic(LambertConformalConic::new_2sp(
-                    Ellipsoid::GRS80, 44.0, 49.0, 46.5, 3.0, 700_000.0, 6_600_000.0,
-                )));
-            }
-            // NSIDC Sea Ice Polar Stereographic North
-            Some(3413) => {
-                return Ok(Self::PolarStereographic(PolarStereographic::new(
-                    Ellipsoid::WGS84, 70.0, -45.0, 0.0, 0.0,
-                )));
-            }
-            // Antarctic Polar Stereographic
-            Some(3031) => {
-                return Ok(Self::PolarStereographic(PolarStereographic::new(
-                    Ellipsoid::WGS84, -71.0, 0.0, 0.0, 0.0,
-                )));
-            }
             // User-defined: described by the parameter keys below.
             Some(32767) | None => {}
-            // Any other code names a CRS whose parameters and datum this crate
-            // does not know. Parameter keys alongside it cannot vouch for the datum.
-            Some(_) => return Err(unsupported("projected CRS code is not in the supported list")),
+            Some(code) => {
+                return match crate::epsg::lookup(code) {
+                    Some(def) => Ok(def.to_model()),
+                    // Parameter keys beside an unknown code cannot vouch for its datum.
+                    None => Err(unsupported("projected CRS code is not in the supported list")),
+                };
+            }
         }
 
-        let ellip = Self::wgs84_compatible_ellipsoid(gk).map_err(unsupported)?;
+        let sphere_ok = matches!(gk.proj_coord_trans, Some(10 | 24));
+        let ellip = Self::wgs84_compatible_ellipsoid(gk, sphere_ok).map_err(unsupported)?;
 
         // 2. User-defined projection parameters via ProjCoordTransGeoKey.
         if let Some(ct) = gk.proj_coord_trans {
@@ -213,6 +170,35 @@ impl CrsModel {
                     ps.unit = unit;
                     Ok(Self::PolarStereographic(ps))
                 }
+                // CT_LambertAzimEqualArea
+                10 => {
+                    let mut p = LambertAzimuthalEqualArea::new(
+                        ellip,
+                        gk.center_lat
+                            .or(gk.nat_origin_lat)
+                            .ok_or_else(|| missing("latitude of origin"))?,
+                        gk.center_long
+                            .or(gk.nat_origin_long)
+                            .ok_or_else(|| missing("central meridian"))?,
+                        fe,
+                        fn_m,
+                    );
+                    p.unit = unit;
+                    Ok(Self::Laea(p))
+                }
+                // CT_Sinusoidal
+                24 => {
+                    let mut p = Sinusoidal::new(
+                        ellip,
+                        gk.center_long
+                            .or(gk.nat_origin_long)
+                            .ok_or_else(|| missing("central meridian"))?,
+                        fe,
+                        fn_m,
+                    );
+                    p.unit = unit;
+                    Ok(Self::Sinusoidal(p))
+                }
                 _ => Err(unsupported("projection method is not implemented")),
             };
         }
@@ -227,44 +213,50 @@ impl CrsModel {
 
     /// The ellipsoid for a user-defined or geographic CRS, or the reason its
     /// datum cannot be treated as WGS84.
-    fn wgs84_compatible_ellipsoid(gk: &GeoKeys) -> Result<Ellipsoid, &'static str> {
+    fn wgs84_compatible_ellipsoid(
+        gk: &GeoKeys,
+        sphere_ok: bool,
+    ) -> Result<Ellipsoid, &'static str> {
+        use crate::epsg_table::{WGS84_LIKE_DATUM, WGS84_LIKE_GCS};
         const DATUM: &str = "datum is not WGS84 or one equivalent to it within about 2 m";
-        // Geographic CRS codes on a WGS84-aligned datum: WGS84, NAD83 and its
-        // realizations, ETRS89, GDA94/2020, NZGD2000, SIRGAS, JGD2000/2011,
-        // Hartebeesthoek94, RGF93, SWEREF99.
-        const WGS84_LIKE_GCS: &[u16] = &[
-            4326, 4269, 4152, 4617, 4759, 6318, 4258, 4283, 7844, 4167, 4674, 4170, 4612, 6668,
-            4148, 4171, 4619,
-        ];
-        // The same datums by GeogGeodeticDatumGeoKey code.
-        const WGS84_LIKE_DATUM: &[u16] = &[
-            6326, 6269, 6152, 6140, 6759, 1116, 6258, 6283, 1168, 6167, 6674, 6170, 6612, 1128,
-            6148, 6171, 6619,
-        ];
+        const ELLIPSOID: &str = "ellipsoid is not WGS84 or GRS80, so the datum shift is unknown";
         match gk.geographic_type {
             Some(4326) => return Ok(Ellipsoid::WGS84),
-            Some(code) if WGS84_LIKE_GCS.contains(&code) => return Ok(Ellipsoid::GRS80),
             Some(32767) | None => {}
+            Some(code) if WGS84_LIKE_GCS.binary_search(&code).is_ok() => {
+                return Ok(Ellipsoid::GRS80);
+            }
             Some(_) => return Err(DATUM),
         }
-        if matches!(gk.geodetic_datum, Some(d) if d != 32767 && !WGS84_LIKE_DATUM.contains(&d)) {
+        if matches!(gk.geodetic_datum, Some(d) if d != 32767 && WGS84_LIKE_DATUM.binary_search(&d).is_err())
+        {
             return Err(DATUM);
         }
-        match (gk.semi_major_axis, gk.inv_flattening, gk.ellipsoid) {
+        // A sphere is stored as equal axes or as zero inverse flattening.
+        let inv_f = match (gk.semi_major_axis, gk.semi_minor_axis, gk.inv_flattening) {
+            (_, _, Some(inv_f)) => Some(inv_f),
+            (Some(a), Some(b), None) if a > 0.0 && b > 0.0 => {
+                Some(if (a - b).abs() < 1e-6 { 0.0 } else { a / (a - b) })
+            }
+            _ => None,
+        };
+        match (gk.semi_major_axis, inv_f, gk.ellipsoid) {
             (Some(a), Some(inv_f), _) => {
                 // WGS84 and GRS80 differ only past the ninth digit of 1/f.
                 if (a - 6_378_137.0).abs() < 0.5 && (inv_f - 298.257_22).abs() < 1e-3 {
                     Ok(Ellipsoid::new(a, inv_f))
+                } else if sphere_ok && inv_f == 0.0 && (6.35e6..6.40e6).contains(&a) {
+                    // Equal-area world grids (MODIS sinusoidal, EASE-Grid) are defined
+                    // on a sphere whose latitude and longitude are taken as WGS84's.
+                    Ok(Ellipsoid::sphere(a))
                 } else {
-                    Err("ellipsoid is not WGS84 or GRS80, so the datum shift is unknown")
+                    Err(ELLIPSOID)
                 }
             }
             (Some(_), None, _) | (None, Some(_), _) => Err("ellipsoid is incompletely specified"),
             (None, None, Some(7030) | None) => Ok(Ellipsoid::WGS84),
             (None, None, Some(7019)) => Ok(Ellipsoid::GRS80),
-            (None, None, Some(_)) => {
-                Err("ellipsoid is not WGS84 or GRS80, so the datum shift is unknown")
-            }
+            (None, None, Some(_)) => Err(ELLIPSOID),
         }
     }
 
@@ -289,6 +281,14 @@ impl CrsModel {
             Self::PolarStereographic(ps) => {
                 let (lon, lat) = mercator_to_lonlat_rad(mx, my);
                 ps.forward(lon, lat)
+            }
+            Self::Laea(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
+            Self::Sinusoidal(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
             }
         }
     }
@@ -323,6 +323,8 @@ impl CrsModel {
                 lcc.forward(lon_deg.to_radians(), lat_deg.to_radians())
             }
             Self::PolarStereographic(ps) => ps.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::Laea(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::Sinusoidal(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
         }
     }
 
@@ -345,6 +347,14 @@ impl CrsModel {
             }
             Self::PolarStereographic(ps) => {
                 let (lon, lat) = ps.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::Laea(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::Sinusoidal(p) => {
+                let (lon, lat) = p.inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
         }
@@ -1012,6 +1022,7 @@ mod tests {
             ("an EPSG code outside the list", keys(|k| k.projected_cs_type = Some(27700))),
             ("NAD27 UTM", keys(|k| k.projected_cs_type = Some(26710))),
             ("NAD27 CONUS Albers", keys(|k| k.projected_cs_type = Some(5069))),
+            ("Swiss LV95 (oblique Mercator)", keys(|k| k.projected_cs_type = Some(2056))),
             (
                 "an unknown code even with parameter keys beside it",
                 keys(|k| {
@@ -1032,7 +1043,7 @@ mod tests {
                 keys(|k| {
                     k.model_type = Some(1);
                     k.projected_cs_type = Some(32767);
-                    k.proj_coord_trans = Some(10); // Lambert azimuthal equal-area
+                    k.proj_coord_trans = Some(7); // Mercator
                     k.geographic_type = Some(4326);
                 }),
             ),
@@ -1070,6 +1081,16 @@ mod tests {
                     k.model_type = Some(2);
                     k.geographic_type = Some(4326);
                     k.geog_angular_units = Some(9105);
+                }),
+            ),
+            (
+                "a sphere under a projection that is not defined on one",
+                keys(|k| {
+                    k.projected_cs_type = Some(32767);
+                    k.proj_coord_trans = Some(1);
+                    k.nat_origin_long = Some(0.0);
+                    k.semi_major_axis = Some(6_371_007.181);
+                    k.semi_minor_axis = Some(6_371_007.181);
                 }),
             ),
             ("no CRS keys at all", GeoKeys::default()),

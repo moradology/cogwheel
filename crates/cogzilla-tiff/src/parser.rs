@@ -262,6 +262,7 @@ fn parse_geo_keys(raw_keys: &[u16], double_params: &[f64]) -> GeoKeys {
             2054 if tiff_tag_loc == 0 => gk.geog_angular_units = Some(val_or_offset),
             2056 if tiff_tag_loc == 0 => gk.ellipsoid = Some(val_or_offset),
             2057 => gk.semi_major_axis = get_double(),
+            2058 => gk.semi_minor_axis = get_double(),
             2059 => gk.inv_flattening = get_double(),
             3072 if tiff_tag_loc == 0 => gk.projected_cs_type = Some(val_or_offset),
             3075 if tiff_tag_loc == 0 => gk.proj_coord_trans = Some(val_or_offset),

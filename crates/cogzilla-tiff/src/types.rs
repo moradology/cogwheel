@@ -149,6 +149,8 @@ pub struct GeoKeys {
     pub proj_coord_trans: Option<u16>,
     pub proj_linear_units: Option<u16>,
     pub semi_major_axis: Option<f64>,
+    /// GeogSemiMinorAxisGeoKey (2058).
+    pub semi_minor_axis: Option<f64>,
     pub inv_flattening: Option<f64>,
     pub std_parallel_1: Option<f64>,
     pub std_parallel_2: Option<f64>,

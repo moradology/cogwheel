@@ -29,15 +29,16 @@ def epsg(code):
     return f"GeoKeys {{ model_type: Some(1), projected_cs_type: Some({code}), ..Default::default() }}"
 
 
-def user(ct, unit=None, gcs=None, **keys):
+def user(ct, unit=None, gcs=None, sphere=None, **keys):
     """A user-defined projected CRS, with the keys GDAL writes for it."""
     fields = ", ".join(f"{k}: Some({v!r})" for k, v in keys.items())
     units = f"proj_linear_units: Some({unit}), " if unit else ""
-    datum = (
-        "semi_major_axis: Some(6378137.0), inv_flattening: Some(298.257222101), "
-        if gcs is None
-        else f"geographic_type: Some({gcs}), "
-    )
+    if sphere is not None:
+        datum = f"semi_major_axis: Some({sphere!r}), semi_minor_axis: Some({sphere!r}), "
+    elif gcs is None:
+        datum = "semi_major_axis: Some(6378137.0), inv_flattening: Some(298.257222101), "
+    else:
+        datum = f"geographic_type: Some({gcs}), "
     return (
         "GeoKeys { model_type: Some(1), projected_cs_type: Some(32767), "
         f"proj_coord_trans: Some({ct}), {units}{datum}{fields}, ..Default::default() }}"
@@ -112,6 +113,32 @@ CASES = [
           false_easting=2000000.0, false_northing=2000000.0),
      "+proj=stere +lat_0=90 +lon_0=0 +k_0=0.994 +x_0=2000000 +y_0=2000000 +ellps=WGS84 +units=m", WGS84,
      grid([-150.0, -45.0, 20.0, 100.0], [60.0, 84.0, 89.0])),
+    ("EPSG:3035 ETRS89 LAEA Europe", epsg(3035), "EPSG:3035", "EPSG:4258",
+     grid([-31.0, -9.0, 10.0, 34.0, 44.8], [27.6, 40.0, 52.0, 71.2])),
+    ("EPSG:6931 EASE-Grid 2.0 North", epsg(6931), "EPSG:6931", WGS84,
+     grid([-180.0, -90.0, 0.0, 45.0, 135.0], [0.5, 30.0, 60.0, 89.9])),
+    ("EPSG:6932 EASE-Grid 2.0 South", epsg(6932), "EPSG:6932", WGS84,
+     grid([-180.0, -90.0, 0.0, 45.0, 135.0], [-0.5, -30.0, -60.0, -89.9])),
+    ("custom oblique LAEA on WGS84",
+     user(10, gcs=4326, center_lat=52.0, center_long=10.0, false_easting=4321000.0, false_northing=3210000.0),
+     "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m", WGS84,
+     grid([-60.0, -9.0, 10.0, 34.0, 120.0], [-20.0, 27.6, 52.0, 85.0])),
+    ("custom equatorial LAEA on WGS84",
+     user(10, gcs=4326, center_lat=0.0, center_long=20.0, false_easting=0.0, false_northing=0.0),
+     "+proj=laea +lat_0=0 +lon_0=20 +x_0=0 +y_0=0 +ellps=WGS84 +units=m", WGS84,
+     grid([-30.0, 20.0, 51.0, 110.0], [-70.0, -35.0, 0.0, 37.0, 80.0])),
+    ("custom oblique LAEA on a sphere (US National Atlas)",
+     user(10, sphere=6370997.0, center_lat=45.0, center_long=-100.0, false_easting=0.0, false_northing=0.0),
+     "+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +R=6370997 +units=m", "+proj=longlat +R=6370997 +no_defs",
+     grid([-170.0, -125.0, -100.0, -66.0], [18.0, 45.0, 71.0])),
+    ("MODIS sinusoidal (sphere)",
+     user(24, sphere=6371007.181, center_long=0.0, false_easting=0.0, false_northing=0.0),
+     "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m", "+proj=longlat +R=6371007.181 +no_defs",
+     grid([-179.9, -120.0, -0.1, 10.0, 100.0, 179.9], [-89.0, -60.0, -23.4, 0.0, 45.0, 80.0])),
+    ("custom sinusoidal on WGS84, off-centre",
+     user(24, gcs=4326, center_long=-60.0, false_easting=5000000.0, false_northing=10000000.0),
+     "+proj=sinu +lon_0=-60 +x_0=5000000 +y_0=10000000 +ellps=WGS84 +units=m", WGS84,
+     grid([-179.0, -100.0, -60.0, -34.0, 119.0], [-56.0, -15.0, 0.0, 13.0, 75.0])),
 ]
 
 

@@ -23,7 +23,15 @@ impl Ellipsoid {
         Self { a, f, e: x, e2 }
     }
 
+    /// A sphere of radius `r`.
+    pub fn sphere(r: f64) -> Self {
+        Self { a: r, f: 0.0, e: 0.0, e2: 0.0 }
+    }
+
     pub fn new(a: f64, inv_f: f64) -> Self {
+        if inv_f == 0.0 {
+            return Self::sphere(a);
+        }
         let f = 1.0 / inv_f;
         let e2 = f * (2.0 - f);
         Self {
@@ -114,7 +122,9 @@ impl TransverseMercator {
             unit: 1.0,
         };
         if lat0_deg != 0.0 {
-            let (_, n0) = tm.forward_raw(tm.lon0, lat0_deg.to_radians());
+            // Some national grids put the origin at a pole, outside the range
+            // forward() accepts, so the origin's northing skips the domain check.
+            let (_, n0) = tm.forward_unchecked(0.0, lat0_deg.to_radians());
             tm.m0 = n0;
         }
         tm
@@ -133,6 +143,12 @@ impl TransverseMercator {
         if dlon.abs() > 1.32 || lat.abs() > 1.56 {
             return (f64::NAN, f64::NAN);
         }
+        self.forward_unchecked(dlon, lat)
+    }
+
+    /// The series itself, with no domain check. `dlon` is relative to `lon0`.
+    #[inline(always)]
+    fn forward_unchecked(&self, dlon: f64, lat: f64) -> (f64, f64) {
         let sin_lat = lat.sin();
         let t = (lat.tan().asinh() - self.e * (self.e * sin_lat).atanh()).sinh();
         let xi_p = t.atan2(dlon.cos());
@@ -508,5 +524,257 @@ impl PolarStereographic {
         let lon = self.lon0 + if self.south { dx.atan2(dy) } else { dx.atan2(-dy) };
         let lat = if self.south { -phi } else { phi };
         (lon, lat)
+    }
+}
+
+/// Authalic `q` (Snyder 3-12). On a sphere it reduces to `2 sin(lat)`.
+#[inline(always)]
+fn authalic_q(e: f64, e2: f64, sin_lat: f64) -> f64 {
+    if e < 1e-12 {
+        return 2.0 * sin_lat;
+    }
+    let es = e * sin_lat;
+    (1.0 - e2) * (sin_lat / (1.0 - es * es) - (1.0 / (2.0 * e)) * ((1.0 - es) / (1.0 + es)).ln())
+}
+
+/// Latitude whose authalic `q` is `q`, by Newton iteration from the spherical answer.
+#[inline(always)]
+fn lat_from_authalic_q(e: f64, e2: f64, q: f64, qp: f64) -> f64 {
+    let mut lat = (q / qp).clamp(-1.0, 1.0).asin();
+    if e < 1e-12 {
+        return lat;
+    }
+    for _ in 0..6 {
+        let (s, c) = lat.sin_cos();
+        if c.abs() < 1e-12 {
+            break;
+        }
+        let one_m = 1.0 - e2 * s * s;
+        let step = (authalic_q(e, e2, s) - q) * one_m * one_m / ((1.0 - e2) * 2.0 * c);
+        lat -= step;
+        if step.abs() < 1e-15 {
+            break;
+        }
+    }
+    lat
+}
+
+/// Lambert Azimuthal Equal-Area, ellipsoidal or spherical, in its oblique,
+/// equatorial and polar aspects (EPSG method 9820; e.g. EPSG:3035 for Europe,
+/// EASE-Grid 2.0 at the poles).
+#[derive(Debug, Clone, Copy)]
+pub struct LambertAzimuthalEqualArea {
+    pub a: f64,
+    pub e: f64,
+    pub e2: f64,
+    pub lon0: f64,
+    pub lat0: f64,
+    /// +1 north polar, -1 south polar, 0 oblique or equatorial.
+    pub pole: i8,
+    pub qp: f64,
+    pub rq: f64,
+    pub sin_b1: f64,
+    pub cos_b1: f64,
+    pub d: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
+}
+
+impl LambertAzimuthalEqualArea {
+    pub fn new(
+        ellip: Ellipsoid,
+        lat0_deg: f64,
+        lon0_deg: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let lat0 = lat0_deg.to_radians();
+        let pole = if lat0_deg >= 90.0 - 1e-9 {
+            1
+        } else if lat0_deg <= -90.0 + 1e-9 {
+            -1
+        } else {
+            0
+        };
+        let qp = authalic_q(ellip.e, ellip.e2, 1.0);
+        let rq = (0.5 * qp).sqrt();
+        let (sin0, cos0) = lat0.sin_cos();
+        let sin_b1 = authalic_q(ellip.e, ellip.e2, sin0) / qp;
+        let cos_b1 = (1.0 - sin_b1 * sin_b1).max(0.0).sqrt();
+        let d = if pole != 0 {
+            1.0
+        } else {
+            cos0 / ((1.0 - ellip.e2 * sin0 * sin0).sqrt() * rq * cos_b1)
+        };
+        Self {
+            a: ellip.a,
+            e: ellip.e,
+            e2: ellip.e2,
+            lon0: lon0_deg.to_radians(),
+            lat0,
+            pole,
+            qp,
+            rq,
+            sin_b1,
+            cos_b1,
+            d,
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let dlon = wrap_dlon(lon - self.lon0);
+        let (sin_l, cos_l) = dlon.sin_cos();
+        let q = authalic_q(self.e, self.e2, lat.sin());
+        let (x, y) = match self.pole {
+            1 => {
+                let rho = self.a * (self.qp - q).max(0.0).sqrt();
+                (rho * sin_l, -rho * cos_l)
+            }
+            -1 => {
+                let rho = self.a * (self.qp + q).max(0.0).sqrt();
+                (rho * sin_l, rho * cos_l)
+            }
+            _ => {
+                let sin_b = (q / self.qp).clamp(-1.0, 1.0);
+                let cos_b = (1.0 - sin_b * sin_b).sqrt();
+                let denom = 1.0 + self.sin_b1 * sin_b + self.cos_b1 * cos_b * cos_l;
+                // The antipode of the projection centre has no image.
+                if denom < 1e-12 {
+                    return (f64::NAN, f64::NAN);
+                }
+                let b = self.a * self.rq * (2.0 / denom).sqrt();
+                (
+                    b * self.d * cos_b * sin_l,
+                    (b / self.d) * (self.cos_b1 * sin_b - self.sin_b1 * cos_b * cos_l),
+                )
+            }
+        };
+        (
+            self.false_easting + x / self.unit,
+            self.false_northing + y / self.unit,
+        )
+    }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let x = (easting - self.false_easting) * self.unit / self.a;
+        let y = (northing - self.false_northing) * self.unit / self.a;
+        if self.pole != 0 {
+            let rho2 = x * x + y * y;
+            // Beyond the opposite pole there is nothing to invert.
+            if rho2 > 2.0 * self.qp * (1.0 + 1e-12) {
+                return (f64::NAN, f64::NAN);
+            }
+            let q = (self.pole as f64) * (self.qp - rho2);
+            let lat = lat_from_authalic_q(self.e, self.e2, q, self.qp);
+            let lon = if self.pole == 1 { x.atan2(-y) } else { x.atan2(y) };
+            return (self.lon0 + lon, lat);
+        }
+        let xd = x / self.d;
+        let yd = y * self.d;
+        let rho = xd.hypot(yd);
+        if rho < 1e-15 {
+            return (self.lon0, self.lat0);
+        }
+        let half = 0.5 * rho / self.rq;
+        if half > 1.0 {
+            return (f64::NAN, f64::NAN);
+        }
+        let ce = 2.0 * half.asin();
+        let (sin_ce, cos_ce) = ce.sin_cos();
+        let sin_b = cos_ce * self.sin_b1 + yd * sin_ce * self.cos_b1 / rho;
+        let lon = (xd * sin_ce).atan2(rho * self.cos_b1 * cos_ce - yd * self.sin_b1 * sin_ce);
+        let lat = lat_from_authalic_q(self.e, self.e2, self.qp * sin_b, self.qp);
+        (self.lon0 + lon, lat)
+    }
+}
+
+/// Sinusoidal (Sanson-Flamsteed), ellipsoidal or spherical. MODIS and VIIRS
+/// land products use the spherical form.
+#[derive(Debug, Clone, Copy)]
+pub struct Sinusoidal {
+    pub a: f64,
+    pub e2: f64,
+    pub lon0: f64,
+    /// Rectifying radius: meridian distance is `rect_a * mu`.
+    pub rect_a: f64,
+    /// Series taking geodetic latitude to rectifying latitude, and back.
+    pub to_mu: [f64; 4],
+    pub from_mu: [f64; 4],
+    pub false_easting: f64,
+    pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
+}
+
+impl Sinusoidal {
+    pub fn new(ellip: Ellipsoid, lon0_deg: f64, false_easting: f64, false_northing: f64) -> Self {
+        let n = ellip.f / (2.0 - ellip.f);
+        let (n2, n3, n4) = (n * n, n * n * n, n * n * n * n);
+        Self {
+            a: ellip.a,
+            e2: ellip.e2,
+            lon0: lon0_deg.to_radians(),
+            rect_a: (ellip.a / (1.0 + n)) * (1.0 + n2 / 4.0 + n4 / 64.0),
+            to_mu: [
+                -1.5 * n + (9.0 / 16.0) * n3,
+                (15.0 / 16.0) * n2 - (15.0 / 32.0) * n4,
+                -(35.0 / 48.0) * n3,
+                (315.0 / 512.0) * n4,
+            ],
+            from_mu: [
+                1.5 * n - (27.0 / 32.0) * n3,
+                (21.0 / 16.0) * n2 - (55.0 / 32.0) * n4,
+                (151.0 / 96.0) * n3,
+                (1097.0 / 512.0) * n4,
+            ],
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let dlon = wrap_dlon(lon - self.lon0);
+        let (s, c) = lat.sin_cos();
+        let mut mu = lat;
+        for (i, k) in self.to_mu.iter().enumerate() {
+            mu += k * (2.0 * (i as f64 + 1.0) * lat).sin();
+        }
+        let x = self.a * dlon * c / (1.0 - self.e2 * s * s).sqrt();
+        let y = self.rect_a * mu;
+        (
+            self.false_easting + x / self.unit,
+            self.false_northing + y / self.unit,
+        )
+    }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let x = (easting - self.false_easting) * self.unit;
+        let y = (northing - self.false_northing) * self.unit;
+        let mu = y / self.rect_a;
+        if mu.abs() > std::f64::consts::FRAC_PI_2 + 1e-12 {
+            return (f64::NAN, f64::NAN);
+        }
+        let mut lat = mu;
+        for (i, k) in self.from_mu.iter().enumerate() {
+            lat += k * (2.0 * (i as f64 + 1.0) * mu).sin();
+        }
+        let (s, c) = lat.sin_cos();
+        if c.abs() < 1e-12 {
+            return (self.lon0, lat);
+        }
+        let dlon = x * (1.0 - self.e2 * s * s).sqrt() / (self.a * c);
+        // Outside the projection's lobe: the grid cell covers no part of the Earth.
+        if dlon.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        (self.lon0 + dlon, lat)
     }
 }
