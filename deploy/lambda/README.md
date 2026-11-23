@@ -31,7 +31,7 @@ Download the prebuilt arm64 zip from the [releases page](https://github.com/mora
 
 ```bash
 mkdir -p dist
-curl -fL https://github.com/moradology/cogzilla/releases/latest/download/cogzilla-lambda-v0.3.0-aarch64-unknown-linux-gnu.zip \
+curl -fL https://github.com/moradology/cogzilla/releases/latest/download/cogzilla-lambda-v0.3.1-aarch64-unknown-linux-gnu.zip \
   -o dist/cogzilla-lambda-aarch64.zip
 
 sam deploy \
@@ -50,7 +50,7 @@ resource "aws_lambda_function" "cogzilla" {
   runtime       = "provided.al2023"
   architectures = ["arm64"]
   handler       = "bootstrap"
-  filename      = "cogzilla-lambda-v0.3.0-aarch64-unknown-linux-gnu.zip"
+  filename      = "cogzilla-lambda-v0.3.1-aarch64-unknown-linux-gnu.zip"
   memory_size   = 1769 # 1 full Graviton2 vCPU
   timeout       = 30
 
