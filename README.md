@@ -20,18 +20,23 @@ Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with T
 | Memory at idle | **4 MiB** | 1,112 MiB (10 workers) | **278×** |
 | Instances for 1,000 uncached tiles/s (modeled, `c7g.xlarge`) | **11** | 47 | **4.3×** |
 
-And the ceiling, with the network taken out entirely (local files, warm cache):
+And the ceiling, with the network taken out entirely (local files, warm cache), on two machines:
 
-| Local fixtures (Apple M5, warm) | `cogzilla` | TiTiler | Speedup |
-| :--- | ---: | ---: | ---: |
-| HTTP throughput, Mercator PNG, 32 concurrent | **6,863 tiles/s** | 181 tiles/s | **37.8×** |
-| HTTP throughput, satellite RGB PNG, 32 concurrent | **3,791 tiles/s** | 171 tiles/s | **22.2×** |
-| Single Mercator PNG tile | **634 µs** | 17.6 ms | **27.7×** |
-| Fused NDVI PNG tile | **917 µs** | 14.2 ms | **15.5×** |
+| Local fixtures, warm cache | Apple M5, 10 cores | Linux x86-64, 4 vCPU |
+| :--- | ---: | ---: |
+| HTTP throughput, Mercator PNG, 32 concurrent | 6,863 vs 181 tiles/s: **37.8×** | 1,502 vs 72 tiles/s: **20.8×** |
+| HTTP throughput, satellite RGB PNG, 32 concurrent | 3,791 vs 171 tiles/s: **22.2×** | 812 vs 82 tiles/s: **9.9×** |
+| Single Mercator PNG tile | 634 µs vs 17.6 ms: **27.7×** | 1.78 ms vs 24.4 ms: **13.8×** |
+| Landsat three-file RGB PNG tile | 1.63 ms vs 25.4 ms: **15.6×** | 3.39 ms vs 71.9 ms: **21.2×** |
+
+Each cell is `cogzilla` against TiTiler on the same machine. The Linux column is a GitHub-hosted runner (AMD EPYC, shared) running the same kind of build as the release binaries.
 
 ### What these numbers do and don't say
 
 - **The 4.3× is the number to plan with.** It is CPU for a tile the server has not seen, which is what an origin behind a CDN mostly serves. It ranged from 2.1× to 4.8× on four workloads (the fifth showed 8.3×, but its file was small enough to be partly cached) and does not depend on the network.
+- **The local multiples depend on the machine.** Warm PNG tiles are 15–42× on the M5 and 14–21× on the 4-vCPU Linux runner; HTTP throughput is 22–38× and 10–21×. The Linux figures are from a hosted shared runner (`generic` release build). Quote the Linux range if you need one number for a typical cloud instance.
+- **Not every path is that far ahead.** On the Linux run, lossy WebP output was 3.6× faster, low-zoom tiles from multi-file scenes about 2×, and first-touch local tiles 3.2–9.2×. One raw decode path remained slightly slower than GDAL on x86-64 (LZW with predictor 1 at 0.8×, `0.9×` with `target-cpu=native`; DEFLATE with predictor 2 is 1.2× and LZW with predictor 3 is 1.3×). Those are decode-only measurements, and a warm tile does no decoding.
+- **The S3 results are M5-only.** The CPU, memory and cost figures in the first table have not been repeated on x86.
 - **The larger multiples (13–62× on S3) need the cache to fit.** `cogzilla` keeps decoded blocks in memory and TiTiler keeps none, which is where the big multiples come from. With the default 512 MiB cache, three of the five S3 workloads outgrew it and fell back to S3. Size `--cache-mb` to your working set and budget about 250 MiB on top.
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
 - **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilization, and compute only. The ratio is measured; the instance counts are not.
@@ -80,9 +85,9 @@ The cost is scope. If your data is not a GeoTIFF, or is in a projection outside 
 
 Rust, explicit SIMD (ARM64 NEON, and x86_64 AVX2/FMA chosen at runtime), and native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). There are four stages.
 
-**Reading.** A Classic/BigTIFF and GeoKey parser opens a local file through `mmap` in about a microsecond (0.92–1.3 µs, roughly 300–440× faster than `GDALOpenEx`). A remote file opens with one speculative 128 KiB range request. Later reads coalesce adjacent byte ranges, S3 requests are SigV4-signed, and decoded blocks go into a sharded cache that collapses concurrent requests for the same block into one fetch.
+**Reading.** A Classic/BigTIFF and GeoKey parser opens a local file through `mmap` in about a microsecond (0.92–1.3 µs, hundreds of times faster than `GDALOpenEx`). A remote file opens with one speculative 128 KiB range request. Later reads coalesce adjacent byte ranges, S3 requests are SigV4-signed, and decoded blocks go into a sharded cache that collapses concurrent requests for the same block into one fetch.
 
-**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD). All eight GDAL numeric types from `uint8` to `float64` are supported, in tiled or stripped layout, with internal masks and RGBA alpha. Blocks that are entirely nodata are flagged at decode, so empty tiles return in under 200 ns.
+**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD on the M5). All eight GDAL numeric types from `uint8` to `float64` are supported, in tiled or stripped layout, with internal masks and RGBA alpha. Blocks that are entirely nodata are flagged at decode, so empty tiles return in under 200 ns.
 
 **Projecting.** Closed-form `f64` math for `EPSG:3857`, `EPSG:4326`, all 120 WGS84/NAD83 UTM zones, CONUS and California Albers, Lambert Conformal Conic, and Polar Stereographic (`3413`, `3031`). Tiles at `z <= 8` are projected per pixel; tiles at `z >= 9` interpolate a 17×17 grid. Zooms 0 to 22 are served.
 
@@ -146,7 +151,7 @@ Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I
 - `GET /stac/assets`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/map.html`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
 - The STAC item can be a local path, an HTTP(S) URL or an `s3://` URI. Its JSON is cached, and assets named with `?assets=red&assets=green&assets=blue` are opened concurrently.
 - Expressions can use band positions, `(b1-b2)/(b1+b2)`, or asset names, `(red-green)/(red+green)`.
-- On local fixtures with a warm cache these routes ran 21–82× faster than TiTiler: STAC tiles 2.1 ms against 48.6 ms, TileJSON 63.5×, info 45.3×, three-asset point queries 82.4×.
+- On the M5, with local fixtures and a warm cache, these routes ran 21–82× faster than TiTiler: STAC tiles 2.1 ms against 48.6 ms, TileJSON 63.5×, info 45.3×, three-asset point queries 82.4×.
 
 **`/colorMaps`** and **`/tileMatrixSets`**
 
@@ -178,7 +183,7 @@ GET /cog/tiles/WebMercatorQuad/12/652/1583.f32?url=s3://bucket/VV.tif&expr=db
 ## Benchmarks
 
 - [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md): real COGs on S3 against a tuned TiTiler, covering time, memory and cost, with caveats and reproduction steps. This is the source of the first table above.
-- [benches/COGMARK.md](benches/COGMARK.md): the local `BM-01` to `BM-11` suite against GDAL, `rio-tiler` and TiTiler on synthetic fixtures, with reproduction steps. This is the source of the second table, and it is the best case: no network and a warm cache.
+- [benches/COGMARK.md](benches/COGMARK.md): the local `BM-01` to `BM-11` suite against GDAL, `rio-tiler` and TiTiler on synthetic fixtures, on an Apple M5 and on a Linux x86-64 runner, with reproduction steps. This is the source of the second table, and it is the best case: no network and a warm cache. The Linux numbers come from the manually triggered [COGMark workflow](.github/workflows/bench.yml).
 
 ## Workspace crates
 
