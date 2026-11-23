@@ -874,4 +874,37 @@ impl CogStore {
 
         Ok(results)
     }
+
+    /// Fetch raw compressed bytes for a single COG internal tile, bypassing decoding.
+    ///
+    /// Used by zero-decode pass-through for WebMercator-aligned JPEG/WebP COGs.
+    /// Respects the tier-2 persistent disk cache for remote sources and zero-copy mmap
+    /// slicing for local files.
+    pub async fn get_raw_block(
+        &self,
+        cog: &OpenedCog,
+        ifd_idx: usize,
+        tile_idx: u32,
+        offset: u64,
+        byte_len: u32,
+    ) -> Result<bytes::Bytes, IoError> {
+        let is_local = matches!(cog.source, CogSource::LocalMmap { .. });
+        if !is_local {
+            if let Some(dc) = &self.disk_cache {
+                if let Some(cached) = dc.get(cog.uri.clone(), ifd_idx as u16, tile_idx).await {
+                    return Ok(cached);
+                }
+            }
+        }
+        let raw = cog
+            .source
+            .fetch_range(offset, offset + byte_len as u64)
+            .await?;
+        if !is_local {
+            if let Some(dc) = &self.disk_cache {
+                dc.put_async(&cog.uri, ifd_idx as u16, tile_idx, raw.clone());
+            }
+        }
+        Ok(raw)
+    }
 }

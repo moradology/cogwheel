@@ -612,6 +612,7 @@ pub async fn handle_request(
         let body = serde_json::json!({
             "tiles_served": engine.stats.tiles_served.load(Ordering::Relaxed),
             "empty_short_circuits": engine.stats.empty_short_circuits.load(Ordering::Relaxed),
+            "passthrough_hits": engine.stats.passthrough_hits.load(Ordering::Relaxed),
             "cache_hits": engine.store.cache.hits.load(Ordering::Relaxed),
             "cache_misses": engine.store.cache.misses.load(Ordering::Relaxed),
             "singleflight_coalesced": engine.store.cache.coalesced_waiters.load(Ordering::Relaxed),

@@ -10,7 +10,7 @@ use cogzilla_kernel::{
     render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb, render_single_band,
 };
 use cogzilla_proj::{CoordPlan, CrsModel, ProjError, TileCoord, tile_bounds_3857};
-use cogzilla_tiff::PlanarConfig;
+use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
 use dashmap::DashMap;
 use thiserror::Error;
 
@@ -83,6 +83,7 @@ pub struct TileRequest {
 pub struct EngineStats {
     pub tiles_served: AtomicU64,
     pub empty_short_circuits: AtomicU64,
+    pub passthrough_hits: AtomicU64,
 }
 
 pub struct TileEngine {
@@ -175,6 +176,17 @@ impl TileEngine {
         let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, N as u32);
         let ifd_idx = cog.index.select_ifd(target_rx, target_ry);
         let ifd = &cog.index.ifds[ifd_idx];
+
+        // Zero-decode pass-through for WebMercator-aligned JPEG/WebP COGs:
+        // when the requested XYZ tile matches an internal IFD tile 1:1 with identity RGB
+        // styling and matching compression, stream raw compressed bytes straight through
+        // without decoding, resampling, or re-encoding.
+        if let Some(bytes) = self
+            .try_zero_decode_passthrough::<N>(cog, &crs, ifd_idx, ifd, req)
+            .await?
+        {
+            return Ok(bytes);
+        }
 
         let Some(plan) = CoordPlan::<N>::build(
             &crs,
@@ -1017,5 +1029,345 @@ impl TileEngine {
             return Ok(empty_tile_bytes(req.tile_size, req.format, 3));
         }
         self.render_mosaic_tile(&urls, req).await
+    }
+
+    async fn try_zero_decode_passthrough<const N: usize>(
+        &self,
+        cog: &OpenedCog,
+        crs: &CrsModel,
+        ifd_idx: usize,
+        ifd: &IfdMeta,
+        req: &TileRequest,
+    ) -> Result<Option<Bytes>, EngineError> {
+        let Some((tx, ty)) =
+            aligned_passthrough_tile_coord::<N>(crs, ifd, cog.index.nodata, req)
+        else {
+            return Ok(None);
+        };
+
+        let Some((offset, byte_len)) = ifd.tile_byte_range(tx, ty, 0) else {
+            // Sparse empty internal tile -> short-circuit without decoding.
+            self.stats
+                .empty_short_circuits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(empty_tile_bytes(N as u32, req.format, 3)));
+        };
+
+        let tile_idx = ifd.tile_index(tx, ty, 0) as u32;
+        let raw = self
+            .store
+            .get_raw_block(cog, ifd_idx, tile_idx, offset, byte_len)
+            .await?;
+
+        let out = if ifd.compression == Compression::Jpeg {
+            if let Some(tables) = ifd.jpeg_tables.as_deref() {
+                splice_jpeg_tables(tables, &raw)
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+
+        self.stats.passthrough_hits.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(out))
+    }
+}
+
+/// Pure eligibility check for zero-decode pass-through of WebMercator-aligned JPEG/WebP COGs.
+/// Returns `Some((tx, ty))` when the requested XYZ tile maps 1:1 onto a full, in-bounds
+/// internal COG tile with identical codec and identity RGB styling.
+fn aligned_passthrough_tile_coord<const N: usize>(
+    crs: &CrsModel,
+    ifd: &IfdMeta,
+    nodata: Option<f32>,
+    req: &TileRequest,
+) -> Option<(u32, u32)> {
+    if !matches!(crs, CrsModel::Epsg3857) {
+        return None;
+    }
+    if ifd.is_stripped
+        || ifd.planar_config != PlanarConfig::Chunky
+        || ifd.sample_type != SampleType::Uint8
+        || ifd.samples_per_pixel != 3
+        || ifd.mask_ifd.is_some()
+        || !ifd.extra_samples.is_empty()
+        || nodata.is_some()
+        || !ifd.crs_to_pixel.is_axis_aligned()
+        || ifd.tile_width != N as u32
+        || ifd.tile_height != N as u32
+        || !(ifd.photometric == 2 || ifd.photometric == 6)
+    {
+        return None;
+    }
+
+    let codec_matches = matches!(
+        (ifd.compression, req.format),
+        (Compression::Jpeg, OutputFormat::Jpeg { .. })
+            | (Compression::Webp, OutputFormat::Webp { .. })
+    );
+    if !codec_matches {
+        return None;
+    }
+
+    match &req.bands {
+        BandRequest::Rgb {
+            bands_1based: [1, 2, 3],
+            rescale_min,
+            rescale_max,
+        } if *rescale_min == [0.0, 0.0, 0.0] && *rescale_max == [255.0, 255.0, 255.0] => {}
+        _ => return None,
+    }
+
+    let (min_x, min_y, max_x, max_y) = tile_bounds_3857(req.tile);
+    let (col0, row0) = ifd.crs_to_pixel.forward(min_x, max_y);
+    let (col1, row1) = ifd.crs_to_pixel.forward(max_x, min_y);
+    let nf = N as f64;
+    const TOL: f64 = 1e-2;
+
+    if (col1 - col0 - nf).abs() > TOL || (row1 - row0 - nf).abs() > TOL {
+        return None;
+    }
+    if col0 < -TOL
+        || row0 < -TOL
+        || col1 > ifd.width as f64 + TOL
+        || row1 > ifd.height as f64 + TOL
+    {
+        return None;
+    }
+
+    let tx_f = col0 / nf;
+    let ty_f = row0 / nf;
+    let tx_round = tx_f.round();
+    let ty_round = ty_f.round();
+    if (tx_f - tx_round).abs() * nf > TOL || (ty_f - ty_round).abs() * nf > TOL {
+        return None;
+    }
+    let tx = tx_round as i64;
+    let ty = ty_round as i64;
+    if tx < 0 || ty < 0 || tx >= ifd.tiles_across as i64 || ty >= ifd.tiles_down as i64 {
+        return None;
+    }
+    Some((tx as u32, ty as u32))
+}
+
+/// Merge TIFF tag 347 `JPEGTables` with an abbreviated JPEG tile bitstream into a
+/// standalone browser-decodable JPEG stream.
+fn splice_jpeg_tables(tables: &[u8], raw: &[u8]) -> Bytes {
+    if tables.len() >= 4 && raw.len() >= 2 {
+        let t_end = if tables.ends_with(&[0xFF, 0xD9]) {
+            tables.len() - 2
+        } else {
+            tables.len()
+        };
+        let c_start = if raw.starts_with(&[0xFF, 0xD8]) { 2 } else { 0 };
+        let mut out = Vec::with_capacity(t_end + (raw.len() - c_start));
+        out.extend_from_slice(&tables[..t_end]);
+        out.extend_from_slice(&raw[c_start..]);
+        Bytes::from(out)
+    } else {
+        Bytes::copy_from_slice(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cogzilla_tiff::Affine2D;
+
+    fn make_aligned_ifd(
+        tile: TileCoord,
+        compression: Compression,
+        tile_size: u32,
+        tiles_across: u32,
+        tiles_down: u32,
+    ) -> IfdMeta {
+        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
+        let res_x = (max_x - min_x) / tile_size as f64;
+        let res_y = (max_y - min_y) / tile_size as f64;
+        // Anchor COG origin 1 tile west and 1 tile north so `tile` sits at internal `(tx=1, ty=1)`.
+        let origin_x = min_x - (max_x - min_x);
+        let origin_y = max_y + (max_y - min_y);
+        let pixel_to_crs = Affine2D {
+            a: res_x,
+            b: 0.0,
+            c: origin_x,
+            d: 0.0,
+            e: -res_y,
+            f: origin_y,
+        };
+        let crs_to_pixel = pixel_to_crs.invert().unwrap();
+        let n_tiles = (tiles_across * tiles_down) as usize;
+        IfdMeta {
+            width: tile_size * tiles_across,
+            height: tile_size * tiles_down,
+            tile_width: tile_size,
+            tile_height: tile_size,
+            tiles_across,
+            tiles_down,
+            sample_type: SampleType::Uint8,
+            samples_per_pixel: 3,
+            planar_config: PlanarConfig::Chunky,
+            compression,
+            predictor: cogzilla_tiff::Predictor::None,
+            photometric: 6,
+            extra_samples: Vec::new(),
+            jpeg_tables: None,
+            mask_ifd: None,
+            is_stripped: false,
+            pixel_to_crs,
+            crs_to_pixel,
+            tile_offsets: vec![0u64; n_tiles].into_boxed_slice(),
+            tile_byte_counts: vec![128u32; n_tiles].into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn zero_decode_passthrough_matches_aligned_jpeg_and_webp_and_rejects_transforms() {
+        let tile = TileCoord { z: 12, x: 655, y: 1583 };
+        let ifd_jpeg = make_aligned_ifd(tile, Compression::Jpeg, 256, 4, 4);
+        let ifd_webp = make_aligned_ifd(tile, Compression::Webp, 256, 4, 4);
+
+        let rgb_id = BandRequest::Rgb {
+            bands_1based: [1, 2, 3],
+            rescale_min: [0.0, 0.0, 0.0],
+            rescale_max: [255.0, 255.0, 255.0],
+        };
+
+        let req_jpeg = TileRequest {
+            tile,
+            tile_size: 256,
+            bands: rgb_id.clone(),
+            resample: ResampleMode::Bilinear,
+            format: OutputFormat::Jpeg { quality: 85 },
+        };
+        assert_eq!(
+            aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_jpeg, None, &req_jpeg),
+            Some((1, 1))
+        );
+
+        let req_webp = TileRequest {
+            tile,
+            tile_size: 256,
+            bands: rgb_id.clone(),
+            resample: ResampleMode::Bilinear,
+            format: OutputFormat::Webp { quality: Some(85.0) },
+        };
+        assert_eq!(
+            aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_webp, None, &req_webp),
+            Some((1, 1))
+        );
+
+        // Reject mismatched format (PNG requested on JPEG COG)
+        let req_png = TileRequest {
+            format: OutputFormat::Png,
+            ..req_jpeg.clone()
+        };
+        assert_eq!(
+            aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_jpeg, None, &req_png),
+            None
+        );
+
+        // Reject rescaled request
+        let req_rescaled = TileRequest {
+            bands: BandRequest::Rgb {
+                bands_1based: [1, 2, 3],
+                rescale_min: [10.0, 10.0, 10.0],
+                rescale_max: [200.0, 200.0, 200.0],
+            },
+            ..req_jpeg.clone()
+        };
+        assert_eq!(
+            aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_jpeg, None, &req_rescaled),
+            None
+        );
+
+        // Reject band-swapped request
+        let req_swap = TileRequest {
+            bands: BandRequest::Rgb {
+                bands_1based: [3, 2, 1],
+                rescale_min: [0.0, 0.0, 0.0],
+                rescale_max: [255.0, 255.0, 255.0],
+            },
+            ..req_jpeg.clone()
+        };
+        assert_eq!(
+            aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_jpeg, None, &req_swap),
+            None
+        );
+
+        // Reject non-aligned (half-tile shifted) IFD
+        let mut ifd_shifted = ifd_jpeg.clone();
+        ifd_shifted.pixel_to_crs.c += ifd_shifted.pixel_to_crs.a * 128.0;
+        ifd_shifted.crs_to_pixel = ifd_shifted.pixel_to_crs.invert().unwrap();
+        assert_eq!(
+            aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_shifted, None, &req_jpeg),
+            None
+        );
+
+        // Verify JPEGTables splicing strips trailing EOI (FF D9) from tables and leading SOI (FF D8) from tile
+        let spliced = splice_jpeg_tables(
+            &[0xFF, 0xD8, 0xFF, 0xDB, 0x01, 0x02, 0xFF, 0xD9],
+            &[0xFF, 0xD8, 0xFF, 0xC0, 0xAA, 0xBB, 0xFF, 0xD9],
+        );
+        assert_eq!(
+            spliced.as_ref(),
+            &[0xFF, 0xD8, 0xFF, 0xDB, 0x01, 0x02, 0xFF, 0xC0, 0xAA, 0xBB, 0xFF, 0xD9]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_decode_passthrough_streams_exact_bytes_without_decoding() {
+        let tile = TileCoord { z: 12, x: 655, y: 1583 };
+        let mut ifd = make_aligned_ifd(tile, Compression::Jpeg, 256, 2, 2);
+        // Write a real payload to a temp file and point tile (1, 1) (index 3) to it.
+        let payload = b"\xFF\xD8\xFF\xE0\x00\x10JFIF_ZERO_DECODE_TEST_PAYLOAD\xFF\xD9";
+        let tmp_path = std::env::temp_dir().join(format!(
+            "cogzilla_passthrough_test_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&tmp_path, payload).unwrap();
+        ifd.tile_offsets = vec![0, 0, 0, 0].into_boxed_slice();
+        ifd.tile_byte_counts = vec![0, 0, 0, payload.len() as u32].into_boxed_slice();
+
+        let mut geo_keys = cogzilla_tiff::GeoKeys::default();
+        geo_keys.model_type = Some(1);
+        geo_keys.projected_cs_type = Some(3857);
+        let index = cogzilla_tiff::CogIndex {
+            byte_order: cogzilla_tiff::ByteOrder::Little,
+            is_bigtiff: false,
+            geo_keys,
+            nodata: None,
+            scales: vec![1.0; 3],
+            offsets: vec![0.0; 3],
+            ifds: vec![ifd],
+        };
+        let source = cogzilla_io::CogSource::open_local(&tmp_path).unwrap();
+        let cog = OpenedCog {
+            id: 999_999,
+            uri: tmp_path.to_string_lossy().into_owned(),
+            index,
+            source,
+        };
+
+        let engine = TileEngine::new(16 * 1024 * 1024);
+        let req = TileRequest {
+            tile,
+            tile_size: 256,
+            bands: BandRequest::Rgb {
+                bands_1based: [1, 2, 3],
+                rescale_min: [0.0, 0.0, 0.0],
+                rescale_max: [255.0, 255.0, 255.0],
+            },
+            resample: ResampleMode::Bilinear,
+            format: OutputFormat::Jpeg { quality: 85 },
+        };
+        let out = engine.render_tile(&cog, &req).await.unwrap();
+        let _ = std::fs::remove_file(&tmp_path);
+
+        assert_eq!(out.as_ref(), payload);
+        assert_eq!(engine.stats.passthrough_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.store.cache.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.store.cache.misses.load(Ordering::Relaxed), 0);
     }
 }
