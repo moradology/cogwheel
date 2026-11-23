@@ -10,7 +10,6 @@ use cogzilla_kernel::{
 };
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::header::{
     ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH,
 };
@@ -785,10 +784,32 @@ async fn open_query_urls(
     Ok(opened)
 }
 
-pub async fn handle_request(
+/// Convenience entry point for serverless / embedded runtimes (such as AWS Lambda)
+/// that already hold the request body in memory as `Bytes`.
+pub async fn handle_bytes_request(
     engine: Arc<TileEngine>,
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+    req: Request<Bytes>,
+) -> Response<Bytes> {
+    let (parts, body) = req.into_parts();
+    let req_full = Request::from_parts(parts, Full::new(body));
+    let Ok(resp) = handle_request(engine, req_full).await;
+    let (rparts, rbody) = resp.into_parts();
+    let bytes = rbody
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    Response::from_parts(rparts, bytes)
+}
+
+pub async fn handle_request<B>(
+    engine: Arc<TileEngine>,
+    req: Request<B>,
+) -> Result<Response<Full<Bytes>>, Infallible>
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
     let host = req
         .headers()
         .get("host")

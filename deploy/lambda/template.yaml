@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: cogzilla - Zero-GDAL Rust + SIMD COG & STAC tile server on AWS Lambda (provided.al2023 arm64)
+
+Parameters:
+  MemorySize:
+    Type: Number
+    Default: 1769
+    Description: Lambda memory in MiB (1769 MiB = 1 full Graviton2 vCPU)
+  CacheMb:
+    Type: Number
+    Default: 256
+    Description: In-memory decoded block cache size in MiB
+  DiskCacheMb:
+    Type: Number
+    Default: 256
+    Description: Optional /tmp compressed-block cache size in MiB (0 to disable)
+  S3BucketArn:
+    Type: String
+    Default: ""
+    Description: Optional S3 bucket ARN to grant s3:GetObject access (leave empty for public buckets)
+
+Conditions:
+  HasS3Bucket: !Not [!Equals [!Ref S3BucketArn, ""]]
+
+Resources:
+  CogzillaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cogzilla
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Handler: bootstrap
+      CodeUri: ../../dist/cogzilla-lambda-aarch64.zip
+      MemorySize: !Ref MemorySize
+      Timeout: 30
+      EphemeralStorage:
+        Size: 512
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+            - "*"
+          AllowMethods:
+            - GET
+            - POST
+            - OPTIONS
+      Environment:
+        Variables:
+          COGZILLA_CACHE_MB: !Ref CacheMb
+          COGZILLA_DISK_CACHE_MB: !Ref DiskCacheMb
+          COGZILLA_DISK_CACHE_DIR: /tmp/cogzilla-cache
+          COGZILLA_CACHE_CONTROL_MAX_AGE: "3600"
+          RUST_LOG: info
+      Policies:
+        - !If
+          - HasS3Bucket
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${S3BucketArn}/*"
+          - !Ref AWS::NoValue
+
+Outputs:
+  FunctionUrl:
+    Description: Direct HTTPS endpoint for cogzilla (plug into MapLibre / Leaflet / CloudFront)
+    Value: !GetAtt CogzillaFunctionUrl.FunctionUrl

@@ -42,7 +42,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked -p cogzilla-server --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p cogzilla-server --target ${{ matrix.target }}
+          if [[ "${{ matrix.target }}" == *"-unknown-linux-gnu" ]]; then
+            cargo build --release --locked -p cogzilla-lambda --target ${{ matrix.target }}
+          fi
       - name: Package
         run: |
           name="cogzilla-server-${GITHUB_REF_NAME}-${{ matrix.target }}"
@@ -55,6 +59,15 @@ jobs:
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           rm -r "$name"
+          if [[ "${{ matrix.target }}" == *"-unknown-linux-gnu" ]]; then
+            lname="cogzilla-lambda-${GITHUB_REF_NAME}-${{ matrix.target }}"
+            mkdir -p "lambda-pkg"
+            cp "../target/${{ matrix.target }}/release/cogzilla-lambda" "lambda-pkg/bootstrap"
+            chmod +x "lambda-pkg/bootstrap"
+            (cd lambda-pkg && zip -q "../$lname.zip" bootstrap)
+            shasum -a 256 "$lname.zip" > "$lname.zip.sha256"
+            rm -r "lambda-pkg"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
@@ -160,7 +173,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat dist/*.sha256 > dist/SHA256SUMS
-          rm dist/*.tar.gz.sha256
+          rm dist/*.sha256
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \

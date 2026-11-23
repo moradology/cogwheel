@@ -10,5 +10,5 @@ pub use catalog::{
     load_catalog_json_str, tile_to_quadkey, wgs84_bbox_to_3857,
 };
 pub use engine::{BandRequest, EngineError, EngineStats, TileEngine, TileRequest};
-pub use http::{handle_request, serve, serve_listener};
+pub use http::{handle_bytes_request, handle_request, serve, serve_listener};
 pub use tile_cache::{CachedTile, TileCache};

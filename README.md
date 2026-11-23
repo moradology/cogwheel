@@ -50,7 +50,7 @@ Request tiles from any COG over HTTP, S3, GCS or Azure Blob:
 GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=s3://your-bucket/your.tif
 ```
 
-Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source: `cargo build --release -p cogzilla-server`.
+Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda** `bootstrap` zips (`provided.al2023`, arm64 & x86_64, see [deploy/lambda/template.yaml](deploy/lambda/template.yaml)) are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source: `cargo build --release -p cogzilla-server` (or `-p cogzilla-lambda`).
 
 ## What it does
 

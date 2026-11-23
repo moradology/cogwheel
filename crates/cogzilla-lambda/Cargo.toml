@@ -1,0 +1,18 @@
+[package]
+name = "cogzilla-lambda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cogzilla-lambda"
+path = "src/main.rs"
+
+[dependencies]
+cogzilla-io = { path = "../cogzilla-io" }
+cogzilla-server = { path = "../cogzilla-server" }
+bytes.workspace = true
+lambda_http.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
