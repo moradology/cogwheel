@@ -4,7 +4,7 @@
 
 # `cogzilla`
 
-An ultra-fast, zero-GDAL Cloud Optimized GeoTIFF (COG) tile server built in Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native C codecs (`libdeflate`, `zstd`, `libwebp`), purpose-built for satellite imagery (**Landsat Collection 2 `uint16`**, **OPERA RTC-S1 / Sentinel-1 `float32` SAR**, **Sentinel-2**, DEMs).
+An ultra-fast, zero-GDAL Cloud Optimized GeoTIFF (COG) & STAC tile server built in Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). Drop-in TiTiler API compatible across all 8 GDAL numeric dtypes (`uint8`–`float64`), JPEG/WebP/ZSTD/DEFLATE/LZW COGs, stripped GeoTIFFs, internal masks & RGBA alpha, and all 211 `rio-tiler` colormaps.
 
 ## Highlights
 
