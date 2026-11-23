@@ -43,7 +43,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     assert_eq!(info["dtype"], "float32");
     assert_eq!(info["count"], 3);
     assert_eq!(info["width"], 2048);
-    let bounds = info["bounds"].as_array().unwrap();
+    let bounds = info["wgs84_bounds"].as_array().unwrap();
     assert!(bounds[0].as_f64().unwrap() < -122.5 && bounds[2].as_f64().unwrap() > -122.5);
 
     // 2. GET /cog/info.geojson
@@ -53,8 +53,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
 
     // 3. GET /cog/WebMercatorQuad/tilejson.json
     let tj = get_json(&client, format!("{base}/cog/WebMercatorQuad/tilejson.json?url={sat_url}")).await;
-    assert_eq!(tj["tilejson"], "2.2.0");
-    assert!(tj["tiles"][0].as_str().unwrap().contains("/cog/tiles/WebMercatorQuad/{z}/{x}/{y}@1x"));
+    assert_eq!(tj["tilejson"], "3.0.0");
+    assert!(tj["tiles"][0].as_str().unwrap().contains("/cog/tiles/WebMercatorQuad/{z}/{x}/{y}"));
 
     // 4. GET /cog/tiles & /cog/tiles/WebMercatorQuad
     assert_eq!(

@@ -115,6 +115,46 @@ pub fn decode_tile(
                 false,
                 nodata,
             ),
+            SampleType::Int8 => predictor::reconstruct_i8(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                false,
+                nodata,
+            ),
+            SampleType::Uint32 => predictor::reconstruct_int32(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                false,
+                false,
+                nodata,
+            ),
+            SampleType::Int32 => predictor::reconstruct_int32(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                true,
+                false,
+                nodata,
+            ),
+            SampleType::Float64 => {
+                let mut copy = compressed[..expected_bytes].to_vec();
+                predictor::reconstruct_f64(
+                    &mut copy,
+                    ifd.tile_width,
+                    ifd.tile_height,
+                    bands_in_tile,
+                    byte_order,
+                    Predictor::None,
+                    nodata,
+                )
+            }
         };
         return Ok(DecodedTile { bands });
     }
@@ -231,6 +271,43 @@ pub fn decode_tile(
                 ifd.tile_height,
                 bands_in_tile,
                 p == Predictor::HorizontalInt,
+                nodata,
+            ),
+            (SampleType::Int8, p) => predictor::reconstruct_i8(
+                raw_slice,
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                p == Predictor::HorizontalInt,
+                nodata,
+            ),
+            (SampleType::Uint32, p) => predictor::reconstruct_int32(
+                raw_slice,
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                false,
+                p == Predictor::HorizontalInt,
+                nodata,
+            ),
+            (SampleType::Int32, p) => predictor::reconstruct_int32(
+                raw_slice,
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                true,
+                p == Predictor::HorizontalInt,
+                nodata,
+            ),
+            (SampleType::Float64, p) => predictor::reconstruct_f64(
+                raw_slice,
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                p,
                 nodata,
             ),
         };

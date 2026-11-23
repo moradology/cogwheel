@@ -453,7 +453,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             continue;
         }
 
-        // Accept float32, uint16, int16, uint8 (all widen to f32 at block decode)
+        // Accept all 8 standard GDAL numeric sample types (widened to f32 at block decode)
         let bps = bits_per_sample
             .as_deref()
             .and_then(|v| v.first().copied())
@@ -463,10 +463,14 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             .and_then(|v| v.first().copied())
             .unwrap_or(1);
         let sample_type = match (fmt, bps) {
-            (3, 32) => SampleType::Float32,
+            (1, 8) => SampleType::Uint8,
+            (2, 8) => SampleType::Int8,
             (1, 16) => SampleType::Uint16,
             (2, 16) => SampleType::Int16,
-            (1, 8) => SampleType::Uint8,
+            (1, 32) => SampleType::Uint32,
+            (2, 32) => SampleType::Int32,
+            (3, 32) => SampleType::Float32,
+            (3, 64) => SampleType::Float64,
             _ => {
                 return Err(TiffError::UnsupportedSampleFormat {
                     format: fmt,

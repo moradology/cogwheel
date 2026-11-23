@@ -169,6 +169,14 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     pq.tile_size = sz;
                 }
             }
+            "scale" => {
+                if let Ok(sc) = v.parse::<u32>() {
+                    pq.tile_size = match sc {
+                        2 => 512,
+                        _ => 256,
+                    };
+                }
+            }
             "max_size" => {
                 if let Ok(ms) = v.parse::<u32>() {
                     pq.max_size = ms.clamp(64, 4096);

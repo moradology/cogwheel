@@ -43,32 +43,45 @@ pub enum Predictor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleType {
-    /// IEEE-754 32-bit float (SAR RTC, DEMs, scientific COGs).
-    Float32,
+    /// Unsigned 8-bit integer (Sentinel-2 TCI, visual RGB, QA masks).
+    Uint8,
+    /// Signed 8-bit integer.
+    Int8,
     /// Unsigned 16-bit integer (Landsat Collection 2, Sentinel-2 L2A).
     Uint16,
     /// Signed 16-bit integer (SRTM / Copernicus DEMs, MODIS).
     Int16,
-    /// Unsigned 8-bit integer (Sentinel-2 TCI, Planet/NAIP/Maxar visual RGB, QA masks).
-    Uint8,
+    /// Unsigned 32-bit integer (classification / counts).
+    Uint32,
+    /// Signed 32-bit integer.
+    Int32,
+    /// IEEE-754 32-bit float (SAR RTC, DEMs, scientific COGs).
+    Float32,
+    /// IEEE-754 64-bit float (scientific / geodetic rasters).
+    Float64,
 }
 
 impl SampleType {
     #[inline(always)]
     pub fn bytes_per_sample(self) -> usize {
         match self {
-            Self::Float32 => 4,
+            Self::Uint8 | Self::Int8 => 1,
             Self::Uint16 | Self::Int16 => 2,
-            Self::Uint8 => 1,
+            Self::Uint32 | Self::Int32 | Self::Float32 => 4,
+            Self::Float64 => 8,
         }
     }
 
     pub fn gdal_name(self) -> &'static str {
         match self {
-            Self::Float32 => "float32",
+            Self::Uint8 => "uint8",
+            Self::Int8 => "int8",
             Self::Uint16 => "uint16",
             Self::Int16 => "int16",
-            Self::Uint8 => "uint8",
+            Self::Uint32 => "uint32",
+            Self::Int32 => "int32",
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
         }
     }
 }

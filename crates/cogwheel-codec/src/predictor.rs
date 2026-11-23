@@ -1362,6 +1362,255 @@ pub fn reconstruct_i16(
         .collect()
 }
 
+/// Reconstruct `int8` Predictor 1 or Predictor 2 -> `AlignedF32Slab`.
+pub fn reconstruct_i8(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    horizontal_diff: bool,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut acc = vec![0i8; bands_in_tile];
+
+    for y in 0..h {
+        if horizontal_diff {
+            acc.fill(0);
+        }
+        let row_off = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let s = raw[(row_off + x) * bands_in_tile + b] as i8;
+                let val = if horizontal_diff {
+                    acc[b] = acc[b].wrapping_add(s);
+                    acc[b]
+                } else {
+                    s
+                };
+                let (v, is_nd) = check_val(val as f32, finite_nodata);
+                slabs[b][row_off + x] = v;
+                if is_nd {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    if v < min_val[b] { min_val[b] = v; }
+                    if v > max_val[b] { max_val[b] = v; }
+                }
+            }
+        }
+    }
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data,
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
+/// Reconstruct `uint32` or `int32` Predictor 1 or Predictor 2 -> `AlignedF32Slab`.
+pub fn reconstruct_int32(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    signed: bool,
+    horizontal_diff: bool,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut acc = vec![0u32; bands_in_tile];
+
+    for y in 0..h {
+        if horizontal_diff {
+            acc.fill(0);
+        }
+        let row_off = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let off = ((row_off + x) * bands_in_tile + b) * 4;
+                let bytes = [raw[off], raw[off + 1], raw[off + 2], raw[off + 3]];
+                let raw_u32 = match byte_order {
+                    ByteOrder::Little => u32::from_le_bytes(bytes),
+                    ByteOrder::Big => u32::from_be_bytes(bytes),
+                };
+                let bits = if horizontal_diff {
+                    acc[b] = acc[b].wrapping_add(raw_u32);
+                    acc[b]
+                } else {
+                    raw_u32
+                };
+                let vf = if signed { (bits as i32) as f32 } else { bits as f32 };
+                let (v, is_nd) = check_val(vf, finite_nodata);
+                slabs[b][row_off + x] = v;
+                if is_nd {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    if v < min_val[b] { min_val[b] = v; }
+                    if v > max_val[b] { max_val[b] = v; }
+                }
+            }
+        }
+    }
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data,
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
+/// Reconstruct `float64` (Predictor 1, Predictor 2, or 8-plane Predictor 3) -> `AlignedF32Slab`.
+pub fn reconstruct_f64(
+    raw: &mut [u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    predictor: cogwheel_tiff::Predictor,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    match predictor {
+        cogwheel_tiff::Predictor::FloatingPoint => {
+            let samples_per_row = w * bands_in_tile;
+            let row_bytes = samples_per_row * 8;
+            for y in 0..h {
+                let row = &mut raw[y * row_bytes..(y + 1) * row_bytes];
+                prefix_sum_scalar(row, bands_in_tile);
+                let row_off = y * w;
+                for x in 0..w {
+                    let base = x * bands_in_tile;
+                    for b in 0..bands_in_tile {
+                        let idx = base + b;
+                        let bytes = [
+                            row[7 * samples_per_row + idx],
+                            row[6 * samples_per_row + idx],
+                            row[5 * samples_per_row + idx],
+                            row[4 * samples_per_row + idx],
+                            row[3 * samples_per_row + idx],
+                            row[2 * samples_per_row + idx],
+                            row[samples_per_row + idx],
+                            row[idx],
+                        ];
+                        let vf = f64::from_le_bytes(bytes) as f32;
+                        let (v, is_nd) = check_val(vf, finite_nodata);
+                        slabs[b][row_off + x] = v;
+                        if is_nd {
+                            any_nodata[b] = true;
+                        } else {
+                            any_valid[b] = true;
+                            if v < min_val[b] { min_val[b] = v; }
+                            if v > max_val[b] { max_val[b] = v; }
+                        }
+                    }
+                }
+            }
+        }
+        cogwheel_tiff::Predictor::HorizontalInt => {
+            let mut acc = vec![0u64; bands_in_tile];
+            for y in 0..h {
+                acc.fill(0);
+                let row_off = y * w;
+                for x in 0..w {
+                    for b in 0..bands_in_tile {
+                        let off = ((row_off + x) * bands_in_tile + b) * 8;
+                        let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
+                        let delta = match byte_order {
+                            ByteOrder::Little => u64::from_le_bytes(bytes),
+                            ByteOrder::Big => u64::from_be_bytes(bytes),
+                        };
+                        acc[b] = acc[b].wrapping_add(delta);
+                        let vf = f64::from_bits(acc[b]) as f32;
+                        let (v, is_nd) = check_val(vf, finite_nodata);
+                        slabs[b][row_off + x] = v;
+                        if is_nd {
+                            any_nodata[b] = true;
+                        } else {
+                            any_valid[b] = true;
+                            if v < min_val[b] { min_val[b] = v; }
+                            if v > max_val[b] { max_val[b] = v; }
+                        }
+                    }
+                }
+            }
+        }
+        cogwheel_tiff::Predictor::None => {
+            for i in 0..pixels {
+                for b in 0..bands_in_tile {
+                    let off = (i * bands_in_tile + b) * 8;
+                    let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
+                    let vf = match byte_order {
+                        ByteOrder::Little => f64::from_le_bytes(bytes) as f32,
+                        ByteOrder::Big => f64::from_be_bytes(bytes) as f32,
+                    };
+                    let (v, is_nd) = check_val(vf, finite_nodata);
+                    slabs[b][i] = v;
+                    if is_nd {
+                        any_nodata[b] = true;
+                    } else {
+                        any_valid[b] = true;
+                        if v < min_val[b] { min_val[b] = v; }
+                        if v > max_val[b] { max_val[b] = v; }
+                    }
+                }
+            }
+        }
+    }
+
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data,
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
 /// Reconstruct `uint8` Predictor 1 or Predictor 2 (Sentinel-2 TCI, visual RGB, masks) -> `AlignedF32Slab`.
 pub fn reconstruct_u8(
     raw: &[u8],

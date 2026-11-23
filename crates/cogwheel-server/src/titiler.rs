@@ -46,8 +46,15 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         None => ("None", serde_json::Value::Null),
     };
 
+    let (x0, y0) = full.pixel_to_crs.forward(0.0, 0.0);
+    let (x1, y1) = full
+        .pixel_to_crs
+        .forward(full.width as f64, full.height as f64);
+    let native_bounds = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+
     Ok(serde_json::json!({
-        "bounds": bounds,
+        "bounds": native_bounds,
+        "wgs84_bounds": bounds,
         "minzoom": minzoom,
         "maxzoom": maxzoom,
         "band_metadata": band_metadata,
@@ -70,7 +77,7 @@ pub fn build_cog_info_geojson(
     cog: &OpenedCog,
 ) -> Result<serde_json::Value, EngineError> {
     let info = build_cog_info(engine, cog)?;
-    let b = info["bounds"].as_array().unwrap();
+    let b = info["wgs84_bounds"].as_array().unwrap();
     let (w, s, e, n) = (
         b[0].as_f64().unwrap(),
         b[1].as_f64().unwrap(),
@@ -109,12 +116,12 @@ pub fn build_tilejson(
         minzoom as f64,
     ];
     let tile_url = if raw_query.is_empty() {
-        format!("http://{host}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}@1x")
+        format!("http://{host}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}")
     } else {
-        format!("http://{host}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}@1x?{raw_query}")
+        format!("http://{host}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}")
     };
     Ok(serde_json::json!({
-        "tilejson": "2.2.0",
+        "tilejson": "3.0.0",
         "name": cog.uri,
         "version": "1.0.0",
         "scheme": "xyz",
