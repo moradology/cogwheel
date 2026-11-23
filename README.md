@@ -26,19 +26,25 @@ Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serve
 
 Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from one file. Nothing is pre-rendered: every tile is resampled, shaded, colormapped and encoded when it is requested, at 3,372 hillshade tiles per second on an M5 once the source blocks are cached.
 
-## Quickstart
+## Try the demo
+
+One command, no data to download and no account:
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.1
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.2
 ```
 
-Then open a live hillshade map of Mt. Rainier, read straight from a public S3 bucket:
+Then open <http://localhost:8080>.
 
-```text
-http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif&algorithm=hillshade
-```
+<p align="center">
+  <img src="assets/demo-page.jpg" alt="The cogzilla demo page: Mt. Rainier in 3D with a sidebar of demos and a tile-time readout" width="100%" />
+</p>
 
-Or request tiles from any COG over HTTP, S3, GCS or Azure Blob:
+The server's own front page is the demo. It has one-click maps of public data (Mt. Rainier as hillshade, slope, aspect and 3D terrain; Sentinel-2 true colour and NDVI), a box for your own COG URL, and a readout of how long each tile took. The first view of an area waits on S3; after that, tiles like the ones above render in a few milliseconds from cached blocks.
+
+## Use it
+
+Request tiles from any COG over HTTP, S3, GCS or Azure Blob:
 
 ```text
 GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=s3://your-bucket/your.tif
