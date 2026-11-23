@@ -15,8 +15,8 @@ pub use color_formula::ColorFormula;
 pub use colormap::{ColormapLut, ColormapName};
 pub use expr_vm::ExprProgram;
 pub use kernel::{
-    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, empty_tile_bytes, render_bandmath1,
-    render_bandmath2, render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb,
-    render_single_band, sample_cubic,
+    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, empty_tile_bytes, encode_rgba_tile,
+    render_bandmath1, render_bandmath2, render_bandmath3, render_expr_vm, render_rgb_bands,
+    render_sar_rgb, render_single_band, sample_cubic,
 };
 pub use source::BandSource;

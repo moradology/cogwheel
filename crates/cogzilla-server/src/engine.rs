@@ -6,8 +6,8 @@ use bytes::Bytes;
 use cogzilla_io::{CogStore, IoError, OpenedCog};
 use cogzilla_kernel::{
     BandSource, ColormapName, ExprProgram, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle,
-    SpectralExpr, empty_tile_bytes, render_bandmath1, render_bandmath2, render_bandmath3,
-    render_expr_vm, render_rgb_bands, render_sar_rgb, render_single_band,
+    SpectralExpr, empty_tile_bytes, encode_rgba_tile, render_bandmath1, render_bandmath2,
+    render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb, render_single_band,
 };
 use cogzilla_proj::{CoordPlan, CrsModel, ProjError, TileCoord};
 use cogzilla_tiff::PlanarConfig;
@@ -930,5 +930,61 @@ impl TileEngine {
                 "multi-COG compositing supports 1, 2, or 3 assets, got {other}"
             ))),
         }
+    }
+
+    /// Render a dynamic front-to-back mosaic across `urls` with **early-exit pixel coverage**:
+    /// walks scenes in priority order, composites only into unfilled (`alpha == 0`) pixels, and
+    /// stops immediately once all `tile_size * tile_size` pixels are opaque — never opening,
+    /// fetching, or decoding remaining background scenes!
+    pub async fn render_mosaic_tile(
+        &self,
+        urls: &[String],
+        req: &TileRequest,
+    ) -> Result<Bytes, EngineError> {
+        if urls.is_empty() {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one ?url= parameter".into(),
+            ));
+        }
+        let n = req.tile_size as usize;
+        let total_pixels = n * n;
+        let mut canvas = vec![0u8; total_pixels * 4];
+        let mut filled = 0usize;
+
+        let mut scene_req = req.clone();
+        scene_req.format = OutputFormat::RawRgba;
+
+        for url in urls {
+            if filled >= total_pixels {
+                break;
+            }
+            let cog = self.store.open_uri(url).await?;
+            let src = self.render_tile(&cog, &scene_req).await?;
+            if src.len() != total_pixels * 4 {
+                continue;
+            }
+            for i in 0..total_pixels {
+                let off = i * 4;
+                if canvas[off + 3] == 0 && src[off + 3] > 0 {
+                    canvas[off] = src[off];
+                    canvas[off + 1] = src[off + 1];
+                    canvas[off + 2] = src[off + 2];
+                    canvas[off + 3] = src[off + 3];
+                    if src[off + 3] == 255 {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+
+        if filled == 0 && canvas.chunks_exact(4).all(|p| p[3] == 0) {
+            return Ok(empty_tile_bytes(req.tile_size, req.format, 3));
+        }
+        Ok(encode_rgba_tile(
+            &canvas,
+            req.tile_size,
+            filled == total_pixels,
+            req.format,
+        ))
     }
 }

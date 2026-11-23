@@ -28,6 +28,8 @@ pub enum OutputFormat {
     /// JPEG (lossy quality `1..=100`, default `85`).
     Jpeg { quality: u8 },
     RawF32,
+    /// Uncompressed RGBA8 (`N * N * 4` bytes), used internally for multi-scene mosaic compositing.
+    RawRgba,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -473,6 +475,52 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
             }
             buf.freeze()
         }
+        OutputFormat::RawRgba => Bytes::from(vec![0u8; (tile_size as usize) * (tile_size as usize) * 4]),
+    }
+}
+
+#[inline]
+fn rgb_to_rgba_bytes(rgb: &[u8]) -> Bytes {
+    let pixels = rgb.len() / 3;
+    let mut out = Vec::with_capacity(pixels * 4);
+    for chunk in rgb.chunks_exact(3) {
+        out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+    }
+    Bytes::from(out)
+}
+
+/// Encode an RGBA8 tile buffer into PNG (using opaque RGB when `all_opaque`), WebP, JPEG, or raw RGBA.
+pub fn encode_rgba_tile(rgba: &[u8], size: u32, all_opaque: bool, format: OutputFormat) -> Bytes {
+    let n = size as usize;
+    match format {
+        OutputFormat::Png => {
+            if all_opaque {
+                let row_len = n * 3 + 1;
+                let mut filtered = vec![0u8; n * row_len];
+                let mut rgb_row = vec![0u8; n * 3];
+                for y in 0..n {
+                    let src = &rgba[y * n * 4..(y + 1) * n * 4];
+                    for x in 0..n {
+                        rgb_row[x * 3] = src[x * 4];
+                        rgb_row[x * 3 + 1] = src[x * 4 + 1];
+                        rgb_row[x * 3 + 2] = src[x * 4 + 2];
+                    }
+                    filter_sub_rgb_row(&rgb_row, &mut filtered[y * row_len..(y + 1) * row_len]);
+                }
+                encode_filtered_png(size, size, 2, &filtered)
+            } else {
+                let row_len = n * 4 + 1;
+                let mut filtered = vec![0u8; n * row_len];
+                for y in 0..n {
+                    let src = &rgba[y * n * 4..(y + 1) * n * 4];
+                    filter_sub_rgba_row(src, &mut filtered[y * row_len..(y + 1) * row_len]);
+                }
+                encode_filtered_png(size, size, 6, &filtered)
+            }
+        }
+        OutputFormat::Webp { quality } => encode_webp_rgba(size, size, rgba, quality),
+        OutputFormat::Jpeg { quality } => encode_jpeg_rgba(size, size, rgba, quality),
+        OutputFormat::RawRgba | OutputFormat::RawF32 => Bytes::copy_from_slice(rgba),
     }
 }
 
@@ -566,7 +614,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total])
                     });
                 }
-                OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => {
+                OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
                     let lut: &ColormapLut = style.colormap.lut();
                     return SCRATCH.with(|cell| {
                         let mut guard = cell.borrow_mut();
@@ -610,6 +658,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             OutputFormat::Webp { quality: wq } => {
                                 encode_webp_rgb(N as u32, N as u32, &sc.img_buf[..total], wq)
                             }
+                            OutputFormat::RawRgba => rgb_to_rgba_bytes(&sc.img_buf[..total]),
                             _ => unreachable!(),
                         }
                     });
@@ -689,7 +738,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                 }
             })
         }
-        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
             let lut: &ColormapLut = style.colormap.lut();
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
@@ -719,6 +768,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         OutputFormat::Webp { quality } => {
                             encode_webp_rgb(N as u32, N as u32, buf, quality)
                         }
+                        OutputFormat::RawRgba => rgb_to_rgba_bytes(buf),
                         _ => unreachable!(),
                     }
                 } else {
@@ -749,6 +799,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         OutputFormat::Webp { quality } => {
                             encode_webp_rgba(N as u32, N as u32, buf, quality)
                         }
+                        OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
                         _ => unreachable!(),
                     }
                 }
@@ -865,7 +916,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             }
         }),
-        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => SCRATCH.with(|cell| {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let sc = &mut *guard;
             if CLEAN {
@@ -893,6 +944,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                     OutputFormat::Webp { quality } => {
                         encode_webp_rgb(N as u32, N as u32, buf, quality)
                     }
+                    OutputFormat::RawRgba => rgb_to_rgba_bytes(buf),
                     _ => unreachable!(),
                 }
             } else {
@@ -928,6 +980,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                     OutputFormat::Webp { quality } => {
                         encode_webp_rgba(N as u32, N as u32, buf, quality)
                     }
+                    OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
                     _ => unreachable!(),
                 }
             }
@@ -1012,7 +1065,7 @@ fn render_rgb_cubic<const N: usize>(
             }
             encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
         }),
-        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => SCRATCH.with(|cell| {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let sc = &mut *guard;
             let total = N * N * 4;
@@ -1039,6 +1092,7 @@ fn render_rgb_cubic<const N: usize>(
             match style.format {
                 OutputFormat::Jpeg { quality: jq } => encode_jpeg_rgba(N as u32, N as u32, buf, jq),
                 OutputFormat::Webp { quality } => encode_webp_rgba(N as u32, N as u32, buf, quality),
+                OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
                 _ => unreachable!(),
             }
         }),
@@ -1101,7 +1155,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             })
         }
-        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
             let lut: &ColormapLut = style.colormap.lut();
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
@@ -1133,6 +1187,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                     OutputFormat::Webp { quality } => {
                         encode_webp_rgba(N as u32, N as u32, buf, quality)
                     }
+                    OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
                     _ => unreachable!(),
                 }
             })
@@ -1267,7 +1322,7 @@ pub fn render_sar_rgb<const N: usize>(
             }
             encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
         }),
-        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => SCRATCH.with(|cell| {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let sc = &mut *guard;
             let total = N * N * 4;

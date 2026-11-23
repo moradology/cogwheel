@@ -395,4 +395,66 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             .unwrap();
         assert_eq!(&stac_prev[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
     }
+
+    // ------------------------------------------------------------------------
+    // 16. Dynamic early-exit COG mosaic (/mosaic/tiles/...)
+    // ------------------------------------------------------------------------
+    let merc_path = fixture("mercator_4k_zstd_p3.tif");
+    if merc_path.exists() {
+        let merc_url = merc_path.canonicalize().unwrap().to_string_lossy().to_string();
+        // Proof 1: When the front scene covers 100% of the tile, background URLs are NEVER opened!
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let hits = Arc::new(AtomicU64::new(0));
+            let hits_srv = hits.clone();
+            let bg_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bg_addr = bg_listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((_stream, _)) = bg_listener.accept().await else {
+                        break;
+                    };
+                    hits_srv.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let bg_url = format!("http://{bg_addr}/never_touched.tif");
+            let mosaic_png = client
+                .get(format!(
+                    "{base}/mosaic/tiles/WebMercatorQuad/12/655/1583.png?url={merc_url}&url={bg_url}&rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mosaic_png.status(), 200);
+            let bytes = mosaic_png.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            assert_eq!(
+                hits.load(Ordering::Relaxed),
+                0,
+                "background scene should never be opened when front scene covers 100% of pixels"
+            );
+        }
+
+        // Proof 2: When the front scene has partial nodata holes (coastal_4k_nodata.tif),
+        // the mosaic fills those holes from the background scene!
+        let coastal_path = fixture("coastal_4k_nodata.tif");
+        if coastal_path.exists() {
+            let coastal_url = coastal_path.canonicalize().unwrap().to_string_lossy().to_string();
+            let resp = client
+                .get(format!(
+                    "{base}/mosaic/tiles/WebMercatorQuad/12/655/1583.png?url={coastal_url}&url={merc_url}&rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let bytes = resp.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            // PNG IHDR color_type is at byte offset 25: 2 = RGB (100% opaque, all holes filled!)
+            assert_eq!(
+                bytes[25], 2,
+                "expected opaque RGB PNG (color_type=2) after filling coastal nodata holes from background scene"
+            );
+        }
+    }
 }

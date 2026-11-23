@@ -621,6 +621,7 @@ pub async fn render_wgs84_bbox(
                 }
                 b.freeze()
             }
+            OutputFormat::RawRgba => Bytes::from(vec![0u8; w * h * 4]),
         });
     }
 
@@ -981,7 +982,7 @@ pub async fn render_wgs84_bbox(
             }
         }
         OutputFormat::Jpeg { quality } => Ok(encode_jpeg_rgba(w as u32, h as u32, &rgba, quality)),
-        OutputFormat::RawF32 => Ok(Bytes::from(rgba)),
+        OutputFormat::RawF32 | OutputFormat::RawRgba => Ok(Bytes::from(rgba)),
     }
 }
 

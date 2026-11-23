@@ -641,6 +641,52 @@ pub async fn handle_request(
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     // ------------------------------------------------------------------------
+    // Dynamic early-exit COG mosaic:
+    //   GET /mosaic/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{ext}]?url=a&url=b&...
+    //   GET /mosaic/tiles/{z}/{x}/{y}[@scale][.{ext}]?url=a&url=b&...
+    // ------------------------------------------------------------------------
+    if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(1) == Some(&"tiles") {
+        let coords = match segs.as_slice() {
+            ["mosaic", "tiles", _, zs, xs, ys] | ["mosaic", "tiles", zs, xs, ys] => (
+                zs.parse::<u8>().ok(),
+                xs.parse::<u32>().ok(),
+                parse_y_scale_ext(ys),
+            ),
+            _ => (None, None, None),
+        };
+        let res = match coords {
+            (Some(z), Some(x), Some((y, sc, ext))) => {
+                if pq.urls.is_empty() {
+                    Err(EngineError::BadRequest(
+                        "missing required ?url= parameter(s) for /mosaic/tiles".into(),
+                    ))
+                } else {
+                    match engine.store.open_uri(&pq.urls[0]).await {
+                        Ok(first_cog) => {
+                            let db = first_cog.index.full_res().samples_per_pixel;
+                            let is_u8 = first_cog.index.full_res().sample_type
+                                == cogzilla_tiff::SampleType::Uint8;
+                            match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)
+                            {
+                                Ok((treq, ct)) => engine
+                                    .render_mosaic_tile(&pq.urls, &treq)
+                                    .await
+                                    .map(|b| (b, ct)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(EngineError::Io(e)),
+                    }
+                }
+            }
+            _ => Err(EngineError::BadRequest(
+                "invalid /mosaic/tiles coordinate path".into(),
+            )),
+        };
+        return Ok(to_http_response(res));
+    }
+
+    // ------------------------------------------------------------------------
     // Pre-registered fast path: GET /tiles/{dataset_or_scene}/{z}/{x}/{y}[@scale][.{ext}]
     // ------------------------------------------------------------------------
     if method == Method::GET && segs.first() == Some(&"tiles") && segs.len() == 5 {
