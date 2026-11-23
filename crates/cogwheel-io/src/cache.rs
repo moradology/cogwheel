@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use cogwheel_codec::DecodedTile;
 use dashmap::DashMap;
@@ -23,6 +23,7 @@ pub struct SingleflightBlockCache {
     map: DashMap<BlockKey, CacheEntry, ahash::RandomState>,
     current_bytes: AtomicUsize,
     max_bytes: usize,
+    evicting: AtomicBool,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub coalesced_waiters: AtomicU64,
@@ -42,10 +43,24 @@ impl SingleflightBlockCache {
             map: DashMap::with_capacity_and_hasher(2048, ahash::RandomState::new()),
             current_bytes: AtomicUsize::new(0),
             max_bytes,
+            evicting: AtomicBool::new(false),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             coalesced_waiters: AtomicU64::new(0),
         }
+    }
+
+    /// Check current state of `key`: `Some(Ok(tile))` if ready, `Some(Err(current_notify))` if
+    /// in-flight (returning the live owner's `Notify`), or `None` if removed/aborted.
+    #[inline(always)]
+    pub fn peek_state(&self, key: &BlockKey) -> Option<Result<Arc<DecodedTile>, Arc<Notify>>> {
+        self.map.get(key).map(|entry| match entry.value() {
+            CacheEntry::Ready(tile) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Ok(tile.clone())
+            }
+            CacheEntry::InFlight(n) => Err(n.clone()),
+        })
     }
 
     #[inline(always)]
@@ -129,7 +144,22 @@ impl SingleflightBlockCache {
     }
 
     fn evict_some(&self) {
-        // Fast approximate eviction: drop ~25% of ready entries without global lock
+        // Non-blocking guard: at most 1 worker evicts while all other workers stay lock-free
+        if self
+            .evicting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        struct Reset<'a>(&'a AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _reset = Reset(&self.evicting);
+
         let target_drop = self.max_bytes / 4;
         let mut dropped = 0usize;
         let mut keys_to_remove = Vec::with_capacity(64);
@@ -145,7 +175,11 @@ impl SingleflightBlockCache {
         }
         for (k, sz) in keys_to_remove {
             if self.map.remove(&k).is_some() {
-                self.current_bytes.fetch_sub(sz, Ordering::Relaxed);
+                let _ = self
+                    .current_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(sz))
+                    });
             }
         }
     }

@@ -231,20 +231,13 @@ impl CogStore {
                 match self.cache.acquire(key) {
                     LookupResult::Hit(hit) => out.push(Some(hit)),
                     LookupResult::Owner => {
-                        match decode_tile(slice, ifd, cog.index.byte_order, cog.index.nodata) {
-                            Ok(decoded) => {
-                                let arc = Arc::new(decoded);
-                                self.cache.complete(key, arc.clone());
-                                out.push(Some(arc));
-                            }
-                            Err(e) => {
-                                self.cache.abort(&key);
-                                return Err(IoError::Codec(e));
-                            }
-                        }
+                        let guard = self.cache.guard(key);
+                        let decoded = decode_tile(slice, ifd, cog.index.byte_order, cog.index.nodata)?;
+                        let arc = Arc::new(decoded);
+                        guard.complete(arc.clone());
+                        out.push(Some(arc));
                     }
                     LookupResult::Wait(_) => {
-                        // Another thread is decoding this block; yield to async path to await Notify
                         return Ok(None);
                     }
                 }
@@ -379,17 +372,46 @@ impl CogStore {
             }
         }
 
-        // Resolve any singleflight waiters with race-free Notify::enable() before re-checking cache!
-        for (slot, key, notify) in waiters {
+        // Resolve any singleflight waiters; if an owner was cancelled/aborted mid-flight,
+        // seamlessly take over and fetch those orphaned slots instead of deadlocking!
+        let mut retry_slots: Vec<(usize, u32)> = Vec::new();
+        for (slot, key, mut notify) in waiters {
             loop {
-                let fut = notify.notified();
-                tokio::pin!(fut);
-                fut.as_mut().enable();
-                if let Some(hit) = self.cache.try_get_fast(&key) {
-                    results[slot] = Some(hit);
-                    break;
+                let switch_to = {
+                    let fut = notify.notified();
+                    tokio::pin!(fut);
+                    fut.as_mut().enable();
+                    match self.cache.peek_state(&key) {
+                        Some(Ok(hit)) => {
+                            results[slot] = Some(hit);
+                            break;
+                        }
+                        Some(Err(live_notify)) => {
+                            if !Arc::ptr_eq(&notify, &live_notify) {
+                                Some(live_notify)
+                            } else {
+                                fut.await;
+                                None
+                            }
+                        }
+                        None => {
+                            retry_slots.push((slot, key.tile_idx));
+                            break;
+                        }
+                    }
+                };
+                if let Some(new_notify) = switch_to {
+                    notify = new_notify;
                 }
-                fut.await;
+            }
+        }
+
+        if !retry_slots.is_empty() {
+            let retry_indices: Vec<Option<u32>> =
+                retry_slots.iter().map(|&(_, tidx)| Some(tidx)).collect();
+            let recovered = Box::pin(self.get_blocks(cog, ifd_idx, &retry_indices)).await?;
+            for ((slot, _), tile) in retry_slots.into_iter().zip(recovered.into_iter()) {
+                results[slot] = tile;
             }
         }
 
