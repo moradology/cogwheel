@@ -4,9 +4,55 @@
 
 # `cogzilla`
 
-An ultra-fast, zero-GDAL Cloud Optimized GeoTIFF (COG) & STAC tile server built in Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). Drop-in TiTiler API compatible across all 8 GDAL numeric dtypes (`uint8`–`float64`), JPEG/WebP/ZSTD/DEFLATE/LZW COGs, stripped GeoTIFFs, internal masks & RGBA alpha, and all 211 `rio-tiler` colormaps.
+[![CI](https://github.com/moradology/cogzilla/actions/workflows/ci.yml/badge.svg)](https://github.com/moradology/cogzilla/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/moradology/cogzilla)](https://github.com/moradology/cogzilla/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Highlights
+**A COG & STAC tile server that speaks TiTiler's API, without GDAL.** Written in Rust, it serves the same `/cog/*` and `/stac/*` routes at a fraction of the latency: point your map client at a new base URL and keep everything else.
+
+| Workload (Apple M5, warm) | `cogzilla` | TiTiler | Speedup |
+| :--- | ---: | ---: | ---: |
+| HTTP throughput, Mercator PNG, 32 concurrent | **6,863 tiles/s** | 181 tiles/s | **37.8×** |
+| HTTP throughput, satellite RGB PNG, 32 concurrent | **3,791 tiles/s** | 171 tiles/s | **22.2×** |
+| Single Mercator PNG tile | **634 µs** | 17.6 ms | **27.7×** |
+| Fused NDVI PNG tile | **917 µs** | 14.2 ms | **15.5×** |
+| Remote cold open + tile, 20 ms RTT | **48.3 ms** | 147.0 ms | **3.0×** |
+
+The last row is the honest floor: once the network dominates, the gain is fewer round trips, not faster pixels. [Full results](#cogmark-benchmarks-vs-gdal--rio-tiler--titiler) and [how to reproduce them](#reproducing-cogmark) are below.
+
+## Install
+
+```bash
+# Docker (linux/amd64 + linux/arm64)
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.0
+```
+
+```bash
+# Prebuilt binary: Linux and macOS, x86_64 and arm64
+curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.0/cogzilla-server-v0.1.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+```
+
+Then request a tile from any COG reachable over HTTP or S3:
+
+```text
+GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=https://example.com/your.tif
+```
+
+Other targets (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`) and `SHA256SUMS` are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source, see [Quickstart](#quickstart).
+
+### Coming from TiTiler
+
+Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. That is evidence for the routes and parameters [listed below](#drop-in-titiler-api-surface-cog-stac-colormaps-tilematrixsets), not a promise of parity with every TiTiler feature, extension, or deployment: there is no `/mosaicjson`, no pgSTAC, and no custom algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
+
+## Why no GDAL?
+
+GDAL reads hundreds of formats in thousands of projections, and it is very good at that. A tile server for COGs needs a small corner of it: one container format, a handful of codecs, and the projections satellite imagery actually ships in. `cogzilla` implements only that corner, which lets each stage be specialized: a TIFF parser that opens a file in about a microsecond, closed-form projection math, and decode, resample, band math, and encode fused into a single SIMD pass.
+
+The cost is scope. If your data is not a GeoTIFF, or is in a projection outside the supported list, use TiTiler.
+
+## Architecture
+
+Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). Supports all 8 GDAL numeric dtypes (`uint8`–`float64`), JPEG/WebP/ZSTD/DEFLATE/LZW COGs, stripped GeoTIFFs, internal masks & RGBA alpha, and all 211 `rio-tiler` colormaps.
 
 - **Zero GDAL / Zero `libproj`**: Custom Classic/BigTIFF + GeoKey parser (`0.92–1.3 µs` local `mmap` open — **~300–440×** faster than `GDALOpenEx`) and closed-form `f64` projections (`EPSG:3857`, `EPSG:4326`, all 120 WGS84/NAD83 UTM zones, CONUS/CA Albers, Lambert Conformal Conic, Polar Stereographic `3413`/`3031`) with automatic `Exact2D` low-zoom (`z <= 8`) and `17×17` `Grid2D` (`z >= 9`) multi-zoom tiling (`z=0..22`).
 - **SIMD Codecs & Predictors**: Thread-local `libdeflate`, `ZSTD_DCtx`, custom 64-bit MSB-first TIFF LZW, and ARM64 NEON / x86_64 AVX2 Predictor 1/2/3 unshufflers (**0-ULP bit-exact** against GDAL):
