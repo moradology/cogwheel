@@ -8,8 +8,33 @@ use crate::colormap::{ColormapLut, ColormapName};
 use crate::expr_vm::ExprProgram;
 use crate::jpeg_fast::{empty_black_jpeg, encode_jpeg_rgb, encode_jpeg_rgba};
 use crate::png_fast::{
-    empty_transparent_png, encode_filtered_png, filter_sub_rgb_row, filter_sub_rgba_row,
+    empty_transparent_png, encode_filtered_png, encode_indexed_png, filter_sub_rgb_row,
+    filter_sub_rgba_row, filter_sub_u8_row,
 };
+
+#[inline]
+fn build_plte_opaque(lut: &ColormapLut) -> [u8; 768] {
+    let mut plte = [0u8; 768];
+    for i in 0..256 {
+        plte[i * 3] = lut.rgb[i][0];
+        plte[i * 3 + 1] = lut.rgb[i][1];
+        plte[i * 3 + 2] = lut.rgb[i][2];
+    }
+    plte
+}
+
+#[inline]
+fn build_plte_nodata(lut: &ColormapLut) -> [u8; 768] {
+    let mut plte = [0u8; 768];
+    // Index 0 = transparent nodata (paired with tRNS = [0]); indices 1..=255 span lut[0..=255].
+    for i in 1..256 {
+        let src_idx = ((i - 1) * 255 + 127) / 254;
+        plte[i * 3] = lut.rgb[src_idx][0];
+        plte[i * 3 + 1] = lut.rgb[src_idx][1];
+        plte[i * 3 + 2] = lut.rgb[src_idx][2];
+    }
+    plte
+}
 use crate::source::BandSource;
 use crate::webp_fast::{empty_transparent_webp, encode_webp_rgb, encode_webp_rgba};
 
@@ -572,16 +597,17 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                 }
                 OutputFormat::Png => {
                     let lut: &ColormapLut = style.colormap.lut();
+                    let plte = build_plte_opaque(lut);
                     return SCRATCH.with(|cell| {
                         let mut guard = cell.borrow_mut();
                         let sc = &mut *guard;
-                        let stride = 1 + N * 3;
+                        let stride = 1 + N;
                         let total = N * stride;
                         if sc.img_buf.len() < total {
                             sc.img_buf.resize(total, 0);
                         }
-                        if sc.row_buf.len() < N * 3 {
-                            sc.row_buf.resize(N * 3, 0);
+                        if sc.row_buf.len() < N {
+                            sc.row_buf.resize(N, 0);
                         }
                         if sc.f32_row.len() < N {
                             sc.f32_row.resize(N, 0.0);
@@ -601,21 +627,16 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                                 fy,
                                 &mut sc.f32_row[..N],
                             );
-                            let row_rgb = &mut sc.row_buf[..N * 3];
+                            let row_idx = &mut sc.row_buf[..N];
                             for px in 0..N {
-                                let idx = rescale_u8(sc.f32_row[px], inv_range, min_val) as usize;
-                                let rgb = unsafe { *lut.rgb.get_unchecked(idx) };
-                                let off = px * 3;
-                                row_rgb[off] = rgb[0];
-                                row_rgb[off + 1] = rgb[1];
-                                row_rgb[off + 2] = rgb[2];
+                                row_idx[px] = rescale_u8(sc.f32_row[px], inv_range, min_val);
                             }
-                            filter_sub_rgb_row(
-                                row_rgb,
+                            filter_sub_u8_row(
+                                row_idx,
                                 &mut sc.img_buf[py * stride..(py + 1) * stride],
                             );
                         }
-                        encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total])
+                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
                     });
                 }
                 OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
@@ -687,58 +708,48 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
                 let sc = &mut *guard;
+                let stride = 1 + N;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N {
+                    sc.row_buf.resize(N, 0);
+                }
                 if CLEAN {
-                    let stride = 1 + N * 3;
-                    let total = N * stride;
-                    if sc.img_buf.len() < total {
-                        sc.img_buf.resize(total, 0);
-                    }
-                    if sc.row_buf.len() < N * 3 {
-                        sc.row_buf.resize(N * 3, 0);
-                    }
+                    let plte = build_plte_opaque(lut);
                     for py in 0..N {
-                        let row_rgb = &mut sc.row_buf[..N * 3];
+                        let row_idx = &mut sc.row_buf[..N];
                         for_each_pixel_in_row(plan, py, |px, u, v| {
                             let val = sample_val::<BILINEAR, true>(src, u, v);
-                            let idx = rescale_u8(val, inv_range, min_val) as usize;
-                            let rgb = unsafe { *lut.rgb.get_unchecked(idx) };
-                            let off = px * 3;
-                            row_rgb[off] = rgb[0];
-                            row_rgb[off + 1] = rgb[1];
-                            row_rgb[off + 2] = rgb[2];
+                            row_idx[px] = rescale_u8(val, inv_range, min_val);
                         });
-                        filter_sub_rgb_row(row_rgb, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                        filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                     }
-                    encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total])
+                    encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
                 } else {
-                    let stride = 1 + N * 4;
-                    let total = N * stride;
-                    if sc.img_buf.len() < total {
-                        sc.img_buf.resize(total, 0);
-                    }
-                    if sc.row_buf.len() < N * 4 {
-                        sc.row_buf.resize(N * 4, 0);
-                    }
+                    let plte = build_plte_nodata(lut);
+                    let inv_range_254 = 254.0 / range;
                     for py in 0..N {
-                        let row_rgba = &mut sc.row_buf[..N * 4];
-                        let row_u32 = unsafe {
-                            std::slice::from_raw_parts_mut(row_rgba.as_mut_ptr() as *mut u32, N)
-                        };
+                        let row_idx = &mut sc.row_buf[..N];
                         for_each_pixel_in_row(plan, py, |px, u, v| {
                             let val = sample_val::<BILINEAR, false>(src, u, v);
                             if val.is_nan() {
-                                row_u32[px] = 0;
+                                row_idx[px] = 0;
                             } else {
-                                let idx = rescale_u8(val, inv_range, min_val) as usize;
-                                row_u32[px] = unsafe { *lut.rgba_u32.get_unchecked(idx) };
+                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
+                                row_idx[px] = 1 + (t as u8);
                             }
                         });
-                        filter_sub_rgba_row(
-                            row_rgba,
-                            &mut sc.img_buf[py * stride..(py + 1) * stride],
-                        );
+                        filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                     }
-                    encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
+                    encode_indexed_png(
+                        N as u32,
+                        N as u32,
+                        &plte,
+                        Some(&[0u8]),
+                        &sc.img_buf[..total],
+                    )
                 }
             })
         }
@@ -1129,34 +1140,39 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
         }
         OutputFormat::Png => {
             let lut: &ColormapLut = style.colormap.lut();
+            let plte = build_plte_nodata(lut);
+            let inv_range_254 = 254.0 / range;
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
                 let sc = &mut *guard;
-                let stride = 1 + N * 4;
+                let stride = 1 + N;
                 let total = N * stride;
                 if sc.img_buf.len() < total {
                     sc.img_buf.resize(total, 0);
                 }
-                if sc.row_buf.len() < N * 4 {
-                    sc.row_buf.resize(N * 4, 0);
+                if sc.row_buf.len() < N {
+                    sc.row_buf.resize(N, 0);
                 }
                 for py in 0..N {
-                    let row_rgba = &mut sc.row_buf[..N * 4];
-                    let row_u32 = unsafe {
-                        std::slice::from_raw_parts_mut(row_rgba.as_mut_ptr() as *mut u32, N)
-                    };
+                    let row_idx = &mut sc.row_buf[..N];
                     for_each_pixel_in_row(plan, py, |px, u, v| {
                         let val = eval_uv(u, v);
-                        row_u32[px] = if val.is_nan() {
+                        row_idx[px] = if val.is_nan() {
                             0
                         } else {
-                            let idx = rescale_u8(val, inv_range, min_val) as usize;
-                            unsafe { *lut.rgba_u32.get_unchecked(idx) }
+                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
+                            1 + (t as u8)
                         };
                     });
-                    filter_sub_rgba_row(row_rgba, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
-                encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
+                encode_indexed_png(
+                    N as u32,
+                    N as u32,
+                    &plte,
+                    Some(&[0u8]),
+                    &sc.img_buf[..total],
+                )
             })
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {

@@ -178,6 +178,77 @@ pub fn filter_sub_rgb_row(src_rgb: &[u8], dst_filtered: &mut [u8]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_sub_u8_avx2(src: &[u8], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let len = src.len();
+    let mut i = 0usize;
+    let mut prev = _mm_setzero_si128();
+    while i + 16 <= len {
+        let cur = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+        let left = _mm_alignr_epi8::<15>(cur, prev);
+        let diff = _mm_sub_epi8(cur, left);
+        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, diff);
+        prev = cur;
+        i += 16;
+    }
+    while i < len {
+        let left = if i >= 1 { src[i - 1] } else { 0 };
+        out[i] = src[i].wrapping_sub(left);
+        i += 1;
+    }
+}
+
+/// Apply PNG Sub filter (type = 1) to an 8-bit indexed/grayscale scanline (`bpp = 1`) using NEON or AVX2.
+#[inline(always)]
+pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
+    dst_filtered[0] = 1;
+    let out = &mut dst_filtered[1..1 + src.len()];
+    let len = src.len();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let mut i = 0usize;
+        let mut prev = unsafe { vdupq_n_u8(0) };
+        while i + 16 <= len {
+            unsafe {
+                let cur = vld1q_u8(src.as_ptr().add(i));
+                let left = vextq_u8::<15>(prev, cur);
+                let diff = vsubq_u8(cur, left);
+                vst1q_u8(out.as_mut_ptr().add(i), diff);
+                prev = cur;
+            }
+            i += 16;
+        }
+        while i < len {
+            let left = if i >= 1 { src[i - 1] } else { 0 };
+            out[i] = src[i].wrapping_sub(left);
+            i += 1;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { filter_sub_u8_avx2(src, out) };
+            return;
+        }
+    }
+
+    #[allow(unreachable_code)]
+    {
+        if len > 0 {
+            out[0] = src[0];
+        }
+        for i in 1..len {
+            out[i] = src[i].wrapping_sub(src[i - 1]);
+        }
+    }
+}
+
 /// Compress already-filtered PNG scanlines in a single whole-buffer `libdeflate` call
 /// and frame into a complete valid PNG `Bytes` buffer.
 /// `color_type`: `2` = RGB8, `6` = RGBA8.
@@ -206,6 +277,51 @@ pub fn encode_filtered_png(width: u32, height: u32, color_type: u8, filtered: &[
         ihdr[11] = 0;
         ihdr[12] = 0;
         write_chunk(&mut out, *b"IHDR", &ihdr);
+        write_chunk(&mut out, *b"IDAT", &enc.zlib_buf[..written]);
+        out.put_slice(&PNG_IEND);
+        out.freeze()
+    })
+}
+
+/// Compress already-filtered 8-bit indexed (`color_type = 3`) PNG scanlines with a `PLTE`
+/// palette chunk and optional `tRNS` transparency chunk (3–4× smaller raw buffer & faster deflate
+/// than 24/32-bit RGB/RGBA for colormapped single-band tiles!).
+pub fn encode_indexed_png(
+    width: u32,
+    height: u32,
+    plte: &[u8],
+    trns: Option<&[u8]>,
+    filtered: &[u8],
+) -> Bytes {
+    PNG_ENC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let enc = &mut *guard;
+        let bound = enc.compressor.zlib_compress_bound(filtered.len());
+        if enc.zlib_buf.len() < bound {
+            enc.zlib_buf.resize(bound, 0);
+        }
+        let written = enc
+            .compressor
+            .zlib_compress(filtered, &mut enc.zlib_buf[..bound])
+            .expect("libdeflate zlib compress");
+
+        let extra = 12 + plte.len() + trns.map(|t| 12 + t.len()).unwrap_or(0);
+        let mut out = BytesMut::with_capacity(8 + 25 + extra + 12 + written + 12);
+        out.put_slice(&PNG_SIG);
+
+        let mut ihdr = [0u8; 13];
+        ihdr[0..4].copy_from_slice(&width.to_be_bytes());
+        ihdr[4..8].copy_from_slice(&height.to_be_bytes());
+        ihdr[8] = 8; // 8-bit palette index
+        ihdr[9] = 3; // color_type = 3 (Indexed-color)
+        ihdr[10] = 0;
+        ihdr[11] = 0;
+        ihdr[12] = 0;
+        write_chunk(&mut out, *b"IHDR", &ihdr);
+        write_chunk(&mut out, *b"PLTE", plte);
+        if let Some(t) = trns {
+            write_chunk(&mut out, *b"tRNS", t);
+        }
         write_chunk(&mut out, *b"IDAT", &enc.zlib_buf[..written]);
         out.put_slice(&PNG_IEND);
         out.freeze()
