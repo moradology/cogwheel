@@ -31,7 +31,7 @@ Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from one file. 
 One command, no data to download and no account:
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.2
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.3
 ```
 
 Then open <http://localhost:8080>.
@@ -65,7 +65,7 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the [releases pa
 
 Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes pass 39 of 39 differential checks against a live TiTiler 2.4; the mosaic routes and terrain algorithms are newer and not yet in that set. Outputs are the same picture but not the same bytes.
 
-`cogzilla` is not a general replacement. It has no pgSTAC and no custom Python algorithms or readers, and it only reads GeoTIFFs in the projections listed above. For anything else, use TiTiler. The known differences are listed in [docs/api.md](docs/api.md#differences-from-titiler).
+`cogzilla` is not a general replacement. It has no pgSTAC and no custom Python algorithms or readers, and it only reads GeoTIFFs in the projections listed above. For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` rather than being ignored; the full list is in [docs/api.md](docs/api.md#differences-from-titiler).
 
 **Running it on the public internet?** Set `COGZILLA_ALLOWED_URL_PREFIXES`. By default the server opens any `url=` it is given, including local paths.
 
