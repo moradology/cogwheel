@@ -49,12 +49,12 @@ Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches
 
 ```bash
 # Docker (linux/amd64 + linux/arm64)
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.2
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.3
 ```
 
 ```bash
 # Prebuilt binary: Linux and macOS, x86_64 and arm64
-curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.2/cogzilla-server-v0.1.2-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.3/cogzilla-server-v0.1.3-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
 Then open a live map of a public Sentinel-2 scene (northeast Colorado, no credentials needed):
