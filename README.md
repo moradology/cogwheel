@@ -24,12 +24,12 @@ The last row is the honest floor: once the network dominates, the gain is fewer 
 
 ```bash
 # Docker (linux/amd64 + linux/arm64)
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.0
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.1
 ```
 
 ```bash
 # Prebuilt binary: Linux and macOS, x86_64 and arm64
-curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.0/cogzilla-server-v0.1.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.1/cogzilla-server-v0.1.1-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
 Then request a tile from any COG reachable over HTTP or S3:
