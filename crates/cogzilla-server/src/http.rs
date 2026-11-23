@@ -597,6 +597,18 @@ pub async fn handle_request(
     }
 
     if method == Method::GET && path == "/stats" {
+        let disk = engine.store.disk_cache.as_ref().map(|dc| {
+            let s = dc.stats();
+            serde_json::json!({
+                "hits": s.hits,
+                "misses": s.misses,
+                "bytes_used": s.bytes_used,
+                "max_bytes": s.max_bytes,
+                "evictions": s.evictions,
+                "write_errors": s.write_errors,
+                "read_errors": s.read_errors,
+            })
+        });
         let body = serde_json::json!({
             "tiles_served": engine.stats.tiles_served.load(Ordering::Relaxed),
             "empty_short_circuits": engine.stats.empty_short_circuits.load(Ordering::Relaxed),
@@ -604,8 +616,12 @@ pub async fn handle_request(
             "cache_misses": engine.store.cache.misses.load(Ordering::Relaxed),
             "singleflight_coalesced": engine.store.cache.coalesced_waiters.load(Ordering::Relaxed),
             "cache_bytes": engine.store.cache.current_bytes(),
+            "upstream_limit": engine.store.upstream_limiter.current_limit(),
+            "upstream_in_flight": engine.store.upstream_limiter.in_flight(),
+            "upstream_throttles": engine.store.upstream_limiter.throttle_events(),
             "remote_range_requests": engine.store.metrics.remote_range_requests.load(Ordering::Relaxed),
             "remote_bytes_fetched": engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed),
+            "disk_cache": disk,
         })
         .to_string();
         return Ok(plain_resp(StatusCode::OK, Bytes::from(body), "application/json"));

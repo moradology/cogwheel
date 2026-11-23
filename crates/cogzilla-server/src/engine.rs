@@ -93,8 +93,12 @@ pub struct TileEngine {
 
 impl TileEngine {
     pub fn new(cache_max_bytes: usize) -> Self {
+        Self::with_store(Arc::new(CogStore::new(cache_max_bytes)))
+    }
+
+    pub fn with_store(store: Arc<CogStore>) -> Self {
         Self {
-            store: Arc::new(CogStore::new(cache_max_bytes)),
+            store,
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
             scenes: DashMap::with_hasher(ahash::RandomState::new()),
             stac_cache: DashMap::with_hasher(ahash::RandomState::new()),

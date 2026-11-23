@@ -1,19 +1,29 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use cogzilla_io::{CogStore, DiskBlockCache};
 use cogzilla_server::{TileEngine, serve};
 
 #[derive(Parser, Debug)]
-#[command(name = "cogzilla-server", about = "Ultra-fast float32 COG tile server")]
+#[command(name = "cogzilla-server", about = "Ultra-fast COG & STAC tile server")]
 struct Args {
     /// Address to bind HTTP server
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
 
-    /// Decoded block cache size in MiB
+    /// Decoded block cache size in MiB (tier 1, RAM)
     #[arg(long, default_value_t = 512)]
     cache_mb: usize,
+
+    /// Optional directory for persistent compressed-block cache (tier 2, local disk/NVMe)
+    #[arg(long)]
+    disk_cache_dir: Option<PathBuf>,
+
+    /// Maximum disk cache size in MiB (0 disables tier 2 even if --disk-cache-dir is set)
+    #[arg(long, default_value_t = 0)]
+    disk_cache_mb: u64,
 
     /// Pre-registered local COG datasets as `name=/path/to/file.tif` (repeatable)
     #[arg(long = "dataset")]
@@ -34,7 +44,31 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let engine = Arc::new(TileEngine::new(args.cache_mb * 1024 * 1024));
+    let mut store = CogStore::new(args.cache_mb * 1024 * 1024);
+    if args.disk_cache_mb > 0 {
+        let dir = args
+            .disk_cache_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("cogzilla-disk-cache"));
+        match DiskBlockCache::open(&dir, args.disk_cache_mb * 1024 * 1024) {
+            Ok(dc) => {
+                tracing::info!(
+                    dir = %dir.display(),
+                    disk_cache_mb = args.disk_cache_mb,
+                    "enabled tier-2 compressed-block disk cache"
+                );
+                store = store.with_disk_cache(dc);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "failed to open disk cache directory; continuing with tier 2 disabled"
+                );
+            }
+        }
+    }
+    let engine = Arc::new(TileEngine::with_store(Arc::new(store)));
 
     for spec in &args.datasets {
         let Some((name, path)) = spec.split_once('=') else {

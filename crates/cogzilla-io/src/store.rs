@@ -38,6 +38,7 @@ fn clone_for_decode(ifd: &IfdMeta) -> IfdMeta {
 
 use crate::backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges};
 use crate::cache::{BlockKey, InFlightGuard, LookupResult, SingleflightBlockCache};
+use crate::disk_cache::DiskBlockCache;
 use crate::limiter::AimdLimiter;
 use crate::s3::S3Config;
 
@@ -70,6 +71,7 @@ pub struct CogStore {
     uri_clock: AtomicU64,
     evicting_uris: AtomicBool,
     pub cache: Arc<SingleflightBlockCache>,
+    pub disk_cache: Option<Arc<DiskBlockCache>>,
     pub upstream_limiter: Arc<AimdLimiter>,
     pub client: reqwest::Client,
     pub s3_cfg: Option<S3Config>,
@@ -115,11 +117,18 @@ impl CogStore {
             uri_clock: AtomicU64::new(0),
             evicting_uris: AtomicBool::new(false),
             cache: Arc::new(SingleflightBlockCache::new(cache_max_bytes)),
+            disk_cache: None,
             upstream_limiter,
             client,
             s3_cfg: S3Config::from_env(),
             metrics: Arc::new(IoMetrics::default()),
         }
+    }
+
+    /// Attach a persistent tier-2 compressed-block disk cache for remote S3/HTTP sources.
+    pub fn with_disk_cache(mut self, disk_cache: Arc<DiskBlockCache>) -> Self {
+        self.disk_cache = Some(disk_cache);
+        self
     }
 
     #[inline(always)]
@@ -566,157 +575,245 @@ impl CogStore {
                     return Err(e);
                 }
             } else {
-                let reqs: Vec<TileByteReq> = owned
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(_, _, offset, len))| TileByteReq {
-                        slot: i,
-                        offset,
-                        len,
-                    })
-                    .collect();
-                let spans = coalesce_ranges(reqs, RANGE_GAP_THRESHOLD, MAX_COALESCED_SPAN);
-
-                let mut span_futs = Vec::with_capacity(spans.len());
-                for span in spans {
-                    let src = cog.source.clone();
-                    span_futs.push(async move {
-                        let data = src.fetch_range(span.start, span.end).await?;
-                        Ok::<_, IoError>((span, data))
-                    });
-                }
-
-                let mut join_set = tokio::task::JoinSet::new();
-                for fut in span_futs {
-                    join_set.spawn(fut);
-                }
-
-                // Parallel decode set for multi-block remote spans (overlaps decode with remaining downloads!)
-                let mut decode_set: tokio::task::JoinSet<Result<(usize, Arc<DecodedTile>), IoError>> =
-                    tokio::task::JoinSet::new();
-                let mut decode_meta_opt: Option<Arc<IfdMeta>> = None;
-                let byte_order = cog.index.byte_order;
-                let nodata = cog.index.nodata;
-
-                let mut fetch_err: Option<IoError> = None;
-                while let Some(res) = join_set.join_next().await {
-                    match res {
-                        Ok(Ok((span, data))) => {
-                            let can_parallel =
-                                span.items.len() >= 2 && ifd.mask_ifd.is_none();
-                            if can_parallel {
-                                let meta = decode_meta_opt
-                                    .get_or_insert_with(|| Arc::new(clone_for_decode(ifd)))
-                                    .clone();
-                                for item in span.items {
-                                    let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
-                                    let orig_slot = *orig_slot;
-                                    let rel_start = (item.offset - span.start) as usize;
-                                    let rel_end = rel_start + item.len as usize;
-                                    if rel_end > data.len() {
-                                        fetch_err = Some(IoError::Tiff(TiffError::NeedMoreBytes {
-                                            required: item.offset + item.len as u64,
-                                            available: span.start + data.len() as u64,
-                                        }));
-                                        continue;
-                                    }
-                                    let slice = data.slice(rel_start..rel_end);
-                                    let guard = guard_opt.take();
-                                    let m = meta.clone();
-                                    decode_set.spawn(async move {
-                                        let decoded = decode_tile(&slice, &m, byte_order, nodata)?;
-                                        let arc = Arc::new(decoded);
-                                        if let Some(g) = guard {
-                                            g.complete(arc.clone());
+                // Tier-2 compressed-block disk cache lookup for remote sources (RAM miss -> disk hit)
+                if !is_local && ifd.mask_ifd.is_none() {
+                    if let Some(dc) = &self.disk_cache {
+                        let meta = Arc::new(clone_for_decode(ifd));
+                        let byte_order = cog.index.byte_order;
+                        let nodata = cog.index.nodata;
+                        let mut disk_set = tokio::task::JoinSet::new();
+                        let prev_owned = std::mem::take(&mut owned);
+                        for item in prev_owned {
+                            let (orig_slot, guard_opt, offset, count) = item;
+                            let tidx = tile_indices[orig_slot].unwrap();
+                            let dc_c = dc.clone();
+                            let uri = cog.uri.clone();
+                            let m = meta.clone();
+                            disk_set.spawn(async move {
+                                if let Some(compressed) =
+                                    dc_c.get(uri, ifd_idx as u16, tidx).await
+                                {
+                                    match decode_tile(&compressed, &m, byte_order, nodata) {
+                                        Ok(decoded) => {
+                                            let arc = Arc::new(decoded);
+                                            if let Some(guard) = guard_opt {
+                                                guard.complete(arc.clone());
+                                            }
+                                            return Ok::<_, (usize, Option<InFlightGuard>, u64, u32)>(
+                                                (orig_slot, arc),
+                                            );
                                         }
-                                        Ok((orig_slot, arc))
-                                    });
-                                }
-                            } else {
-                                for item in span.items {
-                                    let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
-                                    let rel_start = (item.offset - span.start) as usize;
-                                    let rel_end = rel_start + item.len as usize;
-                                    if rel_end > data.len() {
-                                        fetch_err = Some(IoError::Tiff(TiffError::NeedMoreBytes {
-                                            required: item.offset + item.len as u64,
-                                            available: span.start + data.len() as u64,
-                                        }));
-                                        continue;
+                                        Err(_) => {
+                                            // Corrupt/unreadable disk entry: fail-open and refetch!
+                                            return Err((orig_slot, guard_opt, offset, count));
+                                        }
                                     }
-                                    match decode_tile(
-                                        &data[rel_start..rel_end],
-                                        ifd,
-                                        byte_order,
-                                        nodata,
-                                    ) {
-                                        Ok(mut decoded) => {
-                                            if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                                                if mask_ifd.tile_width == ifd.tile_width
-                                                    && mask_ifd.tile_height == ifd.tile_height
+                                }
+                                Err((orig_slot, guard_opt, offset, count))
+                            });
+                        }
+                        while let Some(res) = disk_set.join_next().await {
+                            match res {
+                                Ok(Ok((orig_slot, arc))) => {
+                                    results[orig_slot] = Some(arc);
+                                }
+                                Ok(Err(miss)) => {
+                                    owned.push(miss);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+
+                if !owned.is_empty() {
+                    let reqs: Vec<TileByteReq> = owned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(_, _, offset, len))| TileByteReq {
+                            slot: i,
+                            offset,
+                            len,
+                        })
+                        .collect();
+                    let spans = coalesce_ranges(reqs, RANGE_GAP_THRESHOLD, MAX_COALESCED_SPAN);
+
+                    let mut span_futs = Vec::with_capacity(spans.len());
+                    for span in spans {
+                        let src = cog.source.clone();
+                        span_futs.push(async move {
+                            let data = src.fetch_range(span.start, span.end).await?;
+                            Ok::<_, IoError>((span, data))
+                        });
+                    }
+
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for fut in span_futs {
+                        join_set.spawn(fut);
+                    }
+
+                    // Parallel decode set for multi-block remote spans (overlaps decode with remaining downloads!)
+                    let mut decode_set: tokio::task::JoinSet<
+                        Result<(usize, Arc<DecodedTile>), IoError>,
+                    > = tokio::task::JoinSet::new();
+                    let mut decode_meta_opt: Option<Arc<IfdMeta>> = None;
+                    let byte_order = cog.index.byte_order;
+                    let nodata = cog.index.nodata;
+
+                    let mut fetch_err: Option<IoError> = None;
+                    while let Some(res) = join_set.join_next().await {
+                        match res {
+                            Ok(Ok((span, data))) => {
+                                let can_parallel =
+                                    span.items.len() >= 2 && ifd.mask_ifd.is_none();
+                                if can_parallel {
+                                    let meta = decode_meta_opt
+                                        .get_or_insert_with(|| Arc::new(clone_for_decode(ifd)))
+                                        .clone();
+                                    for item in span.items {
+                                        let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
+                                        let orig_slot = *orig_slot;
+                                        let rel_start = (item.offset - span.start) as usize;
+                                        let rel_end = rel_start + item.len as usize;
+                                        if rel_end > data.len() {
+                                            fetch_err =
+                                                Some(IoError::Tiff(TiffError::NeedMoreBytes {
+                                                    required: item.offset + item.len as u64,
+                                                    available: span.start + data.len() as u64,
+                                                }));
+                                            continue;
+                                        }
+                                        let slice = data.slice(rel_start..rel_end);
+                                        if !is_local {
+                                            if let Some(dc) = &self.disk_cache {
+                                                if let Some(Some(tidx)) =
+                                                    tile_indices.get(orig_slot)
                                                 {
-                                                    if let Some(Some(tidx)) =
-                                                        tile_indices.get(*orig_slot)
+                                                    dc.put_async(
+                                                        &cog.uri,
+                                                        ifd_idx as u16,
+                                                        *tidx,
+                                                        slice.clone(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        let guard = guard_opt.take();
+                                        let m = meta.clone();
+                                        decode_set.spawn(async move {
+                                            let decoded =
+                                                decode_tile(&slice, &m, byte_order, nodata)?;
+                                            let arc = Arc::new(decoded);
+                                            if let Some(g) = guard {
+                                                g.complete(arc.clone());
+                                            }
+                                            Ok((orig_slot, arc))
+                                        });
+                                    }
+                                } else {
+                                    for item in span.items {
+                                        let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
+                                        let rel_start = (item.offset - span.start) as usize;
+                                        let rel_end = rel_start + item.len as usize;
+                                        if rel_end > data.len() {
+                                            fetch_err =
+                                                Some(IoError::Tiff(TiffError::NeedMoreBytes {
+                                                    required: item.offset + item.len as u64,
+                                                    available: span.start + data.len() as u64,
+                                                }));
+                                            continue;
+                                        }
+                                        if !is_local && ifd.mask_ifd.is_none() {
+                                            if let Some(dc) = &self.disk_cache {
+                                                if let Some(Some(tidx)) =
+                                                    tile_indices.get(*orig_slot)
+                                                {
+                                                    dc.put_async(
+                                                        &cog.uri,
+                                                        ifd_idx as u16,
+                                                        *tidx,
+                                                        data.slice(rel_start..rel_end),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        match decode_tile(
+                                            &data[rel_start..rel_end],
+                                            ifd,
+                                            byte_order,
+                                            nodata,
+                                        ) {
+                                            Ok(mut decoded) => {
+                                                if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                                                    if mask_ifd.tile_width == ifd.tile_width
+                                                        && mask_ifd.tile_height == ifd.tile_height
                                                     {
-                                                        let per_plane = (ifd.tiles_across as usize)
-                                                            * (ifd.tiles_down as usize);
-                                                        let mask_idx =
-                                                            (*tidx as usize) % per_plane.max(1);
-                                                        if let Some((moff, mlen)) =
-                                                            mask_ifd.tile_byte_range(mask_idx)
+                                                        if let Some(Some(tidx)) =
+                                                            tile_indices.get(*orig_slot)
                                                         {
-                                                            if let Ok(mbytes) = cog
-                                                                .source
-                                                                .fetch_range(
-                                                                    moff,
-                                                                    moff + mlen as u64,
-                                                                )
-                                                                .await
+                                                            let per_plane =
+                                                                (ifd.tiles_across as usize)
+                                                                    * (ifd.tiles_down as usize);
+                                                            let mask_idx =
+                                                                (*tidx as usize) % per_plane.max(1);
+                                                            if let Some((moff, mlen)) =
+                                                                mask_ifd.tile_byte_range(mask_idx)
                                                             {
-                                                                if let Ok(mask) = decode_mask_tile(
-                                                                    &mbytes, mask_ifd,
-                                                                ) {
-                                                                    apply_mask_to_tile(
-                                                                        &mut decoded,
-                                                                        &mask,
-                                                                    );
+                                                                if let Ok(mbytes) = cog
+                                                                    .source
+                                                                    .fetch_range(
+                                                                        moff,
+                                                                        moff + mlen as u64,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    if let Ok(mask) =
+                                                                        decode_mask_tile(
+                                                                            &mbytes, mask_ifd,
+                                                                        )
+                                                                    {
+                                                                        apply_mask_to_tile(
+                                                                            &mut decoded,
+                                                                            &mask,
+                                                                        );
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
+                                                let arc = Arc::new(decoded);
+                                                if let Some(guard) = guard_opt.take() {
+                                                    guard.complete(arc.clone());
+                                                }
+                                                results[*orig_slot] = Some(arc);
                                             }
-                                            let arc = Arc::new(decoded);
-                                            if let Some(guard) = guard_opt.take() {
-                                                guard.complete(arc.clone());
+                                            Err(e) => {
+                                                fetch_err = Some(IoError::Codec(e));
                                             }
-                                            results[*orig_slot] = Some(arc);
-                                        }
-                                        Err(e) => {
-                                            fetch_err = Some(IoError::Codec(e));
                                         }
                                     }
                                 }
                             }
+                            Ok(Err(e)) => fetch_err = Some(e),
+                            Err(_) => {}
                         }
-                        Ok(Err(e)) => fetch_err = Some(e),
-                        Err(_) => {}
                     }
-                }
 
-                while let Some(res) = decode_set.join_next().await {
-                    match res {
-                        Ok(Ok((orig_slot, arc))) => {
-                            results[orig_slot] = Some(arc);
+                    while let Some(res) = decode_set.join_next().await {
+                        match res {
+                            Ok(Ok((orig_slot, arc))) => {
+                                results[orig_slot] = Some(arc);
+                            }
+                            Ok(Err(e)) => fetch_err = Some(e),
+                            Err(_) => {}
                         }
-                        Ok(Err(e)) => fetch_err = Some(e),
-                        Err(_) => {}
                     }
-                }
 
-                if let Some(e) = fetch_err {
-                    // Any uncompleted guards in `owned` auto-abort cleanly on Drop!
-                    return Err(e);
+                    if let Some(e) = fetch_err {
+                        // Any uncompleted guards in `owned` auto-abort cleanly on Drop!
+                        return Err(e);
+                    }
                 }
             }
         }

@@ -671,3 +671,68 @@ async fn datasets_by_uri_cap_enforced_under_concurrent_opens() {
         store.open_uri_count()
     );
 }
+
+/// End-to-end tier-2 disk cache test: fetch remote blocks once, clear RAM cache,
+/// re-fetch and verify 0 additional HTTP requests + identical decoded pixel data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disk_cache_serves_ram_misses_with_zero_remote_requests() {
+    use cogzilla_io::DiskBlockCache;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/mercator_4k_zstd_p3.tif");
+    if !path.exists() {
+        return;
+    }
+    let bytes = Arc::new(std::fs::read(&path).unwrap());
+    let (url, reqs) = start_mock_range_server(bytes, 5).await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "cogzilla_e2e_disk_cache_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dc = DiskBlockCache::open(&dir, 32 * 1024 * 1024).unwrap();
+    let store = Arc::new(CogStore::new(16 * 1024 * 1024).with_disk_cache(dc.clone()));
+
+    let cog = store.open_uri(&url).await.unwrap();
+    let first = store.get_blocks(&cog, 0, &[Some(0), Some(1), Some(2)]).await.unwrap();
+    assert!(first.iter().all(|b| b.is_some()));
+
+    // Wait briefly for the non-blocking background writer to flush the 3 blocks
+    let mut flushed = false;
+    for _ in 0..50 {
+        if dc.stats().bytes_used > 0 {
+            flushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(flushed, "background disk cache writer never flushed");
+    // Give any remaining queued block a moment to rename
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let reqs_after_first = reqs.load(Ordering::Relaxed);
+    // Clear RAM completely!
+    store.cache.clear();
+
+    // Re-fetch the exact same 3 blocks -> must be served 100% from disk with 0 HTTP requests!
+    let second = store.get_blocks(&cog, 0, &[Some(0), Some(1), Some(2)]).await.unwrap();
+    assert_eq!(
+        reqs.load(Ordering::Relaxed),
+        reqs_after_first,
+        "expected 0 remote HTTP requests on disk cache hit"
+    );
+    assert_eq!(dc.stats().hits, 3);
+    for i in 0..3 {
+        let a = first[i].as_ref().unwrap().bands[0].data.as_f32_slice().unwrap();
+        let b = second[i].as_ref().unwrap().bands[0].data.as_f32_slice().unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a[0].to_bits(), b[0].to_bits());
+        assert_eq!(a[a.len() - 1].to_bits(), b[b.len() - 1].to_bits());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
