@@ -1,3 +1,4 @@
+pub mod allowlist;
 pub mod backend;
 pub mod cache;
 pub mod cloud;
@@ -6,6 +7,7 @@ pub mod limiter;
 pub mod s3;
 pub mod store;
 
+pub use allowlist::{ALLOWED_URL_PREFIXES_ENV, allowlist_enabled, check_uri_allowed};
 pub use backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges};
 pub use cache::{BlockKey, SingleflightBlockCache};
 pub use cloud::{

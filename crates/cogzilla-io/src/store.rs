@@ -268,6 +268,7 @@ impl CogStore {
     /// Open (or fetch from metadata cache) any local path, `file://`, `http(s)://`, or `s3://` COG.
     /// Singleflight-deduplicated so a 32-tile cold burst against a new S3 COG issues only 1 header GET.
     pub async fn open_uri(&self, uri: &str) -> Result<Arc<OpenedCog>, IoError> {
+        crate::allowlist::check_uri_allowed(uri)?;
         loop {
             if let Some(existing) = self.datasets_by_uri.get(uri) {
                 if let OpenSlot::Ready { cog, last_used } = existing.value() {

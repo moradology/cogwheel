@@ -592,6 +592,7 @@ async fn load_mosaicjson(
     engine: &TileEngine,
     uri: &str,
 ) -> Result<Arc<MosaicJsonCatalog>, EngineError> {
+    cogzilla_io::check_uri_allowed(uri)?;
     if let Some(cached) = engine.mosaicjson_cache.get(uri) {
         return Ok(cached.clone());
     }
@@ -816,6 +817,7 @@ pub async fn handle_request(
             let catalog: Arc<dyn SceneCatalog> = if let Some(cat_val) = spec.get("catalog") {
                 load_catalog_json_str(&cat_val.to_string()).map_err(EngineError::BadRequest)?
             } else if let Some(search_url) = spec.get("stac_api_url").and_then(|v| v.as_str()) {
+                cogzilla_io::check_uri_allowed(search_url)?;
                 let mut search_body = serde_json::Map::new();
                 for k in ["collections", "bbox", "datetime", "limit", "query", "filter"] {
                     if let Some(v) = spec.get(k) {
@@ -2183,6 +2185,9 @@ fn to_http_response(
         }
         Err(EngineError::BadRequest(msg)) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain")
+        }
+        Err(EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_))) => {
+            plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
         }
         Err(e) => {
             tracing::warn!(error = %e, "request failed with 500");

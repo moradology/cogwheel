@@ -31,6 +31,8 @@ pub enum IoError {
     Codec(#[from] cogzilla_codec::CodecError),
     #[error("invalid URI: {0}")]
     InvalidUri(String),
+    #[error("location is not in COGZILLA_ALLOWED_URL_PREFIXES: {0}")]
+    Forbidden(String),
 }
 
 #[derive(Default)]

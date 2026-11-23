@@ -81,6 +81,7 @@ pub async fn load_stac_item(
     client: &reqwest::Client,
     uri: &str,
 ) -> Result<Arc<StacItem>, EngineError> {
+    cogzilla_io::check_uri_allowed(uri)?;
     if let Some(hit) = cache.get(uri) {
         return Ok(hit.clone());
     }
