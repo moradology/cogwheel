@@ -25,8 +25,9 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     let engine = Arc::new(TileEngine::new(128 * 1024 * 1024));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
     tokio::spawn(async move {
-        let _ = serve_listener(engine, listener).await;
+        let _ = serve_listener(engine_srv, listener).await;
     });
 
     let base = format!("http://{addr}");
@@ -455,6 +456,66 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 bytes[25], 2,
                 "expected opaque RGB PNG (color_type=2) after filling coastal nodata holes from background scene"
             );
+        }
+
+        // --------------------------------------------------------------------
+        // 17. Indexed spatial catalog mosaic (/mosaic/{name}/tiles/...)
+        // --------------------------------------------------------------------
+        {
+            use cogzilla_proj::{TileCoord, tile_bounds_3857};
+            use cogzilla_server::{InMemoryCatalog, SceneEntry};
+            let (tx0, ty0, tx1, ty1) = tile_bounds_3857(TileCoord {
+                z: 12,
+                x: 655,
+                y: 1583,
+            });
+            let cat = InMemoryCatalog::new(vec![
+                SceneEntry {
+                    uri: merc_url.clone(),
+                    bbox_3857: [tx0 - 500.0, ty0 - 500.0, tx1 + 500.0, ty1 + 500.0],
+                    priority: 100,
+                },
+                SceneEntry {
+                    uri: "/nonexistent/low_priority_scene.tif".into(),
+                    bbox_3857: [tx0 - 500.0, ty0 - 500.0, tx1 + 500.0, ty1 + 500.0],
+                    priority: 10,
+                },
+            ]);
+            engine.register_catalog("demo", Arc::new(cat));
+
+            // In-bounds: hits high-priority merc_url and early-exits before touching nonexistent scene!
+            let resp = client
+                .get(format!(
+                    "{base}/mosaic/demo/tiles/WebMercatorQuad/12/655/1583.png?rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let bytes = resp.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // Out-of-bounds: spatial index returns 0 scenes -> instant transparent PNG!
+            let empty_resp = client
+                .get(format!(
+                    "{base}/mosaic/demo/tiles/WebMercatorQuad/12/0/0.png"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(empty_resp.status(), 200);
+            let empty_bytes = empty_resp.bytes().await.unwrap();
+            assert_eq!(&empty_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // Unknown catalog -> 404
+            let missing_resp = client
+                .get(format!(
+                    "{base}/mosaic/nope/tiles/WebMercatorQuad/12/655/1583.png"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(missing_resp.status(), 404);
         }
     }
 }

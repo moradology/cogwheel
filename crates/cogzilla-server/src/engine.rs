@@ -9,10 +9,12 @@ use cogzilla_kernel::{
     SpectralExpr, empty_tile_bytes, encode_rgba_tile, render_bandmath1, render_bandmath2,
     render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb, render_single_band,
 };
-use cogzilla_proj::{CoordPlan, CrsModel, ProjError, TileCoord};
+use cogzilla_proj::{CoordPlan, CrsModel, ProjError, TileCoord, tile_bounds_3857};
 use cogzilla_tiff::PlanarConfig;
 use dashmap::DashMap;
 use thiserror::Error;
+
+use crate::catalog::SceneCatalog;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -87,6 +89,7 @@ pub struct TileEngine {
     pub store: Arc<CogStore>,
     crs_cache: DashMap<u64, CrsModel, ahash::RandomState>,
     scenes: DashMap<String, Vec<Arc<OpenedCog>>, ahash::RandomState>,
+    catalogs: DashMap<String, Arc<dyn SceneCatalog>, ahash::RandomState>,
     pub stac_cache: DashMap<String, Arc<crate::stac::StacItem>, ahash::RandomState>,
     pub stats: Arc<EngineStats>,
 }
@@ -101,9 +104,19 @@ impl TileEngine {
             store,
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
             scenes: DashMap::with_hasher(ahash::RandomState::new()),
+            catalogs: DashMap::with_hasher(ahash::RandomState::new()),
             stac_cache: DashMap::with_hasher(ahash::RandomState::new()),
             stats: Arc::new(EngineStats::default()),
         }
+    }
+
+    /// Register a pluggable spatial catalog (`SceneCatalog`) for `/mosaic/{name}/tiles`.
+    pub fn register_catalog(&self, name: impl Into<String>, catalog: Arc<dyn SceneCatalog>) {
+        self.catalogs.insert(name.into(), catalog);
+    }
+
+    pub fn get_catalog(&self, name: &str) -> Option<Arc<dyn SceneCatalog>> {
+        self.catalogs.get(name).map(|v| v.clone())
     }
 
     /// Pre-register a multi-COG satellite scene (e.g., Landsat `[B4, B3, B2]` or SAR `[VV, VH]`).
@@ -986,5 +999,23 @@ impl TileEngine {
             filled == total_pixels,
             req.format,
         ))
+    }
+
+    /// Query a pluggable `SceneCatalog` for the requested tile's EPSG:3857 bounding box
+    /// and render an early-exit mosaic across the intersecting scenes.
+    pub async fn render_catalog_mosaic_tile(
+        &self,
+        catalog: &dyn SceneCatalog,
+        req: &TileRequest,
+    ) -> Result<Bytes, EngineError> {
+        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(req.tile);
+        let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
+        if urls.is_empty() {
+            self.stats
+                .empty_short_circuits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(empty_tile_bytes(req.tile_size, req.format, 3));
+        }
+        self.render_mosaic_tile(&urls, req).await
     }
 }

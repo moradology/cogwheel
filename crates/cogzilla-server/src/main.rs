@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use cogzilla_io::{CogStore, DiskBlockCache};
-use cogzilla_server::{TileEngine, serve};
+use cogzilla_server::{InMemoryCatalog, SceneCatalog, TileEngine, serve};
 
 #[derive(Parser, Debug)]
 #[command(name = "cogzilla-server", about = "Ultra-fast COG & STAC tile server")]
@@ -32,6 +32,10 @@ struct Args {
     /// Pre-registered multi-COG scenes as `name=band1.tif,band2.tif[,band3.tif]` (Landsat RGB / SAR VV+VH)
     #[arg(long = "scene")]
     scenes: Vec<String>,
+
+    /// Pre-registered spatial mosaic catalogs as `name=/path/to/catalog.json` (STAC FeatureCollection or JSON array)
+    #[arg(long = "mosaic")]
+    mosaics: Vec<String>,
 }
 
 #[tokio::main]
@@ -106,6 +110,24 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("Failed to open scene '{name}': {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    for spec in &args.mosaics {
+        let Some((name, path)) = spec.split_once('=') else {
+            eprintln!("Invalid --mosaic '{spec}', expected name=/path/to/catalog.json");
+            std::process::exit(1);
+        };
+        match InMemoryCatalog::from_json_file(path) {
+            Ok(cat) => {
+                let count = cat.len();
+                engine.register_catalog(name, Arc::new(cat));
+                tracing::info!(mosaic = name, scenes = count, "registered spatial mosaic catalog");
+            }
+            Err(e) => {
+                eprintln!("Failed to load mosaic catalog '{name}' ({path}): {e}");
                 std::process::exit(1);
             }
         }

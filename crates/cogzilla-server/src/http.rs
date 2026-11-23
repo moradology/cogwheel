@@ -644,6 +644,9 @@ pub async fn handle_request(
     // Dynamic early-exit COG mosaic:
     //   GET /mosaic/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{ext}]?url=a&url=b&...
     //   GET /mosaic/tiles/{z}/{x}/{y}[@scale][.{ext}]?url=a&url=b&...
+    // Indexed spatial-catalog mosaic:
+    //   GET /mosaic/{name}/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{ext}]
+    //   GET /mosaic/{name}/tiles/{z}/{x}/{y}[@scale][.{ext}]
     // ------------------------------------------------------------------------
     if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(1) == Some(&"tiles") {
         let coords = match segs.as_slice() {
@@ -681,6 +684,55 @@ pub async fn handle_request(
             }
             _ => Err(EngineError::BadRequest(
                 "invalid /mosaic/tiles coordinate path".into(),
+            )),
+        };
+        return Ok(to_http_response(res));
+    }
+
+    if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(2) == Some(&"tiles") {
+        let cat_name = segs[1];
+        let coords = match segs.as_slice() {
+            ["mosaic", _, "tiles", _, zs, xs, ys] | ["mosaic", _, "tiles", zs, xs, ys] => (
+                zs.parse::<u8>().ok(),
+                xs.parse::<u32>().ok(),
+                parse_y_scale_ext(ys),
+            ),
+            _ => (None, None, None),
+        };
+        let res = match (engine.get_catalog(cat_name), coords) {
+            (None, _) => Err(EngineError::NotFound(format!("mosaic catalog '{cat_name}'"))),
+            (Some(catalog), (Some(z), Some(x), Some((y, sc, ext)))) => {
+                let tile = TileCoord { z, x, y };
+                let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
+                let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
+                if urls.is_empty() {
+                    match build_tile_request(tile, sc, ext, &pq, 3, true) {
+                        Ok((treq, ct)) => Ok((
+                            cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, 3),
+                            ct,
+                        )),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    match engine.store.open_uri(&urls[0]).await {
+                        Ok(first_cog) => {
+                            let db = first_cog.index.full_res().samples_per_pixel;
+                            let is_u8 = first_cog.index.full_res().sample_type
+                                == cogzilla_tiff::SampleType::Uint8;
+                            match build_tile_request(tile, sc, ext, &pq, db, is_u8) {
+                                Ok((treq, ct)) => engine
+                                    .render_mosaic_tile(&urls, &treq)
+                                    .await
+                                    .map(|b| (b, ct)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(EngineError::Io(e)),
+                    }
+                }
+            }
+            _ => Err(EngineError::BadRequest(
+                "invalid /mosaic/{name}/tiles coordinate path".into(),
             )),
         };
         return Ok(to_http_response(res));
