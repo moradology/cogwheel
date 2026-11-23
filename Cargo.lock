@@ -235,6 +235,7 @@ dependencies = [
  "bytes",
  "cogzilla-codec",
  "cogzilla-tiff",
+ "crc32fast",
  "dashmap",
  "hex",
  "hmac",
