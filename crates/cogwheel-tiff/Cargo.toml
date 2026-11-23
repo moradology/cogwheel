@@ -1,7 +1,0 @@
-[package]
-name = "cogwheel-tiff"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-thiserror.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "cogzilla-kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cogzilla-tiff = { path = "../cogzilla-tiff" }
+cogzilla-codec = { path = "../cogzilla-codec" }
+cogzilla-proj = { path = "../cogzilla-proj" }
+thiserror.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+libdeflater.workspace = true
+libwebp-sys.workspace = true
+jpeg-encoder.workspace = true
+serde_json.workspace = true

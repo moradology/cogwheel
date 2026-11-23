@@ -200,12 +200,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
- "cogwheel-codec",
- "cogwheel-io",
- "cogwheel-kernel",
- "cogwheel-proj",
- "cogwheel-server",
- "cogwheel-tiff",
+ "cogzilla-codec",
+ "cogzilla-io",
+ "cogzilla-kernel",
+ "cogzilla-proj",
+ "cogzilla-server",
+ "cogzilla-tiff",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -216,10 +216,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cogwheel-codec"
+name = "cogzilla-codec"
 version = "0.1.0"
 dependencies = [
- "cogwheel-tiff",
+ "cogzilla-tiff",
  "libdeflater",
  "libwebp-sys",
  "thiserror",
@@ -228,13 +228,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cogwheel-io"
+name = "cogzilla-io"
 version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
- "cogwheel-codec",
- "cogwheel-tiff",
+ "cogzilla-codec",
+ "cogzilla-tiff",
  "dashmap",
  "hex",
  "hmac",
@@ -251,13 +251,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cogwheel-kernel"
+name = "cogzilla-kernel"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "cogwheel-codec",
- "cogwheel-proj",
- "cogwheel-tiff",
+ "cogzilla-codec",
+ "cogzilla-proj",
+ "cogzilla-tiff",
  "crc32fast",
  "jpeg-encoder",
  "libdeflater",
@@ -267,25 +267,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "cogwheel-proj"
+name = "cogzilla-proj"
 version = "0.1.0"
 dependencies = [
- "cogwheel-tiff",
+ "cogzilla-tiff",
  "thiserror",
 ]
 
 [[package]]
-name = "cogwheel-server"
+name = "cogzilla-server"
 version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
  "clap",
- "cogwheel-codec",
- "cogwheel-io",
- "cogwheel-kernel",
- "cogwheel-proj",
- "cogwheel-tiff",
+ "cogzilla-codec",
+ "cogzilla-io",
+ "cogzilla-kernel",
+ "cogzilla-proj",
+ "cogzilla-tiff",
  "dashmap",
  "http-body-util",
  "hyper",
@@ -300,7 +300,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cogwheel-tiff"
+name = "cogzilla-tiff"
 version = "0.1.0"
 dependencies = [
  "thiserror",

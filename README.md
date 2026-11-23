@@ -1,4 +1,4 @@
-# `cogwheel`
+# `cogzilla`
 
 An ultra-fast, zero-GDAL Cloud Optimized GeoTIFF (COG) tile server built in Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native C codecs (`libdeflate`, `zstd`, `libwebp`), purpose-built for satellite imagery (**Landsat Collection 2 `uint16`**, **OPERA RTC-S1 / Sentinel-1 `float32` SAR**, **Sentinel-2**, DEMs).
 
@@ -16,7 +16,7 @@ An ultra-fast, zero-GDAL Cloud Optimized GeoTIFF (COG) tile server built in Rust
 
 Measured on Apple M5 (10 cores, ARM64 NEON, `rustc 1.95.0 --release`):
 
-| ID | Workload | `cogwheel` | GDAL / TiTiler | Speedup |
+| ID | Workload | `cogzilla` | GDAL / TiTiler | Speedup |
 | :--- | :--- | ---: | ---: | ---: |
 | **`BM-01`** | `ColdHeader` (5-IFD COG open) | **1.3 µs** | 406 µs | **312×** |
 | **`BM-02`** | `UnshufflePred3` (`ZSTD + P3`, 1 MiB) | **350 µs** (3.00 GB/s) | 835 µs (1.26 GB/s) | **2.4×** |
@@ -37,10 +37,10 @@ Measured on Apple M5 (10 cores, ARM64 NEON, `rustc 1.95.0 --release`):
 
 ```bash
 # Build release server
-cargo build --release -p cogwheel-server
+cargo build --release -p cogzilla-server
 
 # Serve pre-registered single COGs and multi-COG satellite scenes
-./target/release/cogwheel-server \
+./target/release/cogzilla-server \
   --bind 127.0.0.1:8080 \
   --cache-mb 1024 \
   --dataset dem=/path/to/dem.tif \
@@ -50,7 +50,7 @@ cargo build --release -p cogwheel-server
 
 ### Drop-In TiTiler API Surface (`/cog/*`, `/stac/*`, `/colorMaps`, `/tileMatrixSets`)
 
-`cogwheel-server` implements TiTiler 2.4's non-Postgres routers so MapLibre, Leaflet, OpenLayers, and QGIS clients can switch by changing a single base URL (verified across **39/39 live HTTP differential oracle checks** against TiTiler in `benches/titiler_diff_oracle.py`):
+`cogzilla-server` implements TiTiler 2.4's non-Postgres routers so MapLibre, Leaflet, OpenLayers, and QGIS clients can switch by changing a single base URL (verified across **39/39 live HTTP differential oracle checks** against TiTiler in `benches/titiler_diff_oracle.py`):
 
 - **`/cog/*` (`TilerFactory`)**:
   - **Tiles (`@1x` = 256px, `@2x` = 512px)**: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|jpg|f32}]` (`WebMercatorQuad` & `WorldCRS84Quad`), supporting `?unscale=true`, `?nodata=`, `?return_mask=false`, `?color_formula=`, `?colormap={json}`, `?buffer=`, and all 8 GDAL numeric dtypes (`uint8`, `int8`, `uint16`, `int16`, `uint32`, `int32`, `float32`, `float64`).
@@ -88,7 +88,7 @@ cd benches && uv venv .venv && uv pip install --python .venv/bin/python rasterio
 .venv/bin/python generate_landsat_sar_fixtures.py
 cd ..
 
-# 2. Run cogwheel benchmarks + parity dumps
+# 2. Run cogzilla benchmarks + parity dumps
 cargo run --release -p cogmark -- --dump-parity benches/results/parity
 
 # 3. Run GDAL / TiTiler baseline & pixel parity gate
@@ -97,10 +97,10 @@ benches/.venv/bin/python benches/gdal_oracle.py
 
 ## Workspace Crates
 
-- `crates/cogwheel-tiff` — Classic/BigTIFF + GeoKey parser & compact IFD index (`float32` + `uint16`).
-- `crates/cogwheel-codec` — Thread-local `libdeflate`, `zstd`, 64-bit LZW + NEON/AVX2 Predictor 1/2/3 & `BlockStats`.
-- `crates/cogwheel-proj` — Closed-form `EPSG:3857`, `4326`, UTM, Albers, LCC, Polar Stereographic + `Exact2D`/`Grid2D` planners.
-- `crates/cogwheel-kernel` — Monomorphized fused SIMD resample, rescale, spectral band math, fast PNG/WebP/Raw `f32` encoders.
-- `crates/cogwheel-io` — `MmapBackend`, coalesced HTTP/S3 `RangeBackend` (SigV4), sharded singleflight block cache.
-- `crates/cogwheel-server` — Zero-alloc `hyper` HTTP/1.1 + HTTP/2 server & CLI.
+- `crates/cogzilla-tiff` — Classic/BigTIFF + GeoKey parser & compact IFD index (`float32` + `uint16`).
+- `crates/cogzilla-codec` — Thread-local `libdeflate`, `zstd`, 64-bit LZW + NEON/AVX2 Predictor 1/2/3 & `BlockStats`.
+- `crates/cogzilla-proj` — Closed-form `EPSG:3857`, `4326`, UTM, Albers, LCC, Polar Stereographic + `Exact2D`/`Grid2D` planners.
+- `crates/cogzilla-kernel` — Monomorphized fused SIMD resample, rescale, spectral band math, fast PNG/WebP/Raw `f32` encoders.
+- `crates/cogzilla-io` — `MmapBackend`, coalesced HTTP/S3 `RangeBackend` (SigV4), sharded singleflight block cache.
+- `crates/cogzilla-server` — Zero-alloc `hyper` HTTP/1.1 + HTTP/2 server & CLI.
 - `benches/cogmark` — `BM-01`..`BM-11` benchmark suite & GDAL parity oracle.

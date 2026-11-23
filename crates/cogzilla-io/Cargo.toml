@@ -1,0 +1,25 @@
+[package]
+name = "cogzilla-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cogzilla-tiff = { path = "../cogzilla-tiff" }
+cogzilla-codec = { path = "../cogzilla-codec" }
+thiserror.workspace = true
+bytes.workspace = true
+memmap2.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true

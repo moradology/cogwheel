@@ -2,7 +2,7 @@
 """
 GDAL / rio-tiler / TiTiler benchmark harness and pixel-accuracy parity oracle for COGMark.
 Runs the exact same BM-01..BM-08 workloads against C++ libgdal (via rasterio/rio-tiler)
-and TiTiler HTTP (uvicorn), plus validates cogwheel pixel accuracy against GDAL.
+and TiTiler HTTP (uvicorn), plus validates cogzilla pixel accuracy against GDAL.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def summarize_us(samples_s: list[float]) -> tuple[float, float]:
 
 
 def verify_parity():
-    """Compare cogwheel raw f32 tiles against rio-tiler/GDAL WarpedVRT pixel-by-pixel."""
+    """Compare cogzilla raw f32 tiles against rio-tiler/GDAL WarpedVRT pixel-by-pixel."""
     print("\n=== GDAL Parity Gate ===")
     checks = [
         ("mercator_z12_f32.bin", "mercator_4k_zstd_p3.tif", (657, 1582, 12), [1]),

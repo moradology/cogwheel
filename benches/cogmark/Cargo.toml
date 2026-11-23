@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cogwheel-tiff = { path = "../../crates/cogwheel-tiff" }
-cogwheel-codec = { path = "../../crates/cogwheel-codec" }
-cogwheel-proj = { path = "../../crates/cogwheel-proj" }
-cogwheel-kernel = { path = "../../crates/cogwheel-kernel" }
-cogwheel-io = { path = "../../crates/cogwheel-io" }
-cogwheel-server = { path = "../../crates/cogwheel-server" }
+cogzilla-tiff = { path = "../../crates/cogzilla-tiff" }
+cogzilla-codec = { path = "../../crates/cogzilla-codec" }
+cogzilla-proj = { path = "../../crates/cogzilla-proj" }
+cogzilla-kernel = { path = "../../crates/cogzilla-kernel" }
+cogzilla-io = { path = "../../crates/cogzilla-io" }
+cogzilla-server = { path = "../../crates/cogzilla-server" }
 bytes.workspace = true
 tokio.workspace = true
 reqwest.workspace = true

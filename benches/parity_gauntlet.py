@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive GeoTIFF / COG Parity Gauntlet: cogwheel vs. TiTiler.
+Comprehensive GeoTIFF / COG Parity Gauntlet: cogzilla vs. TiTiler.
 
 Constructs a diverse corpus of 25+ GeoTIFFs spanning:
   - 8 Projections (EPSG:3857, 4326, UTM North 32610, UTM South 32755, NAD83 UTM 26918,
@@ -12,7 +12,7 @@ Constructs a diverse corpus of 25+ GeoTIFFs spanning:
                          no overviews vs multi-overview, NaN nodata, -9999 sentinel nodata,
                          sparse half-nodata, GDAL scale/offset ?unscale=true)
 
-Runs EVERY file live against BOTH `cogwheel-server` (--release) and `TiTiler` (uvicorn) across:
+Runs EVERY file live against BOTH `cogzilla-server` (--release) and `TiTiler` (uvicorn) across:
   1. GET /cog/info            (dtype, band count, width, height, native bounds)
   2. GET /cog/point/{lon},{lat} (exact pixel values)
   3. GET /cog/statistics      (mean & std agreement)
@@ -44,7 +44,7 @@ from rasterio.warp import transform_bounds
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS_DIR = ROOT / "benches" / "fixtures" / "parity_corpus"
 RESULTS_DIR = ROOT / "benches" / "results"
-COGWHEEL_BIN = ROOT / "target" / "release" / "cogwheel-server"
+COGZILLA_BIN = ROOT / "target" / "release" / "cogzilla-server"
 
 PORT_CW = 18811
 PORT_TT = 18812
@@ -431,9 +431,9 @@ def time_get(client: httpx.Client, url: str, iters: int = 5):
 
 def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    if not COGWHEEL_BIN.exists():
-        print("Building cogwheel-server --release...")
-        subprocess.run(["cargo", "build", "--release", "-p", "cogwheel-server"], cwd=ROOT, check=True)
+    if not COGZILLA_BIN.exists():
+        print("Building cogzilla-server --release...")
+        subprocess.run(["cargo", "build", "--release", "-p", "cogzilla-server"], cwd=ROOT, check=True)
 
     print("Building diverse GeoTIFF parity corpus...")
     cases = build_corpus()
@@ -448,7 +448,7 @@ def main():
     )
 
     cw_proc = subprocess.Popen(
-        [str(COGWHEEL_BIN), "--bind", f"127.0.0.1:{PORT_CW}", "--cache-mb", "512"],
+        [str(COGZILLA_BIN), "--bind", f"127.0.0.1:{PORT_CW}", "--cache-mb", "512"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

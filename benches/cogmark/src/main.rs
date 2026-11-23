@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
-use cogwheel_codec::decode_tile;
-use cogwheel_kernel::{ColormapName, OutputFormat, ResampleMode, SpectralExpr};
-use cogwheel_proj::TileCoord;
-use cogwheel_server::{BandRequest, TileEngine, TileRequest, serve_listener};
-use cogwheel_tiff::parse_cog;
+use cogzilla_codec::decode_tile;
+use cogzilla_kernel::{ColormapName, OutputFormat, ResampleMode, SpectralExpr};
+use cogzilla_proj::TileCoord;
+use cogzilla_server::{BandRequest, TileEngine, TileRequest, serve_listener};
+use cogzilla_tiff::parse_cog;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderValue};
@@ -52,7 +52,7 @@ fn summarize_us(mut samples: Vec<f64>) -> (f64, f64) {
 
 async fn bench_tile_sync(
     engine: &TileEngine,
-    cog: &cogwheel_io::OpenedCog,
+    cog: &cogzilla_io::OpenedCog,
     req: &TileRequest,
     iters: usize,
     clear_cache_each: bool,
@@ -168,7 +168,7 @@ async fn main() {
     std::fs::create_dir_all(&args.results_dir).unwrap();
     let mut results: Vec<BenchResult> = Vec::new();
 
-    println!("=== COGMark Benchmark Suite (cogwheel Rust+SIMD) ===");
+    println!("=== COGMark Benchmark Suite (cogzilla Rust+SIMD) ===");
 
     // ------------------------------------------------------------------------
     // BM-01: ColdHeader
@@ -276,7 +276,7 @@ async fn main() {
     // Optional parity dump for GDAL oracle comparison
     if let Some(dump_dir) = &args.dump_parity {
         std::fs::create_dir_all(dump_dir).unwrap();
-        let dumps: Vec<(&str, &Arc<cogwheel_io::OpenedCog>, TileRequest)> = vec![
+        let dumps: Vec<(&str, &Arc<cogzilla_io::OpenedCog>, TileRequest)> = vec![
             (
                 "mercator_z12_f32.bin",
                 &cog_merc,
@@ -1047,7 +1047,7 @@ async fn main() {
         }
     }
 
-    let out_json = args.results_dir.join("cogwheel_results.json");
+    let out_json = args.results_dir.join("cogzilla_results.json");
     std::fs::write(&out_json, serde_json::to_string_pretty(&results).unwrap()).unwrap();
     println!("Saved results to {}", out_json.display());
 }

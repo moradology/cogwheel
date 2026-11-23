@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Live HTTP Differential Oracle: TiTiler vs. cogwheel-server.
+Live HTTP Differential Oracle: TiTiler vs. cogzilla-server.
 
-Spins up BOTH `cogwheel-server` (--release) and `TiTiler` (uvicorn) on loopback,
+Spins up BOTH `cogzilla-server` (--release) and `TiTiler` (uvicorn) on loopback,
 sends identical HTTP requests across the full `/cog/*` API surface, verifies
 JSON schema/numerical parity and PNG visual PSNR/mask agreement, and measures
 per-endpoint warm latency speedups.
@@ -75,7 +75,7 @@ def ensure_dtype_fixtures() -> dict[str, tuple[str, str]]:
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "benches" / "fixtures"
 RESULTS = ROOT / "benches" / "results"
-COGWHEEL_BIN = ROOT / "target" / "release" / "cogwheel-server"
+COGZILLA_BIN = ROOT / "target" / "release" / "cogzilla-server"
 
 PORT_CW = 18801
 PORT_TT = 18802
@@ -131,9 +131,9 @@ def compare_pngs(cw_bytes: bytes, tt_bytes: bytes) -> str:
 
 def main():
     RESULTS.mkdir(parents=True, exist_ok=True)
-    if not COGWHEEL_BIN.exists():
-        print("Building cogwheel-server --release...")
-        subprocess.run(["cargo", "build", "--release", "-p", "cogwheel-server"], cwd=ROOT, check=True)
+    if not COGZILLA_BIN.exists():
+        print("Building cogzilla-server --release...")
+        subprocess.run(["cargo", "build", "--release", "-p", "cogzilla-server"], cwd=ROOT, check=True)
 
     # Write TiTiler app mounted at /cog, /stac, /colorMaps, /tileMatrixSets
     tt_app = RESULTS / "_titiler_oracle_app.py"
@@ -153,7 +153,7 @@ def main():
     )
 
     cw_proc = subprocess.Popen(
-        [str(COGWHEEL_BIN), "--bind", f"127.0.0.1:{PORT_CW}", "--cache-mb", "512"],
+        [str(COGZILLA_BIN), "--bind", f"127.0.0.1:{PORT_CW}", "--cache-mb", "512"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -259,8 +259,8 @@ def main():
             ("GET /stac/preview/256x256.png (3-asset RGB)", "GET", f"/stac/preview/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
         ])
 
-        print("\n=== Live HTTP Differential Oracle: cogwheel vs. TiTiler ===")
-        print(f"{'Endpoint':54s} | {'cogwheel':>9s} | {'TiTiler':>9s} | {'Speedup':>8s} | Parity vs TiTiler")
+        print("\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ===")
+        print(f"{'Endpoint':54s} | {'cogzilla':>9s} | {'TiTiler':>9s} | {'Speedup':>8s} | Parity vs TiTiler")
         print("-" * 135)
 
         summary = []
@@ -301,7 +301,7 @@ def main():
                     j_cw = {c["id"] for c in r_cw.json()["colormaps"]}
                     j_tt = {c["id"] for c in r_tt.json()["colormaps"]}
                     overlap = len(j_cw & j_tt)
-                    parity = f"cogwheel={len(j_cw)} titiler={len(j_tt)} overlap={overlap}/{len(j_cw)}"
+                    parity = f"cogzilla={len(j_cw)} titiler={len(j_tt)} overlap={overlap}/{len(j_cw)}"
                 elif kind == "json_cmap_lut":
                     j_cw, j_tt = r_cw.json(), r_tt.json()
                     exact = sum(1 for k in j_cw if j_cw[k] == j_tt.get(k))
@@ -329,7 +329,7 @@ def main():
                 print(f"{label:54s} | {ms_cw:6.2f} ms | {ms_tt:6.2f} ms | {speedup:7.1f}x | {parity}")
                 summary.append({
                     "endpoint": label,
-                    "cogwheel_ms": ms_cw,
+                    "cogzilla_ms": ms_cw,
                     "titiler_ms": ms_tt,
                     "speedup": speedup,
                     "parity": parity,

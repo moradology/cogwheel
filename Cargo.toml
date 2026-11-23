@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cogwheel-tiff",
-    "crates/cogwheel-codec",
-    "crates/cogwheel-proj",
-    "crates/cogwheel-kernel",
-    "crates/cogwheel-io",
-    "crates/cogwheel-server",
+    "crates/cogzilla-tiff",
+    "crates/cogzilla-codec",
+    "crates/cogzilla-proj",
+    "crates/cogzilla-kernel",
+    "crates/cogzilla-io",
+    "crates/cogzilla-server",
     "benches/cogmark",
 ]
 
