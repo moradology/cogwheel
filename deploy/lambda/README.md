@@ -41,39 +41,39 @@ sam deploy \
   --resolve-s3
 ```
 
-## Option 3: Terraform
+## Option 3: Terraform (ready-to-use module, with optional CloudFront CDN)
+
+A complete module lives in [deploy/lambda/terraform/](terraform/) (IAM role, optional private S3 `s3:GetObject` policy, Lambda `provided.al2023` arm64, Function URL with CORS, and optional CloudFront CDN).
+
+Reference it directly from your own Terraform repo:
 
 ```hcl
-resource "aws_lambda_function" "cogzilla" {
-  function_name = "cogzilla"
-  role          = aws_iam_role.cogzilla.arn
-  runtime       = "provided.al2023"
-  architectures = ["arm64"]
-  handler       = "bootstrap"
-  filename      = "cogzilla-lambda-v0.3.1-aarch64-unknown-linux-gnu.zip"
-  memory_size   = 1769 # 1 full Graviton2 vCPU
-  timeout       = 30
+module "cogzilla" {
+  source = "github.com/moradology/cogzilla//deploy/lambda/terraform?ref=v0.3.1"
 
-  environment {
-    variables = {
-      COGZILLA_CACHE_MB              = "256"
-      COGZILLA_DISK_CACHE_MB         = "256"
-      COGZILLA_DISK_CACHE_DIR        = "/tmp/cogzilla-cache"
-      COGZILLA_CACHE_CONTROL_MAX_AGE = "3600"
-      COGZILLA_ALLOWED_URL_PREFIXES  = "s3://my-cogs-bucket/"
-    }
-  }
+  cogzilla_version     = "v0.3.1"
+  s3_bucket_arns       = ["arn:aws:s3:::my-cogs-bucket"]
+  allowed_url_prefixes = ["s3://my-cogs-bucket/"]
+  enable_cloudfront    = true # optional CDN in front of the Function URL
 }
 
-resource "aws_lambda_function_url" "cogzilla" {
-  function_name      = aws_lambda_function.cogzilla.function_name
-  authorization_type = "NONE"
-  cors {
-    allow_origins = ["*"]
-    allow_methods = ["GET", "POST"]
-  }
+output "tile_endpoint" {
+  value = coalesce(module.cogzilla.cloudfront_url, module.cogzilla.function_url)
 }
 ```
+
+Or run it standalone from a checkout:
+
+```bash
+cd deploy/lambda/terraform
+terraform init
+terraform apply \
+  -var='s3_bucket_arns=["arn:aws:s3:::my-cogs-bucket"]' \
+  -var='allowed_url_prefixes=["s3://my-cogs-bucket/"]' \
+  -var='enable_cloudfront=true'
+```
+
+The module downloads the matching `cogzilla-lambda-v0.3.1-aarch64-unknown-linux-gnu.zip` automatically (or pass `zip_path = "/path/to/bootstrap.zip"` to use a local build). Tear down with `terraform destroy`.
 
 ## Configuration
 
