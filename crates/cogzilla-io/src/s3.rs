@@ -554,6 +554,12 @@ pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// Transport-level failures worth retrying for an idempotent (ranged) `GET`: connect/read timeouts,
+/// connections dropped before or during the response, and truncated or undecodable bodies.
+pub fn is_retryable_transport_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode()
+}
+
 /// Compute exponential backoff delay with deterministic jitter (100ms -> 250ms -> 600ms...).
 pub fn retry_backoff_duration(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
     if let Some(secs) = retry_after_secs {
@@ -569,7 +575,7 @@ pub fn retry_backoff_duration(attempt: u32, retry_after_secs: Option<u64>) -> Du
 /// - Automatic bucket region discovery & caching on `301` / `400` with `x-amz-bucket-region`
 /// - Full SigV4 signing (including `x-amz-security-token` and `x-amz-request-payer`)
 /// - Unsigned public access (`AWS_NO_SIGN_REQUEST=YES` or no creds)
-/// - Transient `429`/`500`/`502`/`503`/`504` retries with exponential backoff
+/// - Transient `429`/`500`/`502`/`503`/`504` and transport-error retries with exponential backoff
 pub async fn fetch_s3_object(
     client: &reqwest::Client,
     bucket: &str,
@@ -634,7 +640,7 @@ pub async fn fetch_s3_object(
 
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) if attempt < cfg.max_retries && (e.is_timeout() || e.is_connect()) => {
+            Err(e) if attempt < cfg.max_retries && is_retryable_transport_error(&e) => {
                 tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
                 attempt += 1;
                 continue;
@@ -644,7 +650,16 @@ pub async fn fetch_s3_object(
 
         let status = resp.status().as_u16();
         if status == 200 || status == 206 {
-            return Ok(resp.bytes().await?);
+            // The body can still fail after a good status line (connection reset mid-transfer).
+            match resp.bytes().await {
+                Ok(body) => return Ok(body),
+                Err(e) if attempt < cfg.max_retries && is_retryable_transport_error(&e) => {
+                    tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(IoError::Http(e)),
+            }
         }
 
         // Automatic S3 bucket region discovery on 301 / 400 with `x-amz-bucket-region`

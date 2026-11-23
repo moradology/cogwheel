@@ -282,3 +282,161 @@ aws_session_token = TOK_PROD
     );
     assert!(parse_aws_json_credentials("{}").is_none());
 }
+
+/// How the raw mock server sabotages the first request it receives.
+#[derive(Clone, Copy)]
+enum FirstAttempt {
+    /// Send a valid status line and headers, half of the body, then drop the connection.
+    ResetMidBody,
+    /// Read the request and drop the connection without answering.
+    CloseBeforeResponse,
+    /// Send headers, then go silent with the connection open.
+    StallBody,
+}
+
+/// Raw TCP mock: the first request is broken per `fault`, every later one gets a clean `206`.
+async fn spawn_flaky_server(fault: FirstAttempt, payload: &'static [u8]) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_cl = calls.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let calls = calls_cl.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                if n == 0 {
+                    match fault {
+                        FirstAttempt::CloseBeforeResponse => {}
+                        FirstAttempt::ResetMidBody => {
+                            let _ = stream.write_all(head.as_bytes()).await;
+                            let _ = stream.write_all(&payload[..payload.len() / 2]).await;
+                            let _ = stream.flush().await;
+                        }
+                        FirstAttempt::StallBody => {
+                            let _ = stream.write_all(head.as_bytes()).await;
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        }
+                    }
+                    return; // dropping `stream` closes the connection
+                }
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(payload).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), calls)
+}
+
+fn anon_cfg(endpoint: String) -> S3Config {
+    S3Config {
+        endpoint_url: Some(endpoint),
+        no_sign_request: true,
+        force_path_style: true,
+        max_retries: 2,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn s3_retries_connection_reset_mid_body() {
+    let (endpoint, calls) = spawn_flaky_server(FirstAttempt::ResetMidBody, b"0123456789ABCDEF").await;
+    let src = CogSource::open_remote(
+        "s3://flaky-bucket/reset.tif",
+        reqwest::Client::new(),
+        Some(anon_cfg(endpoint)),
+        Arc::new(IoMetrics::default()),
+    )
+    .unwrap();
+    let data = src.fetch_range(0, 16).await.unwrap();
+    assert_eq!(&data[..], b"0123456789ABCDEF");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn s3_retries_connection_closed_before_response() {
+    let (endpoint, calls) =
+        spawn_flaky_server(FirstAttempt::CloseBeforeResponse, b"0123456789ABCDEF").await;
+    let src = CogSource::open_remote(
+        "s3://flaky-bucket/closed.tif",
+        reqwest::Client::new(),
+        Some(anon_cfg(endpoint)),
+        Arc::new(IoMetrics::default()),
+    )
+    .unwrap();
+    let data = src.fetch_range(0, 16).await.unwrap();
+    assert_eq!(&data[..], b"0123456789ABCDEF");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn s3_read_timeout_turns_a_stalled_body_into_a_retry() {
+    let (endpoint, calls) = spawn_flaky_server(FirstAttempt::StallBody, b"0123456789ABCDEF").await;
+    let client = reqwest::Client::builder()
+        .read_timeout(std::time::Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let src = CogSource::open_remote(
+        "s3://flaky-bucket/stall.tif",
+        client,
+        Some(anon_cfg(endpoint)),
+        Arc::new(IoMetrics::default()),
+    )
+    .unwrap();
+    let data = tokio::time::timeout(std::time::Duration::from_secs(10), src.fetch_range(0, 16))
+        .await
+        .expect("fetch must not hang on a stalled body")
+        .unwrap();
+    assert_eq!(&data[..], b"0123456789ABCDEF");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn http_retries_connection_reset_mid_body() {
+    let (endpoint, calls) = spawn_flaky_server(FirstAttempt::ResetMidBody, b"0123456789ABCDEF").await;
+    let src = CogSource::open_remote(
+        &format!("{endpoint}/plain/reset.tif"),
+        reqwest::Client::new(),
+        None,
+        Arc::new(IoMetrics::default()),
+    )
+    .unwrap();
+    let data = src.fetch_range(0, 16).await.unwrap();
+    assert_eq!(&data[..], b"0123456789ABCDEF");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn s3_gives_up_after_max_retries_on_persistent_transport_errors() {
+    // Nothing listens here: every attempt fails to connect, and the error must surface.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let src = CogSource::open_remote(
+        "s3://flaky-bucket/gone.tif",
+        reqwest::Client::new(),
+        Some(S3Config { max_retries: 1, ..anon_cfg(format!("http://{addr}")) }),
+        Arc::new(IoMetrics::default()),
+    )
+    .unwrap();
+    assert!(src.fetch_range(0, 16).await.is_err());
+}

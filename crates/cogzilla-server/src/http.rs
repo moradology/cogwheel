@@ -1558,11 +1558,14 @@ fn to_http_response(res: Result<(Bytes, &'static str), EngineError>) -> Response
         Err(EngineError::BadRequest(msg)) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain")
         }
-        Err(e) => plain_resp(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Bytes::from(e.to_string()),
-            "text/plain",
-        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "request failed with 500");
+            plain_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Bytes::from(e.to_string()),
+                "text/plain",
+            )
+        }
     }
 }
 

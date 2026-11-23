@@ -36,7 +36,7 @@ And the ceiling, with the network taken out entirely (local files, warm cache):
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
 - **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilisation, and compute only. The ratio is measured; the instance counts are not.
 - **Same picture, not the same bytes.** Valid-data masks agree with TiTiler on 99.6–100% of pixels; pixel values differ slightly on high-frequency imagery (32–34 dB PSNR on Sentinel-2, 49–54 dB on DEMs).
-- **One request in 822 failed.** A single uncached Copernicus tile returned HTTP 500 during the S3 run. It did not reproduce on replay; the likely cause is an S3 range request that failed at the connection level, which `cogzilla` does not yet retry. Fault injection also showed that a stalled S3 response has no timeout. Neither is fixed.
+- **One request in 822 failed.** A single uncached Copernicus tile returned HTTP 500 during the S3 run. It did not reproduce on replay; the likely cause is an S3 range request that failed at the connection level, which `cogzilla` did not retry at the time. It now retries those and times out stalled responses (`GDAL_HTTP_CONNECTTIMEOUT`, default 10 s; `GDAL_HTTP_TIMEOUT`, default 30 s per read), but the S3 benchmark has not been re-run since.
 
 Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md); the local suite is [below](#cogmark-benchmarks-vs-gdal--rio-tiler--titiler).
 

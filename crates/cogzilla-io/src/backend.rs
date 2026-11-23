@@ -8,8 +8,8 @@ use memmap2::Mmap;
 use thiserror::Error;
 
 use crate::s3::{
-    DynamicCredsCache, S3Config, fetch_s3_object, is_retryable_status, parse_s3_uri,
-    retry_backoff_duration,
+    DynamicCredsCache, S3Config, fetch_s3_object, is_retryable_status,
+    is_retryable_transport_error, parse_s3_uri, retry_backoff_duration,
 };
 
 #[derive(Debug, Error)]
@@ -200,9 +200,7 @@ impl CogSource {
                     metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
                     let resp = match client.get(url).header("Range", &range_hdr).send().await {
                         Ok(r) => r,
-                        Err(e)
-                            if attempt < *max_retries && (e.is_timeout() || e.is_connect()) =>
-                        {
+                        Err(e) if attempt < *max_retries && is_retryable_transport_error(&e) => {
                             tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
                             attempt += 1;
                             continue;
@@ -211,7 +209,17 @@ impl CogSource {
                     };
                     let status = resp.status().as_u16();
                     if status == 200 || status == 206 {
-                        let data = resp.bytes().await?;
+                        let data = match resp.bytes().await {
+                            Ok(d) => d,
+                            Err(e)
+                                if attempt < *max_retries && is_retryable_transport_error(&e) =>
+                            {
+                                tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                                attempt += 1;
+                                continue;
+                            }
+                            Err(e) => return Err(IoError::Http(e)),
+                        };
                         metrics
                             .remote_bytes_fetched
                             .fetch_add(data.len() as u64, Ordering::Relaxed);

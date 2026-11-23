@@ -263,7 +263,8 @@ Not modelled, and worth knowing:
 - **cogzilla returned one HTTP 500** in 822 uncached requests. It did not reproduce on replay. The likely
   cause is a single S3 range request failing at the connection level, which cogzilla passes through
   without a retry; fault injection confirmed that gap and also showed a stalled S3 response hangs the
-  request with no timeout. Neither is fixed.
+  request with no timeout. Both were fixed after this run (transport-error retries, connect and read
+  timeouts); the numbers here predate the fix.
 - GDAL's per-tile S3 request counts were taken from its debug log in-process on every fourth tile with
   only headers warm; cogzilla's come from `/stats` during the miss pass with a partly warm block cache.
   They are comparable only roughly.

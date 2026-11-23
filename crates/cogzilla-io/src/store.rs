@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use cogzilla_codec::{DecodedTile, apply_mask_to_tile, decode_mask_tile, decode_tile};
 use cogzilla_tiff::{CogIndex, TiffError, parse_cog};
@@ -40,9 +41,20 @@ pub struct CogStore {
 
 impl CogStore {
     pub fn new(cache_max_bytes: usize) -> Self {
+        // Without these a stalled S3 response would hang the tile request forever. The read timeout
+        // is per read, not per response, so large range bodies are fine as long as bytes keep flowing.
+        let env_secs = |key: &str, default: u64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&s| s > 0)
+                .unwrap_or(default)
+        };
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
+            .connect_timeout(Duration::from_secs(env_secs("GDAL_HTTP_CONNECTTIMEOUT", 10)))
+            .read_timeout(Duration::from_secs(env_secs("GDAL_HTTP_TIMEOUT", 30)))
             .build()
             .expect("reqwest client");
         Self {
