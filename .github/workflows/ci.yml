@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml sets target-cpu=native for local benchmarking. An empty
+  # RUSTFLAGS overrides it, so cached artifacts stay valid across the mixed
+  # CPUs in the hosted runner pool.
+  RUSTFLAGS: ""
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The integration tests skip themselves when benches/fixtures is missing,
+      # so generate the synthetic COGs to make them actually run.
+      - name: Restore fixtures
+        id: fixtures
+        uses: actions/cache@v4
+        with:
+          path: benches/fixtures
+          key: fixtures-${{ hashFiles('benches/generate_fixtures.py', 'benches/generate_landsat_sar_fixtures.py') }}
+      - uses: astral-sh/setup-uv@v5
+        if: steps.fixtures.outputs.cache-hit != 'true'
+      - name: Generate fixtures
+        if: steps.fixtures.outputs.cache-hit != 'true'
+        run: |
+          uv run --no-project --python 3.12 --with rasterio --with numpy benches/generate_fixtures.py
+          uv run --no-project --python 3.12 --with rasterio --with numpy benches/generate_landsat_sar_fixtures.py
+
+      - run: cargo test --workspace --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Fails on clippy errors only; existing warnings are reported, not denied.
+      - run: cargo clippy --workspace --all-targets --locked
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: cogzilla:ci
+      - run: docker run --rm cogzilla:ci --help

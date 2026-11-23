@@ -11,6 +11,8 @@ pub fn fast_db_from_power(power: f32) -> f32 {
     let m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000); // m in [1.0, 2.0)
     // Degree-4 minimax polynomial for log2(m) on [1, 2) via t = m - 1 in [0, 1)
     let t = m - 1.0;
+    // 1.442_695 is a fitted polynomial coefficient, not LOG2_E.
+    #[allow(clippy::approx_constant)]
     let log2_m = (((-0.081_615_807 * t + 0.345_287_06) * t - 0.706_980_2) * t + 1.442_695) * t;
     // 10 * log10(2) = 3.010299956639812
     3.010_3 * (exp + log2_m)
