@@ -296,9 +296,20 @@ impl TileEngine {
                         band_1based, ifd.samples_per_pixel
                     )));
                 }
-                let mut indices = Vec::with_capacity(grid_len);
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
+                // Pad source block range by 2 source pixels so the 1-px DEM border stencil never
+                // misses an adjacent COG internal block at tile boundaries.
+                let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+                let d_tx0 = ((c0 - 2).max(0) as u32) / ifd.tile_width;
+                let d_tx1 = (((c1 + 2).max(0) as u32) / ifd.tile_width)
+                    .min(ifd.tiles_across.saturating_sub(1));
+                let d_ty0 = ((r0 - 2).max(0) as u32) / ifd.tile_height;
+                let d_ty1 = (((r1 + 2).max(0) as u32) / ifd.tile_height)
+                    .min(ifd.tiles_down.saturating_sub(1));
+                let d_gw = d_tx1 - d_tx0 + 1;
+                let d_gh = d_ty1 - d_ty0 + 1;
+                let mut indices = Vec::with_capacity((d_gw * d_gh) as usize);
+                for ty in d_ty0..=d_ty1 {
+                    for tx in d_tx0..=d_tx1 {
                         let idx = ifd.tile_index(tx, ty, band0) as u32;
                         indices.push(Some(idx));
                     }
@@ -317,10 +328,10 @@ impl TileEngine {
                     ifd.height,
                     ifd.tile_width,
                     ifd.tile_height,
-                    tx0,
-                    ty0,
-                    grid_w,
-                    grid_h,
+                    d_tx0,
+                    d_ty0,
+                    d_gw,
+                    d_gh,
                     &block_refs,
                 );
                 if src.all_nodata {
@@ -347,9 +358,20 @@ impl TileEngine {
                         band_1based, ifd.samples_per_pixel
                     )));
                 }
-                let mut indices = Vec::with_capacity(grid_len);
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
+                // Pad source block range by 2 source pixels so the 1-px DEM border stencil never
+                // misses an adjacent COG internal block at tile boundaries.
+                let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+                let d_tx0 = ((c0 - 2).max(0) as u32) / ifd.tile_width;
+                let d_tx1 = (((c1 + 2).max(0) as u32) / ifd.tile_width)
+                    .min(ifd.tiles_across.saturating_sub(1));
+                let d_ty0 = ((r0 - 2).max(0) as u32) / ifd.tile_height;
+                let d_ty1 = (((r1 + 2).max(0) as u32) / ifd.tile_height)
+                    .min(ifd.tiles_down.saturating_sub(1));
+                let d_gw = d_tx1 - d_tx0 + 1;
+                let d_gh = d_ty1 - d_ty0 + 1;
+                let mut indices = Vec::with_capacity((d_gw * d_gh) as usize);
+                for ty in d_ty0..=d_ty1 {
+                    for tx in d_tx0..=d_tx1 {
                         let idx = ifd.tile_index(tx, ty, band0) as u32;
                         indices.push(Some(idx));
                     }
@@ -368,10 +390,10 @@ impl TileEngine {
                     ifd.height,
                     ifd.tile_width,
                     ifd.tile_height,
-                    tx0,
-                    ty0,
-                    grid_w,
-                    grid_h,
+                    d_tx0,
+                    d_ty0,
+                    d_gw,
+                    d_gh,
                     &block_refs,
                 );
                 if src.all_nodata {

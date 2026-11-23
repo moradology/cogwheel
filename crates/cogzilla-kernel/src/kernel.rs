@@ -2389,6 +2389,15 @@ pub fn render_dem_algorithm<const N: usize>(
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
         }
     };
+    // Sub-pixel bounds-checked sampler for the 1-pixel extrapolated border so tile edges
+    // match neighboring tiles' interior pixels with zero staircase seam.
+    let sample_border = |u: f32, v: f32| -> f32 {
+        match style.resample {
+            ResampleMode::Bilinear => sample_bilinear::<false>(src, u, v),
+            ResampleMode::Nearest => sample_nearest::<false>(src, u, v),
+            ResampleMode::Cubic => sample_cubic(src, u, v),
+        }
+    };
 
     // Sample interior N×N elevation grid + 1-pixel extrapolated border -> (N+2)×(N+2)
     let pad = N + 2;
@@ -2415,34 +2424,44 @@ pub fn render_dem_algorithm<const N: usize>(
         for px in 0..N {
             elev[row_off + px + 1] = sample_px(u_row[px], v_row[px]);
         }
-        // Left/right 1-px extrapolated border for seamless horizontal tile edges
+        // Left/right 1-px extrapolated border using the exact same sub-pixel interpolation
         let du_l = u_row[1] - u_row[0];
         let dv_l = v_row[1] - v_row[0];
-        elev[row_off] = src.sample_checked((u_row[0] - du_l).round() as i32, (v_row[0] - dv_l).round() as i32);
+        elev[row_off] = sample_border(u_row[0] - du_l, v_row[0] - dv_l);
         let du_r = u_row[N - 1] - u_row[N - 2];
         let dv_r = v_row[N - 1] - v_row[N - 2];
-        elev[row_off + N + 1] = src.sample_checked(
-            (u_row[N - 1] + du_r).round() as i32,
-            (v_row[N - 1] + dv_r).round() as i32,
-        );
+        elev[row_off + N + 1] = sample_border(u_row[N - 1] + du_r, v_row[N - 1] + dv_r);
         if py + 1 < N {
             u_prev = u_row;
             v_prev = v_row;
         }
     }
-    // Top/bottom 1-px extrapolated border for seamless vertical tile edges
+    // Top/bottom 1-px extrapolated border using the exact same sub-pixel interpolation
     for px in 0..N {
         let u_top = 2.0 * u_first[px] - u_second[px];
         let v_top = 2.0 * v_first[px] - v_second[px];
-        elev[px + 1] = src.sample_checked(u_top.round() as i32, v_top.round() as i32);
+        elev[px + 1] = sample_border(u_top, v_top);
         let u_bot = 2.0 * u_row[px] - u_prev[px];
         let v_bot = 2.0 * v_row[px] - v_prev[px];
-        elev[(N + 1) * pad + px + 1] = src.sample_checked(u_bot.round() as i32, v_bot.round() as i32);
+        elev[(N + 1) * pad + px + 1] = sample_border(u_bot, v_bot);
     }
-    elev[0] = elev[1];
-    elev[pad - 1] = elev[pad - 2];
-    elev[(N + 1) * pad] = elev[(N + 1) * pad + 1];
-    elev[(N + 1) * pad + pad - 1] = elev[(N + 1) * pad + pad - 2];
+    // 4 extrapolated corners for seamless corner stencils
+    elev[0] = sample_border(
+        (2.0 * u_first[0] - u_second[0]) - (u_first[1] - u_first[0]),
+        (2.0 * v_first[0] - v_second[0]) - (v_first[1] - v_first[0]),
+    );
+    elev[pad - 1] = sample_border(
+        (2.0 * u_first[N - 1] - u_second[N - 1]) + (u_first[N - 1] - u_first[N - 2]),
+        (2.0 * v_first[N - 1] - v_second[N - 1]) + (v_first[N - 1] - v_first[N - 2]),
+    );
+    elev[(N + 1) * pad] = sample_border(
+        (2.0 * u_row[0] - u_prev[0]) - (u_row[1] - u_row[0]),
+        (2.0 * v_row[0] - v_prev[0]) - (v_row[1] - v_row[0]),
+    );
+    elev[(N + 1) * pad + pad - 1] = sample_border(
+        (2.0 * u_row[N - 1] - u_prev[N - 1]) + (u_row[N - 1] - u_row[N - 2]),
+        (2.0 * v_row[N - 1] - v_prev[N - 1]) + (v_row[N - 1] - v_row[N - 2]),
+    );
 
     let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
     let inv_range = 255.0 / (style.rescale_max - style.rescale_min).max(1e-12);
@@ -2810,5 +2829,92 @@ mod tests {
             (ramp_aspect - 90.0).abs() < 1e-3,
             "expected 90 deg (East) aspect, got {ramp_aspect}"
         );
+    }
+
+    #[test]
+    fn dem_adjacent_tiles_have_zero_boundary_seam() {
+        // Smooth tilted plane z(c, r) = 1000 - 10*c - 5*r sampled at 4x zoom (step = 0.25 px)
+        // across two adjacent 32x32 tiles. Every border pixel must produce the exact same slope
+        // as the interior (no 1-pixel staircase spike along tile boundaries!).
+        let tw = 64u32;
+        let th = 64u32;
+        let len = (tw * th) as usize;
+        let mut slab = AlignedF32Slab::filled(len, 0.0);
+        for r in 0..th {
+            for c in 0..tw {
+                slab.as_mut_slice()[(r * tw + c) as usize] =
+                    1000.0 - 10.0 * (c as f32) - 5.0 * (r as f32);
+            }
+        }
+        let band = DecodedBand {
+            width: tw,
+            height: th,
+            data: BandData::F32(slab),
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 0.0,
+                max: 1000.0,
+            },
+        };
+        let blks = [Some(&band)];
+        let src = BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &blks);
+
+        let make_tile_plan = |u0: f32, v0: f32| -> CoordPlan<32> {
+            let mut u = [0.0f32; 32];
+            let mut v = [0.0f32; 32];
+            for i in 0..32 {
+                u[i] = u0 + (i as f32) * 0.25;
+                v[i] = v0 + (i as f32) * 0.25;
+            }
+            CoordPlan::Separable1D {
+                u: Box::new(u),
+                v: Box::new(v),
+                src_min_col: 2,
+                src_max_col: 50,
+                src_min_row: 2,
+                src_max_row: 50,
+                all_in_bounds: true,
+            }
+        };
+
+        let left_plan = make_tile_plan(10.0, 10.0);
+        let right_plan = make_tile_plan(18.0, 10.0);
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 90.0,
+            colormap: ColormapName::Viridis,
+            resample: ResampleMode::Bilinear,
+            format: OutputFormat::RawF32,
+        };
+        let left_bytes = render_dem_algorithm(
+            &left_plan,
+            &src,
+            DemAlgorithm::Slope { z_factor: 1.0 },
+            2.5,
+            &style,
+        );
+        let right_bytes = render_dem_algorithm(
+            &right_plan,
+            &src,
+            DemAlgorithm::Slope { z_factor: 1.0 },
+            2.5,
+            &style,
+        );
+        let read_f32 = |b: &[u8], py: usize, px: usize| -> f32 {
+            let off = (py * 32 + px) * 4;
+            f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+        };
+        let expected = read_f32(&left_bytes, 16, 16);
+        for py in 0..32 {
+            let l_edge = read_f32(&left_bytes, py, 31);
+            let r_edge = read_f32(&right_bytes, py, 0);
+            let top_edge = read_f32(&left_bytes, 0, py);
+            let bot_edge = read_f32(&left_bytes, 31, py);
+            assert!((l_edge - expected).abs() < 1e-3, "left edge seam at py={py}: {l_edge} vs {expected}");
+            assert!((r_edge - expected).abs() < 1e-3, "right edge seam at py={py}: {r_edge} vs {expected}");
+            assert!((top_edge - expected).abs() < 1e-3, "top edge seam at px={py}: {top_edge} vs {expected}");
+            assert!((bot_edge - expected).abs() < 1e-3, "bot edge seam at px={py}: {bot_edge} vs {expected}");
+        }
     }
 }
