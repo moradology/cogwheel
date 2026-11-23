@@ -1,6 +1,7 @@
 pub mod bandmath;
 pub mod color_formula;
 pub mod colormap;
+pub mod colormap_catalog;
 mod colormap_data;
 pub mod expr_vm;
 pub mod jpeg_fast;
@@ -16,6 +17,6 @@ pub use expr_vm::ExprProgram;
 pub use kernel::{
     OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, empty_tile_bytes, render_bandmath1,
     render_bandmath2, render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb,
-    render_single_band,
+    render_single_band, sample_cubic,
 };
 pub use source::BandSource;

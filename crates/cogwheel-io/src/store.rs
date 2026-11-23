@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cogwheel_codec::{DecodedTile, decode_tile};
+use cogwheel_codec::{DecodedTile, apply_mask_to_tile, decode_mask_tile, decode_tile};
 use cogwheel_tiff::{CogIndex, TiffError, parse_cog};
 use dashmap::DashMap;
 
@@ -233,7 +233,24 @@ impl CogStore {
                     LookupResult::Hit(hit) => out.push(Some(hit)),
                     LookupResult::Owner => {
                         let guard = self.cache.guard(key);
-                        let decoded = decode_tile(slice, ifd, cog.index.byte_order, cog.index.nodata)?;
+                        let mut decoded =
+                            decode_tile(slice, ifd, cog.index.byte_order, cog.index.nodata)?;
+                        if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                            if mask_ifd.tile_width == ifd.tile_width
+                                && mask_ifd.tile_height == ifd.tile_height
+                            {
+                                let per_plane =
+                                    (ifd.tiles_across as usize) * (ifd.tiles_down as usize);
+                                let mask_idx = (tile_idx as usize) % per_plane.max(1);
+                                if let Some((moff, mlen)) = mask_ifd.tile_byte_range(mask_idx) {
+                                    if let Some(mslice) = cog.source.local_slice(moff, mlen) {
+                                        if let Ok(mask) = decode_mask_tile(mslice, mask_ifd) {
+                                            apply_mask_to_tile(&mut decoded, &mask);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let arc = Arc::new(decoded);
                         guard.complete(arc.clone());
                         out.push(Some(arc));
@@ -349,7 +366,33 @@ impl CogStore {
                                 cog.index.byte_order,
                                 cog.index.nodata,
                             ) {
-                                Ok(decoded) => {
+                                Ok(mut decoded) => {
+                                    if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                                        if mask_ifd.tile_width == ifd.tile_width
+                                            && mask_ifd.tile_height == ifd.tile_height
+                                        {
+                                            if let Some(Some(tidx)) = tile_indices.get(*orig_slot) {
+                                                let per_plane = (ifd.tiles_across as usize)
+                                                    * (ifd.tiles_down as usize);
+                                                let mask_idx = (*tidx as usize) % per_plane.max(1);
+                                                if let Some((moff, mlen)) =
+                                                    mask_ifd.tile_byte_range(mask_idx)
+                                                {
+                                                    if let Ok(mbytes) = cog
+                                                        .source
+                                                        .fetch_range(moff, moff + mlen as u64)
+                                                        .await
+                                                    {
+                                                        if let Ok(mask) =
+                                                            decode_mask_tile(&mbytes, mask_ifd)
+                                                        {
+                                                            apply_mask_to_tile(&mut decoded, &mask);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let arc = Arc::new(decoded);
                                     if let Some(guard) = guard_opt.take() {
                                         guard.complete(arc.clone());

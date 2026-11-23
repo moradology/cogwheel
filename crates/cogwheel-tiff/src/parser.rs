@@ -1,6 +1,6 @@
 use crate::types::{
-    Affine2D, ByteOrder, CogIndex, Compression, GeoKeys, IfdMeta, PlanarConfig, Predictor,
-    SampleType, TiffError,
+    Affine2D, ByteOrder, CogIndex, Compression, GeoKeys, IfdMeta, MaskIfdMeta, PlanarConfig,
+    Predictor, SampleType, TiffError,
 };
 
 // TIFF Tag IDs
@@ -9,14 +9,20 @@ const TAG_IMAGE_WIDTH: u16 = 256;
 const TAG_IMAGE_LENGTH: u16 = 257;
 const TAG_BITS_PER_SAMPLE: u16 = 258;
 const TAG_COMPRESSION: u16 = 259;
+const TAG_PHOTOMETRIC: u16 = 262;
+const TAG_STRIP_OFFSETS: u16 = 273;
 const TAG_SAMPLES_PER_PIXEL: u16 = 277;
+const TAG_ROWS_PER_STRIP: u16 = 278;
+const TAG_STRIP_BYTE_COUNTS: u16 = 279;
 const TAG_PLANAR_CONFIG: u16 = 284;
 const TAG_PREDICTOR: u16 = 317;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_TILE_LENGTH: u16 = 323;
 const TAG_TILE_OFFSETS: u16 = 324;
 const TAG_TILE_BYTE_COUNTS: u16 = 325;
+const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
+const TAG_JPEG_TABLES: u16 = 347;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
@@ -217,6 +223,11 @@ impl TagEntry {
         let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
         Ok(String::from_utf8_lossy(trimmed).trim().to_string())
     }
+
+    fn read_bytes(&self, r: &Reader<'_>) -> Result<Box<[u8]>, TiffError> {
+        let bytes = r.need(self.value_offset, self.count)?;
+        Ok(bytes.to_vec().into_boxed_slice())
+    }
 }
 
 fn parse_geo_keys(raw_keys: &[u16], double_params: &[f64]) -> GeoKeys {
@@ -351,6 +362,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     };
 
     let mut ifds: Vec<IfdMeta> = Vec::with_capacity(8);
+    let mut mask_ifds: Vec<MaskIfdMeta> = Vec::new();
     let mut geo_keys = GeoKeys::default();
     let mut nodata: Option<f32> = None;
     let mut gdal_metadata_xml: Option<String> = None;
@@ -373,10 +385,16 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         let mut planar_config = PlanarConfig::Chunky;
         let mut compression = Compression::None;
         let mut predictor = Predictor::None;
+        let mut photometric = 1u16;
+        let mut extra_samples: Vec<u16> = Vec::new();
+        let mut jpeg_tables: Option<Box<[u8]>> = None;
         let mut bits_per_sample: Option<Vec<u16>> = None;
         let mut sample_format: Option<Vec<u16>> = None;
         let mut tile_offsets: Option<Box<[u64]>> = None;
         let mut tile_byte_counts: Option<Box<[u32]>> = None;
+        let mut strip_offsets: Option<Box<[u64]>> = None;
+        let mut strip_byte_counts: Option<Box<[u32]>> = None;
+        let mut rows_per_strip: u32 = 0;
 
         // GeoTIFF tags (only expected on IFD 0)
         let mut pixel_scale: Option<Vec<f64>> = None;
@@ -396,12 +414,18 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     compression = match code {
                         1 => Compression::None,
                         5 => Compression::Lzw,
+                        7 => Compression::Jpeg,
                         8 | 32946 => Compression::Deflate,
                         50000 => Compression::Zstd,
+                        50001 => Compression::Webp,
                         other => return Err(TiffError::UnsupportedCompression(other)),
                     };
                 }
+                TAG_PHOTOMETRIC => photometric = entry.read_u64_scalar(&r)? as u16,
+                TAG_STRIP_OFFSETS => strip_offsets = Some(entry.read_u64_vec(&r)?),
                 TAG_SAMPLES_PER_PIXEL => samples_per_pixel = entry.read_u64_scalar(&r)? as u16,
+                TAG_ROWS_PER_STRIP => rows_per_strip = entry.read_u64_scalar(&r)? as u32,
+                TAG_STRIP_BYTE_COUNTS => strip_byte_counts = Some(entry.read_u32_vec(&r)?),
                 TAG_PLANAR_CONFIG => {
                     planar_config = match entry.read_u64_scalar(&r)? {
                         1 => PlanarConfig::Chunky,
@@ -422,7 +446,9 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                 TAG_TILE_LENGTH => tile_height = entry.read_u64_scalar(&r)? as u32,
                 TAG_TILE_OFFSETS => tile_offsets = Some(entry.read_u64_vec(&r)?),
                 TAG_TILE_BYTE_COUNTS => tile_byte_counts = Some(entry.read_u32_vec(&r)?),
+                TAG_EXTRA_SAMPLES => extra_samples = entry.read_u16_vec(&r)?,
                 TAG_SAMPLE_FORMAT => sample_format = Some(entry.read_u16_vec(&r)?),
+                TAG_JPEG_TABLES => jpeg_tables = Some(entry.read_bytes(&r)?),
                 TAG_MODEL_PIXEL_SCALE if ifds.is_empty() => {
                     pixel_scale = Some(entry.read_f64_vec(&r)?);
                 }
@@ -453,8 +479,28 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             }
         }
 
-        // Skip transparency mask IFDs (bit 2 of NewSubfileType == 4)
+        // Capture internal transparency mask IFDs (bit 2 of NewSubfileType == 4)
         if (subfile_type & 4) != 0 {
+            let mask_bps = bits_per_sample
+                .as_deref()
+                .and_then(|v| v.first().copied())
+                .unwrap_or(1);
+            if tile_width > 0 && tile_height > 0 && (mask_bps == 1 || mask_bps == 8) {
+                if let (Some(offs), Some(cnts)) = (tile_offsets, tile_byte_counts) {
+                    mask_ifds.push(MaskIfdMeta {
+                        width,
+                        height,
+                        tile_width,
+                        tile_height,
+                        tiles_across: width.div_ceil(tile_width),
+                        tiles_down: height.div_ceil(tile_height),
+                        bits_per_sample: mask_bps,
+                        compression,
+                        tile_offsets: offs,
+                        tile_byte_counts: cnts,
+                    });
+                }
+            }
             continue;
         }
 
@@ -484,11 +530,21 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             }
         };
 
-        if tile_width == 0 || tile_height == 0 {
-            return Err(TiffError::NotTiled);
-        }
-        let tile_offsets = tile_offsets.ok_or(TiffError::NotTiled)?;
-        let tile_byte_counts = tile_byte_counts.ok_or(TiffError::NotTiled)?;
+        let (tile_width, tile_height, tile_offsets, tile_byte_counts, is_stripped) =
+            if tile_width > 0 && tile_height > 0 {
+                let to = tile_offsets.ok_or(TiffError::NotTiled)?;
+                let tbc = tile_byte_counts.ok_or(TiffError::NotTiled)?;
+                (tile_width, tile_height, to, tbc, false)
+            } else if let (Some(so), Some(sbc)) = (strip_offsets, strip_byte_counts) {
+                let rps = if rows_per_strip == 0 || rows_per_strip > height {
+                    height
+                } else {
+                    rows_per_strip
+                };
+                (width, rps, so, sbc, true)
+            } else {
+                return Err(TiffError::NotTiled);
+            };
 
         let tiles_across = width.div_ceil(tile_width);
         let tiles_down = height.div_ceil(tile_height);
@@ -567,6 +623,11 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             planar_config,
             compression,
             predictor,
+            photometric,
+            extra_samples,
+            jpeg_tables,
+            mask_ifd: None,
+            is_stripped,
             pixel_to_crs,
             crs_to_pixel,
             tile_offsets,
@@ -584,6 +645,16 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         let rb = b.pixel_resolution().0;
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Attach internal transparency mask IFDs to matching image IFDs by (width, height)
+    for m in mask_ifds {
+        if let Some(target) = ifds
+            .iter_mut()
+            .find(|i| i.width == m.width && i.height == m.height && i.mask_ifd.is_none())
+        {
+            target.mask_ifd = Some(Box::new(m));
+        }
+    }
 
     let n_bands = ifds[0].samples_per_pixel as usize;
     let mut scales = vec![1.0f32; n_bands];

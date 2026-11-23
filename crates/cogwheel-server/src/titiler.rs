@@ -654,6 +654,9 @@ pub async fn render_wgs84_bbox(
         if resample == ResampleMode::Nearest {
             return src.sample_checked((u + 0.5).floor() as i32, (v + 0.5).floor() as i32);
         }
+        if resample == ResampleMode::Cubic {
+            return cogwheel_kernel::sample_cubic(src, u, v);
+        }
         let x0_f = u.floor();
         let y0_f = v.floor();
         let fx = u - x0_f;

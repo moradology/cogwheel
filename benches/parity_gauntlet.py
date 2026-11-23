@@ -87,6 +87,7 @@ def _write_cog(
     nodata=None,
     scales: tuple[float, ...] | None = None,
     offsets: tuple[float, ...] | None = None,
+    photometric: str | None = None,
 ):
     if path.exists():
         return
@@ -112,6 +113,8 @@ def _write_cog(
         profile["compress"] = compress
         if predictor > 1:
             profile["predictor"] = predictor
+    if photometric:
+        profile["photometric"] = photometric
     if bigtiff:
         profile["BIGTIFF"] = "YES"
 
@@ -138,6 +141,8 @@ def _write_cog(
             copy_kw["compress"] = compress
             if predictor > 1:
                 copy_kw["predictor"] = predictor
+        if photometric:
+            copy_kw["photometric"] = photometric
         if bigtiff:
             copy_kw["BIGTIFF"] = "YES"
         rio_shutil.copy(tmp, path, **copy_kw)
@@ -212,6 +217,22 @@ def build_corpus() -> list[CorpusCase]:
         _write_cog(p, arr, wm_crs, wm_bounds, compress=comp, predictor=pred)
         cases.append(CorpusCase(name, "codec", p, f"rescale={rescale}&colormap_name=plasma&resampling=bilinear"))
 
+    # JPEG-in-TIFF (YCbCr RGB + Grayscale) & WebP-in-TIFF
+    rgb_u8_codec = (_make_pattern(1024, 1024, 3) * 240 + 5).astype(np.uint8)
+    gray_u8_codec = (norm * 240 + 5).astype(np.uint8)
+
+    p = CORPUS_DIR / "codec_jpeg_ycbcr_rgb_u8.tif"
+    _write_cog(p, rgb_u8_codec, wm_crs, wm_bounds, compress="JPEG", photometric="YCBCR", overviews=[2])
+    cases.append(CorpusCase("codec_jpeg_ycbcr_rgb_u8", "codec", p, "bidx=1&bidx=2&bidx=3&resampling=bilinear"))
+
+    p = CORPUS_DIR / "codec_jpeg_gray_u8.tif"
+    _write_cog(p, gray_u8_codec, wm_crs, wm_bounds, compress="JPEG", overviews=[2])
+    cases.append(CorpusCase("codec_jpeg_gray_u8", "codec", p, "colormap_name=viridis&resampling=bilinear"))
+
+    p = CORPUS_DIR / "codec_webp_rgb_u8.tif"
+    _write_cog(p, rgb_u8_codec, wm_crs, wm_bounds, compress="WEBP", overviews=[2])
+    cases.append(CorpusCase("codec_webp_rgb_u8", "codec", p, "bidx=1&bidx=2&bidx=3&resampling=bilinear"))
+
     # ------------------------------------------------------------------
     # 4. INTERLEAVE, BAND COUNTS & STRUCTURAL QUIRKS
     # ------------------------------------------------------------------
@@ -276,6 +297,62 @@ def build_corpus() -> list[CorpusCase]:
         nodata=0, scales=(0.0000275,), offsets=(-0.2,), overviews=[2],
     )
     cases.append(CorpusCase("meta_landsat_unscale_true", "metadata", p, "unscale=true&rescale=0,0.6&colormap_name=viridis&resampling=bilinear"))
+
+    # 4-band RGBA with ExtraSamples alpha mask (diagonal transparent corner)
+    from rasterio.enums import ColorInterp
+    alpha_mask = np.where((xx + yy) < 1100, 0, 255).astype(np.uint8)
+    rgba_u8 = np.vstack([rgb_u8, alpha_mask[None, :, :]])
+    p_rgba = CORPUS_DIR / "mask_rgba_4band_u8.tif"
+    if not p_rgba.exists():
+        transform = from_bounds(*wm_bounds, 1024, 1024)
+        with rasterio.open(
+            p_rgba, "w", driver="GTiff", height=1024, width=1024, count=4, dtype="uint8",
+            crs=wm_crs, transform=transform, tiled=True, blockxsize=256, blockysize=256,
+            compress="DEFLATE", predictor=2,
+        ) as dst:
+            dst.write(rgba_u8)
+            dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha)
+    cases.append(CorpusCase("mask_rgba_4band_u8", "mask", p_rgba, "bidx=1&bidx=2&bidx=3&resampling=bilinear"))
+
+    # 3-band JPEG YCbCr COG with 1-bit internal transparency mask IFD (GDAL_TIFF_INTERNAL_MASK=YES)
+    p_jmask = CORPUS_DIR / "mask_jpeg_internal_1bit.tif"
+    if not p_jmask.exists():
+        transform = from_bounds(*wm_bounds, 1024, 1024)
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+            with rasterio.open(
+                p_jmask, "w", driver="GTiff", height=1024, width=1024, count=3, dtype="uint8",
+                crs=wm_crs, transform=transform, tiled=True, blockxsize=256, blockysize=256,
+                compress="JPEG", photometric="YCBCR",
+            ) as dst:
+                dst.write(rgb_u8)
+                dst.write_mask(alpha_mask)
+    cases.append(CorpusCase("mask_jpeg_internal_1bit", "mask", p_jmask, "bidx=1&bidx=2&bidx=3&resampling=bilinear"))
+
+    # Stripped (non-tiled!) legacy GeoTIFFs: DEFLATE P3 float32 + odd-height RGB uint8 (partial last strip!)
+    p_strip1 = CORPUS_DIR / "struct_stripped_deflate_f32.tif"
+    if not p_strip1.exists():
+        transform = from_bounds(*wm_bounds, 1024, 1024)
+        with rasterio.open(
+            p_strip1, "w", driver="GTiff", height=1024, width=1024, count=1, dtype="float32",
+            crs=wm_crs, transform=transform, tiled=False, blockysize=32, compress="DEFLATE", predictor=3,
+        ) as dst:
+            dst.write(f32_arr)
+    cases.append(CorpusCase("struct_stripped_deflate_f32", "structure", p_strip1, "rescale=0,1000&colormap_name=spectral_r&resampling=bilinear"))
+
+    p_strip2 = CORPUS_DIR / "struct_stripped_odd_rows_rgb_u8.tif"
+    if not p_strip2.exists():
+        odd_rgb = (_make_pattern(950, 1024, 3) * 240 + 5).astype(np.uint8)
+        transform = from_bounds(*wm_bounds, 1024, 950)
+        with rasterio.open(
+            p_strip2, "w", driver="GTiff", height=950, width=1024, count=3, dtype="uint8",
+            crs=wm_crs, transform=transform, tiled=False, blockysize=64, compress="NONE",
+        ) as dst:
+            dst.write(odd_rgb)
+    cases.append(CorpusCase("struct_stripped_odd_rows_rgb_u8", "structure", p_strip2, "bidx=1&bidx=2&bidx=3&resampling=bilinear"))
+
+    # Bicubic (4x4 Catmull-Rom) resampling parity (single-band f32 + 3-band RGB u8)
+    cases.append(CorpusCase("resample_cubic_f32", "resampling", CORPUS_DIR / "proj_3857_mercator.tif", "rescale=0,1000&colormap_name=cividis&resampling=cubic", check_stats=False, check_point=False))
+    cases.append(CorpusCase("resample_cubic_rgb_u8", "resampling", CORPUS_DIR / "layout_rgb_pixel_u8.tif", "bidx=1&bidx=2&bidx=3&resampling=cubic", check_stats=False, check_point=False))
 
     return cases
 

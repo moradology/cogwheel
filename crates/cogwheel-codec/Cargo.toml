@@ -8,3 +8,5 @@ cogwheel-tiff = { path = "../cogwheel-tiff" }
 thiserror.workspace = true
 libdeflater.workspace = true
 zstd-sys.workspace = true
+libwebp-sys.workspace = true
+zune-jpeg.workspace = true

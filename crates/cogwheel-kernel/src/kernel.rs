@@ -17,6 +17,7 @@ use crate::webp_fast::{empty_transparent_webp, encode_webp_rgb, encode_webp_rgba
 pub enum ResampleMode {
     Nearest,
     Bilinear,
+    Cubic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -285,6 +286,61 @@ fn sample_nearest<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f3
     } else {
         src.sample_checked(x, y)
     }
+}
+
+/// 4x4 Keys/Catmull-Rom bicubic kernel (`a = -0.5`, matching GDAL `GRA_Cubic`),
+/// falling back cleanly to nodata-aware bilinear near nodata or raster boundaries.
+#[inline(always)]
+fn cubic_weight(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 1.0 {
+        (1.5 * ax - 2.5) * ax * ax + 1.0
+    } else if ax < 2.0 {
+        ((-0.5 * ax + 2.5) * ax - 4.0) * ax + 2.0
+    } else {
+        0.0
+    }
+}
+
+#[inline(always)]
+pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
+    if !u.is_finite() || !v.is_finite() {
+        return f32::NAN;
+    }
+    let x0_f = u.floor();
+    let y0_f = v.floor();
+    let fx = u - x0_f;
+    let fy = v - y0_f;
+    let x0 = x0_f as i32;
+    let y0 = y0_f as i32;
+
+    let wx = [
+        cubic_weight(fx + 1.0),
+        cubic_weight(fx),
+        cubic_weight(1.0 - fx),
+        cubic_weight(2.0 - fx),
+    ];
+    let wy = [
+        cubic_weight(fy + 1.0),
+        cubic_weight(fy),
+        cubic_weight(1.0 - fy),
+        cubic_weight(2.0 - fy),
+    ];
+
+    let mut acc = 0.0f32;
+    for j in 0..4 {
+        let mut row_acc = 0.0f32;
+        let ry = y0 + (j as i32) - 1;
+        for i in 0..4 {
+            let v_s = src.sample_checked(x0 + (i as i32) - 1, ry);
+            if v_s.is_nan() {
+                return sample_bilinear::<false>(src, u, v);
+            }
+            row_acc += v_s * wx[i];
+        }
+        acc += row_acc * wy[j];
+    }
+    acc
 }
 
 #[inline(always)]
@@ -667,6 +723,7 @@ pub fn render_single_band<const N: usize>(
         (ResampleMode::Bilinear, false) => render_single_specialized::<N, true, false>(plan, src, style),
         (ResampleMode::Nearest, true) => render_single_specialized::<N, false, true>(plan, src, style),
         (ResampleMode::Nearest, false) => render_single_specialized::<N, false, false>(plan, src, style),
+        (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| sample_cubic(src, u, v)),
     }
 }
 
@@ -847,6 +904,94 @@ pub fn render_rgb_bands<const N: usize>(
         (ResampleMode::Bilinear, false) => render_rgb_specialized::<N, true, false>(plan, srcs, style),
         (ResampleMode::Nearest, true) => render_rgb_specialized::<N, false, true>(plan, srcs, style),
         (ResampleMode::Nearest, false) => render_rgb_specialized::<N, false, false>(plan, srcs, style),
+        (ResampleMode::Cubic, _) => render_rgb_cubic::<N>(plan, srcs, style),
+    }
+}
+
+fn render_rgb_cubic<const N: usize>(
+    plan: &CoordPlan<N>,
+    srcs: &[BandSource<'_>; 3],
+    style: &RgbStyle,
+) -> Bytes {
+    let inv = [
+        255.0 / (style.rescale_max[0] - style.rescale_min[0]).max(1e-12),
+        255.0 / (style.rescale_max[1] - style.rescale_min[1]).max(1e-12),
+        255.0 / (style.rescale_max[2] - style.rescale_min[2]).max(1e-12),
+    ];
+    let mins = style.rescale_min;
+    match style.format {
+        OutputFormat::RawF32 => {
+            let mut out = BytesMut::with_capacity(N * N * 12);
+            for b in 0..3 {
+                for py in 0..N {
+                    for_each_pixel_in_row(plan, py, |_px, u, v| {
+                        out.put_slice(&sample_cubic(&srcs[b], u, v).to_le_bytes());
+                    });
+                }
+            }
+            out.freeze()
+        }
+        OutputFormat::Png => SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            let stride = 1 + N * 4;
+            let total = N * stride;
+            if sc.img_buf.len() < total {
+                sc.img_buf.resize(total, 0);
+            }
+            if sc.row_buf.len() < N * 4 {
+                sc.row_buf.resize(N * 4, 0);
+            }
+            for py in 0..N {
+                let row = &mut sc.row_buf[..N * 4];
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    let r = sample_cubic(&srcs[0], u, v);
+                    let g = sample_cubic(&srcs[1], u, v);
+                    let b = sample_cubic(&srcs[2], u, v);
+                    let off = px * 4;
+                    if r.is_nan() || g.is_nan() || b.is_nan() {
+                        row[off..off + 4].fill(0);
+                    } else {
+                        row[off] = rescale_u8(r, inv[0], mins[0]);
+                        row[off + 1] = rescale_u8(g, inv[1], mins[1]);
+                        row[off + 2] = rescale_u8(b, inv[2], mins[2]);
+                        row[off + 3] = 255;
+                    }
+                });
+                filter_sub_rgba_row(row, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+            }
+            encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
+        }),
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            let total = N * N * 4;
+            if sc.img_buf.len() < total {
+                sc.img_buf.resize(total, 0);
+            }
+            let buf = &mut sc.img_buf[..total];
+            for py in 0..N {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    let r = sample_cubic(&srcs[0], u, v);
+                    let g = sample_cubic(&srcs[1], u, v);
+                    let b = sample_cubic(&srcs[2], u, v);
+                    let off = (py * N + px) * 4;
+                    if r.is_nan() || g.is_nan() || b.is_nan() {
+                        buf[off..off + 4].fill(0);
+                    } else {
+                        buf[off] = rescale_u8(r, inv[0], mins[0]);
+                        buf[off + 1] = rescale_u8(g, inv[1], mins[1]);
+                        buf[off + 2] = rescale_u8(b, inv[2], mins[2]);
+                        buf[off + 3] = 255;
+                    }
+                });
+            }
+            match style.format {
+                OutputFormat::Jpeg { quality: jq } => encode_jpeg_rgba(N as u32, N as u32, buf, jq),
+                OutputFormat::Webp { quality } => encode_webp_rgba(N as u32, N as u32, buf, quality),
+                _ => unreachable!(),
+            }
+        }),
     }
 }
 
@@ -970,6 +1115,9 @@ pub fn render_bandmath1<const N: usize>(
         }
         (ResampleMode::Nearest, false) => {
             render_eval_fn(plan, style, |u, v| expr.eval1(sample_nearest::<false>(src, u, v)))
+        }
+        (ResampleMode::Cubic, _) => {
+            render_eval_fn(plan, style, |u, v| expr.eval1(sample_cubic(src, u, v)))
         }
     }
 }
@@ -1152,6 +1300,15 @@ pub fn render_bandmath2<const N: usize>(
                 expr.eval2(a, b)
             }
         }),
+        (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| {
+            let a = sample_cubic(&srcs[0], u, v);
+            let b = sample_cubic(&srcs[1], u, v);
+            if a.is_nan() || b.is_nan() {
+                f32::NAN
+            } else {
+                expr.eval2(a, b)
+            }
+        }),
     }
 }
 
@@ -1198,6 +1355,16 @@ pub fn render_bandmath3<const N: usize>(
             let a = sample_nearest::<false>(&srcs[0], u, v);
             let b = sample_nearest::<false>(&srcs[1], u, v);
             let c = sample_nearest::<false>(&srcs[2], u, v);
+            if a.is_nan() || b.is_nan() || c.is_nan() {
+                f32::NAN
+            } else {
+                expr.eval3(a, b, c)
+            }
+        }),
+        (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| {
+            let a = sample_cubic(&srcs[0], u, v);
+            let b = sample_cubic(&srcs[1], u, v);
+            let c = sample_cubic(&srcs[2], u, v);
             if a.is_nan() || b.is_nan() || c.is_nan() {
                 f32::NAN
             } else {

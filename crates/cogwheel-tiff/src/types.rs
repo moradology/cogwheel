@@ -30,8 +30,10 @@ pub enum ByteOrder {
 pub enum Compression {
     None,
     Lzw,
+    Jpeg,
     Deflate,
     Zstd,
+    Webp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,7 +161,35 @@ pub struct GeoKeys {
     pub scale_at_nat_origin: Option<f64>,
 }
 
-/// Compact metadata for a single IFD (full resolution or overview) of a float32 COG.
+/// Compact metadata for an internal transparency mask IFD (`NewSubfileType & 4 != 0`),
+/// e.g. GDAL's 1-bit or 8-bit `GDAL_TIFF_INTERNAL_MASK` paired with JPEG/YCbCr COGs.
+#[derive(Debug, Clone)]
+pub struct MaskIfdMeta {
+    pub width: u32,
+    pub height: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub tiles_across: u32,
+    pub tiles_down: u32,
+    pub bits_per_sample: u16,
+    pub compression: Compression,
+    pub tile_offsets: Box<[u64]>,
+    pub tile_byte_counts: Box<[u32]>,
+}
+
+impl MaskIfdMeta {
+    #[inline(always)]
+    pub fn tile_byte_range(&self, tile_idx: usize) -> Option<(u64, u32)> {
+        let count = *self.tile_byte_counts.get(tile_idx)?;
+        if count == 0 {
+            return None;
+        }
+        let offset = *self.tile_offsets.get(tile_idx)?;
+        Some((offset, count))
+    }
+}
+
+/// Compact metadata for a single IFD (full resolution or overview) of a COG.
 #[derive(Debug, Clone)]
 pub struct IfdMeta {
     pub width: u32,
@@ -173,6 +203,16 @@ pub struct IfdMeta {
     pub planar_config: PlanarConfig,
     pub compression: Compression,
     pub predictor: Predictor,
+    /// PhotometricInterpretation tag (262): 1=MinIsBlack, 2=RGB, 6=YCbCr, etc.
+    pub photometric: u16,
+    /// ExtraSamples tag (338): 1=AssociatedAlpha, 2=UnassociatedAlpha.
+    pub extra_samples: Vec<u16>,
+    /// Shared JPEG quantization/Huffman tables from tag 347 (`JPEGTables`) for abbreviated JPEG tiles.
+    pub jpeg_tables: Option<Box<[u8]>>,
+    /// Optional internal transparency mask IFD (`NewSubfileType & 4 != 0`) matching this IFD's dimensions.
+    pub mask_ifd: Option<Box<MaskIfdMeta>>,
+    /// True if this IFD is strip-organized (`StripOffsets`/`RowsPerStrip`) rather than tiled.
+    pub is_stripped: bool,
     pub pixel_to_crs: Affine2D,
     pub crs_to_pixel: Affine2D,
     /// Flat array of tile byte offsets.

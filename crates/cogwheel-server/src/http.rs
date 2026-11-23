@@ -227,6 +227,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "resample" | "resampling" => {
                 pq.resample = match v {
                     "nearest" => ResampleMode::Nearest,
+                    "cubic" | "cubicspline" | "lanczos" => ResampleMode::Cubic,
                     _ => ResampleMode::Bilinear,
                 };
             }
@@ -536,6 +537,63 @@ pub async fn handle_request(
 
     if method == Method::GET && path == "/healthz" {
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"ok"), "text/plain"));
+    }
+
+    if method == Method::GET && path == "/openapi.json" {
+        let spec = serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {
+                "title": "cogwheel",
+                "version": env!("CARGO_PKG_VERSION"),
+                "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG & STAC tile server"
+            },
+            "paths": {
+                "/healthz": { "get": { "summary": "Health check" } },
+                "/cog/info": { "get": { "summary": "COG metadata" } },
+                "/cog/info.geojson": { "get": { "summary": "COG GeoJSON metadata" } },
+                "/cog/bounds": { "get": { "summary": "COG WGS84 bounds" } },
+                "/cog/statistics": { "get": { "summary": "COG statistics" }, "post": { "summary": "Polygon-clipped COG statistics" } },
+                "/cog/tiles": { "get": { "summary": "List COG tilesets" } },
+                "/cog/tiles/{tileMatrixSetId}": { "get": { "summary": "COG tileset metadata" } },
+                "/cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render COG map tile" } },
+                "/cog/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "COG TileJSON 3.0" } },
+                "/cog/{tileMatrixSetId}/map.html": { "get": { "summary": "Interactive Leaflet map viewer" } },
+                "/cog/point/{lon},{lat}": { "get": { "summary": "Sample pixel values at point" } },
+                "/cog/preview.{format}": { "get": { "summary": "Render COG preview" } },
+                "/cog/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}": { "get": { "summary": "Render COG bbox crop" } },
+                "/cog/feature/{width}x{height}.{format}": { "post": { "summary": "Render GeoJSON feature crop" } },
+                "/stac/assets": { "get": { "summary": "List STAC Item raster assets" } },
+                "/stac/info": { "get": { "summary": "STAC assets metadata" } },
+                "/stac/info.geojson": { "get": { "summary": "STAC GeoJSON metadata" } },
+                "/stac/asset_statistics": { "get": { "summary": "Per-asset STAC statistics" } },
+                "/stac/statistics": { "get": { "summary": "Merged STAC statistics" }, "post": { "summary": "Polygon-clipped STAC statistics" } },
+                "/stac/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render STAC multi-asset tile" } },
+                "/stac/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "STAC TileJSON 3.0" } },
+                "/stac/point/{lon},{lat}": { "get": { "summary": "Sample STAC asset values at point" } },
+                "/stac/preview/{width}x{height}.{format}": { "get": { "summary": "Render STAC preview" } },
+                "/colorMaps": { "get": { "summary": "List all 211 rio-tiler colormaps" } },
+                "/colorMaps/{colorMapId}": { "get": { "summary": "Get colormap RGBA LUT JSON or ?f=png colorbar" } },
+                "/tileMatrixSets": { "get": { "summary": "List OGC TileMatrixSets" } },
+                "/tileMatrixSets/{tileMatrixSetId}": { "get": { "summary": "Get OGC TileMatrixSet 2.0 definition" } }
+            }
+        })
+        .to_string();
+        return Ok(plain_resp(StatusCode::OK, Bytes::from(spec), "application/json"));
+    }
+
+    if method == Method::GET && path == "/docs" {
+        const SWAGGER_HTML: &str = r#"<!DOCTYPE html>
+<html><head><title>cogwheel API Docs</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+</head><body><div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui'});</script>
+</body></html>"#;
+        return Ok(plain_resp(
+            StatusCode::OK,
+            Bytes::from_static(SWAGGER_HTML.as_bytes()),
+            "text/html; charset=utf-8",
+        ));
     }
 
     if method == Method::GET && path == "/stats" {

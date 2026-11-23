@@ -251,7 +251,7 @@ pub const AVAILABLE_COLORMAPS: &[&str] = &[
 ];
 
 pub fn list_colormaps_json(host: &str) -> serde_json::Value {
-    let items: Vec<serde_json::Value> = AVAILABLE_COLORMAPS
+    let items: Vec<serde_json::Value> = cogwheel_kernel::colormap_catalog::COLORMAP_CATALOG_NAMES
         .iter()
         .map(|id| {
             serde_json::json!({
@@ -274,8 +274,8 @@ pub fn get_colormap_json(id: &str) -> Result<serde_json::Value, EngineError> {
     let lut = cm.lut();
     let mut map = serde_json::Map::with_capacity(256);
     for i in 0..256 {
-        let c = lut.rgb[i];
-        map.insert(i.to_string(), serde_json::json!([c[0], c[1], c[2], 255]));
+        let [r, g, b, a] = lut.rgba_u32[i].to_le_bytes();
+        map.insert(i.to_string(), serde_json::json!([r, g, b, a]));
     }
     Ok(serde_json::Value::Object(map))
 }

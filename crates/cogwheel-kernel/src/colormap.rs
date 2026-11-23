@@ -62,11 +62,17 @@ pub enum ColormapName {
     Terrain,
     Coolwarm,
     Ndvi,
+    /// Index into the full 211-entry `rio-tiler` colormap catalog (`COLORMAP_CATALOG_NAMES`).
+    Catalog(u16),
 }
 
 impl ColormapName {
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
+        let lower = s.to_ascii_lowercase();
+        if let Some(idx) = crate::colormap_catalog::lookup_catalog_index(&lower) {
+            return Some(Self::Catalog(idx));
+        }
+        match lower.as_str() {
             "gray" | "grey" | "grayscale" => Some(Self::Grayscale),
             "viridis" => Some(Self::Viridis),
             "magma" => Some(Self::Magma),
@@ -82,6 +88,7 @@ impl ColormapName {
 
     pub fn lut(self) -> &'static ColormapLut {
         match self {
+            Self::Catalog(idx) => crate::colormap_catalog::catalog_lut(idx),
             Self::Grayscale => {
                 static LUT: OnceLock<ColormapLut> = OnceLock::new();
                 LUT.get_or_init(|| ColormapLut::from_rgb_table(GRAYSCALE_RGB))
