@@ -122,10 +122,13 @@ impl CogStore {
                 let fut = notify.notified();
                 tokio::pin!(fut);
                 fut.as_mut().enable();
-                if let Some(existing) = self.datasets_by_uri.get(uri) {
-                    if let OpenSlot::Ready(cog) = existing.value() {
-                        return Ok(cog.clone());
-                    }
+                match self.datasets_by_uri.get(uri) {
+                    Some(existing) => match existing.value() {
+                        OpenSlot::Ready(cog) => return Ok(cog.clone()),
+                        OpenSlot::InFlight(cur_n) if !Arc::ptr_eq(cur_n, &notify) => continue,
+                        OpenSlot::InFlight(_) => {}
+                    },
+                    None => continue,
                 }
                 fut.await;
                 continue;
@@ -140,7 +143,10 @@ impl CogStore {
             impl Drop for OpenAbortGuard<'_> {
                 fn drop(&mut self) {
                     if !self.done {
-                        if let Some((_, OpenSlot::InFlight(n))) = self.map.remove(&self.uri) {
+                        if let Some((_, OpenSlot::InFlight(n))) = self
+                            .map
+                            .remove_if(&self.uri, |_, v| matches!(v, OpenSlot::InFlight(_)))
+                        {
                             n.notify_waiters();
                         }
                     }

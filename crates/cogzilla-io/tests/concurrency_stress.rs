@@ -152,5 +152,347 @@ async fn singleflight_open_uri_and_midflight_cancellation_never_deadlock() {
     for h in evict_tasks {
         h.await.unwrap();
     }
-    assert!(tiny_store.cache.current_bytes() <= 12 * 1024 * 1024);
+    assert!(
+        tiny_store.cache.current_bytes() <= 4 * 1024 * 1024,
+        "cache exceeded 4 MiB cap: {}",
+        tiny_store.cache.current_bytes()
+    );
+    assert_eq!(
+        tiny_store.cache.current_bytes(),
+        tiny_store.cache.exact_ready_bytes(),
+        "current_bytes drifted from actual Ready bytes in map"
+    );
+    assert_eq!(tiny_store.cache.in_flight_count(), 0, "leaked InFlight entries");
+}
+
+fn make_test_tile(floats: usize, val: f32) -> Arc<cogzilla_codec::DecodedTile> {
+    use cogzilla_codec::{AlignedF32Slab, BlockStats, DecodedBand, DecodedTile};
+    Arc::new(DecodedTile {
+        bands: vec![DecodedBand {
+            data: AlignedF32Slab::filled(floats, val),
+            width: 32,
+            height: 32,
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: val,
+                max: val,
+            },
+        }],
+    })
+}
+
+/// 64 tasks hammering a tiny 4-block cache across 64 keys with singleflight races,
+/// mid-flight aborts, and continuous eviction. Verifies zero deadlocks, strict cap
+/// enforcement, zero InFlight leaks, and exact byte accounting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cache_thundering_herd_stays_bounded_and_exact() {
+    use cogzilla_io::cache::{BlockKey, LookupResult, SingleflightBlockCache};
+
+    const BLOCK_FLOATS: usize = 1024;
+    const BLOCK_BYTES: usize = BLOCK_FLOATS * 4;
+    const CAP_BLOCKS: usize = 4;
+    const CAP_BYTES: usize = CAP_BLOCKS * BLOCK_BYTES;
+
+    let cache = Arc::new(SingleflightBlockCache::new(CAP_BYTES));
+    let mut tasks = Vec::new();
+
+    for t in 0..64u32 {
+        let c = cache.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut rng = (t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            for step in 0..250u32 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let tidx = (rng % 48) as u32;
+                let key = BlockKey {
+                    dataset_id: 1,
+                    ifd_idx: 0,
+                    tile_idx: tidx,
+                };
+                match c.acquire(key) {
+                    LookupResult::Hit(_) => {}
+                    LookupResult::Owner => {
+                        let guard = c.guard(key);
+                        // Yield occasionally to widen the race window with waiters & evictors
+                        if step % 5 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        // Abort 20% of owned fetches to hammer abort + waiter recovery
+                        if rng % 5 == 0 {
+                            drop(guard);
+                        } else {
+                            guard.complete(make_test_tile(BLOCK_FLOATS, tidx as f32));
+                        }
+                    }
+                    LookupResult::Wait(notify) => {
+                        let fut = notify.notified();
+                        tokio::pin!(fut);
+                        fut.as_mut().enable();
+                        if let Some(Err(live)) = c.peek_state(&key) {
+                            if Arc::ptr_eq(&notify, &live) {
+                                let _ = tokio::time::timeout(Duration::from_secs(2), fut)
+                                    .await
+                                    .expect("singleflight waiter deadlocked!");
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in tasks {
+        tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .expect("thundering herd task deadlocked!")
+            .unwrap();
+    }
+
+    assert!(
+        cache.current_bytes() <= CAP_BYTES,
+        "cache exceeded cap after thundering herd: {} > {}",
+        cache.current_bytes(),
+        CAP_BYTES
+    );
+    assert_eq!(
+        cache.current_bytes(),
+        cache.exact_ready_bytes(),
+        "byte counter drifted from exact map contents"
+    );
+    assert_eq!(cache.in_flight_count(), 0, "leaked InFlight entries");
+}
+
+/// 16 reader tasks continuously hot-stamping every cached key while 16 writer tasks insert
+/// new keys into a small cap. Ensures Pass-2 eviction still enforces the memory cap even
+/// when every entry's `last_used` stamp changes mid-snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cache_all_hot_read_storm_still_enforces_cap() {
+    use cogzilla_io::cache::{BlockKey, LookupResult, SingleflightBlockCache};
+    use std::sync::atomic::AtomicBool;
+
+    const BLOCK_FLOATS: usize = 1024;
+    const BLOCK_BYTES: usize = BLOCK_FLOATS * 4;
+    const CAP_BYTES: usize = 8 * BLOCK_BYTES;
+
+    let cache = Arc::new(SingleflightBlockCache::new(CAP_BYTES));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut readers = Vec::new();
+    for r in 0..16u32 {
+        let c = cache.clone();
+        let s = stop.clone();
+        readers.push(tokio::spawn(async move {
+            let mut k = r;
+            while !s.load(Ordering::Relaxed) {
+                let key = BlockKey {
+                    dataset_id: 1,
+                    ifd_idx: 0,
+                    tile_idx: k % 64,
+                };
+                let _ = c.try_get_fast(&key);
+                k = k.wrapping_add(1);
+                if k % 32 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+
+    let mut writers = Vec::new();
+    for w in 0..16u32 {
+        let c = cache.clone();
+        writers.push(tokio::spawn(async move {
+            for i in 0..120u32 {
+                let key = BlockKey {
+                    dataset_id: 1,
+                    ifd_idx: 0,
+                    tile_idx: (w * 13 + i) % 64,
+                };
+                if matches!(c.acquire(key), LookupResult::Owner) {
+                    let guard = c.guard(key);
+                    guard.complete(make_test_tile(BLOCK_FLOATS, i as f32));
+                }
+                if i % 8 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+
+    for h in writers {
+        h.await.unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in readers {
+        h.await.unwrap();
+    }
+
+    assert!(
+        cache.current_bytes() <= CAP_BYTES,
+        "all-hot storm broke cache cap: {} > {}",
+        cache.current_bytes(),
+        CAP_BYTES
+    );
+    assert_eq!(cache.current_bytes(), cache.exact_ready_bytes());
+    assert_eq!(cache.in_flight_count(), 0);
+}
+
+/// Repeatedly cancel owners of `open_uri` at staggered intervals to exercise the
+/// `OpenAbortGuard` + `Notify::enable()` race window across many rounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn open_uri_cancellation_storm_never_deadlocks() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/mercator_4k_zstd_p3.tif");
+    if !path.exists() {
+        return;
+    }
+    let bytes = Arc::new(std::fs::read(&path).unwrap());
+    let (base_url, _reqs) = start_mock_range_server(bytes, 15).await;
+    let store = Arc::new(CogStore::new(16 * 1024 * 1024));
+
+    for round in 0..8u32 {
+        let url = format!("{base_url}?round={round}");
+        let mut doomed = Vec::new();
+        let mut survivors = Vec::new();
+        for i in 0..48u32 {
+            let s = store.clone();
+            let u = url.clone();
+            let h = tokio::spawn(async move { s.open_uri(&u).await.unwrap() });
+            if i < 20 {
+                doomed.push(h);
+            } else {
+                survivors.push(h);
+            }
+        }
+        // Staggered aborts across 0..10 ms to hit both pre-enable and post-enable windows
+        for (idx, h) in doomed.into_iter().enumerate() {
+            if idx % 5 == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            h.abort();
+        }
+        for h in survivors {
+            let cog = tokio::time::timeout(Duration::from_secs(3), h)
+                .await
+                .expect("open_uri waiter deadlocked after owner cancellation!")
+                .unwrap();
+            assert_eq!(cog.uri, url);
+        }
+    }
+}
+
+/// Flaky remote server (returns HTTP 500 on first 12 range requests, then succeeds) +
+/// 48 concurrent multi-block `get_blocks` calls with duplicate tile indices and mid-flight aborts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn flaky_remote_singleflight_and_aborts_never_deadlock() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/mercator_4k_zstd_p3.tif");
+    if !path.exists() {
+        return;
+    }
+    let bytes = Arc::new(std::fs::read(&path).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let req_counter = Arc::new(AtomicU64::new(0));
+    let rc_srv = req_counter.clone();
+    let data_srv = bytes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let io = TokioIo::new(stream);
+            let data = data_srv.clone();
+            let rc = rc_srv.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let data = data.clone();
+                    let rc = rc.clone();
+                    async move {
+                        let n = rc.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(8)).await;
+                        // Succeed on header (n == 0), then fail requests 1..=6 with 500s
+                        if (1..=6).contains(&n) {
+                            let mut resp = Response::new(Full::new(Bytes::from_static(b"boom")));
+                            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok::<_, Infallible>(resp);
+                        }
+                        let total = data.len();
+                        let range = req
+                            .headers()
+                            .get("range")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.strip_prefix("bytes="));
+                        if let Some(r) = range {
+                            if let Some((a, b)) = r.split_once('-') {
+                                let start: usize = a.parse().unwrap_or(0);
+                                let end_incl: usize = b.parse().unwrap_or(total - 1).min(total - 1);
+                                let slice = &data[start..=end_incl];
+                                let mut resp = Response::new(Full::new(Bytes::copy_from_slice(slice)));
+                                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                                resp.headers_mut()
+                                    .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                                resp.headers_mut().insert(
+                                    CONTENT_RANGE,
+                                    HeaderValue::from_str(&format!("bytes {start}-{end_incl}/{total}")).unwrap(),
+                                );
+                                resp.headers_mut().insert(
+                                    CONTENT_LENGTH,
+                                    HeaderValue::from_str(&slice.len().to_string()).unwrap(),
+                                );
+                                return Ok::<_, Infallible>(resp);
+                            }
+                        }
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
+                    }
+                });
+                let _ = ServerBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+
+    let url = format!("http://{addr}/flaky.tif");
+    let store = Arc::new(CogStore::new(4 * 1024 * 1024));
+    let cog = store.open_uri(&url).await.unwrap();
+
+    let mut doomed = Vec::new();
+    let mut survivors = Vec::new();
+    for i in 0..48u32 {
+        let s = store.clone();
+        let c = cog.clone();
+        let h = tokio::spawn(async move {
+            // Overlapping batches with duplicate indices in the same request
+            let b0 = i % 8;
+            let b1 = (i + 1) % 8;
+            s.get_blocks(&c, 0, &[Some(b0), Some(b1), Some(b0)]).await
+        });
+        if i < 12 {
+            doomed.push(h);
+        } else {
+            survivors.push(h);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    for h in doomed {
+        h.abort();
+    }
+    for h in survivors {
+        let res = tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect("flaky singleflight waiter deadlocked!")
+            .unwrap();
+        if let Ok(blocks) = res {
+            assert_eq!(blocks.len(), 3);
+            assert!(blocks[0].is_some() && blocks[1].is_some() && blocks[2].is_some());
+        }
+    }
+    // After transient failures pass, a clean fetch must succeed and leave 0 leaked InFlight slots
+    let clean = store.get_blocks(&cog, 0, &[Some(0), Some(1)]).await.unwrap();
+    assert!(clean[0].is_some() && clean[1].is_some());
+    assert!(store.cache.current_bytes() <= 4 * 1024 * 1024);
+    assert_eq!(store.cache.current_bytes(), store.cache.exact_ready_bytes());
+    assert_eq!(store.cache.in_flight_count(), 0);
 }
