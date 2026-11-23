@@ -23,7 +23,7 @@ enum CacheEntry {
 
 #[inline(always)]
 fn tile_bytes(tile: &DecodedTile) -> usize {
-    tile.bands.iter().map(|b| b.data.len() * 4).sum()
+    tile.bands.iter().map(|b| b.data.byte_len()).sum()
 }
 
 /// Sharded lock-free singleflight cache for decoded `AlignedF32Slab` COG blocks.
@@ -364,7 +364,7 @@ mod tests {
     fn block() -> Arc<DecodedTile> {
         Arc::new(DecodedTile {
             bands: vec![DecodedBand {
-                data: AlignedF32Slab::filled(BLOCK_FLOATS, 1.0),
+                data: AlignedF32Slab::filled(BLOCK_FLOATS, 1.0).into(),
                 width: 32,
                 height: 32,
                 stats: BlockStats {

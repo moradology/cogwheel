@@ -18,7 +18,7 @@ fn decode_all_tiles_band0(path: &PathBuf) -> Vec<f32> {
             let (off, len) = ifd.tile_byte_range(tx, ty, 0).expect("non-sparse tile");
             let slice = &bytes[off as usize..(off as usize + len as usize)];
             let decoded = decode_tile(slice, ifd, cog.byte_order, cog.nodata).expect("decode");
-            out.extend_from_slice(&decoded.bands[0].data);
+            out.extend_from_slice(decoded.bands[0].data.as_f32_slice().expect("f32 band"));
         }
     }
     out

@@ -119,7 +119,7 @@ impl<'a> BandSource<'a> {
         match unsafe { *self.blocks.get_unchecked(bidx) } {
             Some(blk) => {
                 let pidx = (ly as usize) * (self.tile_w as usize) + (lx as usize);
-                unsafe { *blk.data.as_slice().get_unchecked(pidx) }
+                unsafe { blk.data.get_f32_unchecked(pidx) }
             }
             None => f32::NAN,
         }
@@ -132,15 +132,16 @@ impl<'a> BandSource<'a> {
         self.no_nodata && c0 >= 0 && r0 >= 0 && c1 < self.ifd_w && r1 < self.ifd_h
     }
 
-    /// If the tile intersects a single decoded block (`grid_w == 1 && grid_h == 1`), return
+    /// If the tile intersects a single decoded `f32` block (`grid_w == 1 && grid_h == 1`), return
     /// `(flat_slice, base_col, base_row, row_stride)` so hot scanline loops can hoist pointers
     /// and bypass per-pixel tile-grid indexing completely!
     #[inline(always)]
     pub fn single_block_flat(&self) -> Option<(&'a [f32], u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 {
             let blk = self.blocks[0]?;
+            let slice = blk.data.as_f32_slice()?;
             Some((
-                blk.data.as_slice(),
+                slice,
                 self.tx0 * self.tile_w,
                 self.ty0 * self.tile_h,
                 self.tile_w as usize,

@@ -1,6 +1,6 @@
 use cogzilla_tiff::ByteOrder;
 
-use crate::slab::{AlignedF32Slab, BlockStats, DecodedBand};
+use crate::slab::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
 
 #[inline(always)]
 fn finalize_stats(any_valid: bool, any_nodata: bool, min: f32, max: f32) -> BlockStats {
@@ -798,31 +798,32 @@ unsafe fn reconstruct_predictor2_le_avx2(
     finalize_stats(any_valid, any_nodata, min_val, max_val)
 }
 
-/// SIMD 8-lane `u16` horizontal prefix-sum + widen to `f32` + nodata/stats on x86_64 AVX2.
+/// SIMD 8-lane `u16` horizontal prefix-sum directly into compact `u16` + nodata/stats on x86_64 AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn u16_pred2_row_avx2(
     src_u16: &[u8],
-    dst_f32: &mut [f32],
-    finite_nodata: Option<f32>,
+    dst_u16: &mut [u16],
+    nd_u16: Option<u16>,
     any_valid: &mut bool,
     any_nodata: &mut bool,
     min_val: &mut f32,
     max_val: &mut f32,
 ) {
     use std::arch::x86_64::*;
-    let w = dst_f32.len();
+    let w = dst_u16.len();
     let mut carry = _mm_setzero_si128();
     let bcast_last = _mm_setr_epi8(14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15);
 
-    let mut v_min = _mm256_set1_ps(f32::INFINITY);
-    let mut v_max = _mm256_set1_ps(f32::NEG_INFINITY);
-    let mut v_av = _mm256_setzero_ps();
-    let mut v_an = _mm256_setzero_ps();
-    let v_nan = _mm256_set1_ps(f32::NAN);
-    let has_nd = finite_nodata.is_some();
-    let v_nd = _mm256_set1_ps(finite_nodata.unwrap_or(0.0));
-    let all_ones = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+    let has_nd = nd_u16.is_some();
+    let v_nd = _mm_set1_epi16(nd_u16.unwrap_or(0) as i16);
+    let v_max_u16 = _mm_set1_epi16(-1i16);
+    let v_zero = _mm_setzero_si128();
+
+    let mut v_min = v_max_u16;
+    let mut v_max = v_zero;
+    let mut v_av = v_zero;
+    let mut v_an = v_zero;
 
     let mut i = 0usize;
     while i + 8 <= w {
@@ -832,36 +833,40 @@ unsafe fn u16_pred2_row_avx2(
         v = _mm_add_epi16(v, _mm_slli_si128::<8>(v));
         v = _mm_add_epi16(v, carry);
         carry = _mm_shuffle_epi8(v, bcast_last);
+        _mm_storeu_si128(dst_u16.as_mut_ptr().add(i) as *mut __m128i, v);
 
-        let mut fv = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(v));
         if has_nd {
-            let valid = _mm256_andnot_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(fv, v_nd), all_ones);
-            v_av = _mm256_or_ps(v_av, valid);
-            v_an = _mm256_or_ps(v_an, _mm256_andnot_ps(valid, all_ones));
-            fv = _mm256_blendv_ps(v_nan, fv, valid);
-            v_min = _mm256_min_ps(v_min, _mm256_blendv_ps(v_min, fv, valid));
-            v_max = _mm256_max_ps(v_max, _mm256_blendv_ps(v_max, fv, valid));
+            let is_nd = _mm_cmpeq_epi16(v, v_nd);
+            let valid = _mm_andnot_si128(is_nd, v_max_u16);
+            v_av = _mm_or_si128(v_av, valid);
+            v_an = _mm_or_si128(v_an, is_nd);
+            // Replace nodata lanes with 65535 for min and 0 for max
+            let mn_c = _mm_or_si128(_mm_and_si128(valid, v), _mm_and_si128(is_nd, v_max_u16));
+            let mx_c = _mm_and_si128(valid, v);
+            v_min = _mm_min_epu16(v_min, mn_c);
+            v_max = _mm_max_epu16(v_max, mx_c);
         } else {
-            v_av = all_ones;
-            v_min = _mm256_min_ps(v_min, fv);
-            v_max = _mm256_max_ps(v_max, fv);
+            v_av = v_max_u16;
+            v_min = _mm_min_epu16(v_min, v);
+            v_max = _mm_max_epu16(v_max, v);
         }
-        _mm256_storeu_ps(dst_f32.as_mut_ptr().add(i), fv);
         i += 8;
     }
 
-    if _mm256_movemask_ps(v_av) != 0 {
+    if _mm_movemask_epi8(v_av) != 0 {
         *any_valid = true;
-        let mut mn_arr = [0.0f32; 8];
-        let mut mx_arr = [0.0f32; 8];
-        _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
-        _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        let mut mn_arr = [0u16; 8];
+        let mut mx_arr = [0u16; 8];
+        _mm_storeu_si128(mn_arr.as_mut_ptr() as *mut __m128i, v_min);
+        _mm_storeu_si128(mx_arr.as_mut_ptr() as *mut __m128i, v_max);
         for k in 0..8 {
-            if mn_arr[k] < *min_val { *min_val = mn_arr[k]; }
-            if mx_arr[k] > *max_val { *max_val = mx_arr[k]; }
+            let mn = mn_arr[k] as f32;
+            let mx = mx_arr[k] as f32;
+            if mn < *min_val { *min_val = mn; }
+            if mx > *max_val { *max_val = mx; }
         }
     }
-    if _mm256_movemask_ps(v_an) != 0 {
+    if _mm_movemask_epi8(v_an) != 0 {
         *any_nodata = true;
     }
 
@@ -874,14 +879,14 @@ unsafe fn u16_pred2_row_avx2(
         while i < w {
             let off = i * 2;
             acc = acc.wrapping_add(u16::from_le_bytes([src_u16[off], src_u16[off + 1]]));
-            let (v, is_nd) = check_val(acc as f32, finite_nodata);
-            dst_f32[i] = v;
-            if is_nd {
+            dst_u16[i] = acc;
+            if nd_u16 == Some(acc) {
                 *any_nodata = true;
             } else {
                 *any_valid = true;
-                if v < *min_val { *min_val = v; }
-                if v > *max_val { *max_val = v; }
+                let vf = acc as f32;
+                if vf < *min_val { *min_val = vf; }
+                if vf > *max_val { *max_val = vf; }
             }
             i += 1;
         }
@@ -1164,7 +1169,7 @@ pub fn reconstruct_predictor3(
         }
 
         vec![DecodedBand {
-            data: slab,
+            data: BandData::F32(slab),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid, any_nodata, min_val, max_val),
@@ -1258,19 +1263,19 @@ pub fn reconstruct_predictor3(
 
         vec![
             DecodedBand {
-                data: s0,
+                data: BandData::F32(s0),
                 width: tile_w,
                 height: tile_h,
                 stats: finalize_stats(any_valid[0], any_nodata[0], min_val[0], max_val[0]),
             },
             DecodedBand {
-                data: s1,
+                data: BandData::F32(s1),
                 width: tile_w,
                 height: tile_h,
                 stats: finalize_stats(any_valid[1], any_nodata[1], min_val[1], max_val[1]),
             },
             DecodedBand {
-                data: s2,
+                data: BandData::F32(s2),
                 width: tile_w,
                 height: tile_h,
                 stats: finalize_stats(any_valid[2], any_nodata[2], min_val[2], max_val[2]),
@@ -1317,7 +1322,7 @@ pub fn reconstruct_predictor3(
             .into_iter()
             .enumerate()
             .map(|(b, data)| DecodedBand {
-                data,
+                data: BandData::F32(data),
                 width: tile_w,
                 height: tile_h,
                 stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -1424,7 +1429,7 @@ pub fn reconstruct_predictor1(
                 i += 1;
             }
             return vec![DecodedBand {
-                data: slab,
+                data: BandData::F32(slab),
                 width: tile_w,
                 height: tile_h,
                 stats: finalize_stats(any_valid, any_nodata, min_val, max_val),
@@ -1435,7 +1440,7 @@ pub fn reconstruct_predictor1(
         if byte_order == ByteOrder::Little && std::is_x86_feature_detected!("avx2") {
             let stats = unsafe { reconstruct_predictor1_le_avx2(raw, slab.as_mut_slice(), finite_nodata) };
             return vec![DecodedBand {
-                data: slab,
+                data: BandData::F32(slab),
                 width: tile_w,
                 height: tile_h,
                 stats,
@@ -1465,7 +1470,7 @@ pub fn reconstruct_predictor1(
         }
 
         vec![DecodedBand {
-            data: slab,
+            data: BandData::F32(slab),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid, any_nodata, min_val, max_val),
@@ -1503,7 +1508,7 @@ pub fn reconstruct_predictor1(
             .into_iter()
             .enumerate()
             .map(|(b, data)| DecodedBand {
-                data,
+                data: BandData::F32(data),
                 width: tile_w,
                 height: tile_h,
                 stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -1533,7 +1538,7 @@ pub fn reconstruct_predictor2(
             reconstruct_predictor2_le_neon(raw, tile_w, tile_h, slab.as_mut_slice(), finite_nodata)
         };
         return vec![DecodedBand {
-            data: slab,
+            data: BandData::F32(slab),
             width: tile_w,
             height: tile_h,
             stats,
@@ -1547,7 +1552,7 @@ pub fn reconstruct_predictor2(
             reconstruct_predictor2_le_avx2(raw, tile_w, tile_h, slab.as_mut_slice(), finite_nodata)
         };
         return vec![DecodedBand {
-            data: slab,
+            data: BandData::F32(slab),
             width: tile_w,
             height: tile_h,
             stats,
@@ -1594,7 +1599,7 @@ pub fn reconstruct_predictor2(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::F32(data),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -1606,29 +1611,29 @@ pub fn reconstruct_predictor2(
 // uint16 Decoders (Landsat Collection 2 & Sentinel-2 L2A -> AlignedF32Slab)
 // ============================================================================
 
-/// SIMD 8-lane `u16` horizontal prefix-sum + widen to `f32` + nodata/stats on ARM64 NEON.
+/// SIMD 8-lane `u16` horizontal prefix-sum directly into compact `u16` + nodata/stats on ARM64 NEON.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn u16_pred2_row_neon(
     src_u16: &[u8],
-    dst_f32: &mut [f32],
-    finite_nodata: Option<f32>,
+    dst_u16: &mut [u16],
+    nd_u16: Option<u16>,
     any_valid: &mut bool,
     any_nodata: &mut bool,
     min_val: &mut f32,
     max_val: &mut f32,
 ) {
     use std::arch::aarch64::*;
-    let w = dst_f32.len();
+    let w = dst_u16.len();
     let zero = unsafe { vdupq_n_u16(0) };
     let mut carry = zero;
-    let mut v_min = unsafe { vdupq_n_f32(f32::INFINITY) };
-    let mut v_max = unsafe { vdupq_n_f32(f32::NEG_INFINITY) };
-    let mut v_av = unsafe { vdupq_n_u32(0) };
-    let mut v_an = unsafe { vdupq_n_u32(0) };
-    let v_nan = unsafe { vdupq_n_f32(f32::NAN) };
-    let has_nd = finite_nodata.is_some();
-    let v_nd = unsafe { vdupq_n_f32(finite_nodata.unwrap_or(0.0)) };
+    let max_u16 = unsafe { vdupq_n_u16(u16::MAX) };
+    let mut v_min = max_u16;
+    let mut v_max = zero;
+    let mut v_av = zero;
+    let mut v_an = zero;
+    let has_nd = nd_u16.is_some();
+    let v_nd = unsafe { vdupq_n_u16(nd_u16.unwrap_or(0)) };
 
     let mut i = 0usize;
     while i + 8 <= w {
@@ -1640,43 +1645,33 @@ unsafe fn u16_pred2_row_neon(
             v = vaddq_u16(v, vextq_u16::<4>(zero, v));
             v = vaddq_u16(v, carry);
             carry = vdupq_laneq_u16::<7>(v);
+            vst1q_u16(dst_u16.as_mut_ptr().add(i), v);
 
-            let mut f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(v)));
-            let mut f1 = vcvtq_f32_u32(vmovl_high_u16(v));
-
-            macro_rules! proc_u16f {
-                ($fv:expr) => {{
-                    if has_nd {
-                        let valid = vmvnq_u32(vceqq_f32($fv, v_nd));
-                        v_av = vorrq_u32(v_av, valid);
-                        v_an = vorrq_u32(v_an, vmvnq_u32(valid));
-                        $fv = vbslq_f32(valid, $fv, v_nan);
-                    } else {
-                        v_av = vdupq_n_u32(1);
-                    }
-                    v_min = vminnmq_f32(v_min, $fv);
-                    v_max = vmaxnmq_f32(v_max, $fv);
-                }};
+            if has_nd {
+                let is_nd = vceqq_u16(v, v_nd);
+                let valid = vmvnq_u16(is_nd);
+                v_av = vorrq_u16(v_av, valid);
+                v_an = vorrq_u16(v_an, is_nd);
+                v_min = vminq_u16(v_min, vbslq_u16(valid, v, max_u16));
+                v_max = vmaxq_u16(v_max, vbslq_u16(valid, v, zero));
+            } else {
+                v_av = max_u16;
+                v_min = vminq_u16(v_min, v);
+                v_max = vmaxq_u16(v_max, v);
             }
-
-            proc_u16f!(f0);
-            proc_u16f!(f1);
-
-            vst1q_f32(dst_f32.as_mut_ptr().add(i), f0);
-            vst1q_f32(dst_f32.as_mut_ptr().add(i + 4), f1);
         }
         i += 8;
     }
 
     unsafe {
-        if vmaxvq_u32(v_av) != 0 {
+        if vmaxvq_u16(v_av) != 0 {
             *any_valid = true;
-            let mn = vminnmvq_f32(v_min);
-            let mx = vmaxnmvq_f32(v_max);
+            let mn = vminvq_u16(v_min) as f32;
+            let mx = vmaxvq_u16(v_max) as f32;
             if mn < *min_val { *min_val = mn; }
             if mx > *max_val { *max_val = mx; }
         }
-        if vmaxvq_u32(v_an) != 0 {
+        if vmaxvq_u16(v_an) != 0 {
             *any_nodata = true;
         }
     }
@@ -1690,14 +1685,14 @@ unsafe fn u16_pred2_row_neon(
         while i < w {
             let off = i * 2;
             acc = acc.wrapping_add(u16::from_le_bytes([src_u16[off], src_u16[off + 1]]));
-            let (v, is_nd) = check_val(acc as f32, finite_nodata);
-            dst_f32[i] = v;
-            if is_nd {
+            dst_u16[i] = acc;
+            if nd_u16 == Some(acc) {
                 *any_nodata = true;
             } else {
                 *any_valid = true;
-                if v < *min_val { *min_val = v; }
-                if v > *max_val { *max_val = v; }
+                let vf = acc as f32;
+                if vf < *min_val { *min_val = vf; }
+                if vf > *max_val { *max_val = vf; }
             }
             i += 1;
         }
@@ -1705,7 +1700,7 @@ unsafe fn u16_pred2_row_neon(
 }
 
 /// Reconstruct `uint16` Predictor 1 (None) or Predictor 2 (16-bit horizontal diff, Landsat C2)
-/// directly into planar 64-byte-aligned `f32` slabs with `BlockStats`.
+/// directly into compact `BandData::U16` (2 bytes/pixel, 2× less cache RAM) with `BlockStats`.
 pub fn reconstruct_u16(
     raw: &[u8],
     tile_w: u32,
@@ -1716,6 +1711,13 @@ pub fn reconstruct_u16(
     nodata: Option<f32>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let nd_u16 = finite_nodata.and_then(|nd| {
+        if nd >= 0.0 && nd <= (u16::MAX as f32) && (nd as u16) as f32 == nd {
+            Some(nd as u16)
+        } else {
+            None
+        }
+    });
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
@@ -1723,7 +1725,7 @@ pub fn reconstruct_u16(
     // Fast path: single-band little-endian u16 + Predictor 2 (Landsat Collection 2 & Sentinel-2!)
     #[cfg(target_arch = "aarch64")]
     if bands_in_tile == 1 && byte_order == ByteOrder::Little && horizontal_diff {
-        let mut slab = AlignedF32Slab::new_uninit(pixels);
+        let mut data = vec![0u16; pixels].into_boxed_slice();
         let mut any_valid = false;
         let mut any_nodata = false;
         let mut min_val = f32::INFINITY;
@@ -1733,8 +1735,8 @@ pub fn reconstruct_u16(
             unsafe {
                 u16_pred2_row_neon(
                     &raw[y * row_bytes..(y + 1) * row_bytes],
-                    &mut slab[y * w..(y + 1) * w],
-                    finite_nodata,
+                    &mut data[y * w..(y + 1) * w],
+                    nd_u16,
                     &mut any_valid,
                     &mut any_nodata,
                     &mut min_val,
@@ -1743,7 +1745,7 @@ pub fn reconstruct_u16(
             }
         }
         return vec![DecodedBand {
-            data: slab,
+            data: BandData::U16 { data, nodata: nd_u16 },
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid, any_nodata, min_val, max_val),
@@ -1756,7 +1758,7 @@ pub fn reconstruct_u16(
         && horizontal_diff
         && std::is_x86_feature_detected!("avx2")
     {
-        let mut slab = AlignedF32Slab::new_uninit(pixels);
+        let mut data = vec![0u16; pixels].into_boxed_slice();
         let mut any_valid = false;
         let mut any_nodata = false;
         let mut min_val = f32::INFINITY;
@@ -1766,8 +1768,8 @@ pub fn reconstruct_u16(
             unsafe {
                 u16_pred2_row_avx2(
                     &raw[y * row_bytes..(y + 1) * row_bytes],
-                    &mut slab[y * w..(y + 1) * w],
-                    finite_nodata,
+                    &mut data[y * w..(y + 1) * w],
+                    nd_u16,
                     &mut any_valid,
                     &mut any_nodata,
                     &mut min_val,
@@ -1776,16 +1778,16 @@ pub fn reconstruct_u16(
             }
         }
         return vec![DecodedBand {
-            data: slab,
+            data: BandData::U16 { data, nodata: nd_u16 },
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid, any_nodata, min_val, max_val),
         }];
     }
 
-    // General path (Predictor 1, Big-Endian, x86_64, or multi-band chunky u16)
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    // General path (Predictor 1, Big-Endian, or multi-band chunky u16) -> compact U16
+    let mut slabs: Vec<Box<[u16]>> = (0..bands_in_tile)
+        .map(|_| vec![0u16; pixels].into_boxed_slice())
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
@@ -1811,12 +1813,12 @@ pub fn reconstruct_u16(
                 } else {
                     sample
                 };
-                let (v, is_nd) = check_val(val_u16 as f32, finite_nodata);
-                slabs[b][row_off + x] = v;
-                if is_nd {
+                slabs[b][row_off + x] = val_u16;
+                if nd_u16 == Some(val_u16) {
                     any_nodata[b] = true;
                 } else {
                     any_valid[b] = true;
+                    let v = val_u16 as f32;
                     if v < min_val[b] { min_val[b] = v; }
                     if v > max_val[b] { max_val[b] = v; }
                 }
@@ -1828,7 +1830,7 @@ pub fn reconstruct_u16(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::U16 { data, nodata: nd_u16 },
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -1895,7 +1897,7 @@ pub fn reconstruct_i16(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::F32(data),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -1955,7 +1957,7 @@ pub fn reconstruct_i8(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::F32(data),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -2023,7 +2025,7 @@ pub fn reconstruct_int32(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::F32(data),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -2144,7 +2146,7 @@ pub fn reconstruct_f64(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::F32(data),
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -2152,7 +2154,7 @@ pub fn reconstruct_f64(
         .collect()
 }
 
-/// Reconstruct `uint8` Predictor 1 or Predictor 2 (Sentinel-2 TCI, visual RGB, masks) -> `AlignedF32Slab`.
+/// Reconstruct `uint8` Predictor 1 or Predictor 2 (Sentinel-2 TCI, visual RGB, masks) -> compact `BandData::U8` (1 B/px).
 pub fn reconstruct_u8(
     raw: &[u8],
     tile_w: u32,
@@ -2162,12 +2164,19 @@ pub fn reconstruct_u8(
     nodata: Option<f32>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let nd_u8 = finite_nodata.and_then(|nd| {
+        if nd >= 0.0 && nd <= (u8::MAX as f32) && (nd as u8) as f32 == nd {
+            Some(nd as u8)
+        } else {
+            None
+        }
+    });
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
 
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Box<[u8]>> = (0..bands_in_tile)
+        .map(|_| vec![0u8; pixels].into_boxed_slice())
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
@@ -2190,12 +2199,12 @@ pub fn reconstruct_u8(
                 } else {
                     sample
                 };
-                let (v, is_nd) = check_val(val_u8 as f32, finite_nodata);
-                slabs[b][row_off + x] = v;
-                if is_nd {
+                slabs[b][row_off + x] = val_u8;
+                if nd_u8 == Some(val_u8) {
                     any_nodata[b] = true;
                 } else {
                     any_valid[b] = true;
+                    let v = val_u8 as f32;
                     if v < min_val[b] { min_val[b] = v; }
                     if v > max_val[b] { max_val[b] = v; }
                 }
@@ -2207,7 +2216,7 @@ pub fn reconstruct_u8(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data,
+            data: BandData::U8 { data, nodata: nd_u8 },
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),

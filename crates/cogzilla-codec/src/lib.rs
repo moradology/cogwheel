@@ -9,7 +9,7 @@ use cogzilla_tiff::{
 };
 use thiserror::Error;
 
-pub use slab::{AlignedF32Slab, BlockStats, DecodedBand, DecodedTile};
+pub use slab::{AlignedF32Slab, BandData, BlockStats, DecodedBand, DecodedTile};
 
 #[derive(Debug, Error)]
 pub enum CodecError {
@@ -410,13 +410,13 @@ fn apply_rgba_alpha_if_present(bands: &mut [DecodedBand], ifd: &IfdMeta) {
         return;
     }
     let alpha_idx = bands.len() - 1;
-    let n = bands[alpha_idx].data.as_slice().len();
-    let alpha: Vec<f32> = bands[alpha_idx].data.as_slice().to_vec();
+    let n = bands[alpha_idx].data.len();
+    let alpha: Vec<f32> = (0..n).map(|i| bands[alpha_idx].data.get_f32(i)).collect();
     if alpha.iter().all(|&a| a > 0.0) {
         return;
     }
     for b in &mut bands[..alpha_idx] {
-        let slice = b.data.as_mut_slice();
+        let slice = b.data.make_f32_mut();
         let mut all_nd = true;
         let mut no_nd = true;
         for i in 0..n.min(slice.len()) {
@@ -511,7 +511,7 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
         return;
     }
     for b in &mut tile.bands {
-        let slice = b.data.as_mut_slice();
+        let slice = b.data.make_f32_mut();
         let n = slice.len().min(mask.len());
         let mut all_nd = true;
         let mut no_nd = true;

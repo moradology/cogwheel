@@ -169,7 +169,7 @@ fn make_test_tile(floats: usize, val: f32) -> Arc<cogzilla_codec::DecodedTile> {
     use cogzilla_codec::{AlignedF32Slab, BlockStats, DecodedBand, DecodedTile};
     Arc::new(DecodedTile {
         bands: vec![DecodedBand {
-            data: AlignedF32Slab::filled(floats, val),
+            data: AlignedF32Slab::filled(floats, val).into(),
             width: 32,
             height: 32,
             stats: BlockStats {

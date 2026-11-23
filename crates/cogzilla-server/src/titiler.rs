@@ -173,7 +173,7 @@ pub async fn query_point(
                 let v = tiles[0]
                     .as_ref()
                     .and_then(|t| t.bands.get(b))
-                    .map(|band| band.data[pidx])
+                    .map(|band| band.data.get_f32(pidx))
                     .unwrap_or(f32::NAN);
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
@@ -191,7 +191,7 @@ pub async fn query_point(
                 let v = tiles[b]
                     .as_ref()
                     .and_then(|t| t.bands.first())
-                    .map(|band| band.data[pidx])
+                    .map(|band| band.data.get_f32(pidx))
                     .unwrap_or(f32::NAN);
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
@@ -262,7 +262,7 @@ pub async fn compute_statistics(
                         }
                         let pidx = ly * tw + lx;
                         for b in 0..count {
-                            let mut v = tile.bands[b].data[pidx];
+                            let mut v = tile.bands[b].data.get_f32(pidx);
                             if v.is_finite() {
                                 if unscale {
                                     v = v * cog.index.scales[b] + cog.index.offsets[b];
@@ -308,7 +308,7 @@ pub async fn compute_statistics(
                                     mask_total_pixels += 1;
                                 }
                             }
-                            let mut v = band.data[ly * tw + lx];
+                            let mut v = band.data.get_f32(ly * tw + lx);
                             if v.is_finite() {
                                 if unscale {
                                     v = v * cog.index.scales[b] + cog.index.offsets[b];
