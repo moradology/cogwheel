@@ -130,6 +130,8 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `AWS_ENDPOINT_URL`, `AWS_S3_ENDPOINT`, `AWS_HTTPS`, `AWS_VIRTUAL_HOSTING=FALSE` | S3-compatible stores (MinIO, Ceph, and so on) and path-style addressing. |
 | `GDAL_HTTP_MAX_RETRY` (or `AWS_MAX_ATTEMPTS`) | Retries for transient failures. Default 3. |
 | `GDAL_HTTP_CONNECTTIMEOUT`, `GDAL_HTTP_TIMEOUT` | Connect timeout (default 10 s) and per-read timeout (default 30 s). Since 0.1.2. |
+| `COGZILLA_MAX_UPSTREAM_FETCHES` | Maximum concurrent S3/HTTP range requests (default 64). Backs off automatically on `429`/`503`/timeouts (AIMD, floor 4) and recovers on clean responses. |
+| `COGZILLA_MAX_OPEN_URIS` | Maximum cached opened-COG headers in memory (default 4,096, LRU-evicted). |
 | `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
 
 Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I/O counters as JSON, and `GET /docs` with `GET /openapi.json` for the route list.

@@ -7,8 +7,9 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use thiserror::Error;
 
+use crate::limiter::AimdLimiter;
 use crate::s3::{
-    DynamicCredsCache, S3Config, fetch_s3_object, is_retryable_status,
+    DynamicCredsCache, S3Config, fetch_s3_object_limited, is_retryable_status,
     is_retryable_transport_error, parse_s3_uri, retry_backoff_duration,
 };
 
@@ -46,12 +47,14 @@ pub enum CogSource {
         s3_cfg: S3Config,
         dynamic_creds: Arc<DynamicCredsCache>,
         metrics: Arc<IoMetrics>,
+        limiter: Arc<AimdLimiter>,
     },
     RemoteHttp {
         url: String,
         client: reqwest::Client,
         max_retries: u32,
         metrics: Arc<IoMetrics>,
+        limiter: Arc<AimdLimiter>,
     },
 }
 
@@ -126,6 +129,16 @@ impl CogSource {
         s3_cfg: Option<S3Config>,
         metrics: Arc<IoMetrics>,
     ) -> Result<Self, IoError> {
+        Self::open_remote_limited(uri, client, s3_cfg, metrics, Arc::new(AimdLimiter::from_env()))
+    }
+
+    pub fn open_remote_limited(
+        uri: &str,
+        client: reqwest::Client,
+        s3_cfg: Option<S3Config>,
+        metrics: Arc<IoMetrics>,
+        limiter: Arc<AimdLimiter>,
+    ) -> Result<Self, IoError> {
         if let Some((bucket, key)) = parse_s3_uri(uri) {
             let cfg = s3_cfg.unwrap_or_else(S3Config::from_env_full);
             Ok(Self::RemoteS3 {
@@ -135,6 +148,7 @@ impl CogSource {
                 s3_cfg: cfg,
                 dynamic_creds: shared_dynamic_creds(),
                 metrics,
+                limiter,
             })
         } else if uri.starts_with("s3://") || uri.starts_with("/vsis3/") {
             Err(IoError::InvalidUri(uri.to_string()))
@@ -149,6 +163,7 @@ impl CogSource {
                 client,
                 max_retries,
                 metrics,
+                limiter,
             })
         } else {
             let local_path = uri.strip_prefix("file://").unwrap_or(uri);
@@ -171,16 +186,18 @@ impl CogSource {
                 s3_cfg,
                 dynamic_creds,
                 metrics,
+                limiter,
             } => {
                 let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
                 metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-                let data = fetch_s3_object(
+                let data = fetch_s3_object_limited(
                     client,
                     bucket,
                     key,
                     s3_cfg,
                     Some(dynamic_creds),
                     Some(&range_hdr),
+                    Some(limiter),
                 )
                 .await?;
                 metrics
@@ -193,19 +210,27 @@ impl CogSource {
                 client,
                 max_retries,
                 metrics,
+                limiter,
             } => {
                 let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
                 let mut attempt = 0u32;
                 loop {
+                    let permit = limiter.acquire().await;
                     metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
                     let resp = match client.get(url).header("Range", &range_hdr).send().await {
                         Ok(r) => r,
                         Err(e) if attempt < *max_retries && is_retryable_transport_error(&e) => {
+                            permit.on_throttle();
                             tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
                             attempt += 1;
                             continue;
                         }
-                        Err(e) => return Err(IoError::Http(e)),
+                        Err(e) => {
+                            if is_retryable_transport_error(&e) {
+                                permit.on_throttle();
+                            }
+                            return Err(IoError::Http(e));
+                        }
                     };
                     let status = resp.status().as_u16();
                     if status == 200 || status == 206 {
@@ -214,12 +239,19 @@ impl CogSource {
                             Err(e)
                                 if attempt < *max_retries && is_retryable_transport_error(&e) =>
                             {
+                                permit.on_throttle();
                                 tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
                                 attempt += 1;
                                 continue;
                             }
-                            Err(e) => return Err(IoError::Http(e)),
+                            Err(e) => {
+                                if is_retryable_transport_error(&e) {
+                                    permit.on_throttle();
+                                }
+                                return Err(IoError::Http(e));
+                            }
                         };
+                        permit.on_success();
                         metrics
                             .remote_bytes_fetched
                             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -231,9 +263,13 @@ impl CogSource {
                             .get("retry-after")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok());
+                        permit.on_throttle();
                         tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
                         attempt += 1;
                         continue;
+                    }
+                    if is_retryable_status(status) {
+                        permit.on_throttle();
                     }
                     return Err(IoError::HttpStatus {
                         status,

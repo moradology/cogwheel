@@ -584,6 +584,20 @@ pub async fn fetch_s3_object(
     dynamic_creds: Option<&Arc<DynamicCredsCache>>,
     range_header: Option<&str>,
 ) -> Result<bytes::Bytes, IoError> {
+    fetch_s3_object_limited(client, bucket, key, cfg, dynamic_creds, range_header, None).await
+}
+
+/// Same as [`fetch_s3_object`], gated per-attempt by an optional [`crate::limiter::AimdLimiter`]
+/// so retries release their concurrency permit before sleeping on backoff.
+pub async fn fetch_s3_object_limited(
+    client: &reqwest::Client,
+    bucket: &str,
+    key: &str,
+    cfg: &S3Config,
+    dynamic_creds: Option<&Arc<DynamicCredsCache>>,
+    range_header: Option<&str>,
+    limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
+) -> Result<bytes::Bytes, IoError> {
     let mut region = bucket_region_cache()
         .get(bucket)
         .map(|r| r.clone())
@@ -593,6 +607,11 @@ pub async fn fetch_s3_object(
     let mut attempt = 0u32;
 
     loop {
+        let permit = match limiter {
+            Some(l) => Some(l.acquire().await),
+            None => None,
+        };
+
         let (url, host, canonical_uri) = build_s3_endpoint(bucket, key, &region, cfg);
         let mut req = client.get(&url);
         if let Some(rng) = range_header {
@@ -641,24 +660,49 @@ pub async fn fetch_s3_object(
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) if attempt < cfg.max_retries && is_retryable_transport_error(&e) => {
+                if let Some(p) = permit {
+                    p.on_throttle();
+                }
                 tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
                 attempt += 1;
                 continue;
             }
-            Err(e) => return Err(IoError::Http(e)),
+            Err(e) => {
+                if let Some(p) = permit {
+                    if is_retryable_transport_error(&e) {
+                        p.on_throttle();
+                    }
+                }
+                return Err(IoError::Http(e));
+            }
         };
 
         let status = resp.status().as_u16();
         if status == 200 || status == 206 {
             // The body can still fail after a good status line (connection reset mid-transfer).
             match resp.bytes().await {
-                Ok(body) => return Ok(body),
+                Ok(body) => {
+                    if let Some(p) = permit {
+                        p.on_success();
+                    }
+                    return Ok(body);
+                }
                 Err(e) if attempt < cfg.max_retries && is_retryable_transport_error(&e) => {
+                    if let Some(p) = permit {
+                        p.on_throttle();
+                    }
                     tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
                     attempt += 1;
                     continue;
                 }
-                Err(e) => return Err(IoError::Http(e)),
+                Err(e) => {
+                    if let Some(p) = permit {
+                        if is_retryable_transport_error(&e) {
+                            p.on_throttle();
+                        }
+                    }
+                    return Err(IoError::Http(e));
+                }
             }
         }
 
@@ -674,6 +718,7 @@ pub async fn fetch_s3_object(
                 bucket_region_cache().insert(bucket.to_string(), discovered.clone());
                 region = discovered;
                 region_redirected = true;
+                drop(permit);
                 continue;
             }
         }
@@ -685,11 +730,19 @@ pub async fn fetch_s3_object(
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
+            if let Some(p) = permit {
+                p.on_throttle();
+            }
             tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
             attempt += 1;
             continue;
         }
 
+        if let Some(p) = permit {
+            if is_retryable_status(status) {
+                p.on_throttle();
+            }
+        }
         return Err(IoError::HttpStatus { status, url });
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cogzilla_codec::{DecodedTile, apply_mask_to_tile, decode_mask_tile, decode_tile};
@@ -9,12 +9,14 @@ use cogzilla_tiff::{CogIndex, TiffError, parse_cog};
 use dashmap::DashMap;
 
 use crate::backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges};
-use crate::s3::S3Config;
 use crate::cache::{BlockKey, InFlightGuard, LookupResult, SingleflightBlockCache};
+use crate::limiter::AimdLimiter;
+use crate::s3::S3Config;
 
 const INITIAL_HEADER_FETCH_BYTES: u64 = 128 * 1024;
 const RANGE_GAP_THRESHOLD: u64 = 32 * 1024;
 const MAX_COALESCED_SPAN: u64 = 4 * 1024 * 1024;
+const DEFAULT_MAX_OPEN_URIS: usize = 4096;
 
 pub struct OpenedCog {
     pub id: u64,
@@ -24,7 +26,10 @@ pub struct OpenedCog {
 }
 
 enum OpenSlot {
-    Ready(Arc<OpenedCog>),
+    Ready {
+        cog: Arc<OpenedCog>,
+        last_used: AtomicU64,
+    },
     InFlight(Arc<tokio::sync::Notify>),
 }
 
@@ -33,7 +38,11 @@ pub struct CogStore {
     next_id: AtomicU64,
     datasets_by_name: DashMap<String, Arc<OpenedCog>, ahash::RandomState>,
     datasets_by_uri: DashMap<String, OpenSlot, ahash::RandomState>,
+    max_open_uris: usize,
+    uri_clock: AtomicU64,
+    evicting_uris: AtomicBool,
     pub cache: Arc<SingleflightBlockCache>,
+    pub upstream_limiter: Arc<AimdLimiter>,
     pub client: reqwest::Client,
     pub s3_cfg: Option<S3Config>,
     pub metrics: Arc<IoMetrics>,
@@ -41,6 +50,19 @@ pub struct CogStore {
 
 impl CogStore {
     pub fn new(cache_max_bytes: usize) -> Self {
+        let max_open_uris = std::env::var("COGZILLA_MAX_OPEN_URIS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_OPEN_URIS);
+        Self::with_limits(cache_max_bytes, max_open_uris, Arc::new(AimdLimiter::from_env()))
+    }
+
+    pub fn with_limits(
+        cache_max_bytes: usize,
+        max_open_uris: usize,
+        upstream_limiter: Arc<AimdLimiter>,
+    ) -> Self {
         // Without these a stalled S3 response would hang the tile request forever. The read timeout
         // is per read, not per response, so large range bodies are fine as long as bytes keep flowing.
         let env_secs = |key: &str, default: u64| {
@@ -61,10 +83,116 @@ impl CogStore {
             next_id: AtomicU64::new(1),
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
             datasets_by_uri: DashMap::with_hasher(ahash::RandomState::new()),
+            max_open_uris: max_open_uris.max(1),
+            uri_clock: AtomicU64::new(0),
+            evicting_uris: AtomicBool::new(false),
             cache: Arc::new(SingleflightBlockCache::new(cache_max_bytes)),
+            upstream_limiter,
             client,
             s3_cfg: S3Config::from_env(),
             metrics: Arc::new(IoMetrics::default()),
+        }
+    }
+
+    #[inline(always)]
+    fn uri_tick(&self) -> u64 {
+        self.uri_clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Number of currently cached opened-COG URI entries.
+    pub fn open_uri_count(&self) -> usize {
+        self.datasets_by_uri.len()
+    }
+
+    fn evict_uris_if_needed(&self) {
+        loop {
+            if self.datasets_by_uri.len() <= self.max_open_uris {
+                return;
+            }
+            if self
+                .evicting_uris
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+
+            let mut removed_any = false;
+            {
+                struct Reset<'a>(&'a AtomicBool);
+                impl Drop for Reset<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = Reset(&self.evicting_uris);
+
+                loop {
+                    let cur = self.datasets_by_uri.len();
+                    if cur <= self.max_open_uris {
+                        break;
+                    }
+                    let excess = cur - self.max_open_uris;
+                    let target_drop = excess.max(self.max_open_uris / 4).max(1);
+
+                    let mut candidates: Vec<(u64, String)> = self
+                        .datasets_by_uri
+                        .iter()
+                        .filter_map(|item| match item.value() {
+                            OpenSlot::Ready { last_used, .. } => {
+                                Some((last_used.load(Ordering::Relaxed), item.key().clone()))
+                            }
+                            OpenSlot::InFlight(_) => None,
+                        })
+                        .collect();
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    candidates.sort_unstable_by_key(|(stamp, _)| *stamp);
+
+                    let mut dropped = 0usize;
+                    let mut skipped: Vec<String> = Vec::new();
+                    for (stamp, key) in candidates {
+                        if dropped >= target_drop {
+                            break;
+                        }
+                        let removed = self.datasets_by_uri.remove_if(&key, |_, v| {
+                            matches!(v, OpenSlot::Ready { last_used, .. }
+                                if last_used.load(Ordering::Relaxed) == stamp)
+                        });
+                        if removed.is_some() {
+                            dropped += 1;
+                            removed_any = true;
+                        } else {
+                            skipped.push(key);
+                        }
+                    }
+
+                    if self.datasets_by_uri.len() > self.max_open_uris {
+                        for key in skipped {
+                            if self.datasets_by_uri.len() <= self.max_open_uris {
+                                break;
+                            }
+                            if self
+                                .datasets_by_uri
+                                .remove_if(&key, |_, v| matches!(v, OpenSlot::Ready { .. }))
+                                .is_some()
+                            {
+                                dropped += 1;
+                                removed_any = true;
+                            }
+                        }
+                    }
+
+                    if dropped == 0 {
+                        break;
+                    }
+                }
+            }
+
+            if !removed_any || self.datasets_by_uri.len() <= self.max_open_uris {
+                return;
+            }
         }
     }
 
@@ -86,7 +214,13 @@ impl CogStore {
             source,
         });
         self.datasets_by_name.insert(name.into(), cog.clone());
-        self.datasets_by_uri.insert(uri, OpenSlot::Ready(cog.clone()));
+        self.datasets_by_uri.insert(
+            uri,
+            OpenSlot::Ready {
+                cog: cog.clone(),
+                last_used: AtomicU64::new(self.uri_tick()),
+            },
+        );
         Ok(cog)
     }
 
@@ -99,7 +233,8 @@ impl CogStore {
     pub async fn open_uri(&self, uri: &str) -> Result<Arc<OpenedCog>, IoError> {
         loop {
             if let Some(existing) = self.datasets_by_uri.get(uri) {
-                if let OpenSlot::Ready(cog) = existing.value() {
+                if let OpenSlot::Ready { cog, last_used } = existing.value() {
+                    last_used.store(self.uri_tick(), Ordering::Relaxed);
                     return Ok(cog.clone());
                 }
             }
@@ -108,7 +243,10 @@ impl CogStore {
                 use dashmap::mapref::entry::Entry;
                 match self.datasets_by_uri.entry(uri.to_string()) {
                     Entry::Occupied(occ) => match occ.get() {
-                        OpenSlot::Ready(cog) => return Ok(cog.clone()),
+                        OpenSlot::Ready { cog, last_used } => {
+                            last_used.store(self.uri_tick(), Ordering::Relaxed);
+                            return Ok(cog.clone());
+                        }
                         OpenSlot::InFlight(n) => Some(n.clone()),
                     },
                     Entry::Vacant(vac) => {
@@ -124,7 +262,10 @@ impl CogStore {
                 fut.as_mut().enable();
                 match self.datasets_by_uri.get(uri) {
                     Some(existing) => match existing.value() {
-                        OpenSlot::Ready(cog) => return Ok(cog.clone()),
+                        OpenSlot::Ready { cog, last_used } => {
+                            last_used.store(self.uri_tick(), Ordering::Relaxed);
+                            return Ok(cog.clone());
+                        }
                         OpenSlot::InFlight(cur_n) if !Arc::ptr_eq(cur_n, &notify) => continue,
                         OpenSlot::InFlight(_) => {}
                     },
@@ -158,11 +299,12 @@ impl CogStore {
                 done: false,
             };
 
-            let source = CogSource::open_remote(
+            let source = CogSource::open_remote_limited(
                 uri,
                 self.client.clone(),
                 self.s3_cfg.clone(),
                 self.metrics.clone(),
+                self.upstream_limiter.clone(),
             )?;
 
             let index = match &source {
@@ -204,10 +346,17 @@ impl CogStore {
                 source,
             });
             open_guard.done = true;
-            if let Some(OpenSlot::InFlight(n)) =
-                self.datasets_by_uri.insert(uri.to_string(), OpenSlot::Ready(cog.clone()))
-            {
+            if let Some(OpenSlot::InFlight(n)) = self.datasets_by_uri.insert(
+                uri.to_string(),
+                OpenSlot::Ready {
+                    cog: cog.clone(),
+                    last_used: AtomicU64::new(self.uri_tick()),
+                },
+            ) {
                 n.notify_waiters();
+            }
+            if self.datasets_by_uri.len() > self.max_open_uris {
+                self.evict_uris_if_needed();
             }
             return Ok(cog);
         }

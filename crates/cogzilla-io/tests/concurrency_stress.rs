@@ -496,3 +496,178 @@ async fn flaky_remote_singleflight_and_aborts_never_deadlock() {
     assert_eq!(store.cache.current_bytes(), store.cache.exact_ready_bytes());
     assert_eq!(store.cache.in_flight_count(), 0);
 }
+
+/// Verifies that `AimdLimiter` strictly caps concurrent upstream range requests,
+/// backs off on HTTP 503 SlowDown, recovers on clean 206s, and leaks 0 permits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn aimd_limiter_bounds_upstream_concurrency_and_adapts_on_503() {
+    use cogzilla_io::AimdLimiter;
+    use std::sync::atomic::AtomicUsize;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/mercator_4k_zstd_p3.tif");
+    if !path.exists() {
+        return;
+    }
+    let bytes = Arc::new(std::fs::read(&path).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let req_num = Arc::new(AtomicU64::new(0));
+
+    let active_srv = active.clone();
+    let max_srv = max_active.clone();
+    let req_srv = req_num.clone();
+    let data_srv = bytes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let io = TokioIo::new(stream);
+            let data = data_srv.clone();
+            let active = active_srv.clone();
+            let max_active = max_srv.clone();
+            let req_num = req_srv.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let data = data.clone();
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let req_num = req_num.clone();
+                    async move {
+                        let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(cur, Ordering::SeqCst);
+                        struct ActiveGuard(Arc<AtomicUsize>);
+                        impl Drop for ActiveGuard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                        let _ag = ActiveGuard(active);
+
+                        let n = req_num.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(8)).await;
+
+                        // Header (n == 0) succeeds; requests 1..=4 return 503 SlowDown
+                        if (1..=4).contains(&n) {
+                            let mut resp = Response::new(Full::new(Bytes::from_static(b"SlowDown")));
+                            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                            return Ok::<_, Infallible>(resp);
+                        }
+
+                        let total = data.len();
+                        let range = req
+                            .headers()
+                            .get("range")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.strip_prefix("bytes="));
+                        if let Some(r) = range {
+                            if let Some((a, b)) = r.split_once('-') {
+                                let start: usize = a.parse().unwrap_or(0);
+                                let end_incl: usize = b.parse().unwrap_or(total - 1).min(total - 1);
+                                let slice = &data[start..=end_incl];
+                                let mut resp = Response::new(Full::new(Bytes::copy_from_slice(slice)));
+                                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                                resp.headers_mut()
+                                    .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                                resp.headers_mut().insert(
+                                    CONTENT_RANGE,
+                                    HeaderValue::from_str(&format!("bytes {start}-{end_incl}/{total}")).unwrap(),
+                                );
+                                resp.headers_mut().insert(
+                                    CONTENT_LENGTH,
+                                    HeaderValue::from_str(&slice.len().to_string()).unwrap(),
+                                );
+                                return Ok::<_, Infallible>(resp);
+                            }
+                        }
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
+                    }
+                });
+                let _ = ServerBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+
+    let max_cap = 6usize;
+    let limiter = Arc::new(AimdLimiter::new(2, max_cap));
+    let store = Arc::new(CogStore::with_limits(64 * 1024 * 1024, 64, limiter.clone()));
+    let url = format!("http://{addr}/aimd.tif");
+    let cog = store.open_uri(&url).await.unwrap();
+
+    // Launch 24 concurrent distinct tile fetches against cap = 6
+    let mut handles = Vec::new();
+    for tidx in 0..24u32 {
+        let s = store.clone();
+        let c = cog.clone();
+        handles.push(tokio::spawn(async move {
+            s.get_blocks(&c, 0, &[Some(tidx)]).await.unwrap()
+        }));
+    }
+    for h in handles {
+        let blocks = tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .expect("AIMD-limited fetch deadlocked!")
+            .unwrap();
+        assert!(blocks[0].is_some());
+    }
+
+    let observed_max = max_active.load(Ordering::SeqCst);
+    assert!(
+        observed_max <= max_cap,
+        "upstream concurrency exceeded AIMD cap: {observed_max} > {max_cap}"
+    );
+    assert!(
+        limiter.throttle_events() >= 4,
+        "expected AIMD to record 503 throttle events, got {}",
+        limiter.throttle_events()
+    );
+    assert_eq!(limiter.in_flight(), 0, "leaked AIMD permits");
+    // After 24 clean completions, AIMD should have recovered back to max_cap
+    assert_eq!(limiter.current_limit(), max_cap);
+}
+
+/// Verifies `datasets_by_uri` stays strictly bounded by `max_open_uris` under concurrent opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn datasets_by_uri_cap_enforced_under_concurrent_opens() {
+    use cogzilla_io::AimdLimiter;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/mercator_4k_zstd_p3.tif");
+    if !path.exists() {
+        return;
+    }
+    let bytes = Arc::new(std::fs::read(&path).unwrap());
+    let (base_url, _reqs) = start_mock_range_server(bytes, 2).await;
+
+    let max_uris = 8usize;
+    let store = Arc::new(CogStore::with_limits(
+        16 * 1024 * 1024,
+        max_uris,
+        Arc::new(AimdLimiter::new(4, 32)),
+    ));
+
+    let mut handles = Vec::new();
+    for i in 0..40u32 {
+        let s = store.clone();
+        let u = format!("{base_url}?scene={i}");
+        handles.push(tokio::spawn(async move { s.open_uri(&u).await.unwrap() }));
+    }
+    for h in handles {
+        let cog = tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect("open_uri deadlocked under URI eviction!")
+            .unwrap();
+        assert!(!cog.index.ifds.is_empty());
+    }
+
+    assert!(
+        store.open_uri_count() <= max_uris,
+        "datasets_by_uri exceeded cap: {} > {max_uris}",
+        store.open_uri_count()
+    );
+}
