@@ -29,7 +29,7 @@ write_files:
     content: |
       #!/bin/sh
       set -eu
-      COGZILLA_IMAGE="${COGZILLA_IMAGE:-ghcr.io/moradology/cogzilla:0.2.4}"
+      COGZILLA_IMAGE="${COGZILLA_IMAGE:-ghcr.io/moradology/cogzilla:0.3.0}"
       docker pull "$COGZILLA_IMAGE"
       docker rm -f cogzilla 2>/dev/null || true
       docker run -d --name cogzilla --restart unless-stopped \

@@ -31,7 +31,7 @@ Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from one file. 
 One command, no data to download and no account:
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.4
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.3.0
 ```
 
 Then open <http://localhost:8080>.
@@ -55,7 +55,7 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the [releases pa
 ## What it does
 
 - **TiTiler's routes**: `/cog`, `/stac`, `/mosaicjson`, `/colorMaps` and `/tileMatrixSets`, with tiles, TileJSON, previews, crops, point queries and statistics.
-- **Any COG**: all eight numeric types, DEFLATE, ZSTD, LZW, JPEG and WebP compression, and sources in Web Mercator, WGS84, UTM, Albers, Lambert Conformal Conic or Polar Stereographic.
+- **Any COG**: all eight numeric types, DEFLATE, ZSTD, LZW, JPEG and WebP compression, and sources in 3,260 EPSG coordinate systems (UTM, state plane, national Lambert and Albers grids, polar grids, LAEA Europe) plus MODIS sinusoidal.
 - **Rendering per request**: rescaling, all 211 `rio-tiler` colormaps, band math (`expression=` or presets such as `ndvi`), multi-file composites and mosaics.
 - **Terrain**: hillshade, slope and aspect, plus Terrarium and Terrain-RGB tiles for 3D maps.
 - **Cloud storage**: S3, GCS, Azure Blob and plain HTTP, configured with the same environment variables as GDAL.
@@ -65,7 +65,7 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the [releases pa
 
 Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes pass 39 of 39 differential checks against a live TiTiler 2.4; the mosaic routes and terrain algorithms are newer and not yet in that set. Outputs are the same picture but not the same bytes.
 
-`cogzilla` is not a general replacement. It has no pgSTAC and no custom Python algorithms or readers, and it only reads GeoTIFFs in the projections listed above. For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` rather than being ignored; the full list is in [docs/api.md](docs/api.md#differences-from-titiler).
+`cogzilla` is not a general replacement. It has no pgSTAC and no custom Python algorithms or readers, and it only reads GeoTIFFs in the [coordinate systems it can place exactly](docs/api.md#coordinate-systems). For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` rather than being ignored; the full list is in [docs/api.md](docs/api.md#differences-from-titiler).
 
 **Running it on the public internet?** Set `COGZILLA_ALLOWED_URL_PREFIXES`. By default the server opens any `url=` it is given, including local paths.
 
