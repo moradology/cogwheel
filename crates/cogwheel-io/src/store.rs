@@ -7,7 +7,8 @@ use cogwheel_codec::{DecodedTile, decode_tile};
 use cogwheel_tiff::{CogIndex, TiffError, parse_cog};
 use dashmap::DashMap;
 
-use crate::backend::{CogSource, IoError, IoMetrics, S3Config, TileByteReq, coalesce_ranges};
+use crate::backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges};
+use crate::s3::S3Config;
 use crate::cache::{BlockKey, InFlightGuard, LookupResult, SingleflightBlockCache};
 
 const INITIAL_HEADER_FETCH_BYTES: u64 = 128 * 1024;
@@ -148,7 +149,7 @@ impl CogStore {
 
             let index = match &source {
                 CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
-                CogSource::RemoteHttp { .. } => {
+                CogSource::RemoteS3 { .. } | CogSource::RemoteHttp { .. } => {
                     // Speculative 128 KiB single-RTT header read; at most 1 follow-up if IFDs spill past 128 KiB
                     let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
                     loop {

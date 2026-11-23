@@ -1,0 +1,680 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
+
+use crate::backend::IoError;
+
+/// Resolved AWS credentials (static or temporary STS/IAM role).
+#[derive(Debug, Clone)]
+pub struct AwsCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    pub expires_at: Option<Instant>,
+}
+
+impl AwsCredentials {
+    pub fn is_expired_soon(&self) -> bool {
+        match self.expires_at {
+            Some(exp) => Instant::now() + Duration::from_secs(60) >= exp,
+            None => false,
+        }
+    }
+}
+
+/// Complete S3 runtime configuration matching GDAL/VSIS3/TiTiler environment conventions.
+#[derive(Debug, Clone)]
+pub struct S3Config {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    pub region: String,
+    pub endpoint_url: Option<String>,
+    /// When `true` (`AWS_NO_SIGN_REQUEST=YES`), requests are sent unsigned even if credentials exist.
+    pub no_sign_request: bool,
+    /// When `true` (`AWS_REQUEST_PAYER=requester`), sends & signs `x-amz-request-payer: requester`
+    /// (required for Landsat C2 `usgs-landsat`, Sentinel-2 L1C, etc.).
+    pub requester_pays: bool,
+    /// When `true` (`AWS_VIRTUAL_HOSTING=FALSE` or custom endpoint), uses path-style `/bucket/key`.
+    pub force_path_style: bool,
+    /// Max transient retries on `429`/`500`/`502`/`503`/`504` (default: 3, matching `GDAL_HTTP_MAX_RETRY`).
+    pub max_retries: u32,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            access_key: String::new(),
+            secret_key: String::new(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            no_sign_request: false,
+            requester_pays: false,
+            force_path_style: false,
+            max_retries: 3,
+        }
+    }
+}
+
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn env_falsy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(false)
+}
+
+impl S3Config {
+    /// Load S3 configuration from standard AWS & GDAL (`VSIS3`) environment variables
+    /// plus `~/.aws/credentials` fallback.
+    ///
+    /// Always returns a valid `S3Config` (even for anonymous public buckets with custom endpoints,
+    /// regions, or `AWS_NO_SIGN_REQUEST=YES`).
+    pub fn from_env_full() -> Self {
+        let no_sign_request = env_truthy("AWS_NO_SIGN_REQUEST");
+        let requester_pays = std::env::var("AWS_REQUEST_PAYER")
+            .map(|v| v.trim().eq_ignore_ascii_case("requester"))
+            .unwrap_or(false);
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+
+        // Support both standard AWS_ENDPOINT_URL and GDAL's AWS_S3_ENDPOINT
+        let endpoint_url = std::env::var("AWS_ENDPOINT_URL")
+            .or_else(|_| std::env::var("AWS_S3_ENDPOINT"))
+            .ok()
+            .map(|ep| {
+                if ep.starts_with("http://") || ep.starts_with("https://") {
+                    ep
+                } else if env_falsy("AWS_HTTPS") {
+                    format!("http://{ep}")
+                } else {
+                    format!("https://{ep}")
+                }
+            });
+
+        let force_path_style = env_falsy("AWS_VIRTUAL_HOSTING") || endpoint_url.is_some();
+
+        let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
+            .or_else(|_| std::env::var("AWS_MAX_ATTEMPTS"))
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+            .min(10);
+
+        let (access_key, secret_key, session_token) = if no_sign_request {
+            (String::new(), String::new(), None)
+        } else if let (Ok(ak), Ok(sk)) = (
+            std::env::var("AWS_ACCESS_KEY_ID"),
+            std::env::var("AWS_SECRET_ACCESS_KEY"),
+        ) {
+            (ak, sk, std::env::var("AWS_SESSION_TOKEN").ok())
+        } else if let Some(creds) = load_shared_credentials_file(None, None) {
+            (creds.access_key, creds.secret_key, creds.session_token)
+        } else {
+            (String::new(), String::new(), None)
+        };
+
+        Self {
+            access_key,
+            secret_key,
+            session_token,
+            region,
+            endpoint_url,
+            no_sign_request,
+            requester_pays,
+            force_path_style,
+            max_retries,
+        }
+    }
+
+    /// Backwards-compatible constructor returning `Some(S3Config)` only when static env credentials exist.
+    pub fn from_env() -> Option<Self> {
+        let cfg = Self::from_env_full();
+        if cfg.has_credentials() || cfg.endpoint_url.is_some() || cfg.requester_pays || cfg.no_sign_request {
+            Some(cfg)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn has_credentials(&self) -> bool {
+        !self.no_sign_request && !self.access_key.is_empty() && !self.secret_key.is_empty()
+    }
+}
+
+/// Parse `~/.aws/credentials` (or `AWS_SHARED_CREDENTIALS_FILE`) for the active `AWS_PROFILE` (default: `default`).
+pub fn load_shared_credentials_file(
+    explicit_path: Option<&std::path::Path>,
+    explicit_profile: Option<&str>,
+) -> Option<AwsCredentials> {
+    let path: PathBuf = match explicit_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            if let Ok(p) = std::env::var("AWS_SHARED_CREDENTIALS_FILE") {
+                PathBuf::from(p)
+            } else {
+                let home = std::env::var("HOME").ok()?;
+                PathBuf::from(home).join(".aws").join("credentials")
+            }
+        }
+    };
+    let profile = explicit_profile
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("AWS_PROFILE").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_PROFILE").ok())
+        .unwrap_or_else(|| "default".to_string());
+
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_aws_credentials_ini(&text, &profile)
+}
+
+/// Parse INI-formatted AWS credentials text for `profile`.
+pub fn parse_aws_credentials_ini(text: &str, profile: &str) -> Option<AwsCredentials> {
+    let mut in_section = false;
+    let mut ak: Option<String> = None;
+    let mut sk: Option<String> = None;
+    let mut tok: Option<String> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let sec = line[1..line.len() - 1].trim();
+            let sec_clean = sec.strip_prefix("profile ").unwrap_or(sec).trim();
+            in_section = sec_clean == profile;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().to_string();
+            match key.as_str() {
+                "aws_access_key_id" => ak = Some(val),
+                "aws_secret_access_key" => sk = Some(val),
+                "aws_session_token" => tok = Some(val),
+                _ => {}
+            }
+        }
+    }
+
+    Some(AwsCredentials {
+        access_key: ak?,
+        secret_key: sk?,
+        session_token: tok,
+        expires_at: None,
+    })
+}
+
+/// Dynamic credential cache supporting ECS container metadata (`AWS_CONTAINER_CREDENTIALS_*`)
+/// and EC2 IMDSv2 (`169.254.169.254`), with automatic TTL refresh.
+pub struct DynamicCredsCache {
+    cached: RwLock<Option<AwsCredentials>>,
+}
+
+impl Default for DynamicCredsCache {
+    fn default() -> Self {
+        Self {
+            cached: RwLock::new(None),
+        }
+    }
+}
+
+impl DynamicCredsCache {
+    /// Resolve active credentials: returns cached temporary creds if still fresh, otherwise
+    /// tries ECS container credentials endpoint (if env vars are set) or EC2 IMDSv2.
+    pub async fn resolve_dynamic(&self, client: &reqwest::Client) -> Option<AwsCredentials> {
+        {
+            let guard = self.cached.read();
+            if let Some(c) = guard.as_ref() {
+                if !c.is_expired_soon() {
+                    return Some(c.clone());
+                }
+            }
+        }
+
+        // 1. ECS Task Role (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or FULL_URI)
+        let ecs_url = if let Ok(rel) = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+            Some(format!("http://169.254.170.2{rel}"))
+        } else {
+            std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok()
+        };
+
+        if let Some(url) = ecs_url {
+            if let Some(creds) = fetch_ecs_credentials(client, &url).await {
+                *self.cached.write() = Some(creds.clone());
+                return Some(creds);
+            }
+        }
+
+        // 2. EC2 IMDSv2 (only when not explicitly disabled via AWS_EC2_METADATA_DISABLED=true)
+        if !env_truthy("AWS_EC2_METADATA_DISABLED") {
+            if let Some(creds) = fetch_imds_v2_credentials(client).await {
+                *self.cached.write() = Some(creds.clone());
+                return Some(creds);
+            }
+        }
+
+        None
+    }
+}
+
+pub async fn fetch_ecs_credentials(client: &reqwest::Client, url: &str) -> Option<AwsCredentials> {
+    let mut req = client.get(url).timeout(Duration::from_secs(2));
+    if let Ok(tok) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
+        req = req.header("Authorization", tok);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    parse_aws_json_credentials(&body)
+}
+
+async fn fetch_imds_v2_credentials(client: &reqwest::Client) -> Option<AwsCredentials> {
+    let token_resp = client
+        .put("http://169.254.169.254/latest/api/token")
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?;
+    if !token_resp.status().is_success() {
+        return None;
+    }
+    let imds_token = token_resp.text().await.ok()?;
+
+    let role_resp = client
+        .get("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+        .header("X-aws-ec2-metadata-token", &imds_token)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?;
+    if !role_resp.status().is_success() {
+        return None;
+    }
+    let role_text = role_resp.text().await.ok()?;
+    let role = role_text.lines().next()?.trim();
+    if role.is_empty() {
+        return None;
+    }
+
+    let creds_resp = client
+        .get(format!(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}"
+        ))
+        .header("X-aws-ec2-metadata-token", &imds_token)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?;
+    if !creds_resp.status().is_success() {
+        return None;
+    }
+    let body = creds_resp.text().await.ok()?;
+    parse_aws_json_credentials(&body)
+}
+
+/// Minimal dependency-free JSON parser for AWS ECS / IMDSv2 credential responses
+/// (`AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`).
+pub fn parse_aws_json_credentials(body: &str) -> Option<AwsCredentials> {
+    fn extract_str(json: &str, key: &str) -> Option<String> {
+        let needle = format!("\"{key}\"");
+        let idx = json.find(&needle)?;
+        let rest = &json[idx + needle.len()..];
+        let colon = rest.find(':')?;
+        let after = rest[colon + 1..].trim_start();
+        if !after.starts_with('"') {
+            return None;
+        }
+        let inner = &after[1..];
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(esc) = chars.next() {
+                    out.push(esc);
+                }
+            } else if c == '"' {
+                return Some(out);
+            } else {
+                out.push(c);
+            }
+        }
+        None
+    }
+
+    let access_key = extract_str(body, "AccessKeyId")?;
+    let secret_key = extract_str(body, "SecretAccessKey")?;
+    let session_token = extract_str(body, "Token");
+    // Refresh after 15 minutes if Expiration isn't parsed in detail
+    let expires_at = Some(Instant::now() + Duration::from_secs(900));
+    Some(AwsCredentials {
+        access_key,
+        secret_key,
+        session_token,
+        expires_at,
+    })
+}
+
+/// Global lock-free cache mapping `bucket -> discovered AWS region` (populated automatically
+/// whenever S3 returns `301` or `400` with `x-amz-bucket-region`).
+pub fn bucket_region_cache() -> &'static DashMap<String, String, ahash::RandomState> {
+    static CACHE: std::sync::OnceLock<DashMap<String, String, ahash::RandomState>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| DashMap::with_hasher(ahash::RandomState::new()))
+}
+
+/// RFC 3986 URI-encode an S3 path for SigV4 `canonical_uri` (preserving `/`, encoding spaces,
+/// `+`, `:`, `=`, `(`, `)`, `%`, etc. as uppercase `%XX`).
+pub fn encode_s3_canonical_uri(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 16);
+    if !path.starts_with('/') {
+        out.push('/');
+    }
+    for &b in path.as_bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/');
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Parse `s3://bucket/key` or `/vsis3/bucket/key` into `(bucket, key)`.
+pub fn parse_s3_uri(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("/vsis3/"))?;
+    let (bucket, key) = rest.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket, key))
+}
+
+/// Build `(url, host, canonical_uri)` for an S3 bucket/key given `region` and `S3Config`.
+pub fn build_s3_endpoint(
+    bucket: &str,
+    key: &str,
+    region: &str,
+    cfg: &S3Config,
+) -> (String, String, String) {
+    let encoded_key = encode_s3_canonical_uri(key);
+    if let Some(ep) = cfg.endpoint_url.as_deref() {
+        let ep_clean = ep.trim_end_matches('/');
+        let host = ep_clean
+            .split("://")
+            .nth(1)
+            .unwrap_or(ep_clean)
+            .split('/')
+            .next()
+            .unwrap_or(ep_clean)
+            .to_string();
+        if cfg.force_path_style {
+            let canonical_uri = format!("/{bucket}{encoded_key}");
+            (format!("{ep_clean}{canonical_uri}"), host, canonical_uri)
+        } else {
+            let scheme = ep_clean.split("://").next().unwrap_or("https");
+            let vhost = format!("{bucket}.{host}");
+            (format!("{scheme}://{vhost}{encoded_key}"), vhost, encoded_key)
+        }
+    } else if cfg.force_path_style {
+        let host = format!("s3.{region}.amazonaws.com");
+        let canonical_uri = format!("/{bucket}{encoded_key}");
+        (format!("https://{host}{canonical_uri}"), host, canonical_uri)
+    } else {
+        let host = format!("{bucket}.s3.{region}.amazonaws.com");
+        (format!("https://{host}{encoded_key}"), host, encoded_key)
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    hex::encode(h.finalize())
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC key");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Sign an S3 `GET` request using AWS Signature Version 4.
+///
+/// Properly sorts and signs ALL required headers including `x-amz-security-token` (for STS/IAM roles)
+/// and `x-amz-request-payer` (for Requester Pays buckets like Landsat Collection 2), plus optional `Range`.
+pub fn sign_s3_get(
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    host: &str,
+    canonical_uri: &str,
+    range_header: Option<&str>,
+    requester_pays: bool,
+) -> Vec<(&'static str, String)> {
+    let now = time::OffsetDateTime::now_utc();
+    let date_stamp = format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day());
+    let amz_date = format!(
+        "{date_stamp}T{:02}{:02}{:02}Z",
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let empty_hash = sha256_hex(b"");
+
+    // BTreeMap guarantees strict lexicographical sorting by lowercase header name (required by SigV4!)
+    let mut canon = BTreeMap::<&'static str, String>::new();
+    canon.insert("host", host.to_string());
+    if let Some(rng) = range_header {
+        canon.insert("range", rng.to_string());
+    }
+    canon.insert("x-amz-content-sha256", empty_hash.clone());
+    canon.insert("x-amz-date", amz_date.clone());
+    if requester_pays {
+        canon.insert("x-amz-request-payer", "requester".to_string());
+    }
+    if let Some(tok) = session_token {
+        canon.insert("x-amz-security-token", tok.to_string());
+    }
+
+    let mut canonical_headers = String::with_capacity(256);
+    let mut signed_headers = String::with_capacity(128);
+    for (i, (k, v)) in canon.iter().enumerate() {
+        canonical_headers.push_str(k);
+        canonical_headers.push(':');
+        canonical_headers.push_str(v.trim());
+        canonical_headers.push('\n');
+        if i > 0 {
+            signed_headers.push(';');
+        }
+        signed_headers.push_str(k);
+    }
+
+    let canonical_request = format!(
+        "GET\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{empty_hash}"
+    );
+    let scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+
+    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    let mut out = Vec::with_capacity(6);
+    out.push(("Authorization", auth));
+    out.push(("x-amz-date", amz_date));
+    out.push(("x-amz-content-sha256", empty_hash));
+    if requester_pays {
+        out.push(("x-amz-request-payer", "requester".to_string()));
+    }
+    if let Some(tok) = session_token {
+        out.push(("x-amz-security-token", tok.to_string()));
+    }
+    out
+}
+
+/// Check if an HTTP status code is transient and safe to retry (`429`, `500`, `502`, `503`, `504`).
+#[inline]
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Compute exponential backoff delay with deterministic jitter (100ms -> 250ms -> 600ms...).
+pub fn retry_backoff_duration(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+    if let Some(secs) = retry_after_secs {
+        return Duration::from_secs(secs.min(10));
+    }
+    let base_ms = 100u64.saturating_mul(1u64 << attempt.min(5));
+    // Lightweight jitter from current subsec nanos
+    let jitter = (time::OffsetDateTime::now_utc().nanosecond() as u64) % 50;
+    Duration::from_millis((base_ms + jitter).min(4000))
+}
+
+/// Execute a robust GET request against an S3 object (optional `Range` header), handling:
+/// - Automatic bucket region discovery & caching on `301` / `400` with `x-amz-bucket-region`
+/// - Full SigV4 signing (including `x-amz-security-token` and `x-amz-request-payer`)
+/// - Unsigned public access (`AWS_NO_SIGN_REQUEST=YES` or no creds)
+/// - Transient `429`/`500`/`502`/`503`/`504` retries with exponential backoff
+pub async fn fetch_s3_object(
+    client: &reqwest::Client,
+    bucket: &str,
+    key: &str,
+    cfg: &S3Config,
+    dynamic_creds: Option<&Arc<DynamicCredsCache>>,
+    range_header: Option<&str>,
+) -> Result<bytes::Bytes, IoError> {
+    let mut region = bucket_region_cache()
+        .get(bucket)
+        .map(|r| r.clone())
+        .unwrap_or_else(|| cfg.region.clone());
+
+    let mut region_redirected = false;
+    let mut attempt = 0u32;
+
+    loop {
+        let (url, host, canonical_uri) = build_s3_endpoint(bucket, key, &region, cfg);
+        let mut req = client.get(&url);
+        if let Some(rng) = range_header {
+            req = req.header("Range", rng);
+        }
+
+        // Resolve credentials: static config -> dynamic ECS/IMDSv2 (unless no_sign_request)
+        if !cfg.no_sign_request {
+            if cfg.has_credentials() {
+                for (k, v) in sign_s3_get(
+                    &cfg.access_key,
+                    &cfg.secret_key,
+                    cfg.session_token.as_deref(),
+                    &region,
+                    &host,
+                    &canonical_uri,
+                    range_header,
+                    cfg.requester_pays,
+                ) {
+                    req = req.header(k, v);
+                }
+            } else if let Some(dc) = dynamic_creds {
+                if let Some(creds) = dc.resolve_dynamic(client).await {
+                    for (k, v) in sign_s3_get(
+                        &creds.access_key,
+                        &creds.secret_key,
+                        creds.session_token.as_deref(),
+                        &region,
+                        &host,
+                        &canonical_uri,
+                        range_header,
+                        cfg.requester_pays,
+                    ) {
+                        req = req.header(k, v);
+                    }
+                } else if cfg.requester_pays {
+                    req = req.header("x-amz-request-payer", "requester");
+                }
+            } else if cfg.requester_pays {
+                req = req.header("x-amz-request-payer", "requester");
+            }
+        } else if cfg.requester_pays {
+            req = req.header("x-amz-request-payer", "requester");
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) if attempt < cfg.max_retries && (e.is_timeout() || e.is_connect()) => {
+                tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(IoError::Http(e)),
+        };
+
+        let status = resp.status().as_u16();
+        if status == 200 || status == 206 {
+            return Ok(resp.bytes().await?);
+        }
+
+        // Automatic S3 bucket region discovery on 301 / 400 with `x-amz-bucket-region`
+        if !region_redirected && matches!(status, 301 | 400 | 403) {
+            if let Some(discovered) = resp
+                .headers()
+                .get("x-amz-bucket-region")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != &region)
+            {
+                bucket_region_cache().insert(bucket.to_string(), discovered.clone());
+                region = discovered;
+                region_redirected = true;
+                continue;
+            }
+        }
+
+        // Transient S3 retry (429 SlowDown, 500, 502, 503 ServiceUnavailable, 504)
+        if attempt < cfg.max_retries && is_retryable_status(status) {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
+            attempt += 1;
+            continue;
+        }
+
+        return Err(IoError::HttpStatus { status, url });
+    }
+}

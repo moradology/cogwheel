@@ -85,7 +85,13 @@ pub async fn load_stac_item(
         return Ok(hit.clone());
     }
 
-    let raw_bytes = if uri.starts_with("http://") || uri.starts_with("https://") {
+    let raw_bytes = if let Some((bucket, key)) = cogwheel_io::parse_s3_uri(uri) {
+        let cfg = cogwheel_io::S3Config::from_env_full();
+        cogwheel_io::fetch_s3_object(client, bucket, key, &cfg, None, None)
+            .await
+            .map_err(|e| EngineError::BadRequest(format!("failed to fetch S3 STAC item: {e}")))?
+            .to_vec()
+    } else if uri.starts_with("http://") || uri.starts_with("https://") {
         let resp = client
             .get(uri)
             .send()
