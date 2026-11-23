@@ -141,6 +141,16 @@ async fn main() {
     }
 
     tracing::info!(bind = %args.bind, cache_mb = args.cache_mb, "cogzilla-server listening");
+    // A wildcard bind is not an address a browser can open; inside a container
+    // the published port may also differ, but this is right for the default.
+    let open_host = if args.bind.ip().is_unspecified() {
+        "localhost".to_string()
+    } else if args.bind.is_ipv6() {
+        format!("[{}]", args.bind.ip())
+    } else {
+        args.bind.ip().to_string()
+    };
+    eprintln!("\n  Open http://{open_host}:{}/ for a map with live demos.\n", args.bind.port());
     if let Err(e) = serve(engine, args.bind).await {
         eprintln!("server error: {e}");
         std::process::exit(1);

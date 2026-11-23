@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>cogzilla</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1c2027; --line: #2c323c; --text: #e6e9ee;
+    --muted: #98a1b0; --accent: #5fd08a; --accent-ink: #0c1a11; --warn: #f0a35e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  aside {
+    width: 340px; flex: none; overflow-y: auto; padding: 18px 16px;
+    border-right: 1px solid var(--line); background: var(--panel);
+  }
+  #mapwrap { flex: 1; min-width: 0; position: relative; }
+  #map { position: absolute; inset: 0; }
+  #hud {
+    position: absolute; top: 12px; left: 12px; display: flex; gap: 18px; padding: 8px 14px;
+    background: rgba(20, 23, 28, 0.88); border: 1px solid var(--line); border-radius: 8px;
+  }
+  #hud b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  #hud span { color: var(--muted); font-size: 12px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+  h1 small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+  .tag { margin: 4px 0 16px; color: var(--muted); }
+  h2 {
+    margin: 18px 0 8px; font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  button, input { font: inherit; color: inherit; }
+  .demo {
+    display: block; width: 100%; text-align: left; padding: 8px 10px; margin-bottom: 6px;
+    background: transparent; border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
+  }
+  .demo:hover { border-color: var(--muted); }
+  .demo[aria-pressed="true"] { border-color: var(--accent); background: rgba(95, 208, 138, 0.08); }
+  .demo b { display: block; font-weight: 600; }
+  .demo span { color: var(--muted); font-size: 12px; }
+  input[type="text"] {
+    width: 100%; padding: 7px 9px; margin-bottom: 6px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  input[type="text"]:focus { outline: none; border-color: var(--accent); }
+  .go {
+    padding: 7px 14px; background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 6px; font-weight: 600; cursor: pointer;
+  }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .stat { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  #status { color: var(--warn); font-size: 12px; min-height: 18px; margin: 8px 0 0; overflow-wrap: anywhere; }
+  pre {
+    margin: 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 110px; overflow-y: auto;
+  }
+  .links { margin-top: 18px; font-size: 12px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .copy {
+    float: right; margin-top: -2px; padding: 1px 8px; background: transparent;
+    border: 1px solid var(--line); border-radius: 4px; font-size: 11px; cursor: pointer;
+    text-transform: none; letter-spacing: 0; color: var(--muted);
+  }
+  @media (max-width: 760px) {
+    body { flex-direction: column-reverse; }
+    aside { width: 100%; height: 50%; border-right: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <h1>cogzilla <small>v{{VERSION}}</small></h1>
+  <p class="tag">Every tile on this map is read from a public cloud bucket and rendered by this server when the map asks for it.</p>
+
+  <h2>Demos</h2>
+  <div id="demos"></div>
+
+  <h2>Your own COG</h2>
+  <form id="custom">
+    <input type="text" id="custom-url" placeholder="https://… or s3://… .tif" aria-label="COG URL" />
+    <input type="text" id="custom-params" placeholder="optional: rescale=0,3000&amp;colormap_name=viridis" aria-label="Extra query parameters" />
+    <button class="go" type="submit">Open on map</button>
+  </form>
+  <p id="status" role="status"></p>
+  <p class="note">The first view of an area waits on the source bucket. Zoom in or pan nearby and new tiles render from blocks the server already holds, so the tile time on the map drops to what rendering costs.</p>
+
+  <h2>This server, since it started</h2>
+  <div class="stats">
+    <div class="stat"><b id="s-served">–</b><span>tiles rendered</span></div>
+    <div class="stat"><b id="s-hit">–</b><span>block cache hit rate</span></div>
+    <div class="stat"><b id="s-fetched">–</b><span>fetched from source</span></div>
+    <div class="stat"><b id="s-cache">–</b><span>held in block cache</span></div>
+  </div>
+
+  <h2>Tile URL for this layer <button class="copy" id="copy" type="button">copy</button></h2>
+  <pre id="tile-url">–</pre>
+
+  <p class="links">
+    <a href="/docs">API explorer</a> ·
+    <a href="/stats">/stats</a> ·
+    <a href="/metrics">/metrics</a> ·
+    <a href="https://github.com/moradology/cogzilla">GitHub</a>
+  </p>
+</aside>
+<div id="mapwrap">
+  <div id="map"></div>
+  <div id="hud" title="Request to last byte for this layer's tiles, as your browser measured it. Tiles your browser cached are not counted.">
+    <div><b id="s-median">–</b><span>median, last 24 tiles</span></div>
+    <div><b id="s-count">0</b><span>tiles loaded</span></div>
+  </div>
+</div>
+
+<script>
+const DEM = 'https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif';
+const S2 = 'https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A';
+const RAINIER = { center: [-121.76, 46.853], zoom: 11 };
+
+const DEMOS = [
+  { name: 'Hillshade', desc: 'Mt. Rainier, Copernicus 30 m DEM', urls: [DEM],
+    params: 'algorithm=hillshade&azimuth=315&altitude=45&z_factor=1.5&resampling=cubic', view: RAINIER },
+  { name: '3D terrain', desc: 'Terrarium elevation tiles drive the mesh', urls: [DEM],
+    params: 'algorithm=hillshade&azimuth=315&altitude=45&z_factor=1.5&resampling=cubic',
+    terrain: true, view: { ...RAINIER, zoom: 11.5, pitch: 65, bearing: 20 } },
+  { name: 'Slope', desc: 'Degrees, 0 to 60, inferno colormap', urls: [DEM],
+    params: 'algorithm=slope&rescale=0,60&colormap_name=inferno&resampling=cubic', view: RAINIER },
+  { name: 'Aspect', desc: 'Compass direction each slope faces', urls: [DEM],
+    params: 'algorithm=aspect&colormap_name=hsv&resampling=cubic', view: RAINIER },
+  { name: 'Elevation', desc: 'Metres, 0 to 4,400, terrain colormap', urls: [DEM],
+    params: 'rescale=0,4400&colormap_name=terrain&resampling=cubic', view: RAINIER },
+  { name: 'Sentinel-2 true colour', desc: 'Northeast Colorado, September 2024', urls: [S2 + '/TCI.tif'], params: '' },
+  { name: 'Sentinel-2 NDVI', desc: 'Band math across two files, per tile', urls: [S2 + '/B08.tif', S2 + '/B04.tif'],
+    params: 'expression=ndvi&rescale=-0.2,0.8&colormap_name=rdylgn' },
+];
+
+const $ = (id) => document.getElementById(id);
+const status = (msg) => { $('status').textContent = msg || ''; };
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: {
+    version: 8,
+    sources: {
+      osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256,
+             attribution: '© OpenStreetMap contributors' },
+    },
+    layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
+  },
+  center: RAINIER.center, zoom: 9, maxPitch: 80,
+});
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+map.on('error', (e) => {
+  const s = e && e.error && e.error.status;
+  if (s === 403) status('The server refused that source (403). It is outside COGZILLA_ALLOWED_URL_PREFIXES.');
+});
+
+// Tile timings for the current layer, from the browser's resource timing.
+let times = [];
+const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+const WINDOW = 24;
+function showTimes() {
+  const recent = times.slice(-WINDOW);
+  const m = recent.length ? median(recent) : null;
+  $('s-count').textContent = times.length.toLocaleString();
+  $('s-median').textContent = m === null ? '–' : m.toFixed(m < 10 ? 1 : 0) + ' ms';
+}
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) {
+    // transferSize 0 means the browser answered from its own cache.
+    if (e.name.includes('/cog/tiles/') && e.transferSize > 0) times.push(e.duration);
+  }
+  showTimes();
+}).observe({ type: 'resource', buffered: false });
+
+function query(urls, params) {
+  const q = urls.map((u) => 'url=' + encodeURIComponent(u)).join('&');
+  return params ? q + '&' + params : q;
+}
+async function tilejson(urls, params) {
+  const r = await fetch('/cog/WebMercatorQuad/tilejson.json?' + query(urls, params));
+  if (!r.ok) {
+    const body = (await r.text()).slice(0, 200);
+    throw new Error(r.status === 403
+      ? 'The server refused that source (403). It is outside COGZILLA_ALLOWED_URL_PREFIXES.'
+      : 'Could not open that source (' + r.status + '): ' + body);
+  }
+  return r.json();
+}
+
+let generation = 0;
+async function show(layer, button) {
+  const mine = ++generation;
+  status('');
+  document.querySelectorAll('.demo').forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+  try {
+    const tj = await tilejson(layer.urls, layer.params);
+    const dem = layer.terrain ? await tilejson(layer.urls, 'algorithm=terrarium') : null;
+    if (mine !== generation) return;
+
+    map.setTerrain(null);
+    if (map.getLayer('cog')) map.removeLayer('cog');
+    for (const id of ['cog', 'dem']) if (map.getSource(id)) map.removeSource(id);
+    times = [];
+    showTimes();
+
+    map.addSource('cog', { type: 'raster', tiles: tj.tiles, tileSize: 256, bounds: tj.bounds,
+                           minzoom: tj.minzoom, maxzoom: Math.max(tj.maxzoom, 14) });
+    map.addLayer({ id: 'cog', type: 'raster', source: 'cog' });
+    if (dem) {
+      map.addSource('dem', { type: 'raster-dem', tiles: dem.tiles, tileSize: 256, encoding: 'terrarium',
+                             bounds: dem.bounds, maxzoom: 12 });
+      map.setTerrain({ source: 'dem', exaggeration: 1.5 });
+    }
+    $('tile-url').textContent = tj.tiles[0];
+
+    if (layer.view) {
+      map.flyTo({ pitch: 0, bearing: 0, ...layer.view, duration: 800 });
+    } else {
+      map.fitBounds([[tj.bounds[0], tj.bounds[1]], [tj.bounds[2], tj.bounds[3]]],
+                    { padding: 40, pitch: 0, bearing: 0, duration: 800 });
+    }
+  } catch (err) {
+    if (mine === generation) status(err.message);
+  }
+}
+
+DEMOS.forEach((d, i) => {
+  const b = document.createElement('button');
+  b.className = 'demo';
+  b.type = 'button';
+  const name = document.createElement('b');
+  name.textContent = d.name;
+  const desc = document.createElement('span');
+  desc.textContent = d.desc;
+  b.append(name, desc);
+  b.addEventListener('click', () => show(d, b));
+  $('demos').append(b);
+  if (i === 0) map.once('load', () => show(d, b));
+});
+
+$('custom').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const url = $('custom-url').value.trim();
+  if (!url) return status('Enter the URL of a Cloud Optimized GeoTIFF.');
+  show({ urls: [url], params: $('custom-params').value.trim().replace(/^[?&]+/, '') }, null);
+});
+
+$('copy').addEventListener('click', () => {
+  navigator.clipboard.writeText($('tile-url').textContent).then(() => {
+    $('copy').textContent = 'copied';
+    setTimeout(() => { $('copy').textContent = 'copy'; }, 1200);
+  });
+});
+
+const bytes = (n) => {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n < 10 && i > 0 ? 1 : 0) + ' ' + units[i];
+};
+async function pollServer() {
+  try {
+    const s = await (await fetch('/stats')).json();
+    const lookups = s.cache_hits + s.cache_misses;
+    $('s-served').textContent = s.tiles_served.toLocaleString();
+    $('s-hit').textContent = lookups ? Math.round((100 * s.cache_hits) / lookups) + '%' : '–';
+    $('s-fetched').textContent = bytes(s.remote_bytes_fetched);
+    $('s-cache').textContent = bytes(s.cache_bytes);
+  } catch (_) { /* server restarting; keep the last values */ }
+}
+pollServer();
+setInterval(pollServer, 1000);
+</script>
+</body>
+</html>

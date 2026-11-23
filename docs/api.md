@@ -47,7 +47,9 @@ GET /cog/tiles/WebMercatorQuad/12/652/1583.f32?url=s3://bucket/VV.tif&expr=db
 
 ## Live demos on public data
 
-With a server on `localhost:8080`, these open interactive maps from public AWS S3 COGs (no credentials needed):
+The quickest way in is the landing page at `http://localhost:8080/`, which has these demos as buttons, a field for your own COG URL, and per-tile timings. It loads MapLibre and an OpenStreetMap basemap from the internet.
+
+The same maps as direct links, with a server on `localhost:8080` (public AWS S3 COGs, no credentials needed):
 
 - **Sentinel-2 true color** (northeast Colorado):
   ```text

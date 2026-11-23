@@ -39,6 +39,14 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap()
     }
 
+    // 0. GET / serves the landing page with the crate version filled in
+    let landing = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(landing.status().as_u16(), 200);
+    assert!(landing.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    let landing = landing.text().await.unwrap();
+    assert!(landing.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+    assert!(!landing.contains("{{VERSION}}"));
+
     // 1. GET /cog/info
     let info = get_json(&client, format!("{base}/cog/info?url={sat_url}")).await;
     assert_eq!(info["dtype"], "float32");

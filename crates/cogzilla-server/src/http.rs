@@ -696,6 +696,11 @@ pub async fn handle_request(
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"ok"), "text/plain"));
     }
 
+    if method == Method::GET && (path == "/" || path == "/index.html") {
+        let html = include_str!("landing.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+        return Ok(plain_resp(StatusCode::OK, Bytes::from(html), "text/html; charset=utf-8"));
+    }
+
     if method == Method::GET && path == "/openapi.json" {
         let spec = serde_json::json!({
             "openapi": "3.1.0",
@@ -705,6 +710,7 @@ pub async fn handle_request(
                 "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG & STAC tile server"
             },
             "paths": {
+                "/": { "get": { "summary": "Landing page with live demo maps" } },
                 "/healthz": { "get": { "summary": "Health check" } },
                 "/cog/info": { "get": { "summary": "COG metadata" } },
                 "/cog/info.geojson": { "get": { "summary": "COG GeoJSON metadata" } },

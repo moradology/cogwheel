@@ -49,4 +49,4 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_ACCESS_KEY`, `AZURE_STORAGE_ACCESS_TOKEN`, `AZURE_NO_SIGN_REQUEST` | Azure Blob (`az://`, `abfs[s]://`, `/vsiaz/`) SAS token, Bearer token, or SharedKey HMAC-SHA256 signing. |
 | `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
 
-Operational endpoints: `GET /healthz` for liveness, `GET /stats` for JSON counters, `GET /metrics` for Prometheus exposition, `POST /mosaic/register` for dynamic catalog / STAC-API search registration, and `GET /docs` with `GET /openapi.json` for the route list.
+Operational endpoints: `GET /` for the landing page with demo maps, `GET /healthz` for liveness, `GET /stats` for JSON counters, `GET /metrics` for Prometheus exposition, `POST /mosaic/register` for dynamic catalog / STAC-API search registration, and `GET /docs` with `GET /openapi.json` for the route list.
