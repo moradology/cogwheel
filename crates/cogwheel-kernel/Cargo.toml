@@ -1,0 +1,14 @@
+[package]
+name = "cogwheel-kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cogwheel-tiff = { path = "../cogwheel-tiff" }
+cogwheel-codec = { path = "../cogwheel-codec" }
+cogwheel-proj = { path = "../cogwheel-proj" }
+thiserror.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+libdeflater.workspace = true
+libwebp-sys.workspace = true

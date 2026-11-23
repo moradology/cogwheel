@@ -1,0 +1,8 @@
+[package]
+name = "cogwheel-proj"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cogwheel-tiff = { path = "../cogwheel-tiff" }
+thiserror.workspace = true

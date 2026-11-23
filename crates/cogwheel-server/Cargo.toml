@@ -1,0 +1,24 @@
+[package]
+name = "cogwheel-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cogwheel-tiff = { path = "../cogwheel-tiff" }
+cogwheel-codec = { path = "../cogwheel-codec" }
+cogwheel-proj = { path = "../cogwheel-proj" }
+cogwheel-kernel = { path = "../cogwheel-kernel" }
+cogwheel-io = { path = "../cogwheel-io" }
+thiserror.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+ahash.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
