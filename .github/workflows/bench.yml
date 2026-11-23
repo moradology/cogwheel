@@ -1,0 +1,101 @@
+name: COGMark
+
+# Manually triggered: runs the COGMark suite and the GDAL / rio-tiler / TiTiler
+# baseline on a hosted Linux x86-64 runner, then publishes a comparison table
+# in the run summary and the raw JSON as an artifact.
+#
+# Hosted runners are shared VMs, so absolute timings vary between runs. The
+# cogzilla-to-baseline ratios are the meaningful output: both sides run back to
+# back on the same machine.
+on:
+  workflow_dispatch:
+    inputs:
+      target_cpu:
+        description: >-
+          CPU target for the cogzilla build. "generic" matches the published
+          release binaries (AVX2/FMA selected at runtime); "native" matches
+          the local .cargo/config.toml default.
+        type: choice
+        options: [generic, native]
+        default: generic
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ${{ inputs.target_cpu == 'native' && '-C target-cpu=native' || '' }}
+
+jobs:
+  cogmark:
+    name: COGMark (linux x86_64, ${{ inputs.target_cpu }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Python environment
+        run: |
+          uv venv --python 3.12 benches/.venv
+          uv pip install --python benches/.venv/bin/python \
+            rasterio rio-tiler titiler.core uvicorn numpy pillow httpx
+
+      - name: Generate fixtures
+        run: |
+          benches/.venv/bin/python benches/generate_fixtures.py
+          benches/.venv/bin/python benches/generate_landsat_sar_fixtures.py
+
+      - name: Record environment
+        run: |
+          mkdir -p benches/results
+          {
+            echo "commit:     $GITHUB_SHA"
+            echo "target_cpu: ${{ inputs.target_cpu }}"
+            echo "runner:     $ImageOS $ImageVersion"
+            echo "kernel:     $(uname -sr)"
+            echo "cores:      $(nproc)"
+            echo "memory:     $(free -h | awk '/^Mem:/ {print $2}')"
+            echo "rustc:      $(rustc --version)"
+            echo
+            lscpu
+            echo
+            benches/.venv/bin/python -c "import rasterio; print('GDAL (rasterio wheel):', rasterio.__gdal_version__)"
+            echo
+            uv pip freeze --python benches/.venv/bin/python
+          } | tee benches/results/environment.txt
+
+      - name: Build
+        run: cargo build --release --locked -p cogmark
+
+      - name: Run cogzilla benchmarks
+        run: cargo run --release --locked -p cogmark -- --dump-parity benches/results/parity
+
+      - name: Run GDAL / TiTiler baseline
+        run: COGMARK_TITILER_WORKERS="$(nproc)" benches/.venv/bin/python benches/gdal_oracle.py
+
+      - name: Summary
+        run: |
+          {
+            echo "## COGMark: linux x86_64 (${{ inputs.target_cpu }})"
+            echo
+            benches/.venv/bin/python benches/compare_results.py benches/results
+            echo
+            echo "<details><summary>Environment</summary>"
+            echo
+            echo '```text'
+            cat benches/results/environment.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cogmark-linux-x86_64-${{ inputs.target_cpu }}
+          path: |
+            benches/results/*.json
+            benches/results/environment.txt
+          if-no-files-found: warn

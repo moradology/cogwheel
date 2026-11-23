@@ -284,7 +284,8 @@ def run_gdal_benchmarks() -> list[dict]:
     results.append({"id": "BM-06", "median_us": med, "p99_us": p99})
 
     # ------------------------------------------------------------------------
-    # BM-07: PanBurst32 HTTP (TiTiler + uvicorn with 4 workers on loopback)
+    # BM-07: PanBurst32 HTTP (TiTiler + uvicorn on loopback; 10 workers unless
+    # COGMARK_TITILER_WORKERS is set, e.g. to the core count of a smaller host)
     # ------------------------------------------------------------------------
     titiler_app_path = RESULTS / "_titiler_app.py"
     titiler_app_path.write_text(
@@ -315,7 +316,7 @@ def run_gdal_benchmarks() -> list[dict]:
             "--port",
             str(port),
             "--workers",
-            "10",
+            os.environ.get("COGMARK_TITILER_WORKERS", "10"),
             "--log-level",
             "error",
         ],
