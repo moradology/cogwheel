@@ -68,12 +68,12 @@ This is `cogzilla` alone: TiTiler was not run on this workload, so there is no m
 
 ```bash
 # Docker (linux/amd64 + linux/arm64)
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.0
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.1
 ```
 
 ```bash
 # Prebuilt binary: Linux and macOS, x86_64 and arm64
-curl -L https://github.com/moradology/cogzilla/releases/download/v0.2.0/cogzilla-server-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/moradology/cogzilla/releases/download/v0.2.1/cogzilla-server-v0.2.1-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
 Then open a live map directly in your browser (public AWS S3 COGs, no credentials needed):

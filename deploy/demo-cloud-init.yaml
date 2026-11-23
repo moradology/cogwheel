@@ -1,0 +1,47 @@
+#cloud-config
+# Public demo of cogzilla on a single VM (written for Oracle Cloud's Ubuntu
+# images on an Always Free VM.Standard.A1.Flex instance, 4 OCPU / 24 GB).
+#
+# Paste this into "cloud-init script" when creating the instance. It installs
+# Docker, opens port 80 in the host firewall, and runs the server restricted to
+# a short list of public buckets. You still need an ingress rule for TCP 80 in
+# the subnet's security list.
+#
+# Set COGZILLA_IMAGE to a release that includes COGZILLA_ALLOWED_URL_PREFIXES
+# (0.2.1 or later). Without the allowlist a public server will fetch any
+# URL and read any local path it is asked for.
+
+package_update: true
+packages:
+  - docker.io
+
+write_files:
+  - path: /etc/cogzilla-demo.env
+    permissions: "0644"
+    content: |
+      COGZILLA_ALLOWED_URL_PREFIXES=https://copernicus-dem-30m.s3.amazonaws.com/,https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/,s3://copernicus-dem-30m/,https://sentinel-cogs.s3.us-west-2.amazonaws.com/,s3://sentinel-cogs/
+      COGZILLA_CACHE_CONTROL_MAX_AGE=86400
+      AWS_NO_SIGN_REQUEST=YES
+      AWS_REGION=us-west-2
+      AWS_EC2_METADATA_DISABLED=true
+  - path: /usr/local/bin/cogzilla-demo-up
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      COGZILLA_IMAGE="${COGZILLA_IMAGE:-ghcr.io/moradology/cogzilla:0.2.1}"
+      docker pull "$COGZILLA_IMAGE"
+      docker rm -f cogzilla 2>/dev/null || true
+      docker run -d --name cogzilla --restart unless-stopped \
+        --env-file /etc/cogzilla-demo.env \
+        -p 80:8080 \
+        "$COGZILLA_IMAGE" \
+        --cache-mb 8192 --tile-cache-mb 1024
+
+runcmd:
+  # Oracle's Ubuntu images ship an iptables ruleset that rejects everything
+  # except SSH; insert the HTTP rule ahead of the REJECT and persist it.
+  - iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+  - netfilter-persistent save || true
+  - systemctl enable --now docker
+  - /usr/local/bin/cogzilla-demo-up
