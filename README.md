@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/cogzilla-banner.gif" alt="cogzilla" width="100%" />
+  <img src="assets/cogzilla.gif" alt="cogzilla" width="100%" />
 </p>
 
 # `cogzilla`
