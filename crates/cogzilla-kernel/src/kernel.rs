@@ -1499,7 +1499,8 @@ pub fn render_bandmath3<const N: usize>(
     }
 }
 
-/// Evaluate an arbitrary compiled TiTiler `?expression=` bytecode program across any number of bands.
+/// Evaluate an arbitrary compiled TiTiler `?expression=` bytecode program across any number of
+/// bands using the scanline-vectorized [`ExprProgram::eval_row`] engine.
 pub fn render_expr_vm<const N: usize>(
     plan: &CoordPlan<N>,
     srcs: &[BandSource<'_>],
@@ -1509,17 +1510,145 @@ pub fn render_expr_vm<const N: usize>(
     if srcs.is_empty() || srcs.iter().any(|s| s.all_nodata) {
         return empty_tile_bytes(N as u32, style.format, 1);
     }
-    let bilinear = style.resample == ResampleMode::Bilinear;
-    render_eval_fn(plan, style, |u, v| {
-        let mut vals = [0.0f32; 16];
-        let nb = srcs.len().min(16);
-        for i in 0..nb {
-            vals[i] = if bilinear {
-                sample_bilinear::<false>(&srcs[i], u, v)
-            } else {
-                sample_nearest::<false>(&srcs[i], u, v)
-            };
+    let nb = srcs.len().min(16);
+    let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+    let all_clean = plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
+    let range = (style.rescale_max - style.rescale_min).max(1e-12);
+    let inv_range = 255.0 / range;
+    let inv_range_254 = 254.0 / range;
+    let min_val = style.rescale_min;
+
+    let sample_row = |py: usize, band_rows: &mut [[f32; N]]| {
+        match (style.resample, all_clean) {
+            (ResampleMode::Bilinear, true) => {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    for b in 0..nb {
+                        band_rows[b][px] = sample_bilinear::<true>(&srcs[b], u, v);
+                    }
+                });
+            }
+            (ResampleMode::Bilinear, false) => {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    for b in 0..nb {
+                        band_rows[b][px] = sample_bilinear::<false>(&srcs[b], u, v);
+                    }
+                });
+            }
+            (ResampleMode::Nearest, true) => {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    for b in 0..nb {
+                        band_rows[b][px] = sample_nearest::<true>(&srcs[b], u, v);
+                    }
+                });
+            }
+            (ResampleMode::Nearest, false) => {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    for b in 0..nb {
+                        band_rows[b][px] = sample_nearest::<false>(&srcs[b], u, v);
+                    }
+                });
+            }
+            (ResampleMode::Cubic, _) => {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    for b in 0..nb {
+                        band_rows[b][px] = sample_cubic(&srcs[b], u, v);
+                    }
+                });
+            }
         }
-        prog.eval(&vals[..nb])
-    })
+    };
+
+    let mut band_rows = vec![[0.0f32; N]; nb];
+    let mut out_row = [0.0f32; N];
+
+    match style.format {
+        OutputFormat::RawF32 => {
+            let mut out = BytesMut::with_capacity(N * N * 4);
+            for py in 0..N {
+                sample_row(py, &mut band_rows);
+                prog.eval_row::<N>(&band_rows, &mut out_row);
+                for &v in &out_row {
+                    out.put_slice(&v.to_le_bytes());
+                }
+            }
+            out.freeze()
+        }
+        OutputFormat::Png => {
+            let lut: &ColormapLut = style.colormap.lut();
+            let plte = build_plte_nodata(lut);
+            SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let sc = &mut *guard;
+                let stride = 1 + N;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N {
+                    sc.row_buf.resize(N, 0);
+                }
+                for py in 0..N {
+                    sample_row(py, &mut band_rows);
+                    prog.eval_row::<N>(&band_rows, &mut out_row);
+                    let row_idx = &mut sc.row_buf[..N];
+                    for px in 0..N {
+                        let val = out_row[px];
+                        row_idx[px] = if val.is_nan() {
+                            0
+                        } else {
+                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
+                            1 + (t as u8)
+                        };
+                    }
+                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                }
+                encode_indexed_png(
+                    N as u32,
+                    N as u32,
+                    &plte,
+                    Some(&[0u8]),
+                    &sc.img_buf[..total],
+                )
+            })
+        }
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+            let lut: &ColormapLut = style.colormap.lut();
+            SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let sc = &mut *guard;
+                let total = N * N * 4;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                let buf = &mut sc.img_buf[..total];
+                let buf_u32 = unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, N * N)
+                };
+                for py in 0..N {
+                    sample_row(py, &mut band_rows);
+                    prog.eval_row::<N>(&band_rows, &mut out_row);
+                    let row_off = py * N;
+                    for px in 0..N {
+                        let val = out_row[px];
+                        buf_u32[row_off + px] = if val.is_nan() {
+                            0
+                        } else {
+                            let idx = rescale_u8(val, inv_range, min_val) as usize;
+                            unsafe { *lut.rgba_u32.get_unchecked(idx) }
+                        };
+                    }
+                }
+                match style.format {
+                    OutputFormat::Jpeg { quality } => {
+                        encode_jpeg_rgba(N as u32, N as u32, buf, quality)
+                    }
+                    OutputFormat::Webp { quality } => {
+                        encode_webp_rgba(N as u32, N as u32, buf, quality)
+                    }
+                    OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
+                    _ => unreachable!(),
+                }
+            })
+        }
+    }
 }
