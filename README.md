@@ -24,18 +24,18 @@ And the ceiling, with the network taken out entirely (local files, warm cache), 
 
 | Local fixtures, warm cache | Apple M5, 10 cores | Linux x86-64, 4 vCPU |
 | :--- | ---: | ---: |
-| HTTP throughput, Mercator PNG, 32 concurrent | 6,863 vs 181 tiles/s: **37.8×** | 1,502 vs 72 tiles/s: **20.8×** |
-| HTTP throughput, satellite RGB PNG, 32 concurrent | 3,791 vs 171 tiles/s: **22.2×** | 812 vs 82 tiles/s: **9.9×** |
-| Single Mercator PNG tile | 634 µs vs 17.6 ms: **27.7×** | 1.78 ms vs 24.4 ms: **13.8×** |
-| Landsat three-file RGB PNG tile | 1.63 ms vs 25.4 ms: **15.6×** | 3.39 ms vs 71.9 ms: **21.2×** |
+| HTTP throughput, Mercator PNG, 32 concurrent | 14,149 vs 181 tiles/s: **78.2×** | 3,363 vs 85 tiles/s: **39.8×** |
+| HTTP throughput, satellite RGB PNG, 32 concurrent | 5,102 vs 171 tiles/s: **29.8×** | 1,369 vs 62 tiles/s: **22.1×** |
+| Single Mercator PNG tile | 299 µs vs 17.6 ms: **58.9×** | 632 µs vs 21.4 ms: **33.9×** |
+| Landsat three-file RGB PNG tile | 1.58 ms vs 25.4 ms: **16.1×** | 2.62 ms vs 62.6 ms: **23.9×** |
 
 Each cell is `cogzilla` against TiTiler on the same machine. The Linux column is a GitHub-hosted runner (AMD EPYC, shared) running the same kind of build as the release binaries.
 
 ### What these numbers do and don't say
 
 - **The 4.3× is the number to plan with.** It is CPU for a tile the server has not seen, which is what an origin behind a CDN mostly serves. It ranged from 2.1× to 4.8× on four workloads (the fifth showed 8.3×, but its file was small enough to be partly cached) and does not depend on the network.
-- **The local multiples depend on the machine.** Warm PNG tiles are 15–42× on the M5 and 14–21× on the 4-vCPU Linux runner; HTTP throughput is 22–38× and 10–21×. The Linux figures are from a hosted shared runner (`generic` release build). Quote the Linux range if you need one number for a typical cloud instance.
-- **Not every path is that far ahead.** On the Linux run, lossy WebP output was 4.1× faster and first-touch (cold) local tiles were 6.5–14.1× faster (low-zoom multi-file scenes are now 23–38× faster with adaptive quadtree projection). One raw decode path remained slightly slower than GDAL on x86-64 (LZW with predictor 1 at 0.8×, `0.9×` with `target-cpu=native`; DEFLATE with predictor 2 is 1.1–1.2× and LZW with predictor 3 is 1.3–1.4×). Those are decode-only measurements, and a warm tile does no decoding.
+- **The local multiples depend on the machine.** Warm PNG tiles are 16–59× on the M5 and 24–43× on the 4-vCPU Linux runner; HTTP throughput is 30–78× and 22–40×. The Linux figures are from a hosted shared runner (`generic` release build). Quote the Linux range if you need one number for a typical cloud instance.
+- **Not every path is that far ahead.** On the Linux run, lossy WebP output was 4.6× faster and first-touch (cold) local tiles were 8.4–21.5× faster (low-zoom multi-file scenes are 23–32× faster with adaptive quadtree projection). One raw decode path remained slightly slower than GDAL on x86-64 (LZW with predictor 1 at 0.8×, `0.9×` with `target-cpu=native`; DEFLATE with predictor 2 is 1.1–1.2× and LZW with predictor 3 is 1.4×). Those are decode-only measurements, and a warm tile does no decoding.
 - **The S3 results are M5-only.** The CPU, memory and cost figures in the first table have not been repeated on x86.
 - **The larger multiples (13–62× on S3) need the cache to fit.** `cogzilla` keeps decoded blocks in memory and TiTiler keeps none, which is where the big multiples come from. With the default 512 MiB cache, three of the five S3 workloads outgrew it and fell back to S3. Size `--cache-mb` to your working set and budget about 250 MiB on top.
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
@@ -49,12 +49,12 @@ Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches
 
 ```bash
 # Docker (linux/amd64 + linux/arm64)
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.3
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.0
 ```
 
 ```bash
 # Prebuilt binary: Linux and macOS, x86_64 and arm64
-curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.3/cogzilla-server-v0.1.3-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/moradology/cogzilla/releases/download/v0.2.0/cogzilla-server-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
 Then open a live map of a public Sentinel-2 scene (northeast Colorado, no credentials needed):
@@ -87,11 +87,11 @@ Rust, explicit SIMD (ARM64 NEON, and x86_64 AVX2/FMA chosen at runtime), and nat
 
 **Reading.** A Classic/BigTIFF and GeoKey parser opens a local file through `mmap` in about a microsecond (0.92–1.3 µs, hundreds of times faster than `GDALOpenEx`). A remote file opens with one speculative 128 KiB range request. Later reads coalesce adjacent byte ranges, S3 requests are SigV4-signed and gated by a throttle-only AIMD concurrency limiter, and decoded blocks go into a sharded LRU cache (with an optional persistent CRC32-checked tier-2 disk cache for compressed blocks) that collapses concurrent requests for the same block into one fetch.
 
-**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD on the M5). Multi-block cold misses decode in parallel across worker threads. All eight GDAL numeric types from `uint8` to `float64` are supported, with `uint8` and `uint16` stored in native compact slabs (1–2 bytes/pixel for 2–4× higher cache capacity). Blocks that are entirely nodata are flagged at decode, so empty tiles return in under 200 ns.
+**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD on the M5). Multi-block cold misses decode in parallel across worker threads, with a bounded free-list arena pool recycling standard `f32` block allocations. All eight GDAL numeric types from `uint8` to `float64` are supported, with `uint8` and `uint16` stored in native compact slabs (1–2 bytes/pixel for 2–4× higher cache capacity). Blocks that are entirely nodata are flagged at decode, so empty tiles return in under 200 ns. WebMercator-aligned JPEG/WebP COGs with identity RGB styling bypass decode, resample, and re-encode completely via zero-decode pass-through (including TIFF tag 347 `JPEGTables` splicing).
 
 **Projecting.** Closed-form `f64` math for `EPSG:3857`, `EPSG:4326`, all 120 WGS84/NAD83 UTM zones, CONUS and California Albers, Lambert Conformal Conic, and Polar Stereographic (`3413`, `3031`). Tiles at `z <= 8` use adaptive error-bounded quadtree subdivision (`< 0.05 px` tolerance); tiles at `z >= 9` interpolate a 17×17 grid. Zooms 0 to 22 are served.
 
-**Rendering.** One pass per scanline does the resampling (nearest, bilinear or cubic), multi-COG compositing, early-exit dynamic mosaics (`/mosaic/tiles`), band math, rescaling and colormap lookup, then encodes PNG, JPEG, WebP or raw `float32`. Band math is either an arbitrary `expression=` compiled to a small bytecode VM or a built-in preset (`ndvi`, `ndwi`, `nbr`, `savi`, `evi`, `db`, `sar_rgb`). All 211 `rio-tiler` colormaps are included.
+**Rendering.** One pass per scanline does the resampling (nearest, bilinear or cubic), multi-COG compositing, early-exit dynamic and spatially indexed mosaics (`/mosaic/tiles` and `/mosaic/{name}/tiles`, backed by the pluggable `SceneCatalog` trait), scanline-vectorized band math, rescaling and colormap lookup, then encodes PNG (including 1-byte-per-pixel indexed-palette `PLTE`+`tRNS` PNGs with SIMD `bpp=1` Sub filtering for single-band colormapped tiles), JPEG, WebP or raw `float32`. Band math is either an arbitrary `expression=` compiled to a scanline-vectorized bytecode VM or a built-in preset (`ndvi`, `ndwi`, `nbr`, `savi`, `evi`, `db`, `sar_rgb`). All 211 `rio-tiler` colormaps are included.
 
 ## Building and running
 
@@ -114,6 +114,7 @@ cargo build --release -p cogzilla-server
 | `--disk-cache-mb` | `0` | Maximum tier-2 disk cache size in MiB (`0` disables tier 2). |
 | `--dataset name=path` | | Pre-register a local COG, served at `/tiles/{name}/{z}/{x}/{y}`. Repeatable. |
 | `--scene name=a.tif,b.tif[,c.tif]` | | Pre-register a multi-file scene (for example Landsat RGB or SAR VV+VH). Repeatable. |
+| `--mosaic name=/path/to/catalog.json` | | Pre-register a spatial mosaic catalog (STAC `FeatureCollection` or JSON array), served at `/mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`. Repeatable. |
 
 `--dataset` and `--scene` are optional: the `/cog` and `/stac` routes open any `url=` on demand.
 
@@ -166,7 +167,7 @@ Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I
 
 - `resampling` accepts `nearest`, `bilinear` and `cubic`. `lanczos` and `cubicspline` are served as cubic, and any other value falls back to bilinear without an error.
 - Remote sources are `http(s)://`, `s3://` and `/vsis3/`. Other GDAL virtual filesystems such as `/vsicurl/` are not recognized.
-- Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b` renders a front-to-back dynamic mosaic with early exit once 100% of pixels are filled, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
+- Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b` and `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}` render front-to-back dynamic or spatially indexed mosaics with early exit once 100% of pixels are filled, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
 
 ### Example requests
 
