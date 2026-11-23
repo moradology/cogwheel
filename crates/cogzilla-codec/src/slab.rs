@@ -1,8 +1,42 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
+
+struct SendF32Ptr(*mut f32);
+unsafe impl Send for SendF32Ptr {}
+
+struct SlabPools {
+    /// 256×256 f32 (256 KiB each, max 16 = 4 MiB)
+    p256: Mutex<Vec<SendF32Ptr>>,
+    /// 512×512 f32 (1 MiB each, max 16 = 16 MiB)
+    p512: Mutex<Vec<SendF32Ptr>>,
+    /// 1024×1024 f32 (4 MiB each, max 4 = 16 MiB)
+    p1024: Mutex<Vec<SendF32Ptr>>,
+}
+
+fn slab_pools() -> &'static SlabPools {
+    static POOLS: OnceLock<SlabPools> = OnceLock::new();
+    POOLS.get_or_init(|| SlabPools {
+        p256: Mutex::new(Vec::with_capacity(16)),
+        p512: Mutex::new(Vec::with_capacity(16)),
+        p1024: Mutex::new(Vec::with_capacity(4)),
+    })
+}
+
+#[inline]
+fn pool_for_len(len: usize) -> Option<(&'static Mutex<Vec<SendF32Ptr>>, usize)> {
+    match len {
+        65_536 => Some((&slab_pools().p256, 16)),
+        262_144 => Some((&slab_pools().p512, 16)),
+        1_048_576 => Some((&slab_pools().p1024, 4)),
+        _ => None,
+    }
+}
 
 /// 64-byte-aligned heap-allocated contiguous `f32` slab for SIMD-friendly tile storage.
+/// Recycles standard COG block sizes (`256×256`, `512×512`, `1024×1024`) through a bounded
+/// free-list pool to avoid repeated `mmap`/`munmap` zero-page faults under cold-cache churn.
 pub struct AlignedF32Slab {
     ptr: NonNull<f32>,
     len: usize,
@@ -18,6 +52,16 @@ impl AlignedF32Slab {
                 ptr: NonNull::dangling(),
                 len: 0,
             };
+        }
+        if let Some((pool, _)) = pool_for_len(len) {
+            if let Ok(mut guard) = pool.lock() {
+                if let Some(SendF32Ptr(raw)) = guard.pop() {
+                    return Self {
+                        ptr: unsafe { NonNull::new_unchecked(raw) },
+                        len,
+                    };
+                }
+            }
         }
         let layout = Layout::from_size_align(len * std::mem::size_of::<f32>(), 64)
             .expect("valid aligned f32 layout");
@@ -80,6 +124,14 @@ impl DerefMut for AlignedF32Slab {
 impl Drop for AlignedF32Slab {
     fn drop(&mut self) {
         if self.len > 0 {
+            if let Some((pool, cap)) = pool_for_len(self.len) {
+                if let Ok(mut guard) = pool.lock() {
+                    if guard.len() < cap {
+                        guard.push(SendF32Ptr(self.ptr.as_ptr()));
+                        return;
+                    }
+                }
+            }
             let layout = Layout::from_size_align(self.len * std::mem::size_of::<f32>(), 64)
                 .expect("valid aligned f32 layout");
             unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
@@ -287,5 +339,15 @@ mod tests {
         assert_eq!(bands8[0].data.get_f32(1), 42.0);
         assert_eq!(bands8[0].stats.min, 42.0);
         assert_eq!(bands8[0].stats.max, 42.0);
+    }
+
+    #[test]
+    fn slab_arena_recycles_standard_block_allocations() {
+        let s1 = AlignedF32Slab::new_uninit(256 * 256);
+        let p1 = s1.as_slice().as_ptr();
+        drop(s1);
+        let s2 = AlignedF32Slab::new_uninit(256 * 256);
+        let p2 = s2.as_slice().as_ptr();
+        assert_eq!(p1, p2, "expected 256x256 slab pointer to be recycled from free-list");
     }
 }
