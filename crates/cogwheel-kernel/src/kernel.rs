@@ -660,7 +660,7 @@ pub fn render_single_band<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = !matches!(plan, CoordPlan::Exact2D { .. }) && src.is_clean_inbounds(c0, c1, r0, r1);
+    let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
         (ResampleMode::Bilinear, true) => render_single_specialized::<N, true, true>(plan, src, style),
@@ -837,7 +837,7 @@ pub fn render_rgb_bands<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 3);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = !matches!(plan, CoordPlan::Exact2D { .. })
+    let clean = plan.all_in_bounds()
         && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
         && srcs[1].is_clean_inbounds(c0, c1, r0, r1)
         && srcs[2].is_clean_inbounds(c0, c1, r0, r1);
@@ -956,7 +956,7 @@ pub fn render_bandmath1<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = !matches!(plan, CoordPlan::Exact2D { .. }) && src.is_clean_inbounds(c0, c1, r0, r1);
+    let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
         (ResampleMode::Bilinear, true) => {
@@ -984,7 +984,7 @@ pub fn render_sar_rgb<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 3);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = !matches!(plan, CoordPlan::Exact2D { .. })
+    let clean = plan.all_in_bounds()
         && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
         && srcs[1].is_clean_inbounds(c0, c1, r0, r1);
 
@@ -1119,7 +1119,9 @@ pub fn render_bandmath2<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = srcs[0].is_clean_inbounds(c0, c1, r0, r1) && srcs[1].is_clean_inbounds(c0, c1, r0, r1);
+    let clean = plan.all_in_bounds()
+        && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
+        && srcs[1].is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
         (ResampleMode::Bilinear, true) => render_eval_fn(plan, style, |u, v| {
@@ -1164,7 +1166,7 @@ pub fn render_bandmath3<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = !matches!(plan, CoordPlan::Exact2D { .. })
+    let clean = plan.all_in_bounds()
         && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
         && srcs[1].is_clean_inbounds(c0, c1, r0, r1)
         && srcs[2].is_clean_inbounds(c0, c1, r0, r1);

@@ -321,7 +321,11 @@ fn apply_unscale(bands: &mut BandRequest, scales: &[f32], offsets: &[f32]) {
     }
 }
 
-fn build_band_request(pq: &ParsedQuery, default_bands: u16) -> Result<BandRequest, EngineError> {
+fn build_band_request(
+    pq: &ParsedQuery,
+    default_bands: u16,
+    is_u8: bool,
+) -> Result<BandRequest, EngineError> {
     if let Some(raw_expr) = &pq.expr_raw {
         if let Some(preset) = SpectralExpr::from_str_opt(raw_expr) {
             return Ok(match preset {
@@ -407,7 +411,13 @@ fn build_band_request(pq: &ParsedQuery, default_bands: u16) -> Result<BandReques
                 [pq.rescale[0].1, pq.rescale[1].1, pq.rescale[2].1],
             ),
             1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
-            _ => ([0.0; 3], [1.0; 3]),
+            _ => {
+                if is_u8 {
+                    ([0.0; 3], [255.0; 3])
+                } else {
+                    ([0.0; 3], [1.0; 3])
+                }
+            }
         };
         Ok(BandRequest::Rgb {
             bands_1based: bs,
@@ -416,7 +426,8 @@ fn build_band_request(pq: &ParsedQuery, default_bands: u16) -> Result<BandReques
         })
     } else {
         let b = pq.bidx.first().copied().unwrap_or(1);
-        let rescale = pq.rescale.first().copied().unwrap_or((0.0, 1000.0));
+        let default_range = if is_u8 { (0.0, 255.0) } else { (0.0, 1000.0) };
+        let rescale = pq.rescale.first().copied().unwrap_or(default_range);
         Ok(BandRequest::Single {
             band_1based: b,
             rescale,
@@ -431,9 +442,10 @@ fn build_tile_request(
     ext: &str,
     pq: &ParsedQuery,
     default_bands: u16,
+    is_u8: bool,
 ) -> Result<(TileRequest, &'static str), EngineError> {
     let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-    let bands = build_band_request(pq, default_bands)?;
+    let bands = build_band_request(pq, default_bands, is_u8)?;
     let tile_size = match scale_opt {
         Some(2) => 512,
         Some(1) => 256,
@@ -568,13 +580,15 @@ pub async fn handle_request(
             (Some(z), Some(x), Some((y, sc, ext))) => {
                 if let Some(scene) = engine.get_scene(ds) {
                     let db = scene.len() as u16;
-                    match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db) {
+                    let is_u8 = scene[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                    match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8) {
                         Ok((treq, ct)) => engine.render_multi_cog_tile(&scene, &treq).await.map(|b| (b, ct)),
                         Err(e) => Err(e),
                     }
                 } else if let Some(cog) = engine.store.get_registered(ds) {
                     let db = cog.index.full_res().samples_per_pixel;
-                    match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db) {
+                    let is_u8 = cog.index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                    match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8) {
                         Ok((treq, ct)) => engine.render_tile(&cog, &treq).await.map(|b| (b, ct)),
                         Err(e) => Err(e),
                     }
@@ -794,7 +808,8 @@ pub async fn handle_request(
                 } else {
                     cogs[0].index.full_res().samples_per_pixel
                 };
-                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq_stac, db, is_u8)?;
                 if pq_stac.unscale {
                     apply_unscale(&mut treq.bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -881,7 +896,8 @@ pub async fn handle_request(
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let bands = build_band_request(&pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let bands = build_band_request(&pq_stac, db, is_u8)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, None, None, pq_stac.return_mask,
@@ -905,7 +921,8 @@ pub async fn handle_request(
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let bands = build_band_request(&pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let bands = build_band_request(&pq_stac, db, is_u8)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, None, None, pq_stac.return_mask,
@@ -928,7 +945,8 @@ pub async fn handle_request(
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let bands = build_band_request(&pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let bands = build_band_request(&pq_stac, db, is_u8)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, None, None, pq_stac.return_mask,
@@ -952,7 +970,8 @@ pub async fn handle_request(
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let bands = build_band_request(&pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let bands = build_band_request(&pq_stac, db, is_u8)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, None, None, pq_stac.return_mask,
@@ -989,7 +1008,8 @@ pub async fn handle_request(
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let bands = build_band_request(&pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let bands = build_band_request(&pq_stac, db, is_u8)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, None, None, pq_stac.return_mask,
@@ -1018,7 +1038,8 @@ pub async fn handle_request(
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let bands = build_band_request(&pq_stac, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let bands = build_band_request(&pq_stac, db, is_u8)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, None, None, pq_stac.return_mask,
@@ -1163,7 +1184,8 @@ pub async fn handle_request(
                 } else {
                     cogs[0].index.full_res().samples_per_pixel
                 };
-                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut treq.bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -1233,7 +1255,8 @@ pub async fn handle_request(
                 } else {
                     cogs[0].index.full_res().samples_per_pixel
                 };
-                let (treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let (treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
                 let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
                 Ok((data, ct))
             }
@@ -1290,7 +1313,8 @@ pub async fn handle_request(
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -1314,7 +1338,8 @@ pub async fn handle_request(
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -1343,7 +1368,8 @@ pub async fn handle_request(
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -1373,7 +1399,8 @@ pub async fn handle_request(
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -1404,7 +1431,8 @@ pub async fn handle_request(
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }
@@ -1435,7 +1463,8 @@ pub async fn handle_request(
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db)?;
+                let is_u8 = cogs[0].index.full_res().sample_type == cogwheel_tiff::SampleType::Uint8;
+                let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
                     apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
                 }

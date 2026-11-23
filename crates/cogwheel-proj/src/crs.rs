@@ -334,6 +334,7 @@ pub enum CoordPlan<const N: usize> {
         src_max_col: i32,
         src_min_row: i32,
         src_max_row: i32,
+        all_in_bounds: bool,
     },
     /// 17x17 exact closed-form control grid (z >= 9: UTM, Albers, LCC, Polar Stereo).
     Grid2D {
@@ -343,6 +344,7 @@ pub enum CoordPlan<const N: usize> {
         src_max_col: i32,
         src_min_row: i32,
         src_max_row: i32,
+        all_in_bounds: bool,
     },
     /// Exact per-pixel closed-form coordinates for low-zoom (z <= 8) projected tiles where
     /// wide tile spans (~100s–1000s km) exceed linear grid curvature or cross projection boundaries.
@@ -353,6 +355,7 @@ pub enum CoordPlan<const N: usize> {
         src_max_col: i32,
         src_min_row: i32,
         src_max_row: i32,
+        all_in_bounds: bool,
     },
 }
 
@@ -432,6 +435,11 @@ impl<const N: usize> CoordPlan<N> {
                 return None;
             }
 
+            let all_in_bounds = min_u >= 0.0
+                && min_v >= 0.0
+                && (max_u.floor() as i32 + 1) < ifd_w as i32
+                && (max_v.floor() as i32 + 1) < ifd_h as i32;
+
             Some(Self::Separable1D {
                 u,
                 v,
@@ -439,6 +447,7 @@ impl<const N: usize> CoordPlan<N> {
                 src_max_col,
                 src_min_row,
                 src_max_row,
+                all_in_bounds,
             })
         } else if tile.z <= 8 {
             // Low-zoom projected tile (z=0..8): evaluate exact closed-form per pixel so even
@@ -495,6 +504,7 @@ impl<const N: usize> CoordPlan<N> {
                 src_max_col,
                 src_min_row,
                 src_max_row,
+                all_in_bounds: false,
             })
         } else {
             // 17x17 control grid spanning pixel centers [0.5 .. N - 0.5] across 16 intervals
@@ -547,6 +557,13 @@ impl<const N: usize> CoordPlan<N> {
                 return None;
             }
 
+            let all_finite = grid_u.iter().all(|x| x.is_finite()) && grid_v.iter().all(|y| y.is_finite());
+            let all_in_bounds = all_finite
+                && min_u >= 0.0
+                && min_v >= 0.0
+                && (max_u.floor() as i32 + 1) < ifd_w as i32
+                && (max_v.floor() as i32 + 1) < ifd_h as i32;
+
             Some(Self::Grid2D {
                 grid_u,
                 grid_v,
@@ -554,7 +571,18 @@ impl<const N: usize> CoordPlan<N> {
                 src_max_col,
                 src_min_row,
                 src_max_row,
+                all_in_bounds,
             })
+        }
+    }
+
+    /// True iff EVERY output pixel's bilinear footprint lies strictly inside `[0..ifd_w, 0..ifd_h]`.
+    #[inline(always)]
+    pub fn all_in_bounds(&self) -> bool {
+        match self {
+            Self::Separable1D { all_in_bounds, .. }
+            | Self::Grid2D { all_in_bounds, .. }
+            | Self::Exact2D { all_in_bounds, .. } => *all_in_bounds,
         }
     }
 
