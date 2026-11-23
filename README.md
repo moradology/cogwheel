@@ -36,7 +36,7 @@ And the ceiling, with the network taken out entirely (local files, warm cache):
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
 - **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilization, and compute only. The ratio is measured; the instance counts are not.
 - **Same picture, not the same bytes.** Valid-data masks agree with TiTiler on 99.6–100% of pixels; pixel values differ slightly on high-frequency imagery (32–34 dB PSNR on Sentinel-2, 49–54 dB on DEMs).
-- **One request in 822 failed.** A single uncached tile returned HTTP 500 during the S3 run, most likely an S3 connection failure that was not retried. Retries and timeouts for that case were added afterwards and are on `main`, not yet in a release; the benchmark has not been re-run since.
+- **One request in 822 failed.** A single uncached tile returned HTTP 500 during the S3 run, most likely an S3 connection failure that was not retried. Retries and timeouts for that case were added in 0.1.2; the benchmark has not been re-run since.
 
 Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md); the full local suite is in [benches/COGMARK.md](benches/COGMARK.md).
 
@@ -44,12 +44,12 @@ Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches
 
 ```bash
 # Docker (linux/amd64 + linux/arm64)
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.1
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.2
 ```
 
 ```bash
 # Prebuilt binary: Linux and macOS, x86_64 and arm64
-curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.1/cogzilla-server-v0.1.1-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.2/cogzilla-server-v0.1.2-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
 Then open a live map of a public Sentinel-2 scene (northeast Colorado, no credentials needed):
@@ -124,7 +124,7 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | Default region. A bucket in another region is discovered from S3's redirect and remembered. |
 | `AWS_ENDPOINT_URL`, `AWS_S3_ENDPOINT`, `AWS_HTTPS`, `AWS_VIRTUAL_HOSTING=FALSE` | S3-compatible stores (MinIO, Ceph, and so on) and path-style addressing. |
 | `GDAL_HTTP_MAX_RETRY` (or `AWS_MAX_ATTEMPTS`) | Retries for transient failures. Default 3. |
-| `GDAL_HTTP_CONNECTTIMEOUT`, `GDAL_HTTP_TIMEOUT` | Connect timeout (default 10 s) and per-read timeout (default 30 s). On `main`, not yet in a release. |
+| `GDAL_HTTP_CONNECTTIMEOUT`, `GDAL_HTTP_TIMEOUT` | Connect timeout (default 10 s) and per-read timeout (default 30 s). Since 0.1.2. |
 | `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
 
 Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I/O counters as JSON, and `GET /docs` with `GET /openapi.json` for the route list.
