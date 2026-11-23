@@ -45,6 +45,22 @@ Each cell is `cogzilla` against TiTiler on the same machine. The Linux column is
 
 Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md); the full local suite is in [benches/COGMARK.md](benches/COGMARK.md).
 
+## Terrain, computed per request
+
+<p align="center">
+  <img src="assets/terrain-gallery.jpg" alt="Mt. Rainier rendered four ways by cogzilla: hillshade, slope, aspect, and colormapped elevation" width="100%" />
+</p>
+
+Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from the same file. Nothing here is pre-rendered: each 256 px tile is resampled (cubic), run through a Horn 3×3 kernel, colormapped, and PNG-encoded when it is requested, with the encoded-tile cache off.
+
+Serving hillshade like this across the whole DEM (323 distinct tiles, `z=9..12`, 32 connections, 10,000 requests, Apple M5, load generator on the same machine, source blocks already in the block cache):
+
+| Tiles per second | Median | p99 | Errors |
+| ---: | ---: | ---: | ---: |
+| **3,372** | 9.3 ms | 19.5 ms | 0 |
+
+The [live map links below](#install) open the hillshade, slope, and aspect panels as interactive maps.
+
 ## Install
 
 ```bash
