@@ -7,6 +7,10 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use thiserror::Error;
 
+use crate::cloud::{
+    AzureConfig, AzureTarget, GcsConfig, GcsTokenCache, fetch_azure_range, fetch_gcs_range,
+    parse_azure_uri, parse_gcs_uri,
+};
 use crate::limiter::AimdLimiter;
 use crate::s3::{
     DynamicCredsCache, S3Config, fetch_s3_object_limited, is_retryable_status,
@@ -53,6 +57,22 @@ pub enum CogSource {
         url: String,
         client: reqwest::Client,
         max_retries: u32,
+        metrics: Arc<IoMetrics>,
+        limiter: Arc<AimdLimiter>,
+    },
+    RemoteGcs {
+        bucket: String,
+        key: String,
+        client: reqwest::Client,
+        cfg: GcsConfig,
+        token_cache: Arc<GcsTokenCache>,
+        metrics: Arc<IoMetrics>,
+        limiter: Arc<AimdLimiter>,
+    },
+    RemoteAzure {
+        target: AzureTarget,
+        client: reqwest::Client,
+        cfg: AzureConfig,
         metrics: Arc<IoMetrics>,
         limiter: Arc<AimdLimiter>,
     },
@@ -113,6 +133,11 @@ fn shared_dynamic_creds() -> Arc<DynamicCredsCache> {
         .clone()
 }
 
+fn shared_gcs_token_cache() -> Arc<GcsTokenCache> {
+    static CACHE: std::sync::OnceLock<Arc<GcsTokenCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Arc::new(GcsTokenCache::default())).clone()
+}
+
 impl CogSource {
     pub fn open_local(path: impl AsRef<Path>) -> Result<Self, IoError> {
         let file = File::open(path)?;
@@ -151,6 +176,32 @@ impl CogSource {
                 limiter,
             })
         } else if uri.starts_with("s3://") || uri.starts_with("/vsis3/") {
+            Err(IoError::InvalidUri(uri.to_string()))
+        } else if let Some((bucket, key)) = parse_gcs_uri(uri) {
+            Ok(Self::RemoteGcs {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                client,
+                cfg: GcsConfig::from_env(),
+                token_cache: shared_gcs_token_cache(),
+                metrics,
+                limiter,
+            })
+        } else if uri.starts_with("gs://") || uri.starts_with("/vsigs/") {
+            Err(IoError::InvalidUri(uri.to_string()))
+        } else if let Some(target) = parse_azure_uri(uri, None) {
+            Ok(Self::RemoteAzure {
+                target,
+                client,
+                cfg: AzureConfig::from_env(),
+                metrics,
+                limiter,
+            })
+        } else if uri.starts_with("az://")
+            || uri.starts_with("abfs://")
+            || uri.starts_with("abfss://")
+            || uri.starts_with("/vsiaz/")
+        {
             Err(IoError::InvalidUri(uri.to_string()))
         } else if uri.starts_with("http://") || uri.starts_with("https://") {
             let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
@@ -277,6 +328,35 @@ impl CogSource {
                     });
                 }
             }
+            Self::RemoteGcs {
+                bucket,
+                key,
+                client,
+                cfg,
+                token_cache,
+                metrics,
+                limiter,
+            } => {
+                fetch_gcs_range(
+                    client,
+                    bucket,
+                    key,
+                    cfg,
+                    token_cache,
+                    start,
+                    end,
+                    metrics,
+                    limiter,
+                )
+                .await
+            }
+            Self::RemoteAzure {
+                target,
+                client,
+                cfg,
+                metrics,
+                limiter,
+            } => fetch_azure_range(client, target, cfg, start, end, metrics, limiter).await,
         }
     }
 
@@ -289,7 +369,10 @@ impl CogSource {
                 let end = start + len as usize;
                 mmap.get(start..end)
             }
-            Self::RemoteS3 { .. } | Self::RemoteHttp { .. } => None,
+            Self::RemoteS3 { .. }
+            | Self::RemoteHttp { .. }
+            | Self::RemoteGcs { .. }
+            | Self::RemoteAzure { .. } => None,
         }
     }
 }

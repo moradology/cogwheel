@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod cache;
+pub mod cloud;
 pub mod disk_cache;
 pub mod limiter;
 pub mod s3;
@@ -7,6 +8,10 @@ pub mod store;
 
 pub use backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges};
 pub use cache::{BlockKey, SingleflightBlockCache};
+pub use cloud::{
+    AzureConfig, AzureTarget, GcsConfig, GcsTokenCache, fetch_azure_range, fetch_gcs_range,
+    parse_azure_uri, parse_gcs_uri,
+};
 pub use disk_cache::{DiskBlockCache, DiskCacheStats};
 pub use limiter::{AimdLimiter, AimdPermit};
 pub use s3::{AwsCredentials, DynamicCredsCache, S3Config, fetch_s3_object, parse_s3_uri};

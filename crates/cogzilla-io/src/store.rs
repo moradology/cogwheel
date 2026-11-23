@@ -346,7 +346,10 @@ impl CogStore {
 
             let index = match &source {
                 CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
-                CogSource::RemoteS3 { .. } | CogSource::RemoteHttp { .. } => {
+                CogSource::RemoteS3 { .. }
+                | CogSource::RemoteHttp { .. }
+                | CogSource::RemoteGcs { .. }
+                | CogSource::RemoteAzure { .. } => {
                     // Speculative 128 KiB single-RTT header read; at most 1 follow-up if IFDs spill past 128 KiB
                     let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
                     loop {
