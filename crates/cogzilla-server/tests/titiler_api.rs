@@ -563,5 +563,68 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(body.contains("cogzilla_http_304_not_modified_total 1"));
             assert!(body.contains("cogzilla_tile_cache_coalesced_total "));
         }
+
+        // --------------------------------------------------------------------
+        // 19. MosaicJSON (/mosaicjson/*) & Dynamic Registration (POST /mosaic/register)
+        // --------------------------------------------------------------------
+        {
+            let qk = cogzilla_server::tile_to_quadkey(12, 655, 1583);
+            let mj_doc = serde_json::json!({
+                "mosaicjson": "0.0.3",
+                "minzoom": 10,
+                "maxzoom": 16,
+                "quadkey_zoom": 12,
+                "bounds": [-123.0, 37.0, -122.0, 38.0],
+                "tiles": {
+                    qk: [merc_url.clone(), "/nonexistent_bg.tif"]
+                }
+            });
+            let mj_path = std::env::temp_dir().join(format!(
+                "cogzilla_test_mosaic_{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&mj_path, mj_doc.to_string()).unwrap();
+            let mj_url = mj_path.to_string_lossy().to_string();
+
+            let mj_info = get_json(&client, format!("{base}/mosaicjson/info?url={mj_url}")).await;
+            assert_eq!(mj_info["quadkey_zoom"], 12);
+            assert_eq!(mj_info["tiles_count"], 1);
+
+            let mj_tile = client
+                .get(format!(
+                    "{base}/mosaicjson/tiles/WebMercatorQuad/12/655/1583.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_tile.status(), 200);
+            let bytes = mj_tile.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // Dynamic registration via POST /mosaic/register
+            let reg_resp = client
+                .post(format!("{base}/mosaic/register"))
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "name": "live_mj",
+                        "catalog": mj_doc,
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reg_resp.status(), 200);
+            let reg_tile = client
+                .get(format!(
+                    "{base}/mosaic/live_mj/tiles/WebMercatorQuad/12/655/1583.png?rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reg_tile.status(), 200);
+            let _ = std::fs::remove_file(&mj_path);
+        }
     }
 }

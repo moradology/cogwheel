@@ -19,6 +19,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
 use crate::stac::{
     get_colormap_json, get_colormap_png, get_tms_json, list_colormaps_json, list_tms_json,
@@ -503,6 +504,47 @@ fn plain_resp(
     resp
 }
 
+async fn load_mosaicjson(
+    engine: &TileEngine,
+    uri: &str,
+) -> Result<Arc<MosaicJsonCatalog>, EngineError> {
+    if let Some(cached) = engine.mosaicjson_cache.get(uri) {
+        return Ok(cached.clone());
+    }
+    let text = if uri.starts_with("http://") || uri.starts_with("https://") {
+        let resp = engine
+            .store
+            .client
+            .get(uri)
+            .send()
+            .await
+            .map_err(cogzilla_io::IoError::Http)?;
+        if !resp.status().is_success() {
+            return Err(EngineError::Io(cogzilla_io::IoError::HttpStatus {
+                status: resp.status().as_u16(),
+                url: uri.to_string(),
+            }));
+        }
+        resp.text().await.map_err(cogzilla_io::IoError::Http)?
+    } else if let Some((bucket, key)) = cogzilla_io::parse_s3_uri(uri) {
+        let cfg = engine
+            .store
+            .s3_cfg
+            .clone()
+            .unwrap_or_else(cogzilla_io::S3Config::from_env_full);
+        let bytes =
+            cogzilla_io::fetch_s3_object(&engine.store.client, bucket, key, &cfg, None, None)
+                .await?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        let local_path = uri.strip_prefix("file://").unwrap_or(uri);
+        std::fs::read_to_string(local_path).map_err(cogzilla_io::IoError::Fs)?
+    };
+    let cat = Arc::new(MosaicJsonCatalog::from_json_str(&text).map_err(EngineError::BadRequest)?);
+    engine.mosaicjson_cache.insert(uri.to_string(), cat.clone());
+    Ok(cat)
+}
+
 async fn open_query_urls(
     engine: &TileEngine,
     urls: &[String],
@@ -662,6 +704,158 @@ pub async fn handle_request(
     });
 
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // ------------------------------------------------------------------------
+    // Dynamic registration of spatial catalogs (MosaicJSON, STAC FeatureCollection,
+    // JSON array, or live STAC-API POST /search):
+    //   POST /mosaic/register
+    // ------------------------------------------------------------------------
+    if method == Method::POST && path == "/mosaic/register" {
+        let res: Result<(Bytes, &'static str), EngineError> = async {
+            let body_bytes = req
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
+                .to_bytes();
+            let spec: serde_json::Value = serde_json::from_slice(&body_bytes)
+                .map_err(|e| EngineError::BadRequest(format!("invalid JSON body: {e}")))?;
+            let name = spec
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && *s != "tiles" && *s != "register")
+                .ok_or_else(|| {
+                    EngineError::BadRequest("missing valid 'name' for mosaic catalog".into())
+                })?
+                .to_string();
+
+            let catalog: Arc<dyn SceneCatalog> = if let Some(cat_val) = spec.get("catalog") {
+                load_catalog_json_str(&cat_val.to_string()).map_err(EngineError::BadRequest)?
+            } else if let Some(search_url) = spec.get("stac_api_url").and_then(|v| v.as_str()) {
+                let mut search_body = serde_json::Map::new();
+                for k in ["collections", "bbox", "datetime", "limit", "query", "filter"] {
+                    if let Some(v) = spec.get(k) {
+                        search_body.insert(k.to_string(), v.clone());
+                    }
+                }
+                let resp = engine
+                    .store
+                    .client
+                    .post(search_url)
+                    .header("content-type", "application/json")
+                    .body(serde_json::Value::Object(search_body).to_string())
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        EngineError::BadRequest(format!("STAC API search failed: {e}"))
+                    })?;
+                if !resp.status().is_success() {
+                    return Err(EngineError::BadRequest(format!(
+                        "STAC API search returned HTTP {}",
+                        resp.status()
+                    )));
+                }
+                let text = resp.text().await.map_err(|e| {
+                    EngineError::BadRequest(format!("STAC API response read failed: {e}"))
+                })?;
+                load_catalog_json_str(&text).map_err(EngineError::BadRequest)?
+            } else {
+                return Err(EngineError::BadRequest(
+                    "expected 'catalog' or 'stac_api_url' in /mosaic/register body".into(),
+                ));
+            };
+
+            let count = catalog.len();
+            engine.register_catalog(name.clone(), catalog);
+            let body = serde_json::json!({
+                "name": name,
+                "scenes": count,
+                "tiles_url": format!("/mosaic/{name}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png"),
+            })
+            .to_string();
+            Ok((Bytes::from(body), "application/json"))
+        }
+        .await;
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+    }
+
+    // ------------------------------------------------------------------------
+    // TiTiler MosaicJSON Router:
+    //   GET /mosaicjson/info?url=...
+    //   GET /mosaicjson/{tms}/tilejson.json?url=...
+    //   GET /mosaicjson/tiles/{tms}/{z}/{x}/{y}[@scale][.{ext}]?url=...
+    //   GET /mosaicjson/tiles/{z}/{x}/{y}[@scale][.{ext}]?url=...
+    // ------------------------------------------------------------------------
+    if method == Method::GET && segs.first() == Some(&"mosaicjson") {
+        let mj_url = pq.urls.first().cloned();
+        let res: Result<(Bytes, &'static str), EngineError> = match segs.as_slice() {
+            ["mosaicjson", "info"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", tms, "tilejson.json"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let tile_url =
+                    format!("http://{host}/mosaicjson/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
+                let tj = serde_json::json!({
+                    "tilejson": "3.0.0",
+                    "version": mj.version,
+                    "scheme": "xyz",
+                    "tiles": [tile_url],
+                    "minzoom": mj.minzoom,
+                    "maxzoom": mj.maxzoom,
+                    "bounds": mj.bounds,
+                })
+                .to_string();
+                Ok((Bytes::from(tj), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "tiles", _, zs, xs, ys] | ["mosaicjson", "tiles", zs, xs, ys] => {
+                let cache_key = format!("{path}?{raw_query}");
+                engine
+                    .tile_cache
+                    .get_or_render(cache_key, || async {
+                        let u = mj_url
+                            .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                        let mj = load_mosaicjson(&engine, &u).await?;
+                        let (Some(z), Some(x), Some((y, sc, ext))) = (
+                            zs.parse::<u8>().ok(),
+                            xs.parse::<u32>().ok(),
+                            parse_y_scale_ext(ys),
+                        ) else {
+                            return Err(EngineError::BadRequest(
+                                "invalid /mosaicjson/tiles coordinate path".into(),
+                            ));
+                        };
+                        let tile = TileCoord { z, x, y };
+                        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
+                        let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
+                        if urls.is_empty() {
+                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            Ok((
+                                cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, 3),
+                                ct,
+                            ))
+                        } else {
+                            let first_cog = engine.store.open_uri(&urls[0]).await?;
+                            let db = first_cog.index.full_res().samples_per_pixel;
+                            let is_u8 = first_cog.index.full_res().sample_type
+                                == cogzilla_tiff::SampleType::Uint8;
+                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, db, is_u8)?;
+                            let b = engine.render_mosaic_tile(&urls, &treq).await?;
+                            Ok((b, ct))
+                        }
+                    })
+                    .await
+                    .map(|t| (t.bytes, t.content_type))
+            }
+            _ => Err(EngineError::NotFound(path.clone())),
+        };
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+    }
 
     // ------------------------------------------------------------------------
     // Dynamic early-exit COG mosaic:

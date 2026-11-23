@@ -1,4 +1,6 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use cogzilla_proj::{ORIGIN_SHIFT, WEB_MERCATOR_R};
 
@@ -378,6 +380,180 @@ fn parse_iso_datetime_rank(s: &str) -> Option<i64> {
     Some((((((y * 100 + m) * 100 + d) * 100 + hh) * 100) + mm) * 100 + ss)
 }
 
+/// Encode an XYZ WebMercator tile `(z, x, y)` into a Bing/Mercantile quadkey string.
+pub fn tile_to_quadkey(z: u8, x: u32, y: u32) -> String {
+    let mut qk = String::with_capacity(z as usize);
+    for i in (1..=z).rev() {
+        let mask = 1u32 << (i - 1);
+        let mut digit = b'0';
+        if (x & mask) != 0 {
+            digit += 1;
+        }
+        if (y & mask) != 0 {
+            digit += 2;
+        }
+        qk.push(digit as char);
+    }
+    qk
+}
+
+/// MosaicJSON 0.0.2 / 0.0.3 quadkey-indexed spatial catalog.
+///
+/// Implements `SceneCatalog` so MosaicJSON documents plug straight into both
+/// `/mosaic/{name}/tiles` (via `--mosaic`) and `/mosaicjson/tiles?...&url=...`.
+pub struct MosaicJsonCatalog {
+    pub version: String,
+    pub minzoom: u8,
+    pub maxzoom: u8,
+    pub quadkey_zoom: u8,
+    pub bounds: [f64; 4],
+    tiles: HashMap<String, Vec<String>, ahash::RandomState>,
+}
+
+impl MosaicJsonCatalog {
+    pub fn from_json_str(json: &str) -> Result<Self, String> {
+        let val: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("invalid MosaicJSON: {e}"))?;
+        let version = val
+            .get("mosaicjson")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'mosaicjson' version field".to_string())?
+            .to_string();
+        let minzoom = val.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let maxzoom = val.get("maxzoom").and_then(|v| v.as_u64()).unwrap_or(22) as u8;
+        let bounds = val
+            .get("bounds")
+            .and_then(parse_bbox4_val)
+            .unwrap_or([-180.0, -85.05112878, 180.0, 85.05112878]);
+        let tiles_obj = val
+            .get("tiles")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "missing 'tiles' object in MosaicJSON".to_string())?;
+
+        let mut inferred_qk_zoom: Option<u8> = None;
+        let mut tiles: HashMap<String, Vec<String>, ahash::RandomState> =
+            HashMap::with_capacity_and_hasher(tiles_obj.len(), ahash::RandomState::new());
+        for (qk, arr) in tiles_obj {
+            if inferred_qk_zoom.is_none() {
+                inferred_qk_zoom = Some(qk.len() as u8);
+            }
+            if let Some(urls) = arr.as_array() {
+                let list: Vec<String> = urls
+                    .iter()
+                    .filter_map(|u| u.as_str().map(|s| s.to_string()))
+                    .collect();
+                if !list.is_empty() {
+                    tiles.insert(qk.clone(), list);
+                }
+            }
+        }
+        let quadkey_zoom = val
+            .get("quadkey_zoom")
+            .and_then(|v| v.as_u64())
+            .map(|z| z as u8)
+            .or(inferred_qk_zoom)
+            .unwrap_or(minzoom);
+
+        Ok(Self {
+            version,
+            minzoom,
+            maxzoom,
+            quadkey_zoom,
+            bounds,
+            tiles,
+        })
+    }
+
+    pub fn info_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mosaicjson": self.version,
+            "minzoom": self.minzoom,
+            "maxzoom": self.maxzoom,
+            "quadkey_zoom": self.quadkey_zoom,
+            "bounds": self.bounds,
+            "tiles_count": self.tiles.len(),
+        })
+    }
+}
+
+impl SceneCatalog for MosaicJsonCatalog {
+    fn query_bbox_3857(&self, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<String> {
+        let qz = self.quadkey_zoom;
+        let n = (1u64 << qz) as f64;
+        let tile_span = WORLD_SPAN / n;
+        // Shrink slightly inward so adjacent-tile shared edges don't pull neighboring quadkeys.
+        let eps = ((max_x - min_x).min(max_y - min_y) * 1e-6).max(1e-6);
+        let x0 = (((min_x + eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
+        let x1 = (((max_x - eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
+        // WebMercator Y increases northwards while XYZ tile y increases southwards.
+        let y0 = ((ORIGIN_SHIFT - (max_y - eps)) / tile_span).floor() as i64;
+        let y1 = ((ORIGIN_SHIFT - (min_y + eps)) / tile_span).floor() as i64;
+        let max_idx = (1i64 << qz) - 1;
+        let cx0 = x0.clamp(0, max_idx) as u32;
+        let cx1 = x1.clamp(0, max_idx) as u32;
+        let cy0 = y0.clamp(0, max_idx) as u32;
+        let cy1 = y1.clamp(0, max_idx) as u32;
+
+        // Fast path: single quadkey hit (all requests at z >= quadkey_zoom)
+        if cx0 == cx1 && cy0 == cy1 {
+            let qk = tile_to_quadkey(qz, cx0, cy0);
+            return self.tiles.get(&qk).cloned().unwrap_or_default();
+        }
+
+        // Low-zoom overview request: cap scan to avoid pathological zoom-0 fan-out
+        let span_tiles = (cx1 - cx0 + 1) as u64 * (cy1 - cy0 + 1) as u64;
+        let mut out = Vec::new();
+        let mut seen: HashSet<&str, ahash::RandomState> = HashSet::with_hasher(ahash::RandomState::new());
+        if span_tiles <= 4096 {
+            for ty in cy0..=cy1 {
+                for tx in cx0..=cx1 {
+                    let qk = tile_to_quadkey(qz, tx, ty);
+                    if let Some(urls) = self.tiles.get(&qk) {
+                        for u in urls {
+                            if seen.insert(u.as_str()) {
+                                out.push(u.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Very zoomed-out request: iterate indexed quadkeys directly
+            for urls in self.tiles.values() {
+                for u in urls {
+                    if seen.insert(u.as_str()) {
+                        out.push(u.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn len(&self) -> usize {
+        self.tiles.len()
+    }
+}
+
+/// Auto-detect and parse any supported catalog JSON format:
+/// 1. MosaicJSON (`{"mosaicjson": ..., "tiles": {...}}`)
+/// 2. STAC `FeatureCollection` (`{"features": [...]}`)
+/// 3. Simple JSON array (`[{"url": ..., "bbox": [...]}]`)
+pub fn load_catalog_json_str(json: &str) -> Result<Arc<dyn SceneCatalog>, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid catalog JSON: {e}"))?;
+    if val.get("mosaicjson").is_some() && val.get("tiles").is_some() {
+        return Ok(Arc::new(MosaicJsonCatalog::from_json_str(json)?));
+    }
+    Ok(Arc::new(InMemoryCatalog::from_json_str(json)?))
+}
+
+pub fn load_catalog_json_file(path: impl AsRef<Path>) -> Result<Arc<dyn SceneCatalog>, String> {
+    let raw = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| format!("failed to read catalog {}: {e}", path.as_ref().display()))?;
+    load_catalog_json_str(&raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +644,45 @@ mod tests {
         let bb = wgs84_bbox_to_3857([-122.45, 37.75, -122.40, 37.78]);
         let hits = cat.query_bbox_3857(bb[0], bb[1], bb[2], bb[3]);
         assert_eq!(hits, vec!["/new.tif".to_string(), "/old.tif".to_string()]);
+    }
+
+    #[test]
+    fn mosaicjson_quadkey_lookup_and_autodetect() {
+        let tile = TileCoord { z: 12, x: 655, y: 1583 };
+        let qk = tile_to_quadkey(12, 655, 1583);
+        assert_eq!(qk.len(), 12);
+        let json = serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 10,
+            "maxzoom": 16,
+            "quadkey_zoom": 12,
+            "bounds": [-123.0, 37.0, -122.0, 38.0],
+            "tiles": {
+                qk: ["/front.tif", "/back.tif"]
+            }
+        })
+        .to_string();
+
+        let cat = load_catalog_json_str(&json).unwrap();
+        assert_eq!(cat.len(), 1);
+        // Exact z=12 match
+        let (x0, y0, x1, y1) = tile_bounds_3857(tile);
+        assert_eq!(
+            cat.query_bbox_3857(x0, y0, x1, y1),
+            vec!["/front.tif".to_string(), "/back.tif".to_string()]
+        );
+        // Child z=13 tile inside z=12 quadkey also hits!
+        let (cx0, cy0, cx1, cy1) = tile_bounds_3857(TileCoord {
+            z: 13,
+            x: 655 * 2,
+            y: 1583 * 2,
+        });
+        assert_eq!(
+            cat.query_bbox_3857(cx0, cy0, cx1, cy1),
+            vec!["/front.tif".to_string(), "/back.tif".to_string()]
+        );
+        // Unrelated tile returns empty
+        let (ox0, oy0, ox1, oy1) = tile_bounds_3857(TileCoord { z: 12, x: 10, y: 10 });
+        assert!(cat.query_bbox_3857(ox0, oy0, ox1, oy1).is_empty());
     }
 }

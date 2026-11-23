@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use cogzilla_io::{CogStore, DiskBlockCache};
-use cogzilla_server::{InMemoryCatalog, SceneCatalog, TileEngine, serve};
+use cogzilla_server::{TileEngine, load_catalog_json_file, serve};
 
 #[derive(Parser, Debug)]
 #[command(name = "cogzilla-server", about = "Ultra-fast COG & STAC tile server")]
@@ -127,10 +127,10 @@ async fn main() {
             eprintln!("Invalid --mosaic '{spec}', expected name=/path/to/catalog.json");
             std::process::exit(1);
         };
-        match InMemoryCatalog::from_json_file(path) {
+        match load_catalog_json_file(path) {
             Ok(cat) => {
                 let count = cat.len();
-                engine.register_catalog(name, Arc::new(cat));
+                engine.register_catalog(name, cat);
                 tracing::info!(mosaic = name, scenes = count, "registered spatial mosaic catalog");
             }
             Err(e) => {

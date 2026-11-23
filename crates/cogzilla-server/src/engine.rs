@@ -14,7 +14,7 @@ use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
 use dashmap::DashMap;
 use thiserror::Error;
 
-use crate::catalog::SceneCatalog;
+use crate::catalog::{MosaicJsonCatalog, SceneCatalog};
 use crate::tile_cache::TileCache;
 
 #[derive(Debug, Error)]
@@ -94,6 +94,7 @@ pub struct TileEngine {
     scenes: DashMap<String, Vec<Arc<OpenedCog>>, ahash::RandomState>,
     catalogs: DashMap<String, Arc<dyn SceneCatalog>, ahash::RandomState>,
     pub stac_cache: DashMap<String, Arc<crate::stac::StacItem>, ahash::RandomState>,
+    pub mosaicjson_cache: DashMap<String, Arc<MosaicJsonCatalog>, ahash::RandomState>,
     pub tile_cache: Arc<TileCache>,
     pub stats: Arc<EngineStats>,
 }
@@ -114,6 +115,7 @@ impl TileEngine {
             scenes: DashMap::with_hasher(ahash::RandomState::new()),
             catalogs: DashMap::with_hasher(ahash::RandomState::new()),
             stac_cache: DashMap::with_hasher(ahash::RandomState::new()),
+            mosaicjson_cache: DashMap::with_hasher(ahash::RandomState::new()),
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             stats: Arc::new(EngineStats::default()),
         }
