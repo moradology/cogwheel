@@ -662,5 +662,32 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             // Indexed-palette PNG (color_type=3)
             assert_eq!(bytes[25], 3, "expected indexed PNG for algorithm={alg}");
         }
+
+        // Verify TiTiler-compatible JSON ?algorithm_params={"azimuth":180,"angle_altitude":30}
+        {
+            let r_default = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.png?url={merc_url}&algorithm=hillshade"
+                ))
+                .send()
+                .await
+                .unwrap();
+            let b_default = r_default.bytes().await.unwrap();
+
+            let r_json = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.png?url={merc_url}&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A180%2C%22angle_altitude%22%3A30%2C%22z_factor%22%3A2.5%7D"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r_json.status(), 200);
+            let b_json = r_json.bytes().await.unwrap();
+            assert_eq!(&b_json[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            assert_ne!(
+                b_default, b_json,
+                "algorithm_params JSON should alter hillshade lighting"
+            );
+        }
     }
 }

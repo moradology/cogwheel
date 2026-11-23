@@ -185,12 +185,35 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
+            "algorithm_params" => {
+                let dec = percent_decode(v);
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&dec) {
+                    if let Some(a) = obj.get("azimuth").and_then(|x| x.as_f64()) {
+                        pq.azimuth = a as f32;
+                    }
+                    if let Some(a) = obj
+                        .get("angle_altitude")
+                        .or_else(|| obj.get("altitude"))
+                        .or_else(|| obj.get("angle"))
+                        .and_then(|x| x.as_f64())
+                    {
+                        pq.altitude = (a as f32).clamp(0.0, 90.0);
+                    }
+                    if let Some(z) = obj
+                        .get("z_factor")
+                        .or_else(|| obj.get("zfactor"))
+                        .and_then(|x| x.as_f64())
+                    {
+                        pq.z_factor = (z as f32).max(1e-4);
+                    }
+                }
+            }
             "azimuth" => {
                 if let Ok(a) = v.parse::<f32>() {
                     pq.azimuth = a;
                 }
             }
-            "altitude" | "angle" => {
+            "altitude" | "angle" | "angle_altitude" => {
                 if let Ok(a) = v.parse::<f32>() {
                     pq.altitude = a.clamp(0.0, 90.0);
                 }
