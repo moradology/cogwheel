@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use cogzilla_kernel::{
-    ColorFormula, ColormapLut, ColormapName, ExprProgram, OutputFormat, ResampleMode, SpectralExpr,
-    TerrainEncoding,
+    ColorFormula, ColormapLut, ColormapName, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode,
+    SpectralExpr, TerrainEncoding,
 };
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
@@ -133,6 +133,10 @@ struct ParsedQuery {
     coord_crs_3857: bool,
     format_param: Option<String>,
     algorithm: Option<String>,
+    azimuth: f32,
+    altitude: f32,
+    z_factor: f32,
+    colormap_explicit: bool,
 }
 
 fn parse_query(q: Option<&str>) -> ParsedQuery {
@@ -157,6 +161,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         coord_crs_3857: false,
         format_param: None,
         algorithm: None,
+        azimuth: 315.0,
+        altitude: 45.0,
+        z_factor: 1.0,
+        colormap_explicit: false,
     };
     let Some(q) = q else { return pq };
     for pair in q.split('&') {
@@ -177,6 +185,21 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
+            "azimuth" => {
+                if let Ok(a) = v.parse::<f32>() {
+                    pq.azimuth = a;
+                }
+            }
+            "altitude" | "angle" => {
+                if let Ok(a) = v.parse::<f32>() {
+                    pq.altitude = a.clamp(0.0, 90.0);
+                }
+            }
+            "z_factor" | "zfactor" => {
+                if let Ok(z) = v.parse::<f32>() {
+                    pq.z_factor = z.max(1e-4);
+                }
+            }
             "bidx" | "indexes" => {
                 for part in percent_decode(v).split(',') {
                     if let Ok(b) = part.parse::<u16>() {
@@ -205,6 +228,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "colormap_name" => {
                 if let Some(cm) = ColormapName::from_str_opt(&percent_decode(v)) {
                     pq.colormap = cm;
+                    pq.colormap_explicit = true;
                 }
             }
             "color_formula" => {
@@ -347,6 +371,44 @@ fn build_band_request(
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::TerrainRgb,
+                });
+            }
+            "hillshade" => {
+                let rescale = pq.rescale.first().copied().unwrap_or((0.0, 255.0));
+                let colormap = if pq.colormap_explicit {
+                    pq.colormap
+                } else {
+                    ColormapName::from_str_opt("gray").unwrap_or(ColormapName::Viridis)
+                };
+                return Ok(BandRequest::Dem {
+                    band_1based,
+                    algorithm: DemAlgorithm::Hillshade {
+                        azimuth_deg: pq.azimuth,
+                        altitude_deg: pq.altitude,
+                        z_factor: pq.z_factor,
+                    },
+                    rescale,
+                    colormap,
+                });
+            }
+            "slope" => {
+                let rescale = pq.rescale.first().copied().unwrap_or((0.0, 90.0));
+                return Ok(BandRequest::Dem {
+                    band_1based,
+                    algorithm: DemAlgorithm::Slope {
+                        z_factor: pq.z_factor,
+                    },
+                    rescale,
+                    colormap: pq.colormap,
+                });
+            }
+            "aspect" => {
+                let rescale = pq.rescale.first().copied().unwrap_or((0.0, 360.0));
+                return Ok(BandRequest::Dem {
+                    band_1based,
+                    algorithm: DemAlgorithm::Aspect,
+                    rescale,
+                    colormap: pq.colormap,
                 });
             }
             _ => {}

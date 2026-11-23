@@ -15,9 +15,9 @@ pub use color_formula::ColorFormula;
 pub use colormap::{ColormapLut, ColormapName};
 pub use expr_vm::ExprProgram;
 pub use kernel::{
-    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, TerrainEncoding, empty_tile_bytes,
-    encode_rgba_tile, encode_terrain_rgb, encode_terrarium_rgb, render_bandmath1,
-    render_bandmath2, render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb,
-    render_single_band, render_terrain_tile, sample_cubic,
+    DemAlgorithm, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, TerrainEncoding,
+    empty_tile_bytes, encode_rgba_tile, encode_terrain_rgb, encode_terrarium_rgb,
+    render_bandmath1, render_bandmath2, render_bandmath3, render_dem_algorithm, render_expr_vm,
+    render_rgb_bands, render_sar_rgb, render_single_band, render_terrain_tile, sample_cubic,
 };
 pub use source::BandSource;

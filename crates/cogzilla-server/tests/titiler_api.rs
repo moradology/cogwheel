@@ -644,5 +644,23 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             // Opaque RGB PNG (color_type=2) for clean DEM tile
             assert_eq!(bytes[25], 2, "expected RGB PNG for algorithm={alg}");
         }
+
+        // --------------------------------------------------------------------
+        // 21. On-the-Fly DEM Hillshade, Slope, Aspect (?algorithm=...)
+        // --------------------------------------------------------------------
+        for alg in ["hillshade", "slope", "aspect"] {
+            let resp = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.png?url={merc_url}&algorithm={alg}&azimuth=315&altitude=45&z_factor=2.0"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "algorithm={alg} failed");
+            let bytes = resp.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            // Indexed-palette PNG (color_type=3)
+            assert_eq!(bytes[25], 3, "expected indexed PNG for algorithm={alg}");
+        }
     }
 }

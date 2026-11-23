@@ -2283,6 +2283,307 @@ pub fn render_terrain_tile<const N: usize>(
     }
 }
 
+/// On-the-fly 3×3 Horn DEM derivative algorithms (matching `gdaldem`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DemAlgorithm {
+    /// Horn's 3×3 shaded relief in `[0.0, 255.0]`.
+    Hillshade {
+        azimuth_deg: f32,
+        altitude_deg: f32,
+        z_factor: f32,
+    },
+    /// Terrain slope in degrees `[0.0, 90.0]`.
+    Slope { z_factor: f32 },
+    /// Compass aspect in degrees `[0.0, 360.0)` clockwise from North (`0=N, 90=E, 180=S, 270=W`).
+    Aspect,
+}
+
+/// Evaluate a 3×3 Horn stencil centered at `(z_nw..z_se)` with ground spacing `pixel_size_m`.
+#[inline(always)]
+fn eval_horn_3x3(
+    z_nw: f32,
+    z_n: f32,
+    z_ne: f32,
+    z_w: f32,
+    z_c: f32,
+    z_e: f32,
+    z_sw: f32,
+    z_s: f32,
+    z_se: f32,
+    inv_8dx: f32,
+    alg: DemAlgorithm,
+) -> f32 {
+    if z_c.is_nan() {
+        return f32::NAN;
+    }
+    // Fill any missing border neighbor with center elevation so coastal edges stay clean.
+    let nw = if z_nw.is_nan() { z_c } else { z_nw };
+    let n = if z_n.is_nan() { z_c } else { z_n };
+    let ne = if z_ne.is_nan() { z_c } else { z_ne };
+    let w = if z_w.is_nan() { z_c } else { z_w };
+    let e = if z_e.is_nan() { z_c } else { z_e };
+    let sw = if z_sw.is_nan() { z_c } else { z_sw };
+    let s = if z_s.is_nan() { z_c } else { z_s };
+    let se = if z_se.is_nan() { z_c } else { z_se };
+
+    // dz/dx (positive going East), dz/dy (positive going South)
+    let dz_dx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) * inv_8dx;
+    let dz_dy = ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne)) * inv_8dx;
+
+    match alg {
+        DemAlgorithm::Hillshade {
+            azimuth_deg,
+            altitude_deg,
+            z_factor,
+        } => {
+            let zenith = (90.0 - altitude_deg).to_radians();
+            // Sun vector in East/North/Up coordinates:
+            // azimuth_deg is clockwise from North (0=N, 90=E, 315=NW).
+            let az = azimuth_deg.to_radians();
+            let sun_e = az.sin() * zenith.sin();
+            let sun_n = az.cos() * zenith.sin();
+            let sun_u = zenith.cos();
+            // Surface normal in (East, North, Up) = (-z*dz_dx, +z*dz_dy, 1) normalized
+            let nx = -z_factor * dz_dx;
+            let ny = z_factor * dz_dy;
+            let inv_len = 1.0 / (nx * nx + ny * ny + 1.0).sqrt();
+            let dot = (nx * sun_e + ny * sun_n + sun_u) * inv_len;
+            (dot.max(0.0) * 255.0).clamp(0.0, 255.0)
+        }
+        DemAlgorithm::Slope { z_factor } => {
+            let grad = (dz_dx * dz_dx + dz_dy * dz_dy).sqrt() * z_factor;
+            grad.atan().to_degrees()
+        }
+        DemAlgorithm::Aspect => {
+            if dz_dx.abs() < 1e-12 && dz_dy.abs() < 1e-12 {
+                return f32::NAN;
+            }
+            // Downhill vector in (East, North) is (-dz_dx, +dz_dy)
+            let bearing = (-dz_dx).atan2(dz_dy).to_degrees();
+            bearing.rem_euclid(360.0)
+        }
+    }
+}
+
+/// Render an on-the-fly DEM derivative tile (Hillshade, Slope, or Aspect) using Horn's 3×3
+/// stencil over a 1-pixel-padded resampled elevation buffer for seamless tile boundaries.
+pub fn render_dem_algorithm<const N: usize>(
+    plan: &CoordPlan<N>,
+    src: &BandSource<'_>,
+    alg: DemAlgorithm,
+    pixel_size_m: f32,
+    style: &SingleBandStyle,
+) -> Bytes {
+    if src.all_nodata {
+        return empty_tile_bytes(N as u32, style.format, 1);
+    }
+    let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+    let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
+
+    let sample_px = |u: f32, v: f32| -> f32 {
+        match (style.resample, clean) {
+            (ResampleMode::Bilinear, true) => sample_bilinear::<true>(src, u, v),
+            (ResampleMode::Bilinear, false) => sample_bilinear::<false>(src, u, v),
+            (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
+            (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
+            (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
+        }
+    };
+
+    // Sample interior N×N elevation grid + 1-pixel extrapolated border -> (N+2)×(N+2)
+    let pad = N + 2;
+    let mut elev = vec![f32::NAN; pad * pad];
+    let mut u_first = [0.0f32; N];
+    let mut v_first = [0.0f32; N];
+    let mut u_second = [0.0f32; N];
+    let mut v_second = [0.0f32; N];
+    let mut u_prev = [0.0f32; N];
+    let mut v_prev = [0.0f32; N];
+    let mut u_row = [0.0f32; N];
+    let mut v_row = [0.0f32; N];
+
+    for py in 0..N {
+        fill_uv_row(plan, py, &mut u_row, &mut v_row);
+        if py == 0 {
+            u_first = u_row;
+            v_first = v_row;
+        } else if py == 1 {
+            u_second = u_row;
+            v_second = v_row;
+        }
+        let row_off = (py + 1) * pad;
+        for px in 0..N {
+            elev[row_off + px + 1] = sample_px(u_row[px], v_row[px]);
+        }
+        // Left/right 1-px extrapolated border for seamless horizontal tile edges
+        let du_l = u_row[1] - u_row[0];
+        let dv_l = v_row[1] - v_row[0];
+        elev[row_off] = src.sample_checked((u_row[0] - du_l).round() as i32, (v_row[0] - dv_l).round() as i32);
+        let du_r = u_row[N - 1] - u_row[N - 2];
+        let dv_r = v_row[N - 1] - v_row[N - 2];
+        elev[row_off + N + 1] = src.sample_checked(
+            (u_row[N - 1] + du_r).round() as i32,
+            (v_row[N - 1] + dv_r).round() as i32,
+        );
+        if py + 1 < N {
+            u_prev = u_row;
+            v_prev = v_row;
+        }
+    }
+    // Top/bottom 1-px extrapolated border for seamless vertical tile edges
+    for px in 0..N {
+        let u_top = 2.0 * u_first[px] - u_second[px];
+        let v_top = 2.0 * v_first[px] - v_second[px];
+        elev[px + 1] = src.sample_checked(u_top.round() as i32, v_top.round() as i32);
+        let u_bot = 2.0 * u_row[px] - u_prev[px];
+        let v_bot = 2.0 * v_row[px] - v_prev[px];
+        elev[(N + 1) * pad + px + 1] = src.sample_checked(u_bot.round() as i32, v_bot.round() as i32);
+    }
+    elev[0] = elev[1];
+    elev[pad - 1] = elev[pad - 2];
+    elev[(N + 1) * pad] = elev[(N + 1) * pad + 1];
+    elev[(N + 1) * pad + pad - 1] = elev[(N + 1) * pad + pad - 2];
+
+    let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
+    let inv_range = 255.0 / (style.rescale_max - style.rescale_min).max(1e-12);
+    let min_val = style.rescale_min;
+    let lut = style.colormap.lut();
+
+    match style.format {
+        OutputFormat::RawF32 => {
+            let mut out = BytesMut::with_capacity(N * N * 4);
+            for py in 0..N {
+                let r0 = py * pad;
+                let r1 = (py + 1) * pad;
+                let r2 = (py + 2) * pad;
+                for px in 0..N {
+                    let c = px + 1;
+                    let val = eval_horn_3x3(
+                        elev[r0 + c - 1],
+                        elev[r0 + c],
+                        elev[r0 + c + 1],
+                        elev[r1 + c - 1],
+                        elev[r1 + c],
+                        elev[r1 + c + 1],
+                        elev[r2 + c - 1],
+                        elev[r2 + c],
+                        elev[r2 + c + 1],
+                        inv_8dx,
+                        alg,
+                    );
+                    out.put_slice(&val.to_le_bytes());
+                }
+            }
+            out.freeze()
+        }
+        OutputFormat::Png => SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            let stride = 1 + N;
+            let total = N * stride;
+            if sc.img_buf.len() < total {
+                sc.img_buf.resize(total, 0);
+            }
+            if sc.row_buf.len() < N {
+                sc.row_buf.resize(N, 0);
+            }
+            let mut has_nodata = false;
+            for py in 0..N {
+                let r0 = py * pad;
+                let r1 = (py + 1) * pad;
+                let r2 = (py + 2) * pad;
+                let row_idx = &mut sc.row_buf[..N];
+                for px in 0..N {
+                    let c = px + 1;
+                    let val = eval_horn_3x3(
+                        elev[r0 + c - 1],
+                        elev[r0 + c],
+                        elev[r0 + c + 1],
+                        elev[r1 + c - 1],
+                        elev[r1 + c],
+                        elev[r1 + c + 1],
+                        elev[r2 + c - 1],
+                        elev[r2 + c],
+                        elev[r2 + c + 1],
+                        inv_8dx,
+                        alg,
+                    );
+                    if val.is_nan() {
+                        has_nodata = true;
+                        row_idx[px] = 0;
+                    } else {
+                        let idx = rescale_u8(val, inv_range, min_val);
+                        row_idx[px] = if clean && !matches!(alg, DemAlgorithm::Aspect) {
+                            idx
+                        } else {
+                            // Reserve index 0 for transparent nodata when needed
+                            idx.max(1)
+                        };
+                    }
+                }
+                filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+            }
+            if !has_nodata && clean && !matches!(alg, DemAlgorithm::Aspect) {
+                let mut plte = [0u8; 768];
+                for i in 0..256 {
+                    plte[i * 3] = lut.rgb[i][0];
+                    plte[i * 3 + 1] = lut.rgb[i][1];
+                    plte[i * 3 + 2] = lut.rgb[i][2];
+                }
+                encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+            } else {
+                let mut plte = [0u8; 768];
+                for i in 1..256 {
+                    let src_i = ((i - 1) * 255) / 254;
+                    plte[i * 3] = lut.rgb[src_i][0];
+                    plte[i * 3 + 1] = lut.rgb[src_i][1];
+                    plte[i * 3 + 2] = lut.rgb[src_i][2];
+                }
+                let trns = has_nodata.then_some(&[0u8][..]);
+                encode_indexed_png(N as u32, N as u32, &plte, trns, &sc.img_buf[..total])
+            }
+        }),
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+            let mut rgba = vec![0u8; N * N * 4];
+            let mut all_opaque = true;
+            for py in 0..N {
+                let r0 = py * pad;
+                let r1 = (py + 1) * pad;
+                let r2 = (py + 2) * pad;
+                let row_off = py * N * 4;
+                for px in 0..N {
+                    let c = px + 1;
+                    let val = eval_horn_3x3(
+                        elev[r0 + c - 1],
+                        elev[r0 + c],
+                        elev[r0 + c + 1],
+                        elev[r1 + c - 1],
+                        elev[r1 + c],
+                        elev[r1 + c + 1],
+                        elev[r2 + c - 1],
+                        elev[r2 + c],
+                        elev[r2 + c + 1],
+                        inv_8dx,
+                        alg,
+                    );
+                    let off = row_off + px * 4;
+                    if val.is_nan() {
+                        all_opaque = false;
+                    } else {
+                        let idx = rescale_u8(val, inv_range, min_val) as usize;
+                        let rgb = lut.rgb[idx];
+                        rgba[off] = rgb[0];
+                        rgba[off + 1] = rgb[1];
+                        rgba[off + 2] = rgb[2];
+                        rgba[off + 3] = 255;
+                    }
+                }
+            }
+            encode_rgba_tile(&rgba, N as u32, all_opaque, style.format)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2464,5 +2765,50 @@ mod tests {
                 "terrainrgb mismatch for {elev}: got {dec_mb}"
             );
         }
+    }
+
+    #[test]
+    fn dem_horn_3x3_matches_analytical_flat_and_45deg_east_ramp() {
+        let dx = 10.0f32;
+        let inv_8dx = 1.0 / (8.0 * dx);
+
+        // Flat plane z = 500m -> slope = 0 deg, hillshade(alt=45) = 255 * sin(45 deg) ~= 180.3
+        let flat_slope = eval_horn_3x3(
+            500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, inv_8dx,
+            DemAlgorithm::Slope { z_factor: 1.0 },
+        );
+        assert!(flat_slope.abs() < 1e-4, "expected 0 deg slope, got {flat_slope}");
+
+        let flat_hs = eval_horn_3x3(
+            500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, inv_8dx,
+            DemAlgorithm::Hillshade {
+                azimuth_deg: 315.0,
+                altitude_deg: 45.0,
+                z_factor: 1.0,
+            },
+        );
+        assert!(
+            (flat_hs - 180.312).abs() < 0.1,
+            "expected ~180.3 flat hillshade, got {flat_hs}"
+        );
+
+        // 45-degree east-facing ramp: z drops by dx (=10m) each step East -> dz/dx = -1, dz/dy = 0
+        let ramp_slope = eval_horn_3x3(
+            110.0, 100.0, 90.0, 110.0, 100.0, 90.0, 110.0, 100.0, 90.0, inv_8dx,
+            DemAlgorithm::Slope { z_factor: 1.0 },
+        );
+        assert!(
+            (ramp_slope - 45.0).abs() < 1e-3,
+            "expected 45 deg slope, got {ramp_slope}"
+        );
+
+        let ramp_aspect = eval_horn_3x3(
+            110.0, 100.0, 90.0, 110.0, 100.0, 90.0, 110.0, 100.0, 90.0, inv_8dx,
+            DemAlgorithm::Aspect,
+        );
+        assert!(
+            (ramp_aspect - 90.0).abs() < 1e-3,
+            "expected 90 deg (East) aspect, got {ramp_aspect}"
+        );
     }
 }

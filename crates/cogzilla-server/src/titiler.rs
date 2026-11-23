@@ -755,6 +755,33 @@ pub async fn render_wgs84_bbox(
                 }
             }
         }
+        BandRequest::Dem {
+            band_1based,
+            rescale,
+            colormap,
+            ..
+        } => {
+            // General bbox preview fallback for DEM requests: render shaded elevation
+            let refs = get_band_refs(*band_1based, 0);
+            let src = BandSource::new(
+                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
+                &refs,
+            )
+            .with_nodata_override(nodata_override);
+            let lut = custom_lut.unwrap_or_else(|| colormap.lut());
+            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+            for i in 0..(w * h) {
+                let v = sample(&src, u_map[i], v_map[i]);
+                if !v.is_nan() {
+                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                    let c = lut.rgb[idx];
+                    rgba[i * 4] = c[0];
+                    rgba[i * 4 + 1] = c[1];
+                    rgba[i * 4 + 2] = c[2];
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+        }
         BandRequest::Rgb {
             bands_1based,
             rescale_min,
