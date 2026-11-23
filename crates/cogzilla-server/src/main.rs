@@ -17,6 +17,10 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     cache_mb: usize,
 
+    /// Optional encoded-tile micro-cache size in MiB (0 = singleflight dedup only)
+    #[arg(long, default_value_t = 0)]
+    tile_cache_mb: usize,
+
     /// Optional directory for persistent compressed-block cache (tier 2, local disk/NVMe)
     #[arg(long)]
     disk_cache_dir: Option<PathBuf>,
@@ -72,7 +76,10 @@ async fn main() {
             }
         }
     }
-    let engine = Arc::new(TileEngine::with_store(Arc::new(store)));
+    let engine = Arc::new(TileEngine::with_store_and_tile_cache(
+        Arc::new(store),
+        args.tile_cache_mb * 1024 * 1024,
+    ));
 
     for spec in &args.datasets {
         let Some((name, path)) = spec.split_once('=') else {

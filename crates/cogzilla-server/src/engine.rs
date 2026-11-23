@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use thiserror::Error;
 
 use crate::catalog::SceneCatalog;
+use crate::tile_cache::TileCache;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -92,6 +93,7 @@ pub struct TileEngine {
     scenes: DashMap<String, Vec<Arc<OpenedCog>>, ahash::RandomState>,
     catalogs: DashMap<String, Arc<dyn SceneCatalog>, ahash::RandomState>,
     pub stac_cache: DashMap<String, Arc<crate::stac::StacItem>, ahash::RandomState>,
+    pub tile_cache: Arc<TileCache>,
     pub stats: Arc<EngineStats>,
 }
 
@@ -101,12 +103,17 @@ impl TileEngine {
     }
 
     pub fn with_store(store: Arc<CogStore>) -> Self {
+        Self::with_store_and_tile_cache(store, 0)
+    }
+
+    pub fn with_store_and_tile_cache(store: Arc<CogStore>, tile_cache_max_bytes: usize) -> Self {
         Self {
             store,
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
             scenes: DashMap::with_hasher(ahash::RandomState::new()),
             catalogs: DashMap::with_hasher(ahash::RandomState::new()),
             stac_cache: DashMap::with_hasher(ahash::RandomState::new()),
+            tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             stats: Arc::new(EngineStats::default()),
         }
     }

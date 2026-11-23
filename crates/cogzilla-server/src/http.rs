@@ -617,6 +617,10 @@ pub async fn handle_request(
             "cache_misses": engine.store.cache.misses.load(Ordering::Relaxed),
             "singleflight_coalesced": engine.store.cache.coalesced_waiters.load(Ordering::Relaxed),
             "cache_bytes": engine.store.cache.current_bytes(),
+            "tile_cache_hits": engine.tile_cache.hits.load(Ordering::Relaxed),
+            "tile_cache_misses": engine.tile_cache.misses.load(Ordering::Relaxed),
+            "tile_cache_coalesced": engine.tile_cache.coalesced.load(Ordering::Relaxed),
+            "tile_cache_bytes": engine.tile_cache.current_bytes(),
             "upstream_limit": engine.store.upstream_limiter.current_limit(),
             "upstream_in_flight": engine.store.upstream_limiter.in_flight(),
             "upstream_throttles": engine.store.upstream_limiter.throttle_events(),
@@ -630,6 +634,7 @@ pub async fn handle_request(
 
     if method == Method::POST && path == "/admin/clear-cache" {
         engine.store.cache.clear();
+        engine.tile_cache.clear();
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"cleared"), "text/plain"));
     }
 
@@ -658,6 +663,7 @@ pub async fn handle_request(
             ),
             _ => (None, None, None),
         };
+        let cache_key = format!("{path}?{raw_query}");
         let res = match coords {
             (Some(z), Some(x), Some((y, sc, ext))) => {
                 if pq.urls.is_empty() {
@@ -665,22 +671,20 @@ pub async fn handle_request(
                         "missing required ?url= parameter(s) for /mosaic/tiles".into(),
                     ))
                 } else {
-                    match engine.store.open_uri(&pq.urls[0]).await {
-                        Ok(first_cog) => {
+                    engine
+                        .tile_cache
+                        .get_or_render(cache_key, || async {
+                            let first_cog = engine.store.open_uri(&pq.urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)
-                            {
-                                Ok((treq, ct)) => engine
-                                    .render_mosaic_tile(&pq.urls, &treq)
-                                    .await
-                                    .map(|b| (b, ct)),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(EngineError::Io(e)),
-                    }
+                            let (treq, ct) =
+                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            let b = engine.render_mosaic_tile(&pq.urls, &treq).await?;
+                            Ok((b, ct))
+                        })
+                        .await
+                        .map(|t| (t.bytes, t.content_type))
                 }
             }
             _ => Err(EngineError::BadRequest(
@@ -703,34 +707,31 @@ pub async fn handle_request(
         let res = match (engine.get_catalog(cat_name), coords) {
             (None, _) => Err(EngineError::NotFound(format!("mosaic catalog '{cat_name}'"))),
             (Some(catalog), (Some(z), Some(x), Some((y, sc, ext)))) => {
-                let tile = TileCoord { z, x, y };
-                let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
-                let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
-                if urls.is_empty() {
-                    match build_tile_request(tile, sc, ext, &pq, 3, true) {
-                        Ok((treq, ct)) => Ok((
-                            cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, 3),
-                            ct,
-                        )),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    match engine.store.open_uri(&urls[0]).await {
-                        Ok(first_cog) => {
+                let cache_key = format!("{path}?{raw_query}");
+                engine
+                    .tile_cache
+                    .get_or_render(cache_key, || async {
+                        let tile = TileCoord { z, x, y };
+                        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
+                        let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
+                        if urls.is_empty() {
+                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            Ok((
+                                cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, 3),
+                                ct,
+                            ))
+                        } else {
+                            let first_cog = engine.store.open_uri(&urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            match build_tile_request(tile, sc, ext, &pq, db, is_u8) {
-                                Ok((treq, ct)) => engine
-                                    .render_mosaic_tile(&urls, &treq)
-                                    .await
-                                    .map(|b| (b, ct)),
-                                Err(e) => Err(e),
-                            }
+                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, db, is_u8)?;
+                            let b = engine.render_mosaic_tile(&urls, &treq).await?;
+                            Ok((b, ct))
                         }
-                        Err(e) => Err(EngineError::Io(e)),
-                    }
-                }
+                    })
+                    .await
+                    .map(|t| (t.bytes, t.content_type))
             }
             _ => Err(EngineError::BadRequest(
                 "invalid /mosaic/{name}/tiles coordinate path".into(),
@@ -749,25 +750,34 @@ pub async fn handle_request(
             segs[3].parse::<u32>().ok(),
             parse_y_scale_ext(segs[4]),
         );
+        let cache_key = format!("{path}?{raw_query}");
         let res = match parsed {
             (Some(z), Some(x), Some((y, sc, ext))) => {
-                if let Some(scene) = engine.get_scene(ds) {
-                    let db = scene.len() as u16;
-                    let is_u8 = scene[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                    match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8) {
-                        Ok((treq, ct)) => engine.render_multi_cog_tile(&scene, &treq).await.map(|b| (b, ct)),
-                        Err(e) => Err(e),
-                    }
-                } else if let Some(cog) = engine.store.get_registered(ds) {
-                    let db = cog.index.full_res().samples_per_pixel;
-                    let is_u8 = cog.index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                    match build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8) {
-                        Ok((treq, ct)) => engine.render_tile(&cog, &treq).await.map(|b| (b, ct)),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Err(EngineError::NotFound(ds.to_string()))
-                }
+                engine
+                    .tile_cache
+                    .get_or_render(cache_key, || async {
+                        if let Some(scene) = engine.get_scene(ds) {
+                            let db = scene.len() as u16;
+                            let is_u8 = scene[0].index.full_res().sample_type
+                                == cogzilla_tiff::SampleType::Uint8;
+                            let (treq, ct) =
+                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            let b = engine.render_multi_cog_tile(&scene, &treq).await?;
+                            Ok((b, ct))
+                        } else if let Some(cog) = engine.store.get_registered(ds) {
+                            let db = cog.index.full_res().samples_per_pixel;
+                            let is_u8 = cog.index.full_res().sample_type
+                                == cogzilla_tiff::SampleType::Uint8;
+                            let (treq, ct) =
+                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            let b = engine.render_tile(&cog, &treq).await?;
+                            Ok((b, ct))
+                        } else {
+                            Err(EngineError::NotFound(ds.to_string()))
+                        }
+                    })
+                    .await
+                    .map(|t| (t.bytes, t.content_type))
             }
             _ => Err(EngineError::BadRequest(
                 "expected /tiles/{dataset}/{z}/{x}/{y}.{png|webp|f32}".to_string(),
@@ -962,57 +972,109 @@ pub async fn handle_request(
             }
 
             // GET /stac/tiles/{tms}/{z}/{x}/{y}[@scale][.{format}]
-            (Method::GET, ["tiles", tms, zs, xs, ys]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
-                let (_, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
-                let (Some(z), Some(x), Some((y, sc, ext))) = (
-                    zs.parse::<u8>().ok(),
-                    xs.parse::<u32>().ok(),
-                    parse_y_scale_ext(ys),
-                ) else {
-                    return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
-                };
-                let mut pq_stac = pq;
-                pq_stac.expr_raw = rewritten_expr;
-                let db = if cogs.len() > 1 {
-                    cogs.len() as u16
-                } else {
-                    cogs[0].index.full_res().samples_per_pixel
-                };
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq_stac, db, is_u8)?;
-                if pq_stac.unscale {
-                    apply_unscale(&mut treq.bands, &cogs[0].index.scales, &cogs[0].index.offsets);
-                }
-                let needs_general = *tms == "WorldCRS84Quad"
-                    || pq_stac.buffer > 0
-                    || pq_stac.nodata.is_some()
-                    || pq_stac.custom_colormap_json.is_some()
-                    || pq_stac.color_formula.is_some()
-                    || !pq_stac.return_mask;
-                if needs_general {
-                    let custom_lut = pq_stac.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
-                    let cf = pq_stac.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                    let out_dim = treq.tile_size + 2 * pq_stac.buffer;
-                    let bbox = if *tms == "WorldCRS84Quad" {
-                        world_crs84_tile_bbox(z, x, y, pq_stac.buffer, treq.tile_size)
-                    } else {
-                        web_mercator_buffered_wgs84_bbox(z, x, y, pq_stac.buffer, treq.tile_size)
-                    };
-                    let data = render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_dim, out_dim, None, &treq.bands, treq.resample,
-                        treq.format, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
-                    )
-                    .await?;
-                    Ok((data, ct))
-                } else {
-                    let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                    Ok((data, ct))
-                }
+            (Method::GET, ["tiles", tms, zs, xs, ys]) => {
+                let cache_key = format!("{path}?{raw_query}");
+                engine
+                    .tile_cache
+                    .get_or_render(cache_key, || async {
+                        let u = stac_url
+                            .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                        let item =
+                            load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                        let (_, cogs, rewritten_expr) = resolve_stac_assets(
+                            &engine,
+                            &item,
+                            &pq.assets,
+                            pq.expr_raw.as_deref(),
+                        )
+                        .await?;
+                        let (Some(z), Some(x), Some((y, sc, ext))) = (
+                            zs.parse::<u8>().ok(),
+                            xs.parse::<u32>().ok(),
+                            parse_y_scale_ext(ys),
+                        ) else {
+                            return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                        };
+                        let mut pq_stac = pq;
+                        pq_stac.expr_raw = rewritten_expr;
+                        let db = if cogs.len() > 1 {
+                            cogs.len() as u16
+                        } else {
+                            cogs[0].index.full_res().samples_per_pixel
+                        };
+                        let is_u8 = cogs[0].index.full_res().sample_type
+                            == cogzilla_tiff::SampleType::Uint8;
+                        let (mut treq, ct) = build_tile_request(
+                            TileCoord { z, x, y },
+                            sc,
+                            ext,
+                            &pq_stac,
+                            db,
+                            is_u8,
+                        )?;
+                        if pq_stac.unscale {
+                            apply_unscale(
+                                &mut treq.bands,
+                                &cogs[0].index.scales,
+                                &cogs[0].index.offsets,
+                            );
+                        }
+                        let needs_general = *tms == "WorldCRS84Quad"
+                            || pq_stac.buffer > 0
+                            || pq_stac.nodata.is_some()
+                            || pq_stac.custom_colormap_json.is_some()
+                            || pq_stac.color_formula.is_some()
+                            || !pq_stac.return_mask;
+                        if needs_general {
+                            let custom_lut = pq_stac
+                                .custom_colormap_json
+                                .as_deref()
+                                .map(ColormapLut::from_json_str)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq_stac
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let out_dim = treq.tile_size + 2 * pq_stac.buffer;
+                            let bbox = if *tms == "WorldCRS84Quad" {
+                                world_crs84_tile_bbox(z, x, y, pq_stac.buffer, treq.tile_size)
+                            } else {
+                                web_mercator_buffered_wgs84_bbox(
+                                    z,
+                                    x,
+                                    y,
+                                    pq_stac.buffer,
+                                    treq.tile_size,
+                                )
+                            };
+                            let data = render_wgs84_bbox(
+                                &engine,
+                                &cogs,
+                                bbox,
+                                out_dim,
+                                out_dim,
+                                None,
+                                &treq.bands,
+                                treq.resample,
+                                treq.format,
+                                pq_stac.nodata,
+                                custom_lut.as_ref(),
+                                cf.as_ref(),
+                                pq_stac.return_mask,
+                            )
+                            .await?;
+                            Ok((data, ct))
+                        } else {
+                            let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            Ok((data, ct))
+                        }
+                    })
+                    .await
+                    .map(|t| (t.bytes, t.content_type))
             }
-            .await,
 
             // GET /stac/point/{lon},{lat}
             (Method::GET, ["point", coord]) => async {
@@ -1343,97 +1405,117 @@ pub async fn handle_request(
             }
 
             // 6 & 7. GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{format}]
-            (Method::GET, ["tiles", tms, zs, xs, ys]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let (Some(z), Some(x), Some((y, sc, ext))) = (
-                    zs.parse::<u8>().ok(),
-                    xs.parse::<u32>().ok(),
-                    parse_y_scale_ext(ys),
-                ) else {
-                    return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
-                };
-                let db = if cogs.len() > 1 {
-                    cogs.len() as u16
-                } else {
-                    cogs[0].index.full_res().samples_per_pixel
-                };
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
-                if pq.unscale {
-                    apply_unscale(&mut treq.bands, &cogs[0].index.scales, &cogs[0].index.offsets);
-                }
+            (Method::GET, ["tiles", tms, zs, xs, ys]) => {
+                let cache_key = format!("{path}?{raw_query}");
+                engine
+                    .tile_cache
+                    .get_or_render(cache_key, || async {
+                        let cogs = open_query_urls(&engine, &pq.urls).await?;
+                        let (Some(z), Some(x), Some((y, sc, ext))) = (
+                            zs.parse::<u8>().ok(),
+                            xs.parse::<u32>().ok(),
+                            parse_y_scale_ext(ys),
+                        ) else {
+                            return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                        };
+                        let db = if cogs.len() > 1 {
+                            cogs.len() as u16
+                        } else {
+                            cogs[0].index.full_res().samples_per_pixel
+                        };
+                        let is_u8 = cogs[0].index.full_res().sample_type
+                            == cogzilla_tiff::SampleType::Uint8;
+                        let (mut treq, ct) =
+                            build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                        if pq.unscale {
+                            apply_unscale(
+                                &mut treq.bands,
+                                &cogs[0].index.scales,
+                                &cogs[0].index.offsets,
+                            );
+                        }
 
-                let needs_general_path = *tms == "WorldCRS84Quad"
-                    || pq.buffer > 0
-                    || pq.nodata.is_some()
-                    || pq.custom_colormap_json.is_some()
-                    || pq.color_formula.is_some()
-                    || !pq.return_mask;
+                        let needs_general_path = *tms == "WorldCRS84Quad"
+                            || pq.buffer > 0
+                            || pq.nodata.is_some()
+                            || pq.custom_colormap_json.is_some()
+                            || pq.color_formula.is_some()
+                            || !pq.return_mask;
 
-                if needs_general_path {
-                    let custom_lut = pq
-                        .custom_colormap_json
-                        .as_deref()
-                        .map(ColormapLut::from_json_str)
-                        .transpose()
-                        .map_err(EngineError::BadRequest)?;
-                    let cf = pq
-                        .color_formula
-                        .as_deref()
-                        .map(ColorFormula::parse)
-                        .transpose()
-                        .map_err(EngineError::BadRequest)?;
-                    let out_dim = treq.tile_size + 2 * pq.buffer;
-                    let bbox = if *tms == "WorldCRS84Quad" {
-                        world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size)
-                    } else {
-                        web_mercator_buffered_wgs84_bbox(z, x, y, pq.buffer, treq.tile_size)
-                    };
-                    let data = render_wgs84_bbox(
-                        &engine,
-                        &cogs,
-                        bbox,
-                        out_dim,
-                        out_dim,
-                        None,
-                        &treq.bands,
-                        treq.resample,
-                        treq.format,
-                        pq.nodata,
-                        custom_lut.as_ref(),
-                        cf.as_ref(),
-                        pq.return_mask,
-                    )
-                    .await?;
-                    Ok((data, ct))
-                } else {
-                    let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                    Ok((data, ct))
-                }
+                        if needs_general_path {
+                            let custom_lut = pq
+                                .custom_colormap_json
+                                .as_deref()
+                                .map(ColormapLut::from_json_str)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let out_dim = treq.tile_size + 2 * pq.buffer;
+                            let bbox = if *tms == "WorldCRS84Quad" {
+                                world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size)
+                            } else {
+                                web_mercator_buffered_wgs84_bbox(z, x, y, pq.buffer, treq.tile_size)
+                            };
+                            let data = render_wgs84_bbox(
+                                &engine,
+                                &cogs,
+                                bbox,
+                                out_dim,
+                                out_dim,
+                                None,
+                                &treq.bands,
+                                treq.resample,
+                                treq.format,
+                                pq.nodata,
+                                custom_lut.as_ref(),
+                                cf.as_ref(),
+                                pq.return_mask,
+                            )
+                            .await?;
+                            Ok((data, ct))
+                        } else {
+                            let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            Ok((data, ct))
+                        }
+                    })
+                    .await
+                    .map(|t| (t.bytes, t.content_type))
             }
-            .await,
 
             // Alias: GET /cog/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
-            (Method::GET, ["tiles", zs, xs, ys]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let (Some(z), Some(x), Some((y, sc, ext))) = (
-                    zs.parse::<u8>().ok(),
-                    xs.parse::<u32>().ok(),
-                    parse_y_scale_ext(ys),
-                ) else {
-                    return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
-                };
-                let db = if cogs.len() > 1 {
-                    cogs.len() as u16
-                } else {
-                    cogs[0].index.full_res().samples_per_pixel
-                };
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let (treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
-                let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                Ok((data, ct))
+            (Method::GET, ["tiles", zs, xs, ys]) => {
+                let cache_key = format!("{path}?{raw_query}");
+                engine
+                    .tile_cache
+                    .get_or_render(cache_key, || async {
+                        let cogs = open_query_urls(&engine, &pq.urls).await?;
+                        let (Some(z), Some(x), Some((y, sc, ext))) = (
+                            zs.parse::<u8>().ok(),
+                            xs.parse::<u32>().ok(),
+                            parse_y_scale_ext(ys),
+                        ) else {
+                            return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                        };
+                        let db = if cogs.len() > 1 {
+                            cogs.len() as u16
+                        } else {
+                            cogs[0].index.full_res().samples_per_pixel
+                        };
+                        let is_u8 = cogs[0].index.full_res().sample_type
+                            == cogzilla_tiff::SampleType::Uint8;
+                        let (treq, ct) =
+                            build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                        let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                        Ok((data, ct))
+                    })
+                    .await
+                    .map(|t| (t.bytes, t.content_type))
             }
-            .await,
 
             // 8. GET /cog/{tileMatrixSetId}/tilejson.json & /cog/tilejson.json
             (Method::GET, [tms, "tilejson.json"]) => async {
