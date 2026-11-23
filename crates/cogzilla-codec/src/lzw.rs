@@ -6,220 +6,356 @@ const FIRST_CODE: u16 = 258;
 const MAX_TABLE: usize = 4096;
 
 /// Reusable thread-local flat-table state for high-throughput MSB-first TIFF LZW decoding.
-/// Stores `(prefix, first_byte, last_byte, length)` so strings are written directly backwards
-/// into the output buffer without an intermediate stack reversal buffer.
+///
+/// Compact 8-byte dictionary entries (`[u64; 4096]` = 32 KiB, 100% L1d-resident on Zen 4 & M5):
+/// - Bits `48..64`: decoded string length (`1..=4096`).
+/// - If `len <= 6`: bits `0..48` hold the exact 1..6 decoded bytes inline (little-endian),
+///   emitted with a single unaligned 8-byte store (zero loads from `out`, zero prefix chasing).
+/// - If `len > 6`: bits `0..8` hold `first_byte`, bits `16..48` hold the `u32` byte offset in `out`
+///   where this string was previously written, emitted via a linear non-overlapping copy.
+/// - In both cases, `entry as u8` is always `first_byte`.
 pub struct LzwDecoder {
-    prefix: [u16; MAX_TABLE],
-    first_byte: [u8; MAX_TABLE],
-    last_byte: [u8; MAX_TABLE],
-    length: [u16; MAX_TABLE],
+    entries: [u64; MAX_TABLE],
 }
 
 impl LzwDecoder {
     pub fn new() -> Self {
-        let mut d = Self {
-            prefix: [0; MAX_TABLE],
-            first_byte: [0; MAX_TABLE],
-            last_byte: [0; MAX_TABLE],
-            length: [1; MAX_TABLE],
-        };
-        for i in 0..256 {
-            d.first_byte[i] = i as u8;
-            d.last_byte[i] = i as u8;
-            d.length[i] = 1;
+        let mut entries = [0u64; MAX_TABLE];
+        for (i, e) in entries.iter_mut().take(256).enumerate() {
+            *e = (1u64 << 48) | (i as u64);
         }
-        d
+        Self { entries }
     }
 
     /// Decode a TIFF MSB-first (early-change) LZW stream directly into `out`.
     /// Returns the number of decoded bytes written.
     #[inline(never)]
     pub fn decode(&mut self, src: &[u8], out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut bit_buf: u64 = 0;
-        let mut bits_in_buf: u32 = 0;
-        let mut src_pos: usize = 0;
         let src_len = src.len();
+        let src_ptr = src.as_ptr();
+        let src_bits = src_len * 8;
 
-        let mut out_pos: usize = 0;
         let out_len = out.len();
+        let out_ptr = out.as_mut_ptr();
+
+        let mut bit_pos: usize = 0;
+        let mut out_pos: usize = 0;
 
         let mut code_bits: u32 = 9;
+        let mut max_code: u16 = (1u16 << 9) - 1;
         let mut next_code: u16 = FIRST_CODE;
         let mut prev_code: u16 = CLEAR_CODE;
+        let mut prev_out_pos: usize = 0;
+        let mut prev_entry: u64 = 0;
 
-        macro_rules! read_code {
-            () => {{
-                if bits_in_buf < code_bits {
-                    // Refill up to 56 bits when possible using a single unaligned 8-byte BE load
-                    if src_pos + 8 <= src_len {
-                        let bytes = unsafe { *(src.as_ptr().add(src_pos) as *const [u8; 8]) };
-                        let chunk = u64::from_be_bytes(bytes);
-                        let consume_bytes = ((64 - bits_in_buf) >> 3) as usize;
-                        bit_buf |= chunk >> bits_in_buf;
-                        bits_in_buf += (consume_bytes as u32) << 3;
-                        src_pos += consume_bytes;
-                    } else {
-                        while bits_in_buf <= 56 && src_pos < src_len {
-                            let b = unsafe { *src.get_unchecked(src_pos) } as u64;
-                            src_pos += 1;
-                            bit_buf |= b << (56 - bits_in_buf);
-                            bits_in_buf += 8;
-                        }
-                    }
-                    if bits_in_buf < code_bits {
-                        break;
-                    }
-                }
-                let code = (bit_buf >> (64 - code_bits)) as u16;
-                bit_buf <<= code_bits;
-                bits_in_buf -= code_bits;
-                code
-            }};
+        let entries = &mut self.entries;
+
+        #[inline(always)]
+        unsafe fn read_code_slow(
+            src_ptr: *const u8,
+            src_len: usize,
+            bit_pos: &mut usize,
+            code_bits: u32,
+        ) -> Option<u16> {
+            let bp = *bit_pos;
+            if bp + (code_bits as usize) > src_len * 8 {
+                return None;
+            }
+            let byte_pos = bp >> 3;
+            let bit_off = (bp & 7) as u32;
+            let mut chunk: u64 = 0;
+            let avail = (src_len - byte_pos).min(8);
+            for k in 0..avail {
+                chunk |= (unsafe { *src_ptr.add(byte_pos + k) } as u64) << (56 - k * 8);
+            }
+            *bit_pos = bp + (code_bits as usize);
+            Some(((chunk << bit_off) >> (64 - code_bits)) as u16)
         }
 
-        loop {
-            let code = read_code!();
+        // Fast inner loop: guaranteed `byte_pos + 8 <= src_len` and `out_pos + 16 <= out_len`
+        // so bit reading is completely branchless and inline 8-byte stores need zero bounds checks.
+        while (bit_pos >> 3) + 8 <= src_len && out_pos + 16 <= out_len {
+            let byte_pos = bit_pos >> 3;
+            let bit_off = (bit_pos & 7) as u32;
+            let chunk = u64::from_be_bytes(unsafe {
+                (src_ptr.add(byte_pos) as *const [u8; 8]).read_unaligned()
+            });
+            let code = ((chunk << bit_off) >> (64 - code_bits)) as u16;
+            bit_pos += code_bits as usize;
+
+            if code < 256 {
+                unsafe { *out_ptr.add(out_pos) = code as u8 };
+                if prev_code != CLEAR_CODE && (next_code as usize) < MAX_TABLE {
+                    let prev_len = prev_entry >> 48;
+                    let new_entry = if prev_len < 6 {
+                        (prev_entry + (1u64 << 48)) | ((code as u64) << (prev_len * 8))
+                    } else {
+                        ((prev_len + 1) << 48)
+                            | ((prev_out_pos as u64) << 16)
+                            | (prev_entry & 0xFF)
+                    };
+                    unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
+                    next_code += 1;
+                    if next_code == max_code && code_bits < 12 {
+                        code_bits += 1;
+                        max_code = (1u16 << code_bits) - 1;
+                    }
+                }
+                prev_out_pos = out_pos;
+                prev_entry = (1u64 << 48) | (code as u64);
+                prev_code = code;
+                out_pos += 1;
+                continue;
+            }
+
+            if code > EOI_CODE {
+                if code < next_code {
+                    let entry = unsafe { *entries.get_unchecked(code as usize) };
+                    let len = (entry >> 48) as usize;
+                    let first = entry as u8;
+
+                    if len <= 6 {
+                        unsafe {
+                            (out_ptr.add(out_pos) as *mut u64).write_unaligned(entry);
+                        }
+                    } else if out_pos + len <= out_len {
+                        let off = ((entry >> 16) & 0xFFFF_FFFF) as usize;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                out_ptr.add(off),
+                                out_ptr.add(out_pos),
+                                len,
+                            );
+                        }
+                    } else {
+                        let avail = out_len - out_pos;
+                        let off = ((entry >> 16) & 0xFFFF_FFFF) as usize;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                out_ptr.add(off),
+                                out_ptr.add(out_pos),
+                                avail,
+                            );
+                        }
+                        return Ok(out_len);
+                    }
+
+                    if (next_code as usize) < MAX_TABLE {
+                        let prev_len = prev_entry >> 48;
+                        let new_entry = if prev_len < 6 {
+                            (prev_entry + (1u64 << 48)) | ((first as u64) << (prev_len * 8))
+                        } else {
+                            ((prev_len + 1) << 48)
+                                | ((prev_out_pos as u64) << 16)
+                                | (prev_entry & 0xFF)
+                        };
+                        unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
+                        next_code += 1;
+                        if next_code == max_code && code_bits < 12 {
+                            code_bits += 1;
+                            max_code = (1u16 << code_bits) - 1;
+                        }
+                    }
+                    prev_out_pos = out_pos;
+                    prev_entry = entry;
+                    prev_code = code;
+                    out_pos += len;
+                    continue;
+                }
+
+                if code == next_code && prev_code != CLEAR_CODE {
+                    let first = prev_entry as u8;
+                    let prev_len = prev_entry >> 48;
+                    let new_len = (prev_len as usize) + 1;
+                    let new_entry = if prev_len < 6 {
+                        (prev_entry + (1u64 << 48)) | ((first as u64) << (prev_len * 8))
+                    } else {
+                        ((prev_len + 1) << 48) | ((out_pos as u64) << 16) | (first as u64)
+                    };
+
+                    if new_len <= 6 {
+                        unsafe {
+                            (out_ptr.add(out_pos) as *mut u64).write_unaligned(new_entry);
+                        }
+                    } else if out_pos + new_len <= out_len {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                out_ptr.add(prev_out_pos),
+                                out_ptr.add(out_pos),
+                                prev_len as usize,
+                            );
+                            *out_ptr.add(out_pos + prev_len as usize) = first;
+                        }
+                    } else {
+                        let avail = out_len - out_pos;
+                        let copy_prev = avail.min(prev_len as usize);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                out_ptr.add(prev_out_pos),
+                                out_ptr.add(out_pos),
+                                copy_prev,
+                            );
+                            if avail > prev_len as usize {
+                                *out_ptr.add(out_pos + prev_len as usize) = first;
+                            }
+                        }
+                        return Ok(out_len);
+                    }
+
+                    if (next_code as usize) < MAX_TABLE {
+                        unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
+                        next_code += 1;
+                        if next_code == max_code && code_bits < 12 {
+                            code_bits += 1;
+                            max_code = (1u16 << code_bits) - 1;
+                        }
+                    }
+                    prev_out_pos = out_pos;
+                    prev_entry = new_entry;
+                    prev_code = code;
+                    out_pos += new_len;
+                    continue;
+                }
+
+                return Err(CodecError::Lzw("out-of-range LZW code"));
+            }
+
+            if code == EOI_CODE {
+                return Ok(out_pos);
+            }
+            // CLEAR_CODE
+            code_bits = 9;
+            max_code = (1u16 << 9) - 1;
+            next_code = FIRST_CODE;
+            prev_code = CLEAR_CODE;
+        }
+
+        // Tail loop (last <= 8 input bytes or last <= 16 output bytes)
+        while bit_pos + (code_bits as usize) <= src_bits && out_pos < out_len {
+            let Some(code) = (unsafe { read_code_slow(src_ptr, src_len, &mut bit_pos, code_bits) })
+            else {
+                break;
+            };
             if code == EOI_CODE {
                 break;
             }
             if code == CLEAR_CODE {
                 code_bits = 9;
+                max_code = (1u16 << 9) - 1;
                 next_code = FIRST_CODE;
                 prev_code = CLEAR_CODE;
                 continue;
             }
-
             if prev_code == CLEAR_CODE {
                 if code >= 256 {
                     return Err(CodecError::Lzw("first code after CLEAR must be literal"));
                 }
-                if out_pos < out_len {
-                    unsafe { *out.get_unchecked_mut(out_pos) = code as u8 };
-                    out_pos += 1;
-                }
+                unsafe { *out_ptr.add(out_pos) = code as u8 };
+                prev_out_pos = out_pos;
+                prev_entry = (1u64 << 48) | (code as u64);
                 prev_code = code;
+                out_pos += 1;
                 continue;
             }
-
-            // Fast path: literal byte
             if code < 256 {
-                if out_pos < out_len {
-                    unsafe { *out.get_unchecked_mut(out_pos) = code as u8 };
-                    out_pos += 1;
-                }
+                unsafe { *out_ptr.add(out_pos) = code as u8 };
                 if (next_code as usize) < MAX_TABLE {
-                    let nc = next_code as usize;
-                    let pc = prev_code as usize;
-                    self.prefix[nc] = prev_code;
-                    self.first_byte[nc] = self.first_byte[pc];
-                    self.last_byte[nc] = code as u8;
-                    self.length[nc] = self.length[pc] + 1;
+                    let prev_len = prev_entry >> 48;
+                    let new_entry = if prev_len < 6 {
+                        (prev_entry + (1u64 << 48)) | ((code as u64) << (prev_len * 8))
+                    } else {
+                        ((prev_len + 1) << 48)
+                            | ((prev_out_pos as u64) << 16)
+                            | (prev_entry & 0xFF)
+                    };
+                    unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
                     next_code += 1;
-                    // TIFF LZW early-change rule: bump bit width at 511, 1023, 2047
-                    if code_bits < 12 && next_code == ((1u16 << code_bits) - 1) {
+                    if next_code == max_code && code_bits < 12 {
                         code_bits += 1;
+                        max_code = (1u16 << code_bits) - 1;
                     }
                 }
+                prev_out_pos = out_pos;
+                prev_entry = (1u64 << 48) | (code as u64);
                 prev_code = code;
-                continue;
-            }
-
-            if code < next_code {
-                let c = code as usize;
-                let len = self.length[c] as usize;
-                let first = self.first_byte[c];
-
-                // Write string directly backwards into `out`
-                if out_pos + len <= out_len {
-                    let mut cur = code;
-                    let mut wp = out_pos + len;
-                    while cur >= 256 {
-                        wp -= 1;
-                        unsafe {
-                            *out.get_unchecked_mut(wp) = *self.last_byte.get_unchecked(cur as usize);
-                            cur = *self.prefix.get_unchecked(cur as usize);
-                        }
+                out_pos += 1;
+            } else if code < next_code {
+                let entry = unsafe { *entries.get_unchecked(code as usize) };
+                let len = (entry >> 48) as usize;
+                let first = entry as u8;
+                let avail = (out_len - out_pos).min(len);
+                if len <= 6 {
+                    let bytes = entry.to_le_bytes();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_ptr.add(out_pos), avail);
                     }
-                    wp -= 1;
-                    unsafe { *out.get_unchecked_mut(wp) = cur as u8 };
-                    out_pos += len;
                 } else {
-                    // Truncated tail safety (should not happen for valid TIFF tiles)
-                    let mut tmp = [0u8; MAX_TABLE];
-                    let mut cur = code;
-                    let mut wp = len;
-                    while cur >= 256 {
-                        wp -= 1;
-                        tmp[wp] = self.last_byte[cur as usize];
-                        cur = self.prefix[cur as usize];
+                    let off = ((entry >> 16) & 0xFFFF_FFFF) as usize;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(out_ptr.add(off), out_ptr.add(out_pos), avail);
                     }
-                    tmp[0] = cur as u8;
-                    let avail = out_len.saturating_sub(out_pos);
-                    out[out_pos..out_pos + avail].copy_from_slice(&tmp[..avail]);
+                }
+                if avail < len {
                     out_pos += avail;
+                    break;
                 }
-
                 if (next_code as usize) < MAX_TABLE {
-                    let nc = next_code as usize;
-                    let pc = prev_code as usize;
-                    self.prefix[nc] = prev_code;
-                    self.first_byte[nc] = self.first_byte[pc];
-                    self.last_byte[nc] = first;
-                    self.length[nc] = self.length[pc] + 1;
+                    let prev_len = prev_entry >> 48;
+                    let new_entry = if prev_len < 6 {
+                        (prev_entry + (1u64 << 48)) | ((first as u64) << (prev_len * 8))
+                    } else {
+                        ((prev_len + 1) << 48)
+                            | ((prev_out_pos as u64) << 16)
+                            | (prev_entry & 0xFF)
+                    };
+                    unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
                     next_code += 1;
-                    if code_bits < 12 && next_code == ((1u16 << code_bits) - 1) {
+                    if next_code == max_code && code_bits < 12 {
                         code_bits += 1;
+                        max_code = (1u16 << code_bits) - 1;
                     }
                 }
+                prev_out_pos = out_pos;
+                prev_entry = entry;
                 prev_code = code;
+                out_pos += len;
             } else if code == next_code {
-                // KwKwK special case
-                let pc = prev_code as usize;
-                let first = self.first_byte[pc];
-                let len = (self.length[pc] as usize) + 1;
-
-                if out_pos + len <= out_len {
-                    let mut wp = out_pos + len - 1;
-                    unsafe { *out.get_unchecked_mut(wp) = first };
-                    let mut cur = prev_code;
-                    while cur >= 256 {
-                        wp -= 1;
-                        unsafe {
-                            *out.get_unchecked_mut(wp) = *self.last_byte.get_unchecked(cur as usize);
-                            cur = *self.prefix.get_unchecked(cur as usize);
-                        }
+                let first = prev_entry as u8;
+                let prev_len = prev_entry >> 48;
+                let new_len = (prev_len as usize) + 1;
+                let avail = (out_len - out_pos).min(new_len);
+                let copy_prev = avail.min(prev_len as usize);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        out_ptr.add(prev_out_pos),
+                        out_ptr.add(out_pos),
+                        copy_prev,
+                    );
+                    if avail > prev_len as usize {
+                        *out_ptr.add(out_pos + prev_len as usize) = first;
                     }
-                    wp -= 1;
-                    unsafe { *out.get_unchecked_mut(wp) = cur as u8 };
-                    out_pos += len;
-                } else {
-                    let mut tmp = [0u8; MAX_TABLE];
-                    tmp[len - 1] = first;
-                    let mut cur = prev_code;
-                    let mut wp = len - 1;
-                    while cur >= 256 {
-                        wp -= 1;
-                        tmp[wp] = self.last_byte[cur as usize];
-                        cur = self.prefix[cur as usize];
-                    }
-                    tmp[0] = cur as u8;
-                    let avail = out_len.saturating_sub(out_pos);
-                    out[out_pos..out_pos + avail].copy_from_slice(&tmp[..avail]);
+                }
+                if avail < new_len {
                     out_pos += avail;
+                    break;
                 }
-
+                let new_entry = if prev_len < 6 {
+                    (prev_entry + (1u64 << 48)) | ((first as u64) << (prev_len * 8))
+                } else {
+                    ((prev_len + 1) << 48) | ((out_pos as u64) << 16) | (first as u64)
+                };
                 if (next_code as usize) < MAX_TABLE {
-                    let nc = next_code as usize;
-                    self.prefix[nc] = prev_code;
-                    self.first_byte[nc] = first;
-                    self.last_byte[nc] = first;
-                    self.length[nc] = len as u16;
+                    unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
                     next_code += 1;
-                    if code_bits < 12 && next_code == ((1u16 << code_bits) - 1) {
+                    if next_code == max_code && code_bits < 12 {
                         code_bits += 1;
+                        max_code = (1u16 << code_bits) - 1;
                     }
                 }
+                prev_out_pos = out_pos;
+                prev_entry = new_entry;
                 prev_code = code;
+                out_pos += new_len;
             } else {
                 return Err(CodecError::Lzw("out-of-range LZW code"));
             }

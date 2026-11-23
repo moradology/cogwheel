@@ -328,6 +328,112 @@ unsafe fn unshuffle_row_stride3_neon(
     }
 }
 
+/// SIMD 4-lane `u32` horizontal prefix-sum -> `f32` + nodata/stats on ARM64 NEON (Predictor 2).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reconstruct_predictor2_le_neon(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    dst: &mut [f32],
+    finite_nodata: Option<f32>,
+) -> BlockStats {
+    use std::arch::aarch64::*;
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let row_bytes = w * 4;
+    let zero = unsafe { vdupq_n_u32(0) };
+    let v_nan = unsafe { vdupq_n_f32(f32::NAN) };
+    let has_finite_nd = finite_nodata.is_some();
+    let v_nd = unsafe { vdupq_n_f32(finite_nodata.unwrap_or(0.0)) };
+
+    let mut v_min = unsafe { vdupq_n_f32(f32::INFINITY) };
+    let mut v_max = unsafe { vdupq_n_f32(f32::NEG_INFINITY) };
+    let mut v_av = unsafe { vdupq_n_u32(0) };
+    let mut v_an = unsafe { vdupq_n_u32(0) };
+    let mut any_valid = false;
+    let mut any_nodata = false;
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+
+    for y in 0..h {
+        let row_src = &raw[y * row_bytes..(y + 1) * row_bytes];
+        let row_dst = &mut dst[y * w..(y + 1) * w];
+        let mut carry = zero;
+        let mut i = 0usize;
+
+        while i + 4 <= w {
+            unsafe {
+                let mut v = vld1q_u32(row_src.as_ptr().add(i * 4) as *const u32);
+                v = vaddq_u32(v, vextq_u32::<3>(zero, v));
+                v = vaddq_u32(v, vextq_u32::<2>(zero, v));
+                v = vaddq_u32(v, carry);
+                carry = vdupq_laneq_u32::<3>(v);
+
+                let mut fv = vreinterpretq_f32_u32(v);
+                let not_nan = vceqq_f32(fv, fv);
+                let valid = if has_finite_nd {
+                    vbicq_u32(not_nan, vceqq_f32(fv, v_nd))
+                } else {
+                    not_nan
+                };
+                v_av = vorrq_u32(v_av, valid);
+                v_an = vorrq_u32(v_an, vmvnq_u32(valid));
+                if has_finite_nd {
+                    fv = vbslq_f32(valid, fv, v_nan);
+                }
+                v_min = vminnmq_f32(v_min, fv);
+                v_max = vmaxnmq_f32(v_max, fv);
+                vst1q_f32(row_dst.as_mut_ptr().add(i), fv);
+            }
+            i += 4;
+        }
+
+        if i < w {
+            let mut acc: u32 = if i > 0 {
+                unsafe { vgetq_lane_u32::<3>(carry) }
+            } else {
+                0
+            };
+            while i < w {
+                let off = i * 4;
+                let delta = u32::from_le_bytes([
+                    row_src[off],
+                    row_src[off + 1],
+                    row_src[off + 2],
+                    row_src[off + 3],
+                ]);
+                acc = acc.wrapping_add(delta);
+                let (v, is_nd) = check_val(f32::from_bits(acc), finite_nodata);
+                row_dst[i] = v;
+                if is_nd {
+                    any_nodata = true;
+                } else {
+                    any_valid = true;
+                    if v < min_val { min_val = v; }
+                    if v > max_val { max_val = v; }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    unsafe {
+        if vmaxvq_u32(v_av) != 0 {
+            any_valid = true;
+            let mn = vminnmvq_f32(v_min);
+            let mx = vmaxnmvq_f32(v_max);
+            if mn < min_val { min_val = mn; }
+            if mx > max_val { max_val = mx; }
+        }
+        if vmaxvq_u32(v_an) != 0 {
+            any_nodata = true;
+        }
+    }
+
+    finalize_stats(any_valid, any_nodata, min_val, max_val)
+}
+
 // ============================================================================
 // x86_64 AVX2 Kernels (AMD EPYC / Intel Xeon Cloud Servers)
 // ============================================================================
@@ -584,6 +690,345 @@ unsafe fn reconstruct_predictor1_le_avx2(
     finalize_stats(any_valid, any_nodata, min_val, max_val)
 }
 
+/// SIMD 8-lane `u32` horizontal prefix-sum -> `f32` + nodata/stats on x86_64 AVX2 (Predictor 2).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reconstruct_predictor2_le_avx2(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    dst: &mut [f32],
+    finite_nodata: Option<f32>,
+) -> BlockStats {
+    use std::arch::x86_64::*;
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let row_bytes = w * 4;
+
+    let mut v_min = _mm256_set1_ps(f32::INFINITY);
+    let mut v_max = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut v_any_valid = _mm256_setzero_ps();
+    let mut v_any_nodata = _mm256_setzero_ps();
+    let v_nan = _mm256_set1_ps(f32::NAN);
+    let has_finite_nd = finite_nodata.is_some();
+    let v_nd = _mm256_set1_ps(finite_nodata.unwrap_or(0.0));
+    let all_ones = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+
+    let mut any_valid = false;
+    let mut any_nodata = false;
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+
+    for y in 0..h {
+        let row_src = &raw[y * row_bytes..(y + 1) * row_bytes];
+        let row_dst = &mut dst[y * w..(y + 1) * w];
+        let mut carry = _mm256_setzero_si256();
+        let mut i = 0usize;
+
+        while i + 8 <= w {
+            let mut v = _mm256_loadu_si256(row_src.as_ptr().add(i * 4) as *const __m256i);
+            // In-lane 4-wide u32 prefix sum
+            v = _mm256_add_epi32(v, _mm256_slli_si256::<4>(v));
+            v = _mm256_add_epi32(v, _mm256_slli_si256::<8>(v));
+            // Propagate lane-3 sum into upper 128-bit lane
+            let hi_carry = _mm256_shuffle_epi32::<0xFF>(_mm256_permute2x128_si256::<0x08>(v, v));
+            v = _mm256_add_epi32(v, hi_carry);
+            v = _mm256_add_epi32(v, carry);
+            // Broadcast lane 7 as next carry
+            carry = _mm256_shuffle_epi32::<0xFF>(_mm256_permute2x128_si256::<0x11>(v, v));
+
+            let mut fv = _mm256_castsi256_ps(v);
+            let not_nan = _mm256_cmp_ps::<_CMP_ORD_Q>(fv, fv);
+            let valid = if has_finite_nd {
+                _mm256_andnot_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(fv, v_nd), not_nan)
+            } else {
+                not_nan
+            };
+            v_any_valid = _mm256_or_ps(v_any_valid, valid);
+            v_any_nodata = _mm256_or_ps(v_any_nodata, _mm256_andnot_ps(valid, all_ones));
+            if has_finite_nd {
+                fv = _mm256_blendv_ps(v_nan, fv, valid);
+            }
+            v_min = _mm256_min_ps(v_min, _mm256_blendv_ps(v_min, fv, valid));
+            v_max = _mm256_max_ps(v_max, _mm256_blendv_ps(v_max, fv, valid));
+            _mm256_storeu_ps(row_dst.as_mut_ptr().add(i), fv);
+            i += 8;
+        }
+
+        if i < w {
+            let mut acc = _mm_cvtsi128_si32(_mm256_castsi256_si128(carry)) as u32;
+            while i < w {
+                let off = i * 4;
+                let delta = u32::from_le_bytes([
+                    row_src[off],
+                    row_src[off + 1],
+                    row_src[off + 2],
+                    row_src[off + 3],
+                ]);
+                acc = acc.wrapping_add(delta);
+                let (v, is_nd) = check_val(f32::from_bits(acc), finite_nodata);
+                row_dst[i] = v;
+                if is_nd {
+                    any_nodata = true;
+                } else {
+                    any_valid = true;
+                    if v < min_val { min_val = v; }
+                    if v > max_val { max_val = v; }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    if _mm256_movemask_ps(v_any_valid) != 0 {
+        any_valid = true;
+        let mut mn_arr = [0.0f32; 8];
+        let mut mx_arr = [0.0f32; 8];
+        _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
+        _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        for k in 0..8 {
+            if mn_arr[k] < min_val { min_val = mn_arr[k]; }
+            if mx_arr[k] > max_val { max_val = mx_arr[k]; }
+        }
+    }
+    if _mm256_movemask_ps(v_any_nodata) != 0 {
+        any_nodata = true;
+    }
+
+    finalize_stats(any_valid, any_nodata, min_val, max_val)
+}
+
+/// SIMD 8-lane `u16` horizontal prefix-sum + widen to `f32` + nodata/stats on x86_64 AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn u16_pred2_row_avx2(
+    src_u16: &[u8],
+    dst_f32: &mut [f32],
+    finite_nodata: Option<f32>,
+    any_valid: &mut bool,
+    any_nodata: &mut bool,
+    min_val: &mut f32,
+    max_val: &mut f32,
+) {
+    use std::arch::x86_64::*;
+    let w = dst_f32.len();
+    let mut carry = _mm_setzero_si128();
+    let bcast_last = _mm_setr_epi8(14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15);
+
+    let mut v_min = _mm256_set1_ps(f32::INFINITY);
+    let mut v_max = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut v_av = _mm256_setzero_ps();
+    let mut v_an = _mm256_setzero_ps();
+    let v_nan = _mm256_set1_ps(f32::NAN);
+    let has_nd = finite_nodata.is_some();
+    let v_nd = _mm256_set1_ps(finite_nodata.unwrap_or(0.0));
+    let all_ones = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+
+    let mut i = 0usize;
+    while i + 8 <= w {
+        let mut v = _mm_loadu_si128(src_u16.as_ptr().add(i * 2) as *const __m128i);
+        v = _mm_add_epi16(v, _mm_slli_si128::<2>(v));
+        v = _mm_add_epi16(v, _mm_slli_si128::<4>(v));
+        v = _mm_add_epi16(v, _mm_slli_si128::<8>(v));
+        v = _mm_add_epi16(v, carry);
+        carry = _mm_shuffle_epi8(v, bcast_last);
+
+        let mut fv = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(v));
+        if has_nd {
+            let valid = _mm256_andnot_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(fv, v_nd), all_ones);
+            v_av = _mm256_or_ps(v_av, valid);
+            v_an = _mm256_or_ps(v_an, _mm256_andnot_ps(valid, all_ones));
+            fv = _mm256_blendv_ps(v_nan, fv, valid);
+            v_min = _mm256_min_ps(v_min, _mm256_blendv_ps(v_min, fv, valid));
+            v_max = _mm256_max_ps(v_max, _mm256_blendv_ps(v_max, fv, valid));
+        } else {
+            v_av = all_ones;
+            v_min = _mm256_min_ps(v_min, fv);
+            v_max = _mm256_max_ps(v_max, fv);
+        }
+        _mm256_storeu_ps(dst_f32.as_mut_ptr().add(i), fv);
+        i += 8;
+    }
+
+    if _mm256_movemask_ps(v_av) != 0 {
+        *any_valid = true;
+        let mut mn_arr = [0.0f32; 8];
+        let mut mx_arr = [0.0f32; 8];
+        _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
+        _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        for k in 0..8 {
+            if mn_arr[k] < *min_val { *min_val = mn_arr[k]; }
+            if mx_arr[k] > *max_val { *max_val = mx_arr[k]; }
+        }
+    }
+    if _mm256_movemask_ps(v_an) != 0 {
+        *any_nodata = true;
+    }
+
+    if i < w {
+        let mut acc: u16 = if i > 0 {
+            _mm_extract_epi16::<7>(carry) as u16
+        } else {
+            0
+        };
+        while i < w {
+            let off = i * 2;
+            acc = acc.wrapping_add(u16::from_le_bytes([src_u16[off], src_u16[off + 1]]));
+            let (v, is_nd) = check_val(acc as f32, finite_nodata);
+            dst_f32[i] = v;
+            if is_nd {
+                *any_nodata = true;
+            } else {
+                *any_valid = true;
+                if v < *min_val { *min_val = v; }
+                if v > *max_val { *max_val = v; }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Hardware-accelerated 3-band chunky Predictor-3 unshuffle + planar deinterleave on x86_64 AVX2
+/// using `pshufb` 3-way deinterleave (16 RGB pixels / 48 floats / 192 bytes per iteration).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unshuffle_row_stride3_avx2(
+    p0: &[u8],
+    p1: &[u8],
+    p2: &[u8],
+    p3: &[u8],
+    dst0: &mut [f32],
+    dst1: &mut [f32],
+    dst2: &mut [f32],
+    finite_nodata: Option<f32>,
+    any_valid: &mut [bool; 3],
+    any_nodata: &mut [bool; 3],
+    min_val: &mut [f32; 3],
+    max_val: &mut [f32; 3],
+) {
+    use std::arch::x86_64::*;
+    let w = dst0.len();
+    let mut x = 0usize;
+
+    let v_nan = _mm256_set1_ps(f32::NAN);
+    let has_finite_nd = finite_nodata.is_some();
+    let v_nd = _mm256_set1_ps(finite_nodata.unwrap_or(0.0));
+    let all_ones = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+
+    let mut v_min = [_mm256_set1_ps(f32::INFINITY); 3];
+    let mut v_max = [_mm256_set1_ps(f32::NEG_INFINITY); 3];
+    let mut v_av = [_mm256_setzero_ps(); 3];
+    let mut v_an = [_mm256_setzero_ps(); 3];
+
+    // 3-way deinterleave masks for 48 bytes (a=0..15, b=16..31, c=32..47) -> 16 bytes per band
+    let r_a = _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let r_b = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1);
+    let r_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 4, 7, 10, 13);
+
+    let g_a = _mm_setr_epi8(1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let g_b = _mm_setr_epi8(-1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1);
+    let g_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14);
+
+    let b_a = _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let b_b = _mm_setr_epi8(-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1);
+    let b_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15);
+
+    macro_rules! deinterleave_plane {
+        ($ptr:expr) => {{
+            let a = _mm_loadu_si128($ptr as *const __m128i);
+            let b = _mm_loadu_si128($ptr.add(16) as *const __m128i);
+            let c = _mm_loadu_si128($ptr.add(32) as *const __m128i);
+            let c0 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(a, r_a), _mm_shuffle_epi8(b, r_b)), _mm_shuffle_epi8(c, r_c));
+            let c1 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(a, g_a), _mm_shuffle_epi8(b, g_b)), _mm_shuffle_epi8(c, g_c));
+            let c2 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(a, b_a), _mm_shuffle_epi8(b, b_b)), _mm_shuffle_epi8(c, b_c));
+            (c0, c1, c2)
+        }};
+    }
+
+    macro_rules! transpose_store_16 {
+        ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $dst:expr, $bi:expr) => {{
+            let lo01 = _mm_unpacklo_epi8($b0, $b1);
+            let hi01 = _mm_unpackhi_epi8($b0, $b1);
+            let lo23 = _mm_unpacklo_epi8($b2, $b3);
+            let hi23 = _mm_unpackhi_epi8($b2, $b3);
+
+            let f0 = _mm_castsi128_ps(_mm_unpacklo_epi16(lo01, lo23));
+            let f1 = _mm_castsi128_ps(_mm_unpackhi_epi16(lo01, lo23));
+            let f2 = _mm_castsi128_ps(_mm_unpacklo_epi16(hi01, hi23));
+            let f3 = _mm_castsi128_ps(_mm_unpackhi_epi16(hi01, hi23));
+
+            let mut v0 = _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(f0), f1);
+            let mut v1 = _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(f2), f3);
+
+            for fv in [&mut v0, &mut v1] {
+                let not_nan = _mm256_cmp_ps::<_CMP_ORD_Q>(*fv, *fv);
+                let valid = if has_finite_nd {
+                    _mm256_andnot_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(*fv, v_nd), not_nan)
+                } else {
+                    not_nan
+                };
+                v_av[$bi] = _mm256_or_ps(v_av[$bi], valid);
+                v_an[$bi] = _mm256_or_ps(v_an[$bi], _mm256_andnot_ps(valid, all_ones));
+                if has_finite_nd {
+                    *fv = _mm256_blendv_ps(v_nan, *fv, valid);
+                }
+                v_min[$bi] = _mm256_min_ps(v_min[$bi], _mm256_blendv_ps(v_min[$bi], *fv, valid));
+                v_max[$bi] = _mm256_max_ps(v_max[$bi], _mm256_blendv_ps(v_max[$bi], *fv, valid));
+            }
+            _mm256_storeu_ps($dst, v0);
+            _mm256_storeu_ps($dst.add(8), v1);
+        }};
+    }
+
+    while x + 16 <= w {
+        let byte_off = x * 3;
+        let d3 = deinterleave_plane!(p3.as_ptr().add(byte_off));
+        let d2 = deinterleave_plane!(p2.as_ptr().add(byte_off));
+        let d1 = deinterleave_plane!(p1.as_ptr().add(byte_off));
+        let d0 = deinterleave_plane!(p0.as_ptr().add(byte_off));
+
+        transpose_store_16!(d3.0, d2.0, d1.0, d0.0, dst0.as_mut_ptr().add(x), 0);
+        transpose_store_16!(d3.1, d2.1, d1.1, d0.1, dst1.as_mut_ptr().add(x), 1);
+        transpose_store_16!(d3.2, d2.2, d1.2, d0.2, dst2.as_mut_ptr().add(x), 2);
+        x += 16;
+    }
+
+    for b in 0..3 {
+        if _mm256_movemask_ps(v_av[b]) != 0 {
+            any_valid[b] = true;
+            let mut mn_arr = [0.0f32; 8];
+            let mut mx_arr = [0.0f32; 8];
+            _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min[b]);
+            _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max[b]);
+            for k in 0..8 {
+                if mn_arr[k] < min_val[b] { min_val[b] = mn_arr[k]; }
+                if mx_arr[k] > max_val[b] { max_val[b] = mx_arr[k]; }
+            }
+        }
+        if _mm256_movemask_ps(v_an[b]) != 0 {
+            any_nodata[b] = true;
+        }
+    }
+
+    while x < w {
+        let base = x * 3;
+        for (b, dst) in [(0, &mut *dst0), (1, &mut *dst1), (2, &mut *dst2)] {
+            let idx = base + b;
+            let raw = f32::from_le_bytes([p3[idx], p2[idx], p1[idx], p0[idx]]);
+            let (v, is_nd) = check_val(raw, finite_nodata);
+            dst[x] = v;
+            if is_nd {
+                any_nodata[b] = true;
+            } else {
+                any_valid[b] = true;
+                if v < min_val[b] { min_val[b] = v; }
+                if v > max_val[b] { max_val[b] = v; }
+            }
+        }
+        x += 1;
+    }
+}
+
 // ============================================================================
 // Scalar Fallbacks & Public Dispatch
 // ============================================================================
@@ -734,6 +1179,9 @@ pub fn reconstruct_predictor3(
         let mut min_val = [f32::INFINITY; 3];
         let mut max_val = [f32::NEG_INFINITY; 3];
 
+        #[cfg(target_arch = "x86_64")]
+        let has_avx2 = std::is_x86_feature_detected!("avx2");
+
         for y in 0..h {
             let row = &mut raw[y * row_bytes..(y + 1) * row_bytes];
             prefix_sum_scalar(row, 3);
@@ -755,7 +1203,39 @@ pub fn reconstruct_predictor3(
                     &mut any_valid, &mut any_nodata, &mut min_val, &mut max_val,
                 );
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            {
+                if has_avx2 {
+                    unsafe {
+                        unshuffle_row_stride3_avx2(
+                            p0, p1, p2, p3,
+                            &mut s0[row_off..row_off + w],
+                            &mut s1[row_off..row_off + w],
+                            &mut s2[row_off..row_off + w],
+                            finite_nodata,
+                            &mut any_valid, &mut any_nodata, &mut min_val, &mut max_val,
+                        );
+                    }
+                } else {
+                    for x in 0..w {
+                        let base = x * 3;
+                        for (b, slab) in [(0, &mut s0), (1, &mut s1), (2, &mut s2)] {
+                            let idx = base + b;
+                            let v_raw = f32::from_le_bytes([p3[idx], p2[idx], p1[idx], p0[idx]]);
+                            let (v, is_nd) = check_val(v_raw, finite_nodata);
+                            slab[row_off + x] = v;
+                            if is_nd {
+                                any_nodata[b] = true;
+                            } else {
+                                any_valid[b] = true;
+                                if v < min_val[b] { min_val[b] = v; }
+                                if v > max_val[b] { max_val[b] = v; }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             {
                 for x in 0..w {
                     let base = x * 3;
@@ -1046,6 +1526,34 @@ pub fn reconstruct_predictor2(
     let h = tile_h as usize;
     let pixels = w * h;
 
+    #[cfg(target_arch = "aarch64")]
+    if bands_in_tile == 1 && byte_order == ByteOrder::Little {
+        let mut slab = AlignedF32Slab::new_uninit(pixels);
+        let stats = unsafe {
+            reconstruct_predictor2_le_neon(raw, tile_w, tile_h, slab.as_mut_slice(), finite_nodata)
+        };
+        return vec![DecodedBand {
+            data: slab,
+            width: tile_w,
+            height: tile_h,
+            stats,
+        }];
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if bands_in_tile == 1 && byte_order == ByteOrder::Little && std::is_x86_feature_detected!("avx2") {
+        let mut slab = AlignedF32Slab::new_uninit(pixels);
+        let stats = unsafe {
+            reconstruct_predictor2_le_avx2(raw, tile_w, tile_h, slab.as_mut_slice(), finite_nodata)
+        };
+        return vec![DecodedBand {
+            data: slab,
+            width: tile_w,
+            height: tile_h,
+            stats,
+        }];
+    }
+
     let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
         .map(|_| AlignedF32Slab::new_uninit(pixels))
         .collect();
@@ -1224,6 +1732,39 @@ pub fn reconstruct_u16(
         for y in 0..h {
             unsafe {
                 u16_pred2_row_neon(
+                    &raw[y * row_bytes..(y + 1) * row_bytes],
+                    &mut slab[y * w..(y + 1) * w],
+                    finite_nodata,
+                    &mut any_valid,
+                    &mut any_nodata,
+                    &mut min_val,
+                    &mut max_val,
+                );
+            }
+        }
+        return vec![DecodedBand {
+            data: slab,
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid, any_nodata, min_val, max_val),
+        }];
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if bands_in_tile == 1
+        && byte_order == ByteOrder::Little
+        && horizontal_diff
+        && std::is_x86_feature_detected!("avx2")
+    {
+        let mut slab = AlignedF32Slab::new_uninit(pixels);
+        let mut any_valid = false;
+        let mut any_nodata = false;
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        let row_bytes = w * 2;
+        for y in 0..h {
+            unsafe {
+                u16_pred2_row_avx2(
                     &raw[y * row_bytes..(y + 1) * row_bytes],
                     &mut slab[y * w..(y + 1) * w],
                     finite_nodata,

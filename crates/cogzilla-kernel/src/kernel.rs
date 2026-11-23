@@ -130,6 +130,8 @@ unsafe fn bilinear_row_flat_neon<const N: usize>(
 }
 
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for flat single-block `Separable1D + CleanFastPath`.
+/// Uses 64-bit adjacent-pair loads + shuffle instead of microcoded `vgatherdps` (much faster on
+/// AMD Zen 4 / EPYC as well as Intel).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn bilinear_row_flat_avx2<const N: usize>(
@@ -143,18 +145,57 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
     use std::arch::x86_64::*;
     let v_fy = _mm256_set1_ps(fy);
     let v_base = _mm256_set1_ps(base_col as f32);
+    let mut idxs = [0i32; 8];
     let mut px = 0usize;
+
+    macro_rules! load_8_pairs {
+        ($ptr:expr) => {{
+            let c0 = idxs[0] as usize;
+            let c1 = idxs[1] as usize;
+            let c2 = idxs[2] as usize;
+            let c3 = idxs[3] as usize;
+            let c4 = idxs[4] as usize;
+            let c5 = idxs[5] as usize;
+            let c6 = idxs[6] as usize;
+            let c7 = idxs[7] as usize;
+
+            let p01 = _mm_castpd_ps(_mm_set_pd(
+                ($ptr.add(c1) as *const f64).read_unaligned(),
+                ($ptr.add(c0) as *const f64).read_unaligned(),
+            ));
+            let p23 = _mm_castpd_ps(_mm_set_pd(
+                ($ptr.add(c3) as *const f64).read_unaligned(),
+                ($ptr.add(c2) as *const f64).read_unaligned(),
+            ));
+            let p45 = _mm_castpd_ps(_mm_set_pd(
+                ($ptr.add(c5) as *const f64).read_unaligned(),
+                ($ptr.add(c4) as *const f64).read_unaligned(),
+            ));
+            let p67 = _mm_castpd_ps(_mm_set_pd(
+                ($ptr.add(c7) as *const f64).read_unaligned(),
+                ($ptr.add(c6) as *const f64).read_unaligned(),
+            ));
+
+            let lo0 = _mm_shuffle_ps::<0x88>(p01, p23);
+            let lo1 = _mm_shuffle_ps::<0xDD>(p01, p23);
+            let hi0 = _mm_shuffle_ps::<0x88>(p45, p67);
+            let hi1 = _mm_shuffle_ps::<0xDD>(p45, p67);
+            (
+                _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(lo0), hi0),
+                _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(lo1), hi1),
+            )
+        }};
+    }
 
     while px + 8 <= N {
         let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_base);
         let x0_f = _mm256_floor_ps(u);
         let fx = _mm256_sub_ps(u, x0_f);
         let idx = _mm256_cvtps_epi32(x0_f);
+        _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
 
-        let v00 = _mm256_i32gather_ps::<4>(row0_ptr, idx);
-        let v10 = _mm256_i32gather_ps::<4>(row0_ptr.add(1), idx);
-        let v01 = _mm256_i32gather_ps::<4>(row1_ptr, idx);
-        let v11 = _mm256_i32gather_ps::<4>(row1_ptr.add(1), idx);
+        let (v00, v10) = load_8_pairs!(row0_ptr);
+        let (v01, v11) = load_8_pairs!(row1_ptr);
 
         let top = _mm256_fmadd_ps(_mm256_sub_ps(v10, v00), fx, v00);
         let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
@@ -213,17 +254,30 @@ fn bilinear_row_flat_dispatch<const N: usize>(
 // General Per-Pixel Samplers
 // ============================================================================
 
+/// Branchless inline floor returning `(floor_i32, frac)` without calling libm `floorf` on
+/// baseline x86-64 SSE2 builds (where `f32::floor` emits a `floorf@PLT` call per pixel).
+#[inline(always)]
+fn fast_floor_i32(x: f32) -> (i32, f32) {
+    #[cfg(any(target_arch = "aarch64", target_feature = "sse4.1"))]
+    {
+        let f = x.floor();
+        (f as i32, x - f)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "sse4.1")))]
+    {
+        let i = x as i32;
+        let adj = i - ((i as f32 > x) as i32);
+        (adj, x - (adj as f32))
+    }
+}
+
 #[inline(always)]
 fn sample_bilinear<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
     if !CLEAN && (!u.is_finite() || !v.is_finite()) {
         return f32::NAN;
     }
-    let x0_f = u.floor();
-    let y0_f = v.floor();
-    let fx = u - x0_f;
-    let fy = v - y0_f;
-    let x0 = x0_f as i32;
-    let y0 = y0_f as i32;
+    let (x0, fx) = fast_floor_i32(u);
+    let (y0, fy) = fast_floor_i32(v);
 
     if CLEAN {
         let ux0 = x0 as u32;
@@ -279,8 +333,8 @@ fn sample_nearest<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f3
     if !CLEAN && (!u.is_finite() || !v.is_finite()) {
         return f32::NAN;
     }
-    let x = (u + 0.5).floor() as i32;
-    let y = (v + 0.5).floor() as i32;
+    let (x, _) = fast_floor_i32(u + 0.5);
+    let (y, _) = fast_floor_i32(v + 0.5);
     if CLEAN {
         src.sample_inbounds(x as u32, y as u32)
     } else {
@@ -307,12 +361,8 @@ pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
     if !u.is_finite() || !v.is_finite() {
         return f32::NAN;
     }
-    let x0_f = u.floor();
-    let y0_f = v.floor();
-    let fx = u - x0_f;
-    let fy = v - y0_f;
-    let x0 = x0_f as i32;
-    let y0 = y0_f as i32;
+    let (x0, fx) = fast_floor_i32(u);
+    let (y0, fy) = fast_floor_i32(v);
 
     let wx = [
         cubic_weight(fx + 1.0),
