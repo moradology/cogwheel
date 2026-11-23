@@ -8,17 +8,37 @@
 [![Release](https://img.shields.io/github/v/release/moradology/cogzilla)](https://github.com/moradology/cogzilla/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A COG & STAC tile server that speaks TiTiler's API, without GDAL.** Written in Rust, it serves the same `/cog/*` and `/stac/*` routes at a fraction of the latency: point your map client at a new base URL and keep everything else.
+**A COG & STAC tile server that speaks TiTiler's API, without GDAL.** Written in Rust, it serves the same `/cog/*` and `/stac/*` routes for about a quarter of the CPU on tiles it has never seen, and about a thirtieth once the source blocks are in its cache. Point your map client at a new base URL and keep everything else.
 
-| Workload (Apple M5, warm) | `cogzilla` | TiTiler | Speedup |
+Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with TiTiler tuned per its own guidance and given one worker per core:
+
+| Real S3 COGs, equal mix of five workloads | `cogzilla` | TiTiler | Gain |
+| :--- | ---: | ---: | ---: |
+| CPU per 1,000 tiles, never seen before | **13.2 CPU-s** | 56.0 CPU-s | **4.3×** |
+| CPU per 1,000 tiles, source blocks cached | **1.7 CPU-s** | 55.3 CPU-s | **32×** |
+| Tiles per second per busy core, cached | **588** | 18 | **32×** |
+| Memory at idle | **4 MiB** | 1,112 MiB (10 workers) | |
+| Instances for 1,000 uncached tiles/s (modelled, `c7g.xlarge`) | **11** | 47 | **4.3×** |
+
+And the ceiling, with the network taken out entirely (local files, warm cache):
+
+| Local fixtures (Apple M5, warm) | `cogzilla` | TiTiler | Speedup |
 | :--- | ---: | ---: | ---: |
 | HTTP throughput, Mercator PNG, 32 concurrent | **6,863 tiles/s** | 181 tiles/s | **37.8×** |
 | HTTP throughput, satellite RGB PNG, 32 concurrent | **3,791 tiles/s** | 171 tiles/s | **22.2×** |
 | Single Mercator PNG tile | **634 µs** | 17.6 ms | **27.7×** |
 | Fused NDVI PNG tile | **917 µs** | 14.2 ms | **15.5×** |
-| Remote cold open + tile, 20 ms RTT | **48.3 ms** | 147.0 ms | **3.0×** |
 
-The last row is the honest floor: once the network dominates, the gain is fewer round trips, not faster pixels. [Full results](#cogmark-benchmarks-vs-gdal--rio-tiler--titiler) and [how to reproduce them](#reproducing-cogmark) are below.
+### What these numbers do and don't say
+
+- **The 4.3× is the number to plan with.** It is CPU for a tile the server has not seen, which is what an origin behind a CDN mostly serves. It ranged from 2.1× to 4.8× on four workloads (the fifth showed 8.3×, but its file was small enough to be partly cached) and does not depend on the network.
+- **The larger multiples (13–62× on S3) need the cache to fit.** `cogzilla` keeps decoded blocks in memory and TiTiler keeps none, which is where the big multiples come from. With the default 512 MiB cache, three of the five S3 workloads outgrew it and fell back to S3. Size `--cache-mb` to your working set and budget about 250 MiB on top.
+- **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
+- **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilisation, and compute only. The ratio is measured; the instance counts are not.
+- **Same picture, not the same bytes.** Valid-data masks agree with TiTiler on 99.6–100% of pixels; pixel values differ slightly on high-frequency imagery (32–34 dB PSNR on Sentinel-2, 49–54 dB on DEMs).
+- **One request in 822 failed.** A single uncached Copernicus tile returned HTTP 500 during the S3 run. It did not reproduce on replay; the likely cause is an S3 range request that failed at the connection level, which `cogzilla` does not yet retry. Fault injection also showed that a stalled S3 response has no timeout. Neither is fixed.
+
+Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md); the local suite is [below](#cogmark-benchmarks-vs-gdal--rio-tiler--titiler).
 
 ## Install
 
@@ -64,7 +84,7 @@ Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native codecs (`libdeflate
 
 ## `COGMark` Benchmarks (vs. GDAL / `rio-tiler` / `TiTiler`)
 
-Measured on Apple M5 (10 cores, ARM64 NEON, `rustc 1.95.0 --release`):
+Measured on Apple M5 (10 cores, ARM64 NEON, `rustc 1.95.0 --release`) against local synthetic fixtures. "Warm" means the source blocks are already decoded in `cogzilla`'s cache, so these rows are the best case; for remote data and uncached tiles see [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md).
 
 | ID | Workload | `cogzilla` | GDAL / TiTiler | Speedup |
 | :--- | :--- | ---: | ---: | ---: |
@@ -109,7 +129,7 @@ cargo build --release -p cogzilla-server
 - **`/stac/*` (`MultiBaseTilerFactory(reader=STACReader)`)**:
   - `GET /stac/assets`, `GET /stac/info`, `GET /stac/info.geojson`, `GET /stac/asset_statistics`, `GET|POST /stac/statistics`, `GET /stac/tiles`, `GET /stac/tiles/{tms}`, `GET /stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `GET /stac/{tms}/tilejson.json`, `GET /stac/{tms}/map.html`, `GET /stac/point/{lon},{lat}`, `GET /stac/preview[/{w}x{h}][.{ext}]`, `GET /stac/bbox/...`, `POST /stac/feature[/{w}x{h}][.{ext}]`.
   - Resolves and caches STAC Item JSON (local or HTTP/S), opens multi-asset COGs concurrently (`?assets=red&assets=green&assets=blue`), and supports both `?expression=(b1-b2)/(b1+b2)` and asset-named `?expression=(red-green)/(red+green)`.
-  - **21×–82× faster than TiTiler** on STAC tiles (`2.1 ms` vs `48.6 ms`), TileJSON (`63.5×`), info (`45.3×`), and 3-asset point queries (`82.4×`, `0.0000000` error).
+  - **21×–82× faster than TiTiler** on local fixtures with a warm cache, for STAC tiles (`2.1 ms` vs `48.6 ms`), TileJSON (`63.5×`), info (`45.3×`), and 3-asset point queries (`82.4×`, `0.0000000` error).
 - **`/colorMaps` (`ColorMapFactory`)**: `GET /colorMaps`, `GET /colorMaps/{colorMapId}` (256/256 exact `rio-tiler` LUT JSON and `?f=png` / `?format=png` 256×20 colorbar PNG, `PSNR=99.0 dB`).
 - **`/tileMatrixSets` (`TMSFactory`)**: `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}` (`WebMercatorQuad` 25-level & `WorldCRS84Quad` OGC TileMatrixSet 2.0 JSON).
 
@@ -144,6 +164,8 @@ cargo run --release -p cogmark -- --dump-parity benches/results/parity
 # 3. Run GDAL / TiTiler baseline & pixel parity gate
 benches/.venv/bin/python benches/gdal_oracle.py
 ```
+
+The S3 comparison has its own scripts and instructions in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md#reproducing) (about 25 minutes and 4 GB of downloads from public buckets).
 
 ## Workspace Crates
 
