@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use cogzilla_kernel::{
     ColorFormula, ColormapLut, ColormapName, ExprProgram, OutputFormat, ResampleMode, SpectralExpr,
+    TerrainEncoding,
 };
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
@@ -131,6 +132,7 @@ struct ParsedQuery {
     buffer: u32,
     coord_crs_3857: bool,
     format_param: Option<String>,
+    algorithm: Option<String>,
 }
 
 fn parse_query(q: Option<&str>) -> ParsedQuery {
@@ -154,6 +156,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         buffer: 0,
         coord_crs_3857: false,
         format_param: None,
+        algorithm: None,
     };
     let Some(q) = q else { return pq };
     for pair in q.split('&') {
@@ -173,6 +176,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
+            "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
             "bidx" | "indexes" => {
                 for part in percent_decode(v).split(',') {
                     if let Ok(b) = part.parse::<u16>() {
@@ -330,6 +334,24 @@ fn build_band_request(
     default_bands: u16,
     is_u8: bool,
 ) -> Result<BandRequest, EngineError> {
+    if let Some(alg) = pq.algorithm.as_deref() {
+        let band_1based = pq.bidx.first().copied().unwrap_or(1);
+        match alg {
+            "terrarium" => {
+                return Ok(BandRequest::Terrain {
+                    band_1based,
+                    encoding: TerrainEncoding::Terrarium,
+                });
+            }
+            "terrainrgb" | "terrain-rgb" | "mapbox" => {
+                return Ok(BandRequest::Terrain {
+                    band_1based,
+                    encoding: TerrainEncoding::TerrainRgb,
+                });
+            }
+            _ => {}
+        }
+    }
     if let Some(raw_expr) = &pq.expr_raw {
         if let Some(preset) = SpectralExpr::from_str_opt(raw_expr) {
             return Ok(match preset {

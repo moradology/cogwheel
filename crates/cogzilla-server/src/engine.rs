@@ -6,8 +6,9 @@ use bytes::Bytes;
 use cogzilla_io::{CogStore, IoError, OpenedCog};
 use cogzilla_kernel::{
     BandSource, ColormapName, ExprProgram, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle,
-    SpectralExpr, empty_tile_bytes, encode_rgba_tile, render_bandmath1, render_bandmath2,
-    render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb, render_single_band,
+    SpectralExpr, TerrainEncoding, empty_tile_bytes, encode_rgba_tile, render_bandmath1,
+    render_bandmath2, render_bandmath3, render_expr_vm, render_rgb_bands, render_sar_rgb,
+    render_single_band, render_terrain_tile,
 };
 use cogzilla_proj::{CoordPlan, CrsModel, ProjError, TileCoord, tile_bounds_3857};
 use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
@@ -68,6 +69,10 @@ pub enum BandRequest {
         prog: ExprProgram,
         rescale: (f32, f32),
         colormap: ColormapName,
+    },
+    Terrain {
+        band_1based: u16,
+        encoding: TerrainEncoding,
     },
 }
 
@@ -271,6 +276,55 @@ impl TileEngine {
                     format: req.format,
                 };
                 Ok(render_single_band::<N>(&plan, &src, &style))
+            }
+            BandRequest::Terrain {
+                band_1based,
+                encoding,
+            } => {
+                let band0 = band_1based.saturating_sub(1);
+                if band0 >= ifd.samples_per_pixel {
+                    return Err(EngineError::BadRequest(format!(
+                        "band {} out of range (dataset has {} bands)",
+                        band_1based, ifd.samples_per_pixel
+                    )));
+                }
+                let mut indices = Vec::with_capacity(grid_len);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        let idx = ifd.tile_index(tx, ty, band0) as u32;
+                        indices.push(Some(idx));
+                    }
+                }
+                let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                let band_in_decoded = match ifd.planar_config {
+                    PlanarConfig::Chunky => band0 as usize,
+                    PlanarConfig::Planar => 0,
+                };
+                let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                    .iter()
+                    .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+                    .collect();
+                let src = BandSource::new(
+                    ifd.width,
+                    ifd.height,
+                    ifd.tile_width,
+                    ifd.tile_height,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
+                    &block_refs,
+                );
+                if src.all_nodata {
+                    self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(render_terrain_tile::<N>(
+                    &plan,
+                    &src,
+                    *encoding,
+                    req.resample,
+                    req.format,
+                ))
             }
             BandRequest::Spectral1 {
                 expr,

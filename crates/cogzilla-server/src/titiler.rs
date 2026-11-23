@@ -727,6 +727,34 @@ pub async fn render_wgs84_bbox(
                 }
             }
         }
+        BandRequest::Terrain {
+            band_1based,
+            encoding,
+        } => {
+            let refs = get_band_refs(*band_1based, 0);
+            let src = BandSource::new(
+                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
+                &refs,
+            )
+            .with_nodata_override(nodata_override);
+            for i in 0..(w * h) {
+                let v = sample(&src, u_map[i], v_map[i]);
+                if !v.is_nan() {
+                    let [r, g, b] = match encoding {
+                        cogzilla_kernel::TerrainEncoding::Terrarium => {
+                            cogzilla_kernel::encode_terrarium_rgb(v)
+                        }
+                        cogzilla_kernel::TerrainEncoding::TerrainRgb => {
+                            cogzilla_kernel::encode_terrain_rgb(v)
+                        }
+                    };
+                    rgba[i * 4] = r;
+                    rgba[i * 4 + 1] = g;
+                    rgba[i * 4 + 2] = b;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+        }
         BandRequest::Rgb {
             bands_1based,
             rescale_min,

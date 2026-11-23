@@ -626,5 +626,23 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(reg_tile.status(), 200);
             let _ = std::fs::remove_file(&mj_path);
         }
+
+        // --------------------------------------------------------------------
+        // 20. Terrain Tiles: Terrarium & Mapbox Terrain-RGB (?algorithm=...)
+        // --------------------------------------------------------------------
+        for alg in ["terrarium", "terrainrgb"] {
+            let resp = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.png?url={merc_url}&algorithm={alg}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "algorithm={alg} failed");
+            let bytes = resp.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            // Opaque RGB PNG (color_type=2) for clean DEM tile
+            assert_eq!(bytes[25], 2, "expected RGB PNG for algorithm={alg}");
+        }
     }
 }

@@ -2135,6 +2135,154 @@ pub fn render_expr_vm<const N: usize>(
     }
 }
 
+/// Standard RGB terrain elevation encodings for 3D web map engines (MapLibre, Mapbox, Deck.gl, Cesium).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainEncoding {
+    /// Mapzen / AWS Terrarium: `elev = (R * 256 + G + B / 256) - 32768` (~3.9 mm precision).
+    Terrarium,
+    /// Mapbox Terrain-RGB: `elev = -10000 + ((R * 65536 + G * 256 + B) * 0.1)` (0.1 m precision).
+    TerrainRgb,
+}
+
+#[inline(always)]
+pub fn encode_terrarium_rgb(elev_m: f32) -> [u8; 3] {
+    let v = (elev_m as f64 + 32768.0).clamp(0.0, 65535.99609375);
+    let r = (v / 256.0).floor() as u8;
+    let g = (v.floor() as u32 & 0xFF) as u8;
+    let b = ((v - v.floor()) * 256.0).floor().clamp(0.0, 255.0) as u8;
+    [r, g, b]
+}
+
+#[inline(always)]
+pub fn encode_terrain_rgb(elev_m: f32) -> [u8; 3] {
+    let enc = ((elev_m as f64 + 10000.0) * 10.0)
+        .round()
+        .clamp(0.0, 16_777_215.0) as u32;
+    [
+        ((enc >> 16) & 0xFF) as u8,
+        ((enc >> 8) & 0xFF) as u8,
+        (enc & 0xFF) as u8,
+    ]
+}
+
+/// Render a single-band DEM directly into a Terrarium or Mapbox Terrain-RGB tile in one fused pass.
+pub fn render_terrain_tile<const N: usize>(
+    plan: &CoordPlan<N>,
+    src: &BandSource<'_>,
+    encoding: TerrainEncoding,
+    resample: ResampleMode,
+    format: OutputFormat,
+) -> Bytes {
+    if src.all_nodata {
+        return empty_tile_bytes(N as u32, format, 3);
+    }
+    let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+    let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
+
+    let encode_px = |v: f32| -> [u8; 3] {
+        match encoding {
+            TerrainEncoding::Terrarium => encode_terrarium_rgb(v),
+            TerrainEncoding::TerrainRgb => encode_terrain_rgb(v),
+        }
+    };
+
+    let sample_px = |u: f32, v: f32| -> f32 {
+        match (resample, clean) {
+            (ResampleMode::Bilinear, true) => sample_bilinear::<true>(src, u, v),
+            (ResampleMode::Bilinear, false) => sample_bilinear::<false>(src, u, v),
+            (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
+            (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
+            (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
+        }
+    };
+
+    match format {
+        OutputFormat::Png => SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            if clean {
+                let stride = 1 + N * 3;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N * 3 {
+                    sc.row_buf.resize(N * 3, 0);
+                }
+                for py in 0..N {
+                    let row_rgb = &mut sc.row_buf[..N * 3];
+                    for_each_pixel_in_row(plan, py, |px, u, v| {
+                        let [r, g, b] = encode_px(sample_px(u, v));
+                        let off = px * 3;
+                        row_rgb[off] = r;
+                        row_rgb[off + 1] = g;
+                        row_rgb[off + 2] = b;
+                    });
+                    filter_sub_rgb_row(row_rgb, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                }
+                encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total])
+            } else {
+                let stride = 1 + N * 4;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N * 4 {
+                    sc.row_buf.resize(N * 4, 0);
+                }
+                for py in 0..N {
+                    let row_rgba = &mut sc.row_buf[..N * 4];
+                    for_each_pixel_in_row(plan, py, |px, u, v| {
+                        let elev = sample_px(u, v);
+                        let off = px * 4;
+                        if elev.is_nan() {
+                            row_rgba[off] = 0;
+                            row_rgba[off + 1] = 0;
+                            row_rgba[off + 2] = 0;
+                            row_rgba[off + 3] = 0;
+                        } else {
+                            let [r, g, b] = encode_px(elev);
+                            row_rgba[off] = r;
+                            row_rgba[off + 1] = g;
+                            row_rgba[off + 2] = b;
+                            row_rgba[off + 3] = 255;
+                        }
+                    });
+                    filter_sub_rgba_row(row_rgba, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                }
+                encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
+            }
+        }),
+        OutputFormat::RawF32 => {
+            let mut out = BytesMut::with_capacity(N * N * 4);
+            for py in 0..N {
+                for_each_pixel_in_row(plan, py, |_px, u, v| {
+                    out.put_slice(&sample_px(u, v).to_le_bytes());
+                });
+            }
+            out.freeze()
+        }
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+            let mut rgba = vec![0u8; N * N * 4];
+            for py in 0..N {
+                let row_off = py * N * 4;
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    let elev = sample_px(u, v);
+                    let off = row_off + px * 4;
+                    if !elev.is_nan() {
+                        let [r, g, b] = encode_px(elev);
+                        rgba[off] = r;
+                        rgba[off + 1] = g;
+                        rgba[off + 2] = b;
+                        rgba[off + 3] = 255;
+                    }
+                });
+            }
+            encode_rgba_tile(&rgba, N as u32, clean, format)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2296,6 +2444,25 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn terrain_encodings_round_trip_accurately() {
+        for &elev in &[-430.5f32, -10.25, 0.0, 123.45, 2450.7, 8848.86] {
+            let [r, g, b] = encode_terrarium_rgb(elev);
+            let dec_terr = (r as f64 * 256.0 + g as f64 + b as f64 / 256.0) - 32768.0;
+            assert!(
+                (dec_terr - elev as f64).abs() < 0.005,
+                "terrarium mismatch for {elev}: got {dec_terr}"
+            );
+
+            let [mr, mg, mb] = encode_terrain_rgb(elev);
+            let dec_mb = -10000.0 + ((mr as u32 * 65536 + mg as u32 * 256 + mb as u32) as f64 * 0.1);
+            assert!(
+                (dec_mb - elev as f64).abs() <= 0.055,
+                "terrainrgb mismatch for {elev}: got {dec_mb}"
+            );
         }
     }
 }
