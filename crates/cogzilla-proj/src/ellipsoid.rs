@@ -35,6 +35,20 @@ impl Ellipsoid {
     }
 }
 
+/// Wrap a longitude difference into `[-pi, pi]`, so a projection whose central
+/// meridian is near the antimeridian still sees nearby points as nearby.
+#[inline(always)]
+fn wrap_dlon(dlon: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    if dlon > PI {
+        dlon - TAU
+    } else if dlon < -PI {
+        dlon + TAU
+    } else {
+        dlon
+    }
+}
+
 /// Krüger 4th-order Transverse Mercator (exact to < 5 nm across UTM zones, matching PROJ).
 #[derive(Debug, Clone, Copy)]
 pub struct TransverseMercator {
@@ -48,6 +62,8 @@ pub struct TransverseMercator {
     pub beta: [f64; 4],
     pub delta: [f64; 4],
     pub m0: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
 }
 
 impl TransverseMercator {
@@ -95,6 +111,7 @@ impl TransverseMercator {
             beta,
             delta,
             m0: 0.0,
+            unit: 1.0,
         };
         if lat0_deg != 0.0 {
             let (_, n0) = tm.forward_raw(tm.lon0, lat0_deg.to_radians());
@@ -111,7 +128,7 @@ impl TransverseMercator {
 
     #[inline(always)]
     fn forward_raw(&self, lon: f64, lat: f64) -> (f64, f64) {
-        let dlon = lon - self.lon0;
+        let dlon = wrap_dlon(lon - self.lon0);
         // Outside valid Transverse Mercator domain (~75 deg from central meridian)
         if dlon.abs() > 1.32 || lat.abs() > 1.56 {
             return (f64::NAN, f64::NAN);
@@ -119,7 +136,8 @@ impl TransverseMercator {
         let sin_lat = lat.sin();
         let t = (lat.tan().asinh() - self.e * (self.e * sin_lat).atanh()).sinh();
         let xi_p = t.atan2(dlon.cos());
-        let eta_p = (dlon.sin() / (1.0 + t * t).sqrt()).asinh();
+        let cos_dlon = dlon.cos();
+        let eta_p = (dlon.sin() / (t * t + cos_dlon * cos_dlon).sqrt()).asinh();
 
         let mut xi = xi_p;
         let mut eta = eta_p;
@@ -137,13 +155,16 @@ impl TransverseMercator {
     #[inline(always)]
     pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
         let (x, y) = self.forward_raw(lon, lat);
-        (self.false_easting + x, self.false_northing + y - self.m0)
+        (
+            self.false_easting + x / self.unit,
+            self.false_northing + (y - self.m0) / self.unit,
+        )
     }
 
     /// Exact Krüger 4th-order inverse `(E, N)` -> `(lon_rad, lat_rad)`.
     pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
-        let xi = (northing - self.false_northing + self.m0) / (self.k0 * self.rect_a);
-        let eta = (easting - self.false_easting) / (self.k0 * self.rect_a);
+        let xi = ((northing - self.false_northing) * self.unit + self.m0) / (self.k0 * self.rect_a);
+        let eta = (easting - self.false_easting) * self.unit / (self.k0 * self.rect_a);
         let mut xi_p = xi;
         let mut eta_p = eta;
         for (idx, &b) in self.beta.iter().enumerate() {
@@ -177,6 +198,8 @@ pub struct AlbersEqualArea {
     pub rho0: f64,
     pub false_easting: f64,
     pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
 }
 
 impl AlbersEqualArea {
@@ -230,6 +253,7 @@ impl AlbersEqualArea {
             rho0,
             false_easting,
             false_northing,
+            unit: 1.0,
         }
     }
 
@@ -237,17 +261,17 @@ impl AlbersEqualArea {
     pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
         let q = Self::q_fn(self.e, self.e2, lat.sin());
         let rho = self.a * (self.c - self.n * q).max(0.0).sqrt() / self.n;
-        let theta = self.n * (lon - self.lon0);
+        let theta = self.n * wrap_dlon(lon - self.lon0);
         let (st, ct) = theta.sin_cos();
         (
-            self.false_easting + rho * st,
-            self.false_northing + (self.rho0 - rho * ct),
+            self.false_easting + rho * st / self.unit,
+            self.false_northing + (self.rho0 - rho * ct) / self.unit,
         )
     }
 
     pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
-        let dx = easting - self.false_easting;
-        let dy = self.rho0 - (northing - self.false_northing);
+        let dx = (easting - self.false_easting) * self.unit;
+        let dy = self.rho0 - (northing - self.false_northing) * self.unit;
         let sign = if self.n >= 0.0 { 1.0 } else { -1.0 };
         let rho = (dx * dx + dy * dy).sqrt();
         let theta = (sign * dx).atan2(sign * dy);
@@ -281,6 +305,8 @@ pub struct LambertConformalConic {
     pub rho0: f64,
     pub false_easting: f64,
     pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
 }
 
 impl LambertConformalConic {
@@ -335,24 +361,42 @@ impl LambertConformalConic {
             rho0,
             false_easting,
             false_northing,
+            unit: 1.0,
         }
+    }
+
+    /// One standard parallel at the latitude of origin, with scale factor `k0`
+    /// there (EPSG method 9801, GeoTIFF `CT_LambertConfConic_1SP`).
+    pub fn new_1sp(
+        ellip: Ellipsoid,
+        lat0_deg: f64,
+        lon0_deg: f64,
+        k0: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let mut lcc =
+            Self::new_2sp(ellip, lat0_deg, lat0_deg, lat0_deg, lon0_deg, false_easting, false_northing);
+        lcc.f_const *= k0;
+        lcc.rho0 *= k0;
+        lcc
     }
 
     #[inline(always)]
     pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
         let t = Self::t_fn(self.e, lat);
         let rho = self.a * self.f_const * t.powf(self.n);
-        let theta = self.n * (lon - self.lon0);
+        let theta = self.n * wrap_dlon(lon - self.lon0);
         let (st, ct) = theta.sin_cos();
         (
-            self.false_easting + rho * st,
-            self.false_northing + (self.rho0 - rho * ct),
+            self.false_easting + rho * st / self.unit,
+            self.false_northing + (self.rho0 - rho * ct) / self.unit,
         )
     }
 
     pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
-        let dx = easting - self.false_easting;
-        let dy = self.rho0 - (northing - self.false_northing);
+        let dx = (easting - self.false_easting) * self.unit;
+        let dy = self.rho0 - (northing - self.false_northing) * self.unit;
         let sign = if self.n >= 0.0 { 1.0 } else { -1.0 };
         let rho = sign * (dx * dx + dy * dy).sqrt();
         let theta = (sign * dx).atan2(sign * dy);
@@ -378,6 +422,8 @@ pub struct PolarStereographic {
     pub scale_factor: f64,
     pub false_easting: f64,
     pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
 }
 
 impl PolarStereographic {
@@ -404,6 +450,32 @@ impl PolarStereographic {
             scale_factor,
             false_easting,
             false_northing,
+            unit: 1.0,
+        }
+    }
+
+    /// Scale factor `k0` given at the pole instead of a latitude of true scale
+    /// (EPSG method 9810, "variant A", as used by UPS).
+    pub fn new_pole_scale(
+        ellip: Ellipsoid,
+        south: bool,
+        k0: f64,
+        lon0_deg: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let e = ellip.e;
+        let scale_factor =
+            2.0 * ellip.a * k0 / ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+        Self {
+            a: ellip.a,
+            e,
+            lon0: lon0_deg.to_radians(),
+            south,
+            scale_factor,
+            false_easting,
+            false_northing,
+            unit: 1.0,
         }
     }
 
@@ -417,14 +489,14 @@ impl PolarStereographic {
         let rho = self.scale_factor * t;
         let dlon = lon - self.lon0;
         let (s, c) = dlon.sin_cos();
-        let x = self.false_easting + rho * s;
-        let y = self.false_northing + if self.south { rho * c } else { -rho * c };
+        let x = self.false_easting + rho * s / self.unit;
+        let y = self.false_northing + if self.south { rho * c } else { -rho * c } / self.unit;
         (x, y)
     }
 
     pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
-        let dx = easting - self.false_easting;
-        let dy = northing - self.false_northing;
+        let dx = (easting - self.false_easting) * self.unit;
+        let dy = (northing - self.false_northing) * self.unit;
         let rho = (dx * dx + dy * dy).sqrt();
         let t = rho / self.scale_factor;
         let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();

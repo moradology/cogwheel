@@ -39,6 +39,18 @@
 - Mosaics: `GET /mosaicjson/{info,{tms}/tilejson.json,tiles/...}?url=...` serves quadkey-indexed MosaicJSON documents; `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b`, `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`, and `POST /mosaic/register` serve front-to-back dynamic or spatially indexed mosaics (including live STAC-API `/search`) with early exit once 100% of pixels are filled.
 - Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
 
+## Coordinate systems
+
+A source file is served only if `cogzilla` can place it correctly. Anything else returns `400` with the reason, rather than a picture in the wrong location.
+
+- **By EPSG code**: `3857`, WGS84 UTM (`32601`–`32660`, `32701`–`32760`), NAD83 UTM (`26901`–`26923`), CONUS Albers (`5070`), California Albers (`3310`), Lambert-93 (`2154`), and polar stereographic `3413` and `3031`.
+- **Geographic, in degrees**: WGS84 (`4326`), NAD83 (`4269`), ETRS89 (`4258`), GDA94, GDA2020 and the other datums listed below.
+- **User-defined** (parameters stored in the file, no EPSG code): Transverse Mercator, Lambert Conformal Conic with one or two standard parallels, Albers Equal Area, and polar stereographic with either a latitude of true scale or a scale factor at the pole. Units may be metres, feet or US survey feet.
+- **Datums**: no datum shift is applied, so only WGS84 and datums that agree with it to about two metres are accepted: NAD83 and its realizations, ETRS89, GDA94, GDA2020, NZGD2000, SIRGAS, JGD2000, JGD2011, Hartebeesthoek94, RGF93 and SWEREF99. NAD27, OSGB36 and other older datums are refused.
+- **Not supported**: any other EPSG code (including ETRS89 UTM, MGA, state plane and national grids, even where the projection method is one of the above), and the Lambert azimuthal equal-area, Mercator variants other than `3857`, sinusoidal, equirectangular, cylindrical equal-area and oblique projections.
+
+The projection math is checked against PROJ to one millimetre at 323 reference points (`crates/cogzilla-proj/tests/proj_reference.rs`), and `benches/projection_oracle.py` checks 55 coordinate systems end to end through real GeoTIFFs.
+
 ## Example requests
 
 ```text

@@ -2335,6 +2335,11 @@ fn to_http_response(
         Err(EngineError::BadRequest(msg)) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain")
         }
+        // The file is in a coordinate system this server cannot place. That is a
+        // property of the requested source, not a server fault.
+        Err(EngineError::Proj(e)) => {
+            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+        }
         Err(EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_))) => {
             plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
         }

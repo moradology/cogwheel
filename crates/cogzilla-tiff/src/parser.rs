@@ -258,6 +258,9 @@ fn parse_geo_keys(raw_keys: &[u16], double_params: &[f64]) -> GeoKeys {
             1024 if tiff_tag_loc == 0 => gk.model_type = Some(val_or_offset),
             1025 if tiff_tag_loc == 0 => gk.raster_type = Some(val_or_offset),
             2048 if tiff_tag_loc == 0 => gk.geographic_type = Some(val_or_offset),
+            2050 if tiff_tag_loc == 0 => gk.geodetic_datum = Some(val_or_offset),
+            2054 if tiff_tag_loc == 0 => gk.geog_angular_units = Some(val_or_offset),
+            2056 if tiff_tag_loc == 0 => gk.ellipsoid = Some(val_or_offset),
             2057 => gk.semi_major_axis = get_double(),
             2059 => gk.inv_flattening = get_double(),
             3072 if tiff_tag_loc == 0 => gk.projected_cs_type = Some(val_or_offset),
@@ -269,9 +272,14 @@ fn parse_geo_keys(raw_keys: &[u16], double_params: &[f64]) -> GeoKeys {
             3081 => gk.nat_origin_lat = get_double(),
             3082 => gk.false_easting = get_double(),
             3083 => gk.false_northing = get_double(),
+            3084 => gk.false_origin_long = get_double(),
+            3085 => gk.false_origin_lat = get_double(),
+            3086 => gk.false_origin_easting = get_double(),
+            3087 => gk.false_origin_northing = get_double(),
             3088 => gk.center_long = get_double(),
             3089 => gk.center_lat = get_double(),
             3092 => gk.scale_at_nat_origin = get_double(),
+            3095 => gk.straight_vert_pole_long = get_double(),
             _ => {}
         }
     }
