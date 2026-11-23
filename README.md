@@ -17,8 +17,8 @@ Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with T
 | CPU per 1,000 tiles, never seen before | **13.2 CPU-s** | 56.0 CPU-s | **4.3×** |
 | CPU per 1,000 tiles, source blocks cached | **1.7 CPU-s** | 55.3 CPU-s | **32×** |
 | Tiles per second per busy core, cached | **588** | 18 | **32×** |
-| Memory at idle | **4 MiB** | 1,112 MiB (10 workers) | |
-| Instances for 1,000 uncached tiles/s (modelled, `c7g.xlarge`) | **11** | 47 | **4.3×** |
+| Memory at idle | **4 MiB** | 1,112 MiB (10 workers) | **278×** |
+| Instances for 1,000 uncached tiles/s (modeled, `c7g.xlarge`) | **11** | 47 | **4.3×** |
 
 And the ceiling, with the network taken out entirely (local files, warm cache):
 
@@ -34,11 +34,11 @@ And the ceiling, with the network taken out entirely (local files, warm cache):
 - **The 4.3× is the number to plan with.** It is CPU for a tile the server has not seen, which is what an origin behind a CDN mostly serves. It ranged from 2.1× to 4.8× on four workloads (the fifth showed 8.3×, but its file was small enough to be partly cached) and does not depend on the network.
 - **The larger multiples (13–62× on S3) need the cache to fit.** `cogzilla` keeps decoded blocks in memory and TiTiler keeps none, which is where the big multiples come from. With the default 512 MiB cache, three of the five S3 workloads outgrew it and fell back to S3. Size `--cache-mb` to your working set and budget about 250 MiB on top.
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
-- **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilisation, and compute only. The ratio is measured; the instance counts are not.
+- **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilization, and compute only. The ratio is measured; the instance counts are not.
 - **Same picture, not the same bytes.** Valid-data masks agree with TiTiler on 99.6–100% of pixels; pixel values differ slightly on high-frequency imagery (32–34 dB PSNR on Sentinel-2, 49–54 dB on DEMs).
-- **One request in 822 failed.** A single uncached Copernicus tile returned HTTP 500 during the S3 run. It did not reproduce on replay; the likely cause is an S3 range request that failed at the connection level, which `cogzilla` did not retry at the time. It now retries those and times out stalled responses (`GDAL_HTTP_CONNECTTIMEOUT`, default 10 s; `GDAL_HTTP_TIMEOUT`, default 30 s per read), but the S3 benchmark has not been re-run since.
+- **One request in 822 failed.** A single uncached tile returned HTTP 500 during the S3 run, most likely an S3 connection failure that was not retried. Retries and timeouts for that case were added afterwards and are on `main`, not yet in a release; the benchmark has not been re-run since.
 
-Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md); the local suite is [below](#cogmark-benchmarks-vs-gdal--rio-tiler--titiler).
+Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md); the full local suite is in [benches/COGMARK.md](benches/COGMARK.md).
 
 ## Install
 
@@ -52,17 +52,23 @@ docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.1.1
 curl -L https://github.com/moradology/cogzilla/releases/download/v0.1.1/cogzilla-server-v0.1.1-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
-Then request a tile from any COG reachable over HTTP or S3:
+Then open a live map of a public Sentinel-2 scene (northeast Colorado, no credentials needed):
 
 ```text
-GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=https://example.com/your.tif
+http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A/TCI.tif
 ```
 
-Other targets (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`) and `SHA256SUMS` are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source, see [Quickstart](#quickstart).
+Or request tiles from any COG reachable over HTTP or S3:
+
+```text
+GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=s3://your-bucket/your.tif
+```
+
+Other targets (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`) and `SHA256SUMS` are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source, see [Building and running](#building-and-running).
 
 ### Coming from TiTiler
 
-Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. That is evidence for the routes and parameters [listed below](#drop-in-titiler-api-surface-cog-stac-colormaps-tilematrixsets), not a promise of parity with every TiTiler feature, extension, or deployment: there is no `/mosaicjson`, no pgSTAC, and no custom algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
+Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. That is evidence for the routes and parameters [listed below](#api), not a promise of parity with every TiTiler feature, extension, or deployment: there is no `/mosaicjson`, no pgSTAC, and no custom algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
 
 ## Why no GDAL?
 
@@ -70,46 +76,23 @@ GDAL reads hundreds of formats in thousands of projections, and it is very good 
 
 The cost is scope. If your data is not a GeoTIFF, or is in a projection outside the supported list, use TiTiler.
 
-## Architecture
+## How it works
 
-Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). Supports all 8 GDAL numeric dtypes (`uint8`–`float64`), JPEG/WebP/ZSTD/DEFLATE/LZW COGs, stripped GeoTIFFs, internal masks & RGBA alpha, and all 211 `rio-tiler` colormaps.
+Rust, explicit SIMD (ARM64 NEON, and x86_64 AVX2/FMA chosen at runtime), and native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). There are four stages.
 
-- **Zero GDAL / Zero `libproj`**: Custom Classic/BigTIFF + GeoKey parser (`0.92–1.3 µs` local `mmap` open — **~300–440×** faster than `GDALOpenEx`) and closed-form `f64` projections (`EPSG:3857`, `EPSG:4326`, all 120 WGS84/NAD83 UTM zones, CONUS/CA Albers, Lambert Conformal Conic, Polar Stereographic `3413`/`3031`) with automatic `Exact2D` low-zoom (`z <= 8`) and `17×17` `Grid2D` (`z >= 9`) multi-zoom tiling (`z=0..22`).
-- **SIMD Codecs & Predictors**: Thread-local `libdeflate`, `ZSTD_DCtx`, custom 64-bit MSB-first TIFF LZW, and ARM64 NEON / x86_64 AVX2 Predictor 1/2/3 unshufflers (**0-ULP bit-exact** against GDAL):
-  - `float32` Predictor 3 (single-band & hardware `vld3q_u8` 3-band chunky RGB): **`3.00 GB/s`** on `ZSTD + P3`.
-  - `uint16` Predictor 2 (Landsat C2 / Sentinel-2): NEON 8-lane Kogge-Stone prefix-sum widened straight into 64-byte-aligned `f32` slabs at block decode.
-  - Register-fused `BlockStats` (`all_nodata`, `no_nodata`) enabling `< 200 ns` static empty-tile responses on tilted satellite swath corners and automatic opaque RGB encoding (`CleanFastPath`).
-- **Monomorphized Fused Kernels & Band Math**: Single scanline pass fusing bilinear/nearest resampling, multi-COG compositing (e.g. Landsat 3-file `SR_B4 + SR_B3 + SR_B2` or SAR 2-file `VV + VH`), in-register spectral indices (`ndvi`, `ndwi`, `nbr`, `savi`, `evi`, fast IEEE-754 SAR `db` `10*log10`, dual-pol `sar_rgb`), SIMD PNG Sub filtering + whole-buffer `libdeflate`, `libwebp`, and raw `f32` binary output.
-- **Local `mmap` + Coalesced Remote S3/HTTP + Singleflight Cache**: Speculative 128 KiB single-RTT remote header open, byte-range coalescing, AWS SigV4 signing, and sharded lock-free singleflight block caching.
+**Reading.** A Classic/BigTIFF and GeoKey parser opens a local file through `mmap` in about a microsecond (0.92–1.3 µs, roughly 300–440× faster than `GDALOpenEx`). A remote file opens with one speculative 128 KiB range request. Later reads coalesce adjacent byte ranges, S3 requests are SigV4-signed, and decoded blocks go into a sharded cache that collapses concurrent requests for the same block into one fetch.
 
-## `COGMark` Benchmarks (vs. GDAL / `rio-tiler` / `TiTiler`)
+**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD). All eight GDAL numeric types from `uint8` to `float64` are supported, in tiled or stripped layout, with internal masks and RGBA alpha. Blocks that are entirely nodata are flagged at decode, so empty tiles return in under 200 ns.
 
-Measured on Apple M5 (10 cores, ARM64 NEON, `rustc 1.95.0 --release`) against local synthetic fixtures. "Warm" means the source blocks are already decoded in `cogzilla`'s cache, so these rows are the best case; for remote data and uncached tiles see [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md).
+**Projecting.** Closed-form `f64` math for `EPSG:3857`, `EPSG:4326`, all 120 WGS84/NAD83 UTM zones, CONUS and California Albers, Lambert Conformal Conic, and Polar Stereographic (`3413`, `3031`). Tiles at `z <= 8` are projected per pixel; tiles at `z >= 9` interpolate a 17×17 grid. Zooms 0 to 22 are served.
 
-| ID | Workload | `cogzilla` | GDAL / TiTiler | Speedup |
-| :--- | :--- | ---: | ---: | ---: |
-| **`BM-01`** | `ColdHeader` (5-IFD COG open) | **1.3 µs** | 406 µs | **312×** |
-| **`BM-02`** | `UnshufflePred3` (`ZSTD + P3`, 1 MiB) | **350 µs** (3.00 GB/s) | 835 µs (1.26 GB/s) | **2.4×** |
-| **`BM-03`** | `NativeMercator` PNG (warm) | **634 µs** | 17,587 µs | **27.7×** |
-| **`BM-03`** | `NativeMercator` Raw `f32` (warm) | **268 µs** | 12,377 µs | **46.2×** |
-| **`BM-04`** | `Reproj4326` PNG (warm) | **607 µs** | 25,766 µs | **42.4×** |
-| **`BM-05a`** | `Satellite UTM10N 3-Band RGB` PNG (warm / cold) | **1.22 ms** / 6.65 ms | 47.7 ms / 47.8 ms | **39.2×** / **7.2×** |
-| **`BM-05d`** | `Satellite Fused NDVI` PNG (warm) | **917 µs** | 14,208 µs | **15.5×** |
-| **`BM-06`** | `SparseCoastline` (50% empty, avg/tile) | **420 µs** | 9,180 µs | **21.9×** |
-| **`BM-07`** | `PanBurst32` HTTP Mercator PNG (32 concurrent) | **6,863 tiles/s** | 181 tiles/s | **37.8×** |
-| **`BM-07`** | `PanBurst32` HTTP Satellite RGB PNG (32 concurrent) | **3,791 tiles/s** | 171 tiles/s | **22.2×** |
-| **`BM-08`** | `RemoteRangeRTT` (20 ms RTT cold open + tile) | **48.3 ms** (3 reqs) | 147.0 ms (4 reqs) | **3.0×** |
-| **`BM-09`** | `Landsat C2 3-File uint16 RGB` PNG (warm) | **1.63 ms** | 25.4 ms | **15.6×** |
-| **`BM-10`** | `OPERA RTC-S1 Dual-Pol SAR-RGB` PNG (warm) | **1.35 ms** | 20.7 ms | **15.3×** |
-| **`BM-11`** | `MultiZoom` Landsat C2 (`z=5 / 8 / 10 / 12 / 14 / 16`) | **7.3 / 7.0 / 1.8 / 1.6 / 1.2 / 1.2 ms** | — | `99.86–100%` mask parity |
+**Rendering.** One pass per scanline does the resampling (nearest, bilinear or cubic), multi-COG compositing, band math, rescaling and colormap lookup, then encodes PNG, JPEG, WebP or raw `float32`. Band math is either an arbitrary `expression=` compiled to a small bytecode VM or a built-in preset (`ndvi`, `ndwi`, `nbr`, `savi`, `evi`, `db`, `sar_rgb`). All 211 `rio-tiler` colormaps are included.
 
-## Quickstart
+## Building and running
 
 ```bash
-# Build release server
 cargo build --release -p cogzilla-server
 
-# Serve pre-registered single COGs and multi-COG satellite scenes
 ./target/release/cogzilla-server \
   --bind 127.0.0.1:8080 \
   --cache-mb 1024 \
@@ -118,61 +101,91 @@ cargo build --release -p cogzilla-server
   --scene sar=/path/to/OPERA_VV.tif,/path/to/OPERA_VH.tif
 ```
 
-### Drop-In TiTiler API Surface (`/cog/*`, `/stac/*`, `/colorMaps`, `/tileMatrixSets`)
+| Flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `--bind` | `127.0.0.1:8080` | Listen address. The Docker image fixes this to `0.0.0.0:8080`; remap the port with `-p`. |
+| `--cache-mb` | `512` | Decoded-block cache size in MiB. Size it to your working set (see the cache note above). |
+| `--dataset name=path` | | Pre-register a local COG, served at `/tiles/{name}/{z}/{x}/{y}`. Repeatable. |
+| `--scene name=a.tif,b.tif[,c.tif]` | | Pre-register a multi-file scene (for example Landsat RGB or SAR VV+VH). Repeatable. |
 
-`cogzilla-server` implements TiTiler 2.4's non-Postgres routers so MapLibre, Leaflet, OpenLayers, and QGIS clients can switch by changing a single base URL (verified across **39/39 live HTTP differential oracle checks** against TiTiler in `benches/titiler_diff_oracle.py`):
+`--dataset` and `--scene` are optional: the `/cog` and `/stac` routes open any `url=` on demand.
 
-- **`/cog/*` (`TilerFactory`)**:
-  - **Tiles (`@1x` = 256px, `@2x` = 512px)**: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|jpg|f32}]` (`WebMercatorQuad` & `WorldCRS84Quad`), supporting `?unscale=true`, `?nodata=`, `?return_mask=false`, `?color_formula=`, `?colormap={json}`, `?buffer=`, and all 8 GDAL numeric dtypes (`uint8`, `int8`, `uint16`, `int16`, `uint32`, `int32`, `float32`, `float64`).
-  - **Arbitrary Band Math**: `?expression=(b4-b3)/(b4+b3)` (compiled to a zero-alloc register bytecode VM) plus fast presets (`ndvi`, `ndwi`, `nbr`, `savi`, `evi`, `db`, `sar_rgb`).
-  - **Metadata, Point, Stats & Crops**: `GET /cog/info`, `GET /cog/info.geojson`, `GET /cog/bounds`, `GET /cog/{tms}/tilejson.json`, `GET /cog/tiles`, `GET /cog/tiles/{tms}`, `GET /cog/{tms}/map.html`, `GET /cog/point/{lon},{lat}` (`?coord_crs=`), `GET|POST /cog/statistics` (GeoJSON polygon clipping), `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]`.
-- **`/stac/*` (`MultiBaseTilerFactory(reader=STACReader)`)**:
-  - `GET /stac/assets`, `GET /stac/info`, `GET /stac/info.geojson`, `GET /stac/asset_statistics`, `GET|POST /stac/statistics`, `GET /stac/tiles`, `GET /stac/tiles/{tms}`, `GET /stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `GET /stac/{tms}/tilejson.json`, `GET /stac/{tms}/map.html`, `GET /stac/point/{lon},{lat}`, `GET /stac/preview[/{w}x{h}][.{ext}]`, `GET /stac/bbox/...`, `POST /stac/feature[/{w}x{h}][.{ext}]`.
-  - Resolves and caches STAC Item JSON (local or HTTP/S), opens multi-asset COGs concurrently (`?assets=red&assets=green&assets=blue`), and supports both `?expression=(b1-b2)/(b1+b2)` and asset-named `?expression=(red-green)/(red+green)`.
-  - **21×–82× faster than TiTiler** on local fixtures with a warm cache, for STAC tiles (`2.1 ms` vs `48.6 ms`), TileJSON (`63.5×`), info (`45.3×`), and 3-asset point queries (`82.4×`, `0.0000000` error).
-- **`/colorMaps` (`ColorMapFactory`)**: `GET /colorMaps`, `GET /colorMaps/{colorMapId}` (256/256 exact `rio-tiler` LUT JSON and `?f=png` / `?format=png` 256×20 colorbar PNG, `PSNR=99.0 dB`).
-- **`/tileMatrixSets` (`TMSFactory`)**: `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}` (`WebMercatorQuad` 25-level & `WorldCRS84Quad` OGC TileMatrixSet 2.0 JSON).
+## Configuration
 
-### Example HTTP Tile Requests
+S3 and HTTP behavior is set through the same environment variables GDAL and the AWS SDKs use, so an existing TiTiler deployment's settings mostly carry over.
+
+| Variable | Purpose |
+| :--- | :--- |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Static or temporary credentials. |
+| `AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE` | Credentials from a shared credentials file. |
+| (none) | ECS task roles and EC2 instance roles (IMDSv2) are picked up automatically. Set `AWS_EC2_METADATA_DISABLED=true` to skip the instance lookup. |
+| `AWS_NO_SIGN_REQUEST=YES` | Send unsigned requests, for public buckets. |
+| `AWS_REQUEST_PAYER=requester` | Access requester-pays buckets. |
+| `AWS_REGION`, `AWS_DEFAULT_REGION` | Default region. A bucket in another region is discovered from S3's redirect and remembered. |
+| `AWS_ENDPOINT_URL`, `AWS_S3_ENDPOINT`, `AWS_HTTPS`, `AWS_VIRTUAL_HOSTING=FALSE` | S3-compatible stores (MinIO, Ceph, and so on) and path-style addressing. |
+| `GDAL_HTTP_MAX_RETRY` (or `AWS_MAX_ATTEMPTS`) | Retries for transient failures. Default 3. |
+| `GDAL_HTTP_CONNECTTIMEOUT`, `GDAL_HTTP_TIMEOUT` | Connect timeout (default 10 s) and per-read timeout (default 30 s). On `main`, not yet in a release. |
+| `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
+
+Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I/O counters as JSON, and `GET /docs` with `GET /openapi.json` for the route list.
+
+## API
+
+`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing.
+
+**`/cog/*`** (TiTiler's `TilerFactory`)
+
+- Tiles: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|jpg|f32}]`, for `WebMercatorQuad` and `WorldCRS84Quad`. `@1x` is 256 px and `@2x` is 512 px.
+- Tile parameters: `rescale`, `colormap_name`, `colormap` (JSON), `expression`, `resampling`, `nodata`, `unscale`, `return_mask`, `color_formula`, `buffer`.
+- Metadata: `GET /cog/info`, `/cog/info.geojson`, `/cog/bounds`, `/cog/{tms}/tilejson.json`, `/cog/tiles`, `/cog/tiles/{tms}`, `/cog/{tms}/map.html`.
+- Point and statistics: `GET /cog/point/{lon},{lat}` (with `coord_crs`), `GET|POST /cog/statistics` (POST clips to a GeoJSON polygon).
+- Crops: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]`.
+
+**`/stac/*`** (TiTiler's `MultiBaseTilerFactory` with `STACReader`)
+
+- `GET /stac/assets`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/map.html`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
+- The STAC item can be a local path, an HTTP(S) URL or an `s3://` URI. Its JSON is cached, and assets named with `?assets=red&assets=green&assets=blue` are opened concurrently.
+- Expressions can use band positions, `(b1-b2)/(b1+b2)`, or asset names, `(red-green)/(red+green)`.
+- On local fixtures with a warm cache these routes ran 21–82× faster than TiTiler: STAC tiles 2.1 ms against 48.6 ms, TileJSON 63.5×, info 45.3×, three-asset point queries 82.4×.
+
+**`/colorMaps`** and **`/tileMatrixSets`**
+
+- `GET /colorMaps`, `GET /colorMaps/{colorMapId}`: the lookup tables match `rio-tiler`'s exactly, and `?f=png` returns a 256×20 colorbar.
+- `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}`: `WebMercatorQuad` (25 levels) and `WorldCRS84Quad` as OGC TileMatrixSet 2.0 JSON.
+
+**Differences worth knowing**
+
+- `resampling` accepts `nearest`, `bilinear` and `cubic`. `lanczos` and `cubicspline` are served as cubic, and any other value falls back to bilinear without an error.
+- Remote sources are `http(s)://`, `s3://` and `/vsis3/`. Other GDAL virtual filesystems such as `/vsicurl/` are not recognized.
+- Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
+
+### Example requests
 
 ```text
-# Pre-registered Landsat C2 3-file uint16 RGB PNG
+# Pre-registered Landsat C2 three-file uint16 RGB
 GET /tiles/landsat/12/652/1583.png?rescale=7500,22500
 
-# Pre-registered OPERA RTC-S1 dual-pol SAR false-color RGB ([VV_dB, VH_dB, VV_dB - VH_dB])
+# Pre-registered OPERA RTC-S1 dual-pol SAR false color ([VV_dB, VH_dB, VV_dB - VH_dB])
 GET /tiles/sar/12/652/1583.png?expr=sar_rgb
 
-# Dynamic multi-COG S3/HTTP URL compositing (Landsat NDVI as WebP)
-GET /cog/tiles/12/652/1583.webp?url=s3://bucket/B5.tif&url=s3://bucket/B4.tif&expr=ndvi&rescale=-0.2,0.8&colormap=ndvi&quality=82
+# Landsat NDVI composited from two S3 COGs, as WebP
+GET /cog/tiles/WebMercatorQuad/12/652/1583.webp?url=s3://bucket/B5.tif&url=s3://bucket/B4.tif&expr=ndvi&rescale=-0.2,0.8&colormap_name=rdylgn&quality=82
 
-# Single-pol SAR linear power -> dB as raw float32 for WebGL / Deck.gl
-GET /cog/tiles/12/652/1583.f32?url=s3://bucket/VV.tif&expr=db
+# Single-pol SAR linear power to dB, as raw float32 for WebGL or deck.gl
+GET /cog/tiles/WebMercatorQuad/12/652/1583.f32?url=s3://bucket/VV.tif&expr=db
 ```
 
-## Reproducing `COGMark`
+## Benchmarks
 
-```bash
-# 1. Generate deterministic COG fixtures (requires uv)
-cd benches && uv venv .venv && uv pip install --python .venv/bin/python rasterio rio-tiler titiler.core uvicorn numpy pillow httpx
-.venv/bin/python generate_fixtures.py
-.venv/bin/python generate_landsat_sar_fixtures.py
-cd ..
+- [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md): real COGs on S3 against a tuned TiTiler, covering time, memory and cost, with caveats and reproduction steps. This is the source of the first table above.
+- [benches/COGMARK.md](benches/COGMARK.md): the local `BM-01` to `BM-11` suite against GDAL, `rio-tiler` and TiTiler on synthetic fixtures, with reproduction steps. This is the source of the second table, and it is the best case: no network and a warm cache.
 
-# 2. Run cogzilla benchmarks + parity dumps
-cargo run --release -p cogmark -- --dump-parity benches/results/parity
+## Workspace crates
 
-# 3. Run GDAL / TiTiler baseline & pixel parity gate
-benches/.venv/bin/python benches/gdal_oracle.py
-```
-
-The S3 comparison has its own scripts and instructions in [benches/S3_BENCHMARK.md](benches/S3_BENCHMARK.md#reproducing) (about 25 minutes and 4 GB of downloads from public buckets).
-
-## Workspace Crates
-
-- `crates/cogzilla-tiff` — Classic/BigTIFF + GeoKey parser & compact IFD index (`float32` + `uint16`).
-- `crates/cogzilla-codec` — Thread-local `libdeflate`, `zstd`, 64-bit LZW + NEON/AVX2 Predictor 1/2/3 & `BlockStats`.
-- `crates/cogzilla-proj` — Closed-form `EPSG:3857`, `4326`, UTM, Albers, LCC, Polar Stereographic + `Exact2D`/`Grid2D` planners.
-- `crates/cogzilla-kernel` — Monomorphized fused SIMD resample, rescale, spectral band math, fast PNG/WebP/Raw `f32` encoders.
-- `crates/cogzilla-io` — `MmapBackend`, coalesced HTTP/S3 `RangeBackend` (SigV4), sharded singleflight block cache.
-- `crates/cogzilla-server` — Zero-alloc `hyper` HTTP/1.1 + HTTP/2 server & CLI.
-- `benches/cogmark` — `BM-01`..`BM-11` benchmark suite & GDAL parity oracle.
+- `crates/cogzilla-tiff`: Classic/BigTIFF and GeoKey parser with a compact IFD index, for all eight numeric types, tiled or stripped.
+- `crates/cogzilla-codec`: DEFLATE, ZSTD, LZW, JPEG and WebP block decoding, NEON/AVX2 predictors 1/2/3, and per-block nodata statistics.
+- `crates/cogzilla-proj`: closed-form projections (`EPSG:3857`, `4326`, UTM, Albers, LCC, Polar Stereographic) and the per-tile reprojection planners.
+- `crates/cogzilla-kernel`: fused SIMD resampling (nearest, bilinear, cubic), rescaling, band math, colormaps, and the PNG, JPEG, WebP and raw `float32` encoders.
+- `crates/cogzilla-io`: `mmap` and ranged HTTP/S3 backends (SigV4, retries, timeouts) and the singleflight block cache.
+- `crates/cogzilla-server`: the `hyper` HTTP/1.1 and HTTP/2 server and CLI.
+- `benches/cogmark`: the `BM-01` to `BM-11` suite and GDAL parity oracle.
