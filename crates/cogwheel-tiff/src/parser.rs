@@ -453,7 +453,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             continue;
         }
 
-        // Accept float32 (format=3, bits=32) and uint16 (format=1, bits=16, Landsat/Sentinel-2)
+        // Accept float32, uint16, int16, uint8 (all widen to f32 at block decode)
         let bps = bits_per_sample
             .as_deref()
             .and_then(|v| v.first().copied())
@@ -465,6 +465,8 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         let sample_type = match (fmt, bps) {
             (3, 32) => SampleType::Float32,
             (1, 16) => SampleType::Uint16,
+            (2, 16) => SampleType::Int16,
+            (1, 8) => SampleType::Uint8,
             _ => {
                 return Err(TiffError::UnsupportedSampleFormat {
                     format: fmt,

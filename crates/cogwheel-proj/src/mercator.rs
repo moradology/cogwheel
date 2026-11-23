@@ -38,3 +38,12 @@ pub fn mercator_to_lonlat_deg(mx: f64, my: f64) -> (f64, f64) {
     let (lon, lat) = mercator_to_lonlat_rad(mx, my);
     (lon.to_degrees(), lat.to_degrees())
 }
+
+/// Forward Web Mercator: `(lon_deg, lat_deg)` -> `(mx, my)` in meters.
+#[inline(always)]
+pub fn lonlat_deg_to_mercator(lon_deg: f64, lat_deg: f64) -> (f64, f64) {
+    let lat_clamped = lat_deg.clamp(-85.051_128_78, 85.051_128_78).to_radians();
+    let mx = lon_deg.to_radians() * WEB_MERCATOR_R;
+    let my = (std::f64::consts::FRAC_PI_4 + 0.5 * lat_clamped).tan().ln() * WEB_MERCATOR_R;
+    (mx, my)
+}

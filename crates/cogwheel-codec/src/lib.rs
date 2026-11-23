@@ -98,6 +98,23 @@ pub fn decode_tile(
                 false,
                 nodata,
             ),
+            SampleType::Int16 => predictor::reconstruct_i16(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                false,
+                nodata,
+            ),
+            SampleType::Uint8 => predictor::reconstruct_u8(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                false,
+                nodata,
+            ),
         };
         return Ok(DecodedTile { bands });
     }
@@ -197,6 +214,23 @@ pub fn decode_tile(
                 bands_in_tile,
                 byte_order,
                 false,
+                nodata,
+            ),
+            (SampleType::Int16, p) => predictor::reconstruct_i16(
+                raw_slice,
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                byte_order,
+                p == Predictor::HorizontalInt,
+                nodata,
+            ),
+            (SampleType::Uint8, p) => predictor::reconstruct_u8(
+                raw_slice,
+                ifd.tile_width,
+                ifd.tile_height,
+                bands_in_tile,
+                p == Predictor::HorizontalInt,
                 nodata,
             ),
         };

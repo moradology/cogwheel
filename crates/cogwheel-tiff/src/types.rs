@@ -6,7 +6,7 @@ pub enum TiffError {
     NeedMoreBytes { required: u64, available: u64 },
     #[error("invalid TIFF header magic or byte order")]
     InvalidHeader,
-    #[error("unsupported sample format: cogwheel supports float32 (format=3, bits=32) and uint16 (format=1, bits=16), got format={format}, bits={bits}")]
+    #[error("unsupported sample format: cogwheel supports f32, u16, i16, u8, got format={format}, bits={bits}")]
     UnsupportedSampleFormat { format: u16, bits: u16 },
     #[error("unsupported compression code: {0}")]
     UnsupportedCompression(u16),
@@ -45,8 +45,12 @@ pub enum Predictor {
 pub enum SampleType {
     /// IEEE-754 32-bit float (SAR RTC, DEMs, scientific COGs).
     Float32,
-    /// Unsigned 16-bit integer (Landsat Collection 2, Sentinel-2 L2A), widened to `f32` at block decode.
+    /// Unsigned 16-bit integer (Landsat Collection 2, Sentinel-2 L2A).
     Uint16,
+    /// Signed 16-bit integer (SRTM / Copernicus DEMs, MODIS).
+    Int16,
+    /// Unsigned 8-bit integer (Sentinel-2 TCI, Planet/NAIP/Maxar visual RGB, QA masks).
+    Uint8,
 }
 
 impl SampleType {
@@ -54,7 +58,17 @@ impl SampleType {
     pub fn bytes_per_sample(self) -> usize {
         match self {
             Self::Float32 => 4,
-            Self::Uint16 => 2,
+            Self::Uint16 | Self::Int16 => 2,
+            Self::Uint8 => 1,
+        }
+    }
+
+    pub fn gdal_name(self) -> &'static str {
+        match self {
+            Self::Float32 => "float32",
+            Self::Uint16 => "uint16",
+            Self::Int16 => "int16",
+            Self::Uint8 => "uint8",
         }
     }
 }

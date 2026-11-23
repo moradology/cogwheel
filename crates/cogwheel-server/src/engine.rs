@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use cogwheel_io::{CogStore, IoError, OpenedCog};
 use cogwheel_kernel::{
-    BandSource, ColormapName, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr,
-    empty_tile_bytes, render_bandmath1, render_bandmath2, render_bandmath3, render_rgb_bands,
-    render_sar_rgb, render_single_band,
+    BandSource, ColormapName, ExprProgram, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle,
+    SpectralExpr, empty_tile_bytes, render_bandmath1, render_bandmath2, render_bandmath3,
+    render_expr_vm, render_rgb_bands, render_sar_rgb, render_single_band,
 };
 use cogwheel_proj::{CoordPlan, CrsModel, ProjError, TileCoord};
 use cogwheel_tiff::PlanarConfig;
@@ -58,6 +58,11 @@ pub enum BandRequest {
     Spectral3 {
         expr: SpectralExpr,
         bands_1based: [u16; 3],
+        rescale: (f32, f32),
+        colormap: ColormapName,
+    },
+    CustomExpr {
+        prog: ExprProgram,
         rescale: (f32, f32),
         colormap: ColormapName,
     },
@@ -611,6 +616,92 @@ impl TileEngine {
                             ),
                         ];
                         Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                    }
+                }
+            }
+            BandRequest::CustomExpr {
+                prog,
+                rescale,
+                colormap,
+            } => {
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                let nb = prog.used_bands.len();
+                for &b in &prog.used_bands {
+                    if b == 0 || b > ifd.samples_per_pixel {
+                        return Err(EngineError::BadRequest(format!(
+                            "expression band b{b} out of range (dataset has {} bands)",
+                            ifd.samples_per_pixel
+                        )));
+                    }
+                }
+                match ifd.planar_config {
+                    PlanarConfig::Chunky => {
+                        let mut indices = Vec::with_capacity(grid_len);
+                        for ty in ty0..=ty1 {
+                            for tx in tx0..=tx1 {
+                                indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                            }
+                        }
+                        let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                        let mut band_vecs: Vec<Vec<Option<&cogwheel_codec::DecodedBand>>> =
+                            Vec::with_capacity(nb);
+                        for &b in &prog.used_bands {
+                            let b0 = (b - 1) as usize;
+                            band_vecs.push(
+                                tiles
+                                    .iter()
+                                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0)))
+                                    .collect(),
+                            );
+                        }
+                        let srcs: Vec<BandSource<'_>> = band_vecs
+                            .iter()
+                            .map(|refs| {
+                                BandSource::new(
+                                    ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0,
+                                    ty0, grid_w, grid_h, refs,
+                                )
+                            })
+                            .collect();
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                    }
+                    PlanarConfig::Planar => {
+                        let mut indices = Vec::with_capacity(grid_len * nb);
+                        for &b in &prog.used_bands {
+                            let b0 = b - 1;
+                            for ty in ty0..=ty1 {
+                                for tx in tx0..=tx1 {
+                                    indices.push(Some(ifd.tile_index(tx, ty, b0) as u32));
+                                }
+                            }
+                        }
+                        let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                        let mut band_vecs: Vec<Vec<Option<&cogwheel_codec::DecodedBand>>> =
+                            Vec::with_capacity(nb);
+                        for i in 0..nb {
+                            band_vecs.push(
+                                tiles[i * grid_len..(i + 1) * grid_len]
+                                    .iter()
+                                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                                    .collect(),
+                            );
+                        }
+                        let srcs: Vec<BandSource<'_>> = band_vecs
+                            .iter()
+                            .map(|refs| {
+                                BandSource::new(
+                                    ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0,
+                                    ty0, grid_w, grid_h, refs,
+                                )
+                            })
+                            .collect();
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
                     }
                 }
             }

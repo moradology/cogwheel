@@ -48,6 +48,17 @@ cargo build --release -p cogwheel-server
   --scene sar=/path/to/OPERA_VV.tif,/path/to/OPERA_VH.tif
 ```
 
+### Drop-In TiTiler `/cog/*` API Surface
+
+`cogwheel-server` implements the full TiTiler `TilerFactory` `/cog/*` API surface so MapLibre, Leaflet, OpenLayers, and QGIS clients can switch by changing a single base URL:
+
+- **Tiles (`@1x` = 256px, `@2x` = 512px)**: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|f32}]`
+- **Arbitrary Band Math**: `?expression=(b4-b3)/(b4+b3)` (compiled to a zero-alloc register bytecode VM) plus fast presets (`ndvi`, `ndwi`, `nbr`, `savi`, `evi`, `db`, `sar_rgb`)
+- **Multi-Asset Compositing**: Repeatable `?url=B4.tif&url=B3.tif&url=B2.tif` (Landsat C2 `uint16` / OPERA SAR `VV+VH`)
+- **Metadata & Discovery**: `GET /cog/info`, `GET /cog/info.geojson`, `GET /cog/bounds`, `GET /cog/{tms}/tilejson.json`, `GET /cog/tiles`, `GET /cog/tiles/{tms}`, `GET /cog/{tms}/map.html`
+- **Point & Statistics**: `GET /cog/point/{lon},{lat}`, `GET|POST /cog/statistics`
+- **Preview, Bbox & GeoJSON Feature Crop**: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]`
+
 ### Example HTTP Tile Requests
 
 ```text

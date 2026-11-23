@@ -4,6 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use cogwheel_proj::{CoordPlan, GRID_DIM};
 
 use crate::bandmath::{SpectralExpr, fast_db_from_power};
+use crate::expr_vm::ExprProgram;
 use crate::colormap::{ColormapLut, ColormapName};
 use crate::png_fast::{
     empty_transparent_png, encode_filtered_png, filter_sub_rgb_row, filter_sub_rgba_row,
@@ -1142,4 +1143,29 @@ pub fn render_bandmath3<const N: usize>(
             }
         }),
     }
+}
+
+/// Evaluate an arbitrary compiled TiTiler `?expression=` bytecode program across any number of bands.
+pub fn render_expr_vm<const N: usize>(
+    plan: &CoordPlan<N>,
+    srcs: &[BandSource<'_>],
+    prog: &ExprProgram,
+    style: &SingleBandStyle,
+) -> Bytes {
+    if srcs.is_empty() || srcs.iter().any(|s| s.all_nodata) {
+        return empty_tile_bytes(N as u32, style.format, 1);
+    }
+    let bilinear = style.resample == ResampleMode::Bilinear;
+    render_eval_fn(plan, style, |u, v| {
+        let mut vals = [0.0f32; 16];
+        let nb = srcs.len().min(16);
+        for i in 0..nb {
+            vals[i] = if bilinear {
+                sample_bilinear::<false>(&srcs[i], u, v)
+            } else {
+                sample_nearest::<false>(&srcs[i], u, v)
+            };
+        }
+        prog.eval(&vals[..nb])
+    })
 }

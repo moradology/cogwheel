@@ -1294,3 +1294,133 @@ pub fn reconstruct_u16(
         })
         .collect()
 }
+
+/// Reconstruct `int16` Predictor 1 or Predictor 2 (SRTM / Copernicus DEMs, MODIS) -> `AlignedF32Slab`.
+pub fn reconstruct_i16(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    horizontal_diff: bool,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut acc = vec![0i16; bands_in_tile];
+
+    for y in 0..h {
+        if horizontal_diff {
+            acc.fill(0);
+        }
+        let row_off = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let off = ((row_off + x) * bands_in_tile + b) * 2;
+                let sample = match byte_order {
+                    ByteOrder::Little => i16::from_le_bytes([raw[off], raw[off + 1]]),
+                    ByteOrder::Big => i16::from_be_bytes([raw[off], raw[off + 1]]),
+                };
+                let val_i16 = if horizontal_diff {
+                    acc[b] = acc[b].wrapping_add(sample);
+                    acc[b]
+                } else {
+                    sample
+                };
+                let (v, is_nd) = check_val(val_i16 as f32, finite_nodata);
+                slabs[b][row_off + x] = v;
+                if is_nd {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    if v < min_val[b] { min_val[b] = v; }
+                    if v > max_val[b] { max_val[b] = v; }
+                }
+            }
+        }
+    }
+
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data,
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
+/// Reconstruct `uint8` Predictor 1 or Predictor 2 (Sentinel-2 TCI, visual RGB, masks) -> `AlignedF32Slab`.
+pub fn reconstruct_u8(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    horizontal_diff: bool,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut acc = vec![0u8; bands_in_tile];
+
+    for y in 0..h {
+        if horizontal_diff {
+            acc.fill(0);
+        }
+        let row_off = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let off = (row_off + x) * bands_in_tile + b;
+                let sample = raw[off];
+                let val_u8 = if horizontal_diff {
+                    acc[b] = acc[b].wrapping_add(sample);
+                    acc[b]
+                } else {
+                    sample
+                };
+                let (v, is_nd) = check_val(val_u8 as f32, finite_nodata);
+                slabs[b][row_off + x] = v;
+                if is_nd {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    if v < min_val[b] { min_val[b] = v; }
+                    if v > max_val[b] { max_val[b] = v; }
+                }
+            }
+        }
+    }
+
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data,
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}

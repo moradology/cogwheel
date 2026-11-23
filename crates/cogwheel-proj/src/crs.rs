@@ -4,7 +4,10 @@ use thiserror::Error;
 use crate::ellipsoid::{
     AlbersEqualArea, Ellipsoid, LambertConformalConic, PolarStereographic, TransverseMercator,
 };
-use crate::mercator::{TileCoord, mercator_to_lonlat_deg, mercator_to_lonlat_rad, tile_bounds_3857};
+use crate::mercator::{
+    ORIGIN_SHIFT, TileCoord, lonlat_deg_to_mercator, mercator_to_lonlat_deg,
+    mercator_to_lonlat_rad, tile_bounds_3857,
+};
 
 #[derive(Debug, Error)]
 pub enum ProjError {
@@ -222,6 +225,97 @@ impl CrsModel {
         let rx = ((xx - x0).powi(2) + (yx - y0).powi(2)).sqrt();
         let ry = ((xy - x0).powi(2) + (yy - y0).powi(2)).sqrt();
         (rx, ry)
+    }
+
+    /// Map a WGS84 `(lon_deg, lat_deg)` point directly into this CRS's `(x, y)`.
+    #[inline(always)]
+    pub fn from_lonlat_deg(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
+        match self {
+            Self::Epsg3857 => lonlat_deg_to_mercator(lon_deg, lat_deg),
+            Self::Geographic => (lon_deg, lat_deg),
+            Self::TransverseMercator(tm) => tm.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::Albers(alb) => alb.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::LambertConformalConic(lcc) => {
+                lcc.forward(lon_deg.to_radians(), lat_deg.to_radians())
+            }
+            Self::PolarStereographic(ps) => ps.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+        }
+    }
+
+    /// Inverse map a point `(x, y)` in this CRS back to WGS84 `(lon_deg, lat_deg)`.
+    pub fn to_lonlat_deg(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            Self::Epsg3857 => mercator_to_lonlat_deg(x, y),
+            Self::Geographic => (x, y),
+            Self::TransverseMercator(tm) => {
+                let (lon, lat) = tm.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::Albers(alb) => {
+                let (lon, lat) = alb.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::LambertConformalConic(lcc) => {
+                let (lon, lat) = lcc.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::PolarStereographic(ps) => {
+                let (lon, lat) = ps.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+        }
+    }
+
+    /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
+    /// 32 points along the 4 edges of the raster.
+    pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
+        let mut min_lon = f64::INFINITY;
+        let mut min_lat = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+        let w = width as f64;
+        let h = height as f64;
+        let steps = 8;
+
+        let mut visit = |col: f64, row: f64| {
+            let (sx, sy) = pixel_to_crs.forward(col, row);
+            let (lon, lat) = self.to_lonlat_deg(sx, sy);
+            if lon.is_finite() && lat.is_finite() {
+                min_lon = min_lon.min(lon);
+                max_lon = max_lon.max(lon);
+                min_lat = min_lat.min(lat);
+                max_lat = max_lat.max(lat);
+            }
+        };
+
+        for i in 0..=steps {
+            let t = (i as f64) / (steps as f64);
+            visit(t * w, 0.0);
+            visit(t * w, h);
+            visit(0.0, t * h);
+            visit(w, t * h);
+        }
+        [min_lon, min_lat, max_lon, max_lat]
+    }
+
+    /// Estimate TiTiler-compatible `(minzoom, maxzoom)` in WebMercatorQuad for a raster.
+    pub fn web_mercator_zoom_range(
+        &self,
+        pixel_to_crs: &Affine2D,
+        width: u32,
+        height: u32,
+        overview_factor: f64,
+    ) -> (u8, u8) {
+        let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+        let (mx0, my0) = lonlat_deg_to_mercator(w, s);
+        let (mx1, my1) = lonlat_deg_to_mercator(e, n);
+        let span_m = (mx1 - mx0).abs().max((my1 - my0).abs()).max(1.0);
+        let px_m = span_m / (width.max(height) as f64);
+        let world_px0 = (2.0 * ORIGIN_SHIFT) / 256.0;
+        let maxzoom = (world_px0 / px_m).log2().ceil().clamp(0.0, 22.0) as u8;
+        let minzoom_f = (world_px0 / (px_m * overview_factor.max(1.0))).log2().floor();
+        let minzoom = minzoom_f.clamp(0.0, maxzoom as f64) as u8;
+        (minzoom, maxzoom)
     }
 }
 

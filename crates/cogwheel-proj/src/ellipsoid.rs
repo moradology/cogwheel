@@ -45,6 +45,8 @@ pub struct TransverseMercator {
     pub e: f64,
     pub rect_a: f64,
     pub alpha: [f64; 4],
+    pub beta: [f64; 4],
+    pub delta: [f64; 4],
     pub m0: f64,
 }
 
@@ -69,6 +71,18 @@ impl TransverseMercator {
             (61.0 / 240.0) * n3 - (103.0 / 140.0) * n4,
             (49561.0 / 161280.0) * n4,
         ];
+        let beta = [
+            0.5 * n - (2.0 / 3.0) * n2 + (37.0 / 96.0) * n3 - (1.0 / 360.0) * n4,
+            (1.0 / 48.0) * n2 + (1.0 / 15.0) * n3 - (437.0 / 1440.0) * n4,
+            (17.0 / 480.0) * n3 - (37.0 / 840.0) * n4,
+            (4397.0 / 161280.0) * n4,
+        ];
+        let delta = [
+            2.0 * n - (2.0 / 3.0) * n2 - 2.0 * n3 + (116.0 / 45.0) * n4,
+            (7.0 / 3.0) * n2 - (8.0 / 5.0) * n3 - (227.0 / 45.0) * n4,
+            (56.0 / 15.0) * n3 - (136.0 / 35.0) * n4,
+            (4279.0 / 630.0) * n4,
+        ];
 
         let mut tm = Self {
             lon0: lon0_deg.to_radians(),
@@ -78,6 +92,8 @@ impl TransverseMercator {
             e: ellip.e,
             rect_a,
             alpha,
+            beta,
+            delta,
             m0: 0.0,
         };
         if lat0_deg != 0.0 {
@@ -122,6 +138,30 @@ impl TransverseMercator {
     pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
         let (x, y) = self.forward_raw(lon, lat);
         (self.false_easting + x, self.false_northing + y - self.m0)
+    }
+
+    /// Exact Krüger 4th-order inverse `(E, N)` -> `(lon_rad, lat_rad)`.
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let xi = (northing - self.false_northing + self.m0) / (self.k0 * self.rect_a);
+        let eta = (easting - self.false_easting) / (self.k0 * self.rect_a);
+        let mut xi_p = xi;
+        let mut eta_p = eta;
+        for (idx, &b) in self.beta.iter().enumerate() {
+            let j = (2 * (idx + 1)) as f64;
+            let (s_xi, c_xi) = (j * xi).sin_cos();
+            let s_eta = (j * eta).sinh();
+            let c_eta = (j * eta).cosh();
+            xi_p -= b * s_xi * c_eta;
+            eta_p -= b * c_xi * s_eta;
+        }
+        let chi = (xi_p.sin() / eta_p.cosh()).asin();
+        let mut lat = chi;
+        for (idx, &d) in self.delta.iter().enumerate() {
+            let j = (2 * (idx + 1)) as f64;
+            lat += d * (j * chi).sin();
+        }
+        let lon = self.lon0 + eta_p.sinh().atan2(xi_p.cos());
+        (lon, lat)
     }
 }
 
@@ -204,6 +244,30 @@ impl AlbersEqualArea {
             self.false_northing + (self.rho0 - rho * ct),
         )
     }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let dx = easting - self.false_easting;
+        let dy = self.rho0 - (northing - self.false_northing);
+        let sign = if self.n >= 0.0 { 1.0 } else { -1.0 };
+        let rho = (dx * dx + dy * dy).sqrt();
+        let theta = (sign * dx).atan2(sign * dy);
+        let lon = self.lon0 + theta / self.n;
+        let q = (self.c - (rho * self.n / self.a).powi(2)) / self.n;
+        let mut lat = (q / 2.0).clamp(-1.0, 1.0).asin();
+        for _ in 0..6 {
+            let s = lat.sin();
+            let c = lat.cos();
+            if c.abs() < 1e-12 {
+                break;
+            }
+            let es = self.e * s;
+            let one_m_e2s2 = 1.0 - es * es;
+            let fq = Self::q_fn(self.e, self.e2, s) - q;
+            let dfq = (1.0 - self.e2) * 2.0 * c / (one_m_e2s2 * one_m_e2s2);
+            lat -= fq / dfq;
+        }
+        (lon, lat)
+    }
 }
 
 /// Ellipsoidal Lambert Conformal Conic (1SP and 2SP, e.g. EPSG:2154 Lambert-93).
@@ -285,6 +349,23 @@ impl LambertConformalConic {
             self.false_northing + (self.rho0 - rho * ct),
         )
     }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let dx = easting - self.false_easting;
+        let dy = self.rho0 - (northing - self.false_northing);
+        let sign = if self.n >= 0.0 { 1.0 } else { -1.0 };
+        let rho = sign * (dx * dx + dy * dy).sqrt();
+        let theta = (sign * dx).atan2(sign * dy);
+        let lon = self.lon0 + theta / self.n;
+        let t = (rho / (self.a * self.f_const)).max(1e-15).powf(1.0 / self.n);
+        let mut lat = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
+        for _ in 0..7 {
+            let es = self.e * lat.sin();
+            lat = std::f64::consts::FRAC_PI_2
+                - 2.0 * (t * ((1.0 - es) / (1.0 + es)).powf(0.5 * self.e)).atan();
+        }
+        (lon, lat)
+    }
 }
 
 /// Ellipsoidal Polar Stereographic (e.g. EPSG:3413 Arctic, EPSG:3031 Antarctic).
@@ -339,5 +420,21 @@ impl PolarStereographic {
         let x = self.false_easting + rho * s;
         let y = self.false_northing + if self.south { rho * c } else { -rho * c };
         (x, y)
+    }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let dx = easting - self.false_easting;
+        let dy = northing - self.false_northing;
+        let rho = (dx * dx + dy * dy).sqrt();
+        let t = rho / self.scale_factor;
+        let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
+        for _ in 0..7 {
+            let es = self.e * phi.sin();
+            phi = std::f64::consts::FRAC_PI_2
+                - 2.0 * (t * ((1.0 - es) / (1.0 + es)).powf(0.5 * self.e)).atan();
+        }
+        let lon = self.lon0 + if self.south { dx.atan2(dy) } else { dx.atan2(-dy) };
+        let lat = if self.south { -phi } else { phi };
+        (lon, lat)
     }
 }
