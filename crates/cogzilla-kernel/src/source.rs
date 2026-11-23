@@ -230,4 +230,75 @@ impl<'a> BandSource<'a> {
             None
         }
     }
+
+    /// Single-block raw typed slice view for clean (`no_nodata`) `U8`/`U16`/`F32` bands.
+    #[inline(always)]
+    pub fn single_block_u16(&self) -> Option<(&'a [u16], u32, u32, usize)> {
+        if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
+            let blk = self.blocks[0]?;
+            if let cogzilla_codec::BandData::U16 { data, nodata: None } = &blk.data {
+                return Some((
+                    data.as_ref(),
+                    self.tx0 * self.tile_w,
+                    self.ty0 * self.tile_h,
+                    self.tile_w as usize,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Single-block raw `u8` slice view for clean (`no_nodata`) `U8` bands.
+    #[inline(always)]
+    pub fn single_block_u8(&self) -> Option<(&'a [u8], u32, u32, usize)> {
+        if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
+            let blk = self.blocks[0]?;
+            if let cogzilla_codec::BandData::U8 { data, nodata: None } = &blk.data {
+                return Some((
+                    data.as_ref(),
+                    self.tx0 * self.tile_w,
+                    self.ty0 * self.tile_h,
+                    self.tile_w as usize,
+                ));
+            }
+        }
+        None
+    }
+
+    /// True if `other` shares the exact same tile grid geometry as `self`, allowing multi-band
+    /// RGB kernels to compute tile/pixel indices once per pixel instead of 3×.
+    #[inline(always)]
+    pub fn same_grid_as(&self, other: &Self) -> bool {
+        self.tile_w == other.tile_w
+            && self.tile_h == other.tile_h
+            && self.tx0 == other.tx0
+            && self.ty0 == other.ty0
+            && self.grid_w == other.grid_w
+            && self.grid_h == other.grid_h
+    }
+
+    /// Compute `(bidx, p00, p01)` for a 2×2 quad whose top-left `(ux0, uy0)` stays strictly
+    /// inside a single internal block (`lx + 1 < tile_w && ly + 1 < tile_h`).
+    #[inline(always)]
+    pub fn interior_quad_loc(&self, ux0: u32, uy0: u32) -> Option<(usize, usize, usize)> {
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (ux0 >> s, ux0 & self.mask_x),
+            None => (ux0 / self.tile_w, ux0 % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (uy0 >> s, uy0 & self.mask_y),
+            None => (uy0 / self.tile_h, uy0 % self.tile_h),
+        };
+        if lx + 1 < self.tile_w && ly + 1 < self.tile_h {
+            let gx = tx.wrapping_sub(self.tx0);
+            let gy = ty.wrapping_sub(self.ty0);
+            if gx < self.grid_w && gy < self.grid_h {
+                let bidx = (gy * self.grid_w + gx) as usize;
+                let tw = self.tile_w as usize;
+                let p00 = (ly as usize) * tw + (lx as usize);
+                return Some((bidx, p00, p00 + tw));
+            }
+        }
+        None
+    }
 }
