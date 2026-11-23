@@ -85,6 +85,7 @@ pub struct EngineStats {
     pub tiles_served: AtomicU64,
     pub empty_short_circuits: AtomicU64,
     pub passthrough_hits: AtomicU64,
+    pub http_304_not_modified: AtomicU64,
 }
 
 pub struct TileEngine {

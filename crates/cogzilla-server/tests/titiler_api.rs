@@ -517,5 +517,51 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .unwrap();
             assert_eq!(missing_resp.status(), 404);
         }
+
+        // --------------------------------------------------------------------
+        // 18. HTTP Caching (ETag, Cache-Control, If-None-Match -> 304) & /metrics
+        // --------------------------------------------------------------------
+        {
+            let tile_url = format!(
+                "{base}/cog/tiles/WebMercatorQuad/12/655/1583.png?url={merc_url}&rescale=0,2500&colormap_name=viridis"
+            );
+            let r1 = client.get(&tile_url).send().await.unwrap();
+            assert_eq!(r1.status(), 200);
+            let etag = r1
+                .headers()
+                .get("etag")
+                .expect("ETag header missing")
+                .to_str()
+                .unwrap()
+                .to_string();
+            let cc = r1
+                .headers()
+                .get("cache-control")
+                .expect("Cache-Control header missing")
+                .to_str()
+                .unwrap();
+            assert!(cc.contains("public"), "unexpected Cache-Control: {cc}");
+            let _ = r1.bytes().await.unwrap();
+
+            // Conditional GET with If-None-Match -> 304 Not Modified with empty body
+            let r2 = client
+                .get(&tile_url)
+                .header("If-None-Match", &etag)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r2.status(), 304);
+            assert!(r2.bytes().await.unwrap().is_empty());
+
+            // Prometheus /metrics exposition
+            let m = client.get(format!("{base}/metrics")).send().await.unwrap();
+            assert_eq!(m.status(), 200);
+            let ct = m.headers().get("content-type").unwrap().to_str().unwrap();
+            assert!(ct.starts_with("text/plain"));
+            let body = m.text().await.unwrap();
+            assert!(body.contains("cogzilla_tiles_served_total "));
+            assert!(body.contains("cogzilla_http_304_not_modified_total 1"));
+            assert!(body.contains("cogzilla_tile_cache_coalesced_total "));
+        }
     }
 }

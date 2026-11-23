@@ -10,7 +10,9 @@ use cogzilla_kernel::{
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
+use hyper::header::{
+    ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH,
+};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -527,6 +529,11 @@ pub async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("127.0.0.1:8080")
         .to_string();
+    let if_none_match = req
+        .headers()
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
@@ -613,6 +620,7 @@ pub async fn handle_request(
             "tiles_served": engine.stats.tiles_served.load(Ordering::Relaxed),
             "empty_short_circuits": engine.stats.empty_short_circuits.load(Ordering::Relaxed),
             "passthrough_hits": engine.stats.passthrough_hits.load(Ordering::Relaxed),
+            "http_304_not_modified": engine.stats.http_304_not_modified.load(Ordering::Relaxed),
             "cache_hits": engine.store.cache.hits.load(Ordering::Relaxed),
             "cache_misses": engine.store.cache.misses.load(Ordering::Relaxed),
             "singleflight_coalesced": engine.store.cache.coalesced_waiters.load(Ordering::Relaxed),
@@ -630,6 +638,15 @@ pub async fn handle_request(
         })
         .to_string();
         return Ok(plain_resp(StatusCode::OK, Bytes::from(body), "application/json"));
+    }
+
+    if method == Method::GET && path == "/metrics" {
+        let prom = render_prometheus_metrics(&engine);
+        return Ok(plain_resp(
+            StatusCode::OK,
+            Bytes::from(prom),
+            "text/plain; version=0.0.4; charset=utf-8",
+        ));
     }
 
     if method == Method::POST && path == "/admin/clear-cache" {
@@ -691,7 +708,7 @@ pub async fn handle_request(
                 "invalid /mosaic/tiles coordinate path".into(),
             )),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(2) == Some(&"tiles") {
@@ -737,7 +754,7 @@ pub async fn handle_request(
                 "invalid /mosaic/{name}/tiles coordinate path".into(),
             )),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     // ------------------------------------------------------------------------
@@ -783,7 +800,7 @@ pub async fn handle_request(
                 "expected /tiles/{dataset}/{z}/{x}/{y}.{png|webp|f32}".to_string(),
             )),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     // ------------------------------------------------------------------------
@@ -804,7 +821,7 @@ pub async fn handle_request(
             }
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     // ------------------------------------------------------------------------
@@ -821,7 +838,7 @@ pub async fn handle_request(
             }
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     // ------------------------------------------------------------------------
@@ -1286,7 +1303,7 @@ pub async fn handle_request(
 
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     // ------------------------------------------------------------------------
@@ -1736,7 +1753,7 @@ pub async fn handle_request(
 
             _ => Err(EngineError::NotFound(path)),
         };
-        return Ok(to_http_response(res));
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
     Ok(plain_resp(
@@ -1746,9 +1763,143 @@ pub async fn handle_request(
     ))
 }
 
-fn to_http_response(res: Result<(Bytes, &'static str), EngineError>) -> Response<Full<Bytes>> {
+fn cache_control_header() -> &'static HeaderValue {
+    static VAL: std::sync::OnceLock<HeaderValue> = std::sync::OnceLock::new();
+    VAL.get_or_init(|| {
+        let secs: u64 = std::env::var("COGZILLA_CACHE_CONTROL_MAX_AGE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3600);
+        let s = if secs == 0 {
+            "no-cache".to_string()
+        } else {
+            format!("public, max-age={secs}")
+        };
+        HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600"))
+    })
+}
+
+/// Fast, deterministic FNV-1a 64-bit strong ETag for rendered tile bytes.
+fn compute_etag(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("\"cgz-{h:016x}-{}\"", bytes.len())
+}
+
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let trimmed = if_none_match.trim();
+    if trimmed == "*" {
+        return true;
+    }
+    for part in trimmed.split(',') {
+        let cand = part.trim().strip_prefix("W/").unwrap_or(part.trim());
+        if cand == etag {
+            return true;
+        }
+    }
+    false
+}
+
+fn render_prometheus_metrics(engine: &TileEngine) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(2048);
+    let _ = writeln!(out, "# HELP cogzilla_tiles_served_total Total tiles rendered or served.");
+    let _ = writeln!(out, "# TYPE cogzilla_tiles_served_total counter");
+    let _ = writeln!(out, "cogzilla_tiles_served_total {}", engine.stats.tiles_served.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# HELP cogzilla_empty_short_circuits_total Empty/nodata tiles short-circuited.");
+    let _ = writeln!(out, "# TYPE cogzilla_empty_short_circuits_total counter");
+    let _ = writeln!(out, "cogzilla_empty_short_circuits_total {}", engine.stats.empty_short_circuits.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# HELP cogzilla_passthrough_hits_total Zero-decode JPEG/WebP pass-through tiles.");
+    let _ = writeln!(out, "# TYPE cogzilla_passthrough_hits_total counter");
+    let _ = writeln!(out, "cogzilla_passthrough_hits_total {}", engine.stats.passthrough_hits.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# HELP cogzilla_http_304_not_modified_total Conditional GET 304 Not Modified responses.");
+    let _ = writeln!(out, "# TYPE cogzilla_http_304_not_modified_total counter");
+    let _ = writeln!(out, "cogzilla_http_304_not_modified_total {}", engine.stats.http_304_not_modified.load(Ordering::Relaxed));
+
+    let _ = writeln!(out, "# TYPE cogzilla_block_cache_hits_total counter");
+    let _ = writeln!(out, "cogzilla_block_cache_hits_total {}", engine.store.cache.hits.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_block_cache_misses_total counter");
+    let _ = writeln!(out, "cogzilla_block_cache_misses_total {}", engine.store.cache.misses.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_block_cache_coalesced_total counter");
+    let _ = writeln!(out, "cogzilla_block_cache_coalesced_total {}", engine.store.cache.coalesced_waiters.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_block_cache_bytes gauge");
+    let _ = writeln!(out, "cogzilla_block_cache_bytes {}", engine.store.cache.current_bytes());
+
+    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_hits_total counter");
+    let _ = writeln!(out, "cogzilla_tile_cache_hits_total {}", engine.tile_cache.hits.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_misses_total counter");
+    let _ = writeln!(out, "cogzilla_tile_cache_misses_total {}", engine.tile_cache.misses.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_coalesced_total counter");
+    let _ = writeln!(out, "cogzilla_tile_cache_coalesced_total {}", engine.tile_cache.coalesced.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_bytes gauge");
+    let _ = writeln!(out, "cogzilla_tile_cache_bytes {}", engine.tile_cache.current_bytes());
+
+    let _ = writeln!(out, "# TYPE cogzilla_upstream_limit gauge");
+    let _ = writeln!(out, "cogzilla_upstream_limit {}", engine.store.upstream_limiter.current_limit());
+    let _ = writeln!(out, "# TYPE cogzilla_upstream_in_flight gauge");
+    let _ = writeln!(out, "cogzilla_upstream_in_flight {}", engine.store.upstream_limiter.in_flight());
+    let _ = writeln!(out, "# TYPE cogzilla_upstream_throttles_total counter");
+    let _ = writeln!(out, "cogzilla_upstream_throttles_total {}", engine.store.upstream_limiter.throttle_events());
+    let _ = writeln!(out, "# TYPE cogzilla_remote_range_requests_total counter");
+    let _ = writeln!(out, "cogzilla_remote_range_requests_total {}", engine.store.metrics.remote_range_requests.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# TYPE cogzilla_remote_bytes_fetched_total counter");
+    let _ = writeln!(out, "cogzilla_remote_bytes_fetched_total {}", engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed));
+
+    if let Some(dc) = &engine.store.disk_cache {
+        let s = dc.stats();
+        let _ = writeln!(out, "# TYPE cogzilla_disk_cache_hits_total counter");
+        let _ = writeln!(out, "cogzilla_disk_cache_hits_total {}", s.hits);
+        let _ = writeln!(out, "# TYPE cogzilla_disk_cache_misses_total counter");
+        let _ = writeln!(out, "cogzilla_disk_cache_misses_total {}", s.misses);
+        let _ = writeln!(out, "# TYPE cogzilla_disk_cache_bytes gauge");
+        let _ = writeln!(out, "cogzilla_disk_cache_bytes {}", s.bytes_used);
+    }
+    out
+}
+
+fn to_http_response(
+    engine: &TileEngine,
+    res: Result<(Bytes, &'static str), EngineError>,
+    if_none_match: Option<&str>,
+) -> Response<Full<Bytes>> {
     match res {
-        Ok((bytes, content_type)) => plain_resp(StatusCode::OK, bytes, content_type),
+        Ok((bytes, content_type)) => {
+            let is_binary_tile = content_type.starts_with("image/")
+                || content_type == "application/octet-stream";
+            if is_binary_tile {
+                let etag = compute_etag(&bytes);
+                if let Some(inm) = if_none_match {
+                    if etag_matches(inm, &etag) {
+                        engine
+                            .stats
+                            .http_304_not_modified
+                            .fetch_add(1, Ordering::Relaxed);
+                        let mut resp = Response::new(Full::new(Bytes::new()));
+                        *resp.status_mut() = StatusCode::NOT_MODIFIED;
+                        if let Ok(hv) = HeaderValue::from_str(&etag) {
+                            resp.headers_mut().insert(ETAG, hv);
+                        }
+                        resp.headers_mut()
+                            .insert(CACHE_CONTROL, cache_control_header().clone());
+                        resp.headers_mut()
+                            .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+                        return resp;
+                    }
+                }
+                let mut resp = plain_resp(StatusCode::OK, bytes, content_type);
+                if let Ok(hv) = HeaderValue::from_str(&etag) {
+                    resp.headers_mut().insert(ETAG, hv);
+                }
+                resp.headers_mut()
+                    .insert(CACHE_CONTROL, cache_control_header().clone());
+                resp
+            } else {
+                plain_resp(StatusCode::OK, bytes, content_type)
+            }
+        }
         Err(EngineError::NotFound(msg)) => {
             plain_resp(StatusCode::NOT_FOUND, Bytes::from(msg), "text/plain")
         }
