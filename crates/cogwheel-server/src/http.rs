@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use cogwheel_kernel::{ColormapName, ExprProgram, OutputFormat, ResampleMode, SpectralExpr};
-use cogwheel_proj::TileCoord;
+use cogwheel_kernel::{
+    ColorFormula, ColormapLut, ColormapName, ExprProgram, OutputFormat, ResampleMode, SpectralExpr,
+};
+use cogwheel_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
@@ -107,11 +109,19 @@ struct ParsedQuery {
     bidx: Vec<u16>,
     rescale: Vec<(f32, f32)>,
     colormap: ColormapName,
+    custom_colormap_json: Option<String>,
+    color_formula: Option<String>,
     resample: ResampleMode,
     tile_size: u32,
     max_size: u32,
     webp_quality: Option<f32>,
+    jpeg_quality: u8,
     expr_raw: Option<String>,
+    nodata: Option<f32>,
+    unscale: bool,
+    return_mask: bool,
+    buffer: u32,
+    coord_crs_3857: bool,
 }
 
 fn parse_query(q: Option<&str>) -> ParsedQuery {
@@ -120,11 +130,19 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         bidx: Vec::new(),
         rescale: Vec::new(),
         colormap: ColormapName::Viridis,
+        custom_colormap_json: None,
+        color_formula: None,
         resample: ResampleMode::Bilinear,
         tile_size: 256,
         max_size: 1024,
         webp_quality: None,
+        jpeg_quality: 85,
         expr_raw: None,
+        nodata: None,
+        unscale: false,
+        return_mask: true,
+        buffer: 0,
+        coord_crs_3857: false,
     };
     let Some(q) = q else { return pq };
     for pair in q.split('&') {
@@ -153,10 +171,42 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     }
                 }
             }
-            "colormap" | "colormap_name" => {
+            "colormap" => {
+                let dec = percent_decode(v);
+                if dec.trim_start().starts_with('{') {
+                    pq.custom_colormap_json = Some(dec);
+                } else if let Some(cm) = ColormapName::from_str_opt(&dec) {
+                    pq.colormap = cm;
+                }
+            }
+            "colormap_name" => {
                 if let Some(cm) = ColormapName::from_str_opt(&percent_decode(v)) {
                     pq.colormap = cm;
                 }
+            }
+            "color_formula" => {
+                pq.color_formula = Some(percent_decode(v));
+            }
+            "nodata" => {
+                let dec = percent_decode(v);
+                if let Ok(nd) = dec.parse::<f32>() {
+                    pq.nodata = Some(nd);
+                }
+            }
+            "unscale" => {
+                pq.unscale = v.eq_ignore_ascii_case("true") || v == "1";
+            }
+            "return_mask" => {
+                pq.return_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
+            }
+            "buffer" => {
+                if let Ok(buf) = v.parse::<f32>() {
+                    pq.buffer = buf.round().clamp(0.0, 256.0) as u32;
+                }
+            }
+            "coord_crs" => {
+                let dec = percent_decode(v);
+                pq.coord_crs_3857 = dec.contains("3857");
             }
             "resample" | "resampling" => {
                 pq.resample = match v {
@@ -186,6 +236,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if v != "lossless" {
                     if let Ok(qual) = v.parse::<f32>() {
                         pq.webp_quality = Some(qual.clamp(1.0, 100.0));
+                        pq.jpeg_quality = qual.round().clamp(1.0, 100.0) as u8;
                     }
                 }
             }
@@ -198,7 +249,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     pq
 }
 
-fn parse_ext_format(ext: &str, webp_quality: Option<f32>) -> Result<(OutputFormat, &'static str), EngineError> {
+fn parse_ext_format(
+    ext: &str,
+    webp_quality: Option<f32>,
+    jpeg_quality: u8,
+) -> Result<(OutputFormat, &'static str), EngineError> {
     match ext {
         "png" | "" => Ok((OutputFormat::Png, "image/png")),
         "webp" => Ok((
@@ -207,10 +262,46 @@ fn parse_ext_format(ext: &str, webp_quality: Option<f32>) -> Result<(OutputForma
             },
             "image/webp",
         )),
+        "jpg" | "jpeg" => Ok((OutputFormat::Jpeg { quality: jpeg_quality }, "image/jpeg")),
         "f32" | "bin" | "raw" | "npy" => Ok((OutputFormat::RawF32, "application/octet-stream")),
         other => Err(EngineError::BadRequest(format!(
-            "unsupported format '.{other}' (use .png, .webp, or .f32)"
+            "unsupported format '.{other}' (use .png, .webp, .jpg, or .f32)"
         ))),
+    }
+}
+
+/// Fold GDAL `scale`/`offset` into rescale bounds when `?unscale=true` (zero per-pixel cost!).
+fn apply_unscale(bands: &mut BandRequest, scales: &[f32], offsets: &[f32]) {
+    let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+        let i = b1.saturating_sub(1) as usize;
+        let sc = scales.get(i).copied().unwrap_or(1.0);
+        let off = offsets.get(i).copied().unwrap_or(0.0);
+        if (sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9 {
+            (mn, mx)
+        } else {
+            ((mn - off) / sc, (mx - off) / sc)
+        }
+    };
+    match bands {
+        BandRequest::Single {
+            band_1based,
+            rescale,
+            ..
+        } => {
+            *rescale = adj(*band_1based, rescale.0, rescale.1);
+        }
+        BandRequest::Rgb {
+            bands_1based,
+            rescale_min,
+            rescale_max,
+        } => {
+            for k in 0..3 {
+                let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                rescale_min[k] = mn;
+                rescale_max[k] = mx;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -325,7 +416,7 @@ fn build_tile_request(
     pq: &ParsedQuery,
     default_bands: u16,
 ) -> Result<(TileRequest, &'static str), EngineError> {
-    let (format, content_type) = parse_ext_format(ext, pq.webp_quality)?;
+    let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands)?;
     let tile_size = match scale_opt {
         Some(2) => 512,
@@ -342,6 +433,29 @@ fn build_tile_request(
         },
         content_type,
     ))
+}
+
+fn world_crs84_tile_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
+    let cols = (1u64 << (z as u32 + 1)) as f64;
+    let rows = (1u64 << (z as u32)) as f64;
+    let lon_span = 360.0 / cols;
+    let lat_span = 180.0 / rows;
+    let pad_lon = lon_span * (buffer as f64 / tile_size as f64);
+    let pad_lat = lat_span * (buffer as f64 / tile_size as f64);
+    let min_lon = -180.0 + (x as f64) * lon_span - pad_lon;
+    let max_lon = min_lon + lon_span + 2.0 * pad_lon;
+    let max_lat = 90.0 - (y as f64) * lat_span + pad_lat;
+    let min_lat = max_lat - lat_span - 2.0 * pad_lat;
+    [min_lon, min_lat, max_lon, max_lat]
+}
+
+fn web_mercator_buffered_wgs84_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
+    let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
+    let pad_x = (max_x - min_x) * (buffer as f64 / tile_size as f64);
+    let pad_y = (max_y - min_y) * (buffer as f64 / tile_size as f64);
+    let (w, s) = mercator_to_lonlat_deg(min_x - pad_x, min_y - pad_y);
+    let (e, n) = mercator_to_lonlat_deg(max_x + pad_x, max_y + pad_y);
+    [w, s, e, n]
 }
 
 fn plain_resp(
@@ -492,11 +606,48 @@ pub async fn handle_request(
             }
             .await,
 
-            // 3. GET / POST /cog/statistics
-            (Method::GET | Method::POST, ["statistics"]) => async {
+            // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
+            (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = compute_statistics(&engine, &cogs[0], pq.max_size).await?;
+                let json = compute_statistics(&engine, &cogs[0], pq.max_size, None, pq.unscale).await?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
+            }
+            .await,
+            (Method::POST, ["statistics"]) => async {
+                let body_bytes = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
+                    .to_bytes();
+                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                if body_bytes.is_empty() {
+                    let json =
+                        compute_statistics(&engine, &cogs[0], pq.max_size, None, pq.unscale).await?;
+                    Ok((Bytes::from(json.to_string()), "application/json"))
+                } else {
+                    let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
+                        .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
+                    let (mask, _) = PolygonMask::from_geojson(&geojson)?;
+                    let stats =
+                        compute_statistics(&engine, &cogs[0], pq.max_size, Some(&mask), pq.unscale)
+                            .await?;
+                    if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                        if let Some(props) = geojson.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = geojson.as_object_mut() {
+                            obj.insert("properties".into(), serde_json::json!({"statistics": stats}));
+                        }
+                        Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                    } else {
+                        let feat = serde_json::json!({
+                            "type": "Feature",
+                            "geometry": geojson,
+                            "properties": { "statistics": stats },
+                        });
+                        Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                    }
+                }
             }
             .await,
 
@@ -508,6 +659,11 @@ pub async fn handle_request(
                             "title": "WebMercatorQuad",
                             "id": "WebMercatorQuad",
                             "crs": "http://www.opengis.net/def/crs/EPSG/0/3857"
+                        },
+                        {
+                            "title": "WorldCRS84Quad",
+                            "id": "WorldCRS84Quad",
+                            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
                         }
                     ]
                 })
@@ -517,10 +673,15 @@ pub async fn handle_request(
 
             // 5. GET /cog/tiles/{tileMatrixSetId}
             (Method::GET, ["tiles", tms]) => {
+                let crs_uri = if *tms == "WorldCRS84Quad" {
+                    "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+                } else {
+                    "http://www.opengis.net/def/crs/EPSG/0/3857"
+                };
                 let body = serde_json::json!({
                     "id": tms,
                     "title": tms,
-                    "crs": "http://www.opengis.net/def/crs/EPSG/0/3857",
+                    "crs": crs_uri,
                     "dataType": "map",
                 })
                 .to_string();
@@ -528,7 +689,7 @@ pub async fn handle_request(
             }
 
             // 6 & 7. GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{format}]
-            (Method::GET, ["tiles", _tms, zs, xs, ys]) => async {
+            (Method::GET, ["tiles", tms, zs, xs, ys]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let (Some(z), Some(x), Some((y, sc, ext))) = (
                     zs.parse::<u8>().ok(),
@@ -542,9 +703,58 @@ pub async fn handle_request(
                 } else {
                     cogs[0].index.full_res().samples_per_pixel
                 };
-                let (treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db)?;
-                let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                Ok((data, ct))
+                let (mut treq, ct) = build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut treq.bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+
+                let needs_general_path = *tms == "WorldCRS84Quad"
+                    || pq.buffer > 0
+                    || pq.nodata.is_some()
+                    || pq.custom_colormap_json.is_some()
+                    || pq.color_formula.is_some()
+                    || !pq.return_mask;
+
+                if needs_general_path {
+                    let custom_lut = pq
+                        .custom_colormap_json
+                        .as_deref()
+                        .map(ColormapLut::from_json_str)
+                        .transpose()
+                        .map_err(EngineError::BadRequest)?;
+                    let cf = pq
+                        .color_formula
+                        .as_deref()
+                        .map(ColorFormula::parse)
+                        .transpose()
+                        .map_err(EngineError::BadRequest)?;
+                    let out_dim = treq.tile_size + 2 * pq.buffer;
+                    let bbox = if *tms == "WorldCRS84Quad" {
+                        world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size)
+                    } else {
+                        web_mercator_buffered_wgs84_bbox(z, x, y, pq.buffer, treq.tile_size)
+                    };
+                    let data = render_wgs84_bbox(
+                        &engine,
+                        &cogs,
+                        bbox,
+                        out_dim,
+                        out_dim,
+                        None,
+                        &treq.bands,
+                        treq.resample,
+                        treq.format,
+                        pq.nodata,
+                        custom_lut.as_ref(),
+                        cf.as_ref(),
+                        pq.return_mask,
+                    )
+                    .await?;
+                    Ok((data, ct))
+                } else {
+                    let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                    Ok((data, ct))
+                }
             }
             .await,
 
@@ -589,14 +799,19 @@ pub async fn handle_request(
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
 
-            // 10. GET /cog/point/{lon},{lat}
+            // 10. GET /cog/point/{lon},{lat} (supports coord_crs=EPSG:3857)
             (Method::GET, ["point", coord]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let Some((lons, lats)) = coord.split_once(',') else {
                     return Err(EngineError::BadRequest("expected /cog/point/{lon},{lat}".into()));
                 };
-                let (Ok(lon), Ok(lat)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
+                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
                     return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
+                };
+                let (lon, lat) = if pq.coord_crs_3857 {
+                    mercator_to_lonlat_deg(x, y)
+                } else {
+                    (x, y)
                 };
                 let json = query_point(&engine, &cogs[0], lon, lat).await?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
@@ -614,10 +829,16 @@ pub async fn handle_request(
                 let out_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality)?;
-                let bands = build_band_request(&pq, db)?;
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -632,10 +853,16 @@ pub async fn handle_request(
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality)?;
-                let bands = build_band_request(&pq, db)?;
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -644,35 +871,57 @@ pub async fn handle_request(
 
             // 12. GET /cog/bbox/{minx},{miny},{maxx},{maxy}[.{format}] & /cog/bbox/{...}/{w}x{h}.{format}
             (Method::GET, ["bbox", bbox_seg]) => async {
-                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((mut bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("expected /cog/bbox/{minx},{miny},{maxx},{maxy}.{ext}".into()));
                 };
+                if pq.coord_crs_3857 {
+                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
+                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
+                    bbox = [w, s, e, n];
+                }
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq.webp_quality)?;
-                let bands = build_band_request(&pq, db)?;
+                let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, None, &bands, pq.resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
             }
             .await,
             (Method::GET, ["bbox", bbox_seg, dims_ext]) => async {
-                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((mut bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox coordinates".into()));
                 };
+                if pq.coord_crs_3857 {
+                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
+                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
+                    bbox = [w, s, e, n];
+                }
                 let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality)?;
-                let bands = build_band_request(&pq, db)?;
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -694,10 +943,16 @@ pub async fn handle_request(
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality)?;
-                let bands = build_band_request(&pq, db)?;
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, Some(&mask), &bands, pq.resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -719,10 +974,16 @@ pub async fn handle_request(
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality)?;
-                let bands = build_band_request(&pq, db)?;
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db)?;
+                if pq.unscale {
+                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                }
+                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq.resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
                 )
                 .await?;
                 Ok((data, ct))

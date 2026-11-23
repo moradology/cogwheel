@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use cogwheel_io::OpenedCog;
-use cogwheel_kernel::png_fast::{encode_filtered_png, filter_sub_rgba_row};
-use cogwheel_kernel::webp_fast::encode_webp_rgba;
-use cogwheel_kernel::{BandSource, OutputFormat, ResampleMode, fast_db_from_power};
+use cogwheel_kernel::jpeg_fast::{encode_jpeg_rgb, encode_jpeg_rgba};
+use cogwheel_kernel::png_fast::{encode_filtered_png, filter_sub_rgb_row, filter_sub_rgba_row};
+use cogwheel_kernel::webp_fast::{encode_webp_rgb, encode_webp_rgba};
+use cogwheel_kernel::{
+    BandSource, ColorFormula, ColormapLut, OutputFormat, ResampleMode, fast_db_from_power,
+};
 use cogwheel_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
@@ -207,12 +210,15 @@ pub async fn query_point(
 }
 
 /// TiTiler-compatible `/cog/statistics` computed from the coarsest overview <= `max_size`.
+/// When `poly_mask` is `Some`, clips statistics strictly to pixels inside the posted GeoJSON polygon.
 pub async fn compute_statistics(
     engine: &TileEngine,
     cog: &OpenedCog,
     max_size: u32,
+    poly_mask: Option<&PolygonMask>,
+    unscale: bool,
 ) -> Result<serde_json::Value, EngineError> {
-    // Pick finest IFD whose max dimension <= max_size, or coarsest overview
+    let crs = engine.get_or_build_crs(cog)?;
     let mut ifd_idx = cog.index.ifds.len() - 1;
     for (i, ifd) in cog.index.ifds.iter().enumerate() {
         if ifd.width.max(ifd.height) <= max_size {
@@ -223,6 +229,7 @@ pub async fn compute_statistics(
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
     let total_pixels = (ifd.width as usize) * (ifd.height as usize);
+    let mut mask_total_pixels = 0usize;
 
     let mut per_band: Vec<Vec<f32>> = vec![Vec::with_capacity(total_pixels); count];
     match ifd.planar_config {
@@ -241,15 +248,25 @@ pub async fn compute_statistics(
                 let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
                 let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                 let tw = ifd.tile_width as usize;
-                for b in 0..count {
-                    let band = &tile.bands[b];
-                    if band.stats.all_nodata {
-                        continue;
-                    }
-                    for ly in 0..y_max {
-                        let row = &band.data[ly * tw..ly * tw + x_max];
-                        for &v in row {
+                for ly in 0..y_max {
+                    let row_pix = (ty * ifd.tile_height) as usize + ly;
+                    for lx in 0..x_max {
+                        let col_pix = (tx * ifd.tile_width) as usize + lx;
+                        if let Some(pm) = poly_mask {
+                            let (sx, sy) = ifd.pixel_to_crs.forward(col_pix as f64 + 0.5, row_pix as f64 + 0.5);
+                            let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+                            if !pm.contains(lon, lat) {
+                                continue;
+                            }
+                            mask_total_pixels += 1;
+                        }
+                        let pidx = ly * tw + lx;
+                        for b in 0..count {
+                            let mut v = tile.bands[b].data[pidx];
                             if v.is_finite() {
+                                if unscale {
+                                    v = v * cog.index.scales[b] + cog.index.offsets[b];
+                                }
                                 per_band[b].push(v);
                             }
                         }
@@ -278,9 +295,24 @@ pub async fn compute_statistics(
                     let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                     let tw = ifd.tile_width as usize;
                     for ly in 0..y_max {
-                        let row = &band.data[ly * tw..ly * tw + x_max];
-                        for &v in row {
+                        let row_pix = (ty * ifd.tile_height) as usize + ly;
+                        for lx in 0..x_max {
+                            let col_pix = (tx * ifd.tile_width) as usize + lx;
+                            if let Some(pm) = poly_mask {
+                                let (sx, sy) = ifd.pixel_to_crs.forward(col_pix as f64 + 0.5, row_pix as f64 + 0.5);
+                                let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+                                if !pm.contains(lon, lat) {
+                                    continue;
+                                }
+                                if b == 0 {
+                                    mask_total_pixels += 1;
+                                }
+                            }
+                            let mut v = band.data[ly * tw + lx];
                             if v.is_finite() {
+                                if unscale {
+                                    v = v * cog.index.scales[b] + cog.index.offsets[b];
+                                }
                                 per_band[b].push(v);
                             }
                         }
@@ -290,12 +322,18 @@ pub async fn compute_statistics(
         }
     }
 
+    let denom_pixels = if poly_mask.is_some() {
+        mask_total_pixels.max(1)
+    } else {
+        total_pixels
+    };
+
     let mut out = serde_json::Map::new();
     for (b, vals) in per_band.iter_mut().enumerate() {
         let valid_px = vals.len();
-        let masked_px = total_pixels.saturating_sub(valid_px);
-        let valid_pct = if total_pixels > 0 {
-            (valid_px as f64 / total_pixels as f64) * 100.0
+        let masked_px = denom_pixels.saturating_sub(valid_px);
+        let valid_pct = if denom_pixels > 0 {
+            (valid_px as f64 / denom_pixels as f64) * 100.0
         } else {
             0.0
         };
@@ -492,7 +530,10 @@ impl PolygonMask {
     }
 }
 
-/// Arbitrary-dimensions WGS84 bounding-box renderer backing `/cog/preview`, `/cog/bbox`, and `POST /cog/feature`.
+/// Arbitrary-dimensions WGS84 bounding-box renderer backing `/cog/preview`, `/cog/bbox`,
+/// `POST /cog/feature`, `WorldCRS84Quad` tiles, and custom post-processing (`color_formula`,
+/// custom JSON `?colormap=`, `?return_mask=false`, `?nodata=`, `?buffer=`).
+#[allow(clippy::too_many_arguments)]
 pub async fn render_wgs84_bbox(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
@@ -503,6 +544,10 @@ pub async fn render_wgs84_bbox(
     bands: &BandRequest,
     resample: ResampleMode,
     format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&ColormapLut>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
 ) -> Result<Bytes, EngineError> {
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
@@ -565,6 +610,9 @@ pub async fn render_wgs84_bbox(
             OutputFormat::Png => encode_filtered_png(w as u32, h as u32, 6, &raw),
             OutputFormat::Webp { quality } => {
                 encode_webp_rgba(w as u32, h as u32, &vec![0u8; w * h * 4], quality)
+            }
+            OutputFormat::Jpeg { quality } => {
+                encode_jpeg_rgb(w as u32, h as u32, &vec![0u8; w * h * 3], quality)
             }
             OutputFormat::RawF32 => {
                 let mut b = BytesMut::with_capacity(w * h * 4);
@@ -659,8 +707,9 @@ pub async fn render_wgs84_bbox(
             let src = BandSource::new(
                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
                 &refs,
-            );
-            let lut = colormap.lut();
+            )
+            .with_nodata_override(nodata_override);
+            let lut = custom_lut.unwrap_or_else(|| colormap.lut());
             let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
             for i in 0..(w * h) {
                 let v = sample(&src, u_map[i], v_map[i]);
@@ -786,8 +835,9 @@ pub async fn render_wgs84_bbox(
             let src = BandSource::new(
                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
                 &refs,
-            );
-            let lut = colormap.lut();
+            )
+            .with_nodata_override(nodata_override);
+            let lut = custom_lut.unwrap_or_else(|| colormap.lut());
             let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
             for i in 0..(w * h) {
                 let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
@@ -876,19 +926,58 @@ pub async fn render_wgs84_bbox(
         }
     }
 
+    if let Some(cf) = color_formula {
+        cf.apply_buffer_in_place(&mut rgba, 4);
+    }
+
     match format {
         OutputFormat::Png => {
-            let stride = 1 + w * 4;
-            let mut filtered = vec![0u8; h * stride];
-            for py in 0..h {
-                filter_sub_rgba_row(
-                    &rgba[py * w * 4..(py + 1) * w * 4],
-                    &mut filtered[py * stride..(py + 1) * stride],
-                );
+            if !return_mask {
+                let mut rgb = vec![0u8; w * h * 3];
+                for i in 0..(w * h) {
+                    if rgba[i * 4 + 3] != 0 {
+                        rgb[i * 3] = rgba[i * 4];
+                        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+                        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+                    }
+                }
+                let stride = 1 + w * 3;
+                let mut filtered = vec![0u8; h * stride];
+                for py in 0..h {
+                    filter_sub_rgb_row(
+                        &rgb[py * w * 3..(py + 1) * w * 3],
+                        &mut filtered[py * stride..(py + 1) * stride],
+                    );
+                }
+                Ok(encode_filtered_png(w as u32, h as u32, 2, &filtered))
+            } else {
+                let stride = 1 + w * 4;
+                let mut filtered = vec![0u8; h * stride];
+                for py in 0..h {
+                    filter_sub_rgba_row(
+                        &rgba[py * w * 4..(py + 1) * w * 4],
+                        &mut filtered[py * stride..(py + 1) * stride],
+                    );
+                }
+                Ok(encode_filtered_png(w as u32, h as u32, 6, &filtered))
             }
-            Ok(encode_filtered_png(w as u32, h as u32, 6, &filtered))
         }
-        OutputFormat::Webp { quality } => Ok(encode_webp_rgba(w as u32, h as u32, &rgba, quality)),
+        OutputFormat::Webp { quality } => {
+            if !return_mask {
+                let mut rgb = vec![0u8; w * h * 3];
+                for i in 0..(w * h) {
+                    if rgba[i * 4 + 3] != 0 {
+                        rgb[i * 3] = rgba[i * 4];
+                        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+                        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+                    }
+                }
+                Ok(encode_webp_rgb(w as u32, h as u32, &rgb, quality))
+            } else {
+                Ok(encode_webp_rgba(w as u32, h as u32, &rgba, quality))
+            }
+        }
+        OutputFormat::Jpeg { quality } => Ok(encode_jpeg_rgba(w as u32, h as u32, &rgba, quality)),
         OutputFormat::RawF32 => Ok(Bytes::from(rgba)),
     }
 }

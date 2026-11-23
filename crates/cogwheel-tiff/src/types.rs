@@ -228,6 +228,10 @@ pub struct CogIndex {
     /// `None` means no explicit GDAL_NODATA tag (NaN is still always treated as nodata).
     /// `Some(v)` where `v.is_nan()` means explicit NaN nodata; finite `v` means sentinel nodata.
     pub nodata: Option<f32>,
+    /// Per-band scale factors parsed from `GDAL_METADATA` (defaults to `1.0` per band).
+    pub scales: Vec<f32>,
+    /// Per-band additive offsets parsed from `GDAL_METADATA` (defaults to `0.0` per band).
+    pub offsets: Vec<f32>,
     pub geo_keys: GeoKeys,
     /// IFDs sorted from highest resolution (index 0) to lowest resolution overview.
     pub ifds: Vec<IfdMeta>,

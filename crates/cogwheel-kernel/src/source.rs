@@ -15,6 +15,8 @@ pub struct BandSource<'a> {
     pub blocks: &'a [Option<&'a DecodedBand>],
     pub all_nodata: bool,
     pub no_nodata: bool,
+    /// Optional runtime `?nodata=` override; when `Some(nd)`, values equal to `nd` become `NaN`.
+    pub nodata_override: Option<f32>,
     /// Fast path when tile_w/tile_h are powers of two (e.g. 256 or 512).
     shift_x: Option<u32>,
     mask_x: u32,
@@ -63,11 +65,23 @@ impl<'a> BandSource<'a> {
             blocks,
             all_nodata,
             no_nodata,
+            nodata_override: None,
             shift_x: tile_w.is_power_of_two().then(|| tile_w.trailing_zeros()),
             mask_x: tile_w.wrapping_sub(1),
             shift_y: tile_h.is_power_of_two().then(|| tile_h.trailing_zeros()),
             mask_y: tile_h.wrapping_sub(1),
         }
+    }
+
+    #[inline(always)]
+    pub fn with_nodata_override(mut self, nodata: Option<f32>) -> Self {
+        if let Some(nd) = nodata {
+            if !nd.is_nan() {
+                self.nodata_override = Some(nd);
+                self.no_nodata = false;
+            }
+        }
+        self
     }
 
     /// Sample source pixel `(col, row)` with bounds check. Out-of-bounds returns `f32::NAN`.
@@ -76,7 +90,13 @@ impl<'a> BandSource<'a> {
         if col < 0 || row < 0 || col >= self.ifd_w || row >= self.ifd_h {
             return f32::NAN;
         }
-        self.sample_inbounds(col as u32, row as u32)
+        let v = self.sample_inbounds(col as u32, row as u32);
+        if let Some(nd) = self.nodata_override {
+            if v == nd {
+                return f32::NAN;
+            }
+        }
+        v
     }
 
     /// Sample source pixel `(col, row)` guaranteed in `[0..ifd_w, 0..ifd_h]`.

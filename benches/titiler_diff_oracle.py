@@ -207,11 +207,16 @@ def main():
             ("GET /cog/info.geojson", "GET", f"/cog/info.geojson?url={sat}", None, "json_geojson"),
             ("GET /cog/WebMercatorQuad/tilejson.json", "GET", f"/cog/WebMercatorQuad/tilejson.json?url={sat}", None, "json_tj"),
             ("GET /cog/tiles/WebMercatorQuad/12/652/1583.png (Sat RGB)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&resampling=bilinear", None, "png"),
-            ("GET /cog/tiles/WebMercatorQuad/12/652/1583.png?scale=2 (512px)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&scale=2&bidx=1&bidx=2&bidx=3&rescale=0,0.35&resampling=bilinear", None, "png"),
+            ("GET /cog/tiles/.../12/652/1583.jpg (JPEG output)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.jpg?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&resampling=bilinear", None, "png"),
+            ("GET /cog/tiles/...?return_mask=false (Opaque RGB)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&return_mask=false", None, "png"),
+            ("GET /cog/tiles/...?color_formula=Gamma RGB 1.5", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&color_formula=Gamma%20RGB%201.5", None, "png"),
+            ("GET /cog/tiles/WorldCRS84Quad/10/325/297.png (CRS84)", "GET", f"/cog/tiles/WorldCRS84Quad/10/325/297.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "png"),
             ("GET /cog/tiles/...?expression=(b1-b2)/(b1+b2)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&expression=(b1-b2)/(b1%2Bb2)&rescale=-0.5,0.5&colormap_name=viridis&resampling=bilinear", None, "png"),
             ("GET /cog/tiles/WebMercatorQuad/12/657/1582.png (Mercator)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&rescale=0,1000&colormap_name=viridis&resampling=bilinear", None, "png"),
             ("GET /cog/point/-122.65,37.773", "GET", f"/cog/point/-122.65,37.773?url={sat}", None, "json_point"),
+            ("GET /cog/point (coord_crs=EPSG:3857)", "GET", f"/cog/point/-13653336.0,4547451.0?url={sat}&coord_crs=EPSG:3857", None, "json_point"),
             ("GET /cog/statistics?max_size=512", "GET", f"/cog/statistics?url={sat}&max_size=512", None, "json_stats"),
+            ("POST /cog/statistics (GeoJSON Polygon clip)", "POST", f"/cog/statistics?url={sat}&max_size=512", poly_feature, "json_post_stats"),
             ("GET /cog/preview/256x256.png", "GET", f"/cog/preview/256x256.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "png"),
             ("GET /cog/bbox/.../256x256.png", "GET", f"/cog/bbox/-122.8,37.6,-122.5,37.9/256x256.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "png"),
             ("POST /cog/feature/256x256.png", "POST", f"/cog/feature/256x256.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", poly_feature, "png"),
@@ -261,6 +266,11 @@ def main():
                     m_err = abs(j_cw["b1"]["mean"] - j_tt["b1"]["mean"])
                     s_err = abs(j_cw["b1"]["std"] - j_tt["b1"]["std"])
                     parity = f"b1.mean_err={m_err:.5f} b1.std_err={s_err:.5f}"
+                elif kind == "json_post_stats":
+                    j_cw, j_tt = r_cw.json()["properties"]["statistics"], r_tt.json()["properties"]["statistics"]
+                    m_err = abs(j_cw["b1"]["mean"] - j_tt["b1"]["mean"])
+                    s_err = abs(j_cw["b1"]["std"] - j_tt["b1"]["std"])
+                    parity = f"poly b1.mean_err={m_err:.5f} b1.std_err={s_err:.5f}"
                 else:
                     parity = "ok"
 

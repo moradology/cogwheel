@@ -4,8 +4,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use cogwheel_proj::{CoordPlan, GRID_DIM};
 
 use crate::bandmath::{SpectralExpr, fast_db_from_power};
-use crate::expr_vm::ExprProgram;
 use crate::colormap::{ColormapLut, ColormapName};
+use crate::expr_vm::ExprProgram;
+use crate::jpeg_fast::{empty_black_jpeg, encode_jpeg_rgb, encode_jpeg_rgba};
 use crate::png_fast::{
     empty_transparent_png, encode_filtered_png, filter_sub_rgb_row, filter_sub_rgba_row,
 };
@@ -23,6 +24,8 @@ pub enum OutputFormat {
     Png,
     /// `quality: None` = lossless WebP, `Some(q)` = lossy quality (e.g. `82.0`).
     Webp { quality: Option<f32> },
+    /// JPEG (lossy quality `1..=100`, default `85`).
+    Jpeg { quality: u8 },
     RawF32,
 }
 
@@ -354,6 +357,7 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
     match format {
         OutputFormat::Png => empty_transparent_png(tile_size),
         OutputFormat::Webp { .. } => empty_transparent_webp(tile_size),
+        OutputFormat::Jpeg { .. } => empty_black_jpeg(tile_size),
         OutputFormat::RawF32 => {
             let count = (tile_size as usize) * (tile_size as usize) * num_bands;
             let mut buf = BytesMut::with_capacity(count * 4);
@@ -456,7 +460,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total])
                     });
                 }
-                OutputFormat::Webp { quality } => {
+                OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => {
                     let lut: &ColormapLut = style.colormap.lut();
                     return SCRATCH.with(|cell| {
                         let mut guard = cell.borrow_mut();
@@ -493,7 +497,15 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                                 sc.img_buf[off + 2] = rgb[2];
                             }
                         }
-                        encode_webp_rgb(N as u32, N as u32, &sc.img_buf[..total], quality)
+                        match style.format {
+                            OutputFormat::Jpeg { quality: jq } => {
+                                encode_jpeg_rgb(N as u32, N as u32, &sc.img_buf[..total], jq)
+                            }
+                            OutputFormat::Webp { quality: wq } => {
+                                encode_webp_rgb(N as u32, N as u32, &sc.img_buf[..total], wq)
+                            }
+                            _ => unreachable!(),
+                        }
                     });
                 }
             }
@@ -571,7 +583,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                 }
             })
         }
-        OutputFormat::Webp { quality } => {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => {
             let lut: &ColormapLut = style.colormap.lut();
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
@@ -594,7 +606,15 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             buf[off + 2] = rgb[2];
                         });
                     }
-                    encode_webp_rgb(N as u32, N as u32, buf, quality)
+                    match style.format {
+                        OutputFormat::Jpeg { quality } => {
+                            encode_jpeg_rgb(N as u32, N as u32, buf, quality)
+                        }
+                        OutputFormat::Webp { quality } => {
+                            encode_webp_rgb(N as u32, N as u32, buf, quality)
+                        }
+                        _ => unreachable!(),
+                    }
                 } else {
                     let total = N * N * 4;
                     if sc.img_buf.len() < total {
@@ -616,7 +636,15 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             };
                         });
                     }
-                    encode_webp_rgba(N as u32, N as u32, buf, quality)
+                    match style.format {
+                        OutputFormat::Jpeg { quality } => {
+                            encode_jpeg_rgba(N as u32, N as u32, buf, quality)
+                        }
+                        OutputFormat::Webp { quality } => {
+                            encode_webp_rgba(N as u32, N as u32, buf, quality)
+                        }
+                        _ => unreachable!(),
+                    }
                 }
             })
         }
@@ -730,7 +758,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             }
         }),
-        OutputFormat::Webp { quality } => SCRATCH.with(|cell| {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let sc = &mut *guard;
             if CLEAN {
@@ -751,7 +779,15 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                         buf[off + 2] = rescale_u8(b, inv[2], mins[2]);
                     });
                 }
-                encode_webp_rgb(N as u32, N as u32, buf, quality)
+                match style.format {
+                    OutputFormat::Jpeg { quality } => {
+                        encode_jpeg_rgb(N as u32, N as u32, buf, quality)
+                    }
+                    OutputFormat::Webp { quality } => {
+                        encode_webp_rgb(N as u32, N as u32, buf, quality)
+                    }
+                    _ => unreachable!(),
+                }
             } else {
                 let total = N * N * 4;
                 if sc.img_buf.len() < total {
@@ -778,7 +814,15 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                         }
                     });
                 }
-                encode_webp_rgba(N as u32, N as u32, buf, quality)
+                match style.format {
+                    OutputFormat::Jpeg { quality } => {
+                        encode_jpeg_rgba(N as u32, N as u32, buf, quality)
+                    }
+                    OutputFormat::Webp { quality } => {
+                        encode_webp_rgba(N as u32, N as u32, buf, quality)
+                    }
+                    _ => unreachable!(),
+                }
             }
         }),
     }
@@ -862,7 +906,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             })
         }
-        OutputFormat::Webp { quality } => {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => {
             let lut: &ColormapLut = style.colormap.lut();
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
@@ -887,7 +931,15 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                         };
                     });
                 }
-                encode_webp_rgba(N as u32, N as u32, buf, quality)
+                match style.format {
+                    OutputFormat::Jpeg { quality } => {
+                        encode_jpeg_rgba(N as u32, N as u32, buf, quality)
+                    }
+                    OutputFormat::Webp { quality } => {
+                        encode_webp_rgba(N as u32, N as u32, buf, quality)
+                    }
+                    _ => unreachable!(),
+                }
             })
         }
     }
@@ -1017,7 +1069,7 @@ pub fn render_sar_rgb<const N: usize>(
             }
             encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
         }),
-        OutputFormat::Webp { quality } => SCRATCH.with(|cell| {
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let sc = &mut *guard;
             let total = N * N * 4;
@@ -1043,7 +1095,15 @@ pub fn render_sar_rgb<const N: usize>(
                     }
                 });
             }
-            encode_webp_rgba(N as u32, N as u32, buf, quality)
+            match style.format {
+                OutputFormat::Jpeg { quality } => {
+                    encode_jpeg_rgba(N as u32, N as u32, buf, quality)
+                }
+                OutputFormat::Webp { quality } => {
+                    encode_webp_rgba(N as u32, N as u32, buf, quality)
+                }
+                _ => unreachable!(),
+            }
         }),
     }
 }

@@ -22,6 +22,7 @@ const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
 const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
 const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
+const TAG_GDAL_METADATA: u16 = 42112;
 const TAG_GDAL_NODATA: u16 = 42113;
 
 // TIFF Field Types
@@ -352,6 +353,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     let mut ifds: Vec<IfdMeta> = Vec::with_capacity(8);
     let mut geo_keys = GeoKeys::default();
     let mut nodata: Option<f32> = None;
+    let mut gdal_metadata_xml: Option<String> = None;
     let mut base_affine: Option<Affine2D> = None;
     let mut base_dims: Option<(u32, u32)> = None;
 
@@ -435,6 +437,9 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                 }
                 TAG_GEO_DOUBLE_PARAMS if ifds.is_empty() => {
                     double_params = entry.read_f64_vec(&r)?;
+                }
+                TAG_GDAL_METADATA if ifds.is_empty() => {
+                    gdal_metadata_xml = Some(entry.read_ascii(&r)?);
                 }
                 TAG_GDAL_NODATA if ifds.is_empty() => {
                     let s = entry.read_ascii(&r)?;
@@ -580,11 +585,57 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let n_bands = ifds[0].samples_per_pixel as usize;
+    let mut scales = vec![1.0f32; n_bands];
+    let mut offsets = vec![0.0f32; n_bands];
+    if let Some(xml) = &gdal_metadata_xml {
+        parse_gdal_scale_offset(xml, &mut scales, &mut offsets);
+    }
+
     Ok(CogIndex {
         byte_order: bo,
         is_bigtiff,
         nodata,
+        scales,
+        offsets,
         geo_keys,
         ifds,
     })
+}
+
+/// Lightweight zero-dep extractor for `<Item name="SCALE" sample="0">...</Item>` and `OFFSET`
+/// inside TIFF tag 42112 (`GDAL_METADATA`).
+fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
+    let mut rest = xml;
+    while let Some(pos) = rest.find("<Item ") {
+        rest = &rest[pos + 6..];
+        let Some(tag_end) = rest.find('>') else { break };
+        let attrs = &rest[..tag_end];
+        rest = &rest[tag_end + 1..];
+        let Some(val_end) = rest.find("</Item>") else { break };
+        let val_str = rest[..val_end].trim();
+        rest = &rest[val_end + 7..];
+
+        let is_scale = attrs.contains("name=\"SCALE\"") || attrs.contains("name=\"scale\"");
+        let is_offset = attrs.contains("name=\"OFFSET\"") || attrs.contains("name=\"offset\"");
+        if !is_scale && !is_offset {
+            continue;
+        }
+        let Ok(v) = val_str.parse::<f32>() else {
+            continue;
+        };
+        let sample_idx = attrs.find("sample=\"").and_then(|sp| {
+            let s = &attrs[sp + 8..];
+            s.split('"').next()?.parse::<usize>().ok()
+        });
+        match sample_idx {
+            Some(idx) if idx < scales.len() => {
+                if is_scale { scales[idx] = v; } else { offsets[idx] = v; }
+            }
+            None => {
+                if is_scale { scales.fill(v); } else { offsets.fill(v); }
+            }
+            _ => {}
+        }
+    }
 }
