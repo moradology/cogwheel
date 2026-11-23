@@ -50,7 +50,7 @@ Request tiles from any COG over HTTP, S3, GCS or Azure Blob:
 GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=s3://your-bucket/your.tif
 ```
 
-Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda** `bootstrap` zips (`provided.al2023`, arm64 & x86_64, see [deploy/lambda/template.yaml](deploy/lambda/template.yaml)) are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source: `cargo build --release -p cogzilla-server` (or `-p cogzilla-lambda`).
+Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda** `bootstrap` zips (`provided.al2023`, arm64 & x86_64 — see the [AWS Lambda deploy guide](deploy/lambda/README.md)) are on the [releases page](https://github.com/moradology/cogzilla/releases/latest). To build from source: `cargo build --release -p cogzilla-server` (or `-p cogzilla-lambda`).
 
 ## What it does
 
@@ -75,6 +75,7 @@ Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` rou
 | :--- | :--- |
 | [API](docs/api.md) | Every route and parameter, example requests, and live demo links |
 | [Running and configuring](docs/configuration.md) | Flags, cache sizing, cloud credentials, and operational endpoints |
+| [AWS Lambda](deploy/lambda/README.md) | One-command deploy script, SAM template, and Terraform snippet |
 | [Benchmarks](docs/benchmarks.md) | Where each number comes from and what it does not show |
 | [How it works](docs/architecture.md) | Why there is no GDAL, the four pipeline stages, and the crates |
 
