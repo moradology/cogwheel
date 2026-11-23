@@ -101,10 +101,20 @@ impl SingleflightBlockCache {
         }
     }
 
-    /// Abort an in-flight fetch on error so waiters can retry cleanly.
+    /// Abort an in-flight fetch on error or cancellation so waiters can retry cleanly.
     pub fn abort(&self, key: &BlockKey) {
         if let Some((_, CacheEntry::InFlight(n))) = self.map.remove(key) {
             n.notify_waiters();
+        }
+    }
+
+    /// Create an RAII guard that automatically calls `abort(&key)` on `Drop` (e.g. HTTP client
+    /// disconnect or panic) unless `complete(tile)` is called.
+    pub fn guard(self: &Arc<Self>, key: BlockKey) -> InFlightGuard {
+        InFlightGuard {
+            cache: self.clone(),
+            key,
+            done: false,
         }
     }
 
@@ -137,6 +147,33 @@ impl SingleflightBlockCache {
             if self.map.remove(&k).is_some() {
                 self.current_bytes.fetch_sub(sz, Ordering::Relaxed);
             }
+        }
+    }
+}
+
+/// RAII guard guaranteeing an `InFlight` singleflight slot is always completed or aborted,
+/// even if the owning HTTP request future is cancelled/dropped mid-S3 fetch.
+pub struct InFlightGuard {
+    cache: Arc<SingleflightBlockCache>,
+    key: BlockKey,
+    done: bool,
+}
+
+impl InFlightGuard {
+    pub fn complete(mut self, tile: Arc<DecodedTile>) {
+        self.done = true;
+        self.cache.complete(self.key, tile);
+    }
+
+    pub fn key(&self) -> BlockKey {
+        self.key
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.cache.abort(&self.key);
         }
     }
 }

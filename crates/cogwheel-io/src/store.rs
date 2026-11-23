@@ -8,7 +8,7 @@ use cogwheel_tiff::{CogIndex, TiffError, parse_cog};
 use dashmap::DashMap;
 
 use crate::backend::{CogSource, IoError, IoMetrics, S3Config, TileByteReq, coalesce_ranges};
-use crate::cache::{BlockKey, LookupResult, SingleflightBlockCache};
+use crate::cache::{BlockKey, InFlightGuard, LookupResult, SingleflightBlockCache};
 
 const INITIAL_HEADER_FETCH_BYTES: u64 = 128 * 1024;
 const RANGE_GAP_THRESHOLD: u64 = 32 * 1024;
@@ -21,11 +21,16 @@ pub struct OpenedCog {
     pub source: CogSource,
 }
 
+enum OpenSlot {
+    Ready(Arc<OpenedCog>),
+    InFlight(Arc<tokio::sync::Notify>),
+}
+
 /// Manages opened COGs (local mmap + remote HTTP/S3) and the shared singleflight block cache.
 pub struct CogStore {
     next_id: AtomicU64,
     datasets_by_name: DashMap<String, Arc<OpenedCog>, ahash::RandomState>,
-    datasets_by_uri: DashMap<String, Arc<OpenedCog>, ahash::RandomState>,
+    datasets_by_uri: DashMap<String, OpenSlot, ahash::RandomState>,
     pub cache: Arc<SingleflightBlockCache>,
     pub client: reqwest::Client,
     pub s3_cfg: Option<S3Config>,
@@ -68,7 +73,7 @@ impl CogStore {
             source,
         });
         self.datasets_by_name.insert(name.into(), cog.clone());
-        self.datasets_by_uri.insert(uri, cog.clone());
+        self.datasets_by_uri.insert(uri, OpenSlot::Ready(cog.clone()));
         Ok(cog)
     }
 
@@ -77,58 +82,116 @@ impl CogStore {
     }
 
     /// Open (or fetch from metadata cache) any local path, `file://`, `http(s)://`, or `s3://` COG.
+    /// Singleflight-deduplicated so a 32-tile cold burst against a new S3 COG issues only 1 header GET.
     pub async fn open_uri(&self, uri: &str) -> Result<Arc<OpenedCog>, IoError> {
-        if let Some(existing) = self.datasets_by_uri.get(uri) {
-            return Ok(existing.clone());
-        }
+        loop {
+            if let Some(existing) = self.datasets_by_uri.get(uri) {
+                if let OpenSlot::Ready(cog) = existing.value() {
+                    return Ok(cog.clone());
+                }
+            }
 
-        let source = CogSource::open_remote(
-            uri,
-            self.client.clone(),
-            self.s3_cfg.clone(),
-            self.metrics.clone(),
-        )?;
+            let wait_notify = {
+                use dashmap::mapref::entry::Entry;
+                match self.datasets_by_uri.entry(uri.to_string()) {
+                    Entry::Occupied(occ) => match occ.get() {
+                        OpenSlot::Ready(cog) => return Ok(cog.clone()),
+                        OpenSlot::InFlight(n) => Some(n.clone()),
+                    },
+                    Entry::Vacant(vac) => {
+                        vac.insert(OpenSlot::InFlight(Arc::new(tokio::sync::Notify::new())));
+                        None
+                    }
+                }
+            };
 
-        let index = match &source {
-            CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
-            CogSource::RemoteHttp { .. } => {
-                // Speculative 128 KiB single-RTT header read; at most 1 follow-up if IFD arrays spill past 128 KiB
-                let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
-                loop {
-                    match parse_cog(&hdr) {
-                        Ok(idx) => break idx,
-                        Err(TiffError::NeedMoreBytes { required, .. }) => {
-                            let cur_len = hdr.len() as u64;
-                            let target = ((required + 65535) / 65536) * 65536;
-                            if target <= cur_len {
-                                return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                    required,
-                                    available: cur_len,
-                                }));
-                            }
-                            let more = source.fetch_range(cur_len, target).await?;
-                            if more.is_empty() {
-                                return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                    required,
-                                    available: cur_len,
-                                }));
-                            }
-                            hdr.extend_from_slice(&more);
+            if let Some(notify) = wait_notify {
+                let fut = notify.notified();
+                tokio::pin!(fut);
+                fut.as_mut().enable();
+                if let Some(existing) = self.datasets_by_uri.get(uri) {
+                    if let OpenSlot::Ready(cog) = existing.value() {
+                        return Ok(cog.clone());
+                    }
+                }
+                fut.await;
+                continue;
+            }
+
+            // We own the cold open; ensure abort on error or cancellation
+            struct OpenAbortGuard<'a> {
+                map: &'a DashMap<String, OpenSlot, ahash::RandomState>,
+                uri: String,
+                done: bool,
+            }
+            impl Drop for OpenAbortGuard<'_> {
+                fn drop(&mut self) {
+                    if !self.done {
+                        if let Some((_, OpenSlot::InFlight(n))) = self.map.remove(&self.uri) {
+                            n.notify_waiters();
                         }
-                        Err(e) => return Err(IoError::Tiff(e)),
                     }
                 }
             }
-        };
+            let mut open_guard = OpenAbortGuard {
+                map: &self.datasets_by_uri,
+                uri: uri.to_string(),
+                done: false,
+            };
 
-        let cog = Arc::new(OpenedCog {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            uri: uri.to_string(),
-            index,
-            source,
-        });
-        self.datasets_by_uri.insert(uri.to_string(), cog.clone());
-        Ok(cog)
+            let source = CogSource::open_remote(
+                uri,
+                self.client.clone(),
+                self.s3_cfg.clone(),
+                self.metrics.clone(),
+            )?;
+
+            let index = match &source {
+                CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
+                CogSource::RemoteHttp { .. } => {
+                    // Speculative 128 KiB single-RTT header read; at most 1 follow-up if IFDs spill past 128 KiB
+                    let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
+                    loop {
+                        match parse_cog(&hdr) {
+                            Ok(idx) => break idx,
+                            Err(TiffError::NeedMoreBytes { required, .. }) => {
+                                let cur_len = hdr.len() as u64;
+                                let target = ((required + 65535) / 65536) * 65536;
+                                if target <= cur_len {
+                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                        required,
+                                        available: cur_len,
+                                    }));
+                                }
+                                let more = source.fetch_range(cur_len, target).await?;
+                                if more.is_empty() {
+                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                        required,
+                                        available: cur_len,
+                                    }));
+                                }
+                                hdr.extend_from_slice(&more);
+                            }
+                            Err(e) => return Err(IoError::Tiff(e)),
+                        }
+                    }
+                }
+            };
+
+            let cog = Arc::new(OpenedCog {
+                id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                uri: uri.to_string(),
+                index,
+                source,
+            });
+            open_guard.done = true;
+            if let Some(OpenSlot::InFlight(n)) =
+                self.datasets_by_uri.insert(uri.to_string(), OpenSlot::Ready(cog.clone()))
+            {
+                n.notify_waiters();
+            }
+            return Ok(cog);
+        }
     }
 
     /// Synchronous zero-allocation fast path for local `mmap` or fully cached blocks.
@@ -208,7 +271,8 @@ impl CogStore {
 
         let ifd = &cog.index.ifds[ifd_idx];
         let mut results: Vec<Option<Arc<DecodedTile>>> = vec![None; tile_indices.len()];
-        let mut owned: Vec<(usize, BlockKey, u64, u32)> = Vec::new();
+        // Each owned slot holds an Option<InFlightGuard> so cancellation/panic auto-aborts!
+        let mut owned: Vec<(usize, Option<InFlightGuard>, u64, u32)> = Vec::new();
         let mut waiters: Vec<(usize, BlockKey, Arc<tokio::sync::Notify>)> = Vec::new();
 
         // Deduplicate identical tile_indices within the same call (e.g. chunky multi-band requests)
@@ -235,7 +299,7 @@ impl CogStore {
                 LookupResult::Owner => {
                     let offset = ifd.tile_offsets[tile_idx as usize];
                     seen_owned.insert(tile_idx, slot);
-                    owned.push((slot, key, offset, count));
+                    owned.push((slot, Some(self.cache.guard(key)), offset, count));
                 }
                 LookupResult::Wait(notify) => {
                     waiters.push((slot, key, notify));
@@ -265,7 +329,6 @@ impl CogStore {
                 });
             }
 
-            // Execute all coalesced HTTP Range fetches concurrently!
             let mut join_set = tokio::task::JoinSet::new();
             for fut in span_futs {
                 join_set.spawn(fut);
@@ -276,11 +339,10 @@ impl CogStore {
                 match res {
                     Ok(Ok((span, data))) => {
                         for item in span.items {
-                            let (orig_slot, key, _, _) = owned[item.slot];
+                            let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
                             let rel_start = (item.offset - span.start) as usize;
                             let rel_end = rel_start + item.len as usize;
                             if rel_end > data.len() {
-                                self.cache.abort(&key);
                                 fetch_err = Some(IoError::Tiff(TiffError::NeedMoreBytes {
                                     required: item.offset + item.len as u64,
                                     available: span.start + data.len() as u64,
@@ -295,11 +357,12 @@ impl CogStore {
                             ) {
                                 Ok(decoded) => {
                                     let arc = Arc::new(decoded);
-                                    self.cache.complete(key, arc.clone());
-                                    results[orig_slot] = Some(arc);
+                                    if let Some(guard) = guard_opt.take() {
+                                        guard.complete(arc.clone());
+                                    }
+                                    results[*orig_slot] = Some(arc);
                                 }
                                 Err(e) => {
-                                    self.cache.abort(&key);
                                     fetch_err = Some(IoError::Codec(e));
                                 }
                             }
@@ -311,21 +374,22 @@ impl CogStore {
             }
 
             if let Some(e) = fetch_err {
-                for (_, key, _, _) in &owned {
-                    self.cache.abort(key);
-                }
+                // Any uncompleted guards in `owned` auto-abort cleanly on Drop!
                 return Err(e);
             }
         }
 
-        // Resolve any singleflight waiters
+        // Resolve any singleflight waiters with race-free Notify::enable() before re-checking cache!
         for (slot, key, notify) in waiters {
             loop {
+                let fut = notify.notified();
+                tokio::pin!(fut);
+                fut.as_mut().enable();
                 if let Some(hit) = self.cache.try_get_fast(&key) {
                     results[slot] = Some(hit);
                     break;
                 }
-                notify.notified().await;
+                fut.await;
             }
         }
 
