@@ -57,13 +57,28 @@ docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.2.0
 curl -L https://github.com/moradology/cogzilla/releases/download/v0.2.0/cogzilla-server-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
 ```
 
-Then open a live map of a public Sentinel-2 scene (northeast Colorado, no credentials needed):
+Then open a live map directly in your browser (public AWS S3 COGs, no credentials needed):
 
-```text
-http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A/TCI.tif
-```
+- **Sentinel-2 true color** (northeast Colorado):
+  ```text
+  http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A/TCI.tif
+  ```
+- **Mt. Rainier on-the-fly DEM hillshade** (Copernicus 30m DEM, cubic Horn 3×3):
+  ```text
+  http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif&algorithm=hillshade&azimuth=315&altitude=45&z_factor=1.5&resampling=cubic
+  ```
+- **Mt. Rainier slope (`inferno`, 0–60°)** and **aspect (`hsv`, 0–360°)**:
+  ```text
+  http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif&algorithm=slope&rescale=0,60&colormap_name=inferno&resampling=cubic
+  http://localhost:8080/cog/WebMercatorQuad/map.html?url=https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif&algorithm=aspect&colormap_name=hsv&resampling=cubic
+  ```
+- **3D Terrain tiles** (drop into MapLibre GL JS `raster-dem` or Deck.gl `TerrainLayer` with `terrarium` or `terrainrgb`):
+  ```text
+  GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif&algorithm=terrarium
+  GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif&algorithm=terrainrgb
+  ```
 
-Or request tiles from any COG reachable over HTTP or S3:
+Or request tiles from any COG reachable over HTTP, S3 (`s3://`), GCS (`gs://`), or Azure Blob (`az://`, `abfs://`):
 
 ```text
 GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=s3://your-bucket/your.tif
@@ -73,7 +88,7 @@ Other targets (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-appl
 
 ### Coming from TiTiler
 
-Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. That is evidence for the routes and parameters [listed below](#api), not a promise of parity with every TiTiler feature, extension, or deployment: there is no `/mosaicjson`, no pgSTAC, and no custom algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
+Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/mosaicjson`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. That is evidence for the routes and parameters [listed below](#api), not a promise of parity with every TiTiler feature, extension, or deployment: there is no pgSTAC and no custom Python algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
 
 ## Why no GDAL?
 
@@ -110,11 +125,12 @@ cargo build --release -p cogzilla-server
 | :--- | :--- | :--- |
 | `--bind` | `127.0.0.1:8080` | Listen address. The Docker image fixes this to `0.0.0.0:8080`; remap the port with `-p`. |
 | `--cache-mb` | `512` | Decoded-block cache size in MiB (tier 1, RAM). Size it to your working set (see the cache note above). |
+| `--tile-cache-mb` | `0` | Optional encoded-tile LRU micro-cache in MiB (`0` keeps request-level singleflight deduplication enabled with no retention). |
 | `--disk-cache-dir` | | Directory for persistent compressed-block cache (tier 2, local disk/NVMe). |
 | `--disk-cache-mb` | `0` | Maximum tier-2 disk cache size in MiB (`0` disables tier 2). |
 | `--dataset name=path` | | Pre-register a local COG, served at `/tiles/{name}/{z}/{x}/{y}`. Repeatable. |
 | `--scene name=a.tif,b.tif[,c.tif]` | | Pre-register a multi-file scene (for example Landsat RGB or SAR VV+VH). Repeatable. |
-| `--mosaic name=/path/to/catalog.json` | | Pre-register a spatial mosaic catalog (STAC `FeatureCollection` or JSON array), served at `/mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`. Repeatable. |
+| `--mosaic name=/path/to/catalog.json` | | Pre-register a spatial mosaic catalog (MosaicJSON, STAC `FeatureCollection`, or JSON array), served at `/mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`. Repeatable. |
 
 `--dataset` and `--scene` are optional: the `/cog` and `/stac` routes open any `url=` on demand.
 
@@ -133,11 +149,14 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `AWS_ENDPOINT_URL`, `AWS_S3_ENDPOINT`, `AWS_HTTPS`, `AWS_VIRTUAL_HOSTING=FALSE` | S3-compatible stores (MinIO, Ceph, and so on) and path-style addressing. |
 | `GDAL_HTTP_MAX_RETRY` (or `AWS_MAX_ATTEMPTS`) | Retries for transient failures. Default 3. |
 | `GDAL_HTTP_CONNECTTIMEOUT`, `GDAL_HTTP_TIMEOUT` | Connect timeout (default 10 s) and per-read timeout (default 30 s). Since 0.1.2. |
-| `COGZILLA_MAX_UPSTREAM_FETCHES` | Maximum concurrent S3/HTTP range requests (default 64). Backs off automatically on `429`/`503`/timeouts (AIMD, floor 4) and recovers on clean responses. |
+| `COGZILLA_MAX_UPSTREAM_FETCHES` | Maximum concurrent S3/GCS/Azure/HTTP range requests (default 64). Backs off automatically on `429`/`503`/timeouts (AIMD, floor 4) and recovers on clean responses. |
 | `COGZILLA_MAX_OPEN_URIS` | Maximum cached opened-COG headers in memory (default 4,096, LRU-evicted). |
+| `COGZILLA_CACHE_CONTROL_MAX_AGE` | `Cache-Control: public, max-age=<N>` seconds on tile responses (default `3600`; `0` emits `no-cache`). All tile responses also emit strong `ETag` and honor `If-None-Match` (`304 Not Modified`). |
+| `GS_OAUTH2_ACCESS_TOKEN`, `GS_NO_SIGN_REQUEST`, `GS_USER_PROJECT`, `GS_ENDPOINT_URL` | Google Cloud Storage (`gs://`, `/vsigs/`) auth (falls back to GCE/GKE/Cloud Run metadata server) and requester-pays project. |
+| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_ACCESS_KEY`, `AZURE_STORAGE_ACCESS_TOKEN`, `AZURE_NO_SIGN_REQUEST` | Azure Blob (`az://`, `abfs[s]://`, `/vsiaz/`) SAS token, Bearer token, or SharedKey HMAC-SHA256 signing. |
 | `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
 
-Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I/O counters as JSON, and `GET /docs` with `GET /openapi.json` for the route list.
+Operational endpoints: `GET /healthz` for liveness, `GET /stats` for JSON counters, `GET /metrics` for Prometheus exposition, `POST /mosaic/register` for dynamic catalog / STAC-API search registration, and `GET /docs` with `GET /openapi.json` for the route list.
 
 ## API
 
@@ -146,7 +165,7 @@ Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I
 **`/cog/*`** (TiTiler's `TilerFactory`)
 
 - Tiles: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|jpg|f32}]`, for `WebMercatorQuad` and `WorldCRS84Quad`. `@1x` is 256 px and `@2x` is 512 px.
-- Tile parameters: `rescale`, `colormap_name`, `colormap` (JSON), `expression`, `resampling`, `nodata`, `unscale`, `return_mask`, `color_formula`, `buffer`.
+- Tile parameters: `rescale`, `colormap_name`, `colormap` (JSON), `expression`, `algorithm` (`terrarium`, `terrainrgb`, `hillshade`, `slope`, `aspect`, with `azimuth`, `altitude`, `z_factor`), `resampling`, `nodata`, `unscale`, `return_mask`, `color_formula`, `buffer`.
 - Metadata: `GET /cog/info`, `/cog/info.geojson`, `/cog/bounds`, `/cog/{tms}/tilejson.json`, `/cog/tiles`, `/cog/tiles/{tms}`, `/cog/{tms}/map.html`.
 - Point and statistics: `GET /cog/point/{lon},{lat}` (with `coord_crs`), `GET|POST /cog/statistics` (POST clips to a GeoJSON polygon).
 - Crops: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]`.
@@ -166,8 +185,9 @@ Operational endpoints: `GET /healthz` for liveness, `GET /stats` for cache and I
 **Differences worth knowing**
 
 - `resampling` accepts `nearest`, `bilinear` and `cubic`. `lanczos` and `cubicspline` are served as cubic, and any other value falls back to bilinear without an error.
-- Remote sources are `http(s)://`, `s3://` and `/vsis3/`. Other GDAL virtual filesystems such as `/vsicurl/` are not recognized.
-- Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b` and `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}` render front-to-back dynamic or spatially indexed mosaics with early exit once 100% of pixels are filled, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
+- Remote sources are `http(s)://`, `s3://`, `/vsis3/`, `gs://`, `/vsigs/`, `az://`, `abfs[s]://`, and `/vsiaz/`. Other GDAL virtual filesystems such as `/vsicurl/` are not recognized.
+- Mosaics: `GET /mosaicjson/{info,{tms}/tilejson.json,tiles/...}?url=...` serves quadkey-indexed MosaicJSON documents; `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b`, `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`, and `POST /mosaic/register` serve front-to-back dynamic or spatially indexed mosaics (including live STAC-API `/search`) with early exit once 100% of pixels are filled.
+- Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
 
 ### Example requests
 
