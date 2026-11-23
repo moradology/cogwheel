@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/cogzilla-banner.png" alt="cogzilla" width="100%" />
+</p>
+
 # `cogzilla`
 
 An ultra-fast, zero-GDAL Cloud Optimized GeoTIFF (COG) tile server built in Rust + explicit SIMD (ARM64 NEON & x86_64 AVX2/FMA) + native C codecs (`libdeflate`, `zstd`, `libwebp`), purpose-built for satellite imagery (**Landsat Collection 2 `uint16`**, **OPERA RTC-S1 / Sentinel-1 `float32` SAR**, **Sentinel-2**, DEMs).
