@@ -196,7 +196,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
 name = "cogmark"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "clap",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-codec"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cogzilla-tiff",
  "libdeflater",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-io"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "ahash",
  "bytes",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-kernel"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "cogzilla-codec",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-proj"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cogzilla-tiff",
  "thiserror",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "ahash",
  "bytes",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-tiff"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "thiserror",
 ]
