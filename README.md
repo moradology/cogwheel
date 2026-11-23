@@ -10,7 +10,7 @@
 
 **A COG & STAC tile server that speaks TiTiler's API, without GDAL.** Written in Rust, it serves the same `/cog/*` and `/stac/*` routes for about a quarter of the CPU on tiles it has never seen, and about a thirtieth once the source blocks are in its cache. Point your map client at a new base URL and keep everything else.
 
-Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with TiTiler tuned per its own guidance and given one worker per core:
+Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with TiTiler tuned per its own guidance and given one worker per core. This is one run of `cogzilla` v0.1.0 on an Apple M5 over a home network, on 2026-11-22:
 
 | Real S3 COGs, equal mix of five workloads | `cogzilla` | TiTiler | Gain |
 | :--- | ---: | ---: | ---: |
@@ -24,19 +24,22 @@ And the ceiling, with the network taken out entirely (local files, warm cache), 
 
 | Local fixtures, warm cache | Apple M5, 10 cores | Linux x86-64, 4 vCPU |
 | :--- | ---: | ---: |
-| HTTP throughput, Mercator PNG, 32 concurrent | 14,149 vs 181 tiles/s: **78.2×** | 3,363 vs 85 tiles/s: **39.8×** |
-| HTTP throughput, satellite RGB PNG, 32 concurrent | 5,102 vs 171 tiles/s: **29.8×** | 1,369 vs 62 tiles/s: **22.1×** |
-| Single Mercator PNG tile | 299 µs vs 17.6 ms: **58.9×** | 632 µs vs 21.4 ms: **33.9×** |
-| Landsat three-file RGB PNG tile | 1.58 ms vs 25.4 ms: **16.1×** | 2.62 ms vs 62.6 ms: **23.9×** |
+| HTTP throughput, Mercator PNG, 32 concurrent | 13,195 vs 180 tiles/s: **73.4×** | 3,363 vs 85 tiles/s: **39.8×** |
+| HTTP throughput, satellite RGB PNG, 32 concurrent | 5,728 vs 142 tiles/s: **40.2×** | 1,369 vs 62 tiles/s: **22.1×** |
+| Single Mercator PNG tile | 303 µs vs 16.6 ms: **54.7×** | 632 µs vs 21.4 ms: **33.9×** |
+| Landsat three-file RGB PNG tile | 1.36 ms vs 52.3 ms: **38.6×** | 2.62 ms vs 62.6 ms: **23.9×** |
 
-Each cell is `cogzilla` against TiTiler on the same machine. The Linux column is a GitHub-hosted runner (AMD EPYC, shared) running the same kind of build as the release binaries.
+Each cell is `cogzilla` against TiTiler on the same machine. The two columns differ in more than hardware:
+
+- **Linux** is a single run on a GitHub-hosted shared runner (4 vCPU AMD EPYC 9V45) at commit `56a6500`, with the same kind of build as the release binaries and both servers measured back to back.
+- **M5** is a single run at commit `7282f7c` with a `target-cpu=native` build, TiTiler given 10 workers, and both servers measured back to back. The laptop was not idle during the run, so expect a few percent of movement.
 
 ### What these numbers do and don't say
 
 - **The 4.3× is the number to plan with.** It is CPU for a tile the server has not seen, which is what an origin behind a CDN mostly serves. It ranged from 2.1× to 4.8× on four workloads (the fifth showed 8.3×, but its file was small enough to be partly cached) and does not depend on the network.
-- **The local multiples depend on the machine.** Warm PNG tiles are 16–59× on the M5 and 24–43× on the 4-vCPU Linux runner; HTTP throughput is 30–78× and 22–40×. The Linux figures are from a hosted shared runner (`generic` release build). Quote the Linux range if you need one number for a typical cloud instance.
+- **The local multiples depend on the machine.** Warm PNG tiles are 39–75× on the M5 and 24–43× on the 4-vCPU Linux runner; HTTP throughput is 40–73× and 22–40×. The Linux figures are one run on a hosted shared runner (`generic` release build); GitHub assigns a different CPU model from run to run, and TiTiler's own time for the same tile has varied between 21 ms and 31 ms across runs. Quote the Linux range if you need one number for a typical cloud instance.
 - **Not every path is that far ahead.** On the Linux run, lossy WebP output was 4.6× faster and first-touch (cold) local tiles were 8.4–21.5× faster (low-zoom multi-file scenes are 23–32× faster with adaptive quadtree projection). One raw decode path remained slightly slower than GDAL on x86-64 (LZW with predictor 1 at 0.8×, `0.9×` with `target-cpu=native`; DEFLATE with predictor 2 is 1.1–1.2× and LZW with predictor 3 is 1.4×). Those are decode-only measurements, and a warm tile does no decoding.
-- **The S3 results are M5-only.** The CPU, memory and cost figures in the first table have not been repeated on x86.
+- **The S3 results are M5-only and from v0.1.0.** The CPU, memory and cost figures in the first table have not been repeated on x86, and have not been re-run since the rendering optimizations in 0.2.0.
 - **The larger multiples (13–62× on S3) need the cache to fit.** `cogzilla` keeps decoded blocks in memory and TiTiler keeps none, which is where the big multiples come from. With the default 512 MiB cache, three of the five S3 workloads outgrew it and fell back to S3. Size `--cache-mb` to your working set and budget about 250 MiB on top.
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
 - **The cost row is a model, not a bill.** It assumes a Graviton vCPU does half the work of an M5 core, 60% target utilization, and compute only. The ratio is measured; the instance counts are not.
@@ -53,13 +56,13 @@ Method, per-workload tables and caveats are in [benches/S3_BENCHMARK.md](benches
 
 Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from the same file. Nothing here is pre-rendered: each 256 px tile is resampled (cubic), run through a Horn 3×3 kernel, colormapped, and PNG-encoded when it is requested, with the encoded-tile cache off.
 
-Serving hillshade like this across the whole DEM (323 distinct tiles, `z=9..12`, 32 connections, 10,000 requests, Apple M5, load generator on the same machine, source blocks already in the block cache):
+Serving hillshade like this across the whole DEM, in one `oha` run against a local build from 2026-11-23 (323 distinct tiles, `z=9..12`, 32 connections, 10,000 requests, Apple M5, load generator on the same machine, source blocks already in the block cache so no S3 requests were made):
 
 | Tiles per second | Median | p99 | Errors |
 | ---: | ---: | ---: | ---: |
 | **3,372** | 9.3 ms | 19.5 ms | 0 |
 
-The [live map links below](#install) open the hillshade, slope, and aspect panels as interactive maps.
+This is `cogzilla` alone: TiTiler was not run on this workload, so there is no multiple to quote. The [live map links below](#install) open the hillshade, slope, and aspect panels as interactive maps.
 
 ## Install
 
@@ -104,7 +107,7 @@ Other targets (`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-appl
 
 ### Coming from TiTiler
 
-Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/mosaicjson`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. That is evidence for the routes and parameters [listed below](#api), not a promise of parity with every TiTiler feature, extension, or deployment: there is no pgSTAC and no custom Python algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
+Change the base URL. `cogzilla` implements TiTiler 2.4's non-Postgres routers (`/cog`, `/stac`, `/mosaicjson`, `/colorMaps`, `/tileMatrixSets`) and passes 39/39 differential HTTP checks against a live TiTiler. The checks cover `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets`; `/mosaicjson` and the `algorithm=` terrain outputs were added later and are not yet in the checked set. That is evidence for the checked routes and parameters, not a promise of parity with every TiTiler feature, extension, or deployment: there is no pgSTAC and no custom Python algorithms or readers. If your workload uses something that is missing or behaves differently, please open an issue.
 
 ## Why no GDAL?
 
@@ -116,9 +119,9 @@ The cost is scope. If your data is not a GeoTIFF, or is in a projection outside 
 
 Rust, explicit SIMD (ARM64 NEON, and x86_64 AVX2/FMA chosen at runtime), and native codecs (`libdeflate`, `zstd`, `libwebp`, `zune-jpeg`). There are four stages.
 
-**Reading.** A Classic/BigTIFF and GeoKey parser opens a local file through `mmap` in about a microsecond (0.92–1.3 µs, hundreds of times faster than `GDALOpenEx`). A remote file opens with one speculative 128 KiB range request. Later reads coalesce adjacent byte ranges, S3 requests are SigV4-signed and gated by a throttle-only AIMD concurrency limiter, and decoded blocks go into a sharded LRU cache (with an optional persistent CRC32-checked tier-2 disk cache for compressed blocks) that collapses concurrent requests for the same block into one fetch.
+**Reading.** A Classic/BigTIFF and GeoKey parser opens a local file through `mmap` in one to two microseconds (0.9–2.0 µs across runs, hundreds of times faster than `GDALOpenEx`). A remote file opens with one speculative 128 KiB range request. Later reads coalesce adjacent byte ranges, S3 requests are SigV4-signed and gated by a throttle-only AIMD concurrency limiter, and decoded blocks go into a sharded LRU cache (with an optional persistent CRC32-checked tier-2 disk cache for compressed blocks) that collapses concurrent requests for the same block into one fetch.
 
-**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD on the M5). Multi-block cold misses decode in parallel across worker threads, with a bounded free-list arena pool recycling standard `f32` block allocations. All eight GDAL numeric types from `uint8` to `float64` are supported, with `uint8` and `uint16` stored in native compact slabs (1–2 bytes/pixel for 2–4× higher cache capacity). Blocks that are entirely nodata are flagged at decode, so empty tiles return in under 200 ns. WebMercator-aligned JPEG/WebP COGs with identity RGB styling bypass decode, resample, and re-encode completely via zero-decode pass-through (including TIFF tag 347 `JPEGTables` splicing).
+**Decoding.** DEFLATE, ZSTD, LZW, JPEG and WebP compression, with TIFF predictors 1, 2 and 3 written in NEON and AVX2 and bit-exact against GDAL (`float32` predictor 3 runs at 3.00 GB/s on ZSTD on the M5). Multi-block cold misses decode in parallel across worker threads, with a bounded free-list arena pool recycling standard `f32` block allocations. All eight GDAL numeric types from `uint8` to `float64` are supported, with `uint8` and `uint16` stored in native compact slabs (1–2 bytes/pixel for 2–4× higher cache capacity). Blocks that are entirely nodata are flagged at decode, so empty tiles return a pre-encoded transparent image without rendering (this path has no benchmark of its own). WebMercator-aligned JPEG/WebP COGs with identity RGB styling bypass decode, resample, and re-encode completely via zero-decode pass-through (including TIFF tag 347 `JPEGTables` splicing).
 
 **Projecting.** Closed-form `f64` math for `EPSG:3857`, `EPSG:4326`, all 120 WGS84/NAD83 UTM zones, CONUS and California Albers, Lambert Conformal Conic, and Polar Stereographic (`3413`, `3031`). Tiles at `z <= 8` use adaptive error-bounded quadtree subdivision (`< 0.05 px` tolerance); tiles at `z >= 9` interpolate a 17×17 grid. Zooms 0 to 22 are served.
 
@@ -176,7 +179,7 @@ Operational endpoints: `GET /healthz` for liveness, `GET /stats` for JSON counte
 
 ## API
 
-`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing.
+`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet.
 
 **`/cog/*`** (TiTiler's `TilerFactory`)
 
@@ -191,7 +194,7 @@ Operational endpoints: `GET /healthz` for liveness, `GET /stats` for JSON counte
 - `GET /stac/assets`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/map.html`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
 - The STAC item can be a local path, an HTTP(S) URL or an `s3://` URI. Its JSON is cached, and assets named with `?assets=red&assets=green&assets=blue` are opened concurrently.
 - Expressions can use band positions, `(b1-b2)/(b1+b2)`, or asset names, `(red-green)/(red+green)`.
-- On the M5, with local fixtures and a warm cache, these routes ran 21–82× faster than TiTiler: STAC tiles 2.1 ms against 48.6 ms, TileJSON 63.5×, info 45.3×, three-asset point queries 82.4×.
+- On the M5 at v0.1.0, with local fixtures, a warm cache and one request at a time, these routes ran 4–84× faster than TiTiler. The large multiples are tiles (2.1 ms against 52.3 ms, 25×), info (50×), TileJSON (70×) and three-asset point queries (84×); asset listing, statistics and previews were 4–11×.
 
 **`/colorMaps`** and **`/tileMatrixSets`**
 
