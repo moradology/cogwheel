@@ -47,6 +47,47 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     assert!(landing.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
     assert!(!landing.contains("{{VERSION}}"));
 
+    // 0b. Options this server does not implement are rejected, not ignored.
+    let tile = format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.png?url={sat_url}");
+    for (what, url) in [
+        ("unknown algorithm", format!("{tile}&algorithm=contours")),
+        ("unsupported resampling", format!("{tile}&resampling=average")),
+        ("padding", format!("{tile}&padding=4")),
+        ("reproject", format!("{tile}&reproject=bilinear")),
+        ("bad rescale", format!("{tile}&rescale=abc")),
+        ("unknown colormap", format!("{tile}&bidx=1&colormap_name=nope")),
+        ("bad tilesize", format!("{tile}&tilesize=7")),
+        ("unknown tms tile", format!("{base}/cog/tiles/UTM31WGS84Quad/10/163/395.png?url={sat_url}")),
+        ("unknown tms tilejson", format!("{base}/cog/UTM31WGS84Quad/tilejson.json?url={sat_url}")),
+        ("statistics percentiles", format!("{base}/cog/statistics?url={sat_url}&p=5")),
+        ("statistics expression", format!("{base}/cog/statistics?url={sat_url}&expression=b1/b2")),
+        ("point expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1/b2")),
+        ("point coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:32610")),
+        ("preview dst_crs", format!("{base}/cog/preview.png?url={sat_url}&dst_crs=epsg:4326")),
+        ("preview width", format!("{base}/cog/preview.png?url={sat_url}&width=300")),
+        ("bbox max_size", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8.png?url={sat_url}&max_size=2000")),
+        ("info.geojson crs", format!("{base}/cog/info.geojson?url={sat_url}&crs=epsg:32610")),
+        ("colormap orientation", format!("{base}/colorMaps/viridis?f=png&orientation=vertical")),
+    ] {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{what} should be rejected: {url}");
+    }
+    // Supported spellings and parameters this server does not know are still accepted.
+    for (what, url) in [
+        ("tilesize alias", format!("{tile}&tilesize=512&rescale=0,1")),
+        ("cubic_spline", format!("{tile}&resampling=cubic_spline&rescale=0,1")),
+        ("padding=0", format!("{tile}&padding=0&rescale=0,1")),
+        ("unrelated parameter", format!("{tile}&rescale=0,1&_cachebust=1&access_token=x")),
+        ("hillshade", format!("{tile}&bidx=1&algorithm=hillshade")),
+        ("WorldCRS84Quad", format!("{base}/cog/WorldCRS84Quad/tilejson.json?url={sat_url}")),
+        ("point coord_crs 4326", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&coord_crs=epsg:4326")),
+    ] {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");
+    }
+    let big = client.get(format!("{tile}&tilesize=512&rescale=0,1")).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(u32::from_be_bytes(big[16..20].try_into().unwrap()), 512, "tilesize=512 yields a 512 px PNG");
+
     // 1. GET /cog/info
     let info = get_json(&client, format!("{base}/cog/info?url={sat_url}")).await;
     assert_eq!(info["dtype"], "float32");

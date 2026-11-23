@@ -24,7 +24,17 @@
 
 ## Differences from TiTiler
 
-- `resampling` accepts `nearest`, `bilinear` and `cubic`. `lanczos` and `cubicspline` are served as cubic, and any other value falls back to bilinear without an error.
+- **Unsupported options return `400`, never a silently different picture.** TiTiler answers an invalid value with `422`; `cogzilla` answers `400` with a plain-text reason, both for invalid values and for the TiTiler options listed below that it does not implement. Query parameters that neither server defines (cache-busters, tokens) are ignored, as in TiTiler.
+- `resampling` accepts `nearest`, `bilinear` and `cubic`. `lanczos` and `cubic_spline` are served as cubic. The other GDAL methods (`average`, `mode`, `gauss`, `rms`, `max`, `min`, `med`, `q1`, `q3`, `sum`) are rejected.
+- `algorithm` accepts `hillshade`, `slope`, `aspect`, `terrarium` and `terrainrgb`. TiTiler's `contours`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale` and `bitonal` are rejected, and there are no `/algorithms` routes. `aspect` is a `cogzilla` addition.
+- Tile matrix sets are `WebMercatorQuad` and `WorldCRS84Quad`; TiTiler's other eleven are rejected.
+- Rejected parameters: `padding` (other than `0`), `reproject`, `dst_crs`, `crs`, `width` and `height` as query parameters (use the `{w}x{h}` path form), `minzoom`, `maxzoom`, `tile_format`, `histogram_bins`, `histogram_range`, `categorical`, `c`, `p`, `cover_scale`, and `orientation` on colormap images.
+- Statistics always report the 2nd and 98th percentiles and a 10-bin histogram over every band; `expression`, `algorithm` and `bidx` are rejected there and on point queries. `POST /statistics` takes a single Feature or geometry, not a FeatureCollection.
+- `coord_crs` accepts `EPSG:4326` and `EPSG:3857`, on point queries and `/cog/bbox`. `max_size` is rejected on bbox routes.
+- `tilesize` accepts 64 to 2048.
+- Output formats are `png`, `jpg`, `webp`, `npy` and raw `f32`. GeoTIFF, JPEG 2000 and `pngraw` are not available.
+- `expression` supports arithmetic and functions such as `sqrt` and `log`, but not multiple `;`-separated outputs, comparisons or `where(...)`.
+- A tile outside the dataset's bounds returns a transparent tile with `200`; TiTiler returns `404`.
 - Remote sources are `http(s)://`, `s3://`, `/vsis3/`, `gs://`, `/vsigs/`, `az://`, `abfs[s]://`, and `/vsiaz/`. Other GDAL virtual filesystems such as `/vsicurl/` are not recognized.
 - Mosaics: `GET /mosaicjson/{info,{tms}/tilejson.json,tiles/...}?url=...` serves quadkey-indexed MosaicJSON documents; `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b`, `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`, and `POST /mosaic/register` serve front-to-back dynamic or spatially indexed mosaics (including live STAC-API `/search`) with early exit once 100% of pixels are filled.
 - Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.

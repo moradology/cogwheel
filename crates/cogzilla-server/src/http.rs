@@ -137,6 +137,10 @@ struct ParsedQuery {
     altitude: f32,
     z_factor: f32,
     colormap_explicit: bool,
+    /// Parameter names present in the query, for per-route validation.
+    keys: Vec<String>,
+    /// Values that could not be parsed or name something unsupported.
+    errors: Vec<String>,
 }
 
 fn parse_query(q: Option<&str>) -> ParsedQuery {
@@ -165,8 +169,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         altitude: 45.0,
         z_factor: 1.0,
         colormap_explicit: false,
+        keys: Vec::new(),
+        errors: Vec::new(),
     };
     let Some(q) = q else { return pq };
+    let mut pq_errors: Vec<String> = Vec::new();
     for pair in q.split('&') {
         if pair.is_empty() {
             continue;
@@ -174,6 +181,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
+        pq.keys.push(k.to_string());
+        let mut bad = |what: &str| pq_errors.push(format!("invalid {k}={}: {what}", percent_decode(v)));
         match k {
             "url" => pq.urls.push(percent_decode(v)),
             "assets" => {
@@ -187,6 +196,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm_params" => {
                 let dec = percent_decode(v);
+                if serde_json::from_str::<serde_json::Value>(&dec).is_err() {
+                    bad("expected a JSON object");
+                }
                 if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&dec) {
                     if let Some(a) = obj.get("azimuth").and_then(|x| x.as_f64()) {
                         pq.azimuth = a as f32;
@@ -211,32 +223,39 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "azimuth" => {
                 if let Ok(a) = v.parse::<f32>() {
                     pq.azimuth = a;
+                } else {
+                    bad("expected a number");
                 }
             }
             "altitude" | "angle" | "angle_altitude" => {
                 if let Ok(a) = v.parse::<f32>() {
                     pq.altitude = a.clamp(0.0, 90.0);
+                } else {
+                    bad("expected a number");
                 }
             }
             "z_factor" | "zfactor" => {
                 if let Ok(z) = v.parse::<f32>() {
                     pq.z_factor = z.max(1e-4);
+                } else {
+                    bad("expected a number");
                 }
             }
             "bidx" | "indexes" => {
                 for part in percent_decode(v).split(',') {
                     if let Ok(b) = part.parse::<u16>() {
                         pq.bidx.push(b);
+                    } else {
+                        bad("expected band numbers");
                     }
                 }
             }
             "rescale" => {
                 let decoded = percent_decode(v);
                 for group in decoded.split(';') {
-                    if let Some((a, b)) = group.split_once(',') {
-                        if let (Ok(mn), Ok(mx)) = (a.parse::<f32>(), b.parse::<f32>()) {
-                            pq.rescale.push((mn, mx));
-                        }
+                    match group.split_once(',').map(|(a, b)| (a.parse::<f32>(), b.parse::<f32>())) {
+                        Some((Ok(mn), Ok(mx))) => pq.rescale.push((mn, mx)),
+                        _ => bad("expected min,max"),
                     }
                 }
             }
@@ -246,12 +265,16 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     pq.custom_colormap_json = Some(dec);
                 } else if let Some(cm) = ColormapName::from_str_opt(&dec) {
                     pq.colormap = cm;
+                } else {
+                    bad("expected a JSON colormap or a colormap name");
                 }
             }
             "colormap_name" => {
                 if let Some(cm) = ColormapName::from_str_opt(&percent_decode(v)) {
                     pq.colormap = cm;
                     pq.colormap_explicit = true;
+                } else {
+                    bad("unknown colormap (see /colorMaps)");
                 }
             }
             "color_formula" => {
@@ -261,6 +284,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 let dec = percent_decode(v);
                 if let Ok(nd) = dec.parse::<f32>() {
                     pq.nodata = Some(nd);
+                } else {
+                    bad("expected a number");
                 }
             }
             "unscale" => {
@@ -272,22 +297,32 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "buffer" => {
                 if let Ok(buf) = v.parse::<f32>() {
                     pq.buffer = buf.round().clamp(0.0, 256.0) as u32;
+                } else {
+                    bad("expected a number");
                 }
             }
             "coord_crs" => {
-                let dec = percent_decode(v);
+                let dec = percent_decode(v).to_ascii_lowercase();
                 pq.coord_crs_3857 = dec.contains("3857");
+                if !(dec.contains("3857") || dec.contains("4326") || dec.contains("crs84")) {
+                    bad("only EPSG:4326 and EPSG:3857 are supported");
+                }
             }
             "resample" | "resampling" => {
                 pq.resample = match v {
                     "nearest" => ResampleMode::Nearest,
-                    "cubic" | "cubicspline" | "lanczos" => ResampleMode::Cubic,
-                    _ => ResampleMode::Bilinear,
+                    "cubic" | "cubicspline" | "cubic_spline" | "lanczos" => ResampleMode::Cubic,
+                    "bilinear" => ResampleMode::Bilinear,
+                    _ => {
+                        bad("use nearest, bilinear or cubic");
+                        ResampleMode::Bilinear
+                    }
                 };
             }
-            "tile_size" | "size" => {
-                if let Ok(sz) = v.parse::<u32>() {
-                    pq.tile_size = sz;
+            "tile_size" | "tilesize" | "size" => {
+                match v.parse::<u32>() {
+                    Ok(sz) if (64..=2048).contains(&sz) => pq.tile_size = sz,
+                    _ => bad("expected a tile size from 64 to 2048"),
                 }
             }
             "scale" => {
@@ -301,6 +336,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "max_size" => {
                 if let Ok(ms) = v.parse::<u32>() {
                     pq.max_size = ms.clamp(64, 4096);
+                } else {
+                    bad("expected a number");
                 }
             }
             "quality" => {
@@ -314,10 +351,89 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "expr" | "expression" | "index" => {
                 pq.expr_raw = Some(percent_decode_opts(v, false));
             }
+            "padding" => {
+                if v.parse::<f32>().ok() != Some(0.0) {
+                    bad("padding is not supported");
+                }
+            }
+            "reproject" | "dst_crs" | "crs" | "histogram_bins" | "histogram_range"
+            | "categorical" | "c" | "p" | "cover_scale" | "height" | "width" | "minzoom"
+            | "maxzoom" | "tile_format" | "orientation" => {
+                pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
+            }
             _ => {}
         }
     }
+    pq.errors = pq_errors;
     pq
+}
+
+const SUPPORTED_ALGORITHMS: &[&str] =
+    &["hillshade", "slope", "aspect", "terrarium", "terrainrgb", "terrain-rgb", "mapbox"];
+const SUPPORTED_TMS: &[&str] = &["WebMercatorQuad", "WorldCRS84Quad"];
+
+/// Reject requests that ask for something this server would otherwise ignore.
+///
+/// TiTiler answers these with a 422. Returning a 200 with the option silently
+/// dropped gives a client the wrong picture and no way to notice.
+fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
+    let family = segs.first().copied().unwrap_or("");
+    if !matches!(family, "cog" | "stac" | "mosaicjson" | "mosaic" | "tiles" | "colorMaps") {
+        return Ok(());
+    }
+    if let Some(e) = pq.errors.first() {
+        return Err(e.clone());
+    }
+    if let Some(alg) = pq.algorithm.as_deref() {
+        if !SUPPORTED_ALGORITHMS.contains(&alg) {
+            return Err(format!(
+                "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
+            ));
+        }
+    }
+
+    // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html
+    if family != "tiles" && family != "colorMaps" {
+        let last = segs.last().copied().unwrap_or("");
+        let tms = if (last == "tilejson.json" || last == "map.html") && segs.len() >= 3 {
+            Some(segs[segs.len() - 2])
+        } else {
+            match segs.iter().position(|s| *s == "tiles") {
+                Some(i) if matches!(segs.len() - i, 2 | 5) => Some(segs[i + 1]),
+                _ => None,
+            }
+        };
+        if let Some(tms) = tms {
+            if !SUPPORTED_TMS.contains(&tms) {
+                return Err(format!(
+                    "tile matrix set '{tms}' is not supported (use WebMercatorQuad or WorldCRS84Quad)"
+                ));
+            }
+        }
+    }
+
+    let has = |names: &[&str]| pq.keys.iter().find(|k| names.contains(&k.as_str())).cloned();
+    let route = |name: &str| segs[1..].iter().any(|s| *s == name);
+    if route("statistics") || route("asset_statistics") {
+        if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
+            return Err(format!("parameter '{k}' is not supported on statistics routes"));
+        }
+    }
+    if route("point") {
+        if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
+            return Err(format!("parameter '{k}' is not supported on point routes"));
+        }
+    } else if family == "stac" || !route("bbox") {
+        if let Some(k) = has(&["coord_crs"]) {
+            return Err(format!("parameter '{k}' is not supported on this route"));
+        }
+    }
+    if route("bbox") {
+        if let Some(k) = has(&["max_size"]) {
+            return Err(format!("parameter '{k}' is not supported on bbox routes"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_ext_format(
@@ -818,6 +934,10 @@ pub async fn handle_request(
     });
 
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    if let Err(msg) = validate_query(&segs, &pq) {
+        return Ok(plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain"));
+    }
 
     // ------------------------------------------------------------------------
     // Dynamic registration of spatial catalogs (MosaicJSON, STAC FeatureCollection,
