@@ -87,6 +87,7 @@ pub struct TileEngine {
     pub store: Arc<CogStore>,
     crs_cache: DashMap<u64, CrsModel, ahash::RandomState>,
     scenes: DashMap<String, Vec<Arc<OpenedCog>>, ahash::RandomState>,
+    pub stac_cache: DashMap<String, Arc<crate::stac::StacItem>, ahash::RandomState>,
     pub stats: Arc<EngineStats>,
 }
 
@@ -96,6 +97,7 @@ impl TileEngine {
             store: Arc::new(CogStore::new(cache_max_bytes)),
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
             scenes: DashMap::with_hasher(ahash::RandomState::new()),
+            stac_cache: DashMap::with_hasher(ahash::RandomState::new()),
             stats: Arc::new(EngineStats::default()),
         }
     }
@@ -819,8 +821,22 @@ impl TileEngine {
                         };
                         Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
                     }
+                    BandRequest::CustomExpr {
+                        prog,
+                        rescale,
+                        colormap,
+                    } => {
+                        let style = SingleBandStyle {
+                            rescale_min: rescale.0,
+                            rescale_max: rescale.1,
+                            colormap: *colormap,
+                            resample: req.resample,
+                            format: req.format,
+                        };
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                    }
                     _ => Err(EngineError::BadRequest(
-                        "2-asset scene requires expr=sar_rgb, ndvi, ndwi, nbr, savi, ratio, or diff"
+                        "2-asset scene requires expr=sar_rgb, ndvi, ndwi, nbr, savi, ratio, diff, or custom expression"
                             .to_string(),
                     )),
                 }
@@ -887,8 +903,22 @@ impl TileEngine {
                         };
                         Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
                     }
+                    BandRequest::CustomExpr {
+                        prog,
+                        rescale,
+                        colormap,
+                    } => {
+                        let style = SingleBandStyle {
+                            rescale_min: rescale.0,
+                            rescale_max: rescale.1,
+                            colormap: *colormap,
+                            resample: req.resample,
+                            format: req.format,
+                        };
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                    }
                     _ => Err(EngineError::BadRequest(
-                        "3-asset scene requires RGB or expr=evi".to_string(),
+                        "3-asset scene requires RGB, expr=evi, or custom expression".to_string(),
                     )),
                 }
             }

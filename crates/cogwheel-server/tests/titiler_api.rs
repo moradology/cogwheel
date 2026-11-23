@@ -174,4 +174,225 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         .await
         .unwrap();
     assert_eq!(&feat_img[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+    // ------------------------------------------------------------------------
+    // 13. /colorMaps and /colorMaps/{colorMapId}
+    // ------------------------------------------------------------------------
+    let cmaps: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/colorMaps"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let cmap_list = cmaps["colormaps"].as_array().unwrap();
+    assert!(cmap_list.iter().any(|v| v["id"] == "viridis"));
+    assert!(cmap_list.iter().any(|v| v["id"] == "rdylgn"));
+
+    let viridis_json: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/colorMaps/viridis"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(viridis_json.as_object().unwrap().len(), 256);
+    assert_eq!(viridis_json["0"], serde_json::json!([68, 1, 84, 255]));
+
+    let viridis_png = client
+        .get(format!("{base}/colorMaps/viridis?format=png"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&viridis_png[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+    // ------------------------------------------------------------------------
+    // 14. /tileMatrixSets and /tileMatrixSets/{tileMatrixSetId}
+    // ------------------------------------------------------------------------
+    let tms_list: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/tileMatrixSets"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let tms_arr = tms_list["tileMatrixSets"].as_array().unwrap();
+    assert!(tms_arr.iter().any(|t| t["id"] == "WebMercatorQuad"));
+    assert!(tms_arr.iter().any(|t| t["id"] == "WorldCRS84Quad"));
+
+    let tms_wm: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/tileMatrixSets/WebMercatorQuad"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tms_wm["id"], "WebMercatorQuad");
+    assert_eq!(tms_wm["tileMatrices"].as_array().unwrap().len(), 25);
+
+    // ------------------------------------------------------------------------
+    // 15. /stac/* (MultiBaseTilerFactory(reader=STACReader))
+    // ------------------------------------------------------------------------
+    let stac_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/landsat_c2_stac.json");
+    if stac_path.exists() {
+        let stac_url = stac_path.to_string_lossy();
+
+        // /stac/assets
+        let assets: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!("{base}/stac/assets?url={stac_url}"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let arr = assets.as_array().unwrap();
+        assert!(arr.iter().any(|v| v == "red"));
+        assert!(arr.iter().any(|v| v == "green"));
+        assert!(arr.iter().any(|v| v == "blue"));
+        assert!(!arr.iter().any(|v| v == "thumbnail"));
+
+        // /stac/info
+        let stac_info: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!("{base}/stac/info?url={stac_url}&assets=red&assets=green"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stac_info.get("red").is_some());
+        assert!(stac_info.get("green").is_some());
+
+        // /stac/tiles/WebMercatorQuad/12/652/1583.png?assets=red&assets=green&assets=blue
+        let stac_tile = client
+            .get(format!(
+                "{base}/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_url}&assets=red&assets=green&assets=blue&rescale=7000,20000"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(&stac_tile[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+        // /stac/tiles/... with asset-named expression
+        let stac_expr_tile = client
+            .get(format!(
+                "{base}/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_url}&expression=(red-green)/(red+green)&rescale=-0.5,0.5&colormap_name=rdylgn"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(&stac_expr_tile[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+        // /stac/WebMercatorQuad/tilejson.json
+        let stac_tj: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!(
+                    "{base}/stac/WebMercatorQuad/tilejson.json?url={stac_url}&assets=red&assets=green&assets=blue"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stac_tj["tilejson"], "3.0.0");
+
+        // /stac/point/{lon},{lat}
+        let stac_pt: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!(
+                    "{base}/stac/point/-122.65,37.77?url={stac_url}&assets=red&assets=green&assets=blue"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stac_pt["values"].as_array().unwrap().len(), 3);
+        assert_eq!(stac_pt["band_names"].as_array().unwrap().len(), 3);
+
+        // /stac/asset_statistics & /stac/statistics
+        let stac_astats: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!(
+                    "{base}/stac/asset_statistics?url={stac_url}&assets=red&assets=green&max_size=256"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stac_astats.get("red").is_some());
+        assert!(stac_astats.get("green").is_some());
+
+        let stac_stats: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!(
+                    "{base}/stac/statistics?url={stac_url}&assets=red&assets=green&max_size=256"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stac_stats.get("b1").is_some());
+        assert!(stac_stats.get("b2").is_some());
+
+        // /stac/preview/256x256.png
+        let stac_prev = client
+            .get(format!(
+                "{base}/stac/preview/256x256.png?url={stac_url}&assets=red&assets=green&assets=blue&rescale=7000,20000"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(&stac_prev[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
 }

@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod http;
+pub mod stac;
 pub mod titiler;
 
 pub use engine::{BandRequest, EngineError, EngineStats, TileEngine, TileRequest};

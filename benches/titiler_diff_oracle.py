@@ -135,14 +135,21 @@ def main():
         print("Building cogwheel-server --release...")
         subprocess.run(["cargo", "build", "--release", "-p", "cogwheel-server"], cwd=ROOT, check=True)
 
-    # Write TiTiler app mounted at /cog
+    # Write TiTiler app mounted at /cog, /stac, /colorMaps, /tileMatrixSets
     tt_app = RESULTS / "_titiler_oracle_app.py"
     tt_app.write_text(
         "from fastapi import FastAPI\n"
-        "from titiler.core.factory import TilerFactory\n"
+        "from rio_tiler.io import STACReader\n"
+        "from titiler.core.factory import TilerFactory, MultiBaseTilerFactory, ColorMapFactory, TMSFactory\n"
         "app = FastAPI()\n"
         "cog = TilerFactory()\n"
+        "stac = MultiBaseTilerFactory(reader=STACReader)\n"
+        "cmaps = ColorMapFactory()\n"
+        "tms = TMSFactory()\n"
         "app.include_router(cog.router, prefix='/cog')\n"
+        "app.include_router(stac.router, prefix='/stac')\n"
+        "app.include_router(cmaps.router)\n"
+        "app.include_router(tms.router)\n"
     )
 
     cw_proc = subprocess.Popen(
@@ -233,6 +240,25 @@ def main():
                 "png",
             ))
 
+        # Add /colorMaps, /tileMatrixSets, and /stac/* differential parity checks
+        stac_item = str((FIXTURES / "landsat_c2_stac.json").resolve())
+        cases.extend([
+            ("GET /colorMaps", "GET", "/colorMaps", None, "json_cmaps"),
+            ("GET /colorMaps/viridis (256-entry exact LUT)", "GET", "/colorMaps/viridis", None, "json_cmap_lut"),
+            ("GET /colorMaps/viridis?f=png", "GET", "/colorMaps/viridis?f=png", None, "png"),
+            ("GET /tileMatrixSets", "GET", "/tileMatrixSets", None, "json_tms_list"),
+            ("GET /tileMatrixSets/WebMercatorQuad", "GET", "/tileMatrixSets/WebMercatorQuad", None, "json_tms_one"),
+            ("GET /stac/assets", "GET", f"/stac/assets?url={stac_item}", None, "json_stac_assets"),
+            ("GET /stac/info?assets=red&assets=green", "GET", f"/stac/info?url={stac_item}&assets=red&assets=green", None, "json_stac_info"),
+            ("GET /stac/tiles/.../12/652/1583.png (RGB 3-asset)", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000&resampling=bilinear", None, "png"),
+            ("GET /stac/tiles/...?expression=(b1-b2)/(b1+b2)", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_item}&assets=red&assets=green&expression=(b1-b2)/(b1%2Bb2)&rescale=-0.5,0.5&colormap_name=rdylgn&resampling=bilinear", None, "png"),
+            ("GET /stac/WebMercatorQuad/tilejson.json", "GET", f"/stac/WebMercatorQuad/tilejson.json?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_tj"),
+            ("GET /stac/point/-122.65,37.773 (3-asset)", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_point"),
+            ("GET /stac/asset_statistics?assets=red&assets=green", "GET", f"/stac/asset_statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stac_asset_stats"),
+            ("GET /stac/statistics?assets=red&assets=green", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stats"),
+            ("GET /stac/preview/256x256.png (3-asset RGB)", "GET", f"/stac/preview/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
+        ])
+
         print("\n=== Live HTTP Differential Oracle: cogwheel vs. TiTiler ===")
         print(f"{'Endpoint':54s} | {'cogwheel':>9s} | {'TiTiler':>9s} | {'Speedup':>8s} | Parity vs TiTiler")
         print("-" * 135)
@@ -271,6 +297,32 @@ def main():
                     m_err = abs(j_cw["b1"]["mean"] - j_tt["b1"]["mean"])
                     s_err = abs(j_cw["b1"]["std"] - j_tt["b1"]["std"])
                     parity = f"poly b1.mean_err={m_err:.5f} b1.std_err={s_err:.5f}"
+                elif kind == "json_cmaps":
+                    j_cw = {c["id"] for c in r_cw.json()["colormaps"]}
+                    j_tt = {c["id"] for c in r_tt.json()["colormaps"]}
+                    overlap = len(j_cw & j_tt)
+                    parity = f"cogwheel={len(j_cw)} titiler={len(j_tt)} overlap={overlap}/{len(j_cw)}"
+                elif kind == "json_cmap_lut":
+                    j_cw, j_tt = r_cw.json(), r_tt.json()
+                    exact = sum(1 for k in j_cw if j_cw[k] == j_tt.get(k))
+                    parity = f"exact_entries={exact}/256"
+                elif kind == "json_tms_list":
+                    ids_cw = {t["id"] for t in r_cw.json()["tileMatrixSets"]}
+                    ids_tt = {t["id"] for t in r_tt.json()["tileMatrixSets"]}
+                    parity = f"ids={sorted(ids_cw)} subset_of_tt={ids_cw.issubset(ids_tt)}"
+                elif kind == "json_tms_one":
+                    j_cw, j_tt = r_cw.json(), r_tt.json()
+                    parity = f"id={j_cw['id']}=={j_tt['id']} matrices={len(j_cw['tileMatrices'])}=={len(j_tt['tileMatrices'])}"
+                elif kind == "json_stac_assets":
+                    j_cw, j_tt = set(r_cw.json()), set(r_tt.json())
+                    parity = f"assets={sorted(j_cw)} exact_match={j_cw == j_tt}"
+                elif kind == "json_stac_info":
+                    j_cw, j_tt = r_cw.json(), r_tt.json()
+                    parity = f"keys={sorted(j_cw.keys())}=={sorted(j_tt.keys())}"
+                elif kind == "json_stac_asset_stats":
+                    j_cw, j_tt = r_cw.json(), r_tt.json()
+                    m_err = abs(j_cw["red"]["b1"]["mean"] - j_tt["red"]["b1"]["mean"])
+                    parity = f"keys={sorted(j_cw.keys())}=={sorted(j_tt.keys())} red.b1.mean_err={m_err:.2f}"
                 else:
                     parity = "ok"
 
