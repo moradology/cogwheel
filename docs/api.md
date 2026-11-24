@@ -1,6 +1,6 @@
 # API
 
-`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet. titiler-pgstac's search and collection mosaic routes, which do need Postgres, are described under [pgSTAC](#pgstac).
+`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet. titiler-pgstac's search, collection and item routes, which do need Postgres, are described under [pgSTAC](#pgstac).
 
 **`/cog/*`** (TiTiler's `TilerFactory`)
 
@@ -24,7 +24,7 @@
 
 ## pgSTAC
 
-With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search and collection mosaic routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 101 requests to both servers on one database and compares status codes, JSON bodies, item lists and rendered tiles; all 101 agreed when last run, at v0.5.19 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2. Agreement on tiles means the same valid pixels and a PSNR of at least 25 dB; the 20 tile pairs had a median of 37.5 dB (30.1 to 43.4).
+With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 133 requests to both servers on one database and compares status codes, JSON bodies, item lists and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 128 agreed and 5 were known differences, all on the item routes and listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; the 29 agreeing pairs had a median of 37.5 dB (25.8 to 52.1).
 
 - `POST /searches/register` with a STAC search body (`collections`, `ids`, `bbox`, `intersects`, `datetime`, `query`, `filter`, `sortby`) and optional `metadata`. The returned `id` is pgSTAC's hash, the same one titiler-pgstac returns for the same body.
 - `GET /searches/` and `/searches/list` (with `limit`, `offset`, and `sortby` on `lastused` or `usecount`), `GET /searches/{id}/info`.
@@ -38,9 +38,27 @@ With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla
 
 Responses follow titiler-pgstac: errors are JSON `{"detail": ...}`, a missing `assets` is a `422`, a tile no item covers is a `204`, and a tile with no extension is a JPEG when every pixel is valid and a PNG otherwise. Resampling follows TiTiler on these routes: nearest neighbour by default, with `resampling` applied to sources already in Web Mercator and `reproject` to sources that have to be reprojected.
 
-Not there yet, each answered with a `400` or `404` rather than a different picture:
+### Item routes
 
-- Point values, `bbox` and `feature` images, `statistics` and WMTS on the search and collection routes, and the `/collections/{id}/items/{id}` family.
+`/collections/{collection_id}/items/{item_id}/...` is the [`/stac`](#stac) router over an item read from pgSTAC with `get_item` instead of from `url`: `assets`, `info`, `info.geojson`, `statistics`, `asset_statistics`, `tiles/{tms}/{z}/{x}/{y}`, `{tms}/tilejson.json`, `{tms}/map.html`, `point/{lon},{lat}`, `preview`, `bbox/...` and `POST feature` and `statistics`, plus `tiles`, `tiles/{tms}` and `renders`. On top of what `/stac` does, these routes follow titiler-pgstac:
+
+- `assets` is required on every route that reads pixels, also with `expression`, and has to name an asset of the item; `GET .../assets` lists the assets in rio-tiler's default media types.
+- An unknown item is a `404`, a tile that does not touch the item is a `404`, and errors are JSON `{"detail": ...}`.
+- The item's bounds and zoom range come from its projection metadata (`proj:shape`, `proj:transform`, `proj:epsg` or `proj:code`) by rio-tiler's rule, or from its bbox when it has none. They are used for the tilesets, the TileJSON and `info.geojson`.
+- A tile with no extension is a JPEG when every pixel is valid and a PNG otherwise, and `.jpg` is served as `image/jpg`.
+
+Known differences from titiler-pgstac on these routes, inherited from the shared `/stac` code:
+
+- `preview`: the picture does not fill `max_size` or the size asked for the way TiTiler's does, so the two images are offset.
+- `statistics` and `asset_statistics`: the sample is smaller than `max_size` (115 by 115 where TiTiler reads 128 by 128), so `max`, `minority` and the other sample-sensitive numbers differ, and `statistics` describes a band as `b1` where TiTiler says `visual_b1`.
+- A point outside the item is a `404`; titiler-pgstac answers `500`.
+- `renders` answers for items without STAC renders; `renders/{id}`, items that have renders, and `WMTSCapabilities.xml` are not served.
+
+### Not there yet
+
+Each of these is answered with a `400` or `404` rather than a different picture:
+
+- Point values, `bbox` and `feature` images, `statistics` and WMTS on the search and collection routes.
 - On collection routes, a `filter` in CQL2 text (titiler-pgstac's default `filter-lang`): pass CQL2 JSON.
 - `coord_crs` other than `epsg:4326` on the `bbox` and `point` routes, and `f=html` on the tileset routes.
 - In the tileset list, the twelve tile matrix sets other than `WebMercatorQuad` that titiler-pgstac also lists.
