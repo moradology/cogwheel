@@ -59,9 +59,9 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("bad tilesize", format!("{tile}&tilesize=7")),
         ("unknown tms tile", format!("{base}/cog/tiles/UTM31WGS84Quad/10/163/395.png?url={sat_url}")),
         ("unknown tms tilejson", format!("{base}/cog/UTM31WGS84Quad/tilejson.json?url={sat_url}")),
-        ("statistics percentiles", format!("{base}/cog/statistics?url={sat_url}&p=5")),
         ("statistics expression", format!("{base}/cog/statistics?url={sat_url}&expression=b1/b2")),
-        ("point expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1/b2")),
+        ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
+        ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
         ("point coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:32610")),
         ("preview dst_crs", format!("{base}/cog/preview.png?url={sat_url}&dst_crs=epsg:4326")),
         ("preview explicit dims width", format!("{base}/cog/preview/256x256.png?url={sat_url}&width=300")),
@@ -88,10 +88,40 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("algorithm hillshade", format!("{base}/algorithms/hillshade")),
         ("cog validate", format!("{base}/cog/validate?url={sat_url}")),
         ("cog wmts", format!("{base}/cog/WebMercatorQuad/WMTSCapabilities.xml?url={sat_url}")),
+        ("statistics custom percentiles & bins & bidx", format!("{base}/cog/statistics?url={sat_url}&bidx=1&p=5&p=95&histogram_bins=20&categorical=true")),
+        ("point expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2")),
+        ("point bidx", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&bidx=2")),
+        ("mosaic tile buffer+nodata", format!("{base}/mosaic/tiles/WebMercatorQuad/10/163/395.png?url={sat_url}&rescale=0,1&buffer=4&nodata=0")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");
     }
+    let st_custom = get_json(
+        &client,
+        format!("{base}/cog/statistics?url={sat_url}&bidx=1&p=5&p=95&histogram_bins=20&categorical=true"),
+    )
+    .await;
+    assert_eq!(st_custom.as_object().unwrap().len(), 1);
+    assert!(st_custom["b1"]["percentile_5"].is_number());
+    assert!(st_custom["b1"]["percentile_95"].is_number());
+    assert_eq!(st_custom["b1"]["histogram"][0].as_array().unwrap().len(), 20);
+    assert!(st_custom["b1"]["categories"].is_object());
+
+    let pt_expr = get_json(
+        &client,
+        format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2"),
+    )
+    .await;
+    assert_eq!(pt_expr["values"].as_array().unwrap().len(), 1);
+    assert_eq!(pt_expr["band_names"][0], "b1-b2");
+
+    let pt_b2 = get_json(
+        &client,
+        format!("{base}/cog/point/-122.6,37.7?url={sat_url}&bidx=2"),
+    )
+    .await;
+    assert_eq!(pt_b2["values"].as_array().unwrap().len(), 1);
+    assert_eq!(pt_b2["band_names"][0], "b2");
     let prev_300 = client
         .get(format!("{base}/cog/preview.png?url={sat_url}&width=300"))
         .send()
