@@ -664,16 +664,21 @@ fn collection_search(
             .map_err(|_| invalid_param("query", "query", "Input should be valid JSON"))?;
         search.insert("query".into(), parsed);
     }
+    // As in titiler-pgstac a filter is CQL2 text unless `filter-lang` says JSON, and text
+    // is turned into the JSON its converter gives, so the search has the same hash.
+    let filter_lang = query_value(pairs, "filter-lang").unwrap_or("cql2-text");
+    if !matches!(filter_lang, "cql2-text" | "cql2-json") {
+        return Err(invalid_param("query", "filter-lang", "Input should be 'cql2-text' or 'cql2-json'"));
+    }
     if let Some(v) = query_value(pairs, "filter") {
-        // titiler-pgstac defaults to CQL2 text here and converts it; only JSON is taken yet.
-        if query_value(pairs, "filter-lang") != Some("cql2-json") {
-            return Err(detail(
-                StatusCode::BAD_REQUEST,
-                "cql2-text filters are not supported yet: pass the filter as CQL2 JSON with filter-lang=cql2-json",
-            ));
-        }
-        let parsed: Value = serde_json::from_str(v)
-            .map_err(|_| invalid_param("query", "filter", "Input should be valid JSON"))?;
+        let parsed: Value = if filter_lang == "cql2-json" {
+            serde_json::from_str(v)
+                .map_err(|_| invalid_param("query", "filter", "Input should be valid JSON"))?
+        } else {
+            super::cql2_text::to_json(v).map_err(|e| {
+                detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 text filter: {e}"))
+            })?
+        };
         search.insert("filter".into(), parsed);
     }
 
@@ -3399,7 +3404,32 @@ mod tests {
         assert_eq!(status("bbox=1,2,3"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("bbox=1,2,x,4"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("query=nope"), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(status("filter=eo:cloud_cover%3C20"), StatusCode::BAD_REQUEST);
+        assert_eq!(status("filter=eo:cloud_cover%3C"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=eo:cloud_cover"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=a%3D1&filter-lang=cql2-nope"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=a%3D1&filter-lang=cql2-json"), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // A filter is CQL2 text unless `filter-lang` says otherwise, and is stored as the
+        // JSON titiler-pgstac's converter gives: numbers as floats, `filter-lang` JSON.
+        for query in [
+            "filter=eo:cloud_cover%20%3C%2020%20AND%20platform%20%3D%20%27sentinel-2b%27",
+            "filter=eo:cloud_cover%3C20+and+platform%3D%27sentinel-2b%27&filter-lang=cql2-text",
+        ] {
+            let (search, _) = collection_search("c", &json!({}), &query_pairs(query)).unwrap();
+            assert_eq!(
+                search,
+                json!({
+                    "collections": ["c"],
+                    "filter-lang": "cql2-json",
+                    "filter": { "op": "and", "args": [
+                        { "op": "<", "args": [{ "property": "eo:cloud_cover" }, 20.0] },
+                        { "op": "=", "args": [{ "property": "platform" }, "sentinel-2b"] }
+                    ]}
+                }),
+                "{query}"
+            );
+            assert!(search.to_string().contains("20.0"), "{query}");
+        }
     }
 
     #[test]
