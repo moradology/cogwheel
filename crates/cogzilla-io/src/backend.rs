@@ -82,7 +82,7 @@ pub enum CogSource {
 
 /// Strip `?query`, `#fragment`, and `user:pass@` userinfo from an HTTP(S) URL before surfacing it
 /// in `IoError::HttpStatus` so presigned S3 / Azure SAS / basic-auth credentials never leak.
-fn redact_http_url(url: &str) -> String {
+pub fn redact_http_url(url: &str) -> String {
     let no_query = url.split(['?', '#']).next().unwrap_or(url);
     if let Some(scheme_end) = no_query.find("://") {
         let after_scheme = &no_query[scheme_end + 3..];
@@ -414,5 +414,26 @@ impl CogSource {
             | Self::RemoteGcs { .. }
             | Self::RemoteAzure { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_http_url;
+
+    #[test]
+    fn redact_http_url_strips_credentials_query_and_fragment() {
+        assert_eq!(
+            redact_http_url("https://user:secret@example.com/a/b.tif?X-Amz-Signature=deadbeef#frag"),
+            "https://example.com/a/b.tif"
+        );
+        assert_eq!(
+            redact_http_url("https://example.com/cog.tif?sig=123"),
+            "https://example.com/cog.tif"
+        );
+        assert_eq!(
+            redact_http_url("https://example.com/cog.tif"),
+            "https://example.com/cog.tif"
+        );
     }
 }

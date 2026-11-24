@@ -878,7 +878,7 @@ async fn fetch_s3_inner(
                         p.on_throttle();
                     }
                 }
-                return Err(IoError::Http(e));
+                return Err(IoError::Http(e.without_url()));
             }
         };
 
@@ -889,7 +889,10 @@ async fn fetch_s3_inner(
             && let Some(rng) = range_header
             && !rng.starts_with("bytes=0-")
         {
-            return Err(IoError::HttpStatus { status: 200, url });
+            return Err(IoError::HttpStatus {
+                status: 200,
+                url: crate::backend::redact_http_url(&url),
+            });
         }
         if status == 200 || status == 206 {
             // The body can still fail after a good status line (connection reset mid-transfer).
@@ -921,15 +924,15 @@ async fn fetch_s3_inner(
                             p.on_throttle();
                         }
                     }
-                    return Err(IoError::Http(e));
+                    return Err(IoError::Http(e.without_url()));
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // Automatic S3 bucket region discovery on 301 / 400 / 403 with `x-amz-bucket-region`.
+        // Automatic S3 bucket region discovery on 301 / 307 / 400 / 403 with `x-amz-bucket-region`.
         // Strictly validate region syntax to prevent SSRF/credential exfiltration via spoofed headers.
-        if !region_redirected && matches!(status, 301 | 400 | 403) {
+        if !region_redirected && matches!(status, 301 | 307 | 400 | 403) {
             if let Some(discovered) = resp
                 .headers()
                 .get("x-amz-bucket-region")
@@ -968,7 +971,10 @@ async fn fetch_s3_inner(
                 p.on_throttle();
             }
         }
-        return Err(IoError::HttpStatus { status, url });
+        return Err(IoError::HttpStatus {
+            status,
+            url: crate::backend::redact_http_url(&url),
+        });
     }
 }
 

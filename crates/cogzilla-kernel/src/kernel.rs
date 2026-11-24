@@ -265,11 +265,12 @@ fn bilinear_row_flat_dispatch<const N: usize>(
     #[allow(unreachable_code)]
     {
         let bc = base_col as f32;
+        let max_x = row0.len().min(row1.len()).saturating_sub(2);
         for px in 0..N {
             let u = u_coords[px] - bc;
             let x0_f = u.floor();
             let fx = u - x0_f;
-            let x0 = x0_f as usize;
+            let x0 = (x0_f.max(0.0) as usize).min(max_x);
             let v00 = unsafe { *row0.get_unchecked(x0) };
             let v10 = unsafe { *row0.get_unchecked(x0 + 1) };
             let v01 = unsafe { *row1.get_unchecked(x0) };
@@ -688,6 +689,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
         if let (CoordPlan::Separable1D { u, v, .. }, Some((flat, base_col, base_row, row_stride))) =
             (plan, src.single_block_flat())
         {
+            let max_y = (flat.len() / row_stride).saturating_sub(2);
             match style.format {
                 OutputFormat::RawF32 | OutputFormat::Npy => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
@@ -696,7 +698,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         let vy = v[py] - (base_row as f32);
                         let y0_f = vy.floor();
                         let fy = vy - y0_f;
-                        let y0 = y0_f as usize;
+                        let y0 = (y0_f.max(0.0) as usize).min(max_y);
                         let r0 = &flat[y0 * row_stride..];
                         let r1 = &flat[(y0 + 1) * row_stride..];
                         bilinear_row_flat_dispatch::<N>(
@@ -734,7 +736,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             let vy = v[py] - (base_row as f32);
                             let y0_f = vy.floor();
                             let fy = vy - y0_f;
-                            let y0 = y0_f as usize;
+                            let y0 = (y0_f.max(0.0) as usize).min(max_y);
                             let r0 = &flat[y0 * row_stride..];
                             let r1 = &flat[(y0 + 1) * row_stride..];
                             bilinear_row_flat_dispatch::<N>(
@@ -773,7 +775,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             let vy = v[py] - (base_row as f32);
                             let y0_f = vy.floor();
                             let fy = vy - y0_f;
-                            let y0 = y0_f as usize;
+                            let y0 = (y0_f.max(0.0) as usize).min(max_y);
                             let r0 = &flat[y0 * row_stride..];
                             let r1 = &flat[(y0 + 1) * row_stride..];
                             bilinear_row_flat_dispatch::<N>(

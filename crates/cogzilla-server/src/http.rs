@@ -24,7 +24,7 @@ mod pgstac;
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
 use crate::stac::{
-    get_colormap_json, get_colormap_png, get_tms_json, list_colormaps_json, list_tms_json,
+    get_colormap_image, get_colormap_json, get_tms_json, list_colormaps_json, list_tms_json,
     load_stac_item, resolve_stac_assets,
 };
 use crate::titiler::{
@@ -131,6 +131,7 @@ struct ParsedQuery {
     custom_colormap_json: Option<String>,
     color_formula: Option<String>,
     resample: ResampleMode,
+    reproject: ResampleMode,
     tile_size: u32,
     max_size: u32,
     webp_quality: Option<f32>,
@@ -142,11 +143,15 @@ struct ParsedQuery {
     buffer: u32,
     coord_crs_3857: bool,
     format_param: Option<String>,
+    minzoom: Option<u8>,
+    maxzoom: Option<u8>,
+    tile_format: Option<String>,
     algorithm: Option<String>,
     azimuth: f32,
     altitude: f32,
     z_factor: f32,
     colormap_explicit: bool,
+    colormap_name_set: bool,
     /// Parameter names present in the query, for per-route validation.
     keys: Vec<String>,
     /// Values that could not be parsed or name something unsupported.
@@ -159,10 +164,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         assets: Vec::new(),
         bidx: Vec::new(),
         rescale: Vec::new(),
-        colormap: ColormapName::Viridis,
+        colormap: ColormapName::Grayscale,
         custom_colormap_json: None,
         color_formula: None,
-        resample: ResampleMode::Bilinear,
+        resample: ResampleMode::Nearest,
+        reproject: ResampleMode::Nearest,
         tile_size: 256,
         max_size: 1024,
         webp_quality: None,
@@ -174,11 +180,15 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         buffer: 0,
         coord_crs_3857: false,
         format_param: None,
+        minzoom: None,
+        maxzoom: None,
+        tile_format: None,
         algorithm: None,
         azimuth: 315.0,
         altitude: 45.0,
         z_factor: 1.0,
         colormap_explicit: false,
+        colormap_name_set: false,
         keys: Vec::new(),
         errors: Vec::new(),
     };
@@ -226,7 +236,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             }
                         }
                         if let Some(val) = obj
-                            .get("z_factor")
+                            .get("z_exaggeration")
+                            .or_else(|| obj.get("z_factor"))
                             .or_else(|| obj.get("zfactor"))
                         {
                             match val.as_f64().map(|z| z as f32) {
@@ -277,7 +288,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "rescale" => {
                 let decoded = percent_decode(v);
                 for group in decoded.split(';') {
-                    match group.split_once(',').map(|(a, b)| (a.parse::<f32>(), b.parse::<f32>())) {
+                    let cleaned = group.trim().trim_matches(|c| c == '[' || c == ']');
+                    match cleaned
+                        .split_once(',')
+                        .map(|(a, b)| (a.trim().parse::<f32>(), b.trim().parse::<f32>()))
+                    {
                         Some((Ok(mn), Ok(mx))) if mn.is_finite() && mx.is_finite() => {
                             pq.rescale.push((mn, mx));
                         }
@@ -300,6 +315,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if let Some(cm) = ColormapName::from_str_opt(&percent_decode(v)) {
                     pq.colormap = cm;
                     pq.colormap_explicit = true;
+                    pq.colormap_name_set = true;
                 } else {
                     bad("unknown colormap (see /colorMaps)");
                 }
@@ -309,12 +325,19 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "nodata" => {
                 let dec = percent_decode(v);
-                if let Ok(nd) = dec.parse::<f32>()
+                let trimmed = dec.trim();
+                if trimmed.eq_ignore_ascii_case("nan") {
+                    pq.nodata = Some(f32::NAN);
+                } else if trimmed.eq_ignore_ascii_case("inf") || trimmed.eq_ignore_ascii_case("+inf") {
+                    pq.nodata = Some(f32::INFINITY);
+                } else if trimmed.eq_ignore_ascii_case("-inf") {
+                    pq.nodata = Some(f32::NEG_INFINITY);
+                } else if let Ok(nd) = trimmed.parse::<f32>()
                     && nd.is_finite()
                 {
                     pq.nodata = Some(nd);
                 } else {
-                    bad("expected a finite number");
+                    bad("expected a number, nan, inf, or -inf");
                 }
             }
             "unscale" => {
@@ -346,7 +369,18 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     "bilinear" => ResampleMode::Bilinear,
                     _ => {
                         bad("use nearest, bilinear or cubic");
-                        ResampleMode::Bilinear
+                        ResampleMode::Nearest
+                    }
+                };
+            }
+            "reproject" => {
+                pq.reproject = match v {
+                    "nearest" => ResampleMode::Nearest,
+                    "cubic" | "cubicspline" | "cubic_spline" | "lanczos" => ResampleMode::Cubic,
+                    "bilinear" => ResampleMode::Bilinear,
+                    _ => {
+                        bad("use nearest, bilinear or cubic");
+                        ResampleMode::Nearest
                     }
                 };
             }
@@ -380,20 +414,59 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "expr" | "expression" | "index" => {
-                pq.expr_raw = Some(percent_decode_opts(v, false));
+                // Standard HTTP clients (httpx, requests, URLSearchParams) form-encode spaces as `+`
+                // and literal plus as `%2B`, while raw CLI/browser URLs often write `(b1+b2)` directly.
+                // Decode `+` as space when form-encoding markers are present so both work cleanly.
+                let plus_is_space = v.contains("%2B")
+                    || v.contains("%2b")
+                    || v.contains("+-")
+                    || v.contains("-+")
+                    || v.contains("+*")
+                    || v.contains("*+")
+                    || v.contains("+/")
+                    || v.contains("/+")
+                    || v.contains("++")
+                    || v.contains("+(")
+                    || v.contains(")+")
+                    || v.contains("%2F+")
+                    || v.contains("+%2F")
+                    || v.contains("%2f+")
+                    || v.contains("+%2f")
+                    || v.contains("%28+")
+                    || v.contains("+%29");
+                pq.expr_raw = Some(percent_decode_opts(v, plus_is_space));
             }
             "padding" => {
                 if v.parse::<f32>().ok() != Some(0.0) {
                     bad("padding is not supported");
                 }
             }
-            "reproject" | "dst_crs" | "crs" | "histogram_bins" | "histogram_range"
-            | "categorical" | "c" | "p" | "cover_scale" | "height" | "width" | "minzoom"
-            | "maxzoom" | "tile_format" | "orientation" => {
+            "minzoom" => match v.parse::<u8>() {
+                Ok(z) if z <= 30 => pq.minzoom = Some(z),
+                _ => bad("expected minzoom in 0..=30"),
+            },
+            "maxzoom" => match v.parse::<u8>() {
+                Ok(z) if z <= 30 => pq.maxzoom = Some(z),
+                _ => bad("expected maxzoom in 0..=30"),
+            },
+            "tile_format" => {
+                let fmt = percent_decode(v).to_ascii_lowercase();
+                if parse_ext_format(&fmt, None, 85).is_ok() {
+                    pq.tile_format = Some(fmt);
+                } else {
+                    bad("unsupported tile_format (use png, webp, jpg, f32, or npy)");
+                }
+            }
+            "dst_crs" | "crs" | "histogram_bins" | "histogram_range" | "categorical" | "c"
+            | "p" | "cover_scale" | "height" | "width" | "orientation" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
         }
+    }
+    // TiTiler precedence: colormap_name wins over inline JSON colormap when both are supplied.
+    if pq.colormap_name_set {
+        pq.custom_colormap_json = None;
     }
     pq.errors = pq_errors;
     pq
@@ -468,12 +541,67 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
     }
-    if route("bbox") {
+    if route("bbox") && segs.len() >= 4 {
         if let Some(k) = has(&["max_size"]) {
-            return Err(format!("parameter '{k}' is not supported on bbox routes"));
+            return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
+        }
+    }
+    let last_seg = segs.last().copied().unwrap_or("");
+    if last_seg != "tilejson.json" && last_seg != "map.html" {
+        if let Some(k) = has(&["minzoom", "maxzoom", "tile_format"]) {
+            return Err(format!(
+                "parameter '{k}' is only supported on tilejson.json and map.html routes"
+            ));
         }
     }
     Ok(())
+}
+
+/// Apply TiTiler `minzoom`, `maxzoom`, and `tile_format` query overrides to a TileJSON document,
+/// stripping those TileJSON-only params from the forwarded tile URL template.
+fn apply_tilejson_overrides(
+    tj: &mut serde_json::Value,
+    pq: &ParsedQuery,
+    host: &str,
+    route_prefix: &str,
+    tms: &str,
+    raw_query: &str,
+) {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    };
+    let filtered_query: String = raw_query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split('=').next().unwrap_or("");
+            !pair.is_empty() && !matches!(k, "minzoom" | "maxzoom" | "tile_format")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let ext_suffix = pq
+        .tile_format
+        .as_deref()
+        .map(|f| format!(".{f}"))
+        .unwrap_or_default();
+    let tile_url = if filtered_query.is_empty() {
+        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}")
+    } else {
+        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}?{filtered_query}")
+    };
+    tj["tiles"] = serde_json::json!([tile_url]);
+    if let Some(minz) = pq.minzoom {
+        tj["minzoom"] = serde_json::json!(minz);
+        if let Some(center) = tj.get_mut("center").and_then(|v| v.as_array_mut())
+            && center.len() >= 3
+        {
+            center[2] = serde_json::json!(minz);
+        }
+    }
+    if let Some(maxz) = pq.maxzoom {
+        tj["maxzoom"] = serde_json::json!(maxz);
+    }
 }
 
 fn parse_ext_format(
@@ -547,10 +675,51 @@ fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCo
     }
 }
 
+/// Compute aspect-preserving `(width, height)` inside `max_dim` for format-only `/bbox` and
+/// `POST /feature` routes (matching TiTiler instead of stretching into a fixed square).
+fn aspect_preserving_dims(bbox: [f64; 4], max_dim: u32) -> (u32, u32) {
+    let max_d = max_dim.clamp(1, 4096) as f64;
+    let dx = (bbox[2] - bbox[0]).abs();
+    let dy = (bbox[3] - bbox[1]).abs();
+    if !dx.is_finite() || !dy.is_finite() || dx <= 0.0 || dy <= 0.0 {
+        let d = max_dim.clamp(1, 4096);
+        return (d, d);
+    }
+    if dx >= dy {
+        let w = max_d.round() as u32;
+        let h = ((max_d * (dy / dx)).round() as u32).clamp(1, max_dim.clamp(1, 4096));
+        (w.max(1), h)
+    } else {
+        let h = max_d.round() as u32;
+        let w = ((max_d * (dx / dy)).round() as u32).clamp(1, max_dim.clamp(1, 4096));
+        (w, h.max(1))
+    }
+}
+
+/// Default rescale range matching TiTiler's `dtype_ranges` when `?rescale=` is omitted.
+fn default_rescale_for_dtype(st: cogzilla_tiff::SampleType, single: bool) -> (f32, f32) {
+    use cogzilla_tiff::SampleType;
+    match st {
+        SampleType::Uint8 => (0.0, 255.0),
+        SampleType::Int8 => (-128.0, 127.0),
+        SampleType::Uint16 => (0.0, 65535.0),
+        SampleType::Int16 => (-32768.0, 32767.0),
+        SampleType::Uint32 => (0.0, 4_294_967_295.0),
+        SampleType::Int32 => (-2_147_483_648.0, 2_147_483_647.0),
+        SampleType::Float32 | SampleType::Float64 => {
+            if single {
+                (0.0, 1000.0)
+            } else {
+                (0.0, 1.0)
+            }
+        }
+    }
+}
+
 fn build_band_request(
     pq: &ParsedQuery,
     default_bands: u16,
-    is_u8: bool,
+    sample_type: cogzilla_tiff::SampleType,
 ) -> Result<BandRequest, EngineError> {
     if let Some(alg) = pq.algorithm.as_deref() {
         let band_1based = pq.bidx.first().copied().unwrap_or(1);
@@ -694,11 +863,8 @@ fn build_band_request(
             ),
             1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
             _ => {
-                if is_u8 {
-                    ([0.0; 3], [255.0; 3])
-                } else {
-                    ([0.0; 3], [1.0; 3])
-                }
+                let (lo, hi) = default_rescale_for_dtype(sample_type, false);
+                ([lo; 3], [hi; 3])
             }
         };
         Ok(BandRequest::Rgb {
@@ -708,7 +874,7 @@ fn build_band_request(
         })
     } else {
         let b = pq.bidx.first().copied().unwrap_or(1);
-        let default_range = if is_u8 { (0.0, 255.0) } else { (0.0, 1000.0) };
+        let default_range = default_rescale_for_dtype(sample_type, true);
         let rescale = pq.rescale.first().copied().unwrap_or(default_range);
         Ok(BandRequest::Single {
             band_1based: b,
@@ -718,13 +884,34 @@ fn build_band_request(
     }
 }
 
+/// Match TiTiler / rio-tiler resampling semantics: when the source CRS matches the target CRS,
+/// `resampling` applies; when reprojecting across CRSes, `reproject` applies (both default to
+/// `Nearest`).
+fn resolve_resample(
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    target_is_4326: bool,
+) -> ResampleMode {
+    let Some(cog) = source_cog else {
+        return pq.resample;
+    };
+    let same_crs = match cogzilla_proj::CrsModel::from_geo_keys(&cog.index.geo_keys) {
+        Ok(cogzilla_proj::CrsModel::Epsg3857) => !target_is_4326,
+        Ok(cogzilla_proj::CrsModel::Geographic) => target_is_4326,
+        _ => false,
+    };
+    if same_crs { pq.resample } else { pq.reproject }
+}
+
 fn build_tile_request(
     tile: TileCoord,
     scale_opt: Option<u32>,
     ext: &str,
     pq: &ParsedQuery,
     default_bands: u16,
-    is_u8: bool,
+    sample_type: cogzilla_tiff::SampleType,
+    is_crs84: bool,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
     if tile.z > 30 {
         return Err(EngineError::BadRequest(format!(
@@ -732,8 +919,21 @@ fn build_tile_request(
             tile.z
         )));
     }
-    let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-    let bands = build_band_request(pq, default_bands, is_u8)?;
+    let rows = 1u64 << (tile.z as u32);
+    let cols = if is_crs84 { rows << 1 } else { rows };
+    if (tile.x as u64) >= cols || (tile.y as u64) >= rows {
+        return Err(EngineError::BadRequest(format!(
+            "tile coordinate ({}, {}) out of range for z={} (expected x < {cols}, y < {rows})",
+            tile.x, tile.y, tile.z
+        )));
+    }
+    let eff_ext = if ext.is_empty() {
+        pq.format_param.as_deref().unwrap_or("png")
+    } else {
+        ext
+    };
+    let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
+    let bands = build_band_request(pq, default_bands, sample_type)?;
     let tile_size = match scale_opt {
         Some(sc) if (1..=4).contains(&sc) => sc * 256,
         Some(other) => {
@@ -748,12 +948,69 @@ fn build_tile_request(
             tile,
             tile_size,
             bands,
-            resample: pq.resample,
+            resample: resolve_resample(pq, source_cog, is_crs84),
             format,
             unscale: pq.unscale,
         },
         content_type,
     ))
+}
+
+fn validate_mosaic_tile_params(pq: &ParsedQuery, tile_size: u32) -> Result<(), EngineError> {
+    if tile_size != 256 && tile_size != 512 {
+        return Err(EngineError::BadRequest(format!(
+            "mosaic tile routes only support tile_size 256 or 512 (got {tile_size})"
+        )));
+    }
+    if pq.nodata.is_some() {
+        return Err(EngineError::BadRequest(
+            "query parameter 'nodata' is not supported on mosaic tile routes".into(),
+        ));
+    }
+    if pq.custom_colormap_json.is_some() {
+        return Err(EngineError::BadRequest(
+            "inline JSON 'colormap' is not supported on mosaic tile routes (use 'colormap_name')"
+                .into(),
+        ));
+    }
+    if pq.buffer > 0 {
+        return Err(EngineError::BadRequest(
+            "query parameter 'buffer' is not supported on mosaic tile routes".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn render_mosaic_tile_styled(
+    engine: &TileEngine,
+    urls: &[String],
+    mut treq: TileRequest,
+    pq: &ParsedQuery,
+) -> Result<Bytes, EngineError> {
+    if (pq.color_formula.is_some() || !pq.return_mask)
+        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+    {
+        let cf = pq
+            .color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let orig_format = treq.format;
+        treq.format = OutputFormat::RawRgba;
+        let raw = engine.render_mosaic_tile(urls, &treq).await?;
+        let dim = treq.tile_size as usize;
+        let data = if let Some(cf) = cf {
+            let mut buf = raw.to_vec();
+            cf.apply_buffer_in_place(&mut buf, 4);
+            encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
+        } else {
+            encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
+        };
+        Ok(data)
+    } else {
+        engine.render_mosaic_tile(urls, &treq).await
+    }
 }
 
 fn world_crs84_tile_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
@@ -1009,7 +1266,13 @@ where
     }
 
     if method == Method::GET && (path == "/" || path == "/index.html") {
-        let html = include_str!("landing.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+        let base_path_js = serde_json::to_string(&forwarded_prefix)
+            .unwrap_or_else(|_| "\"\"".to_string())
+            .replace("</", "<\\/");
+        let html = include_str!("landing.html")
+            .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+            .replace("{{BASE_PATH}}", &forwarded_prefix)
+            .replace("{{BASE_PATH_JS}}", &base_path_js);
         return Ok(plain_resp(StatusCode::OK, Bytes::from(html), "text/html; charset=utf-8"));
     }
 
@@ -1203,7 +1466,10 @@ where
                     .send()
                     .await
                     .map_err(|e| {
-                        EngineError::BadRequest(format!("STAC API search failed: {e}"))
+                        EngineError::BadRequest(format!(
+                            "STAC API search failed: {}",
+                            e.without_url()
+                        ))
                     })?;
                 if !resp.status().is_success() {
                     return Err(EngineError::BadRequest(format!(
@@ -1305,7 +1571,17 @@ where
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                3,
+                                cogzilla_tiff::SampleType::Uint8,
+                                false,
+                                None,
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
                                 _ => 1,
@@ -1317,10 +1593,19 @@ where
                         } else {
                             let first_cog = engine.store.open_uri(&urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
-                            let is_u8 = first_cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, db, is_u8)?;
-                            let b = engine.render_mosaic_tile(&urls, &treq).await?;
+                            let st = first_cog.index.full_res().sample_type;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                st,
+                                false,
+                                Some(&first_cog),
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             Ok((b, ct))
                         }
                     })
@@ -1372,11 +1657,19 @@ where
                         .get_or_render(cache_key, || async {
                             let first_cog = engine.store.open_uri(&pq.urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
-                            let is_u8 = first_cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) =
-                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
-                            let b = engine.render_mosaic_tile(&pq.urls, &treq).await?;
+                            let st = first_cog.index.full_res().sample_type;
+                            let (treq, ct) = build_tile_request(
+                                TileCoord { z, x, y },
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                st,
+                                false,
+                                Some(&first_cog),
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let b = render_mosaic_tile_styled(&engine, &pq.urls, treq, &pq).await?;
                             Ok((b, ct))
                         })
                         .await;
@@ -1417,7 +1710,17 @@ where
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                3,
+                                cogzilla_tiff::SampleType::Uint8,
+                                false,
+                                None,
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
                                 _ => 1,
@@ -1429,10 +1732,19 @@ where
                         } else {
                             let first_cog = engine.store.open_uri(&urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
-                            let is_u8 = first_cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, db, is_u8)?;
-                            let b = engine.render_mosaic_tile(&urls, &treq).await?;
+                            let st = first_cog.index.full_res().sample_type;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                st,
+                                false,
+                                Some(&first_cog),
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             Ok((b, ct))
                         }
                     })
@@ -1480,10 +1792,17 @@ where
                             } else {
                                 cogs[0].index.full_res().samples_per_pixel
                             };
-                            let is_u8 = cogs[0].index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
-                            let (mut treq, ct) =
-                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            let st = cogs[0].index.full_res().sample_type;
+                            let (mut treq, ct) = build_tile_request(
+                                TileCoord { z, x, y },
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                st,
+                                false,
+                                Some(&cogs[0]),
+                            )?;
                             if pq.unscale {
                                 apply_unscale_cogs(&mut treq.bands, &cogs);
                             }
@@ -1575,13 +1894,23 @@ where
                 Bytes::from(list_colormaps_json(&host).to_string()),
                 "application/json",
             )),
-            ["colorMaps", id] => {
-                if pq.format_param.as_deref() == Some("png") {
-                    get_colormap_png(id).map(|b| (b, "image/png"))
-                } else {
+            ["colorMaps", id] => match pq.format_param.as_deref() {
+                None | Some("json") => {
                     get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
                 }
-            }
+                Some("png") => get_colormap_image(id, OutputFormat::Png).map(|b| (b, "image/png")),
+                Some("jpg" | "jpeg") => {
+                    get_colormap_image(id, OutputFormat::Jpeg { quality: pq.jpeg_quality })
+                        .map(|b| (b, "image/jpeg"))
+                }
+                Some("webp") => {
+                    get_colormap_image(id, OutputFormat::Webp { quality: pq.webp_quality })
+                        .map(|b| (b, "image/webp"))
+                }
+                Some(other) => Err(EngineError::BadRequest(format!(
+                    "unsupported colormap format '{other}' (use json, png, jpg, or webp)"
+                ))),
+            },
             _ => Err(EngineError::NotFound(path.clone())),
         };
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
@@ -1739,48 +2068,107 @@ where
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
-                let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
+                let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
-                let (mask, _) = PolygonMask::from_geojson(&geojson)?;
-                let mask = Arc::new(mask);
-                let n = names.len();
-                let mut set = tokio::task::JoinSet::new();
-                for (idx, cog) in cogs.into_iter().enumerate() {
+
+                let compute_stac_merged_stats = |mask: Arc<PolygonMask>| {
+                    let cogs_c = cogs.clone();
                     let eng = engine.clone();
-                    let mask_c = mask.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    set.spawn(async move {
-                        let st = compute_statistics(
-                            &eng,
-                            &cog,
-                            max_size,
-                            Some(&mask_c),
-                            unscale,
-                            nodata,
-                        )
-                        .await?;
-                        Ok::<_, EngineError>((idx, st))
-                    });
-                }
-                let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
-                while let Some(res) = set.join_next().await {
-                    let (idx, st) = res.map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
-                    ordered[idx] = Some(st);
-                }
-                let mut map = serde_json::Map::new();
-                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
-                    if let Some(st) = st {
-                        map.insert(name, st);
+                    let n = names.len();
+                    async move {
+                        let mut set = tokio::task::JoinSet::new();
+                        for (idx, cog) in cogs_c.into_iter().enumerate() {
+                            let eng_c = eng.clone();
+                            let mask_c = mask.clone();
+                            set.spawn(async move {
+                                let st = compute_statistics(
+                                    &eng_c,
+                                    &cog,
+                                    max_size,
+                                    Some(&mask_c),
+                                    unscale,
+                                    nodata,
+                                )
+                                .await?;
+                                Ok::<_, EngineError>((idx, st))
+                            });
+                        }
+                        let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
+                        while let Some(res) = set.join_next().await {
+                            let (idx, st) = res
+                                .map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
+                            ordered[idx] = Some(st);
+                        }
+                        // Merge bands across assets into b1..bN to match TiTiler's POST /stac/statistics.
+                        let mut merged = serde_json::Map::new();
+                        let mut b_counter = 1usize;
+                        for st in ordered.into_iter().flatten() {
+                            if let Some(obj) = st.as_object() {
+                                for (_k, v) in obj {
+                                    merged.insert(format!("b{b_counter}"), v.clone());
+                                    b_counter += 1;
+                                }
+                            }
+                        }
+                        Ok::<_, EngineError>(serde_json::Value::Object(merged))
+                    }
+                };
+
+                if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                    let features = geojson
+                        .get_mut("features")
+                        .and_then(|v| v.as_array_mut())
+                        .ok_or_else(|| {
+                            EngineError::BadRequest("FeatureCollection missing 'features' array".into())
+                        })?;
+                    if features.len() > 64 {
+                        return Err(EngineError::BadRequest(format!(
+                            "FeatureCollection exceeds max 64 features (got {})",
+                            features.len()
+                        )));
+                    }
+                    for feat in features.iter_mut() {
+                        let (mask, _) = PolygonMask::from_geojson(feat)?;
+                        let stats = compute_stac_merged_stats(Arc::new(mask)).await?;
+                        if let Some(props) =
+                            feat.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = feat.as_object_mut() {
+                            obj.insert(
+                                "properties".into(),
+                                serde_json::json!({"statistics": stats}),
+                            );
+                        }
+                    }
+                    Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                } else {
+                    let (mask, _) = PolygonMask::from_geojson(&geojson)?;
+                    let stats = compute_stac_merged_stats(Arc::new(mask)).await?;
+                    if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                        if let Some(props) =
+                            geojson.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = geojson.as_object_mut() {
+                            obj.insert(
+                                "properties".into(),
+                                serde_json::json!({"statistics": stats}),
+                            );
+                        }
+                        Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                    } else {
+                        let feat = serde_json::json!({
+                            "type": "Feature",
+                            "geometry": geojson,
+                            "properties": { "statistics": stats },
+                        });
+                        Ok((Bytes::from(feat.to_string()), "application/geo+json"))
                     }
                 }
-                let feat = serde_json::json!({
-                    "type": "Feature",
-                    "geometry": geojson.get("geometry").cloned().unwrap_or(geojson),
-                    "properties": { "statistics": map },
-                });
-                Ok((Bytes::from(feat.to_string()), "application/geo+json"))
             }
             .await,
 
@@ -1800,8 +2188,7 @@ where
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
-                let tile_url = format!("{host}/stac/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
-                tj["tiles"] = serde_json::json!([tile_url]);
+                apply_tilejson_overrides(&mut tj, &pq, &host, "stac", tms, &raw_query);
                 tj["name"] = serde_json::json!(item.id);
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
@@ -1844,15 +2231,16 @@ where
                         } else {
                             cogs[0].index.full_res().samples_per_pixel
                         };
-                        let is_u8 = cogs[0].index.full_res().sample_type
-                            == cogzilla_tiff::SampleType::Uint8;
+                        let st = cogs[0].index.full_res().sample_type;
                         let (mut treq, ct) = build_tile_request(
                             TileCoord { z, x, y },
                             sc,
                             ext,
                             &pq_stac,
                             db,
-                            is_u8,
+                            st,
+                            tms == "WorldCRS84Quad",
+                            Some(&cogs[0]),
                         )?;
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -2001,9 +2389,10 @@ where
                     }
                 }
                 let body = serde_json::json!({
-                    "coordinates": [lon, lat],
+                    "coordinates": [x, y],
                     "values": all_vals,
                     "band_names": all_names,
+                    "band_descriptions": all_names,
                 })
                 .to_string();
                 Ok((Bytes::from(body), "application/json"))
@@ -2012,7 +2401,7 @@ where
 
             // GET /stac/preview[/{w}x{h}][.{ext}]
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
-                let ext = p.strip_prefix("preview.").unwrap_or("png");
+                let ext_opt = p.strip_prefix("preview.");
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
@@ -2026,9 +2415,10 @@ where
                 let out_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2067,8 +2457,8 @@ where
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2105,9 +2495,13 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let (fmt, ct) = parse_ext_format(
+                    ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
+                    pq_stac.webp_quality,
+                    pq_stac.jpeg_quality,
+                )?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2123,15 +2517,18 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq_stac.max_size.min(1024));
                 let data = if pq_stac.coord_crs_3857 {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, 512, 512, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
@@ -2154,8 +2551,8 @@ where
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2172,14 +2569,16 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let data = if pq_stac.coord_crs_3857 {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
@@ -2210,8 +2609,8 @@ where
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2227,16 +2626,19 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
             }
             .await,
-            (Method::POST, [feat_ext]) if feat_ext.starts_with("feature.") => async {
-                let ext = feat_ext.strip_prefix("feature.").unwrap_or("png");
+            (Method::POST, [feat_ext])
+                if *feat_ext == "feature" || feat_ext.starts_with("feature.") =>
+            async {
+                let ext_opt = feat_ext.strip_prefix("feature.");
                 let s = pq.max_size.min(1024);
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
@@ -2249,9 +2651,10 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2267,8 +2670,10 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, s);
+                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2346,30 +2751,75 @@ where
                 } else {
                     let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                         .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
-                    let (mask, _) = PolygonMask::from_geojson(&geojson)?;
-                    let stats = compute_statistics(
-                        &engine,
-                        &cogs[0],
-                        pq.max_size,
-                        Some(&mask),
-                        pq.unscale,
-                        pq.nodata,
-                    )
-                    .await?;
-                    if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
-                        if let Some(props) = geojson.get_mut("properties").and_then(|v| v.as_object_mut()) {
-                            props.insert("statistics".into(), stats);
-                        } else if let Some(obj) = geojson.as_object_mut() {
-                            obj.insert("properties".into(), serde_json::json!({"statistics": stats}));
+                    if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                        let features = geojson
+                            .get_mut("features")
+                            .and_then(|v| v.as_array_mut())
+                            .ok_or_else(|| {
+                                EngineError::BadRequest(
+                                    "FeatureCollection missing 'features' array".into(),
+                                )
+                            })?;
+                        if features.len() > 64 {
+                            return Err(EngineError::BadRequest(format!(
+                                "FeatureCollection exceeds max 64 features (got {})",
+                                features.len()
+                            )));
+                        }
+                        for feat in features.iter_mut() {
+                            let (mask, _) = PolygonMask::from_geojson(feat)?;
+                            let stats = compute_statistics(
+                                &engine,
+                                &cogs[0],
+                                pq.max_size,
+                                Some(&mask),
+                                pq.unscale,
+                                pq.nodata,
+                            )
+                            .await?;
+                            if let Some(props) =
+                                feat.get_mut("properties").and_then(|v| v.as_object_mut())
+                            {
+                                props.insert("statistics".into(), stats);
+                            } else if let Some(obj) = feat.as_object_mut() {
+                                obj.insert(
+                                    "properties".into(),
+                                    serde_json::json!({"statistics": stats}),
+                                );
+                            }
                         }
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                     } else {
-                        let feat = serde_json::json!({
-                            "type": "Feature",
-                            "geometry": geojson,
-                            "properties": { "statistics": stats },
-                        });
-                        Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                        let (mask, _) = PolygonMask::from_geojson(&geojson)?;
+                        let stats = compute_statistics(
+                            &engine,
+                            &cogs[0],
+                            pq.max_size,
+                            Some(&mask),
+                            pq.unscale,
+                            pq.nodata,
+                        )
+                        .await?;
+                        if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                            if let Some(props) =
+                                geojson.get_mut("properties").and_then(|v| v.as_object_mut())
+                            {
+                                props.insert("statistics".into(), stats);
+                            } else if let Some(obj) = geojson.as_object_mut() {
+                                obj.insert(
+                                    "properties".into(),
+                                    serde_json::json!({"statistics": stats}),
+                                );
+                            }
+                            Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                        } else {
+                            let feat = serde_json::json!({
+                                "type": "Feature",
+                                "geometry": geojson,
+                                "properties": { "statistics": stats },
+                            });
+                            Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                        }
                     }
                 }
             }
@@ -2433,10 +2883,17 @@ where
                         } else {
                             cogs[0].index.full_res().samples_per_pixel
                         };
-                        let is_u8 = cogs[0].index.full_res().sample_type
-                            == cogzilla_tiff::SampleType::Uint8;
-                        let (mut treq, ct) =
-                            build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                        let st = cogs[0].index.full_res().sample_type;
+                        let (mut treq, ct) = build_tile_request(
+                            TileCoord { z, x, y },
+                            sc,
+                            ext,
+                            &pq,
+                            db,
+                            st,
+                            tms == "WorldCRS84Quad",
+                            Some(&cogs[0]),
+                        )?;
                         if pq.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
@@ -2540,13 +2997,16 @@ where
             // 8. GET /cog/{tileMatrixSetId}/tilejson.json & /cog/tilejson.json
             (Method::GET, [tms, "tilejson.json"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
+                let mut json = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
+                apply_tilejson_overrides(&mut json, &pq, &host, "cog", tms, &raw_query);
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
             (Method::GET, ["tilejson.json"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = build_tilejson(&engine, &cogs[0], &host, "WebMercatorQuad", &raw_query)?;
+                let mut json =
+                    build_tilejson(&engine, &cogs[0], &host, "WebMercatorQuad", &raw_query)?;
+                apply_tilejson_overrides(&mut json, &pq, &host, "cog", "WebMercatorQuad", &raw_query);
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
@@ -2571,14 +3031,21 @@ where
                 } else {
                     (x, y)
                 };
-                let json = query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
+                let mut json =
+                    query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
+                if pq.coord_crs_3857 {
+                    json["coordinates"] = serde_json::json!([x, y]);
+                }
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
 
             // 11. GET /cog/preview, /cog/preview.{format}, /cog/preview/{w}x{h}.{format}
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
-                let ext = p.strip_prefix("preview.").unwrap_or("png");
+                let ext = p
+                    .strip_prefix("preview.")
+                    .or(pq.format_param.as_deref())
+                    .unwrap_or("png");
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
@@ -2588,8 +3055,8 @@ where
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2613,8 +3080,8 @@ where
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2637,23 +3104,30 @@ where
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let (fmt, ct) = parse_ext_format(
+                    ext_opt.or(pq.format_param.as_deref()).unwrap_or("png"),
+                    pq.webp_quality,
+                    pq.jpeg_quality,
+                )?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size.min(1024));
                 let data = if pq.coord_crs_3857 {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, 512, 512, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, 512, 512, None, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
@@ -2672,22 +3146,24 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = if pq.coord_crs_3857 {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
@@ -2698,7 +3174,10 @@ where
 
             // 13. POST /cog/feature, /cog/feature.{format}, /cog/feature/{w}x{h}.{format}
             (Method::POST, [f]) if *f == "feature" || f.starts_with("feature.") => async {
-                let ext = f.strip_prefix("feature.").unwrap_or("png");
+                let ext = f
+                    .strip_prefix("feature.")
+                    .or(pq.format_param.as_deref())
+                    .unwrap_or("png");
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
@@ -2707,15 +3186,17 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size.min(1024));
+                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, 512, 512, Some(&mask), &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2734,15 +3215,16 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2935,8 +3417,19 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
         EngineError::Io(e @ cogzilla_io::IoError::InvalidUri(_)) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
         }
+        EngineError::Io(e @ cogzilla_io::IoError::Tiff(_)) => {
+            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+        }
         EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_)) => {
             plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
+        }
+        EngineError::Io(e @ cogzilla_io::IoError::HttpStatus { status: 404, .. }) => {
+            plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
+        }
+        EngineError::Io(e @ cogzilla_io::IoError::Fs(io_err))
+            if io_err.kind() == std::io::ErrorKind::NotFound =>
+        {
+            plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
         }
         e => {
             tracing::warn!(error = %e, "request failed with 500");
@@ -3019,7 +3512,8 @@ mod tests {
     fn colormap_param_sets_explicit_for_hillshade_and_stac_bbox_accepts_coord_crs() {
         let pq = parse_query(Some("algorithm=hillshade&colormap=terrain"));
         assert!(pq.colormap_explicit);
-        let bands = build_band_request(&pq, 1, false).expect("valid hillshade request");
+        let bands = build_band_request(&pq, 1, cogzilla_tiff::SampleType::Float32)
+            .expect("valid hillshade request");
         match bands {
             BandRequest::Dem { colormap, .. } => {
                 assert_ne!(colormap, ColormapName::Grayscale);
@@ -3032,5 +3526,93 @@ mod tests {
         let pq_bbox = parse_query(Some("url=foo.json&coord_crs=EPSG:3857"));
         let res = validate_query(&["stac", "bbox", "0,0,1000,1000.png"], &pq_bbox);
         assert!(res.is_ok(), "unexpected error: {res:?}");
+    }
+
+    #[test]
+    fn xyz_bounds_and_http_error_status_mapping() {
+        let pq = parse_query(None);
+        assert_eq!(pq.resample, ResampleMode::Nearest);
+        assert_eq!(pq.reproject, ResampleMode::Nearest);
+        let u8t = cogzilla_tiff::SampleType::Uint8;
+        // WebMercatorQuad at z=2 has 4x4 tiles (0..=3)
+        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, u8t, false, None).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, u8t, false, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, u8t, false, None).is_err());
+        // WorldCRS84Quad at z=2 has 8x4 tiles (x: 0..=7, y: 0..=3)
+        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, u8t, true, None).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, u8t, true, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, u8t, true, None).is_err());
+
+        // ?reproject= is accepted and parsed independently from ?resampling=
+        let pq_rp = parse_query(Some("resampling=bilinear&reproject=cubic"));
+        assert!(pq_rp.errors.is_empty());
+        assert_eq!(pq_rp.resample, ResampleMode::Bilinear);
+        assert_eq!(pq_rp.reproject, ResampleMode::Cubic);
+        assert!(validate_query(&["cog", "tiles", "WebMercatorQuad", "0", "0", "0.png"], &pq_rp).is_ok());
+
+        // Single-band default colormap is Grayscale (matching TiTiler)
+        assert_eq!(pq.colormap, ColormapName::Grayscale);
+
+        // Form-encoded ?expression= with spaces (`+`) and `%2B` decodes cleanly, while raw `(b1+b2)` still works
+        let pq_form = parse_query(Some("expression=%28b1+-+b2%29+%2F+%28b1+%2B+b2%29"));
+        assert_eq!(pq_form.expr_raw.as_deref(), Some("(b1 - b2) / (b1 + b2)"));
+        let pq_raw = parse_query(Some("expression=(b1-b2)/(b1+b2)"));
+        assert_eq!(pq_raw.expr_raw.as_deref(), Some("(b1-b2)/(b1+b2)"));
+
+        // ?format= applies on format-less tile routes
+        let pq_fmt = parse_query(Some("format=webp"));
+        let (treq, ct) =
+            build_tile_request(TileCoord { z: 2, x: 1, y: 1 }, None, "", &pq_fmt, 3, u8t, false, None)
+                .unwrap();
+        assert_eq!(ct, "image/webp");
+        assert!(matches!(treq.format, OutputFormat::Webp { .. }));
+
+        // Default dtype rescale ranges & aspect-preserving dims & hex colormaps
+        assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Uint16, false), (0.0, 65535.0));
+        assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Int16, true), (-32768.0, 32767.0));
+        assert_eq!(aspect_preserving_dims([0.0, 0.0, 2.0, 1.0], 512), (512, 256));
+        assert_eq!(aspect_preserving_dims([0.0, 0.0, 1.0, 4.0], 512), (128, 512));
+        let hex_lut = ColormapLut::from_json_str(r##"{"0":"#112233","255":"#ff000080"}"##).unwrap();
+        assert_eq!(hex_lut.rgb[0], [0x11, 0x22, 0x33]);
+        assert_eq!(hex_lut.rgba_u32[255].to_le_bytes(), [0xff, 0x00, 0x00, 0x80]);
+
+        // TiTiler query param parity: nodata=nan/inf/-inf, z_exaggeration, [0,1000] rescale,
+        // colormap_name precedence over inline colormap, and tilejson minzoom/maxzoom/tile_format.
+        let pq_nd = parse_query(Some("nodata=nan&rescale=[0,%201000]&algorithm_params=%7B%22z_exaggeration%22:2.5%7D"));
+        assert!(pq_nd.errors.is_empty());
+        assert!(pq_nd.nodata.unwrap().is_nan());
+        assert_eq!(pq_nd.rescale, vec![(0.0, 1000.0)]);
+        assert!((pq_nd.z_factor - 2.5).abs() < 1e-6);
+
+        let pq_cm = parse_query(Some("colormap=%7B%220%22:[0,0,0,255]%7D&colormap_name=viridis"));
+        assert!(pq_cm.errors.is_empty());
+        assert!(pq_cm.custom_colormap_json.is_none());
+        assert_eq!(pq_cm.colormap, ColormapName::from_str_opt("viridis").unwrap());
+
+        let pq_tj = parse_query(Some("url=a.tif&minzoom=4&maxzoom=14&tile_format=webp"));
+        assert!(pq_tj.errors.is_empty());
+        assert!(validate_query(&["cog", "WebMercatorQuad", "tilejson.json"], &pq_tj).is_ok());
+        assert!(validate_query(&["cog", "tiles", "WebMercatorQuad", "4", "0", "0.png"], &pq_tj).is_err());
+        let mut tj = serde_json::json!({"minzoom": 0, "maxzoom": 10, "center": [0.0, 0.0, 0], "tiles": []});
+        apply_tilejson_overrides(&mut tj, &pq_tj, "http://host", "cog", "WebMercatorQuad", "url=a.tif&minzoom=4&maxzoom=14&tile_format=webp");
+        assert_eq!(tj["minzoom"], 4);
+        assert_eq!(tj["maxzoom"], 14);
+        assert_eq!(tj["center"][2], 4);
+        assert_eq!(tj["tiles"][0], "http://host/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.webp?url=a.tif");
+
+        // HTTP status mapping for upstream 404, local NotFound, and invalid TIFF
+        let r404 = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::HttpStatus {
+            status: 404,
+            url: "https://example.com/missing.tif".into(),
+        }));
+        assert_eq!(r404.status(), StatusCode::NOT_FOUND);
+        let r_enoent = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Fs(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        )));
+        assert_eq!(r_enoent.status(), StatusCode::NOT_FOUND);
+        let r_tiff = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Tiff(
+            cogzilla_tiff::TiffError::Corrupt("not a tiff"),
+        )));
+        assert_eq!(r_tiff.status(), StatusCode::BAD_REQUEST);
     }
 }
