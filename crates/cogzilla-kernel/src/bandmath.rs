@@ -6,6 +6,9 @@ pub fn fast_db_from_power(power: f32) -> f32 {
     if !(power > 0.0) {
         return f32::NAN;
     }
+    if !power.is_finite() {
+        return f32::INFINITY;
+    }
     let bits = power.to_bits();
     let exp = ((bits >> 23) as i32 - 127) as f32;
     let m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000); // m in [1.0, 2.0)

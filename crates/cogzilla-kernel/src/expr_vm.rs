@@ -38,6 +38,14 @@ const MAX_EXPR_BANDS: usize = 16;
 
 impl ExprProgram {
     pub fn compile(input: &str) -> Result<Self, String> {
+        const MAX_EXPR_CHARS: usize = 4096;
+        const MAX_EXPR_OPS: usize = 256;
+        if input.len() > MAX_EXPR_CHARS {
+            return Err(format!(
+                "expression length ({}) exceeds limit ({MAX_EXPR_CHARS})",
+                input.len()
+            ));
+        }
         let tokens = tokenize(input)?;
         let mut p = Parser {
             tokens: &tokens,
@@ -49,6 +57,12 @@ impl ExprProgram {
         p.parse_expr()?;
         if p.pos < p.tokens.len() {
             return Err(format!("unexpected trailing token at position {}", p.pos));
+        }
+        if p.ops.len() > MAX_EXPR_OPS {
+            return Err(format!(
+                "expression has {} ops (max {MAX_EXPR_OPS})",
+                p.ops.len()
+            ));
         }
         if p.used_bands.len() > MAX_EXPR_BANDS {
             return Err(format!(

@@ -447,7 +447,11 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     }
 
     let has = |names: &[&str]| pq.keys.iter().find(|k| names.contains(&k.as_str())).cloned();
-    let route = |name: &str| segs[1..].iter().any(|s| *s == name);
+    // Only match route sub-endpoints on `/cog/...` and `/stac/...` so dataset/catalog names like
+    // `/tiles/statistics/0/0/0.png` or `/mosaic/point/tiles/0/0/0.png` are never misclassified.
+    let route = |name: &str| {
+        matches!(segs[0], "cog" | "stac") && segs.get(1) == Some(&name)
+    };
     if route("statistics") || route("asset_statistics") {
         if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
             return Err(format!("parameter '{k}' is not supported on statistics routes"));
