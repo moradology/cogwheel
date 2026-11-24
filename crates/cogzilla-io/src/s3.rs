@@ -119,7 +119,13 @@ impl S3Config {
             std::env::var("AWS_ACCESS_KEY_ID"),
             std::env::var("AWS_SECRET_ACCESS_KEY"),
         ) {
-            (ak, sk, std::env::var("AWS_SESSION_TOKEN").ok())
+            (
+                ak,
+                sk,
+                std::env::var("AWS_SESSION_TOKEN")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            )
         } else if let Some(creds) = load_shared_credentials_file(None, None) {
             (creds.access_key, creds.secret_key, creds.session_token)
         } else {

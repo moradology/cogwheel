@@ -175,10 +175,22 @@ impl SingleflightBlockCache {
         }
     }
 
-    /// Clear all cached blocks (used for cold-cache benchmarks).
+    /// Clear all cached Ready blocks while preserving active InFlight singleflight entries so
+    /// parked waiters never deadlock.
     pub fn clear(&self) {
-        self.map.clear();
-        self.current_bytes.store(0, Ordering::Release);
+        let mut removed_bytes = 0usize;
+        self.map.retain(|_, entry| match entry {
+            CacheEntry::InFlight(_) => true,
+            CacheEntry::Ready { tile, .. } => {
+                removed_bytes = removed_bytes.saturating_add(tile_bytes(tile));
+                false
+            }
+        });
+        let _ = self
+            .current_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some(c.saturating_sub(removed_bytes))
+            });
     }
 
     pub fn current_bytes(&self) -> usize {
@@ -450,5 +462,21 @@ mod tests {
             insert(&cache, i);
         }
         assert!(matches!(cache.acquire(key(999)), LookupResult::Wait(_)));
+    }
+
+    #[test]
+    fn clear_preserves_in_flight_entries_and_zeros_ready_bytes() {
+        let cache = SingleflightBlockCache::new(8 * BLOCK_BYTES);
+        insert(&cache, 1);
+        insert(&cache, 2);
+        assert_eq!(cache.current_bytes(), 2 * BLOCK_BYTES);
+        assert!(matches!(cache.acquire(key(99)), LookupResult::Owner));
+        cache.clear();
+        assert_eq!(cache.current_bytes(), 0);
+        assert!(!contains(&cache, 1));
+        assert!(
+            matches!(cache.acquire(key(99)), LookupResult::Wait(_)),
+            "clear() must never delete InFlight singleflight entries"
+        );
     }
 }

@@ -110,6 +110,15 @@ impl CogStore {
             .tcp_nodelay(true)
             .connect_timeout(Duration::from_secs(env_secs("GDAL_HTTP_CONNECTTIMEOUT", 10)))
             .read_timeout(Duration::from_secs(env_secs("GDAL_HTTP_TIMEOUT", 30)))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("too many HTTP redirects");
+                }
+                if let Err(e) = crate::allowlist::check_uri_allowed(attempt.url().as_str()) {
+                    return attempt.error(e);
+                }
+                attempt.follow()
+            }))
             .build()
             .expect("reqwest client");
         let heavy_permits = std::thread::available_parallelism()

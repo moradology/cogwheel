@@ -212,6 +212,9 @@ impl TileEngine {
             return Ok(c.clone());
         }
         let crs = CrsModel::from_geo_keys(&cog.index.geo_keys)?;
+        if self.crs_cache.len() >= 8192 {
+            self.crs_cache.clear();
+        }
         self.crs_cache.insert(cog.id, crs.clone());
         Ok(crs)
     }

@@ -161,6 +161,9 @@ pub async fn load_stac_item(
         geometry,
         assets,
     });
+    if cache.len() >= 1024 {
+        cache.clear();
+    }
     cache.insert(uri.to_string(), item.clone());
     Ok(item)
 }

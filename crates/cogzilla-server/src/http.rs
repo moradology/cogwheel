@@ -183,7 +183,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         pq.keys.push(k.to_string());
         let mut bad = |what: &str| pq_errors.push(format!("invalid {k}={}: {what}", percent_decode(v)));
         match k {
-            "url" => pq.urls.push(percent_decode(v)),
+            // Do not convert `+` to space in `url=` (S3 keys and Azure SAS tokens often contain literal `+`)
+            "url" => pq.urls.push(percent_decode_opts(v, false)),
             "assets" => {
                 for a in percent_decode(v).split(',') {
                     if !a.is_empty() {
@@ -670,6 +671,12 @@ fn build_tile_request(
     default_bands: u16,
     is_u8: bool,
 ) -> Result<(TileRequest, &'static str), EngineError> {
+    if tile.z > 30 {
+        return Err(EngineError::BadRequest(format!(
+            "zoom level z={} exceeds maximum supported zoom (30)",
+            tile.z
+        )));
+    }
     let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, is_u8)?;
     let tile_size = match scale_opt {
@@ -764,6 +771,9 @@ async fn load_mosaicjson(
         std::fs::read_to_string(local_path).map_err(cogzilla_io::IoError::Fs)?
     };
     let cat = Arc::new(MosaicJsonCatalog::from_json_str(&text).map_err(EngineError::BadRequest)?);
+    if engine.mosaicjson_cache.len() >= 256 {
+        engine.mosaicjson_cache.clear();
+    }
     engine.mosaicjson_cache.insert(uri.to_string(), cat.clone());
     Ok(cat)
 }
@@ -855,6 +865,29 @@ where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
+    let is_head = *req.method() == Method::HEAD;
+    let resp = handle_request_inner(engine, req, is_head).await?;
+    if is_head {
+        let (mut parts, body) = resp.into_parts();
+        if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
+            if let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
+                parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
+            }
+        }
+        return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
+    }
+    Ok(resp)
+}
+
+async fn handle_request_inner<B>(
+    engine: Arc<TileEngine>,
+    req: Request<B>,
+    is_head: bool,
+) -> Result<Response<Full<Bytes>>, Infallible>
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
     let host = req
         .headers()
         .get("host")
@@ -866,12 +899,25 @@ where
         .get(IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let method = req.method().clone();
+    let method = if is_head {
+        Method::GET
+    } else {
+        req.method().clone()
+    };
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
 
     if method == Method::OPTIONS {
-        return Ok(plain_resp(StatusCode::NO_CONTENT, Bytes::new(), "text/plain"));
+        let mut resp = plain_resp(StatusCode::NO_CONTENT, Bytes::new(), "text/plain");
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, HEAD, OPTIONS"),
+        );
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type, If-None-Match, Authorization"),
+        );
+        return Ok(resp);
     }
 
     if method == Method::GET && path == "/healthz" {

@@ -1981,6 +1981,10 @@ pub async fn render_wgs84_bbox(
 
 /// Interactive MapLibre HTML viewer (`/cog/{tms}/map.html`), matching TiTiler's built-in viewer.
 pub fn build_map_html(tilejson_url: &str) -> String {
+    // Escape `</` so an untrusted query string can never break out of the inline `<script>` tag.
+    let safe_url_js = serde_json::to_string(tilejson_url)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace("</", "<\\/");
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -1995,7 +1999,7 @@ pub fn build_map_html(tilejson_url: &str) -> String {
 <body>
   <div id="map"></div>
   <script>
-    fetch({tilejson_url:?}).then(r => r.json()).then(tj => {{
+    fetch({safe_url_js}).then(r => r.json()).then(tj => {{
       const map = new maplibregl.Map({{
         container: 'map',
         style: {{
