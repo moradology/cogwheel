@@ -973,8 +973,16 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     let n_bands = ifds[0].samples_per_pixel as usize;
     let mut scales = vec![1.0f32; n_bands];
     let mut offsets = vec![0.0f32; n_bands];
+    let mut band_metadata: Vec<Vec<(String, String)>> = vec![Vec::new(); n_bands];
+    let mut band_descriptions: Vec<String> = vec![String::new(); n_bands];
     if let Some(xml) = &gdal_metadata_xml {
-        parse_gdal_scale_offset(xml, &mut scales, &mut offsets);
+        parse_gdal_metadata(
+            xml,
+            &mut scales,
+            &mut offsets,
+            &mut band_metadata,
+            &mut band_descriptions,
+        );
     }
 
     Ok(CogIndex {
@@ -983,14 +991,25 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         nodata,
         scales,
         offsets,
+        band_metadata,
+        band_descriptions,
         geo_keys,
         ifds,
     })
 }
 
-/// Lightweight zero-dep extractor for `<Item name="SCALE" sample="0">...</Item>` and `OFFSET`
+/// Lightweight zero-dep extractor for `<Item name="..." sample="0">...</Item>`
 /// inside TIFF tag 42112 (`GDAL_METADATA`).
-fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
+fn parse_gdal_metadata(
+    xml: &str,
+    scales: &mut [f32],
+    offsets: &mut [f32],
+    band_metadata: &mut [Vec<(String, String)>],
+    band_descriptions: &mut [String],
+) {
+    const MAX_META_ITEMS: usize = 256;
+    const MAX_META_VALUE_BYTES: usize = 4096;
+    let mut stored_items = 0usize;
     let mut rest = xml;
     while let Some(pos) = rest.find("<Item ") {
         rest = &rest[pos + 6..];
@@ -1015,31 +1034,71 @@ fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
             }
         }
 
-        let is_scale = attrs.contains("name=\"SCALE\"") || attrs.contains("name=\"scale\"");
-        let is_offset = attrs.contains("name=\"OFFSET\"") || attrs.contains("name=\"offset\"");
-        if !is_scale && !is_offset {
-            continue;
-        }
-        let Ok(v) = val_str.parse::<f32>() else {
+        let Some(name) = attrs
+            .find("name=\"")
+            .and_then(|np| attrs[np + 6..].split('"').next())
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
-        if !v.is_finite() || (is_scale && v == 0.0) {
-            continue;
-        }
+
         let sample_idx = attrs.find("sample=\"").and_then(|sp| {
             let s = &attrs[sp + 8..];
             s.split('"').next()?.parse::<usize>().ok()
         });
-        match sample_idx {
-            Some(idx) if idx < scales.len() => {
-                if is_scale { scales[idx] = v; } else { offsets[idx] = v; }
+
+        let is_scale = name.eq_ignore_ascii_case("SCALE");
+        let is_offset = name.eq_ignore_ascii_case("OFFSET");
+        if is_scale || is_offset {
+            if let Ok(v) = val_str.parse::<f32>()
+                && v.is_finite()
+                && (!is_scale || v != 0.0)
+            {
+                match sample_idx {
+                    Some(idx) if idx < scales.len() => {
+                        if is_scale { scales[idx] = v; } else { offsets[idx] = v; }
+                    }
+                    None => {
+                        if is_scale { scales.fill(v); } else { offsets.fill(v); }
+                    }
+                    _ => {}
+                }
             }
-            None => {
-                if is_scale { scales.fill(v); } else { offsets.fill(v); }
+            continue;
+        }
+
+        if val_str.len() > MAX_META_VALUE_BYTES || stored_items >= MAX_META_ITEMS {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("DESCRIPTION") {
+            match sample_idx {
+                Some(idx) if idx < band_descriptions.len() => {
+                    band_descriptions[idx] = val_str.to_string();
+                }
+                None => {
+                    for d in band_descriptions.iter_mut() {
+                        if d.is_empty() {
+                            *d = val_str.to_string();
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            stored_items += 1;
+        } else if let Some(idx) = sample_idx
+            && idx < band_metadata.len()
+        {
+            band_metadata[idx].push((name.to_string(), val_str.to_string()));
+            stored_items += 1;
         }
     }
+}
+
+#[cfg(test)]
+fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
+    let mut meta = vec![Vec::new(); scales.len()];
+    let mut desc = vec![String::new(); scales.len()];
+    parse_gdal_metadata(xml, scales, offsets, &mut meta, &mut desc);
 }
 
 #[cfg(test)]

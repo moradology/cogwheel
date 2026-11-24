@@ -199,13 +199,13 @@ impl ColorFormula {
                     b = lb[b as usize];
                 }
                 ColorStage::Saturation(sat) => {
-                    let rf = r as f32;
-                    let gf = g as f32;
-                    let bf = b as f32;
-                    let luma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
-                    r = (luma + (rf - luma) * sat).round().clamp(0.0, 255.0) as u8;
-                    g = (luma + (gf - luma) * sat).round().clamp(0.0, 255.0) as u8;
-                    b = (luma + (bf - luma) * sat).round().clamp(0.0, 255.0) as u8;
+                    // Match `rio-color` LCH saturation: sRGB -> linear RGB -> CIE XYZ (D65) ->
+                    // CIE Lab -> scale chroma `(a, b) *= sat` (exact equivalent of `C *= sat` at
+                    // constant hue `H`) -> CIE XYZ -> linear RGB -> sRGB.
+                    let (nr, ng, nb) = apply_lch_saturation(r, g, b, *sat);
+                    r = nr;
+                    g = ng;
+                    b = nb;
                 }
             }
         }
@@ -229,6 +229,78 @@ impl ColorFormula {
             i += stride;
         }
     }
+}
+
+/// CIE LCH (D65) saturation matching `rio-color`'s `Saturation` operation.
+/// Scaling chroma `C *= sat` at constant hue `H` is mathematically identical to scaling
+/// CIE Lab `(a, b)` by `sat` directly without trigonometric round-trips.
+#[inline(always)]
+fn apply_lch_saturation(r: u8, g: u8, b: u8, sat: f32) -> (u8, u8, u8) {
+    #[inline(always)]
+    fn srgb_to_lin(c: u8) -> f32 {
+        let u = (c as f32) * (1.0 / 255.0);
+        if u <= 0.04045 {
+            u * (1.0 / 12.92)
+        } else {
+            ((u + 0.055) * (1.0 / 1.055)).powf(2.4)
+        }
+    }
+    #[inline(always)]
+    fn lin_to_srgb(u: f32) -> u8 {
+        let c = u.clamp(0.0, 1.0);
+        let s = if c <= 0.0031308 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0).round().clamp(0.0, 255.0) as u8
+    }
+    #[inline(always)]
+    fn lab_f(t: f32) -> f32 {
+        if t > 0.0088564516 {
+            t.cbrt()
+        } else {
+            7.787037 * t + (16.0 / 116.0)
+        }
+    }
+    #[inline(always)]
+    fn lab_f_inv(t: f32) -> f32 {
+        if t > 0.20689655 {
+            t * t * t
+        } else {
+            (t - (16.0 / 116.0)) * (1.0 / 7.787037)
+        }
+    }
+
+    let rl = srgb_to_lin(r);
+    let gl = srgb_to_lin(g);
+    let bl = srgb_to_lin(b);
+
+    // sRGB -> CIE XYZ (D65)
+    let x = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl;
+    let y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl;
+    let z = 0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl;
+
+    // XYZ -> Lab (D65 whitepoint: 0.95047, 1.0, 1.08883)
+    let fx = lab_f(x * (1.0 / 0.95047));
+    let fy = lab_f(y);
+    let fz = lab_f(z * (1.0 / 1.08883));
+    let a = 500.0 * (fx - fy) * sat;
+    let b_lab = 200.0 * (fy - fz) * sat;
+
+    // Lab -> XYZ
+    let fx2 = fy + a * (1.0 / 500.0);
+    let fz2 = fy - b_lab * (1.0 / 200.0);
+    let x2 = 0.95047 * lab_f_inv(fx2);
+    let y2 = lab_f_inv(fy);
+    let z2 = 1.08883 * lab_f_inv(fz2);
+
+    // XYZ -> linear sRGB
+    let rl2 = 3.2404542 * x2 - 1.5371385 * y2 - 0.4985314 * z2;
+    let gl2 = -0.9692660 * x2 + 1.8760108 * y2 + 0.0415560 * z2;
+    let bl2 = 0.0556434 * x2 - 0.2040259 * y2 + 1.0572252 * z2;
+
+    (lin_to_srgb(rl2), lin_to_srgb(gl2), lin_to_srgb(bl2))
 }
 
 #[cfg(test)]

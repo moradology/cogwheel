@@ -341,6 +341,10 @@ pub struct CogIndex {
     pub scales: Vec<f32>,
     /// Per-band additive offsets parsed from `GDAL_METADATA` (defaults to `0.0` per band).
     pub offsets: Vec<f32>,
+    /// Per-band GDAL metadata key/value tags parsed from `GDAL_METADATA` (`sample="k"`).
+    pub band_metadata: Vec<Vec<(String, String)>>,
+    /// Optional per-band descriptions parsed from `GDAL_METADATA` (`name="DESCRIPTION"`).
+    pub band_descriptions: Vec<String>,
     pub geo_keys: GeoKeys,
     /// IFDs sorted from highest resolution (index 0) to lowest resolution overview.
     pub ifds: Vec<IfdMeta>,

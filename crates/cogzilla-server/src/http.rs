@@ -823,7 +823,7 @@ fn parse_ext_format(
     jpeg_quality: u8,
 ) -> Result<(OutputFormat, &'static str), EngineError> {
     match ext {
-        "png" | "" => Ok((OutputFormat::Png, "image/png")),
+        "png" | "pngraw" | "" => Ok((OutputFormat::Png, "image/png")),
         "webp" => Ok((
             OutputFormat::Webp {
                 quality: webp_quality,
