@@ -504,13 +504,25 @@ pub fn encode_s3_canonical_uri(path: &str) -> String {
     out
 }
 
+/// Validate an S3 bucket name to prevent SSRF host/query injection (`?`, `#`, `@`, `:`, `%`, `..`).
+fn is_valid_s3_bucket(bucket: &str) -> bool {
+    let bytes = bucket.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && !bucket.contains("..")
+}
+
 /// Parse `s3://bucket/key` or `/vsis3/bucket/key` into `(bucket, key)`.
 pub fn parse_s3_uri(uri: &str) -> Option<(&str, &str)> {
     let rest = uri
         .strip_prefix("s3://")
         .or_else(|| uri.strip_prefix("/vsis3/"))?;
     let (bucket, key) = rest.split_once('/')?;
-    if bucket.is_empty() || key.is_empty() {
+    if !is_valid_s3_bucket(bucket) || key.is_empty() {
         return None;
     }
     Some((bucket, key))
@@ -546,7 +558,9 @@ pub fn build_s3_endpoint(
                 canonical_uri,
             )
         }
-    } else if cfg.force_path_style {
+    } else if cfg.force_path_style || bucket.contains('.') {
+        // Dotted AWS bucket names fail wildcard TLS validation (`*.s3.<region>.amazonaws.com`)
+        // under virtual-hosted addressing, so automatically use path-style.
         let host = format!("s3.{region}.amazonaws.com");
         let canonical_uri = format!("/{bucket}{encoded_key}");
         (format!("https://{host}{canonical_uri}"), host, canonical_uri)
@@ -910,5 +924,37 @@ async fn fetch_s3_inner(
             }
         }
         return Err(IoError::HttpStatus { status, url });
+    }
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::*;
+
+    #[test]
+    fn parse_s3_uri_rejects_ssrf_and_invalid_buckets() {
+        assert_eq!(parse_s3_uri("s3://sentinel-cogs/path/to/tile.tif"), Some(("sentinel-cogs", "path/to/tile.tif")));
+        assert_eq!(parse_s3_uri("/vsis3/my.dotted.bucket/a.tif"), Some(("my.dotted.bucket", "a.tif")));
+        for bad in [
+            "s3://attacker.example?/k",
+            "s3://attacker.example#/k",
+            "s3://attacker.example:8443/k",
+            "s3://user@attacker.example/k",
+            "s3://bad..bucket/k",
+            "s3://-leading-dash/k",
+            "s3://ab/k",
+            "s3://valid-bucket/",
+        ] {
+            assert!(parse_s3_uri(bad).is_none(), "expected rejection for {bad}");
+        }
+    }
+
+    #[test]
+    fn build_s3_endpoint_uses_path_style_for_dotted_aws_buckets() {
+        let cfg = S3Config::default();
+        let (url, host, canonical) = build_s3_endpoint("my.dotted.bucket", "a/b.tif", "us-west-2", &cfg);
+        assert_eq!(host, "s3.us-west-2.amazonaws.com");
+        assert_eq!(canonical, "/my.dotted.bucket/a/b.tif");
+        assert_eq!(url, "https://s3.us-west-2.amazonaws.com/my.dotted.bucket/a/b.tif");
     }
 }

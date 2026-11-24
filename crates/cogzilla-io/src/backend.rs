@@ -228,11 +228,11 @@ impl CogSource {
 
     /// Fetch a byte range `[start, end)` (exclusive end) from a remote source.
     pub async fn fetch_range(&self, start: u64, end: u64) -> Result<Bytes, IoError> {
+        if start >= end {
+            return Ok(Bytes::new());
+        }
         match self {
             Self::LocalMmap { mmap } => {
-                if start >= end {
-                    return Ok(Bytes::new());
-                }
                 let s = usize::try_from(start).unwrap_or(usize::MAX).min(mmap.len());
                 let e = usize::try_from(end).unwrap_or(usize::MAX).min(mmap.len());
                 Ok(Bytes::copy_from_slice(&mmap[s..e]))

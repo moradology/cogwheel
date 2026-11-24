@@ -14,13 +14,50 @@ type HmacSha256 = Hmac<Sha256>;
 
 const AZURE_API_VERSION: &str = "2020-10-02";
 
+/// Validate a GCS bucket name (3..=63 chars, `[a-z0-9._-]`, alphanumeric ends, no `..`).
+fn is_valid_gcs_bucket(bucket: &str) -> bool {
+    let bytes = bucket.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'))
+        && !bucket.contains("..")
+}
+
+/// Validate an Azure storage account name (3..=24 lowercase ASCII alphanumeric chars).
+fn is_valid_azure_account(account: &str) -> bool {
+    let bytes = account.as_bytes();
+    (3..=24).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Validate an Azure blob container name (3..=63 `[a-z0-9-]`, alphanumeric ends, no `--`,
+/// plus standard system containers `$web`, `$logs`, `$root`).
+fn is_valid_azure_container(container: &str) -> bool {
+    if matches!(container, "$web" | "$logs" | "$root") {
+        return true;
+    }
+    let bytes = container.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && (bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !container.contains("--")
+}
+
 /// Parse `gs://bucket/key` or `/vsigs/bucket/key` into `(bucket, key)`.
 pub fn parse_gcs_uri(uri: &str) -> Option<(&str, &str)> {
     let rest = uri
         .strip_prefix("gs://")
         .or_else(|| uri.strip_prefix("/vsigs/"))?;
     let (bucket, key) = rest.split_once('/')?;
-    if bucket.is_empty() || key.is_empty() {
+    if !is_valid_gcs_bucket(bucket) || key.is_empty() {
         return None;
     }
     Some((bucket, key))
@@ -46,8 +83,17 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
     {
         let (auth, blob) = rest.split_once('/')?;
         let (container, host) = auth.split_once('@')?;
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return None;
+        }
         let account = host.split('.').next()?;
-        if account.is_empty() || container.is_empty() || blob.is_empty() {
+        if !is_valid_azure_account(account)
+            || !is_valid_azure_container(container)
+            || blob.is_empty()
+        {
             return None;
         }
         return Some(AzureTarget {
@@ -65,6 +111,9 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
         return None;
     }
     if let Some(acct) = account_override.filter(|s| !s.is_empty()) {
+        if !is_valid_azure_account(acct) || !is_valid_azure_container(first) {
+            return None;
+        }
         return Some(AzureTarget {
             account: acct.to_string(),
             container: first.to_string(),
@@ -72,9 +121,13 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
         });
     }
     if let Ok(acct) = std::env::var("AZURE_STORAGE_ACCOUNT") {
-        if !acct.trim().is_empty() {
+        let acct = acct.trim();
+        if !acct.is_empty() {
+            if !is_valid_azure_account(acct) || !is_valid_azure_container(first) {
+                return None;
+            }
             return Some(AzureTarget {
-                account: acct.trim().to_string(),
+                account: acct.to_string(),
                 container: first.to_string(),
                 blob: tail.to_string(),
             });
@@ -82,7 +135,10 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
     }
     // Fallback: az://account/container/blob
     let (container, blob) = tail.split_once('/')?;
-    if container.is_empty() || blob.is_empty() {
+    if !is_valid_azure_account(first)
+        || !is_valid_azure_container(container)
+        || blob.is_empty()
+    {
         return None;
     }
     Some(AzureTarget {
@@ -916,5 +972,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(az_bytes.as_ref(), b"AZR_DATA");
+    }
+
+    #[test]
+    fn parse_gcs_and_azure_uri_reject_ssrf_and_invalid_names() {
+        assert_eq!(parse_gcs_uri("gs://gcp-public-data-landsat/a.tif"), Some(("gcp-public-data-landsat", "a.tif")));
+        for bad in [
+            "gs://attacker.example?/k",
+            "gs://bucket#frag/k",
+            "gs://bad..bucket/k",
+            "gs://UPPERCASE/k",
+            "gs://ab/k",
+        ] {
+            assert!(parse_gcs_uri(bad).is_none(), "expected GCS rejection for {bad}");
+        }
+
+        let ok = parse_azure_uri("abfss://sentinel2@pcdata.dfs.core.windows.net/a/b.tif", None).unwrap();
+        assert_eq!(ok.account, "pcdata");
+        assert_eq!(ok.container, "sentinel2");
+        assert_eq!(ok.blob, "a/b.tif");
+
+        for bad in [
+            "az://attacker.example?/c/b",
+            "az://attacker.example#/c/b",
+            "az://bad_acct/cont/b",
+            "az://validacct/bad?cont/b",
+            "abfss://cont@internal:8443?/b",
+            "abfss://cont@attacker.example?/b",
+            "abfss://bad..cont@pcdata.dfs.core.windows.net/b",
+        ] {
+            assert!(parse_azure_uri(bad, None).is_none(), "expected Azure rejection for {bad}");
+        }
     }
 }

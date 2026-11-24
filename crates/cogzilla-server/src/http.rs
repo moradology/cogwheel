@@ -83,6 +83,9 @@ fn parse_wxh_ext(seg: &str) -> Option<(u32, u32, &str)> {
     let (ws, hs) = dims.split_once('x')?;
     let w = ws.parse::<u32>().ok()?;
     let h = hs.parse::<u32>().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
     Some((w, h, ext))
 }
 
@@ -202,28 +205,35 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm_params" => {
                 let dec = percent_decode(v);
-                if serde_json::from_str::<serde_json::Value>(&dec).is_err() {
-                    bad("expected a JSON object");
-                }
-                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&dec) {
-                    if let Some(a) = obj.get("azimuth").and_then(|x| x.as_f64()) {
-                        pq.azimuth = a as f32;
+                match serde_json::from_str::<serde_json::Value>(&dec) {
+                    Ok(serde_json::Value::Object(obj)) => {
+                        if let Some(val) = obj.get("azimuth") {
+                            match val.as_f64().map(|a| a as f32) {
+                                Some(a) if a.is_finite() => pq.azimuth = a,
+                                _ => bad("azimuth must be a finite number"),
+                            }
+                        }
+                        if let Some(val) = obj
+                            .get("angle_altitude")
+                            .or_else(|| obj.get("altitude"))
+                            .or_else(|| obj.get("angle"))
+                        {
+                            match val.as_f64().map(|a| a as f32) {
+                                Some(a) if a.is_finite() => pq.altitude = a.clamp(0.0, 90.0),
+                                _ => bad("altitude must be a finite number"),
+                            }
+                        }
+                        if let Some(val) = obj
+                            .get("z_factor")
+                            .or_else(|| obj.get("zfactor"))
+                        {
+                            match val.as_f64().map(|z| z as f32) {
+                                Some(z) if z.is_finite() => pq.z_factor = z.max(1e-4),
+                                _ => bad("z_factor must be a finite number"),
+                            }
+                        }
                     }
-                    if let Some(a) = obj
-                        .get("angle_altitude")
-                        .or_else(|| obj.get("altitude"))
-                        .or_else(|| obj.get("angle"))
-                        .and_then(|x| x.as_f64())
-                    {
-                        pq.altitude = (a as f32).clamp(0.0, 90.0);
-                    }
-                    if let Some(z) = obj
-                        .get("z_factor")
-                        .or_else(|| obj.get("zfactor"))
-                        .and_then(|x| x.as_f64())
-                    {
-                        pq.z_factor = (z as f32).max(1e-4);
-                    }
+                    _ => bad("expected a JSON object"),
                 }
             }
             "azimuth" => {
@@ -297,10 +307,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "nodata" => {
                 let dec = percent_decode(v);
-                if let Ok(nd) = dec.parse::<f32>() {
+                if let Ok(nd) = dec.parse::<f32>()
+                    && nd.is_finite()
+                {
                     pq.nodata = Some(nd);
                 } else {
-                    bad("expected a number");
+                    bad("expected a finite number");
                 }
             }
             "unscale" => {
@@ -1134,7 +1146,15 @@ where
             let name = spec
                 .get("name")
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty() && *s != "tiles" && *s != "register")
+                .filter(|s| {
+                    !s.is_empty()
+                        && *s != "tiles"
+                        && *s != "register"
+                        && !s.contains('/')
+                        && !s.contains('?')
+                        && !s.contains('#')
+                        && !s.chars().any(|c| c.is_whitespace())
+                })
                 .ok_or_else(|| {
                     EngineError::BadRequest("missing valid 'name' for mosaic catalog".into())
                 })?
@@ -1309,10 +1329,19 @@ where
         let cache_key = format!("{path}?{raw_query}");
         let res = match coords {
             (Some(z), Some(x), Some((y, sc, ext))) => {
-                if pq.urls.is_empty() {
+                if z > 30 {
+                    Err(EngineError::BadRequest(format!(
+                        "invalid zoom level z={z} (expected 0..=30)"
+                    )))
+                } else if pq.urls.is_empty() {
                     Err(EngineError::BadRequest(
                         "missing required ?url= parameter(s) for /mosaic/tiles".into(),
                     ))
+                } else if pq.urls.len() > 16 {
+                    Err(EngineError::BadRequest(format!(
+                        "too many ?url= parameters ({}; max 16)",
+                        pq.urls.len()
+                    )))
                 } else {
                     let cached = engine
                         .tile_cache
@@ -2808,6 +2837,9 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
         // The file is in a coordinate system this server cannot place. That is a
         // property of the requested source, not a server fault.
         EngineError::Proj(e) => {
+            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+        }
+        EngineError::Io(e @ cogzilla_io::IoError::InvalidUri(_)) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
         }
         EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_)) => {

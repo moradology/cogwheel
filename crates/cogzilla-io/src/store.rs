@@ -1585,6 +1585,9 @@ impl CogStore {
             )
             .await;
         }
+        if uri.starts_with("s3://") || uri.starts_with("/vsis3/") {
+            return Err(IoError::InvalidUri(uri.to_string()));
+        }
 
         if let Some((bucket, key)) = crate::cloud::parse_gcs_uri(uri) {
             let cfg = crate::cloud::GcsConfig::from_env();
@@ -1601,6 +1604,9 @@ impl CogStore {
             )
             .await;
         }
+        if uri.starts_with("gs://") || uri.starts_with("/vsigs/") {
+            return Err(IoError::InvalidUri(uri.to_string()));
+        }
 
         if let Some(target) = crate::cloud::parse_azure_uri(uri, None) {
             let az_cfg = crate::cloud::AzureConfig::from_env();
@@ -1614,12 +1620,20 @@ impl CogStore {
             )
             .await;
         }
+        if uri.starts_with("az://")
+            || uri.starts_with("abfs://")
+            || uri.starts_with("abfss://")
+            || uri.starts_with("/vsiaz/")
+        {
+            return Err(IoError::InvalidUri(uri.to_string()));
+        }
 
         if uri.starts_with("http://") || uri.starts_with("https://") {
             let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
-                .unwrap_or(4);
+                .unwrap_or(4)
+                .min(10);
             for attempt in 0..=max_retries {
                 let permit = self.upstream_limiter.acquire().await;
                 let send_res = self.client.get(uri).send().await;

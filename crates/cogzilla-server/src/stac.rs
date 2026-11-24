@@ -222,6 +222,12 @@ pub async fn resolve_stac_assets(
             "STAC item has no raster COG assets".into(),
         ));
     }
+    if names.len() > 16 {
+        return Err(EngineError::BadRequest(format!(
+            "too many STAC assets ({}; max 16)",
+            names.len()
+        )));
+    }
 
     let mut hrefs = Vec::with_capacity(names.len());
     for name in &names {

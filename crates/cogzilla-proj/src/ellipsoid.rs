@@ -364,10 +364,15 @@ impl LambertConformalConic {
         let t2 = Self::t_fn(ellip.e, lat2);
         let t0 = Self::t_fn(ellip.e, lat0);
 
-        let n = if (lat1 - lat2).abs() < 1e-10 {
+        let n_raw = if (lat1 - lat2).abs() < 1e-10 {
             lat1.sin()
         } else {
             (m1.ln() - m2.ln()) / (t1.ln() - t2.ln())
+        };
+        let n = if n_raw.is_finite() && n_raw.abs() >= 1e-12 {
+            n_raw
+        } else {
+            1e-12
         };
         let f_const = m1 / (n * t1.powf(n));
         let rho0 = ellip.a * f_const * t0.powf(n);
