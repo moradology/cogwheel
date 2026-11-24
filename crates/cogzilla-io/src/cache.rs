@@ -199,10 +199,16 @@ impl SingleflightBlockCache {
     /// Fail an in-flight fetch with an explicit upstream/decode error, broadcasting the shared
     /// error to all parked waiters so they fail in 1 RTT instead of retrying serially.
     pub fn fail(&self, key: &BlockKey, err: Arc<IoError>) {
-        if let Some((_, CacheEntry::InFlight(f))) =
-            self.map.remove_if(key, |_, v| matches!(v, CacheEntry::InFlight(_)))
-        {
-            f.set_outcome(Err(err));
+        // Set outcome *inside* `remove_if` while holding the shard write lock so no waiter can
+        // observe the key removed before `take_outcome()` is populated.
+        if let Some((_, CacheEntry::InFlight(f))) = self.map.remove_if(key, |_, v| {
+            if let CacheEntry::InFlight(f) = v {
+                f.set_outcome(Err(err.clone()));
+                true
+            } else {
+                false
+            }
+        }) {
             f.notify.notify_waiters();
         }
     }

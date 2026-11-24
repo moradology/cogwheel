@@ -594,11 +594,18 @@ impl CogStore {
                 }
                 Err(err) => {
                     let shared = Arc::new(err);
-                    if let Some((_, OpenSlot::InFlight(f))) = self
-                        .datasets_by_uri
-                        .remove_if(uri, |_, v| matches!(v, OpenSlot::InFlight(_)))
+                    // Set outcome while holding the shard lock before removing the InFlight entry
+                    // so no waiter can observe `None` in both the map and `take_outcome()`.
+                    if let Some((_, OpenSlot::InFlight(f))) =
+                        self.datasets_by_uri.remove_if(uri, |_, v| {
+                            if let OpenSlot::InFlight(f) = v {
+                                f.set_outcome(Err(shared.clone()));
+                                true
+                            } else {
+                                false
+                            }
+                        })
                     {
-                        f.set_outcome(Err(shared.clone()));
                         f.notify.notify_waiters();
                     }
                     return Err(IoError::Shared(shared));
@@ -1174,17 +1181,24 @@ impl CogStore {
                     let nodata = cog.index.nodata;
                     let mut fetch_err: Option<IoError> = None;
 
-                    // Fast path: 1 coalesced span -> await fetch_range directly (no JoinSet spawn)
+                    // Fast path: 1 coalesced span -> await fetch_range directly (no JoinSet spawn).
+                    // Capture Err into `fetch_err` (instead of early `?`) so `guard.fail(...)`
+                    // broadcasts the error to all parked singleflight waiters in 1 RTT.
                     let mut single_span = if spans.len() == 1 {
                         let span = spans.pop().unwrap();
-                        let data = cog.source.fetch_range(span.start, span.end).await?;
-                        Some((span, data))
+                        match cog.source.fetch_range(span.start, span.end).await {
+                            Ok(data) => Some((span, data)),
+                            Err(e) => {
+                                fetch_err = Some(e);
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
 
                     let mut join_set = tokio::task::JoinSet::new();
-                    if single_span.is_none() {
+                    if single_span.is_none() && fetch_err.is_none() {
                         for span in spans {
                             let src = cog.source.clone();
                             join_set.spawn(async move {
@@ -1279,28 +1293,47 @@ impl CogStore {
                                             let slice_for_disk = disk_put
                                                 .as_ref()
                                                 .map(|_| slice.clone());
-                                            let decoded = if let Some(sem) = sem {
-                                                let _permit =
-                                                    sem.acquire_owned().await.map_err(|e| {
-                                                        IoError::Fs(std::io::Error::other(format!(
-                                                            "heavy CPU semaphore closed: {e}"
-                                                        )))
-                                                    })?;
-                                                tokio::task::spawn_blocking(move || {
-                                                    decode_tile_rows(
-                                                        &slice, &m, byte_order, nodata, rows,
+                                            let decode_res: Result<DecodedTile, IoError> = async {
+                                                if let Some(sem) = sem {
+                                                    let _permit =
+                                                        sem.acquire_owned().await.map_err(|e| {
+                                                            IoError::Fs(std::io::Error::other(
+                                                                format!(
+                                                                    "heavy CPU semaphore closed: {e}"
+                                                                ),
+                                                            ))
+                                                        })?;
+                                                    let tile = tokio::task::spawn_blocking(
+                                                        move || {
+                                                            decode_tile_rows(
+                                                                &slice, &m, byte_order, nodata,
+                                                                rows,
+                                                            )
+                                                        },
                                                     )
-                                                })
-                                                .await
-                                                .map_err(|e| {
-                                                    IoError::Fs(std::io::Error::other(format!(
-                                                        "heavy remote decode task failed: {e}"
-                                                    )))
-                                                })??
-                                            } else {
-                                                decode_tile_rows(
-                                                    &slice, &m, byte_order, nodata, rows,
-                                                )?
+                                                    .await
+                                                    .map_err(|e| {
+                                                        IoError::Fs(std::io::Error::other(format!(
+                                                            "heavy remote decode task failed: {e}"
+                                                        )))
+                                                    })??;
+                                                    Ok(tile)
+                                                } else {
+                                                    Ok(decode_tile_rows(
+                                                        &slice, &m, byte_order, nodata, rows,
+                                                    )?)
+                                                }
+                                            }
+                                            .await;
+                                            let decoded = match decode_res {
+                                                Ok(d) => d,
+                                                Err(e) => {
+                                                    let shared = Arc::new(e);
+                                                    if let Some(g) = guard {
+                                                        g.fail(shared.clone());
+                                                    }
+                                                    return Err(IoError::Shared(shared));
+                                                }
                                             };
                                             // Persist to tier-2 disk cache only AFTER decode succeeds
                                             // so corrupt upstream payloads never poison disk.

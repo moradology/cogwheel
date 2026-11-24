@@ -1017,13 +1017,26 @@ impl<const N: usize> CoordPlan<N> {
                 all_in_bounds,
             })
         } else {
-            // For z >= 9 (and not on the eastern antimeridian tile column), try the fast 17x17
-            // bilinear control grid first. If all 289 control points are finite, return `Grid2D`
-            // (or `None` if strictly outside the raster); if any control point hits a projection
-            // domain boundary (Sinusoidal/LAEA/UTM NaN), fall through to adaptive `Exact2D` so
-            // boundary 16x16 blocks are never dropped.
-            let try_grid_2d =
-                tile.z > 8 && ((tile.x as u64) + 1 < (1u64 << tile.z.min(30)));
+            // For z >= 9 (and not on the eastern antimeridian tile column or an interior
+            // `lon0 ± π` projection branch cut), try the fast 17x17 bilinear control grid first.
+            // If all 289 control points are finite, return `Grid2D` (or `None` if strictly outside
+            // the raster); if any control point hits a projection domain boundary, fall through
+            // to adaptive `Exact2D` so boundary 16x16 blocks are never dropped or smeared.
+            let branch_lon0: Option<f64> = match crs {
+                CrsModel::Sinusoidal(p) => Some(p.lon0),
+                CrsModel::Albers(p) => Some(p.lon0),
+                CrsModel::LambertConformalConic(p) => Some(p.lon0),
+                _ => None,
+            };
+            let straddles_branch_cut = branch_lon0.is_some_and(|lon0| {
+                let (lon_w, _) = mercator_to_lonlat_rad(min_x, max_y);
+                let (lon_e, _) = mercator_to_lonlat_rad(max_x, max_y);
+                let wrap = |d: f64| (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+                wrap(lon_w - lon0) > 0.0 && wrap(lon_e - lon0) < 0.0
+            });
+            let try_grid_2d = tile.z > 8
+                && ((tile.x as u64) + 1 < (1u64 << tile.z.min(30)))
+                && !straddles_branch_cut;
             if try_grid_2d {
                 let mut grid_u = [0.0f32; GRID_DIM * GRID_DIM];
                 let mut grid_v = [0.0f32; GRID_DIM * GRID_DIM];
