@@ -73,6 +73,9 @@ pub struct CogStore {
     pub cache: Arc<SingleflightBlockCache>,
     pub disk_cache: Option<Arc<DiskBlockCache>>,
     pub upstream_limiter: Arc<AimdLimiter>,
+    /// Bounds concurrent heavy CPU offloads (`spawn_blocking` for >2 MiB blocks, large stats/bbox)
+    /// to `num_cpus` so pathological workloads never oversubscribe OS threads or starve Tokio I/O.
+    pub heavy_cpu_sem: Arc<tokio::sync::Semaphore>,
     pub client: reqwest::Client,
     pub s3_cfg: Option<S3Config>,
     pub metrics: Arc<IoMetrics>,
@@ -109,6 +112,10 @@ impl CogStore {
             .read_timeout(Duration::from_secs(env_secs("GDAL_HTTP_TIMEOUT", 30)))
             .build()
             .expect("reqwest client");
+        let heavy_permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
         Self {
             next_id: AtomicU64::new(1),
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
@@ -119,10 +126,30 @@ impl CogStore {
             cache: Arc::new(SingleflightBlockCache::new(cache_max_bytes)),
             disk_cache: None,
             upstream_limiter,
+            heavy_cpu_sem: Arc::new(tokio::sync::Semaphore::new(heavy_permits)),
             client,
             s3_cfg: S3Config::from_env(),
             metrics: Arc::new(IoMetrics::default()),
         }
+    }
+
+    /// Run a heavy synchronous CPU closure on Tokio's blocking pool gated by `heavy_cpu_sem`
+    /// (`num_cpus` permits) so large blocks, `/cog/statistics`, and giant bbox crops never stall
+    /// Tokio's async I/O reactor threads or oversubscribe the blocking pool.
+    pub async fn run_heavy_cpu<F, R>(&self, f: F) -> Result<R, IoError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let _permit = self
+            .heavy_cpu_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| IoError::Fs(std::io::Error::other(format!("heavy CPU semaphore closed: {e}"))))?;
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| IoError::Fs(std::io::Error::other(format!("heavy CPU task failed: {e}"))))
     }
 
     /// Attach a persistent tier-2 compressed-block disk cache for remote S3/HTTP sources.
@@ -548,12 +575,68 @@ impl CogStore {
                 .saturating_mul(ifd.tile_height as usize)
                 .saturating_mul(ifd.samples_per_pixel as usize)
                 .saturating_mul(ifd.sample_type.bytes_per_sample());
+            const HEAVY_DECODE_BYTES: usize = 2 * 1024 * 1024;
+            let heavy_block = expected_bytes > HEAVY_DECODE_BYTES;
             let trivial_block = ifd.compression == cogzilla_tiff::Compression::None
                 && ifd.predictor == cogzilla_tiff::Predictor::None
                 && expected_bytes <= 256 * 1024;
 
             if is_local {
-                if num_workers >= 2
+                if heavy_block && ifd.mask_ifd.is_none() {
+                    let decode_meta = Arc::new(clone_for_decode(ifd));
+                    let byte_order = cog.index.byte_order;
+                    let nodata = cog.index.nodata;
+                    let mut decode_set = tokio::task::JoinSet::new();
+                    let mut decode_err: Option<IoError> = None;
+
+                    for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
+                        let sem = self.heavy_cpu_sem.clone();
+                        let src = cog.source.clone();
+                        let meta = decode_meta.clone();
+                        decode_set.spawn(async move {
+                            let _permit = sem.acquire_owned().await.map_err(|e| {
+                                IoError::Fs(std::io::Error::other(format!(
+                                    "heavy CPU semaphore closed: {e}"
+                                )))
+                            })?;
+                            let decoded = tokio::task::spawn_blocking(move || {
+                                let Some(slice) = src.local_slice(offset, count) else {
+                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                        required: offset + count as u64,
+                                        available: 0,
+                                    }));
+                                };
+                                Ok::<_, IoError>(decode_tile(slice, &meta, byte_order, nodata)?)
+                            })
+                            .await
+                            .map_err(|e| {
+                                IoError::Fs(std::io::Error::other(format!(
+                                    "heavy local decode task failed: {e}"
+                                )))
+                            })??;
+                            let arc = Arc::new(decoded);
+                            if let Some(guard) = guard_opt {
+                                guard.complete(arc.clone());
+                            }
+                            Ok::<_, IoError>((orig_slot, arc))
+                        });
+                    }
+
+                    while let Some(res) = decode_set.join_next().await {
+                        match res {
+                            Ok(Ok((orig_slot, arc))) => results[orig_slot] = Some(arc),
+                            Ok(Err(e)) => decode_err = Some(e),
+                            Err(e) => {
+                                decode_err = Some(IoError::Fs(std::io::Error::other(format!(
+                                    "heavy local decode task failed: {e}"
+                                ))));
+                            }
+                        }
+                    }
+                    if let Some(e) = decode_err {
+                        return Err(e);
+                    }
+                } else if num_workers >= 2
                     && owned.len() >= 2
                     && !trivial_block
                     && ifd.mask_ifd.is_none()
@@ -792,9 +875,10 @@ impl CogStore {
                             Ok((span, data)) => {
                                 let has_more_fetches = !join_set.is_empty();
                                 let can_parallel = ifd.mask_ifd.is_none()
-                                    && !trivial_block
-                                    && ((num_workers >= 2 && span.items.len() >= 2)
-                                        || has_more_fetches);
+                                    && (heavy_block
+                                        || (!trivial_block
+                                            && ((num_workers >= 2 && span.items.len() >= 2)
+                                                || has_more_fetches)));
                                 if can_parallel {
                                     let meta = decode_meta_opt
                                         .get_or_insert_with(|| Arc::new(clone_for_decode(ifd)))
@@ -840,9 +924,31 @@ impl CogStore {
                                         }
                                         let guard = guard_opt.take();
                                         let m = meta.clone();
+                                        let sem = if heavy_block {
+                                            Some(self.heavy_cpu_sem.clone())
+                                        } else {
+                                            None
+                                        };
                                         decode_set.spawn(async move {
-                                            let decoded =
-                                                decode_tile(&slice, &m, byte_order, nodata)?;
+                                            let decoded = if let Some(sem) = sem {
+                                                let _permit =
+                                                    sem.acquire_owned().await.map_err(|e| {
+                                                        IoError::Fs(std::io::Error::other(format!(
+                                                            "heavy CPU semaphore closed: {e}"
+                                                        )))
+                                                    })?;
+                                                tokio::task::spawn_blocking(move || {
+                                                    decode_tile(&slice, &m, byte_order, nodata)
+                                                })
+                                                .await
+                                                .map_err(|e| {
+                                                    IoError::Fs(std::io::Error::other(format!(
+                                                        "heavy remote decode task failed: {e}"
+                                                    )))
+                                                })??
+                                            } else {
+                                                decode_tile(&slice, &m, byte_order, nodata)?
+                                            };
                                             let arc = Arc::new(decoded);
                                             if let Some(g) = guard {
                                                 g.complete(arc.clone());

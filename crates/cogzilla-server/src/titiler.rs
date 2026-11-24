@@ -788,23 +788,23 @@ fn build_tile_polygon_mask(
     }
 }
 
-/// TiTiler-compatible `/cog/statistics` computed from the coarsest overview <= `max_size`.
-/// When `poly_mask` is `Some`, clips statistics strictly to pixels inside the posted GeoJSON polygon.
-pub async fn compute_statistics(
-    engine: &TileEngine,
+enum StatsTiles {
+    Chunky(Vec<Option<Arc<cogzilla_codec::DecodedTile>>>),
+    Planar {
+        band_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
+        tile_masks: Option<Vec<Option<Vec<u8>>>>,
+        mask_total_pixels: usize,
+    },
+}
+
+fn compute_statistics_cpu(
     cog: &OpenedCog,
-    max_size: u32,
+    ifd_idx: usize,
+    crs: &cogzilla_proj::CrsModel,
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
-) -> Result<serde_json::Value, EngineError> {
-    let crs = engine.get_or_build_crs(cog)?;
-    let mut ifd_idx = cog.index.ifds.len() - 1;
-    for (i, ifd) in cog.index.ifds.iter().enumerate() {
-        if ifd.width.max(ifd.height) <= max_size {
-            ifd_idx = i;
-            break;
-        }
-    }
+    fetched: StatsTiles,
+) -> serde_json::Value {
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
     let total_pixels = (ifd.width as usize) * (ifd.height as usize);
@@ -814,15 +814,8 @@ pub async fn compute_statistics(
         .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, total_pixels))
         .collect();
 
-    match ifd.planar_config {
-        PlanarConfig::Chunky => {
-            let mut indices = Vec::new();
-            for ty in 0..ifd.tiles_down {
-                for tx in 0..ifd.tiles_across {
-                    indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
-                }
-            }
-            let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+    match fetched {
+        StatsTiles::Chunky(tiles) => {
             for (ti, tile_opt) in tiles.iter().enumerate() {
                 let Some(tile) = tile_opt else { continue };
                 let tx = (ti as u32) % ifd.tiles_across;
@@ -833,7 +826,7 @@ pub async fn compute_statistics(
 
                 if let Some(pm) = poly_mask {
                     let Some((mask_bits, inside)) =
-                        build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
+                        build_tile_polygon_mask(ifd, crs, pm, tx, ty, x_max, y_max)
                     else {
                         continue;
                     };
@@ -871,44 +864,13 @@ pub async fn compute_statistics(
                 }
             }
         }
-        PlanarConfig::Planar => {
-            // Precompute per-tile polygon masks once across all bands
-            let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
-            let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
-                let mut masks = Vec::with_capacity(n_tiles);
-                for ty in 0..ifd.tiles_down {
-                    for tx in 0..ifd.tiles_across {
-                        let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
-                        let y_max =
-                            (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
-                        if let Some((bits, inside)) =
-                            build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
-                        {
-                            mask_total_pixels += inside;
-                            masks.push(Some(bits));
-                        } else {
-                            masks.push(None);
-                        }
-                    }
-                }
-                masks
-            });
-
-            for b in 0..count {
-                let mut indices = Vec::with_capacity(n_tiles);
-                for ty in 0..ifd.tiles_down {
-                    for tx in 0..ifd.tiles_across {
-                        let ti = (ty * ifd.tiles_across + tx) as usize;
-                        if let Some(ref masks) = tile_masks {
-                            if masks[ti].is_none() {
-                                indices.push(None);
-                                continue;
-                            }
-                        }
-                        indices.push(Some(ifd.tile_index(tx, ty, b as u16) as u32));
-                    }
-                }
-                let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+        StatsTiles::Planar {
+            band_tiles,
+            tile_masks,
+            mask_total_pixels: planar_mask_px,
+        } => {
+            mask_total_pixels = planar_mask_px;
+            for (b, tiles) in band_tiles.iter().enumerate() {
                 for (ti, tile_opt) in tiles.iter().enumerate() {
                     let Some(tile) = tile_opt else { continue };
                     let band = &tile.bands[0];
@@ -963,10 +925,117 @@ pub async fn compute_statistics(
         );
     }
 
-    Ok(serde_json::Value::Object(out))
+    serde_json::Value::Object(out)
+}
+
+/// TiTiler-compatible `/cog/statistics` computed from the coarsest overview <= `max_size`.
+/// When `poly_mask` is `Some`, clips statistics strictly to pixels inside the posted GeoJSON polygon.
+pub async fn compute_statistics(
+    engine: &TileEngine,
+    cog: &Arc<OpenedCog>,
+    max_size: u32,
+    poly_mask: Option<&PolygonMask>,
+    unscale: bool,
+) -> Result<serde_json::Value, EngineError> {
+    let crs = engine.get_or_build_crs(cog)?;
+    let mut ifd_idx = cog.index.ifds.len() - 1;
+    for (i, ifd) in cog.index.ifds.iter().enumerate() {
+        if ifd.width.max(ifd.height) <= max_size {
+            ifd_idx = i;
+            break;
+        }
+    }
+    let ifd = &cog.index.ifds[ifd_idx];
+    let count = ifd.samples_per_pixel as usize;
+    let total_pixels = (ifd.width as usize) * (ifd.height as usize);
+
+    let fetched = match ifd.planar_config {
+        PlanarConfig::Chunky => {
+            let mut indices = Vec::new();
+            for ty in 0..ifd.tiles_down {
+                for tx in 0..ifd.tiles_across {
+                    indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                }
+            }
+            let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+            StatsTiles::Chunky(tiles)
+        }
+        PlanarConfig::Planar => {
+            let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+            let mut mask_total_pixels = 0usize;
+            let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
+                let mut masks = Vec::with_capacity(n_tiles);
+                for ty in 0..ifd.tiles_down {
+                    for tx in 0..ifd.tiles_across {
+                        let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+                        let y_max =
+                            (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+                        if let Some((bits, inside)) =
+                            build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
+                        {
+                            mask_total_pixels += inside;
+                            masks.push(Some(bits));
+                        } else {
+                            masks.push(None);
+                        }
+                    }
+                }
+                masks
+            });
+
+            let mut band_tiles = Vec::with_capacity(count);
+            for b in 0..count {
+                let mut indices = Vec::with_capacity(n_tiles);
+                for ty in 0..ifd.tiles_down {
+                    for tx in 0..ifd.tiles_across {
+                        let ti = (ty * ifd.tiles_across + tx) as usize;
+                        if let Some(ref masks) = tile_masks {
+                            if masks[ti].is_none() {
+                                indices.push(None);
+                                continue;
+                            }
+                        }
+                        indices.push(Some(ifd.tile_index(tx, ty, b as u16) as u32));
+                    }
+                }
+                band_tiles.push(engine.store.get_blocks(cog, ifd_idx, &indices).await?);
+            }
+            StatsTiles::Planar {
+                band_tiles,
+                tile_masks,
+                mask_total_pixels,
+            }
+        }
+    };
+
+    // Offload large (>256x256) statistics accumulation/Quickselect to bounded spawn_blocking so
+    // heavy analytics requests never stall Tokio's async I/O reactor on mixed workloads.
+    if total_pixels > 256 * 256 {
+        let cog_owned = cog.clone();
+        let pm_owned = poly_mask.cloned();
+        let val = engine
+            .store
+            .run_heavy_cpu(move || {
+                compute_statistics_cpu(
+                    &cog_owned,
+                    ifd_idx,
+                    &crs,
+                    pm_owned.as_ref(),
+                    unscale,
+                    fetched,
+                )
+            })
+            .await?;
+        Ok(val)
+    } else {
+        Ok(compute_statistics_cpu(
+            cog, ifd_idx, &crs, poly_mask, unscale, fetched,
+        ))
+    }
 }
 
 /// Simple ray-casting point-in-polygon check for GeoJSON Feature crop masking (`POST /cog/feature`).
+#[derive(Clone)]
 pub struct PolygonMask {
     /// List of polygons; each polygon is `[outer_ring, hole1, ...]`, each ring is `Vec<(lon, lat)>`.
     pub polygons: Vec<Vec<Vec<(f64, f64)>>>,
@@ -1396,373 +1465,391 @@ pub async fn render_wgs84_bbox(
         cog_tiles.push(engine.store.get_blocks(c, ifd_idx, &indices).await?);
     }
 
-    let ifd_w_i = ifd.width as i32;
-    let ifd_h_i = ifd.height as i32;
-    let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
-        if !u.is_finite() || !v.is_finite() {
-            return f32::NAN;
-        }
-        match resample {
-            ResampleMode::Nearest => {
-                let xi = (u + 0.5).floor() as i32;
-                let yi = (v + 0.5).floor() as i32;
-                if xi >= 0 && yi >= 0 && xi < ifd_w_i && yi < ifd_h_i {
-                    src.sample_inbounds(xi as u32, yi as u32)
-                } else {
-                    f32::NAN
-                }
+    let ifd_width = ifd.width;
+    let ifd_height = ifd.height;
+    let ifd_tile_width = ifd.tile_width;
+    let ifd_tile_height = ifd.tile_height;
+    let num_cogs = cogs.len();
+
+    let render_cpu = move |u_map: Vec<f32>,
+                           v_map: Vec<f32>,
+                           cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
+                           bands: &BandRequest,
+                           custom_lut: Option<&ColormapLut>,
+                           color_formula: Option<&ColorFormula>|
+          -> Bytes {
+        let ifd_w_i = ifd_width as i32;
+        let ifd_h_i = ifd_height as i32;
+        let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
+            if !u.is_finite() || !v.is_finite() {
+                return f32::NAN;
             }
-            ResampleMode::Cubic => cogzilla_kernel::sample_cubic(src, u, v),
-            ResampleMode::Bilinear => {
-                let x0_f = u.floor();
-                let y0_f = v.floor();
-                let fx = u - x0_f;
-                let fy = v - y0_f;
-                let x0 = x0_f as i32;
-                let y0 = y0_f as i32;
-                let (v00, v10, v01, v11) =
-                    if x0 >= 0 && y0 >= 0 && (x0 + 1) < ifd_w_i && (y0 + 1) < ifd_h_i {
-                        src.sample_quad_inbounds(x0 as u32, y0 as u32)
+            match resample {
+                ResampleMode::Nearest => {
+                    let xi = (u + 0.5).floor() as i32;
+                    let yi = (v + 0.5).floor() as i32;
+                    if xi >= 0 && yi >= 0 && xi < ifd_w_i && yi < ifd_h_i {
+                        src.sample_inbounds(xi as u32, yi as u32)
                     } else {
-                        (
-                            src.sample_checked(x0, y0),
-                            src.sample_checked(x0 + 1, y0),
-                            src.sample_checked(x0, y0 + 1),
-                            src.sample_checked(x0 + 1, y0 + 1),
-                        )
-                    };
-                let omx = 1.0 - fx;
-                let omy = 1.0 - fy;
-                // Fast branchless path when all 4 corners are valid (99.9% of interior pixels)
-                if !(v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan()) {
-                    let top = v00 * omx + v10 * fx;
-                    let bot = v01 * omx + v11 * fx;
-                    return top * omy + bot * fy;
-                }
-                let (mut sum, mut wsum) = (0.0f32, 0.0f32);
-                for (val, wt) in [
-                    (v00, omx * omy),
-                    (v10, fx * omy),
-                    (v01, omx * fy),
-                    (v11, fx * fy),
-                ] {
-                    if !val.is_nan() {
-                        sum += val * wt;
-                        wsum += wt;
+                        f32::NAN
                     }
                 }
-                if wsum > 1e-6 { sum / wsum } else { f32::NAN }
-            }
-        }
-    };
-
-    // Helper to build BandSource for 1-based band index across single or multi-COG
-    let get_band_refs = |b_1based: u16, asset_slot: usize| -> Vec<Option<&cogzilla_codec::DecodedBand>> {
-        if cogs.len() > 1 {
-            let slot = asset_slot.min(cogs.len() - 1);
-            cog_tiles[slot]
-                .iter()
-                .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                .collect()
-        } else {
-            let b0 = b_1based.saturating_sub(1) as usize;
-            cog_tiles[0]
-                .iter()
-                .map(|o| o.as_ref().and_then(|t| t.bands.get(b0)))
-                .collect()
-        }
-    };
-
-    let mut rgba = vec![0u8; w * h * 4];
-    match bands {
-        BandRequest::Single {
-            band_1based,
-            rescale,
-            colormap,
-        } => {
-            let refs = get_band_refs(*band_1based, 0);
-            let src = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
-                &refs,
-            )
-            .with_nodata_override(nodata_override);
-            let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
-            for i in 0..(w * h) {
-                let v = sample(&src, u_map[i], v_map[i]);
-                if !v.is_nan() {
-                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    let c = lut.rgb[idx];
-                    rgba[i * 4] = c[0];
-                    rgba[i * 4 + 1] = c[1];
-                    rgba[i * 4 + 2] = c[2];
-                    rgba[i * 4 + 3] = 255;
+                ResampleMode::Cubic => cogzilla_kernel::sample_cubic(src, u, v),
+                ResampleMode::Bilinear => {
+                    let x0_f = u.floor();
+                    let y0_f = v.floor();
+                    let fx = u - x0_f;
+                    let fy = v - y0_f;
+                    let x0 = x0_f as i32;
+                    let y0 = y0_f as i32;
+                    let (v00, v10, v01, v11) =
+                        if x0 >= 0 && y0 >= 0 && (x0 + 1) < ifd_w_i && (y0 + 1) < ifd_h_i {
+                            src.sample_quad_inbounds(x0 as u32, y0 as u32)
+                        } else {
+                            (
+                                src.sample_checked(x0, y0),
+                                src.sample_checked(x0 + 1, y0),
+                                src.sample_checked(x0, y0 + 1),
+                                src.sample_checked(x0 + 1, y0 + 1),
+                            )
+                        };
+                    let omx = 1.0 - fx;
+                    let omy = 1.0 - fy;
+                    // Fast branchless path when all 4 corners are valid (99.9% of interior pixels)
+                    if !(v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan()) {
+                        let top = v00 * omx + v10 * fx;
+                        let bot = v01 * omx + v11 * fx;
+                        return top * omy + bot * fy;
+                    }
+                    let (mut sum, mut wsum) = (0.0f32, 0.0f32);
+                    for (val, wt) in [
+                        (v00, omx * omy),
+                        (v10, fx * omy),
+                        (v01, omx * fy),
+                        (v11, fx * fy),
+                    ] {
+                        if !val.is_nan() {
+                            sum += val * wt;
+                            wsum += wt;
+                        }
+                    }
+                    if wsum > 1e-6 { sum / wsum } else { f32::NAN }
                 }
             }
+        };
+
+        // Helper to build BandSource for 1-based band index across single or multi-COG
+        let get_band_refs =
+            |b_1based: u16, asset_slot: usize| -> Vec<Option<&cogzilla_codec::DecodedBand>> {
+                if num_cogs > 1 {
+                    let slot = asset_slot.min(num_cogs - 1);
+                    cog_tiles[slot]
+                        .iter()
+                        .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                        .collect()
+                } else {
+                    let b0 = b_1based.saturating_sub(1) as usize;
+                    cog_tiles[0]
+                        .iter()
+                        .map(|o| o.as_ref().and_then(|t| t.bands.get(b0)))
+                        .collect()
+                }
+            };
+
+        macro_rules! make_src {
+            ($refs:expr) => {
+                BandSource::new(
+                    ifd_width,
+                    ifd_height,
+                    ifd_tile_width,
+                    ifd_tile_height,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
+                    $refs,
+                )
+            };
         }
-        BandRequest::Terrain {
-            band_1based,
-            encoding,
-        } => {
-            let refs = get_band_refs(*band_1based, 0);
-            let src = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
-                &refs,
-            )
-            .with_nodata_override(nodata_override);
-            for i in 0..(w * h) {
-                let v = sample(&src, u_map[i], v_map[i]);
-                if !v.is_nan() {
-                    let [r, g, b] = match encoding {
-                        cogzilla_kernel::TerrainEncoding::Terrarium => {
-                            cogzilla_kernel::encode_terrarium_rgb(v)
-                        }
-                        cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                            cogzilla_kernel::encode_terrain_rgb(v)
-                        }
+
+        let mut rgba = vec![0u8; w * h * 4];
+        match bands {
+            BandRequest::Single {
+                band_1based,
+                rescale,
+                colormap,
+            } => {
+                let refs = get_band_refs(*band_1based, 0);
+                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
+                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                for i in 0..(w * h) {
+                    let v = sample(&src, u_map[i], v_map[i]);
+                    if !v.is_nan() {
+                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                        let c = lut.rgb[idx];
+                        rgba[i * 4] = c[0];
+                        rgba[i * 4 + 1] = c[1];
+                        rgba[i * 4 + 2] = c[2];
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::Terrain {
+                band_1based,
+                encoding,
+            } => {
+                let refs = get_band_refs(*band_1based, 0);
+                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                for i in 0..(w * h) {
+                    let v = sample(&src, u_map[i], v_map[i]);
+                    if !v.is_nan() {
+                        let [r, g, b] = match encoding {
+                            cogzilla_kernel::TerrainEncoding::Terrarium => {
+                                cogzilla_kernel::encode_terrarium_rgb(v)
+                            }
+                            cogzilla_kernel::TerrainEncoding::TerrainRgb => {
+                                cogzilla_kernel::encode_terrain_rgb(v)
+                            }
+                        };
+                        rgba[i * 4] = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::Dem {
+                band_1based,
+                rescale,
+                colormap,
+                ..
+            } => {
+                let refs = get_band_refs(*band_1based, 0);
+                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
+                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                for i in 0..(w * h) {
+                    let v = sample(&src, u_map[i], v_map[i]);
+                    if !v.is_nan() {
+                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                        let c = lut.rgb[idx];
+                        rgba[i * 4] = c[0];
+                        rgba[i * 4 + 1] = c[1];
+                        rgba[i * 4 + 2] = c[2];
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::Rgb {
+                bands_1based,
+                rescale_min,
+                rescale_max,
+            } => {
+                let r0 = get_band_refs(bands_1based[0], 0);
+                let r1 = get_band_refs(bands_1based[1], 1);
+                let r2 = get_band_refs(bands_1based[2], 2);
+                let s0 = make_src!(&r0);
+                let s1 = make_src!(&r1);
+                let s2 = make_src!(&r2);
+                let inv = [
+                    255.0 / (rescale_max[0] - rescale_min[0]).max(1e-12),
+                    255.0 / (rescale_max[1] - rescale_min[1]).max(1e-12),
+                    255.0 / (rescale_max[2] - rescale_min[2]).max(1e-12),
+                ];
+                for i in 0..(w * h) {
+                    let r = sample(&s0, u_map[i], v_map[i]);
+                    let g = sample(&s1, u_map[i], v_map[i]);
+                    let b = sample(&s2, u_map[i], v_map[i]);
+                    if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                        rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::SarRgb {
+                bands_1based,
+                rescale_min,
+                rescale_max,
+            } => {
+                let r0 = get_band_refs(bands_1based[0], 0);
+                let r1 = get_band_refs(bands_1based[1], 1);
+                let s0 = make_src!(&r0);
+                let s1 = make_src!(&r1);
+                let inv = [
+                    255.0 / (rescale_max[0] - rescale_min[0]).max(1e-12),
+                    255.0 / (rescale_max[1] - rescale_min[1]).max(1e-12),
+                    255.0 / (rescale_max[2] - rescale_min[2]).max(1e-12),
+                ];
+                for i in 0..(w * h) {
+                    let vv = fast_db_from_power(sample(&s0, u_map[i], v_map[i]));
+                    let vh = fast_db_from_power(sample(&s1, u_map[i], v_map[i]));
+                    if !vv.is_nan() && !vh.is_nan() {
+                        rgba[i * 4] = ((vv - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 1] = ((vh - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 2] =
+                            (((vv - vh) - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::CustomExpr {
+                prog,
+                rescale,
+                colormap,
+            } => {
+                let ref_vecs: Vec<_> = prog
+                    .used_bands
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &b)| get_band_refs(b, slot))
+                    .collect();
+                let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                let lut = colormap.lut();
+                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let mut vals = [0.0f32; 16];
+                let nb = srcs.len().min(16);
+                for i in 0..(w * h) {
+                    for k in 0..nb {
+                        vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                    }
+                    let v = prog.eval(&vals[..nb]);
+                    if !v.is_nan() {
+                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                        let c = lut.rgb[idx];
+                        rgba[i * 4] = c[0];
+                        rgba[i * 4 + 1] = c[1];
+                        rgba[i * 4 + 2] = c[2];
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::Spectral1 {
+                expr,
+                band_1based,
+                rescale,
+                colormap,
+            } => {
+                let refs = get_band_refs(*band_1based, 0);
+                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
+                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                for i in 0..(w * h) {
+                    let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
+                    if !v.is_nan() {
+                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                        let c = lut.rgb[idx];
+                        rgba[i * 4] = c[0];
+                        rgba[i * 4 + 1] = c[1];
+                        rgba[i * 4 + 2] = c[2];
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::Spectral2 {
+                expr,
+                bands_1based,
+                rescale,
+                colormap,
+            } => {
+                let r0 = get_band_refs(bands_1based[0], 0);
+                let r1 = get_band_refs(bands_1based[1], 1);
+                let s0 = make_src!(&r0);
+                let s1 = make_src!(&r1);
+                let lut = colormap.lut();
+                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                for i in 0..(w * h) {
+                    let a = sample(&s0, u_map[i], v_map[i]);
+                    let b = sample(&s1, u_map[i], v_map[i]);
+                    let v = if a.is_nan() || b.is_nan() {
+                        f32::NAN
+                    } else {
+                        expr.eval2(a, b)
                     };
-                    rgba[i * 4] = r;
-                    rgba[i * 4 + 1] = g;
-                    rgba[i * 4 + 2] = b;
-                    rgba[i * 4 + 3] = 255;
+                    if !v.is_nan() {
+                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                        let c = lut.rgb[idx];
+                        rgba[i * 4] = c[0];
+                        rgba[i * 4 + 1] = c[1];
+                        rgba[i * 4 + 2] = c[2];
+                        rgba[i * 4 + 3] = 255;
+                    }
+                }
+            }
+            BandRequest::Spectral3 {
+                expr,
+                bands_1based,
+                rescale,
+                colormap,
+            } => {
+                let r0 = get_band_refs(bands_1based[0], 0);
+                let r1 = get_band_refs(bands_1based[1], 1);
+                let r2 = get_band_refs(bands_1based[2], 2);
+                let s0 = make_src!(&r0);
+                let s1 = make_src!(&r1);
+                let s2 = make_src!(&r2);
+                let lut = colormap.lut();
+                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                for i in 0..(w * h) {
+                    let a = sample(&s0, u_map[i], v_map[i]);
+                    let b = sample(&s1, u_map[i], v_map[i]);
+                    let c = sample(&s2, u_map[i], v_map[i]);
+                    let v = if a.is_nan() || b.is_nan() || c.is_nan() {
+                        f32::NAN
+                    } else {
+                        expr.eval3(a, b, c)
+                    };
+                    if !v.is_nan() {
+                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                        let col = lut.rgb[idx];
+                        rgba[i * 4] = col[0];
+                        rgba[i * 4 + 1] = col[1];
+                        rgba[i * 4 + 2] = col[2];
+                        rgba[i * 4 + 3] = 255;
+                    }
                 }
             }
         }
-        BandRequest::Dem {
-            band_1based,
-            rescale,
-            colormap,
-            ..
-        } => {
-            // General bbox preview fallback for DEM requests: render shaded elevation
-            let refs = get_band_refs(*band_1based, 0);
-            let src = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
-                &refs,
-            )
-            .with_nodata_override(nodata_override);
-            let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
-            for i in 0..(w * h) {
-                let v = sample(&src, u_map[i], v_map[i]);
-                if !v.is_nan() {
-                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    let c = lut.rgb[idx];
-                    rgba[i * 4] = c[0];
-                    rgba[i * 4 + 1] = c[1];
-                    rgba[i * 4 + 2] = c[2];
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        BandRequest::Rgb {
-            bands_1based,
-            rescale_min,
-            rescale_max,
-        } => {
-            let r0 = get_band_refs(bands_1based[0], 0);
-            let r1 = get_band_refs(bands_1based[1], 1);
-            let r2 = get_band_refs(bands_1based[2], 2);
-            let s0 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r0,
-            );
-            let s1 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r1,
-            );
-            let s2 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r2,
-            );
-            let inv = [
-                255.0 / (rescale_max[0] - rescale_min[0]).max(1e-12),
-                255.0 / (rescale_max[1] - rescale_min[1]).max(1e-12),
-                255.0 / (rescale_max[2] - rescale_min[2]).max(1e-12),
-            ];
-            for i in 0..(w * h) {
-                let r = sample(&s0, u_map[i], v_map[i]);
-                let g = sample(&s1, u_map[i], v_map[i]);
-                let b = sample(&s2, u_map[i], v_map[i]);
-                if !r.is_nan() && !g.is_nan() && !b.is_nan() {
-                    rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        BandRequest::SarRgb {
-            bands_1based,
-            rescale_min,
-            rescale_max,
-        } => {
-            let r0 = get_band_refs(bands_1based[0], 0);
-            let r1 = get_band_refs(bands_1based[1], 1);
-            let s0 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r0,
-            );
-            let s1 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r1,
-            );
-            let inv = [
-                255.0 / (rescale_max[0] - rescale_min[0]).max(1e-12),
-                255.0 / (rescale_max[1] - rescale_min[1]).max(1e-12),
-                255.0 / (rescale_max[2] - rescale_min[2]).max(1e-12),
-            ];
-            for i in 0..(w * h) {
-                let vv = fast_db_from_power(sample(&s0, u_map[i], v_map[i]));
-                let vh = fast_db_from_power(sample(&s1, u_map[i], v_map[i]));
-                if !vv.is_nan() && !vh.is_nan() {
-                    rgba[i * 4] = ((vv - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 1] = ((vh - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 2] = (((vv - vh) - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        BandRequest::CustomExpr {
-            prog,
-            rescale,
-            colormap,
-        } => {
-            let ref_vecs: Vec<_> = prog
-                .used_bands
-                .iter()
-                .enumerate()
-                .map(|(slot, &b)| get_band_refs(b, slot))
-                .collect();
-            let srcs: Vec<_> = ref_vecs
-                .iter()
-                .map(|r| {
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, r,
-                    )
-                })
-                .collect();
-            let lut = colormap.lut();
-            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
-            let mut vals = [0.0f32; 16];
-            let nb = srcs.len().min(16);
-            for i in 0..(w * h) {
-                for k in 0..nb {
-                    vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
-                }
-                let v = prog.eval(&vals[..nb]);
-                if !v.is_nan() {
-                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    let c = lut.rgb[idx];
-                    rgba[i * 4] = c[0];
-                    rgba[i * 4 + 1] = c[1];
-                    rgba[i * 4 + 2] = c[2];
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        BandRequest::Spectral1 {
-            expr,
-            band_1based,
-            rescale,
-            colormap,
-        } => {
-            let refs = get_band_refs(*band_1based, 0);
-            let src = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h,
-                &refs,
-            )
-            .with_nodata_override(nodata_override);
-            let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
-            for i in 0..(w * h) {
-                let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
-                if !v.is_nan() {
-                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    let c = lut.rgb[idx];
-                    rgba[i * 4] = c[0];
-                    rgba[i * 4 + 1] = c[1];
-                    rgba[i * 4 + 2] = c[2];
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        BandRequest::Spectral2 {
-            expr,
-            bands_1based,
-            rescale,
-            colormap,
-        } => {
-            let r0 = get_band_refs(bands_1based[0], 0);
-            let r1 = get_band_refs(bands_1based[1], 1);
-            let s0 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r0,
-            );
-            let s1 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r1,
-            );
-            let lut = colormap.lut();
-            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
-            for i in 0..(w * h) {
-                let a = sample(&s0, u_map[i], v_map[i]);
-                let b = sample(&s1, u_map[i], v_map[i]);
-                let v = if a.is_nan() || b.is_nan() {
-                    f32::NAN
-                } else {
-                    expr.eval2(a, b)
-                };
-                if !v.is_nan() {
-                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    let c = lut.rgb[idx];
-                    rgba[i * 4] = c[0];
-                    rgba[i * 4 + 1] = c[1];
-                    rgba[i * 4 + 2] = c[2];
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-        BandRequest::Spectral3 {
-            expr,
-            bands_1based,
-            rescale,
-            colormap,
-        } => {
-            let r0 = get_band_refs(bands_1based[0], 0);
-            let r1 = get_band_refs(bands_1based[1], 1);
-            let r2 = get_band_refs(bands_1based[2], 2);
-            let s0 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r0,
-            );
-            let s1 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r1,
-            );
-            let s2 = BandSource::new(
-                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, &r2,
-            );
-            let lut = colormap.lut();
-            let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
-            for i in 0..(w * h) {
-                let a = sample(&s0, u_map[i], v_map[i]);
-                let b = sample(&s1, u_map[i], v_map[i]);
-                let c = sample(&s2, u_map[i], v_map[i]);
-                let v = if a.is_nan() || b.is_nan() || c.is_nan() {
-                    f32::NAN
-                } else {
-                    expr.eval3(a, b, c)
-                };
-                if !v.is_nan() {
-                    let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    let col = lut.rgb[idx];
-                    rgba[i * 4] = col[0];
-                    rgba[i * 4 + 1] = col[1];
-                    rgba[i * 4 + 2] = col[2];
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-        }
-    }
 
-    if let Some(cf) = color_formula {
-        cf.apply_buffer_in_place(&mut rgba, 4);
-    }
+        if let Some(cf) = color_formula {
+            cf.apply_buffer_in_place(&mut rgba, 4);
+        }
 
-    Ok(encode_rgba_output(w, h, &rgba, format, return_mask))
+        encode_rgba_output(w, h, &rgba, format, return_mask)
+    };
+
+    // Offload large (>512x512) bbox renders to bounded spawn_blocking so giant previews/crops
+    // never stall Tokio's async I/O workers.
+    if w * h > 512 * 512 {
+        let bands_owned = bands.clone();
+        let lut_owned = custom_lut.cloned();
+        let cf_owned = color_formula.cloned();
+        let bytes = engine
+            .store
+            .run_heavy_cpu(move || {
+                render_cpu(
+                    u_map,
+                    v_map,
+                    cog_tiles,
+                    &bands_owned,
+                    lut_owned.as_ref(),
+                    cf_owned.as_ref(),
+                )
+            })
+            .await?;
+        Ok(bytes)
+    } else {
+        Ok(render_cpu(
+            u_map,
+            v_map,
+            cog_tiles,
+            bands,
+            custom_lut,
+            color_formula,
+        ))
+    }
 }
 
 /// Interactive MapLibre HTML viewer (`/cog/{tms}/map.html`), matching TiTiler's built-in viewer.

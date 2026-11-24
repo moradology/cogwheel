@@ -391,6 +391,10 @@ pub fn decode_tile(
         };
 
         apply_rgba_alpha_if_present(&mut bands, ifd);
+        // Prevent a single pathological >4 MiB block from permanently pinning huge TLS scratch.
+        if st.scratch.capacity() > 4 * 1024 * 1024 {
+            st.scratch = Vec::with_capacity(512 * 512 * 4);
+        }
         Ok(DecodedTile { bands })
     })
 }
