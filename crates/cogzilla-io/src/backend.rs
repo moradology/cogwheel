@@ -286,10 +286,20 @@ impl CogSource {
                         }
                     };
                     let status = resp.status().as_u16();
+                    if status == 200 && start > 0 {
+                        // Server ignored Range header and sent full object from offset 0:
+                        // returning those bytes would silently corrupt tile/IFD data!
+                        return Err(IoError::HttpStatus {
+                            status: 200,
+                            url: url.clone(),
+                        });
+                    }
                     if status == 200 || status == 206 {
-                        let data = match resp.bytes().await {
+                        let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
+                        let data = match crate::cloud::read_response_capped(resp, expected_len).await
+                        {
                             Ok(d) => d,
-                            Err(e)
+                            Err(IoError::Http(e))
                                 if attempt < *max_retries && is_retryable_transport_error(&e) =>
                             {
                                 permit.on_throttle();
@@ -297,12 +307,13 @@ impl CogSource {
                                 attempt += 1;
                                 continue;
                             }
-                            Err(e) => {
+                            Err(IoError::Http(e)) => {
                                 if is_retryable_transport_error(&e) {
                                     permit.on_throttle();
                                 }
                                 return Err(IoError::Http(e));
                             }
+                            Err(e) => return Err(e),
                         };
                         permit.on_success();
                         metrics

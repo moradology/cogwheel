@@ -72,7 +72,8 @@ pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
         if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
             return false;
         }
-        if cur.split(['/', '\\']).any(|seg| seg == "..") {
+        let path_part = cur.split(['?', '#']).next().unwrap_or(&cur);
+        if path_part.split(['/', '\\']).any(|seg| seg == "..") {
             return false;
         }
         let next = decode_percent_once(&cur);
@@ -141,6 +142,8 @@ mod tests {
         assert!(!matches_any_prefix(&p, "https://bucket.example.com/a/%2e%2e/b.tif"));
         assert!(!matches_any_prefix(&p, "https://bucket.example.com/a/..%2fb.tif"));
         assert!(!matches_any_prefix(&p, "https://bucket.example.com/a/%252e%252e/b.tif"));
+        assert!(!matches_any_prefix(&p, "https://bucket.example.com/public/..?x=1"));
+        assert!(!matches_any_prefix(&p, "https://bucket.example.com/public/..#frag"));
         assert!(matches_any_prefix(&p, "https://bucket.example.com/a..b.tif"));
     }
 }

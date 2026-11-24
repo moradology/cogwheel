@@ -1381,6 +1381,18 @@ impl CogStore {
             .source
             .fetch_range(offset, offset + byte_len as u64)
             .await?;
+        let want = byte_len as usize;
+        if raw.len() < want {
+            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                required: offset + byte_len as u64,
+                available: offset + raw.len() as u64,
+            }));
+        }
+        let raw = if raw.len() > want {
+            raw.slice(..want)
+        } else {
+            raw
+        };
         if !is_local {
             if let Some(dc) = &self.disk_cache {
                 dc.put_async(&cog.uri, ifd_idx as u16, tile_idx, raw.clone());

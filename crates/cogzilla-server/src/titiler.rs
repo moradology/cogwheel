@@ -1300,8 +1300,7 @@ pub(crate) fn encode_rgba_output(
 }
 
 /// Arbitrary-dimensions WGS84 bounding-box renderer backing `/cog/preview`, `/cog/bbox`,
-/// `POST /cog/feature`, `WorldCRS84Quad` tiles, and custom post-processing (`color_formula`,
-/// custom JSON `?colormap=`, `?return_mask=false`, `?nodata=`, `?buffer=`).
+/// `POST /cog/feature`, and `WorldCRS84Quad` tiles.
 #[allow(clippy::too_many_arguments)]
 pub async fn render_wgs84_bbox(
     engine: &TileEngine,
@@ -1318,10 +1317,90 @@ pub async fn render_wgs84_bbox(
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
 ) -> Result<Bytes, EngineError> {
+    render_bbox_impl(
+        engine,
+        cogs,
+        bbox,
+        false,
+        width,
+        height,
+        poly_mask,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+    )
+    .await
+}
+
+/// Arbitrary-dimensions EPSG:3857 Web Mercator bounding-box renderer backing `WebMercatorQuad`
+/// tiles with `?nodata=`, `?buffer=`, or custom JSON `?colormap=` in true Web Mercator meters.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_mercator_bbox(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox_3857: [f64; 4],
+    width: u32,
+    height: u32,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&ColormapLut>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+) -> Result<Bytes, EngineError> {
+    render_bbox_impl(
+        engine,
+        cogs,
+        bbox_3857,
+        true,
+        width,
+        height,
+        None,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_bbox_impl(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    bbox_is_3857: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&ColormapLut>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+) -> Result<Bytes, EngineError> {
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
     let primary = &cogs[0];
     let crs = engine.get_or_build_crs(primary)?;
+
+    let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
+        if bbox_is_3857 {
+            crs.from_3857(x, y)
+        } else {
+            crs.from_lonlat_deg(x, y)
+        }
+    };
 
     // Estimate target CRS resolution to pick optimal overview IFD.
     // Probe bbox center first; if out of CRS domain (e.g. WorldCRS84Quad z=0/1 on a UTM COG >75°
@@ -1331,9 +1410,9 @@ pub async fn render_wgs84_bbox(
     let dlx = (bbox[2] - bbox[0]) / (w as f64);
     let dly = (bbox[3] - bbox[1]) / (h as f64);
     let probe_res = |px: f64, py: f64| -> (f64, f64) {
-        let (s0x, s0y) = crs.from_lonlat_deg(px, py);
-        let (s1x, s1y) = crs.from_lonlat_deg(px + dlx, py);
-        let (s2x, s2y) = crs.from_lonlat_deg(px, py + dly);
+        let (s0x, s0y) = to_src_crs(px, py);
+        let (s1x, s1y) = to_src_crs(px + dlx, py);
+        let (s2x, s2y) = to_src_crs(px, py + dly);
         let rx = ((s1x - s0x).powi(2) + (s1y - s0y).powi(2)).sqrt();
         let ry = ((s2x - s0x).powi(2) + (s2y - s0y).powi(2)).sqrt();
         (rx, ry)
@@ -1342,8 +1421,16 @@ pub async fn render_wgs84_bbox(
     if !target_rx.is_finite() || !target_ry.is_finite() {
         let full = primary.index.full_res();
         let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-        let rcx = (0.5 * (rb[0] + rb[2])).clamp(bbox[0], bbox[2]);
-        let rcy = (0.5 * (rb[1] + rb[3])).clamp(bbox[1], bbox[3]);
+        let (rcx_raw, rcy_raw) = if bbox_is_3857 {
+            let lat_rad = (0.5 * (rb[1] + rb[3])).clamp(-85.05112878, 85.05112878).to_radians();
+            let lon_rad = (0.5 * (rb[0] + rb[2])).to_radians();
+            const R: f64 = 6_378_137.0;
+            (R * lon_rad, R * (std::f64::consts::FRAC_PI_4 + 0.5 * lat_rad).tan().ln())
+        } else {
+            (0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]))
+        };
+        let rcx = rcx_raw.clamp(bbox[0], bbox[2]);
+        let rcy = rcy_raw.clamp(bbox[1], bbox[3]);
         let probes = [
             (rcx, rcy),
             (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
@@ -1381,11 +1468,11 @@ pub async fn render_wgs84_bbox(
     let mut grid_v = vec![f64::NAN; gw * gh];
     for gy in 0..gh {
         let py_f = (gy * STEP).min(h) as f64;
-        let lat = bbox[3] - py_f * dly;
+        let y_coord = bbox[3] - py_f * dly;
         for gx in 0..gw {
             let px_f = (gx * STEP).min(w) as f64;
-            let lon = bbox[0] + px_f * dlx;
-            let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+            let x_coord = bbox[0] + px_f * dlx;
+            let (sx, sy) = to_src_crs(x_coord, y_coord);
             if sx.is_finite() && sy.is_finite() {
                 let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
                 grid_u[gy * gw + gx] = col - 0.5;
@@ -1495,7 +1582,7 @@ pub async fn render_wgs84_bbox(
                                 continue;
                             }
                         }
-                        let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+                        let (sx, sy) = to_src_crs(lon, lat);
                         if !sx.is_finite() || !sy.is_finite() {
                             continue;
                         }
@@ -1965,10 +2052,15 @@ pub async fn render_wgs84_bbox(
                 for i in 0..(w * h) {
                     elev[i] = sample(&src, u_map[i], v_map[i]);
                 }
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                let px_m = ((dlx * 111_320.0 * lat_rad.cos()).abs()
-                    .max((dly * 111_320.0).abs()))
-                    .max(1e-3) as f32;
+                let px_m = if bbox_is_3857 {
+                    let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
+                    (dlx.abs().max(dly.abs()) * center_lat.to_radians().cos()).max(1e-3) as f32
+                } else {
+                    let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                    ((dlx * 111_320.0 * lat_rad.cos()).abs()
+                        .max((dly * 111_320.0).abs()))
+                        .max(1e-3) as f32
+                };
                 let inv_8dx = 1.0 / (8.0 * px_m);
                 for py in 0..h {
                     let ym = py.saturating_sub(1);

@@ -27,7 +27,7 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, build_cog_info, build_cog_info_geojson, build_map_html, build_tilejson,
-    compute_statistics, encode_rgba_output, query_point, render_wgs84_bbox,
+    compute_statistics, encode_rgba_output, query_point, render_mercator_bbox, render_wgs84_bbox,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -728,13 +728,11 @@ fn world_crs84_tile_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> 
     [min_lon, min_lat, max_lon, max_lat]
 }
 
-fn web_mercator_buffered_wgs84_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
+fn web_mercator_buffered_3857_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
     let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
     let pad_x = (max_x - min_x) * (buffer as f64 / tile_size as f64);
     let pad_y = (max_y - min_y) * (buffer as f64 / tile_size as f64);
-    let (w, s) = mercator_to_lonlat_deg(min_x - pad_x, min_y - pad_y);
-    let (e, n) = mercator_to_lonlat_deg(max_x + pad_x, max_y + pad_y);
-    [w, s, e, n]
+    [min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y]
 }
 
 fn plain_resp(
@@ -1614,33 +1612,54 @@ where
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
                             let out_dim = treq.tile_size + 2 * pq_stac.buffer;
-                            let bbox = if tms == "WorldCRS84Quad" {
-                                world_crs84_tile_bbox(z, x, y, pq_stac.buffer, treq.tile_size)
-                            } else {
-                                web_mercator_buffered_wgs84_bbox(
+                            let data = if tms == "WorldCRS84Quad" {
+                                let bbox = world_crs84_tile_bbox(
                                     z,
                                     x,
                                     y,
                                     pq_stac.buffer,
                                     treq.tile_size,
+                                );
+                                render_wgs84_bbox(
+                                    &engine,
+                                    &cogs,
+                                    bbox,
+                                    out_dim,
+                                    out_dim,
+                                    None,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq_stac.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq_stac.return_mask,
                                 )
+                                .await?
+                            } else {
+                                let bbox_3857 = web_mercator_buffered_3857_bbox(
+                                    z,
+                                    x,
+                                    y,
+                                    pq_stac.buffer,
+                                    treq.tile_size,
+                                );
+                                render_mercator_bbox(
+                                    &engine,
+                                    &cogs,
+                                    bbox_3857,
+                                    out_dim,
+                                    out_dim,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq_stac.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq_stac.return_mask,
+                                )
+                                .await?
                             };
-                            let data = render_wgs84_bbox(
-                                &engine,
-                                &cogs,
-                                bbox,
-                                out_dim,
-                                out_dim,
-                                None,
-                                &treq.bands,
-                                treq.resample,
-                                treq.format,
-                                pq_stac.nodata,
-                                custom_lut.as_ref(),
-                                cf.as_ref(),
-                                pq_stac.return_mask,
-                            )
-                            .await?;
                             Ok((data, ct))
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
                             && treq.format != OutputFormat::RawF32
@@ -2133,27 +2152,49 @@ where
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
                             let out_dim = treq.tile_size + 2 * pq.buffer;
-                            let bbox = if tms == "WorldCRS84Quad" {
-                                world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size)
+                            let data = if tms == "WorldCRS84Quad" {
+                                let bbox =
+                                    world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size);
+                                render_wgs84_bbox(
+                                    &engine,
+                                    &cogs,
+                                    bbox,
+                                    out_dim,
+                                    out_dim,
+                                    None,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq.return_mask,
+                                )
+                                .await?
                             } else {
-                                web_mercator_buffered_wgs84_bbox(z, x, y, pq.buffer, treq.tile_size)
+                                let bbox_3857 = web_mercator_buffered_3857_bbox(
+                                    z,
+                                    x,
+                                    y,
+                                    pq.buffer,
+                                    treq.tile_size,
+                                );
+                                render_mercator_bbox(
+                                    &engine,
+                                    &cogs,
+                                    bbox_3857,
+                                    out_dim,
+                                    out_dim,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq.return_mask,
+                                )
+                                .await?
                             };
-                            let data = render_wgs84_bbox(
-                                &engine,
-                                &cogs,
-                                bbox,
-                                out_dim,
-                                out_dim,
-                                None,
-                                &treq.bands,
-                                treq.resample,
-                                treq.format,
-                                pq.nodata,
-                                custom_lut.as_ref(),
-                                cf.as_ref(),
-                                pq.return_mask,
-                            )
-                            .await?;
                             Ok((data, ct))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
                             && treq.format != OutputFormat::RawF32

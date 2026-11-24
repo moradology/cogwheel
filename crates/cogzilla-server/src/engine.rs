@@ -1460,15 +1460,17 @@ fn aligned_passthrough_tile_coord<const N: usize>(
         || !ifd.crs_to_pixel.is_axis_aligned()
         || ifd.tile_width != N as u32
         || ifd.tile_height != N as u32
-        || !(ifd.photometric == 2 || ifd.photometric == 6)
     {
         return None;
     }
 
+    // Only pass through browser-safe encodings: YCbCr JPEG (photometric=6) or WebP (self-describing).
+    // TIFF RGB JPEG (photometric=2) may omit Adobe APP14 transform=0, causing browsers to decode
+    // raw RGB as YCbCr (magenta/green corruption).
     let codec_matches = matches!(
-        (ifd.compression, req.format),
-        (Compression::Jpeg, OutputFormat::Jpeg { .. })
-            | (Compression::Webp, OutputFormat::Webp { .. })
+        (ifd.compression, ifd.photometric, req.format),
+        (Compression::Jpeg, 6, OutputFormat::Jpeg { .. })
+            | (Compression::Webp, 2 | 6, OutputFormat::Webp { .. })
     );
     if !codec_matches {
         return None;
