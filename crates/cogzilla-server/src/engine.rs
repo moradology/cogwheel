@@ -1219,253 +1219,234 @@ impl TileEngine {
             }
         }
 
-        match cogs.len() {
-            2 => {
-                // Fetch both COGs concurrently (e.g., SAR VV + VH or Landsat B5 + B4)
-                let (t0, t1) = tokio::try_join!(
-                    self.store.get_blocks(&cogs[0], ifd_idx, &indices),
-                    self.store.get_blocks(&cogs[1], ifd_idx, &indices),
-                )?;
-                let r0: Vec<_> = t0
-                    .iter()
+        if cogs.is_empty() || cogs.len() > 16 {
+            return Err(EngineError::BadRequest(format!(
+                "multi-COG compositing supports 1..=16 assets, got {}",
+                cogs.len()
+            )));
+        }
+
+        // Fetch all co-registered COGs concurrently via JoinSet (supports 2..=16 assets).
+        let indices_arc = Arc::new(indices);
+        let mut js = tokio::task::JoinSet::new();
+        for (slot, c) in cogs.iter().enumerate() {
+            let store = self.store.clone();
+            let cog = c.clone();
+            let idx_ref = indices_arc.clone();
+            js.spawn(async move {
+                let blocks = store.get_blocks(&cog, ifd_idx, &idx_ref).await?;
+                Ok::<_, cogzilla_io::IoError>((slot, blocks))
+            });
+        }
+        let mut fetched: Vec<Option<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>> =
+            vec![None; cogs.len()];
+        while let Some(res) = js.join_next().await {
+            let (slot, blocks) = res.map_err(|e| {
+                EngineError::Io(cogzilla_io::IoError::Fs(std::io::Error::other(format!(
+                    "multi-cog tile fetch task failed: {e}"
+                ))))
+            })??;
+            fetched[slot] = Some(blocks);
+        }
+        let all_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>> =
+            fetched.into_iter().map(|o| o.unwrap()).collect();
+        let all_refs: Vec<Vec<Option<&cogzilla_codec::DecodedBand>>> = all_tiles
+            .iter()
+            .map(|ts| {
+                ts.iter()
                     .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                    .collect();
-                let r1: Vec<_> = t1
-                    .iter()
-                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                    .collect();
-                let apply_unscale = req.unscale && needs_source_unscale(&req.bands, req.format);
-                let cog_so = |slot: usize| -> (f32, f32) {
-                    if apply_unscale {
-                        (
-                            cogs[slot].index.scales.first().copied().unwrap_or(1.0),
-                            cogs[slot].index.offsets.first().copied().unwrap_or(0.0),
-                        )
-                    } else {
-                        (1.0, 0.0)
-                    }
-                };
-                let (s0, o0) = cog_so(0);
-                let (s1, o1) = cog_so(1);
-                let srcs = [
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &r0,
-                    )
-                    .with_scale_offset(s0, o0),
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &r1,
-                    )
-                    .with_scale_offset(s1, o1),
-                ];
-                match &req.bands {
-                    BandRequest::SarRgb {
-                        rescale_min,
-                        rescale_max,
-                        ..
-                    } => {
-                        let style = RgbStyle {
-                            rescale_min: *rescale_min,
-                            rescale_max: *rescale_max,
-                            resample: req.resample,
-                            format: req.format,
-                        };
-                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
-                    }
-                    BandRequest::Spectral2 {
-                        expr,
-                        rescale,
-                        colormap,
-                        ..
-                    } => {
-                        let style = SingleBandStyle {
-                            rescale_min: rescale.0,
-                            rescale_max: rescale.1,
-                            colormap: *colormap,
-                            resample: req.resample,
-                            format: req.format,
-                        };
-                        Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
-                    }
-                    BandRequest::CustomExpr {
-                        prog,
-                        rescale,
-                        colormap,
-                    } => {
-                        let style = SingleBandStyle {
-                            rescale_min: rescale.0,
-                            rescale_max: rescale.1,
-                            colormap: *colormap,
-                            resample: req.resample,
-                            format: req.format,
-                        };
-                        let mut ordered = Vec::with_capacity(prog.used_bands.len());
-                        for &b in &prog.used_bands {
-                            let idx = b.saturating_sub(1) as usize;
-                            let refs = match idx {
-                                0 => &r0,
-                                1 => &r1,
-                                _ => {
-                                    return Err(EngineError::BadRequest(format!(
-                                        "expression references band b{b}, but only 2 assets were provided"
-                                    )));
-                                }
-                            };
-                            let (sc, off) = cog_so(idx);
-                            ordered.push(
-                                BandSource::new(
-                                    ifd.width,
-                                    ifd.height,
-                                    ifd.tile_width,
-                                    ifd.tile_height,
-                                    tx0,
-                                    ty0,
-                                    grid_w,
-                                    grid_h,
-                                    refs,
-                                )
-                                .with_scale_offset(sc, off),
-                            );
-                        }
-                        Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
-                    }
-                    _ => Err(EngineError::BadRequest(
-                        "2-asset scene requires expr=sar_rgb, ndvi, ndwi, nbr, savi, ratio, diff, or custom expression"
-                            .to_string(),
-                    )),
-                }
+                    .collect()
+            })
+            .collect();
+
+        let apply_unscale = req.unscale && needs_source_unscale(&req.bands, req.format);
+        let make_src = |b_1based: u16| -> Result<BandSource<'_>, EngineError> {
+            let idx = b_1based.saturating_sub(1) as usize;
+            if b_1based == 0 || idx >= all_refs.len() {
+                return Err(EngineError::BadRequest(format!(
+                    "band b{b_1based} out of range (only {} assets were provided)",
+                    all_refs.len()
+                )));
             }
-            3 => {
-                // Fetch all 3 COGs concurrently (e.g., Landsat SR_B4 + SR_B3 + SR_B2!)
-                let (t0, t1, t2) = tokio::try_join!(
-                    self.store.get_blocks(&cogs[0], ifd_idx, &indices),
-                    self.store.get_blocks(&cogs[1], ifd_idx, &indices),
-                    self.store.get_blocks(&cogs[2], ifd_idx, &indices),
-                )?;
-                let r0: Vec<_> = t0
-                    .iter()
-                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                    .collect();
-                let r1: Vec<_> = t1
-                    .iter()
-                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                    .collect();
-                let r2: Vec<_> = t2
-                    .iter()
-                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                    .collect();
-                let apply_unscale = req.unscale && needs_source_unscale(&req.bands, req.format);
-                let cog_so = |slot: usize| -> (f32, f32) {
-                    if apply_unscale {
-                        (
-                            cogs[slot].index.scales.first().copied().unwrap_or(1.0),
-                            cogs[slot].index.offsets.first().copied().unwrap_or(0.0),
-                        )
-                    } else {
-                        (1.0, 0.0)
-                    }
+            let (sc, off) = if apply_unscale {
+                (
+                    cogs[idx].index.scales.first().copied().unwrap_or(1.0),
+                    cogs[idx].index.offsets.first().copied().unwrap_or(0.0),
+                )
+            } else {
+                (1.0, 0.0)
+            };
+            Ok(BandSource::new(
+                ifd.width,
+                ifd.height,
+                ifd.tile_width,
+                ifd.tile_height,
+                tx0,
+                ty0,
+                grid_w,
+                grid_h,
+                &all_refs[idx],
+            )
+            .with_scale_offset(sc, off))
+        };
+
+        match &req.bands {
+            BandRequest::Single {
+                band_1based,
+                rescale,
+                colormap,
+            } => {
+                let src = make_src(*band_1based)?;
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
                 };
-                let (s0, o0) = cog_so(0);
-                let (s1, o1) = cog_so(1);
-                let (s2, o2) = cog_so(2);
-                let srcs = [
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &r0,
-                    )
-                    .with_scale_offset(s0, o0),
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &r1,
-                    )
-                    .with_scale_offset(s1, o1),
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &r2,
-                    )
-                    .with_scale_offset(s2, o2),
-                ];
-                match &req.bands {
-                    BandRequest::Spectral3 {
-                        expr,
-                        rescale,
-                        colormap,
-                        ..
-                    } => {
-                        let style = SingleBandStyle {
-                            rescale_min: rescale.0,
-                            rescale_max: rescale.1,
-                            colormap: *colormap,
-                            resample: req.resample,
-                            format: req.format,
-                        };
-                        Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
-                    }
-                    BandRequest::Rgb {
-                        rescale_min,
-                        rescale_max,
-                        ..
-                    } => {
-                        let style = RgbStyle {
-                            rescale_min: *rescale_min,
-                            rescale_max: *rescale_max,
-                            resample: req.resample,
-                            format: req.format,
-                        };
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
-                    }
-                    BandRequest::CustomExpr {
-                        prog,
-                        rescale,
-                        colormap,
-                    } => {
-                        let style = SingleBandStyle {
-                            rescale_min: rescale.0,
-                            rescale_max: rescale.1,
-                            colormap: *colormap,
-                            resample: req.resample,
-                            format: req.format,
-                        };
-                        let mut ordered = Vec::with_capacity(prog.used_bands.len());
-                        for &b in &prog.used_bands {
-                            let idx = b.saturating_sub(1) as usize;
-                            let refs = match idx {
-                                0 => &r0,
-                                1 => &r1,
-                                2 => &r2,
-                                _ => {
-                                    return Err(EngineError::BadRequest(format!(
-                                        "expression references band b{b}, but only 3 assets were provided"
-                                    )));
-                                }
-                            };
-                            let (sc, off) = cog_so(idx);
-                            ordered.push(
-                                BandSource::new(
-                                    ifd.width,
-                                    ifd.height,
-                                    ifd.tile_width,
-                                    ifd.tile_height,
-                                    tx0,
-                                    ty0,
-                                    grid_w,
-                                    grid_h,
-                                    refs,
-                                )
-                                .with_scale_offset(sc, off),
-                            );
-                        }
-                        Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
-                    }
-                    _ => Err(EngineError::BadRequest(
-                        "3-asset scene requires RGB, expr=evi, or custom expression".to_string(),
-                    )),
-                }
+                Ok(render_single_band::<N>(&plan, &src, &style))
             }
-            other => Err(EngineError::BadRequest(format!(
-                "multi-COG compositing supports 1, 2, or 3 assets, got {other}"
-            ))),
+            BandRequest::Terrain {
+                band_1based,
+                encoding,
+            } => {
+                let src = make_src(*band_1based)?;
+                Ok(render_terrain_tile::<N>(
+                    &plan,
+                    &src,
+                    *encoding,
+                    req.resample,
+                    req.format,
+                ))
+            }
+            BandRequest::Dem {
+                band_1based,
+                algorithm,
+                rescale,
+                colormap,
+            } => {
+                let src = make_src(*band_1based)?;
+                let (bx0, by0, bx1, by1) = tile_bounds_3857(req.tile);
+                let (_, lat_deg) = mercator_to_lonlat_deg((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
+                let pixel_size_m =
+                    (((bx1 - bx0) / N as f64) * lat_deg.to_radians().cos().max(0.05)) as f32;
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                Ok(render_dem_algorithm::<N>(
+                    &plan,
+                    &src,
+                    *algorithm,
+                    pixel_size_m,
+                    &style,
+                ))
+            }
+            BandRequest::Spectral1 {
+                expr,
+                band_1based,
+                rescale,
+                colormap,
+            } => {
+                let src = make_src(*band_1based)?;
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
+            }
+            BandRequest::SarRgb {
+                bands_1based,
+                rescale_min,
+                rescale_max,
+            } => {
+                let srcs = [make_src(bands_1based[0])?, make_src(bands_1based[1])?];
+                let style = RgbStyle {
+                    rescale_min: *rescale_min,
+                    rescale_max: *rescale_max,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+            }
+            BandRequest::Spectral2 {
+                expr,
+                bands_1based,
+                rescale,
+                colormap,
+            } => {
+                let srcs = [make_src(bands_1based[0])?, make_src(bands_1based[1])?];
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+            }
+            BandRequest::Spectral3 {
+                expr,
+                bands_1based,
+                rescale,
+                colormap,
+            } => {
+                let srcs = [
+                    make_src(bands_1based[0])?,
+                    make_src(bands_1based[1])?,
+                    make_src(bands_1based[2])?,
+                ];
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+            }
+            BandRequest::Rgb {
+                bands_1based,
+                rescale_min,
+                rescale_max,
+            } => {
+                let srcs = [
+                    make_src(bands_1based[0])?,
+                    make_src(bands_1based[1])?,
+                    make_src(bands_1based[2])?,
+                ];
+                let style = RgbStyle {
+                    rescale_min: *rescale_min,
+                    rescale_max: *rescale_max,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+            }
+            BandRequest::CustomExpr {
+                prog,
+                rescale,
+                colormap,
+            } => {
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap: *colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                let mut ordered = Vec::with_capacity(prog.used_bands.len());
+                for &b in &prog.used_bands {
+                    ordered.push(make_src(b)?);
+                }
+                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
+            }
         }
     }
 

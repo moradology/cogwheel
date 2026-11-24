@@ -1873,13 +1873,14 @@ async fn render_bbox_impl(
 
         // Helper to build BandSource for 1-based band index across single (chunky/planar) or multi-COG
         let get_band_refs = |b_1based: u16,
-                             asset_slot: usize|
+                             _asset_slot: usize|
          -> (Vec<Option<&cogzilla_codec::DecodedBand>>, (f32, f32)) {
+            let slot = (b_1based.saturating_sub(1) as usize).min(num_cogs.saturating_sub(1));
             let so = if !apply_source_unscale {
                 (1.0, 0.0)
             } else if num_cogs > 1 {
                 band_scale_offsets
-                    .get(asset_slot.min(num_cogs - 1))
+                    .get(slot)
                     .copied()
                     .unwrap_or((1.0, 0.0))
             } else {
@@ -1889,7 +1890,6 @@ async fn render_bbox_impl(
                     .unwrap_or((1.0, 0.0))
             };
             let refs = if num_cogs > 1 {
-                let slot = asset_slot.min(num_cogs - 1);
                 cog_tiles[slot]
                     .iter()
                     .map(|o| o.as_ref().and_then(|t| t.bands.first()))
