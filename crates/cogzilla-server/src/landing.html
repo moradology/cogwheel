@@ -114,9 +114,9 @@
   <pre id="tile-url">–</pre>
 
   <p class="links">
-    <a href="/docs">API explorer</a> ·
-    <a href="/stats">/stats</a> ·
-    <a href="/metrics">/metrics</a> ·
+    <a href="{{BASE_PATH}}/docs">API explorer</a> ·
+    <a href="{{BASE_PATH}}/stats">/stats</a> ·
+    <a href="{{BASE_PATH}}/metrics">/metrics</a> ·
     <a href="https://github.com/moradology/cogzilla">GitHub</a>
   </p>
 </aside>
@@ -130,6 +130,7 @@
 </div>
 
 <script>
+const BASE_PATH = {{BASE_PATH_JS}};
 const DEM = 'https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif';
 const S2 = 'https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A';
 const S2_STAC = S2 + '/S2A_13TEE_20240929_0_L2A.json';
@@ -228,7 +229,7 @@ function query(urls, params) {
   return params ? q + '&' + params : q;
 }
 async function tilejson(urls, params, kind) {
-  const prefix = kind === 'stac' ? '/stac' : '/cog';
+  const prefix = BASE_PATH + (kind === 'stac' ? '/stac' : '/cog');
   const r = await fetch(prefix + '/WebMercatorQuad/tilejson.json?' + query(urls, params));
   if (!r.ok) {
     const body = (await r.text()).slice(0, 200);
@@ -319,7 +320,7 @@ map.on('click', async (ev) => {
   hud.textContent = 'Sampling raw source bands…';
   try {
     const samples = await Promise.all(layer.urls.map(async (url) => {
-      const path = isStac ? '/stac/point' : '/cog/point';
+      const path = BASE_PATH + (isStac ? '/stac/point' : '/cog/point');
       const r = await fetch(`${path}/${lon},${lat}?${query([url], pointParams.toString())}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
@@ -352,7 +353,7 @@ const bytes = (n) => {
 };
 async function pollServer() {
   try {
-    const s = await (await fetch('/stats')).json();
+    const s = await (await fetch(BASE_PATH + '/stats')).json();
     const lookups = s.cache_hits + s.cache_misses;
     $('s-served').textContent = s.tiles_served.toLocaleString();
     $('s-hit').textContent = lookups ? Math.round((100 * s.cache_hits) / lookups) + '%' : '–';

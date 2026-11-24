@@ -483,24 +483,38 @@ impl MosaicJsonCatalog {
 
 impl SceneCatalog for MosaicJsonCatalog {
     fn query_bbox_3857(&self, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<String> {
+        if !min_x.is_finite()
+            || !min_y.is_finite()
+            || !max_x.is_finite()
+            || !max_y.is_finite()
+            || min_x >= max_x
+            || min_y >= max_y
+        {
+            return Vec::new();
+        }
         let qz = self.quadkey_zoom;
         let n = (1u64 << qz) as f64;
         let tile_span = WORLD_SPAN / n;
-        // Shrink slightly inward so adjacent-tile shared edges don't pull neighboring quadkeys.
-        let eps = ((max_x - min_x).min(max_y - min_y) * 1e-6).max(1e-6);
+        // Shrink slightly inward so adjacent-tile shared edges don't pull neighboring quadkeys,
+        // while never inverting min/max on very small bboxes.
+        let min_span = (max_x - min_x).min(max_y - min_y);
+        let eps = (min_span * 1e-6).max(1e-6).min(min_span * 0.25);
         let x0 = (((min_x + eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
         let x1 = (((max_x - eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
         // WebMercator Y increases northwards while XYZ tile y increases southwards.
         let y0 = ((ORIGIN_SHIFT - (max_y - eps)) / tile_span).floor() as i64;
         let y1 = ((ORIGIN_SHIFT - (min_y + eps)) / tile_span).floor() as i64;
         let max_idx = (1i64 << qz) - 1;
-        if x1 < 0 || x0 > max_idx || y1 < 0 || y0 > max_idx {
+        if x1 < 0 || x0 > max_idx || y1 < 0 || y0 > max_idx || x0 > x1 || y0 > y1 {
             return Vec::new();
         }
         let cx0 = x0.clamp(0, max_idx) as u32;
         let cx1 = x1.clamp(0, max_idx) as u32;
         let cy0 = y0.clamp(0, max_idx) as u32;
         let cy1 = y1.clamp(0, max_idx) as u32;
+        if cx0 > cx1 || cy0 > cy1 {
+            return Vec::new();
+        }
 
         // Fast path: single quadkey hit (all requests at z >= quadkey_zoom)
         if cx0 == cx1 && cy0 == cy1 {

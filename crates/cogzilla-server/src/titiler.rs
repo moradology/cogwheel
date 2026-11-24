@@ -1864,19 +1864,42 @@ async fn render_bbox_impl(
                 && v01.is_finite()
                 && v11.is_finite();
 
-            // Skip entire cell if all 4 corners are strictly outside the source image bounds,
-            // and fall back to exact per-pixel projection if the cell wraps across the antimeridian.
+            // Skip entire cell if all 4 corners + midpoint are strictly outside the source image
+            // bounds, and fall back to exact per-pixel projection if the cell has high curvature
+            // (> 0.05 px midpoint error) or wraps across the antimeridian / pole in X or Y.
             let mut use_bilinear = all_finite;
             if all_finite {
-                let cu_min = u00.min(u10).min(u01).min(u11) as f32;
-                let cu_max = u00.max(u10).max(u01).max(u11) as f32;
-                let cv_min = v00.min(v10).min(v01).min(v11) as f32;
-                let cv_max = v00.max(v10).max(v01).max(v11) as f32;
-                if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
-                    continue;
-                }
-                if ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f {
+                let x_mid = bbox[0] + (0.5 * (x0 + x1) as f64) * dlx;
+                let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
+                let (msx, msy) = to_src_crs(x_mid, y_mid);
+                let mid_ok = if msx.is_finite() && msy.is_finite() {
+                    let (mcol, mrow) = ifd.crs_to_pixel.forward(msx, msy);
+                    let mu = mcol - 0.5;
+                    let mv = mrow - 0.5;
+                    let u_avg = 0.25 * (u00 + u10 + u01 + u11);
+                    let v_avg = 0.25 * (v00 + v10 + v01 + v11);
+                    mu.is_finite()
+                        && mv.is_finite()
+                        && (mu - u_avg).abs() <= 0.05
+                        && (mv - v_avg).abs() <= 0.05
+                } else {
+                    false
+                };
+                if !mid_ok {
                     use_bilinear = false;
+                } else {
+                    let cu_min = u00.min(u10).min(u01).min(u11) as f32;
+                    let cu_max = u00.max(u10).max(u01).max(u11) as f32;
+                    let cv_min = v00.min(v10).min(v01).min(v11) as f32;
+                    let cv_max = v00.max(v10).max(v01).max(v11) as f32;
+                    if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
+                        continue;
+                    }
+                    if (ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f)
+                        || (ifd.height >= 64 && h > STEP * 2 && (cv_max - cv_min) > 0.5 * ifd_h_f)
+                    {
+                        use_bilinear = false;
+                    }
                 }
             }
 
