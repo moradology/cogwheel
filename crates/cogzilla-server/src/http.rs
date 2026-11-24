@@ -27,10 +27,10 @@ use crate::stac::{
     load_stac_item, resolve_stac_assets,
 };
 use crate::titiler::{
-    PolygonMask, build_cog_info, build_cog_info_geojson, build_cog_validate, build_map_html,
-    build_tilejson, build_wmts_capabilities, compute_statistics, encode_rgba_output,
-    get_algorithm_json, list_algorithms_json, query_point, render_mercator_bbox,
-    render_native_preview, render_wgs84_bbox,
+    PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
+    build_map_html, build_tilejson, build_wmts_capabilities, compute_statistics_with_options,
+    encode_rgba_output, get_algorithm_json, list_algorithms_json, query_point,
+    render_mercator_bbox, render_native_preview, render_wgs84_bbox,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -139,6 +139,11 @@ struct ParsedQuery {
     height: Option<u32>,
     orientation_vertical: bool,
     use_epsg: bool,
+    percentiles: Vec<f64>,
+    histogram_bins: Option<usize>,
+    histogram_range: Option<(f64, f64)>,
+    categorical: bool,
+    categories: Vec<f64>,
     webp_quality: Option<f32>,
     jpeg_quality: u8,
     expr_raw: Option<String>,
@@ -182,6 +187,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         height: None,
         orientation_vertical: false,
         use_epsg: false,
+        percentiles: Vec::new(),
+        histogram_bins: None,
+        histogram_range: None,
+        categorical: false,
+        categories: Vec::new(),
         webp_quality: None,
         jpeg_quality: 85,
         expr_raw: None,
@@ -543,8 +553,50 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "use_epsg" => {
                 pq.use_epsg = v.eq_ignore_ascii_case("true") || v == "1";
             }
-            "dst_crs" | "crs" | "histogram_bins" | "histogram_range" | "categorical" | "c"
-            | "p" | "cover_scale" => {
+            "p" => {
+                let dec = percent_decode(v);
+                for tok in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    match tok.parse::<f64>() {
+                        Ok(p) if p.is_finite() && (0.0..=100.0).contains(&p) => pq.percentiles.push(p),
+                        _ => bad("expected percentile p in 0..=100"),
+                    }
+                }
+            }
+            "histogram_bins" => match v.parse::<usize>() {
+                Ok(n) if (1..=1000).contains(&n) => pq.histogram_bins = Some(n),
+                _ => bad("expected histogram_bins in 1..=1000"),
+            },
+            "histogram_range" => {
+                let dec = percent_decode(v);
+                let parts: Vec<&str> = dec
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(str::trim)
+                    .collect();
+                if parts.len() == 2
+                    && let (Ok(lo), Ok(hi)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+                    && lo.is_finite()
+                    && hi.is_finite()
+                    && lo < hi
+                {
+                    pq.histogram_range = Some((lo, hi));
+                } else {
+                    bad("expected histogram_range=min,max with min < max");
+                }
+            }
+            "categorical" => {
+                pq.categorical = v.eq_ignore_ascii_case("true") || v == "1";
+            }
+            "c" => {
+                let dec = percent_decode(v);
+                for tok in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    match tok.parse::<f64>() {
+                        Ok(c) if c.is_finite() => pq.categories.push(c),
+                        _ => bad("expected numeric category value"),
+                    }
+                }
+            }
+            "dst_crs" | "crs" | "cover_scale" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
@@ -632,12 +684,14 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         }
     }
     if route("statistics") || route("asset_statistics") {
-        if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
+        if let Some(k) = has(&["expression", "expr", "index", "algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on statistics routes"));
         }
+    } else if let Some(k) = has(&["p", "histogram_bins", "histogram_range", "categorical", "c"]) {
+        return Err(format!("parameter '{k}' is only supported on statistics routes"));
     }
     if route("point") {
-        if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
+        if let Some(k) = has(&["algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on point routes"));
         }
     } else if !route("bbox") {
@@ -1141,27 +1195,101 @@ fn build_tile_request(
     ))
 }
 
-fn validate_mosaic_tile_params(pq: &ParsedQuery, tile_size: u32) -> Result<(), EngineError> {
-    if tile_size != 256 && tile_size != 512 {
+fn build_stats_options(pq: &ParsedQuery) -> StatsOptions {
+    let mut opts = StatsOptions::default();
+    if !pq.percentiles.is_empty() {
+        opts.percentiles = pq.percentiles.clone();
+    }
+    if let Some(bins) = pq.histogram_bins {
+        opts.histogram_bins = bins;
+    }
+    opts.histogram_range = pq.histogram_range;
+    opts.categorical = pq.categorical;
+    if !pq.categories.is_empty() {
+        opts.categories = Some(pq.categories.clone());
+    }
+    if !pq.bidx.is_empty() {
+        opts.bidx = Some(pq.bidx.clone());
+    }
+    opts
+}
+
+/// Apply optional `?expression=` or `?bidx=` filtering to a TiTiler `/point` JSON payload.
+fn apply_point_filters(
+    pt: &mut serde_json::Value,
+    expr_raw: Option<&str>,
+    bidx: &[u16],
+) -> Result<(), EngineError> {
+    let Some(vals) = pt.get("values").and_then(|v| v.as_array()).cloned() else {
+        return Ok(());
+    };
+    let names: Vec<serde_json::Value> = pt
+        .get("band_names")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let descs: Vec<serde_json::Value> = pt
+        .get("band_descriptions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_else(|| names.clone());
+
+    if let Some(expr) = expr_raw {
+        let prog = ExprProgram::compile(expr).map_err(EngineError::BadRequest)?;
+        let n_bands = vals.len();
+        let mut slot_vals = Vec::with_capacity(prog.used_bands.len());
+        for &b in &prog.used_bands {
+            if b == 0 || (b as usize) > n_bands {
+                return Err(EngineError::BadRequest(format!(
+                    "expression references b{b} but point query only has {n_bands} bands"
+                )));
+            }
+            let f = vals[(b - 1) as usize]
+                .as_f64()
+                .map(|x| x as f32)
+                .unwrap_or(f32::NAN);
+            slot_vals.push(f);
+        }
+        let res = prog.eval(&slot_vals);
+        let out_val = if res.is_finite() {
+            serde_json::json!(res)
+        } else {
+            serde_json::Value::Null
+        };
+        pt["values"] = serde_json::json!([out_val]);
+        pt["band_names"] = serde_json::json!([expr]);
+        pt["band_descriptions"] = serde_json::json!([expr]);
+        return Ok(());
+    }
+
+    if !bidx.is_empty() {
+        let n_bands = vals.len();
+        let mut f_vals = Vec::with_capacity(bidx.len());
+        let mut f_names = Vec::with_capacity(bidx.len());
+        let mut f_descs = Vec::with_capacity(bidx.len());
+        for &b in bidx {
+            if b == 0 || (b as usize) > n_bands {
+                return Err(EngineError::BadRequest(format!(
+                    "band {b} out of range (dataset has {n_bands} bands)"
+                )));
+            }
+            let idx = (b - 1) as usize;
+            f_vals.push(vals[idx].clone());
+            f_names.push(names.get(idx).cloned().unwrap_or_else(|| serde_json::json!(format!("b{b}"))));
+            f_descs.push(descs.get(idx).cloned().unwrap_or_else(|| serde_json::json!(format!("b{b}"))));
+        }
+        pt["values"] = serde_json::Value::Array(f_vals);
+        pt["band_names"] = serde_json::Value::Array(f_names);
+        pt["band_descriptions"] = serde_json::Value::Array(f_descs);
+    }
+    Ok(())
+}
+
+fn validate_mosaic_tile_params(_pq: &ParsedQuery, tile_size: u32) -> Result<(), EngineError> {
+    if !(64..=2048).contains(&tile_size) {
         return Err(EngineError::BadRequest(format!(
-            "mosaic tile routes only support tile_size 256 or 512 (got {tile_size})"
+            "mosaic tile_size must be in 64..=2048 (got {tile_size})"
         )));
-    }
-    if pq.nodata.is_some() {
-        return Err(EngineError::BadRequest(
-            "query parameter 'nodata' is not supported on mosaic tile routes".into(),
-        ));
-    }
-    if pq.custom_colormap_json.is_some() {
-        return Err(EngineError::BadRequest(
-            "inline JSON 'colormap' is not supported on mosaic tile routes (use 'colormap_name')"
-                .into(),
-        ));
-    }
-    if pq.buffer > 0 {
-        return Err(EngineError::BadRequest(
-            "query parameter 'buffer' is not supported on mosaic tile routes".into(),
-        ));
     }
     Ok(())
 }
@@ -1172,6 +1300,86 @@ async fn render_mosaic_tile_styled(
     mut treq: TileRequest,
     pq: &ParsedQuery,
 ) -> Result<Bytes, EngineError> {
+    let needs_bbox_mosaic = pq.nodata.is_some()
+        || pq.custom_colormap_json.is_some()
+        || pq.buffer > 0
+        || (treq.tile_size != 256 && treq.tile_size != 512);
+
+    if needs_bbox_mosaic && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+        let custom_lut = pq
+            .custom_colormap_json
+            .as_deref()
+            .map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty()))
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let cf = pq
+            .color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let out_dim = treq.tile_size + 2 * pq.buffer;
+        let bbox_3857 = web_mercator_buffered_3857_bbox(
+            treq.tile.z,
+            treq.tile.x,
+            treq.tile.y,
+            pq.buffer,
+            treq.tile_size,
+        );
+        let n_px = (out_dim as usize) * (out_dim as usize);
+        let mut comp = vec![0u8; n_px * 4];
+        let mut filled = 0usize;
+
+        for url in urls {
+            let cog = engine.store.open_uri(url).await?;
+            let cogs = vec![cog];
+            let mut scene_bands = treq.bands.clone();
+            if pq.unscale {
+                apply_unscale_cogs(&mut scene_bands, &cogs);
+            }
+            let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), false);
+            let scene_rgba = render_mercator_bbox(
+                engine,
+                &cogs,
+                bbox_3857,
+                out_dim,
+                out_dim,
+                &scene_bands,
+                resample,
+                OutputFormat::RawRgba,
+                pq.nodata,
+                custom_lut.as_ref(),
+                None,
+                true,
+                pq.unscale,
+            )
+            .await?;
+            if scene_rgba.len() != n_px * 4 {
+                continue;
+            }
+            for i in 0..n_px {
+                let o = i * 4;
+                if comp[o + 3] == 0 && scene_rgba[o + 3] > 0 {
+                    comp[o..o + 4].copy_from_slice(&scene_rgba[o..o + 4]);
+                    filled += 1;
+                }
+            }
+            if filled >= n_px {
+                break;
+            }
+        }
+        if let Some(cf) = cf {
+            cf.apply_buffer_in_place(&mut comp, 4);
+        }
+        return Ok(encode_rgba_output(
+            out_dim as usize,
+            out_dim as usize,
+            &comp,
+            treq.format,
+            pq.return_mask,
+        ));
+    }
+
     if (pq.color_formula.is_some() || !pq.return_mask)
         && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
     {
@@ -2365,15 +2573,19 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = names.len();
+                let stats_opts = build_stats_options(&pq);
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
+                    let opts_c = stats_opts.clone();
                     set.spawn(async move {
-                        let st =
-                            compute_statistics(&eng, &cog, max_size, None, unscale, nodata).await?;
+                        let st = compute_statistics_with_options(
+                            &eng, &cog, max_size, None, unscale, nodata, &opts_c,
+                        )
+                        .await?;
                         Ok::<_, EngineError>((idx, st))
                     });
                 }
@@ -2398,16 +2610,20 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = cogs.len();
+                let stats_opts = build_stats_options(&pq);
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
+                    let opts_c = stats_opts.clone();
                     set.spawn(async move {
                         let nb = cog.index.full_res().samples_per_pixel as usize;
-                        let st =
-                            compute_statistics(&eng, &cog, max_size, None, unscale, nodata).await?;
+                        let st = compute_statistics_with_options(
+                            &eng, &cog, max_size, None, unscale, nodata, &opts_c,
+                        )
+                        .await?;
                         Ok::<_, EngineError>((idx, nb, st))
                     });
                 }
@@ -2455,21 +2671,24 @@ where
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
+                    let stats_opts = build_stats_options(&pq);
                     let n = names_c.len();
                     async move {
                         let mut set = tokio::task::JoinSet::new();
                         for (idx, cog) in cogs_c.into_iter().enumerate() {
                             let eng_c = eng.clone();
                             let mask_c = mask.clone();
+                            let opts_c = stats_opts.clone();
                             let nb = cog.index.full_res().samples_per_pixel as usize;
                             set.spawn(async move {
-                                let st = compute_statistics(
+                                let st = compute_statistics_with_options(
                                     &eng_c,
                                     &cog,
                                     max_size,
                                     Some(&mask_c),
                                     unscale,
                                     nodata,
+                                    &opts_c,
                                 )
                                 .await?;
                                 Ok::<_, EngineError>((idx, nb, st))
@@ -2811,8 +3030,8 @@ where
             (Method::GET, ["point", coord]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (names, cogs, _) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                let (names, cogs, rewritten_expr) =
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let Some((lons, lats)) = coord.split_once(',') else {
                     return Err(EngineError::BadRequest("expected /stac/point/{lon},{lat}".into()));
                 };
@@ -2850,14 +3069,14 @@ where
                         }
                     }
                 }
-                let body = serde_json::json!({
+                let mut pt_json = serde_json::json!({
                     "coordinates": [x, y],
                     "values": all_vals,
                     "band_names": all_names,
                     "band_descriptions": all_names,
-                })
-                .to_string();
-                Ok((Bytes::from(body), "application/json"))
+                });
+                apply_point_filters(&mut pt_json, rewritten_expr.as_deref(), &pq.bidx)?;
+                Ok((Bytes::from(pt_json.to_string()), "application/json"))
             }
             .await,
 
@@ -3194,13 +3413,15 @@ where
             // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
             (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = compute_statistics(
+                let stats_opts = build_stats_options(&pq);
+                let json = compute_statistics_with_options(
                     &engine,
                     &cogs[0],
                     pq.max_size,
                     None,
                     pq.unscale,
                     pq.nodata,
+                    &stats_opts,
                 )
                 .await?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
@@ -3209,14 +3430,16 @@ where
             (Method::POST, ["statistics"]) => async {
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let stats_opts = build_stats_options(&pq);
                 if body_bytes.is_empty() {
-                    let json = compute_statistics(
+                    let json = compute_statistics_with_options(
                         &engine,
                         &cogs[0],
                         pq.max_size,
                         None,
                         pq.unscale,
                         pq.nodata,
+                        &stats_opts,
                     )
                     .await?;
                     Ok((Bytes::from(json.to_string()), "application/json"))
@@ -3240,13 +3463,14 @@ where
                         }
                         for feat in features.iter_mut() {
                             let (mask, _) = PolygonMask::from_geojson(feat)?;
-                            let stats = compute_statistics(
+                            let stats = compute_statistics_with_options(
                                 &engine,
                                 &cogs[0],
                                 pq.max_size,
                                 Some(&mask),
                                 pq.unscale,
                                 pq.nodata,
+                                &stats_opts,
                             )
                             .await?;
                             if let Some(props) =
@@ -3263,13 +3487,14 @@ where
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                     } else {
                         let (mask, _) = PolygonMask::from_geojson(&geojson)?;
-                        let stats = compute_statistics(
+                        let stats = compute_statistics_with_options(
                             &engine,
                             &cogs[0],
                             pq.max_size,
                             Some(&mask),
                             pq.unscale,
                             pq.nodata,
+                            &stats_opts,
                         )
                         .await?;
                         if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
@@ -3548,6 +3773,7 @@ where
                 if pq.coord_crs_3857 {
                     json["coordinates"] = serde_json::json!([x, y]);
                 }
+                apply_point_filters(&mut json, pq.expr_raw.as_deref(), &pq.bidx)?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,

@@ -29,8 +29,8 @@
 - `resampling` and `reproject` accept `nearest`, `bilinear` and `cubic`. `lanczos` and `cubic_spline` are served as cubic. The other GDAL methods (`average`, `mode`, `gauss`, `rms`, `max`, `min`, `med`, `q1`, `q3`, `sum`) are rejected.
 - `algorithm` accepts `hillshade`, `slope`, `aspect`, `terrarium` and `terrainrgb`. TiTiler's `contours`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale` and `bitonal` are rejected. `aspect` is a `cogzilla` addition.
 - Tile matrix sets are `WebMercatorQuad` and `WorldCRS84Quad`; TiTiler's other eleven are rejected.
-- Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, `histogram_bins`, `histogram_range`, `categorical`, `c`, `p`, and `cover_scale`.
-- Statistics always report the 2nd and 98th percentiles and a 10-bin histogram over every band; `expression`, `algorithm` and `bidx` are rejected there and on point queries. `POST /statistics` supports a single Feature, geometry, or `FeatureCollection` (up to 64 features).
+- Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, and `cover_scale`.
+- Statistics support `bidx`/`indexes`, custom percentiles (`p`), `histogram_bins`, `histogram_range`, `categorical`, and `c`; `expression` and `algorithm` are rejected on statistics routes. Point queries support `bidx`/`indexes` and `expression`. `POST /statistics` and `POST /feature` both support a single Feature, geometry, or `FeatureCollection` (up to 64 features).
 - `coord_crs` accepts `EPSG:4326` and `EPSG:3857`, on point queries and `/bbox`. `max_size` is supported on format-only `/bbox` routes (and rejected when explicit `{w}x{h}` dimensions are given).
 - `tilesize` accepts 64 to 2048.
 - Output formats are `png`, `jpg`, `webp`, `npy` and raw `f32`. GeoTIFF, JPEG 2000 and `pngraw` are not available.
