@@ -20,13 +20,13 @@ impl ColormapLut {
         Self { rgba_u32, rgb }
     }
 
-    /// Parse TiTiler custom JSON colormap `{"0":[r,g,b,a], "128":[r,g,b,a], ...}` (discrete or interpolated).
+    /// Parse TiTiler custom JSON colormap `{"0":[r,g,b,a], "128":"#rrggbb", ...}`.
     pub fn from_json_str(json_str: &str) -> Result<Self, String> {
         let val: serde_json::Value =
             serde_json::from_str(json_str).map_err(|e| format!("invalid colormap JSON: {e}"))?;
         let obj = val
             .as_object()
-            .ok_or_else(|| "colormap JSON must be an object mapping index -> [r,g,b(,a)]".to_string())?;
+            .ok_or_else(|| "colormap JSON must be an object mapping index -> [r,g,b(,a)] or #rrggbb(aa)".to_string())?;
         let mut rgba_u32 = [0u32; 256];
         let mut rgb = [[0u8; 3]; 256];
         for (k, v) in obj {
@@ -44,6 +44,23 @@ impl ColormapLut {
                     let a = arr.get(3).and_then(|x| x.as_u64()).unwrap_or(255).min(255) as u8;
                     rgb[idx] = [r, g, b];
                     rgba_u32[idx] = u32::from_le_bytes([r, g, b, a]);
+                }
+            } else if let Some(s) = v.as_str() {
+                let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
+                if (hex.len() == 6 || hex.len() == 8) && hex.is_ascii() {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&hex[0..2], 16),
+                        u8::from_str_radix(&hex[2..4], 16),
+                        u8::from_str_radix(&hex[4..6], 16),
+                    ) {
+                        let a = if hex.len() == 8 {
+                            u8::from_str_radix(&hex[6..8], 16).unwrap_or(255)
+                        } else {
+                            255
+                        };
+                        rgb[idx] = [r, g, b];
+                        rgba_u32[idx] = u32::from_le_bytes([r, g, b, a]);
+                    }
                 }
             }
         }
