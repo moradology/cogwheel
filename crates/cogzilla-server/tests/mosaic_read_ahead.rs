@@ -172,7 +172,7 @@ async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     // A tile the first scene fills: read alone, it is the only scene asked for.
     let full = engine.render_mosaic_scenes(&scenes("first"), &inside).await.unwrap();
     let (_, paths) = seen.take();
-    assert_eq!(paths.into_iter().collect::<Vec<_>>(), [format!("/first0.tif")]);
+    assert_eq!(paths.into_iter().collect::<Vec<_>>(), ["/first0.tif".to_string()]);
     // Read together, later scenes may be asked for, and the tile is the same.
     let eager = engine.render_mosaic_scenes_ahead(&scenes("eager"), &inside, MOSAIC_SCENES_AHEAD).await.unwrap();
     assert_eq!(full, eager);
