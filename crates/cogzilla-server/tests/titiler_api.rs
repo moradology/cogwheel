@@ -92,6 +92,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("point expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2")),
         ("point bidx", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&bidx=2")),
         ("mosaic tile buffer+nodata", format!("{base}/mosaic/tiles/WebMercatorQuad/10/163/395.png?url={sat_url}&rescale=0,1&buffer=4&nodata=0")),
+        ("algorithm grayscale", format!("{tile}&algorithm=grayscale")),
+        ("algorithm normalizedIndex", format!("{tile}&algorithm=normalizedIndex&bidx=1,2")),
+        ("algorithm median", format!("{tile}&algorithm=median")),
+        ("algorithm bitonal", format!("{tile}&algorithm=bitonal&algorithm_params=%7B%22threshold%22:0.5%7D")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");

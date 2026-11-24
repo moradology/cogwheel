@@ -19,7 +19,7 @@
 
 **`/algorithms`**, **`/colorMaps`**, and **`/tileMatrixSets`**
 
-- `GET /algorithms`, `GET /algorithms/{algorithmId}`: TiTiler `AlgorithmFactory` metadata for `hillshade`, `slope`, `aspect`, `terrarium`, and `terrainrgb`.
+- `GET /algorithms`, `GET /algorithms/{algorithmId}`: TiTiler `AlgorithmFactory` metadata for all 18 supported algorithms (`hillshade`, `slope`, `aspect`, `terrarium`, `terrainrgb`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale`, `bitonal`).
 - `GET /colorMaps`, `GET /colorMaps/{colorMapId}`: the lookup tables match `rio-tiler`'s exactly, and `?f=png` returns a 256×20 colorbar.
 - `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}`: `WebMercatorQuad` (25 levels) and `WorldCRS84Quad` as OGC TileMatrixSet 2.0 JSON.
 
@@ -27,7 +27,7 @@
 
 - **Unsupported options return `400`, never a silently different picture.** TiTiler answers an invalid value with `422`; `cogzilla` answers `400` with a plain-text reason, both for invalid values and for the TiTiler options listed below that it does not implement. Query parameters that neither server defines (cache-busters, tokens) are ignored, as in TiTiler.
 - `resampling` and `reproject` accept `nearest`, `bilinear` and `cubic`. `lanczos` and `cubic_spline` are served as cubic. The other GDAL methods (`average`, `mode`, `gauss`, `rms`, `max`, `min`, `med`, `q1`, `q3`, `sum`) are rejected.
-- `algorithm` accepts `hillshade`, `slope`, `aspect`, `terrarium` and `terrainrgb`. TiTiler's `contours`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale` and `bitonal` are rejected. `aspect` is a `cogzilla` addition.
+- `algorithm` accepts `hillshade`, `slope`, `aspect`, `terrarium`, `terrainrgb`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale` and `bitonal`. Only TiTiler's `contours` is rejected. `aspect` is a `cogzilla` addition.
 - Tile matrix sets are `WebMercatorQuad` and `WorldCRS84Quad`; TiTiler's other eleven are rejected.
 - Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, and `cover_scale`.
 - Statistics support `bidx`/`indexes`, custom percentiles (`p`), `histogram_bins`, `histogram_range`, `categorical`, and `c`; `expression` and `algorithm` are rejected on statistics routes. Point queries support `bidx`/`indexes` and `expression`. `POST /statistics` and `POST /feature` both support a single Feature, geometry, or `FeatureCollection` (up to 64 features).

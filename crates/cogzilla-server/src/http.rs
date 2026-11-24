@@ -162,6 +162,7 @@ struct ParsedQuery {
     azimuth: f32,
     altitude: f32,
     z_factor: f32,
+    threshold: f32,
     colormap_explicit: bool,
     colormap_name_set: bool,
     /// Parameter names present in the query, for per-route validation.
@@ -210,6 +211,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         azimuth: 315.0,
         altitude: 45.0,
         z_factor: 1.0,
+        threshold: 128.0,
         colormap_explicit: false,
         colormap_name_set: false,
         keys: Vec::new(),
@@ -307,6 +309,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             match val.as_f64().map(|z| z as f32) {
                                 Some(z) if z.is_finite() => pq.z_factor = z.max(1e-4),
                                 _ => bad("z_factor must be a finite number"),
+                            }
+                        }
+                        if let Some(val) = obj.get("threshold") {
+                            match val.as_f64().map(|t| t as f32) {
+                                Some(t) if t.is_finite() => pq.threshold = t,
+                                _ => bad("threshold must be a finite number"),
                             }
                         }
                     }
@@ -610,8 +618,28 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     pq
 }
 
-const SUPPORTED_ALGORITHMS: &[&str] =
-    &["hillshade", "slope", "aspect", "terrarium", "terrainrgb", "terrain-rgb", "mapbox"];
+const SUPPORTED_ALGORITHMS: &[&str] = &[
+    "hillshade",
+    "slope",
+    "aspect",
+    "terrarium",
+    "terrainrgb",
+    "terrain-rgb",
+    "mapbox",
+    "normalizedindex",
+    "cast",
+    "ceil",
+    "floor",
+    "min",
+    "max",
+    "median",
+    "mean",
+    "std",
+    "var",
+    "sum",
+    "grayscale",
+    "bitonal",
+];
 const SUPPORTED_TMS: &[&str] = &["WebMercatorQuad", "WorldCRS84Quad"];
 
 /// Reject requests that ask for something this server would otherwise ignore.
@@ -983,6 +1011,144 @@ fn build_band_request(
                 return Ok(BandRequest::Dem {
                     band_1based,
                     algorithm: DemAlgorithm::Aspect,
+                    rescale,
+                    colormap: pq.colormap,
+                });
+            }
+            "normalizedindex" | "cast" | "ceil" | "floor" | "min" | "max" | "median" | "mean"
+            | "std" | "var" | "sum" | "grayscale" | "bitonal" => {
+                let bands: Vec<u16> = if !pq.bidx.is_empty() {
+                    pq.bidx.clone()
+                } else {
+                    (1..=default_bands.clamp(1, 16)).collect()
+                };
+                let (expr_str, default_rescale) = match alg {
+                    "normalizedindex" => {
+                        if bands.len() < 2 {
+                            return Err(EngineError::BadRequest(
+                                "algorithm 'normalizedIndex' requires at least 2 bands".into(),
+                            ));
+                        }
+                        (
+                            format!(
+                                "(b{} - b{}) / (b{} + b{})",
+                                bands[0], bands[1], bands[0], bands[1]
+                            ),
+                            (-1.0, 1.0),
+                        )
+                    }
+                    "cast" => (
+                        format!("b{}", bands[0]),
+                        default_rescale_for_dtype(sample_type, true),
+                    ),
+                    "ceil" => (
+                        format!("ceil(b{})", bands[0]),
+                        default_rescale_for_dtype(sample_type, true),
+                    ),
+                    "floor" => (
+                        format!("floor(b{})", bands[0]),
+                        default_rescale_for_dtype(sample_type, true),
+                    ),
+                    "min" => {
+                        let mut acc = format!("b{}", bands[0]);
+                        for &b in &bands[1..] {
+                            acc = format!("min({acc}, b{b})");
+                        }
+                        (acc, default_rescale_for_dtype(sample_type, true))
+                    }
+                    "max" => {
+                        let mut acc = format!("b{}", bands[0]);
+                        for &b in &bands[1..] {
+                            acc = format!("max({acc}, b{b})");
+                        }
+                        (acc, default_rescale_for_dtype(sample_type, true))
+                    }
+                    "sum" => {
+                        let sum_s = bands
+                            .iter()
+                            .map(|b| format!("b{b}"))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        let (lo, hi) = default_rescale_for_dtype(sample_type, true);
+                        (sum_s, (lo, hi * bands.len() as f32))
+                    }
+                    "mean" => {
+                        let sum_s = bands
+                            .iter()
+                            .map(|b| format!("b{b}"))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        (
+                            format!("({sum_s}) / {}", bands.len()),
+                            default_rescale_for_dtype(sample_type, true),
+                        )
+                    }
+                    "var" | "std" => {
+                        let expr = if bands.len() <= 1 {
+                            "0".to_string()
+                        } else {
+                            let n = bands.len();
+                            let mean_s = format!(
+                                "({}) / {n}",
+                                bands
+                                    .iter()
+                                    .map(|b| format!("b{b}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" + ")
+                            );
+                            let sq_s = bands
+                                .iter()
+                                .map(|b| format!("(b{b} - ({mean_s}))^2"))
+                                .collect::<Vec<_>>()
+                                .join(" + ");
+                            if alg == "std" {
+                                format!("sqrt(({sq_s}) / {n})")
+                            } else {
+                                format!("({sq_s}) / {n}")
+                            }
+                        };
+                        (expr, default_rescale_for_dtype(sample_type, true))
+                    }
+                    "median" => {
+                        let expr = match bands.len() {
+                            1 => format!("b{}", bands[0]),
+                            2 => format!("(b{} + b{}) / 2", bands[0], bands[1]),
+                            3 => format!(
+                                "b{0} + b{1} + b{2} - min(b{0}, min(b{1}, b{2})) - max(b{0}, max(b{1}, b{2}))",
+                                bands[0], bands[1], bands[2]
+                            ),
+                            _ => {
+                                let sum_s = bands
+                                    .iter()
+                                    .map(|b| format!("b{b}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" + ");
+                                format!("({sum_s}) / {}", bands.len())
+                            }
+                        };
+                        (expr, default_rescale_for_dtype(sample_type, true))
+                    }
+                    "grayscale" => {
+                        let expr = if bands.len() >= 3 {
+                            format!(
+                                "0.299 * b{} + 0.587 * b{} + 0.114 * b{}",
+                                bands[0], bands[1], bands[2]
+                            )
+                        } else {
+                            format!("b{}", bands[0])
+                        };
+                        (expr, default_rescale_for_dtype(sample_type, true))
+                    }
+                    "bitonal" => (
+                        format!("where(b{} >= {}, 1, 0)", bands[0], pq.threshold),
+                        (0.0, 1.0),
+                    ),
+                    _ => unreachable!(),
+                };
+                let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
+                let rescale = pq.rescale.first().copied().unwrap_or(default_rescale);
+                return Ok(BandRequest::CustomExpr {
+                    prog,
                     rescale,
                     colormap: pq.colormap,
                 });
@@ -4372,7 +4538,7 @@ mod tests {
         // AlgorithmFactory JSON responses (/algorithms and /algorithms/{id})
         let algs = list_algorithms_json("http://localhost:8080");
         let list = algs["algorithms"].as_array().unwrap();
-        assert_eq!(list.len(), 5);
+        assert_eq!(list.len(), 18);
         assert_eq!(list[0]["id"], "hillshade");
         assert_eq!(
             list[0]["links"][0]["href"],
@@ -4382,6 +4548,9 @@ mod tests {
         assert_eq!(hs["title"], "Hillshade");
         assert_eq!(hs["inputs"]["nbands"], 1);
         assert_eq!(hs["outputs"]["dtype"], "uint8");
+        assert_eq!(get_algorithm_json("normalizedIndex").unwrap()["title"], "Normalized Index");
+        assert_eq!(get_algorithm_json("grayscale").unwrap()["title"], "Grayscale");
+        assert_eq!(get_algorithm_json("bitonal").unwrap()["title"], "Bitonal");
         assert!(matches!(
             get_algorithm_json("nonexistent"),
             Err(EngineError::NotFound(_))
