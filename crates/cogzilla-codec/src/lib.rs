@@ -103,6 +103,21 @@ pub fn decode_tile_rows(
             got: compressed.len(),
         })?;
 
+    // Never apply GDAL_NODATA to an ExtraSamples alpha channel (e.g. GDAL_NODATA=255 on RGBA
+    // would turn opaque alpha=255 into NaN and blank every pixel). For U8/U16, raw samples stay
+    // intact so apply_rgba_alpha_if_present simply clears nodata on the alpha band; for
+    // F32-backed dtypes we defer nodata masking to the non-alpha color bands only.
+    let chunky_alpha_idx = if ifd.planar_config == PlanarConfig::Chunky {
+        alpha_channel_index(bands_in_tile, &ifd.extra_samples)
+    } else {
+        None
+    };
+    let defer_color_nodata = chunky_alpha_idx.is_some()
+        && nodata.is_some()
+        && !matches!(ifd.sample_type, SampleType::Uint8 | SampleType::Uint16);
+    let recon_nodata = if defer_color_nodata { None } else { nodata };
+    let deferred_nodata = if defer_color_nodata { nodata } else { None };
+
     // Fast path: Uncompressed + Predictor::None avoids touching thread-local scratch completely!
     if ifd.compression == Compression::None
         && ifd.predictor == Predictor::None
@@ -115,7 +130,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 byte_order,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Uint16 => predictor::reconstruct_u16(
                 &compressed[..expected_bytes],
@@ -124,7 +139,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 false,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Int16 => predictor::reconstruct_i16(
                 &compressed[..expected_bytes],
@@ -133,7 +148,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 false,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Uint8 => predictor::reconstruct_u8(
                 &compressed[..expected_bytes],
@@ -141,7 +156,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 false,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Int8 => predictor::reconstruct_i8(
                 &compressed[..expected_bytes],
@@ -149,7 +164,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 false,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Uint32 => predictor::reconstruct_int32(
                 &compressed[..expected_bytes],
@@ -159,7 +174,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 false,
                 false,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Int32 => predictor::reconstruct_int32(
                 &compressed[..expected_bytes],
@@ -169,7 +184,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 true,
                 false,
-                nodata,
+                recon_nodata,
             ),
             SampleType::Float64 => predictor::reconstruct_f64_uncompressed(
                 &compressed[..expected_bytes],
@@ -177,10 +192,10 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 byte_order,
-                nodata,
+                recon_nodata,
             ),
         };
-        apply_rgba_alpha_if_present(&mut bands, ifd);
+        apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
         return Ok(DecodedTile { bands });
     }
 
@@ -430,7 +445,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 byte_order,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Float32, Predictor::HorizontalInt) => predictor::reconstruct_predictor2(
                 raw_slice,
@@ -438,14 +453,14 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 byte_order,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Float32, Predictor::FloatingPoint) => predictor::reconstruct_predictor3(
                 raw_slice,
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Uint16, Predictor::None) => predictor::reconstruct_u16(
                 raw_slice,
@@ -454,7 +469,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 false,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Uint16, Predictor::HorizontalInt) => predictor::reconstruct_u16(
                 raw_slice,
@@ -463,7 +478,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 true,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Uint16, Predictor::FloatingPoint) => predictor::reconstruct_u16(
                 raw_slice,
@@ -472,7 +487,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 false,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Int16, p) => predictor::reconstruct_i16(
                 raw_slice,
@@ -481,7 +496,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 p == Predictor::HorizontalInt,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Uint8, p) => predictor::reconstruct_u8(
                 raw_slice,
@@ -489,7 +504,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 p == Predictor::HorizontalInt,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Int8, p) => predictor::reconstruct_i8(
                 raw_slice,
@@ -497,7 +512,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 p == Predictor::HorizontalInt,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Uint32, p) => predictor::reconstruct_int32(
                 raw_slice,
@@ -507,7 +522,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 false,
                 p == Predictor::HorizontalInt,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Int32, p) => predictor::reconstruct_int32(
                 raw_slice,
@@ -517,7 +532,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 true,
                 p == Predictor::HorizontalInt,
-                nodata,
+                recon_nodata,
             ),
             (SampleType::Float64, p) => predictor::reconstruct_f64(
                 raw_slice,
@@ -526,11 +541,11 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 byte_order,
                 p,
-                nodata,
+                recon_nodata,
             ),
         };
 
-        apply_rgba_alpha_if_present(&mut bands, ifd);
+        apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
         Ok(DecodedTile { bands })
     })
 }
@@ -551,13 +566,87 @@ pub fn alpha_channel_index(samples_per_pixel: usize, extra_samples: &[u16]) -> O
 /// e.g. 2-band Gray+Alpha or 4-band RGBA), mask transparent pixels (`alpha == 0`) to `f32::NAN`
 /// in the color bands and recompute their `BlockStats` so every downstream kernel renders alpha
 /// identically to TiTiler.
-fn apply_rgba_alpha_if_present(bands: &mut [DecodedBand], ifd: &IfdMeta) {
+fn apply_rgba_alpha_if_present(
+    bands: &mut [DecodedBand],
+    ifd: &IfdMeta,
+    deferred_color_nodata: Option<f32>,
+) {
     if ifd.planar_config != PlanarConfig::Chunky {
         return;
     }
     let Some(alpha_idx) = alpha_channel_index(bands.len(), &ifd.extra_samples) else {
         return;
     };
+    // Clear any GDAL_NODATA metadata accidentally attached to a U8/U16 alpha band so e.g.
+    // GDAL_NODATA=255 does not treat opaque alpha=255 as NaN.
+    match &mut bands[alpha_idx].data {
+        BandData::U8 { data, nodata } if nodata.is_some() => {
+            *nodata = None;
+            let mut mn = u8::MAX;
+            let mut mx = u8::MIN;
+            for &v in data.iter() {
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            bands[alpha_idx].stats = BlockStats {
+                all_nodata: data.is_empty(),
+                no_nodata: true,
+                min: if data.is_empty() { f32::NAN } else { mn as f32 },
+                max: if data.is_empty() { f32::NAN } else { mx as f32 },
+            };
+        }
+        BandData::U16 { data, nodata } if nodata.is_some() => {
+            *nodata = None;
+            let mut mn = u16::MAX;
+            let mut mx = u16::MIN;
+            for &v in data.iter() {
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            bands[alpha_idx].stats = BlockStats {
+                all_nodata: data.is_empty(),
+                no_nodata: true,
+                min: if data.is_empty() { f32::NAN } else { mn as f32 },
+                max: if data.is_empty() { f32::NAN } else { mx as f32 },
+            };
+        }
+        _ => {}
+    }
+
+    // Apply deferred GDAL_NODATA to non-alpha F32-backed color bands only.
+    if let Some(nd_f32) = deferred_color_nodata {
+        for (idx, b) in bands.iter_mut().enumerate() {
+            if idx == alpha_idx {
+                continue;
+            }
+            let slice = b.data.make_f32_mut();
+            let mut all_nd = true;
+            let mut no_nd = true;
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for v in slice.iter_mut() {
+                if v.is_nan() || (!nd_f32.is_nan() && *v == nd_f32) {
+                    *v = f32::NAN;
+                    no_nd = false;
+                } else {
+                    all_nd = false;
+                    if *v < mn {
+                        mn = *v;
+                    }
+                    if *v > mx {
+                        mx = *v;
+                    }
+                }
+            }
+            b.stats = BlockStats {
+                all_nodata: all_nd,
+                no_nodata: no_nd,
+                min: if all_nd { f32::NAN } else { mn },
+                max: if all_nd { f32::NAN } else { mx },
+            };
+        }
+    }
+
     // O(1) fast-path: if the alpha band has no nodata and min > 0, every pixel is opaque!
     let alpha_stats = bands[alpha_idx].stats;
     if alpha_stats.no_nodata && alpha_stats.min > 0.0 {
@@ -1000,5 +1089,66 @@ mod tests {
         assert!(tile.bands[0].stats.all_nodata);
         assert!(tile.bands[0].stats.min.is_nan());
         assert!(tile.bands[0].stats.max.is_nan());
+    }
+
+    #[test]
+    fn chunky_rgba_and_gray_alpha_ignore_gdal_nodata_on_alpha_channel() {
+        let mut ifd_u8 = IfdMeta {
+            width: 2,
+            height: 1,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            samples_per_pixel: 4,
+            sample_type: SampleType::Uint8,
+            planar_config: PlanarConfig::Chunky,
+            compression: Compression::None,
+            predictor: Predictor::None,
+            photometric: 2,
+            extra_samples: vec![2],
+            jpeg_tables: None,
+            mask_ifd: None,
+            is_stripped: false,
+            pixel_to_crs: cogzilla_tiff::Affine2D {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 0.0,
+                e: 1.0,
+                f: 0.0,
+            },
+            crs_to_pixel: cogzilla_tiff::Affine2D {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 0.0,
+                e: 1.0,
+                f: 0.0,
+            },
+            tile_offsets: Box::new([0]),
+            tile_byte_counts: Box::new([8]),
+        };
+        // Pixel 0: opaque (R=10, G=20, B=30, A=255), Pixel 1: transparent (R=40, G=50, B=60, A=0)
+        // With GDAL_NODATA = 255, opaque alpha=255 MUST NOT become NaN and blank pixel 0!
+        let raw_u8 = [10u8, 20, 30, 255, 40, 50, 60, 0];
+        let tile_u8 = decode_tile(&raw_u8, &ifd_u8, ByteOrder::Little, Some(255.0)).unwrap();
+        assert_eq!(tile_u8.bands[0].data.get_f32(0), 10.0);
+        assert_eq!(tile_u8.bands[1].data.get_f32(0), 20.0);
+        assert_eq!(tile_u8.bands[2].data.get_f32(0), 30.0);
+        assert!(tile_u8.bands[0].data.get_f32(1).is_nan());
+
+        // Float32 Gray+Alpha with GDAL_NODATA = 1.0: opaque alpha=1.0 must stay opaque,
+        // while color value 1.0 is masked to NaN.
+        ifd_u8.samples_per_pixel = 2;
+        ifd_u8.sample_type = SampleType::Float32;
+        ifd_u8.photometric = 1;
+        let mut raw_f32 = Vec::new();
+        for v in [42.0f32, 1.0f32, 1.0f32, 1.0f32] {
+            raw_f32.extend_from_slice(&v.to_le_bytes());
+        }
+        let tile_f32 = decode_tile(&raw_f32, &ifd_u8, ByteOrder::Little, Some(1.0)).unwrap();
+        assert_eq!(tile_f32.bands[0].data.get_f32(0), 42.0);
+        assert!(tile_f32.bands[0].data.get_f32(1).is_nan());
     }
 }

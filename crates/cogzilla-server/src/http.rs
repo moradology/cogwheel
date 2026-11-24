@@ -723,11 +723,20 @@ fn build_tile_request(
     pq: &ParsedQuery,
     default_bands: u16,
     is_u8: bool,
+    is_crs84: bool,
 ) -> Result<(TileRequest, &'static str), EngineError> {
     if tile.z > 30 {
         return Err(EngineError::BadRequest(format!(
             "zoom level z={} exceeds maximum supported zoom (30)",
             tile.z
+        )));
+    }
+    let rows = 1u64 << (tile.z as u32);
+    let cols = if is_crs84 { rows << 1 } else { rows };
+    if (tile.x as u64) >= cols || (tile.y as u64) >= rows {
+        return Err(EngineError::BadRequest(format!(
+            "tile coordinate ({}, {}) out of range for z={} (expected x < {cols}, y < {rows})",
+            tile.x, tile.y, tile.z
         )));
     }
     let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
@@ -752,6 +761,63 @@ fn build_tile_request(
         },
         content_type,
     ))
+}
+
+fn validate_mosaic_tile_params(pq: &ParsedQuery, tile_size: u32) -> Result<(), EngineError> {
+    if tile_size != 256 && tile_size != 512 {
+        return Err(EngineError::BadRequest(format!(
+            "mosaic tile routes only support tile_size 256 or 512 (got {tile_size})"
+        )));
+    }
+    if pq.nodata.is_some() {
+        return Err(EngineError::BadRequest(
+            "query parameter 'nodata' is not supported on mosaic tile routes".into(),
+        ));
+    }
+    if pq.custom_colormap_json.is_some() {
+        return Err(EngineError::BadRequest(
+            "inline JSON 'colormap' is not supported on mosaic tile routes (use 'colormap_name')"
+                .into(),
+        ));
+    }
+    if pq.buffer > 0 {
+        return Err(EngineError::BadRequest(
+            "query parameter 'buffer' is not supported on mosaic tile routes".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn render_mosaic_tile_styled(
+    engine: &TileEngine,
+    urls: &[String],
+    mut treq: TileRequest,
+    pq: &ParsedQuery,
+) -> Result<Bytes, EngineError> {
+    if (pq.color_formula.is_some() || !pq.return_mask)
+        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+    {
+        let cf = pq
+            .color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let orig_format = treq.format;
+        treq.format = OutputFormat::RawRgba;
+        let raw = engine.render_mosaic_tile(urls, &treq).await?;
+        let dim = treq.tile_size as usize;
+        let data = if let Some(cf) = cf {
+            let mut buf = raw.to_vec();
+            cf.apply_buffer_in_place(&mut buf, 4);
+            encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
+        } else {
+            encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
+        };
+        Ok(data)
+    } else {
+        engine.render_mosaic_tile(urls, &treq).await
+    }
 }
 
 fn world_crs84_tile_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
@@ -1007,7 +1073,13 @@ where
     }
 
     if method == Method::GET && (path == "/" || path == "/index.html") {
-        let html = include_str!("landing.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+        let base_path_js = serde_json::to_string(&forwarded_prefix)
+            .unwrap_or_else(|_| "\"\"".to_string())
+            .replace("</", "<\\/");
+        let html = include_str!("landing.html")
+            .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+            .replace("{{BASE_PATH}}", &forwarded_prefix)
+            .replace("{{BASE_PATH_JS}}", &base_path_js);
         return Ok(plain_resp(StatusCode::OK, Bytes::from(html), "text/html; charset=utf-8"));
     }
 
@@ -1289,7 +1361,9 @@ where
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            let (treq, ct) =
+                                build_tile_request(tile, sc, ext, &pq, 3, true, false)?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
                                 _ => 1,
@@ -1303,8 +1377,10 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, db, is_u8)?;
-                            let b = engine.render_mosaic_tile(&urls, &treq).await?;
+                            let (treq, ct) =
+                                build_tile_request(tile, sc, ext, &pq, db, is_u8, false)?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             Ok((b, ct))
                         }
                     })
@@ -1358,9 +1434,17 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) =
-                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
-                            let b = engine.render_mosaic_tile(&pq.urls, &treq).await?;
+                            let (treq, ct) = build_tile_request(
+                                TileCoord { z, x, y },
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                is_u8,
+                                false,
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let b = render_mosaic_tile_styled(&engine, &pq.urls, treq, &pq).await?;
                             Ok((b, ct))
                         })
                         .await;
@@ -1401,7 +1485,9 @@ where
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            let (treq, ct) =
+                                build_tile_request(tile, sc, ext, &pq, 3, true, false)?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
                                 _ => 1,
@@ -1415,8 +1501,10 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) = build_tile_request(tile, sc, ext, &pq, db, is_u8)?;
-                            let b = engine.render_mosaic_tile(&urls, &treq).await?;
+                            let (treq, ct) =
+                                build_tile_request(tile, sc, ext, &pq, db, is_u8, false)?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             Ok((b, ct))
                         }
                     })
@@ -1466,8 +1554,15 @@ where
                             };
                             let is_u8 = cogs[0].index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (mut treq, ct) =
-                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            let (mut treq, ct) = build_tile_request(
+                                TileCoord { z, x, y },
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                is_u8,
+                                false,
+                            )?;
                             if pq.unscale {
                                 apply_unscale_cogs(&mut treq.bands, &cogs);
                             }
@@ -1837,6 +1932,7 @@ where
                             &pq_stac,
                             db,
                             is_u8,
+                            tms == "WorldCRS84Quad",
                         )?;
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -2419,8 +2515,15 @@ where
                         };
                         let is_u8 = cogs[0].index.full_res().sample_type
                             == cogzilla_tiff::SampleType::Uint8;
-                        let (mut treq, ct) =
-                            build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                        let (mut treq, ct) = build_tile_request(
+                            TileCoord { z, x, y },
+                            sc,
+                            ext,
+                            &pq,
+                            db,
+                            is_u8,
+                            tms == "WorldCRS84Quad",
+                        )?;
                         if pq.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
@@ -2698,8 +2801,9 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let s = pq.max_size.min(1024);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, 512, 512, Some(&mask), &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq.resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2919,8 +3023,19 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
         EngineError::Io(e @ cogzilla_io::IoError::InvalidUri(_)) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
         }
+        EngineError::Io(e @ cogzilla_io::IoError::Tiff(_)) => {
+            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+        }
         EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_)) => {
             plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
+        }
+        EngineError::Io(e @ cogzilla_io::IoError::HttpStatus { status: 404, .. }) => {
+            plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
+        }
+        EngineError::Io(e @ cogzilla_io::IoError::Fs(io_err))
+            if io_err.kind() == std::io::ErrorKind::NotFound =>
+        {
+            plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
         }
         e => {
             tracing::warn!(error = %e, "request failed with 500");
@@ -3016,5 +3131,33 @@ mod tests {
         let pq_bbox = parse_query(Some("url=foo.json&coord_crs=EPSG:3857"));
         let res = validate_query(&["stac", "bbox", "0,0,1000,1000.png"], &pq_bbox);
         assert!(res.is_ok(), "unexpected error: {res:?}");
+    }
+
+    #[test]
+    fn xyz_bounds_and_http_error_status_mapping() {
+        let pq = parse_query(None);
+        // WebMercatorQuad at z=2 has 4x4 tiles (0..=3)
+        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, true, false).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, true, false).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, false).is_err());
+        // WorldCRS84Quad at z=2 has 8x4 tiles (x: 0..=7, y: 0..=3)
+        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, true, true).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, true, true).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, true).is_err());
+
+        // HTTP status mapping for upstream 404, local NotFound, and invalid TIFF
+        let r404 = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::HttpStatus {
+            status: 404,
+            url: "https://example.com/missing.tif".into(),
+        }));
+        assert_eq!(r404.status(), StatusCode::NOT_FOUND);
+        let r_enoent = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Fs(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        )));
+        assert_eq!(r_enoent.status(), StatusCode::NOT_FOUND);
+        let r_tiff = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Tiff(
+            cogzilla_tiff::TiffError::Corrupt("not a tiff"),
+        )));
+        assert_eq!(r_tiff.status(), StatusCode::BAD_REQUEST);
     }
 }
