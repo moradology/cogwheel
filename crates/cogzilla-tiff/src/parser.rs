@@ -453,6 +453,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     const MAX_COG_METADATA_BYTES: usize = 64 * 1024 * 1024;
     const MAX_JPEG_TABLES_BYTES: usize = 64 * 1024;
     let mut total_meta_bytes: usize = 0;
+    let mut parsed_tag_bytes: usize = 0;
     let mut visited_ifds: Vec<u64> = Vec::with_capacity(16);
     while next_ifd != 0 {
         if visited_ifds.contains(&next_ifd) {
@@ -499,12 +500,67 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             u16::try_from(v).map_err(|_| TiffError::Corrupt("IFD integer tag exceeds u16::MAX"))
         };
 
+        let mut charge_tag = |count: u64, out_elem_bytes: usize| -> Result<(), TiffError> {
+            let bytes = usize::try_from(count)
+                .ok()
+                .and_then(|n| n.checked_mul(out_elem_bytes))
+                .ok_or(TiffError::Corrupt("TIFF tag array size overflow"))?;
+            parsed_tag_bytes = parsed_tag_bytes.saturating_add(bytes);
+            if parsed_tag_bytes > MAX_COG_METADATA_BYTES {
+                return Err(TiffError::Corrupt(
+                    "cumulative TIFF tag parsing exceeds 64 MiB limit",
+                ));
+            }
+            Ok(())
+        };
+
+        // Reject duplicate array/metadata tags within the same IFD (disallowed by TIFF 6.0 §2,
+        // prevents transient CPU & allocation amplification from repeated value_offset=0 reads).
+        let mut seen_tags: Vec<u16> = Vec::with_capacity(entries.len().min(32));
         for entry in &entries {
+            let is_recognized = matches!(
+                entry.tag,
+                TAG_NEW_SUBFILE_TYPE
+                    | TAG_IMAGE_WIDTH
+                    | TAG_IMAGE_LENGTH
+                    | TAG_BITS_PER_SAMPLE
+                    | TAG_COMPRESSION
+                    | TAG_PHOTOMETRIC
+                    | TAG_STRIP_OFFSETS
+                    | TAG_SAMPLES_PER_PIXEL
+                    | TAG_ROWS_PER_STRIP
+                    | TAG_STRIP_BYTE_COUNTS
+                    | TAG_PLANAR_CONFIG
+                    | TAG_PREDICTOR
+                    | TAG_TILE_WIDTH
+                    | TAG_TILE_LENGTH
+                    | TAG_TILE_OFFSETS
+                    | TAG_TILE_BYTE_COUNTS
+                    | TAG_EXTRA_SAMPLES
+                    | TAG_SAMPLE_FORMAT
+                    | TAG_JPEG_TABLES
+                    | TAG_MODEL_PIXEL_SCALE
+                    | TAG_MODEL_TIEPOINT
+                    | TAG_MODEL_TRANSFORMATION
+                    | TAG_GEO_KEY_DIRECTORY
+                    | TAG_GEO_DOUBLE_PARAMS
+                    | TAG_GDAL_METADATA
+                    | TAG_GDAL_NODATA
+            );
+            if is_recognized {
+                if seen_tags.contains(&entry.tag) {
+                    return Err(TiffError::Corrupt("duplicate TIFF tag in IFD"));
+                }
+                seen_tags.push(entry.tag);
+            }
             match entry.tag {
                 TAG_NEW_SUBFILE_TYPE => subfile_type = to_u32(entry.read_u64_scalar(&r)?)?,
                 TAG_IMAGE_WIDTH => width = to_u32(entry.read_u64_scalar(&r)?)?,
                 TAG_IMAGE_LENGTH => height = to_u32(entry.read_u64_scalar(&r)?)?,
-                TAG_BITS_PER_SAMPLE => bits_per_sample = Some(entry.read_u16_vec(&r)?),
+                TAG_BITS_PER_SAMPLE => {
+                    charge_tag(entry.count, 2)?;
+                    bits_per_sample = Some(entry.read_u16_vec(&r)?);
+                }
                 TAG_COMPRESSION => {
                     let code = to_u16(entry.read_u64_scalar(&r)?)?;
                     compression = match code {
@@ -518,12 +574,18 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     };
                 }
                 TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
-                TAG_STRIP_OFFSETS => strip_offsets = Some(entry.read_u64_vec(&r)?),
+                TAG_STRIP_OFFSETS => {
+                    charge_tag(entry.count, 8)?;
+                    strip_offsets = Some(entry.read_u64_vec(&r)?);
+                }
                 TAG_SAMPLES_PER_PIXEL => samples_per_pixel = to_u16(entry.read_u64_scalar(&r)?)?,
                 TAG_ROWS_PER_STRIP => {
                     rows_per_strip = entry.read_u64_scalar(&r)?.min(u32::MAX as u64) as u32;
                 }
-                TAG_STRIP_BYTE_COUNTS => strip_byte_counts = Some(entry.read_u32_vec(&r)?),
+                TAG_STRIP_BYTE_COUNTS => {
+                    charge_tag(entry.count, 4)?;
+                    strip_byte_counts = Some(entry.read_u32_vec(&r)?);
+                }
                 TAG_PLANAR_CONFIG => {
                     planar_config = match entry.read_u64_scalar(&r)? {
                         1 => PlanarConfig::Chunky,
@@ -542,30 +604,52 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                 }
                 TAG_TILE_WIDTH => tile_width = to_u32(entry.read_u64_scalar(&r)?)?,
                 TAG_TILE_LENGTH => tile_height = to_u32(entry.read_u64_scalar(&r)?)?,
-                TAG_TILE_OFFSETS => tile_offsets = Some(entry.read_u64_vec(&r)?),
-                TAG_TILE_BYTE_COUNTS => tile_byte_counts = Some(entry.read_u32_vec(&r)?),
-                TAG_EXTRA_SAMPLES => extra_samples = entry.read_u16_vec(&r)?,
-                TAG_SAMPLE_FORMAT => sample_format = Some(entry.read_u16_vec(&r)?),
-                TAG_JPEG_TABLES => jpeg_tables = Some(entry.read_bytes(&r)?),
+                TAG_TILE_OFFSETS => {
+                    charge_tag(entry.count, 8)?;
+                    tile_offsets = Some(entry.read_u64_vec(&r)?);
+                }
+                TAG_TILE_BYTE_COUNTS => {
+                    charge_tag(entry.count, 4)?;
+                    tile_byte_counts = Some(entry.read_u32_vec(&r)?);
+                }
+                TAG_EXTRA_SAMPLES => {
+                    charge_tag(entry.count, 2)?;
+                    extra_samples = entry.read_u16_vec(&r)?;
+                }
+                TAG_SAMPLE_FORMAT => {
+                    charge_tag(entry.count, 2)?;
+                    sample_format = Some(entry.read_u16_vec(&r)?);
+                }
+                TAG_JPEG_TABLES => {
+                    charge_tag(entry.count, 1)?;
+                    jpeg_tables = Some(entry.read_bytes(&r)?);
+                }
                 TAG_MODEL_PIXEL_SCALE if ifds.is_empty() => {
+                    charge_tag(entry.count, 8)?;
                     pixel_scale = Some(entry.read_f64_vec(&r)?);
                 }
                 TAG_MODEL_TIEPOINT if ifds.is_empty() => {
+                    charge_tag(entry.count, 8)?;
                     tiepoint = Some(entry.read_f64_vec(&r)?);
                 }
                 TAG_MODEL_TRANSFORMATION if ifds.is_empty() => {
+                    charge_tag(entry.count, 8)?;
                     model_transform = Some(entry.read_f64_vec(&r)?);
                 }
                 TAG_GEO_KEY_DIRECTORY if ifds.is_empty() => {
+                    charge_tag(entry.count, 2)?;
                     raw_geo_keys = Some(entry.read_u16_vec(&r)?);
                 }
                 TAG_GEO_DOUBLE_PARAMS if ifds.is_empty() => {
+                    charge_tag(entry.count, 8)?;
                     double_params = entry.read_f64_vec(&r)?;
                 }
                 TAG_GDAL_METADATA if ifds.is_empty() => {
+                    charge_tag(entry.count, 1)?;
                     gdal_metadata_xml = Some(entry.read_ascii(&r)?);
                 }
                 TAG_GDAL_NODATA if ifds.is_empty() => {
+                    charge_tag(entry.count, 1)?;
                     let s = entry.read_ascii(&r)?;
                     if s.eq_ignore_ascii_case("nan") {
                         nodata = Some(f32::NAN);
@@ -1019,5 +1103,23 @@ mod tests {
         buf[14..18].copy_from_slice(&8_000_000u32.to_le_bytes());
         let err2 = parse_cog(&buf).unwrap_err();
         assert!(matches!(err2, TiffError::Corrupt(_)), "got {err2:?}");
+    }
+
+    #[test]
+    fn hostile_duplicate_ifd_tags_are_rejected_immediately() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes()); // 2 duplicate TAG_TILE_OFFSETS entries
+        for _ in 0..2 {
+            buf.extend_from_slice(&TAG_TILE_OFFSETS.to_le_bytes());
+            buf.extend_from_slice(&TYPE_LONG.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(matches!(err, TiffError::Corrupt("duplicate TIFF tag in IFD")), "got {err:?}");
     }
 }
