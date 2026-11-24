@@ -1408,38 +1408,65 @@ pub async fn compute_statistics(
         lx0 < x_max && ly0 < y_max
     };
 
-    let mut mask_total_pixels = 0usize;
-    let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
-        let mut masks = Vec::with_capacity(n_tiles);
-        for ty in 0..ifd.tiles_down {
-            for tx in 0..ifd.tiles_across {
-                let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
-                let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
-                if !tile_has_strided_sample(tx, ty, x_max, y_max) {
-                    masks.push(None);
-                    continue;
+    let (tile_masks, mask_total_pixels): (Option<Vec<Option<Vec<u8>>>>, usize) =
+        if let Some(pm) = poly_mask {
+            let build_masks = {
+                let ifd = ifd.clone();
+                let crs = crs.clone();
+                let pm = pm.clone();
+                move || {
+                    let mut masks = Vec::with_capacity(n_tiles);
+                    let mut inside_total = 0usize;
+                    for ty in 0..ifd.tiles_down {
+                        for tx in 0..ifd.tiles_across {
+                            let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+                            let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+                            let has_sample = if step == 1 {
+                                true
+                            } else {
+                                let x0_tile = (tx * ifd.tile_width) as usize;
+                                let y0_tile = (ty * ifd.tile_height) as usize;
+                                let lx0 = (step - (x0_tile % step)) % step;
+                                let ly0 = (step - (y0_tile % step)) % step;
+                                lx0 < x_max && ly0 < y_max
+                            };
+                            if !has_sample {
+                                masks.push(None);
+                                continue;
+                            }
+                            let built = if step > 1 {
+                                let x0_tile = (tx * ifd.tile_width) as usize;
+                                let y0_tile = (ty * ifd.tile_height) as usize;
+                                let lx0 = (step - (x0_tile % step)) % step;
+                                let ly0 = (step - (y0_tile % step)) % step;
+                                build_tile_polygon_mask_strided(
+                                    &ifd, &crs, &pm, tx, ty, x_max, y_max, lx0, ly0, step,
+                                )
+                            } else {
+                                build_tile_polygon_mask(&ifd, &crs, &pm, tx, ty, x_max, y_max)
+                            };
+                            if let Some((bits, inside)) = built {
+                                inside_total += inside;
+                                masks.push(Some(bits));
+                            } else {
+                                masks.push(None);
+                            }
+                        }
+                    }
+                    (Some(masks), inside_total)
                 }
-                let built = if step > 1 {
-                    let x0_tile = (tx * ifd.tile_width) as usize;
-                    let y0_tile = (ty * ifd.tile_height) as usize;
-                    let lx0 = (step - (x0_tile % step)) % step;
-                    let ly0 = (step - (y0_tile % step)) % step;
-                    build_tile_polygon_mask_strided(
-                        ifd, &crs, pm, tx, ty, x_max, y_max, lx0, ly0, step,
-                    )
-                } else {
-                    build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
-                };
-                if let Some((bits, inside)) = built {
-                    mask_total_pixels += inside;
-                    masks.push(Some(bits));
-                } else {
-                    masks.push(None);
-                }
+            };
+            if n_tiles >= 4 || total_pixels >= 65_536 {
+                engine
+                    .store
+                    .run_heavy_cpu(build_masks)
+                    .await?
+            } else {
+                build_masks()
             }
-        }
-        masks
-    });
+        } else {
+            (None, 0)
+        };
 
     let fetched = match ifd.planar_config {
         PlanarConfig::Chunky => {
@@ -1958,126 +1985,196 @@ async fn render_bbox_impl(
     // Precompute source pixel coordinates `(u, v)` using a coarse 16-px projection grid
     // + bilinear interpolation (reduces UTM/LCC trig calls by ~225× while keeping <0.005 px error).
     // Any grid cell with a non-finite corner falls back to exact per-pixel projection.
-    let mut u_map = vec![f32::NAN; w * h];
-    let mut v_map = vec![f32::NAN; w * h];
-    let mut min_u = f32::INFINITY;
-    let mut max_u = f32::NEG_INFINITY;
-    let mut min_v = f32::INFINITY;
-    let mut max_v = f32::NEG_INFINITY;
-
-    const STEP: usize = 16;
-    let gw = w.div_ceil(STEP) + 1;
-    let gh = h.div_ceil(STEP) + 1;
-    let mut grid_u = vec![f64::NAN; gw * gh];
-    let mut grid_v = vec![f64::NAN; gw * gh];
-    for gy in 0..gh {
-        let py_f = (gy * STEP).min(h) as f64;
-        let y_coord = bbox[3] - py_f * dly;
-        for gx in 0..gw {
-            let px_f = (gx * STEP).min(w) as f64;
-            let x_coord = bbox[0] + px_f * dlx;
-            let (sx, sy) = to_src_crs(x_coord, y_coord);
-            if sx.is_finite() && sy.is_finite() {
-                let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
-                grid_u[gy * gw + gx] = col - 0.5;
-                grid_v[gy * gw + gx] = row - 0.5;
-            }
-        }
-    }
-
-    let ifd_w_f = ifd.width as f32;
-    let ifd_h_f = ifd.height as f32;
-
-    for gy in 0..(gh - 1) {
-        let y0 = gy * STEP;
-        let y1 = ((gy + 1) * STEP).min(h);
-        if y0 >= y1 {
-            continue;
-        }
-        let inv_dy = 1.0 / ((y1 - y0) as f64);
-        for gx in 0..(gw - 1) {
-            let x0 = gx * STEP;
-            let x1 = ((gx + 1) * STEP).min(w);
-            if x0 >= x1 {
-                continue;
-            }
-            let inv_dx = 1.0 / ((x1 - x0) as f64);
-            let i00 = gy * gw + gx;
-            let u00 = grid_u[i00];
-            let u10 = grid_u[i00 + 1];
-            let u01 = grid_u[i00 + gw];
-            let u11 = grid_u[i00 + gw + 1];
-            let v00 = grid_v[i00];
-            let v10 = grid_v[i00 + 1];
-            let v01 = grid_v[i00 + gw];
-            let v11 = grid_v[i00 + gw + 1];
-            let all_finite = u00.is_finite()
-                && u10.is_finite()
-                && u01.is_finite()
-                && u11.is_finite()
-                && v00.is_finite()
-                && v10.is_finite()
-                && v01.is_finite()
-                && v11.is_finite();
-
-            // Skip entire cell if all 4 corners + midpoint are strictly outside the source image
-            // bounds, and fall back to exact per-pixel projection if the cell has high curvature
-            // (> 0.05 px midpoint error) or wraps across the antimeridian / pole in X or Y.
-            let mut use_bilinear = all_finite;
-            if all_finite {
-                let x_mid = bbox[0] + (0.5 * (x0 + x1) as f64) * dlx;
-                let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
-                let (msx, msy) = to_src_crs(x_mid, y_mid);
-                let mid_ok = if msx.is_finite() && msy.is_finite() {
-                    let (mcol, mrow) = ifd.crs_to_pixel.forward(msx, msy);
-                    let mu = mcol - 0.5;
-                    let mv = mrow - 0.5;
-                    let u_avg = 0.25 * (u00 + u10 + u01 + u11);
-                    let v_avg = 0.25 * (v00 + v10 + v01 + v11);
-                    mu.is_finite()
-                        && mv.is_finite()
-                        && (mu - u_avg).abs() <= 0.05
-                        && (mv - v_avg).abs() <= 0.05
+    // Offload large grids or polygon-masked bboxes to the bounded heavy-CPU pool so Tokio worker
+    // threads stay responsive under concurrent `/bbox` and `/feature` load.
+    let build_uv_maps = {
+        let crs = crs.clone();
+        let crs_to_pixel = ifd.crs_to_pixel;
+        let ifd_width = ifd.width;
+        let ifd_height = ifd.height;
+        let poly_mask = poly_mask.cloned();
+        move || {
+            let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
+                if bbox_is_3857 {
+                    crs.from_3857(x, y)
                 } else {
-                    false
-                };
-                if !mid_ok {
-                    use_bilinear = false;
-                } else {
-                    let cu_min = u00.min(u10).min(u01).min(u11) as f32;
-                    let cu_max = u00.max(u10).max(u01).max(u11) as f32;
-                    let cv_min = v00.min(v10).min(v01).min(v11) as f32;
-                    let cv_max = v00.max(v10).max(v01).max(v11) as f32;
-                    if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
-                        continue;
-                    }
-                    if (ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f)
-                        || (ifd.height >= 64 && h > STEP * 2 && (cv_max - cv_min) > 0.5 * ifd_h_f)
-                    {
-                        use_bilinear = false;
+                    crs.from_lonlat_deg(x, y)
+                }
+            };
+            let mut u_map = vec![f32::NAN; w * h];
+            let mut v_map = vec![f32::NAN; w * h];
+            let mut min_u = f32::INFINITY;
+            let mut max_u = f32::NEG_INFINITY;
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+
+            const STEP: usize = 16;
+            let gw = w.div_ceil(STEP) + 1;
+            let gh = h.div_ceil(STEP) + 1;
+            let mut grid_u = vec![f64::NAN; gw * gh];
+            let mut grid_v = vec![f64::NAN; gw * gh];
+            for gy in 0..gh {
+                let py_f = (gy * STEP).min(h) as f64;
+                let y_coord = bbox[3] - py_f * dly;
+                for gx in 0..gw {
+                    let px_f = (gx * STEP).min(w) as f64;
+                    let x_coord = bbox[0] + px_f * dlx;
+                    let (sx, sy) = to_src_crs(x_coord, y_coord);
+                    if sx.is_finite() && sy.is_finite() {
+                        let (col, row) = crs_to_pixel.forward(sx, sy);
+                        grid_u[gy * gw + gx] = col - 0.5;
+                        grid_v[gy * gw + gx] = row - 0.5;
                     }
                 }
             }
 
-            for py in y0..y1 {
-                let row_off = py * w;
-                let ty = (py as f64 + 0.5 - y0 as f64) * inv_dy;
-                let lat = bbox[3] - (py as f64 + 0.5) * dly;
-                if use_bilinear {
-                    let ul = u00 + (u01 - u00) * ty;
-                    let ur = u10 + (u11 - u10) * ty;
-                    let vl = v00 + (v01 - v00) * ty;
-                    let vr = v10 + (v11 - v10) * ty;
-                    let du = (ur - ul) * inv_dx;
-                    let dv = (vr - vl) * inv_dx;
-                    let mut u_cur = ul + 0.5 * du;
-                    let mut v_cur = vl + 0.5 * dv;
-                    if let Some(pm) = poly_mask {
-                        for px in x0..x1 {
-                            let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                            if pm.contains(lon, lat) {
-                                let uu = u_cur as f32;
-                                let vv = v_cur as f32;
+            let ifd_w_f = ifd_width as f32;
+            let ifd_h_f = ifd_height as f32;
+
+            for gy in 0..(gh - 1) {
+                let y0 = gy * STEP;
+                let y1 = ((gy + 1) * STEP).min(h);
+                if y0 >= y1 {
+                    continue;
+                }
+                let inv_dy = 1.0 / ((y1 - y0) as f64);
+                for gx in 0..(gw - 1) {
+                    let x0 = gx * STEP;
+                    let x1 = ((gx + 1) * STEP).min(w);
+                    if x0 >= x1 {
+                        continue;
+                    }
+                    let inv_dx = 1.0 / ((x1 - x0) as f64);
+                    let i00 = gy * gw + gx;
+                    let u00 = grid_u[i00];
+                    let u10 = grid_u[i00 + 1];
+                    let u01 = grid_u[i00 + gw];
+                    let u11 = grid_u[i00 + gw + 1];
+                    let v00 = grid_v[i00];
+                    let v10 = grid_v[i00 + 1];
+                    let v01 = grid_v[i00 + gw];
+                    let v11 = grid_v[i00 + gw + 1];
+                    let all_finite = u00.is_finite()
+                        && u10.is_finite()
+                        && u01.is_finite()
+                        && u11.is_finite()
+                        && v00.is_finite()
+                        && v10.is_finite()
+                        && v01.is_finite()
+                        && v11.is_finite();
+
+                    // Skip entire cell if all 4 corners + midpoint are strictly outside the source image
+                    // bounds, and fall back to exact per-pixel projection if the cell has high curvature
+                    // (> 0.05 px midpoint error) or wraps across the antimeridian / pole in X or Y.
+                    let mut use_bilinear = all_finite;
+                    if all_finite {
+                        let x_mid = bbox[0] + (0.5 * (x0 + x1) as f64) * dlx;
+                        let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
+                        let (msx, msy) = to_src_crs(x_mid, y_mid);
+                        let mid_ok = if msx.is_finite() && msy.is_finite() {
+                            let (mcol, mrow) = crs_to_pixel.forward(msx, msy);
+                            let mu = mcol - 0.5;
+                            let mv = mrow - 0.5;
+                            let u_avg = 0.25 * (u00 + u10 + u01 + u11);
+                            let v_avg = 0.25 * (v00 + v10 + v01 + v11);
+                            mu.is_finite()
+                                && mv.is_finite()
+                                && (mu - u_avg).abs() <= 0.05
+                                && (mv - v_avg).abs() <= 0.05
+                        } else {
+                            false
+                        };
+                        if !mid_ok {
+                            use_bilinear = false;
+                        } else {
+                            let cu_min = u00.min(u10).min(u01).min(u11) as f32;
+                            let cu_max = u00.max(u10).max(u01).max(u11) as f32;
+                            let cv_min = v00.min(v10).min(v01).min(v11) as f32;
+                            let cv_max = v00.max(v10).max(v01).max(v11) as f32;
+                            if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f
+                            {
+                                continue;
+                            }
+                            if (ifd_width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f)
+                                || (ifd_height >= 64
+                                    && h > STEP * 2
+                                    && (cv_max - cv_min) > 0.5 * ifd_h_f)
+                            {
+                                use_bilinear = false;
+                            }
+                        }
+                    }
+
+                    for py in y0..y1 {
+                        let row_off = py * w;
+                        let ty = (py as f64 + 0.5 - y0 as f64) * inv_dy;
+                        let lat = bbox[3] - (py as f64 + 0.5) * dly;
+                        if use_bilinear {
+                            let ul = u00 + (u01 - u00) * ty;
+                            let ur = u10 + (u11 - u10) * ty;
+                            let vl = v00 + (v01 - v00) * ty;
+                            let vr = v10 + (v11 - v10) * ty;
+                            let du = (ur - ul) * inv_dx;
+                            let dv = (vr - vl) * inv_dx;
+                            let mut u_cur = ul + 0.5 * du;
+                            let mut v_cur = vl + 0.5 * dv;
+                            if let Some(ref pm) = poly_mask {
+                                for px in x0..x1 {
+                                    let lon = bbox[0] + (px as f64 + 0.5) * dlx;
+                                    if pm.contains(lon, lat) {
+                                        let uu = u_cur as f32;
+                                        let vv = v_cur as f32;
+                                        if uu >= -1.0
+                                            && uu <= ifd_w_f
+                                            && vv >= -1.0
+                                            && vv <= ifd_h_f
+                                        {
+                                            u_map[row_off + px] = uu;
+                                            v_map[row_off + px] = vv;
+                                            min_u = min_u.min(uu);
+                                            max_u = max_u.max(uu);
+                                            min_v = min_v.min(vv);
+                                            max_v = max_v.max(vv);
+                                        }
+                                    }
+                                    u_cur += du;
+                                    v_cur += dv;
+                                }
+                            } else {
+                                for px in x0..x1 {
+                                    let uu = u_cur as f32;
+                                    let vv = v_cur as f32;
+                                    if uu >= -1.0
+                                        && uu <= ifd_w_f
+                                        && vv >= -1.0
+                                        && vv <= ifd_h_f
+                                    {
+                                        u_map[row_off + px] = uu;
+                                        v_map[row_off + px] = vv;
+                                        min_u = min_u.min(uu);
+                                        max_u = max_u.max(uu);
+                                        min_v = min_v.min(vv);
+                                        max_v = max_v.max(vv);
+                                    }
+                                    u_cur += du;
+                                    v_cur += dv;
+                                }
+                            }
+                        } else {
+                            for px in x0..x1 {
+                                let lon = bbox[0] + (px as f64 + 0.5) * dlx;
+                                if let Some(ref pm) = poly_mask {
+                                    if !pm.contains(lon, lat) {
+                                        continue;
+                                    }
+                                }
+                                let (sx, sy) = to_src_crs(lon, lat);
+                                if !sx.is_finite() || !sy.is_finite() {
+                                    continue;
+                                }
+                                let (col, row) = crs_to_pixel.forward(sx, sy);
+                                let uu = (col - 0.5) as f32;
+                                let vv = (row - 0.5) as f32;
                                 if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {
                                     u_map[row_off + px] = uu;
                                     v_map[row_off + px] = vv;
@@ -2087,53 +2184,21 @@ async fn render_bbox_impl(
                                     max_v = max_v.max(vv);
                                 }
                             }
-                            u_cur += du;
-                            v_cur += dv;
-                        }
-                    } else {
-                        for px in x0..x1 {
-                            let uu = u_cur as f32;
-                            let vv = v_cur as f32;
-                            if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {
-                                u_map[row_off + px] = uu;
-                                v_map[row_off + px] = vv;
-                                min_u = min_u.min(uu);
-                                max_u = max_u.max(uu);
-                                min_v = min_v.min(vv);
-                                max_v = max_v.max(vv);
-                            }
-                            u_cur += du;
-                            v_cur += dv;
-                        }
-                    }
-                } else {
-                    for px in x0..x1 {
-                        let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                        if let Some(pm) = poly_mask {
-                            if !pm.contains(lon, lat) {
-                                continue;
-                            }
-                        }
-                        let (sx, sy) = to_src_crs(lon, lat);
-                        if !sx.is_finite() || !sy.is_finite() {
-                            continue;
-                        }
-                        let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
-                        let uu = (col - 0.5) as f32;
-                        let vv = (row - 0.5) as f32;
-                        if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {
-                            u_map[row_off + px] = uu;
-                            v_map[row_off + px] = vv;
-                            min_u = min_u.min(uu);
-                            max_u = max_u.max(uu);
-                            min_v = min_v.min(vv);
-                            max_v = max_v.max(vv);
                         }
                     }
                 }
             }
+            (u_map, v_map, min_u, max_u, min_v, max_v)
         }
-    }
+    };
+    let (u_map, v_map, min_u, max_u, min_v, max_v) = if w * h >= 65_536 || poly_mask.is_some() {
+        engine
+            .store
+            .run_heavy_cpu(build_uv_maps)
+            .await?
+    } else {
+        build_uv_maps()
+    };
 
     // Empty check
     if !min_u.is_finite() {
