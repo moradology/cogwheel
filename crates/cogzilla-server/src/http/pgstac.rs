@@ -29,7 +29,7 @@ use super::{
 };
 use crate::engine::{EngineError, TileEngine};
 use crate::stac::{StacItem, rewrite_stac_expr, stac_item_from_json};
-use crate::titiler::{build_map_html, encode_rgba_output};
+use crate::titiler::{build_map_html, encode_rgba_output, query_point};
 
 /// Most scenes one tile may read. titiler-pgstac's default `items_limit` is 100.
 const MAX_SCENES_PER_TILE: usize = 256;
@@ -535,48 +535,57 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
     }
 }
 
+/// The pgSTAC routes: path, method and summary.
+const OPENAPI_ROUTES: [(&str, &str, &str); 40] = [
+    ("/searches/{search_id}/point/{lon},{lat}", "get", "Values of the items under a point"),
+    ("/collections/{collection_id}/point/{lon},{lat}", "get", "Values of the items under a point"),
+    ("/searches/{search_id}/WMTSCapabilities.xml", "get", "pgSTAC search WMTS capabilities"),
+    ("/collections/{collection_id}/WMTSCapabilities.xml", "get", "pgSTAC collection WMTS capabilities"),
+    ("/collections/{collection_id}/items/{item_id}/WMTSCapabilities.xml", "get", "pgSTAC item WMTS capabilities"),
+    ("/collections/{collection_id}/items/{item_id}/assets", "get", "Assets of a pgSTAC item"),
+    ("/collections/{collection_id}/items/{item_id}/info", "get", "pgSTAC item asset metadata"),
+    ("/collections/{collection_id}/items/{item_id}/info.geojson", "get", "pgSTAC item asset metadata as GeoJSON"),
+    ("/collections/{collection_id}/items/{item_id}/statistics", "get", "pgSTAC item statistics"),
+    ("/collections/{collection_id}/items/{item_id}/asset_statistics", "get", "pgSTAC item per-asset statistics"),
+    ("/collections/{collection_id}/items/{item_id}/tiles", "get", "pgSTAC item tilesets"),
+    ("/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}", "get", "pgSTAC item tileset description"),
+    ("/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get", "Render pgSTAC item tile"),
+    ("/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/tilejson.json", "get", "pgSTAC item TileJSON 3.0"),
+    ("/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/map.html", "get", "pgSTAC item map viewer"),
+    ("/collections/{collection_id}/items/{item_id}/point/{lon},{lat}", "get", "pgSTAC item values at a point"),
+    ("/collections/{collection_id}/items/{item_id}/preview.{format}", "get", "pgSTAC item preview"),
+    ("/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "pgSTAC item image for a bounding box"),
+    ("/collections/{collection_id}/items/{item_id}/feature.{format}", "post", "pgSTAC item image for a GeoJSON feature"),
+    ("/collections/{collection_id}/items/{item_id}/renders", "get", "pgSTAC item renders"),
+    ("/searches/register", "post", "Register a pgSTAC search"),
+    ("/searches/", "get", "List registered pgSTAC searches"),
+    ("/searches/{search_id}/info", "get", "pgSTAC search metadata"),
+    ("/searches/{search_id}/{tileMatrixSetId}/tilejson.json", "get", "pgSTAC search TileJSON 3.0"),
+    ("/searches/{search_id}/{tileMatrixSetId}/map.html", "get", "pgSTAC search map viewer"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get", "Render pgSTAC search mosaic tile"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets", "get", "Items covering a tile"),
+    ("/searches/{search_id}/tiles", "get", "pgSTAC search tilesets"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}", "get", "pgSTAC search tileset description"),
+    ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/assets", "get", "Items intersecting a bounding box"),
+    ("/searches/{search_id}/point/{lon},{lat}/assets", "get", "Items covering a point"),
+    ("/collections/{collection_id}/info", "get", "pgSTAC collection mosaic metadata"),
+    ("/collections/{collection_id}/{tileMatrixSetId}/tilejson.json", "get", "pgSTAC collection TileJSON 3.0"),
+    ("/collections/{collection_id}/{tileMatrixSetId}/map.html", "get", "pgSTAC collection map viewer"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get", "Render pgSTAC collection mosaic tile"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets", "get", "Items covering a tile"),
+    ("/collections/{collection_id}/tiles", "get", "pgSTAC collection tilesets"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}", "get", "pgSTAC collection tileset description"),
+    ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/assets", "get", "Items intersecting a bounding box"),
+    ("/collections/{collection_id}/point/{lon},{lat}/assets", "get", "Items covering a point"),
+];
+
 /// The pgSTAC routes, as entries for the OpenAPI document's `paths`.
 pub(super) fn openapi_paths() -> Value {
-    json!({
-        "/searches/{search_id}/WMTSCapabilities.xml": { "get": { "summary": "pgSTAC search WMTS capabilities" } },
-        "/collections/{collection_id}/WMTSCapabilities.xml": { "get": { "summary": "pgSTAC collection WMTS capabilities" } },
-        "/collections/{collection_id}/items/{item_id}/WMTSCapabilities.xml": { "get": { "summary": "pgSTAC item WMTS capabilities" } },
-        "/collections/{collection_id}/items/{item_id}/assets": { "get": { "summary": "Assets of a pgSTAC item" } },
-        "/collections/{collection_id}/items/{item_id}/info": { "get": { "summary": "pgSTAC item asset metadata" } },
-        "/collections/{collection_id}/items/{item_id}/info.geojson": { "get": { "summary": "pgSTAC item asset metadata as GeoJSON" } },
-        "/collections/{collection_id}/items/{item_id}/statistics": { "get": { "summary": "pgSTAC item statistics" } },
-        "/collections/{collection_id}/items/{item_id}/asset_statistics": { "get": { "summary": "pgSTAC item per-asset statistics" } },
-        "/collections/{collection_id}/items/{item_id}/tiles": { "get": { "summary": "pgSTAC item tilesets" } },
-        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}": { "get": { "summary": "pgSTAC item tileset description" } },
-        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC item tile" } },
-        "/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC item TileJSON 3.0" } },
-        "/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC item map viewer" } },
-        "/collections/{collection_id}/items/{item_id}/point/{lon},{lat}": { "get": { "summary": "pgSTAC item values at a point" } },
-        "/collections/{collection_id}/items/{item_id}/preview.{format}": { "get": { "summary": "pgSTAC item preview" } },
-        "/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}": { "get": { "summary": "pgSTAC item image for a bounding box" } },
-        "/collections/{collection_id}/items/{item_id}/feature.{format}": { "post": { "summary": "pgSTAC item image for a GeoJSON feature" } },
-        "/collections/{collection_id}/items/{item_id}/renders": { "get": { "summary": "pgSTAC item renders" } },
-        "/searches/register": { "post": { "summary": "Register a pgSTAC search" } },
-        "/searches/": { "get": { "summary": "List registered pgSTAC searches" } },
-        "/searches/{search_id}/info": { "get": { "summary": "pgSTAC search metadata" } },
-        "/searches/{search_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC search TileJSON 3.0" } },
-        "/searches/{search_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC search map viewer" } },
-        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC search mosaic tile" } },
-        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets": { "get": { "summary": "Items covering a tile" } },
-        "/searches/{search_id}/tiles": { "get": { "summary": "pgSTAC search tilesets" } },
-        "/searches/{search_id}/tiles/{tileMatrixSetId}": { "get": { "summary": "pgSTAC search tileset description" } },
-        "/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/assets": { "get": { "summary": "Items intersecting a bounding box" } },
-        "/searches/{search_id}/point/{lon},{lat}/assets": { "get": { "summary": "Items covering a point" } },
-        "/collections/{collection_id}/info": { "get": { "summary": "pgSTAC collection mosaic metadata" } },
-        "/collections/{collection_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC collection TileJSON 3.0" } },
-        "/collections/{collection_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC collection map viewer" } },
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC collection mosaic tile" } },
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets": { "get": { "summary": "Items covering a tile" } },
-        "/collections/{collection_id}/tiles": { "get": { "summary": "pgSTAC collection tilesets" } },
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}": { "get": { "summary": "pgSTAC collection tileset description" } },
-        "/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/assets": { "get": { "summary": "Items intersecting a bounding box" } },
-        "/collections/{collection_id}/point/{lon},{lat}/assets": { "get": { "summary": "Items covering a point" } }
-    })
+    let mut paths = serde_json::Map::new();
+    for (path, method, summary) in OPENAPI_ROUTES {
+        paths.insert(path.to_string(), json!({ method: { "summary": summary } }));
+    }
+    Value::Object(paths)
 }
 
 /// The request's query string, re-encoded the way TiTiler writes it into links.
@@ -1274,6 +1283,149 @@ async fn tile_assets(pg: &PgStac, id: &str, tile: TileCoord, pairs: &[(String, S
     }
 }
 
+/// TiTiler's answer for an asset the item does not have: its assets, in jsonb key order.
+fn unknown_asset(asset: &str, item: &MosaicItem) -> Resp {
+    let mut names: Vec<String> = item.assets.keys().cloned().collect();
+    jsonb_key_order(&mut names);
+    let known: Vec<String> = names.iter().map(|k| format!("'{k}'")).collect();
+    detail(
+        StatusCode::NOT_FOUND,
+        format!("'{asset}' is not valid, should be one of [{}]", known.join(", ")),
+    )
+}
+
+/// How many items of a point query are read at once.
+const POINT_ITEMS_IN_FLIGHT: usize = 8;
+
+/// `GET {base}/point/{x},{y}`: the pixel values of every item under a point, in the
+/// search's order, each as `{name, values, band_names, band_descriptions}`.
+async fn point_values(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    hash: &str,
+    coord: &str,
+    pq: &ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    let xy = coord
+        .split_once(',')
+        .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)))
+        .filter(|(x, y)| x.is_finite() && y.is_finite());
+    let Some((x, y)) = xy else {
+        return detail(StatusCode::NOT_FOUND, "Not Found");
+    };
+    if pq.assets.is_empty() {
+        return missing_query_param("assets");
+    }
+    if let Some(e) = pq.errors.iter().find(|e| !e.contains("'reproject'")) {
+        return detail(StatusCode::BAD_REQUEST, e.clone());
+    }
+    if pq.assets.iter().any(|a| a.contains('|')) {
+        return detail(
+            StatusCode::BAD_REQUEST,
+            "per-asset options (assets=name|bidx=...|expression=...) are not supported yet",
+        );
+    }
+    for unsupported in ["expression", "asset_as_band"] {
+        if query_value(pairs, unsupported).is_some() {
+            return detail(
+                StatusCode::BAD_REQUEST,
+                format!("parameter '{unsupported}' is not supported on pgSTAC point routes yet"),
+            );
+        }
+    }
+    let (lon, lat) = if pq.coord_crs_3857 {
+        mercator_to_lonlat_deg(x, y)
+    } else {
+        if let Err(r) = check_coord_crs(pairs) {
+            return r;
+        }
+        (x, y)
+    };
+    let mut limits = match parse_limits(pairs) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    // A point is never "covered", so every item under it is wanted.
+    limits.exitwhenfull = false;
+    limits.skipcovered = false;
+    let point = json!({ "type": "Point", "coordinates": [lon, lat] });
+    let items = match pg.items_for_geometry(&point, hash, limits).await {
+        Ok(items) => items,
+        Err(e) => return db_error(&e),
+    };
+    if items.is_empty() {
+        return no_content();
+    }
+
+    // Resolve every asset before reading anything, so a bad name fails the request at once.
+    let mut jobs: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let mut hrefs = Vec::with_capacity(pq.assets.len());
+        for asset in &pq.assets {
+            match item.asset_href(asset) {
+                Some(href) => hrefs.push((asset.clone(), href.to_string())),
+                None => return unknown_asset(asset, item),
+            }
+        }
+        let name = match &item.collection {
+            Some(c) => format!("{c}/{}", item.id),
+            None => item.id.clone(),
+        };
+        jobs.push((name, hrefs));
+    }
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(POINT_ITEMS_IN_FLIGHT));
+    let mut set = tokio::task::JoinSet::new();
+    let (unscale, nodata) = (pq.unscale, pq.nodata);
+    for (idx, (name, hrefs)) in jobs.into_iter().enumerate() {
+        let engine = ctx.engine.clone();
+        let gate = gate.clone();
+        set.spawn(async move {
+            let _permit = gate.acquire_owned().await;
+            let mut values = Vec::new();
+            let mut descriptions = Vec::new();
+            for (asset, href) in &hrefs {
+                let cog = engine.store.open_uri(href).await?;
+                let pt = match query_point(&engine, &cog, lon, lat, unscale, nodata).await {
+                    Ok(pt) => pt,
+                    // The item's footprint holds the point but this raster does not.
+                    Err(EngineError::NotFound(_)) => return Ok((idx, None)),
+                    Err(e) => return Err(e),
+                };
+                for (i, v) in pt["values"].as_array().into_iter().flatten().enumerate() {
+                    values.push(v.clone());
+                    descriptions.push(format!("{asset}_b{}", i + 1));
+                }
+            }
+            let band_names: Vec<String> = (1..=values.len()).map(|i| format!("b{i}")).collect();
+            let entry = json!({
+                "name": name,
+                "values": values,
+                "band_names": band_names,
+                "band_descriptions": descriptions,
+            });
+            Ok::<_, EngineError>((idx, Some(entry)))
+        });
+    }
+    let mut ordered: Vec<Option<Value>> = vec![None; items.len()];
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok((idx, entry))) => ordered[idx] = entry,
+            Ok(Err(e)) => return engine_error(&e),
+            Err(e) => {
+                tracing::warn!(error = %e, "pgSTAC point task failed");
+                return detail(StatusCode::INTERNAL_SERVER_ERROR, "point query failed");
+            }
+        }
+    }
+    let assets: Vec<Value> = ordered.into_iter().flatten().collect();
+    if assets.is_empty() {
+        return no_content();
+    }
+    json_resp(StatusCode::OK, &json!({ "coordinates": [x, y], "assets": assets }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tile(
     ctx: &Ctx<'_>,
@@ -1303,14 +1455,7 @@ async fn tile(
         for asset in &pq.assets {
             match item.asset_href(asset) {
                 Some(href) => hrefs.push(href.to_string()),
-                None => {
-                    let known: Vec<String> =
-                        item.assets.keys().map(|k| format!("'{k}'")).collect();
-                    return detail(
-                        StatusCode::NOT_FOUND,
-                        format!("'{asset}' is not valid, should be one of [{}]", known.join(", ")),
-                    );
-                }
+                None => return unknown_asset(asset, item),
             }
         }
         scenes.push(hrefs);
@@ -2003,6 +2148,7 @@ async fn mosaic_route(
             });
             geometry_assets(pg, &rec.hash, polygon, limits).await
         }
+        ["point", lonlat] => point_values(ctx, pg, &rec.hash, lonlat, &pq, pairs).await,
         ["point", lonlat, "assets"] => {
             let coords = lonlat
                 .split_once(',')
