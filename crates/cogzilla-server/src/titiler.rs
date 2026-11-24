@@ -1460,10 +1460,32 @@ pub async fn render_wgs84_bbox(
             indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
         }
     }
-    let mut cog_tiles = Vec::with_capacity(cogs.len());
-    for c in cogs {
-        cog_tiles.push(engine.store.get_blocks(c, ifd_idx, &indices).await?);
-    }
+    let cog_tiles = if cogs.len() == 1 {
+        vec![engine.store.get_blocks(&cogs[0], ifd_idx, &indices).await?]
+    } else {
+        let indices_arc = Arc::new(indices);
+        let mut js = tokio::task::JoinSet::new();
+        for (slot, c) in cogs.iter().enumerate() {
+            let store = engine.store.clone();
+            let cog = c.clone();
+            let idx_ref = indices_arc.clone();
+            js.spawn(async move {
+                let blocks = store.get_blocks(&cog, ifd_idx, &idx_ref).await?;
+                Ok::<_, cogzilla_io::IoError>((slot, blocks))
+            });
+        }
+        let mut out: Vec<Option<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>> =
+            vec![None; cogs.len()];
+        while let Some(res) = js.join_next().await {
+            let (slot, blocks) = res.map_err(|e| {
+                EngineError::Io(cogzilla_io::IoError::Fs(std::io::Error::other(format!(
+                    "multi-cog bbox fetch task failed: {e}"
+                ))))
+            })??;
+            out[slot] = Some(blocks);
+        }
+        out.into_iter().map(|o| o.unwrap()).collect()
+    };
 
     let ifd_width = ifd.width;
     let ifd_height = ifd.height;

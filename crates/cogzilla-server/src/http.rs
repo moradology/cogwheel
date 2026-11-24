@@ -768,6 +768,37 @@ async fn load_mosaicjson(
     Ok(cat)
 }
 
+const MAX_POST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+async fn read_limited_body<B>(body: B) -> Result<Bytes, EngineError>
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
+    use bytes::Buf;
+    let mut out = bytes::BytesMut::new();
+    tokio::pin!(body);
+    while let Some(frame_res) = body.frame().await {
+        let frame =
+            frame_res.map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?;
+        if let Ok(mut data) = frame.into_data() {
+            if out.len().saturating_add(data.remaining()) > MAX_POST_BODY_BYTES {
+                return Err(EngineError::BadRequest(format!(
+                    "request body exceeds {} MiB limit",
+                    MAX_POST_BODY_BYTES / (1024 * 1024)
+                )));
+            }
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                out.extend_from_slice(chunk);
+                let n = chunk.len();
+                data.advance(n);
+            }
+        }
+    }
+    Ok(out.freeze())
+}
+
 async fn open_query_urls(
     engine: &TileEngine,
     urls: &[String],
@@ -777,11 +808,25 @@ async fn open_query_urls(
             "missing ?url=... query parameter".to_string(),
         ));
     }
-    let mut opened = Vec::with_capacity(urls.len());
-    for u in urls {
-        opened.push(engine.store.open_uri(u).await?);
+    if urls.len() == 1 {
+        return Ok(vec![engine.store.open_uri(&urls[0]).await?]);
     }
-    Ok(opened)
+    let mut js = tokio::task::JoinSet::new();
+    for (idx, u) in urls.iter().enumerate() {
+        let store = engine.store.clone();
+        let url = u.clone();
+        js.spawn(async move { Ok::<_, cogzilla_io::IoError>((idx, store.open_uri(&url).await?)) });
+    }
+    let mut slots: Vec<Option<Arc<cogzilla_io::OpenedCog>>> = vec![None; urls.len()];
+    while let Some(res) = js.join_next().await {
+        let (idx, cog) = res.map_err(|e| {
+            EngineError::Io(cogzilla_io::IoError::Fs(std::io::Error::other(format!(
+                "open_uri task failed: {e}"
+            ))))
+        })??;
+        slots[idx] = Some(cog);
+    }
+    Ok(slots.into_iter().map(|s| s.unwrap()).collect())
 }
 
 /// Convenience entry point for serverless / embedded runtimes (such as AWS Lambda)
@@ -967,12 +1012,7 @@ where
     // ------------------------------------------------------------------------
     if method == Method::POST && path == "/mosaic/register" {
         let res: Result<(Bytes, &'static str), EngineError> = async {
-            let body_bytes = req
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                .to_bytes();
+            let body_bytes = read_limited_body(req.into_body()).await?;
             let spec: serde_json::Value = serde_json::from_slice(&body_bytes)
                 .map_err(|e| EngineError::BadRequest(format!("invalid JSON body: {e}")))?;
             let name = spec
@@ -1383,12 +1423,7 @@ where
             .await,
             (Method::POST, ["statistics"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let body_bytes = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                    .to_bytes();
+                let body_bytes = read_limited_body(req.into_body()).await?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
@@ -1713,12 +1748,7 @@ where
                     (s, s, "png")
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let body_bytes = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                    .to_bytes();
+                let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
@@ -1743,12 +1773,7 @@ where
                 let ext = feat_ext.strip_prefix("feature.").unwrap_or("png");
                 let s = pq.max_size.min(1024);
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let body_bytes = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                    .to_bytes();
+                let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
@@ -1816,12 +1841,7 @@ where
             }
             .await,
             (Method::POST, ["statistics"]) => async {
-                let body_bytes = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                    .to_bytes();
+                let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 if body_bytes.is_empty() {
                     let json =
@@ -2178,12 +2198,7 @@ where
             // 13. POST /cog/feature, /cog/feature.{format}, /cog/feature/{w}x{h}.{format}
             (Method::POST, [f]) if *f == "feature" || f.starts_with("feature.") => async {
                 let ext = f.strip_prefix("feature.").unwrap_or("png");
-                let body_bytes = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                    .to_bytes();
+                let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
@@ -2210,12 +2225,7 @@ where
                 let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected /cog/feature/{w}x{h}.{ext}".into()));
                 };
-                let body_bytes = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?
-                    .to_bytes();
+                let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
@@ -2388,21 +2398,29 @@ fn to_http_response(
                 plain_resp(StatusCode::OK, bytes, content_type)
             }
         }
-        Err(EngineError::NotFound(msg)) => {
-            plain_resp(StatusCode::NOT_FOUND, Bytes::from(msg), "text/plain")
+        Err(EngineError::Shared(inner)) => error_to_http_response(&inner),
+        Err(e) => error_to_http_response(&e),
+    }
+}
+
+fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
+    match err {
+        EngineError::Shared(inner) => error_to_http_response(inner),
+        EngineError::NotFound(msg) => {
+            plain_resp(StatusCode::NOT_FOUND, Bytes::from(msg.clone()), "text/plain")
         }
-        Err(EngineError::BadRequest(msg)) => {
-            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain")
+        EngineError::BadRequest(msg) => {
+            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg.clone()), "text/plain")
         }
         // The file is in a coordinate system this server cannot place. That is a
         // property of the requested source, not a server fault.
-        Err(EngineError::Proj(e)) => {
+        EngineError::Proj(e) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
         }
-        Err(EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_))) => {
+        EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_)) => {
             plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
         }
-        Err(e) => {
+        e => {
             tracing::warn!(error = %e, "request failed with 500");
             plain_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2421,7 +2439,15 @@ pub async fn serve(engine: Arc<TileEngine>, addr: SocketAddr) -> std::io::Result
 
 pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> std::io::Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Transient socket errors (EMFILE/ENFILE/ECONNABORTED) must never crash the server.
+                tracing::warn!(error = %e, "TCP accept error; backing off briefly");
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
         let io = TokioIo::new(stream);
         let eng = engine.clone();

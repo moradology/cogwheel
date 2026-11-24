@@ -22,7 +22,7 @@ struct ReadyEntry {
 
 struct InFlightSlot {
     notify: Notify,
-    result: std::sync::Mutex<Option<Result<CachedTile, String>>>,
+    result: std::sync::Mutex<Option<Result<CachedTile, Arc<EngineError>>>>,
 }
 
 struct InFlightGuard<'a> {
@@ -33,7 +33,7 @@ struct InFlightGuard<'a> {
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn complete(mut self, res: Result<CachedTile, String>) {
+    fn complete(mut self, res: Result<CachedTile, Arc<EngineError>>) {
         self.completed = true;
         {
             let mut lock = self.slot.result.lock().unwrap();
@@ -117,62 +117,96 @@ impl TileCache {
             return;
         }
         let stamp = self.tick();
-        if let Some(old) = self.ready.insert(
-            key,
-            ReadyEntry {
-                tile,
-                byte_len,
-                last_used: AtomicU64::new(stamp),
-            },
-        ) {
-            self.current_bytes.fetch_sub(old.byte_len, Ordering::Relaxed);
-        }
-        let now = self.current_bytes.fetch_add(byte_len, Ordering::Relaxed) + byte_len;
+        let old_len = self
+            .ready
+            .insert(
+                key,
+                ReadyEntry {
+                    tile,
+                    byte_len,
+                    last_used: AtomicU64::new(stamp),
+                },
+            )
+            .map(|old| old.byte_len)
+            .unwrap_or(0);
+
+        let now = if byte_len >= old_len {
+            let delta = byte_len - old_len;
+            self.current_bytes.fetch_add(delta, Ordering::AcqRel) + delta
+        } else {
+            let delta = old_len - byte_len;
+            self.current_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                    Some(c.saturating_sub(delta))
+                })
+                .unwrap_or(0)
+                .saturating_sub(delta)
+        };
         if now > self.max_bytes {
             self.evict_some();
         }
     }
 
     fn evict_some(&self) {
-        if self
-            .evicting
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
         loop {
-            let cur = self.current_bytes.load(Ordering::Relaxed);
-            if cur <= self.max_bytes {
-                break;
+            if self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
+                return;
             }
-            let excess = cur - self.max_bytes;
-            let target_drop = excess.max(self.max_bytes / 4);
-            let mut candidates: Vec<(u64, String, usize)> = self
-                .ready
-                .iter()
-                .map(|r| (r.last_used.load(Ordering::Relaxed), r.key().clone(), r.byte_len))
-                .collect();
-            if candidates.is_empty() {
-                break;
+            if self
+                .evicting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
             }
-            candidates.sort_unstable_by_key(|(ts, _, _)| *ts);
-            let mut dropped = 0usize;
-            for (_, k, _) in candidates {
-                if let Some((_, entry)) = self.ready.remove(&k) {
-                    self.current_bytes
-                        .fetch_sub(entry.byte_len, Ordering::Relaxed);
-                    dropped += entry.byte_len;
-                    if dropped >= target_drop {
-                        break;
+
+            let mut dropped_any = false;
+            {
+                struct Reset<'a>(&'a AtomicBool);
+                impl Drop for Reset<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = Reset(&self.evicting);
+
+                let cur = self.current_bytes.load(Ordering::Acquire);
+                if cur > self.max_bytes {
+                    let excess = cur - self.max_bytes;
+                    let target_drop = excess.max(self.max_bytes / 4);
+                    let mut candidates: Vec<(u64, String, usize)> = self
+                        .ready
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.last_used.load(Ordering::Relaxed),
+                                r.key().clone(),
+                                r.byte_len,
+                            )
+                        })
+                        .collect();
+                    candidates.sort_unstable_by_key(|(ts, _, _)| *ts);
+                    let mut dropped = 0usize;
+                    for (_, k, _) in candidates {
+                        if let Some((_, entry)) = self.ready.remove(&k) {
+                            let _ = self.current_bytes.fetch_update(
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                                |c| Some(c.saturating_sub(entry.byte_len)),
+                            );
+                            dropped += entry.byte_len;
+                            dropped_any = true;
+                            if dropped >= target_drop {
+                                break;
+                            }
+                        }
                     }
                 }
             }
-            if dropped == 0 {
-                break;
+            if !dropped_any {
+                return;
             }
         }
-        self.evicting.store(false, Ordering::Release);
     }
 
     /// Execute `render_fn` with request-level singleflight deduplication and optional LRU caching.
@@ -232,13 +266,15 @@ impl TileCache {
                                     bytes,
                                     content_type,
                                 };
-                                self.insert_ready(key, tile.clone());
+                                // Wake all singleflight waiters immediately BEFORE any LRU eviction scan.
                                 guard.complete(Ok(tile.clone()));
+                                self.insert_ready(key, tile.clone());
                                 Ok(tile)
                             }
                             Err(e) => {
-                                guard.complete(Err(e.to_string()));
-                                Err(e)
+                                let shared = Arc::new(e);
+                                guard.complete(Err(shared.clone()));
+                                Err(EngineError::Shared(shared))
                             }
                         };
                     }
@@ -253,7 +289,7 @@ impl TileCache {
 
                 // Re-check result after enabling notification to prevent lost wakeups.
                 if let Some(res) = slot.result.lock().unwrap().clone() {
-                    return res.map_err(EngineError::BadRequest);
+                    return res.map_err(EngineError::Shared);
                 }
                 // Also check if slot was already removed (cancelled owner).
                 let still_present = self
@@ -265,7 +301,7 @@ impl TileCache {
                     notified.await;
                 }
                 if let Some(res) = slot.result.lock().unwrap().clone() {
-                    return res.map_err(EngineError::BadRequest);
+                    return res.map_err(EngineError::Shared);
                 }
                 // Owner cancelled without a result: loop to retry and become the new owner.
             }

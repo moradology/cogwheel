@@ -30,6 +30,8 @@ pub enum EngineError {
     BadRequest(String),
     #[error("dataset not found: {0}")]
     NotFound(String),
+    #[error("{0}")]
+    Shared(Arc<EngineError>),
 }
 
 #[derive(Debug, Clone)]
