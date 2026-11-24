@@ -374,7 +374,7 @@ def main() -> int:
         o.check("tile past the grid edge", "status", f"/searches/{sid}/tiles/WebMercatorQuad/12/9999/1.png?assets=visual")
         o.check("tile at an impossible zoom", "status", f"/searches/{sid}/tiles/WebMercatorQuad/40/1/1?assets=visual")
         o.check("tile for an unknown search", "json", "/searches/deadbeef/tiles/WebMercatorQuad/12/1/1?assets=visual")
-        o.check("tile with an unknown asset", "status", f"{base12}?assets=nope")
+        o.check("tile with an unknown asset", "json", f"{base12}?assets=nope")
         o.check("tile for an unknown tile matrix set", "status",
                 f"/searches/{sid}/tiles/Nope/12/{t12.x}/{t12.y}?assets=visual")
         o.check("unknown route", "status", f"/searches/{sid}/nope")
@@ -460,6 +460,25 @@ def main() -> int:
         o.check("collection tile for an unknown tile matrix set", "status",
                 f"{col}/tiles/Nope/12/{t12.x}/{t12.y}?assets=visual")
         o.check("collection unknown route", "status", f"{col}/nope")
+
+        print("point values")
+        # The newest items under these points have GeoTIFF assets. Without a limit the search
+        # reaches items whose assets are JPEG 2000, which titiler-pgstac answers with a 500.
+        pt = f"{lon:.4f},{lat:.4f}"
+        mx, my = mercantile.xy(lon, lat)
+        o.check("point, newest item", "json", f"/searches/{sid}/point/{pt}?assets=visual&items_limit=1")
+        o.check("point, three items", "json", f"/searches/{sid}/point/{pt}?assets=visual&items_limit=3")
+        o.check("point, two assets", "json", f"/searches/{sid}/point/{pt}?assets=red&assets=nir&items_limit=2")
+        o.check("point, filtered search", "json", f"/searches/{sid_meta}/point/{pt}?assets=visual&items_limit=2")
+        o.check("point in Web Mercator coordinates", "json",
+                f"/searches/{sid}/point/{mx:.2f},{my:.2f}?assets=visual&items_limit=2&coord_crs=epsg:3857")
+        o.check("point outside the data", "status", f"/searches/{sid}/point/-100,10?assets=visual")
+        o.check("point without assets", "json", f"/searches/{sid}/point/{pt}")
+        o.check("point with an unknown asset", "json", f"/searches/{sid}/point/{pt}?assets=nope&items_limit=1")
+        o.check("point for an unknown search", "json", f"/searches/deadbeef/point/{pt}?assets=visual")
+        o.check("collection point", "json", f"/collections/{collection}/point/{pt}?assets=visual&items_limit=2")
+        o.check("collection point with a datetime", "json",
+                f"/collections/{collection}/point/{pt}?assets=red&items_limit=2&datetime=2024-06-01T00:00:00Z/2024-08-31T23:59:59Z")
 
         print("wmts")
         o.check("search wmts", "wmts", f"/searches/{sid}/WMTSCapabilities.xml?assets=visual")

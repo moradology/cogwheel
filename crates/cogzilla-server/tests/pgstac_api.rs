@@ -221,6 +221,20 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         let items = get_json(&client, format!("{base}/searches/{id}/{path}")).await;
         assert_eq!(items, json!([]), "{path}");
     }
+    // Point values: nothing is under the point, and the parameters are checked first.
+    for (path, status) in [
+        ("point/8.5,45.75?assets=visual", 204),
+        ("point/945000,5740000?assets=visual&coord_crs=epsg:3857", 204),
+        ("point/8.5,45.75", 422),
+        ("point/8.5,45.75?assets=visual&expression=visual_b1", 400),
+        ("point/8.5,45.75?assets=visual%7Cbidx%3D1", 400),
+        ("point/8.5,45.75?assets=visual&coord_crs=epsg:32632", 400),
+        ("point/8.5,45.75?assets=visual&items_limit=many", 422),
+        ("point/8.5?assets=visual", 404),
+    ] {
+        let resp = client.get(format!("{base}/searches/{id}/{path}")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{path}");
+    }
     for (path, status) in [
         ("bbox/6,44,8/assets", 404),
         ("point/8.5/assets", 404),
