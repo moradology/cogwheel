@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use cogzilla_kernel::{
-    ColorFormula, ColormapLut, ColormapName, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode,
-    SpectralExpr, TerrainEncoding,
+    ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram, OutputFormat,
+    ResampleMode, SpectralExpr, TerrainEncoding,
 };
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
@@ -344,7 +344,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "colormap" => {
                 let dec = percent_decode(v);
-                if dec.trim_start().starts_with('{') {
+                let trimmed = dec.trim_start();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
                     pq.custom_colormap_json = Some(dec);
                 } else if let Some(cm) = ColormapName::from_str_opt(&dec) {
                     pq.colormap = cm;
@@ -1914,7 +1915,7 @@ where
                                 let custom_lut = pq
                                     .custom_colormap_json
                                     .as_deref()
-                                    .map(ColormapLut::from_json_str)
+                                    .map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty()))
                                     .transpose()
                                     .map_err(EngineError::BadRequest)?;
                                 let cf = pq
@@ -2403,7 +2404,7 @@ where
                             let custom_lut = pq_stac
                                 .custom_colormap_json
                                 .as_deref()
-                                .map(ColormapLut::from_json_str)
+                                .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
                             let cf = pq_stac
@@ -2574,7 +2575,7 @@ where
                 let custom_lut = pq_stac
                     .custom_colormap_json
                     .as_deref()
-                    .map(ColormapLut::from_json_str)
+                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let cf = pq_stac
@@ -2615,7 +2616,7 @@ where
                 let custom_lut = pq_stac
                     .custom_colormap_json
                     .as_deref()
-                    .map(ColormapLut::from_json_str)
+                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let cf = pq_stac
@@ -2658,7 +2659,7 @@ where
                 let custom_lut = pq_stac
                     .custom_colormap_json
                     .as_deref()
-                    .map(ColormapLut::from_json_str)
+                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let cf = pq_stac
@@ -2710,7 +2711,7 @@ where
                 let custom_lut = pq_stac
                     .custom_colormap_json
                     .as_deref()
-                    .map(ColormapLut::from_json_str)
+                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let cf = pq_stac
@@ -2764,7 +2765,7 @@ where
                 let custom_lut = pq_stac
                     .custom_colormap_json
                     .as_deref()
-                    .map(ColormapLut::from_json_str)
+                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let cf = pq_stac
@@ -2808,7 +2809,7 @@ where
                 let custom_lut = pq_stac
                     .custom_colormap_json
                     .as_deref()
-                    .map(ColormapLut::from_json_str)
+                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let cf = pq_stac
@@ -3056,7 +3057,7 @@ where
                             let custom_lut = pq
                                 .custom_colormap_json
                                 .as_deref()
-                                .map(ColormapLut::from_json_str)
+                                .map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty()))
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
                             let cf = pq
@@ -3209,7 +3210,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_native_preview(
                     &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
@@ -3235,7 +3236,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_native_preview(
                     &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
@@ -3264,7 +3265,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let data = if pq.coord_crs_3857 {
@@ -3302,7 +3303,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = if pq.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
@@ -3342,7 +3343,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
@@ -3372,7 +3373,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
@@ -3734,7 +3735,7 @@ mod tests {
         assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Int16, true), (-32768.0, 32767.0));
         assert_eq!(aspect_preserving_dims([0.0, 0.0, 2.0, 1.0], 512), (512, 256));
         assert_eq!(aspect_preserving_dims([0.0, 0.0, 1.0, 4.0], 512), (128, 512));
-        let hex_lut = ColormapLut::from_json_str(r##"{"0":"#112233","255":"#ff000080"}"##).unwrap();
+        let hex_lut = cogzilla_kernel::ColormapLut::from_json_str(r##"{"0":"#112233","255":"#ff000080"}"##).unwrap();
         assert_eq!(hex_lut.rgb[0], [0x11, 0x22, 0x33]);
         assert_eq!(hex_lut.rgba_u32[255].to_le_bytes(), [0xff, 0x00, 0x00, 0x80]);
 

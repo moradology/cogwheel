@@ -12,7 +12,7 @@ pub mod webp_fast;
 
 pub use bandmath::{SpectralExpr, fast_db_from_power};
 pub use color_formula::ColorFormula;
-pub use colormap::{ColormapLut, ColormapName};
+pub use colormap::{ColormapLut, ColormapName, CustomColormap};
 pub use expr_vm::ExprProgram;
 pub use kernel::{
     DemAlgorithm, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, TerrainEncoding,
