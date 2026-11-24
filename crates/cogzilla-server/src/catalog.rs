@@ -447,17 +447,17 @@ impl MosaicJsonCatalog {
                 }
             }
         }
-        let quadkey_zoom = val
+        let raw_qk_zoom = val
             .get("quadkey_zoom")
             .and_then(|v| v.as_u64())
-            .map(|z| z as u8)
-            .or(inferred_qk_zoom)
-            .unwrap_or(minzoom);
-        if quadkey_zoom > 30 {
+            .or_else(|| inferred_qk_zoom.map(|z| z as u64))
+            .unwrap_or(minzoom as u64);
+        if raw_qk_zoom > 30 {
             return Err(format!(
-                "MosaicJSON quadkey_zoom {quadkey_zoom} exceeds maximum supported zoom 30"
+                "MosaicJSON quadkey_zoom {raw_qk_zoom} exceeds maximum supported zoom 30"
             ));
         }
+        let quadkey_zoom = raw_qk_zoom as u8;
 
         Ok(Self {
             version,
@@ -494,6 +494,9 @@ impl SceneCatalog for MosaicJsonCatalog {
         let y0 = ((ORIGIN_SHIFT - (max_y - eps)) / tile_span).floor() as i64;
         let y1 = ((ORIGIN_SHIFT - (min_y + eps)) / tile_span).floor() as i64;
         let max_idx = (1i64 << qz) - 1;
+        if x1 < 0 || x0 > max_idx || y1 < 0 || y0 > max_idx {
+            return Vec::new();
+        }
         let cx0 = x0.clamp(0, max_idx) as u32;
         let cx1 = x1.clamp(0, max_idx) as u32;
         let cy0 = y0.clamp(0, max_idx) as u32;
@@ -529,6 +532,9 @@ impl SceneCatalog for MosaicJsonCatalog {
                 .tiles
                 .iter()
                 .filter_map(|(qk, urls)| {
+                    if qk.len() != qz as usize {
+                        return None;
+                    }
                     let (tx, ty) = quadkey_to_tile(qk)?;
                     if tx >= cx0 && tx <= cx1 && ty >= cy0 && ty <= cy1 {
                         Some((qk.as_str(), urls))

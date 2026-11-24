@@ -588,10 +588,10 @@ impl<const N: usize> CoordPlan<N> {
                 _ => unreachable!(),
             }
 
-            // Include +/- 1 pixel margin for bilinear neighbors
-            let src_min_col = (min_u.floor() as i32).max(0);
+            // Include +/- 1 pixel margin for bilinear/cubic neighbor lookups across block seams
+            let src_min_col = (min_u.floor() as i32 - 1).max(0);
             let src_max_col = ((max_u.ceil() as i32) + 1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32).max(0);
+            let src_min_row = (min_v.floor() as i32 - 1).max(0);
             let src_max_row = ((max_v.ceil() as i32) + 1).min(ifd_h as i32 - 1);
 
             if max_u < -0.5 || min_u > (ifd_w as f32 - 0.5) || max_v < -0.5 || min_v > (ifd_h as f32 - 0.5) {
@@ -615,7 +615,7 @@ impl<const N: usize> CoordPlan<N> {
                 src_max_row,
                 all_in_bounds,
             })
-        } else if tile.z <= 8 {
+        } else if tile.z <= 8 || (tile.x as u64) + 1 >= (1u64 << tile.z.min(30)) {
             // Low-zoom projected tile (z=0..8): adaptive error-bounded quadtree subdivision.
             // Subdivides wherever projection curvature exceeds 0.05 source pixels or hits a
             // domain boundary (poles / antimeridian), skips empty out-of-bounds cells in O(1),

@@ -1660,7 +1660,7 @@ fn aligned_passthrough_tile_coord<const N: usize>(
     nodata: Option<f32>,
     req: &TileRequest,
 ) -> Option<(u32, u32)> {
-    if !matches!(crs, CrsModel::Epsg3857) {
+    if !matches!(crs, CrsModel::Epsg3857) || req.unscale {
         return None;
     }
     if ifd.is_stripped

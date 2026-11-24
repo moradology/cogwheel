@@ -90,7 +90,10 @@ fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
     // Handle `minx,miny,maxx,maxy.png` or `minx,miny,maxx,maxy`
     let (coords_str, ext) = if let Some(dot) = seg.rfind('.') {
         let after = &seg[dot + 1..];
-        if matches!(after, "png" | "webp" | "f32" | "bin" | "raw" | "jpg" | "jpeg") {
+        if matches!(
+            after,
+            "png" | "webp" | "f32" | "bin" | "raw" | "npy" | "jpg" | "jpeg"
+        ) {
             (&seg[..dot], Some(after))
         } else {
             (seg, None)
@@ -868,9 +871,11 @@ where
     }
     if is_head {
         let (mut parts, body) = resp.into_parts();
-        if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
-            if let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
-                parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
+        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT {
+            if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
+                if let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
+                    parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
+                }
             }
         }
         return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
@@ -898,8 +903,19 @@ where
         .unwrap_or_else(|| "http".to_string());
     let host_raw = req
         .headers()
-        .get("host")
+        .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            req.headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("127.0.0.1:8080");
     let host = format!("{proto}://{host_raw}");
     let if_none_match = req
@@ -1662,7 +1678,8 @@ where
                         let needs_general = tms == "WorldCRS84Quad"
                             || pq_stac.buffer > 0
                             || pq_stac.nodata.is_some()
-                            || pq_stac.custom_colormap_json.is_some();
+                            || pq_stac.custom_colormap_json.is_some()
+                            || (treq.tile_size != 256 && treq.tile_size != 512);
                         if needs_general {
                             let custom_lut = pq_stac
                                 .custom_colormap_json
@@ -2217,7 +2234,8 @@ where
                         let needs_general_path = tms == "WorldCRS84Quad"
                             || pq.buffer > 0
                             || pq.nodata.is_some()
-                            || pq.custom_colormap_json.is_some();
+                            || pq.custom_colormap_json.is_some()
+                            || (treq.tile_size != 256 && treq.tile_size != 512);
 
                         if needs_general_path {
                             let custom_lut = pq

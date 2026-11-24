@@ -87,13 +87,28 @@ impl S3Config {
             .map(|v| v.trim().eq_ignore_ascii_case("requester"))
             .unwrap_or(false);
         let region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string());
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_DEFAULT_REGION")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "us-east-1".to_string());
 
         // Support both standard AWS_ENDPOINT_URL and GDAL's AWS_S3_ENDPOINT
         let endpoint_url = std::env::var("AWS_ENDPOINT_URL")
-            .or_else(|_| std::env::var("AWS_S3_ENDPOINT"))
             .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_S3_ENDPOINT")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
             .map(|ep| {
                 if ep.starts_with("http://") || ep.starts_with("https://") {
                     ep
@@ -104,7 +119,11 @@ impl S3Config {
                 }
             });
 
-        let force_path_style = env_falsy("AWS_VIRTUAL_HOSTING") || endpoint_url.is_some();
+        let force_path_style = if env_truthy("AWS_VIRTUAL_HOSTING") {
+            false
+        } else {
+            env_falsy("AWS_VIRTUAL_HOSTING") || endpoint_url.is_some()
+        };
 
         let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
             .or_else(|_| std::env::var("AWS_MAX_ATTEMPTS"))
