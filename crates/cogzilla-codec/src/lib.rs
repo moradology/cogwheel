@@ -61,6 +61,10 @@ thread_local! {
     static CODEC_STATE: RefCell<ThreadCodecState> = RefCell::new(ThreadCodecState::new());
 }
 
+/// Hard upper bound on a single decoded TIFF tile/strip (128 MiB) to prevent integer wrap
+/// overflows and zip-bomb OOMs on hostile remote GeoTIFFs.
+const MAX_DECODED_TILE_BYTES: usize = 128 * 1024 * 1024;
+
 /// Decompress and reconstruct a single internal COG tile into planar 64-byte-aligned `f32` bands
 /// with precomputed `BlockStats`, reusing thread-local codec contexts and scratch memory.
 pub fn decode_tile(
@@ -74,16 +78,21 @@ pub fn decode_tile(
         PlanarConfig::Planar => 1,
     };
     let expected_bytes = (ifd.tile_width as usize)
-        * (ifd.tile_height as usize)
-        * bands_in_tile
-        * ifd.sample_type.bytes_per_sample();
+        .checked_mul(ifd.tile_height as usize)
+        .and_then(|n| n.checked_mul(bands_in_tile))
+        .and_then(|n| n.checked_mul(ifd.sample_type.bytes_per_sample()))
+        .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+        .ok_or(CodecError::SizeMismatch {
+            expected: MAX_DECODED_TILE_BYTES,
+            got: compressed.len(),
+        })?;
 
     // Fast path: Uncompressed + Predictor::None avoids touching thread-local scratch completely!
     if ifd.compression == Compression::None
         && ifd.predictor == Predictor::None
         && compressed.len() >= expected_bytes
     {
-        let bands = match ifd.sample_type {
+        let mut bands = match ifd.sample_type {
             SampleType::Float32 => predictor::reconstruct_predictor1(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
@@ -159,12 +168,22 @@ pub fn decode_tile(
                 )
             }
         };
+        apply_rgba_alpha_if_present(&mut bands, ifd);
         return Ok(DecodedTile { bands });
     }
 
     CODEC_STATE.with(|cell| {
+        struct ScratchShrinkGuard<'a>(&'a mut ThreadCodecState);
+        impl Drop for ScratchShrinkGuard<'_> {
+            fn drop(&mut self) {
+                if self.0.scratch.capacity() > 4 * 1024 * 1024 {
+                    self.0.scratch = Vec::with_capacity(512 * 512 * 4);
+                }
+            }
+        }
         let mut guard = cell.borrow_mut();
-        let st = &mut *guard;
+        let st_guard = ScratchShrinkGuard(&mut *guard);
+        let st = &mut *st_guard.0;
         if st.scratch.len() < expected_bytes {
             st.scratch.resize(expected_bytes, 0);
         }
@@ -188,11 +207,15 @@ pub fn decode_tile(
             }
             Compression::Deflate => {
                 // TIFF Adobe Deflate (code 8 / 32946) uses zlib framing; fall back to raw deflate if needed.
-                let res = st.deflate.zlib_decompress(compressed, raw_slice);
-                if let Err(e1) = res {
-                    st.deflate
+                let written = match st.deflate.zlib_decompress(compressed, raw_slice) {
+                    Ok(n) => n,
+                    Err(e1) => st
+                        .deflate
                         .deflate_decompress(compressed, raw_slice)
-                        .map_err(|_| CodecError::Deflate(format!("{e1:?}")))?;
+                        .map_err(|_| CodecError::Deflate(format!("{e1:?}")))?,
+                };
+                if written < expected_bytes {
+                    raw_slice[written..].fill(0);
                 }
             }
             Compression::Zstd => {
@@ -208,9 +231,15 @@ pub fn decode_tile(
                 if unsafe { zstd_sys::ZSTD_isError(code) } != 0 {
                     return Err(CodecError::Zstd(code));
                 }
+                if code < expected_bytes {
+                    raw_slice[code..].fill(0);
+                }
             }
             Compression::Lzw => {
-                st.lzw.decode(compressed, raw_slice)?;
+                let written = st.lzw.decode(compressed, raw_slice)?;
+                if written < expected_bytes {
+                    raw_slice[written..].fill(0);
+                }
             }
             Compression::Jpeg => {
                 // Merge shared TIFF JPEGTables (tag 347) with abbreviated tile bitstream if present
@@ -245,7 +274,10 @@ pub fn decode_tile(
                     (3, 2) => ColorSpace::YCbCr,
                     _ => ColorSpace::RGB,
                 };
-                let opts = DecoderOptions::default().jpeg_set_out_colorspace(out_cs);
+                let opts = DecoderOptions::default()
+                    .jpeg_set_out_colorspace(out_cs)
+                    .set_max_width(ifd.tile_width as usize)
+                    .set_max_height(ifd.tile_height as usize);
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(jpeg_bytes, opts);
                 let pixels = dec
                     .decode()
@@ -391,10 +423,6 @@ pub fn decode_tile(
         };
 
         apply_rgba_alpha_if_present(&mut bands, ifd);
-        // Prevent a single pathological >4 MiB block from permanently pinning huge TLS scratch.
-        if st.scratch.capacity() > 4 * 1024 * 1024 {
-            st.scratch = Vec::with_capacity(512 * 512 * 4);
-        }
         Ok(DecodedTile { bands })
     })
 }
@@ -448,7 +476,13 @@ pub fn decode_mask_tile(compressed: &[u8], mask: &MaskIfdMeta) -> Result<Vec<u8>
     } else {
         w
     };
-    let expected = row_bytes * h;
+    let expected = row_bytes
+        .checked_mul(h)
+        .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+        .ok_or(CodecError::SizeMismatch {
+            expected: MAX_DECODED_TILE_BYTES,
+            got: compressed.len(),
+        })?;
 
     let raw: Vec<u8> = CODEC_STATE.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -531,5 +565,50 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
         }
         b.stats.all_nodata = all_nd;
         b.stats.no_nodata = no_nd;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cogzilla_tiff::Affine2D;
+
+    #[test]
+    fn hostile_tile_dimension_overflow_is_rejected_without_allocation() {
+        // 2_147_418_113 * 2_147_549_185 * 1 * 4 wraps mod 2^64 to 4 bytes in release mode!
+        let ident = Affine2D {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+            e: 1.0,
+            f: 0.0,
+        };
+        let ifd = IfdMeta {
+            width: 2_147_418_113,
+            height: 2_147_549_185,
+            tile_width: 2_147_418_113,
+            tile_height: 2_147_549_185,
+            tiles_across: 1,
+            tiles_down: 1,
+            samples_per_pixel: 1,
+            sample_type: SampleType::Float32,
+            compression: Compression::None,
+            predictor: Predictor::None,
+            planar_config: PlanarConfig::Chunky,
+            photometric: 1,
+            extra_samples: Vec::new(),
+            is_stripped: false,
+            tile_offsets: Box::new([0]),
+            tile_byte_counts: Box::new([4]),
+            jpeg_tables: None,
+            mask_ifd: None,
+            pixel_to_crs: ident,
+            crs_to_pixel: ident,
+        };
+        assert!(matches!(
+            decode_tile(&[0u8; 4], &ifd, ByteOrder::Little, None),
+            Err(CodecError::SizeMismatch { .. })
+        ));
     }
 }

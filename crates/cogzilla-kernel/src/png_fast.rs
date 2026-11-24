@@ -279,6 +279,9 @@ pub fn encode_filtered_png(width: u32, height: u32, color_type: u8, filtered: &[
         write_chunk(&mut out, *b"IHDR", &ihdr);
         write_chunk(&mut out, *b"IDAT", &enc.zlib_buf[..written]);
         out.put_slice(&PNG_IEND);
+        if enc.zlib_buf.capacity() > 4 * 1024 * 1024 {
+            enc.zlib_buf = Vec::with_capacity(512 * 1024);
+        }
         out.freeze()
     })
 }

@@ -3,6 +3,10 @@ use crate::types::{
     Predictor, SampleType, TiffError,
 };
 
+// Defensive parser caps against hostile BigTIFF/TIFF overflows and OOMs
+const MAX_IFD_ENTRIES: u64 = 65_536;
+const MAX_TAG_ARRAY_BYTES: u64 = 32 * 1024 * 1024;
+
 // TIFF Tag IDs
 const TAG_NEW_SUBFILE_TYPE: u16 = 254;
 const TAG_IMAGE_WIDTH: u16 = 256;
@@ -140,8 +144,13 @@ impl TagEntry {
         if self.ty != TYPE_SHORT {
             return Err(TiffError::Corrupt("expected SHORT array"));
         }
+        let total = self
+            .count
+            .checked_mul(2)
+            .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
+            .ok_or(TiffError::Corrupt("SHORT array size overflow"))?;
         let n = self.count as usize;
-        let _ = r.need(self.value_offset, self.count * 2)?;
+        let _ = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             out.push(r.u16_at(self.value_offset + (i as u64) * 2)?);
@@ -150,9 +159,14 @@ impl TagEntry {
     }
 
     fn read_u64_vec(&self, r: &Reader<'_>) -> Result<Box<[u64]>, TiffError> {
-        let n = self.count as usize;
         let elem_sz = type_size(self.ty).ok_or(TiffError::Corrupt("unknown tag type"))?;
-        let _ = r.need(self.value_offset, self.count * elem_sz)?;
+        let total = self
+            .count
+            .checked_mul(elem_sz)
+            .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
+            .ok_or(TiffError::Corrupt("integer array size overflow"))?;
+        let n = self.count as usize;
+        let _ = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
         match self.ty {
             TYPE_SHORT => {
@@ -176,9 +190,14 @@ impl TagEntry {
     }
 
     fn read_u32_vec(&self, r: &Reader<'_>) -> Result<Box<[u32]>, TiffError> {
-        let n = self.count as usize;
         let elem_sz = type_size(self.ty).ok_or(TiffError::Corrupt("unknown tag type"))?;
-        let _ = r.need(self.value_offset, self.count * elem_sz)?;
+        let total = self
+            .count
+            .checked_mul(elem_sz)
+            .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
+            .ok_or(TiffError::Corrupt("byte count array size overflow"))?;
+        let n = self.count as usize;
+        let _ = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
         match self.ty {
             TYPE_SHORT => {
@@ -209,8 +228,13 @@ impl TagEntry {
         if self.ty != TYPE_DOUBLE {
             return Err(TiffError::Corrupt("expected DOUBLE array"));
         }
+        let total = self
+            .count
+            .checked_mul(8)
+            .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
+            .ok_or(TiffError::Corrupt("DOUBLE array size overflow"))?;
         let n = self.count as usize;
-        let _ = r.need(self.value_offset, self.count * 8)?;
+        let _ = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             out.push(r.f64_at(self.value_offset + (i as u64) * 8)?);
@@ -219,12 +243,18 @@ impl TagEntry {
     }
 
     fn read_ascii(&self, r: &Reader<'_>) -> Result<String, TiffError> {
+        if self.count > MAX_TAG_ARRAY_BYTES {
+            return Err(TiffError::Corrupt("ASCII tag exceeds max size"));
+        }
         let bytes = r.need(self.value_offset, self.count)?;
         let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
         Ok(String::from_utf8_lossy(trimmed).trim().to_string())
     }
 
     fn read_bytes(&self, r: &Reader<'_>) -> Result<Box<[u8]>, TiffError> {
+        if self.count > MAX_TAG_ARRAY_BYTES {
+            return Err(TiffError::Corrupt("byte tag exceeds max size"));
+        }
         let bytes = r.need(self.value_offset, self.count)?;
         Ok(bytes.to_vec().into_boxed_slice())
     }
@@ -300,9 +330,21 @@ fn parse_ifd_entries(
         (n, ifd_offset + 2, 12u64, 4u64)
     };
 
-    let next_ifd_pos = entries_start + num_entries * entry_size;
+    if num_entries > MAX_IFD_ENTRIES {
+        return Err(TiffError::Corrupt("IFD entry count exceeds limit"));
+    }
+    let entries_bytes = num_entries
+        .checked_mul(entry_size)
+        .ok_or(TiffError::Corrupt("IFD entries byte size overflow"))?;
+    let next_ifd_pos = entries_start
+        .checked_add(entries_bytes)
+        .ok_or(TiffError::Corrupt("IFD offset overflow"))?;
     let next_ifd_size = if is_bigtiff { 8u64 } else { 4u64 };
-    let _ = r.need(ifd_offset, (next_ifd_pos - ifd_offset) + next_ifd_size)?;
+    let total_ifd_bytes = next_ifd_pos
+        .checked_sub(ifd_offset)
+        .and_then(|d| d.checked_add(next_ifd_size))
+        .ok_or(TiffError::Corrupt("IFD size overflow"))?;
+    let _ = r.need(ifd_offset, total_ifd_bytes)?;
 
     let mut entries = Vec::with_capacity(num_entries as usize);
     for i in 0..num_entries {
@@ -539,6 +581,10 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             }
         };
 
+        if width == 0 || height == 0 || samples_per_pixel == 0 {
+            return Err(TiffError::Corrupt("IFD has zero width, height, or samples_per_pixel"));
+        }
+
         let (tile_width, tile_height, tile_offsets, tile_byte_counts, is_stripped) =
             if tile_width > 0 && tile_height > 0 {
                 let to = tile_offsets.ok_or(TiffError::NotTiled)?;
@@ -557,6 +603,19 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
 
         let tiles_across = width.div_ceil(tile_width);
         let tiles_down = height.div_ceil(tile_height);
+        let planes: u64 = match planar_config {
+            PlanarConfig::Chunky => 1,
+            PlanarConfig::Planar => samples_per_pixel as u64,
+        };
+        let expected_tiles = (tiles_across as u64)
+            .checked_mul(tiles_down as u64)
+            .and_then(|n| n.checked_mul(planes))
+            .ok_or(TiffError::Corrupt("tile grid count overflow"))?;
+        if (tile_offsets.len() as u64) < expected_tiles
+            || (tile_byte_counts.len() as u64) < expected_tiles
+        {
+            return Err(TiffError::Corrupt("truncated tile/strip offset or byte-count table"));
+        }
 
         let pixel_to_crs = if ifds.is_empty() {
             if let Some(rk) = raw_geo_keys {
@@ -566,13 +625,20 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                 if m.len() < 16 {
                     return Err(TiffError::MissingGeoTransform);
                 }
+                let mut c = m[3];
+                let mut f = m[7];
+                // PixelIsPoint (GTRasterTypeGeoKey == 2) shifts origin by half pixel along both axes
+                if geo_keys.raster_type == Some(2) {
+                    c -= 0.5 * (m[0] + m[1]);
+                    f -= 0.5 * (m[4] + m[5]);
+                }
                 Affine2D {
                     a: m[0],
                     b: m[1],
-                    c: m[3],
+                    c,
                     d: m[4],
                     e: m[5],
-                    f: m[7],
+                    f,
                 }
             } else if let (Some(ps), Some(tp)) = (pixel_scale, tiepoint) {
                 if ps.len() < 2 || tp.len() < 6 {
@@ -717,5 +783,26 @@ fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostile_bigtiff_num_entries_overflow_is_rejected_cleanly() {
+        // 32-byte BigTIFF header pointing to IFD at offset 16 with num_entries = 1 << 62
+        // (formerly wrapped `num_entries * 20 == 0` in release and aborted in Vec::with_capacity).
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(b"II"); // little-endian
+        buf.extend_from_slice(&43u16.to_le_bytes()); // BigTIFF
+        buf.extend_from_slice(&8u16.to_le_bytes()); // offset byte size
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        buf.extend_from_slice(&16u64.to_le_bytes()); // first IFD offset
+        buf.extend_from_slice(&(1u64 << 62).to_le_bytes()); // overflowing num_entries
+        buf.extend_from_slice(&0u64.to_le_bytes()); // next IFD
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(matches!(err, TiffError::Corrupt(_)), "got {err:?}");
     }
 }

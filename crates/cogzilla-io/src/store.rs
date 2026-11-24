@@ -378,14 +378,25 @@ impl CogStore {
                 | CogSource::RemoteHttp { .. }
                 | CogSource::RemoteGcs { .. }
                 | CogSource::RemoteAzure { .. } => {
-                    // Speculative 128 KiB single-RTT header read; at most 1 follow-up if IFDs spill past 128 KiB
+                    // Speculative 128 KiB single-RTT header read; bounded at 32 MiB to prevent
+                    // crafted non-COG / BigTIFF offsets from causing OOM or u64 overflow.
+                    const MAX_HEADER_FETCH_BYTES: u64 = 32 * 1024 * 1024;
                     let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
                     loop {
                         match parse_cog(&hdr) {
                             Ok(idx) => break idx,
                             Err(TiffError::NeedMoreBytes { required, .. }) => {
                                 let cur_len = hdr.len() as u64;
-                                let target = ((required + 65535) / 65536) * 65536;
+                                if required > MAX_HEADER_FETCH_BYTES {
+                                    return Err(IoError::Tiff(TiffError::Corrupt(
+                                        "TIFF header/IFD exceeds 32 MiB limit",
+                                    )));
+                                }
+                                let target = required
+                                    .checked_add(65535)
+                                    .map(|v| (v / 65536) * 65536)
+                                    .unwrap_or(MAX_HEADER_FETCH_BYTES)
+                                    .min(MAX_HEADER_FETCH_BYTES);
                                 if target <= cur_len {
                                     return Err(IoError::Tiff(TiffError::NeedMoreBytes {
                                         required,
