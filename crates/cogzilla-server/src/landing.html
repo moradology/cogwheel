@@ -126,7 +126,7 @@
     <div><b id="s-median">–</b><span>median, last 24 tiles</span></div>
     <div><b id="s-count">0</b><span>tiles loaded</span></div>
   </div>
-  <div id="point-hud"><span>Click map to sample live <code>/cog/point</code> or <code>/stac/point</code></span></div>
+  <div id="point-hud">Click the map to sample raw source bands.</div>
 </div>
 
 <script>
@@ -134,13 +134,19 @@ const DEM = 'https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N
 const S2 = 'https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A';
 const S2_STAC = S2 + '/S2A_13TEE_20240929_0_L2A.json';
 const RAINIER = { center: [-121.76, 46.853], zoom: 11 };
-const ELEV_ZONES_CMAP = encodeURIComponent(JSON.stringify({
-  '0': [35, 85, 130, 255],
-  '64': [65, 140, 80, 255],
-  '128': [175, 165, 95, 255],
-  '192': [155, 125, 105, 255],
-  '255': [245, 248, 255, 255],
-}));
+const ELEV_ZONE_COLORS = [
+  [35, 85, 130, 255],
+  [65, 140, 80, 255],
+  [175, 165, 95, 255],
+  [155, 125, 105, 255],
+  [245, 248, 255, 255],
+];
+// The JSON colormap is a discrete lookup table. Fill every rescaled index.
+const ELEV_ZONES_CMAP = encodeURIComponent(JSON.stringify(Object.fromEntries(
+  Array.from({ length: 256 }, (_, index) => [
+    index, ELEV_ZONE_COLORS[Math.floor(index * ELEV_ZONE_COLORS.length / 256)],
+  ]),
+)));
 
 const DEMOS = [
   { name: 'Hillshade', desc: 'Mt. Rainier, Copernicus 30 m DEM', urls: [DEM],
@@ -163,7 +169,7 @@ const DEMOS = [
     kind: 'stac', urls: [S2_STAC],
     params: 'assets=nir&assets=red&assets=green&rescale=0,4000&color_formula=Gamma+RGB+1.4+Saturation+1.25' },
   { name: 'STAC expression VM (NDWI)', desc: '/stac (green-nir)/(green+nir) water index',
-    kind: 'stac', urls: [S2_STAC],
+    kind: 'stac', urls: [S2_STAC], pointAssets: ['green', 'nir'],
     params: 'expression=(green-nir)/(green+nir)&rescale=-0.5,0.5&colormap_name=rdbu' },
   { name: 'Multi-COG algebraic EVI', desc: '3-file expression VM: 2.5*(b1-b2)/(b1+6*b2-7.5*b3+10000)',
     urls: [S2 + '/B08.tif', S2 + '/B04.tif', S2 + '/B02.tif'],
@@ -193,7 +199,12 @@ map.on('error', (e) => {
 
 // Tile timings for the current layer, from the browser's resource timing.
 let times = [];
-const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+let tileTemplates = new Set();
+let tilesStartedAt = 0;
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2;
+}
 const WINDOW = 24;
 function showTimes() {
   const recent = times.slice(-WINDOW);
@@ -203,10 +214,11 @@ function showTimes() {
 }
 new PerformanceObserver((list) => {
   for (const e of list.getEntries()) {
-    // transferSize 0 means the browser answered from its own cache.
-    if ((e.name.includes('/cog/tiles/') || e.name.includes('/stac/tiles/')) && e.transferSize > 0) {
-      times.push(e.duration);
-    }
+    // A zero transfer size means the browser served the tile from its own cache.
+    if (e.startTime < tilesStartedAt || !e.transferSize || e.responseStatus >= 400) continue;
+    const url = new URL(e.name);
+    url.pathname = url.pathname.replace(/\/\d+\/\d+\/\d+(?=(?:\.[^/]+)?$)/, '/{z}/{x}/{y}');
+    if (tileTemplates.has(url.href)) times.push(e.duration);
   }
   showTimes();
 }).observe({ type: 'resource', buffered: false });
@@ -229,9 +241,9 @@ async function tilejson(urls, params, kind) {
 
 let generation = 0;
 let activeLayer = null;
+let pointRequest = 0;
 async function show(layer, button) {
   const mine = ++generation;
-  activeLayer = layer;
   status('');
   document.querySelectorAll('.demo').forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
   try {
@@ -243,7 +255,12 @@ async function show(layer, button) {
     if (map.getLayer('cog')) map.removeLayer('cog');
     for (const id of ['cog', 'dem']) if (map.getSource(id)) map.removeSource(id);
     times = [];
+    tilesStartedAt = performance.now();
+    tileTemplates = new Set([...tj.tiles, ...(dem?.tiles || [])].map(url => new URL(url, location.href).href));
     showTimes();
+    activeLayer = layer;
+    pointRequest++;
+    $('point-hud').textContent = 'Click the map to sample raw source bands.';
 
     map.addSource('cog', { type: 'raster', tiles: tj.tiles, tileSize: 256, bounds: tj.bounds,
                            minzoom: tj.minzoom, maxzoom: Math.max(tj.maxzoom, 14) });
@@ -288,30 +305,35 @@ $('custom').addEventListener('submit', (ev) => {
 });
 
 map.on('click', async (ev) => {
-  if (!activeLayer || !activeLayer.urls || !activeLayer.urls.length) return;
+  const layer = activeLayer;
+  if (!layer) return;
+  const request = ++pointRequest;
   const lon = ev.lngLat.lng.toFixed(5);
   const lat = ev.lngLat.lat.toFixed(5);
   const hud = $('point-hud');
-  const isStac = activeLayer.kind === 'stac';
-  const endpoint = isStac
-    ? `/stac/point/${lon},${lat}?url=${encodeURIComponent(activeLayer.urls[0])}&assets=red&assets=green&assets=nir`
-    : `/cog/point/${lon},${lat}?url=${encodeURIComponent(activeLayer.urls[0])}`;
+  const isStac = layer.kind === 'stac';
+  const assets = layer.pointAssets || new URLSearchParams(layer.params).getAll('assets');
+  const pointParams = new URLSearchParams();
+  assets.forEach(asset => pointParams.append('assets', asset));
   const t0 = performance.now();
+  hud.textContent = 'Sampling raw source bands…';
   try {
-    const r = await fetch(endpoint);
+    const samples = await Promise.all(layer.urls.map(async (url) => {
+      const path = isStac ? '/stac/point' : '/cog/point';
+      const r = await fetch(`${path}/${lon},${lat}?${query([url], pointParams.toString())}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    }));
+    if (request !== pointRequest || layer !== activeLayer) return;
+    const pairs = samples.flatMap((data, source) => (data.band_names || []).map((name, i) => {
+      const label = samples.length > 1 ? `COG ${source + 1} ${name}` : name;
+      const value = data.values?.[i];
+      return `${label}=${value == null ? 'nodata' : Number(value).toFixed(2)}`;
+    })).join('  ');
     const dt = (performance.now() - t0).toFixed(1);
-    if (!r.ok) {
-      hud.textContent = `(${lon}, ${lat}) -> HTTP ${r.status} (${dt} ms)`;
-      return;
-    }
-    const data = await r.json();
-    const pairs = (data.band_names || []).map((name, i) => {
-      const v = data.values && data.values[i];
-      return `${name}=${v === null || v === undefined ? 'nodata' : Number(v).toFixed(2)}`;
-    }).join('  ');
-    hud.textContent = `${isStac ? '/stac/point' : '/cog/point'} (${lon}, ${lat})  ${pairs}  [${dt} ms]`;
+    hud.textContent = `Raw source bands (${lon}, ${lat})  ${pairs}  [${dt} ms]`;
   } catch (err) {
-    hud.textContent = `point query failed: ${err.message}`;
+    if (request === pointRequest && layer === activeLayer) hud.textContent = `Point query failed: ${err.message}`;
   }
 });
 
