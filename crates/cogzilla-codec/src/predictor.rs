@@ -2033,6 +2033,61 @@ pub fn reconstruct_int32(
         .collect()
 }
 
+/// Zero-copy `float64` (`Predictor::None`) decode directly from an immutable slice.
+pub fn reconstruct_f64_uncompressed(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let pixels = (tile_w as usize) * (tile_h as usize);
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    for i in 0..pixels {
+        for b in 0..bands_in_tile {
+            let off = (i * bands_in_tile + b) * 8;
+            let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
+            let vf = match byte_order {
+                ByteOrder::Little => f64::from_le_bytes(bytes) as f32,
+                ByteOrder::Big => f64::from_be_bytes(bytes) as f32,
+            };
+            let (v, is_nd) = check_val(vf, finite_nodata);
+            slabs[b][i] = v;
+            if is_nd {
+                any_nodata[b] = true;
+            } else {
+                any_valid[b] = true;
+                if v < min_val[b] {
+                    min_val[b] = v;
+                }
+                if v > max_val[b] {
+                    max_val[b] = v;
+                }
+            }
+        }
+    }
+
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data: BandData::F32(data),
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
 /// Reconstruct `float64` (Predictor 1, Predictor 2, or 8-plane Predictor 3) -> `AlignedF32Slab`.
 pub fn reconstruct_f64(
     raw: &mut [u8],

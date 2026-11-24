@@ -101,7 +101,7 @@ pub struct TileRequest {
 /// algorithms, terrain encodings, spectral indices, SAR dB, and custom band-math expressions.
 #[inline]
 pub(crate) fn needs_source_unscale(bands: &BandRequest, format: OutputFormat) -> bool {
-    format == OutputFormat::RawF32
+    matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
         || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
 }
 
@@ -240,6 +240,29 @@ impl TileEngine {
         req: &TileRequest,
     ) -> Result<Bytes, EngineError> {
         self.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
+        if req.format == OutputFormat::Npy {
+            let mut raw_req = req.clone();
+            raw_req.format = OutputFormat::RawF32;
+            let raw = match raw_req.tile_size {
+                256 => self.render_tile_sized::<256>(cog, &raw_req).await?,
+                512 => self.render_tile_sized::<512>(cog, &raw_req).await?,
+                other => {
+                    return Err(EngineError::BadRequest(format!(
+                        "unsupported tile_size={other}, expected 256 or 512"
+                    )));
+                }
+            };
+            let nb = match req.bands {
+                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                _ => 1,
+            };
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
+                raw,
+                nb,
+                req.tile_size,
+                req.tile_size,
+            ));
+        }
         match req.tile_size {
             256 => self.render_tile_sized::<256>(cog, req).await,
             512 => self.render_tile_sized::<512>(cog, req).await,
@@ -285,8 +308,18 @@ impl TileEngine {
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
         };
 
-        let (tx0, tx1, ty0, ty1) =
-            plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down);
+        let (tx0, tx1, ty0, ty1) = if matches!(req.bands, BandRequest::Dem { .. }) {
+            let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+            let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
+            let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
+                .min(ifd.tiles_across.saturating_sub(1));
+            let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
+            let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
+                .min(ifd.tiles_down.saturating_sub(1));
+            (d_tx0, d_tx1, d_ty0, d_ty1)
+        } else {
+            plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down)
+        };
         let grid_w = tx1 - tx0 + 1;
         let grid_h = ty1 - ty0 + 1;
         let grid_len = (grid_w * grid_h) as usize;
@@ -1172,6 +1205,29 @@ impl TileEngine {
             return self.render_tile(&cogs[0], req).await;
         }
         self.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
+        if req.format == OutputFormat::Npy {
+            let mut raw_req = req.clone();
+            raw_req.format = OutputFormat::RawF32;
+            let raw = match raw_req.tile_size {
+                256 => self.render_multi_cog_sized::<256>(cogs, &raw_req).await?,
+                512 => self.render_multi_cog_sized::<512>(cogs, &raw_req).await?,
+                other => {
+                    return Err(EngineError::BadRequest(format!(
+                        "unsupported tile_size={other}, expected 256 or 512"
+                    )));
+                }
+            };
+            let nb = match req.bands {
+                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                _ => 1,
+            };
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
+                raw,
+                nb,
+                req.tile_size,
+                req.tile_size,
+            ));
+        }
         match req.tile_size {
             256 => self.render_multi_cog_sized::<256>(cogs, req).await,
             512 => self.render_multi_cog_sized::<512>(cogs, req).await,
@@ -1214,8 +1270,18 @@ impl TileEngine {
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
         };
 
-        let (tx0, tx1, ty0, ty1) =
-            plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down);
+        let (tx0, tx1, ty0, ty1) = if matches!(req.bands, BandRequest::Dem { .. }) {
+            let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+            let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
+            let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
+                .min(ifd.tiles_across.saturating_sub(1));
+            let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
+            let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
+                .min(ifd.tiles_down.saturating_sub(1));
+            (d_tx0, d_tx1, d_ty0, d_ty1)
+        } else {
+            plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down)
+        };
         let grid_w = tx1 - tx0 + 1;
         let grid_h = ty1 - ty0 + 1;
         let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
@@ -1470,9 +1536,9 @@ impl TileEngine {
             _ => 1,
         };
 
-        // RawF32 mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
+        // RawF32 / Npy mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
         // and early exit once every pixel has valid data.
-        if req.format == OutputFormat::RawF32 {
+        if matches!(req.format, OutputFormat::RawF32 | OutputFormat::Npy) {
             let mut canvas = vec![f32::NAN; f32_bands * total_pixels];
             let mut filled = 0usize;
             let mut scene_req = req.clone();
@@ -1519,7 +1585,20 @@ impl TileEngine {
             if filled == 0 {
                 return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
             }
-            let mut out = bytes::BytesMut::with_capacity(f32_bands * total_pixels * 4);
+            let hdr = if req.format == OutputFormat::Npy {
+                Some(cogzilla_kernel::encode_npy_f32_header(
+                    f32_bands,
+                    req.tile_size,
+                    req.tile_size,
+                ))
+            } else {
+                None
+            };
+            let hdr_len = hdr.as_ref().map_or(0, |h| h.len());
+            let mut out = bytes::BytesMut::with_capacity(hdr_len + f32_bands * total_pixels * 4);
+            if let Some(h) = hdr {
+                out.extend_from_slice(&h);
+            }
             for v in canvas {
                 out.extend_from_slice(&v.to_le_bytes());
             }

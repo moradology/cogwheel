@@ -53,6 +53,8 @@ pub enum OutputFormat {
     /// JPEG (lossy quality `1..=100`, default `85`).
     Jpeg { quality: u8 },
     RawF32,
+    /// NumPy v1.0 `.npy` float32 array (`shape = (C, H, W)`, little-endian `<f4`).
+    Npy,
     /// Uncompressed RGBA8 (`N * N * 4` bytes), used internally for multi-scene mosaic compositing.
     RawRgba,
 }
@@ -539,6 +541,35 @@ fn for_each_pixel_in_row<const N: usize, F: FnMut(usize, f32, f32)>(
     }
 }
 
+/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous `<f4` array
+/// of shape `(bands, height, width)`.
+pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
+    let mut dict = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({bands}, {height}, {width}), }}"
+    );
+    let unpadded = 10 + dict.len() + 1;
+    let pad = (64 - (unpadded % 64)) % 64;
+    for _ in 0..pad {
+        dict.push(' ');
+    }
+    dict.push('\n');
+    let hlen = dict.len() as u16;
+    let mut hdr = Vec::with_capacity(10 + dict.len());
+    hdr.extend_from_slice(b"\x93NUMPY\x01\x00");
+    hdr.extend_from_slice(&hlen.to_le_bytes());
+    hdr.extend_from_slice(dict.as_bytes());
+    hdr
+}
+
+/// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes.
+pub fn wrap_raw_f32_as_npy(raw: Bytes, bands: usize, height: u32, width: u32) -> Bytes {
+    let hdr = encode_npy_f32_header(bands, height, width);
+    let mut out = BytesMut::with_capacity(hdr.len() + raw.len());
+    out.put_slice(&hdr);
+    out.put_slice(&raw);
+    out.freeze()
+}
+
 pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) -> Bytes {
     match format {
         OutputFormat::Png => empty_transparent_png(tile_size),
@@ -547,6 +578,17 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
         OutputFormat::RawF32 => {
             let count = (tile_size as usize) * (tile_size as usize) * num_bands;
             let mut buf = BytesMut::with_capacity(count * 4);
+            let nan_bytes = f32::NAN.to_le_bytes();
+            for _ in 0..count {
+                buf.put_slice(&nan_bytes);
+            }
+            buf.freeze()
+        }
+        OutputFormat::Npy => {
+            let hdr = encode_npy_f32_header(num_bands, tile_size, tile_size);
+            let count = (tile_size as usize) * (tile_size as usize) * num_bands;
+            let mut buf = BytesMut::with_capacity(hdr.len() + count * 4);
+            buf.put_slice(&hdr);
             let nan_bytes = f32::NAN.to_le_bytes();
             for _ in 0..count {
                 buf.put_slice(&nan_bytes);
@@ -622,7 +664,9 @@ pub fn encode_rgba_tile(rgba: &[u8], size: u32, all_opaque: bool, format: Output
         }
         OutputFormat::Webp { quality } => encode_webp_rgba(size, size, rgba, quality),
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(size, size, rgba, quality),
-        OutputFormat::RawRgba | OutputFormat::RawF32 => Bytes::copy_from_slice(rgba),
+        OutputFormat::RawRgba | OutputFormat::RawF32 | OutputFormat::Npy => {
+            Bytes::copy_from_slice(rgba)
+        }
     }
 }
 
@@ -645,7 +689,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
             (plan, src.single_block_flat())
         {
             match style.format {
-                OutputFormat::RawF32 => {
+                OutputFormat::RawF32 | OutputFormat::Npy => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
                     let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
@@ -767,7 +811,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
     }
 
     match style.format {
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -1494,7 +1538,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
     let mins = style.rescale_min;
 
     match style.format {
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 3 * 4);
             for b in 0..3 {
                 for py in 0..N {
@@ -1687,7 +1731,7 @@ fn render_rgb_cubic<const N: usize>(
     ];
     let mins = style.rescale_min;
     match style.format {
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 12);
             for b in 0..3 {
                 for py in 0..N {
@@ -1778,7 +1822,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
     let min_val = style.rescale_min;
 
     match style.format {
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -1945,7 +1989,7 @@ pub fn render_sar_rgb<const N: usize>(
     };
 
     match style.format {
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 3 * 4);
             let mut g_plane = Vec::with_capacity(N * N * 4);
             let mut b_plane = Vec::with_capacity(N * N * 4);
@@ -2246,7 +2290,7 @@ pub fn render_expr_vm<const N: usize>(
     let mut out_row = [0.0f32; N];
 
     match style.format {
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 sample_row(py, &mut band_rows);
@@ -2489,7 +2533,7 @@ pub fn render_terrain_tile<const N: usize>(
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             }
         }),
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -2599,8 +2643,9 @@ pub fn safe_rescale_denom(min: f32, max: f32) -> f32 {
     if d.abs() < 1e-12 { 1e-12 } else { d }
 }
 
-/// Evaluate a 3×3 Horn stencil centered at `(z_nw..z_se)` with ground spacing `pixel_size_m`.
+/// Evaluate a 3×3 Horn stencil centered at `(z_nw..z_se)` with isotropic ground spacing `1/(8*dx)`.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub fn eval_horn_3x3(
     z_nw: f32,
     z_n: f32,
@@ -2612,6 +2657,29 @@ pub fn eval_horn_3x3(
     z_s: f32,
     z_se: f32,
     inv_8dx: f32,
+    alg: DemAlgorithm,
+) -> f32 {
+    eval_horn_3x3_aniso(
+        z_nw, z_n, z_ne, z_w, z_c, z_e, z_sw, z_s, z_se, inv_8dx, inv_8dx, alg,
+    )
+}
+
+/// Evaluate a 3×3 Horn stencil with separate East-West (`inv_8dx`) and North-South (`inv_8dy`)
+/// inverse ground spacings (required for WGS84 / non-square bboxes where `dx_m != dy_m`).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn eval_horn_3x3_aniso(
+    z_nw: f32,
+    z_n: f32,
+    z_ne: f32,
+    z_w: f32,
+    z_c: f32,
+    z_e: f32,
+    z_sw: f32,
+    z_s: f32,
+    z_se: f32,
+    inv_8dx: f32,
+    inv_8dy: f32,
     alg: DemAlgorithm,
 ) -> f32 {
     if z_c.is_nan() {
@@ -2629,7 +2697,7 @@ pub fn eval_horn_3x3(
 
     // dz/dx (positive going East), dz/dy (positive going South)
     let dz_dx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) * inv_8dx;
-    let dz_dy = ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne)) * inv_8dx;
+    let dz_dy = ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne)) * inv_8dy;
 
     match alg {
         DemAlgorithm::Hillshade {
@@ -3020,7 +3088,7 @@ pub fn render_dem_algorithm<const N: usize>(
         let lut = style.colormap.lut();
 
         match style.format {
-            OutputFormat::RawF32 => {
+            OutputFormat::RawF32 | OutputFormat::Npy => {
                 let mut out = BytesMut::with_capacity(N * N * 4);
                 for py in 0..N {
                     let r0 = py * pad;
@@ -3620,5 +3688,36 @@ mod tests {
         }
         let avg_us = t0.elapsed().as_secs_f64() * 1e6 / 100.0;
         eprintln!("256x256 cubic SIMD hillshade PNG avg: {avg_us:.1} µs");
+    }
+
+    #[test]
+    fn dem_horn_anisotropic_spacing_matches_exact_slope() {
+        // At 60°N in EPSG:4326, dx_m = 5.0 m and dy_m = 10.0 m.
+        // A 45° East-facing ramp rises 5 m per East pixel (dz/dx = 1.0, dz/dy = 0.0).
+        let slope = eval_horn_3x3_aniso(
+            0.0, 5.0, 10.0,
+            0.0, 5.0, 10.0,
+            0.0, 5.0, 10.0,
+            1.0 / (8.0 * 5.0),
+            1.0 / (8.0 * 10.0),
+            DemAlgorithm::Slope { z_factor: 1.0 },
+        );
+        assert!((slope - 45.0).abs() < 1e-4, "expected 45.0° slope, got {slope}");
+    }
+
+    #[test]
+    fn npy_v1_header_is_64_byte_aligned_and_valid() {
+        let raw = Bytes::from_iter([1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|v| v.to_le_bytes()));
+        let npy = wrap_raw_f32_as_npy(raw.clone(), 1, 2, 2);
+        assert_eq!(&npy[..8], b"\x93NUMPY\x01\x00");
+        let hlen = u16::from_le_bytes([npy[8], npy[9]]) as usize;
+        let total_hdr = 10 + hlen;
+        assert_eq!(total_hdr % 64, 0, "NPY v1.0 header must be 64-byte aligned");
+        let dict = std::str::from_utf8(&npy[10..total_hdr]).unwrap();
+        assert!(dict.contains("'descr': '<f4'"));
+        assert!(dict.contains("'fortran_order': False"));
+        assert!(dict.contains("'shape': (1, 2, 2)"));
+        assert!(dict.ends_with('\n'));
+        assert_eq!(&npy[total_hdr..], raw.as_ref());
     }
 }

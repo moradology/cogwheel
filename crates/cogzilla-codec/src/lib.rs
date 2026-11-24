@@ -171,18 +171,14 @@ pub fn decode_tile_rows(
                 false,
                 nodata,
             ),
-            SampleType::Float64 => {
-                let mut copy = compressed[..expected_bytes].to_vec();
-                predictor::reconstruct_f64(
-                    &mut copy,
-                    ifd.tile_width,
-                    tile_h,
-                    bands_in_tile,
-                    byte_order,
-                    Predictor::None,
-                    nodata,
-                )
-            }
+            SampleType::Float64 => predictor::reconstruct_f64_uncompressed(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                byte_order,
+                nodata,
+            ),
         };
         apply_rgba_alpha_if_present(&mut bands, ifd);
         return Ok(DecodedTile { bands });
