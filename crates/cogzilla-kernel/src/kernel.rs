@@ -684,6 +684,102 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
     let inv_range = 255.0 / range;
     let min_val = style.rescale_min;
 
+    // Ultra-hot Nearest path: Separable1D + Nearest + CleanFastPath + Single-Block!
+    // Hoists `[usize; N]` X-indices once outside `for py in 0..N` for direct flat slice indexing.
+    if !BILINEAR && CLEAN {
+        if let (CoordPlan::Separable1D { u, v, .. }, Some((flat, base_col, base_row, row_stride))) =
+            (plan, src.single_block_flat())
+        {
+            let max_x = (row_stride as i32 - 1).max(0);
+            let max_y = ((flat.len() / row_stride) as i32 - 1).max(0);
+            let bc_f = base_col as f32;
+            let br_f = base_row as f32;
+            let mut x_idx = [0usize; N];
+            for px in 0..N {
+                x_idx[px] = fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+            }
+            match style.format {
+                OutputFormat::RawF32 | OutputFormat::Npy => {
+                    let mut out = BytesMut::with_capacity(N * N * 4);
+                    for py in 0..N {
+                        let y0 = fast_floor_i32(v[py] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                        let row = &flat[y0 * row_stride..];
+                        for px in 0..N {
+                            out.put_slice(&row[x_idx[px]].to_le_bytes());
+                        }
+                    }
+                    return out.freeze();
+                }
+                OutputFormat::Png => {
+                    let lut: &ColormapLut = style.colormap.lut();
+                    let plte = build_plte_opaque(lut);
+                    return SCRATCH.with(|cell| {
+                        let mut guard = cell.borrow_mut();
+                        let sc = &mut *guard;
+                        let stride = 1 + N;
+                        let total = N * stride;
+                        if sc.img_buf.len() < total {
+                            sc.img_buf.resize(total, 0);
+                        }
+                        if sc.row_buf.len() < N {
+                            sc.row_buf.resize(N, 0);
+                        }
+                        for py in 0..N {
+                            let y0 =
+                                fast_floor_i32(v[py] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                            let row = &flat[y0 * row_stride..];
+                            let row_idx = &mut sc.row_buf[..N];
+                            for px in 0..N {
+                                row_idx[px] = rescale_u8(row[x_idx[px]], inv_range, min_val);
+                            }
+                            filter_sub_u8_row(
+                                row_idx,
+                                &mut sc.img_buf[py * stride..(py + 1) * stride],
+                            );
+                        }
+                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                    });
+                }
+                OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+                    let lut: &ColormapLut = style.colormap.lut();
+                    return SCRATCH.with(|cell| {
+                        let mut guard = cell.borrow_mut();
+                        let sc = &mut *guard;
+                        let total = N * N * 3;
+                        if sc.img_buf.len() < total {
+                            sc.img_buf.resize(total, 0);
+                        }
+                        let buf = &mut sc.img_buf[..total];
+                        for py in 0..N {
+                            let y0 =
+                                fast_floor_i32(v[py] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                            let row = &flat[y0 * row_stride..];
+                            let row_off = py * N * 3;
+                            for px in 0..N {
+                                let idx = rescale_u8(row[x_idx[px]], inv_range, min_val) as usize;
+                                let c = lut.rgb[idx];
+                                let off = row_off + px * 3;
+                                buf[off] = c[0];
+                                buf[off + 1] = c[1];
+                                buf[off + 2] = c[2];
+                            }
+                        }
+                        match style.format {
+                            OutputFormat::Jpeg { quality } => {
+                                encode_jpeg_rgb(N as u32, N as u32, buf, quality)
+                            }
+                            OutputFormat::Webp { quality } => {
+                                encode_webp_rgb(N as u32, N as u32, buf, quality)
+                            }
+                            OutputFormat::RawRgba => rgb_to_rgba_bytes(buf),
+                            _ => unreachable!(),
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     // Ultra-hot SIMD path: Separable1D + Bilinear + CleanFastPath + Single-Block!
     if BILINEAR && CLEAN {
         if let (CoordPlan::Separable1D { u, v, .. }, Some((flat, base_col, base_row, row_stride))) =
@@ -1295,6 +1391,219 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
     }
 }
 
+/// Fused clean RGB nearest-neighbor scanline sampler (TiTiler default resampling):
+/// - Fast path 0: shared interleaved `RgbU8` slab (single 3-byte load per pixel, direct copy on identity).
+/// - Fast path 1: single-block `U8`, `U16`, or `F32` (zero block-table lookups per pixel).
+/// - Fast path 2: multi-block aligned grid (computes `(x, y)` and block index once per pixel instead of 3×).
+/// - Fallback: per-band `sample_nearest::<true>` for heterogeneous grids.
+fn sample_rgb_nearest_row_clean<const N: usize>(
+    plan: &CoordPlan<N>,
+    py: usize,
+    srcs: &[BandSource<'_>; 3],
+    inv: [f32; 3],
+    mins: [f32; 3],
+    row_rgb: &mut [u8],
+) {
+    let identity = mins == [0.0, 0.0, 0.0]
+        && (inv[0] - 1.0).abs() < 1e-6
+        && (inv[1] - 1.0).abs() < 1e-6
+        && (inv[2] - 1.0).abs() < 1e-6;
+
+    // Fast path 0: all 3 bands share ONE interleaved RGB8 slab (Sentinel-2 TCI, NAIP, JPEG/WebP RGB).
+    if let (Some((rgb0, 0, bc, br, st)), Some((rgb1, 1, _, _, _)), Some((rgb2, 2, _, _, _))) = (
+        srcs[0].single_block_rgb_u8(),
+        srcs[1].single_block_rgb_u8(),
+        srcs[2].single_block_rgb_u8(),
+    ) {
+        if std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
+            && std::ptr::eq(rgb0.as_ptr(), rgb2.as_ptr())
+            && srcs[0].same_grid_as(&srcs[1])
+            && srcs[0].same_grid_as(&srcs[2])
+        {
+            let mut u_row = [0.0f32; N];
+            let mut v_row = [0.0f32; N];
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
+            let bc_f = bc as f32;
+            let br_f = br as f32;
+            let stride3 = st * 3;
+            let max_x = (st as i32 - 1).max(0);
+            let max_y = ((rgb0.len() / stride3) as i32 - 1).max(0);
+            if identity {
+                for px in 0..N {
+                    let x = fast_floor_i32(u_row[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                    let y = fast_floor_i32(v_row[px] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                    let o = y * stride3 + x * 3;
+                    let d = px * 3;
+                    row_rgb[d] = rgb0[o];
+                    row_rgb[d + 1] = rgb0[o + 1];
+                    row_rgb[d + 2] = rgb0[o + 2];
+                }
+            } else {
+                for px in 0..N {
+                    let x = fast_floor_i32(u_row[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                    let y = fast_floor_i32(v_row[px] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                    let o = y * stride3 + x * 3;
+                    let d = px * 3;
+                    row_rgb[d] = rescale_u8(rgb0[o] as f32, inv[0], mins[0]);
+                    row_rgb[d + 1] = rescale_u8(rgb0[o + 1] as f32, inv[1], mins[1]);
+                    row_rgb[d + 2] = rescale_u8(rgb0[o + 2] as f32, inv[2], mins[2]);
+                }
+            }
+            return;
+        }
+    }
+
+    // Fast path 1a: single-block planar U8 across all 3 bands.
+    if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
+        srcs[0].single_block_u8(),
+        srcs[1].single_block_u8(),
+        srcs[2].single_block_u8(),
+    ) {
+        if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+            let mut u_row = [0.0f32; N];
+            let mut v_row = [0.0f32; N];
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
+            let bc_f = bc as f32;
+            let br_f = br as f32;
+            let min_len = r.len().min(g.len()).min(b.len());
+            let max_x = (st as i32 - 1).max(0);
+            let max_y = ((min_len / st) as i32 - 1).max(0);
+            if identity {
+                for px in 0..N {
+                    let x = fast_floor_i32(u_row[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                    let y = fast_floor_i32(v_row[px] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                    let o = y * st + x;
+                    let d = px * 3;
+                    row_rgb[d] = r[o];
+                    row_rgb[d + 1] = g[o];
+                    row_rgb[d + 2] = b[o];
+                }
+            } else {
+                for px in 0..N {
+                    let x = fast_floor_i32(u_row[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                    let y = fast_floor_i32(v_row[px] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                    let o = y * st + x;
+                    let d = px * 3;
+                    row_rgb[d] = rescale_u8(r[o] as f32, inv[0], mins[0]);
+                    row_rgb[d + 1] = rescale_u8(g[o] as f32, inv[1], mins[1]);
+                    row_rgb[d + 2] = rescale_u8(b[o] as f32, inv[2], mins[2]);
+                }
+            }
+            return;
+        }
+    }
+
+    // Fast path 1b: single-block planar U16 across all 3 bands (Sentinel-2 / Landsat).
+    if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
+        srcs[0].single_block_u16(),
+        srcs[1].single_block_u16(),
+        srcs[2].single_block_u16(),
+    ) {
+        if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+            let mut u_row = [0.0f32; N];
+            let mut v_row = [0.0f32; N];
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
+            let bc_f = bc as f32;
+            let br_f = br as f32;
+            let min_len = r.len().min(g.len()).min(b.len());
+            let max_x = (st as i32 - 1).max(0);
+            let max_y = ((min_len / st) as i32 - 1).max(0);
+            for px in 0..N {
+                let x = fast_floor_i32(u_row[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                let y = fast_floor_i32(v_row[px] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                let o = y * st + x;
+                let d = px * 3;
+                row_rgb[d] = rescale_u8(r[o] as f32, inv[0], mins[0]);
+                row_rgb[d + 1] = rescale_u8(g[o] as f32, inv[1], mins[1]);
+                row_rgb[d + 2] = rescale_u8(b[o] as f32, inv[2], mins[2]);
+            }
+            return;
+        }
+    }
+
+    // Fast path 1c: single-block planar F32 across all 3 bands.
+    if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
+        srcs[0].single_block_flat(),
+        srcs[1].single_block_flat(),
+        srcs[2].single_block_flat(),
+    ) {
+        if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+            let mut u_row = [0.0f32; N];
+            let mut v_row = [0.0f32; N];
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
+            let bc_f = bc as f32;
+            let br_f = br as f32;
+            let min_len = r.len().min(g.len()).min(b.len());
+            let max_x = (st as i32 - 1).max(0);
+            let max_y = ((min_len / st) as i32 - 1).max(0);
+            for px in 0..N {
+                let x = fast_floor_i32(u_row[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                let y = fast_floor_i32(v_row[px] + 0.5 - br_f).0.clamp(0, max_y) as usize;
+                let o = y * st + x;
+                let d = px * 3;
+                row_rgb[d] = rescale_u8(r[o], inv[0], mins[0]);
+                row_rgb[d + 1] = rescale_u8(g[o], inv[1], mins[1]);
+                row_rgb[d + 2] = rescale_u8(b[o], inv[2], mins[2]);
+            }
+            return;
+        }
+    }
+
+    // Fast path 2: multi-block aligned grid across all 3 bands.
+    if srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
+        let s0 = &srcs[0];
+        let s1 = &srcs[1];
+        let s2 = &srcs[2];
+        for_each_pixel_in_row(plan, py, |px, u, v| {
+            let x = fast_floor_i32(u + 0.5).0 as u32;
+            let y = fast_floor_i32(v + 0.5).0 as u32;
+            let (r, g, b) = if let Some((bidx, pidx)) = s0.pixel_loc(x, y) {
+                unsafe {
+                    if let (Some(b0), Some(b1), Some(b2)) = (
+                        *s0.blocks.get_unchecked(bidx),
+                        *s1.blocks.get_unchecked(bidx),
+                        *s2.blocks.get_unchecked(bidx),
+                    ) {
+                        (
+                            b0.data.get_f32_unchecked(pidx),
+                            b1.data.get_f32_unchecked(pidx),
+                            b2.data.get_f32_unchecked(pidx),
+                        )
+                    } else {
+                        (
+                            s0.sample_inbounds(x, y),
+                            s1.sample_inbounds(x, y),
+                            s2.sample_inbounds(x, y),
+                        )
+                    }
+                }
+            } else {
+                (
+                    s0.sample_inbounds(x, y),
+                    s1.sample_inbounds(x, y),
+                    s2.sample_inbounds(x, y),
+                )
+            };
+            let d = px * 3;
+            row_rgb[d] = rescale_u8(r, inv[0], mins[0]);
+            row_rgb[d + 1] = rescale_u8(g, inv[1], mins[1]);
+            row_rgb[d + 2] = rescale_u8(b, inv[2], mins[2]);
+        });
+        return;
+    }
+
+    // Fallback: heterogeneous grids across bands.
+    for_each_pixel_in_row(plan, py, |px, u, v| {
+        let r = sample_nearest::<true>(&srcs[0], u, v);
+        let g = sample_nearest::<true>(&srcs[1], u, v);
+        let b = sample_nearest::<true>(&srcs[2], u, v);
+        let d = px * 3;
+        row_rgb[d] = rescale_u8(r, inv[0], mins[0]);
+        row_rgb[d + 1] = rescale_u8(g, inv[1], mins[1]);
+        row_rgb[d + 2] = rescale_u8(b, inv[2], mins[2]);
+    });
+}
+
 /// Fused clean RGB bilinear scanline sampler:
 /// - Fast path 1: single-block `U8`, `U16`, or `F32` (NEON 4-wide / AVX2 8-wide, zero block lookups).
 /// - Fast path 2: multi-block aligned grid (computes floor/frac + `(bidx, p00, p01)` once per pixel instead of 3×).
@@ -1569,15 +1878,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                     if BILINEAR {
                         sample_rgb_bilinear_row_clean(plan, py, srcs, inv, mins, row_rgb);
                     } else {
-                        for_each_pixel_in_row(plan, py, |px, u, v| {
-                            let r = sample_val::<false, true>(&srcs[0], u, v);
-                            let g = sample_val::<false, true>(&srcs[1], u, v);
-                            let b = sample_val::<false, true>(&srcs[2], u, v);
-                            let off = px * 3;
-                            row_rgb[off] = rescale_u8(r, inv[0], mins[0]);
-                            row_rgb[off + 1] = rescale_u8(g, inv[1], mins[1]);
-                            row_rgb[off + 2] = rescale_u8(b, inv[2], mins[2]);
-                        });
+                        sample_rgb_nearest_row_clean(plan, py, srcs, inv, mins, row_rgb);
                     }
                     filter_sub_rgb_row(row_rgb, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
@@ -1636,15 +1937,14 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                             &mut buf[row_off..row_off + N * 3],
                         );
                     } else {
-                        for_each_pixel_in_row(plan, py, |px, u, v| {
-                            let r = sample_val::<false, true>(&srcs[0], u, v);
-                            let g = sample_val::<false, true>(&srcs[1], u, v);
-                            let b = sample_val::<false, true>(&srcs[2], u, v);
-                            let off = row_off + px * 3;
-                            buf[off] = rescale_u8(r, inv[0], mins[0]);
-                            buf[off + 1] = rescale_u8(g, inv[1], mins[1]);
-                            buf[off + 2] = rescale_u8(b, inv[2], mins[2]);
-                        });
+                        sample_rgb_nearest_row_clean(
+                            plan,
+                            py,
+                            srcs,
+                            inv,
+                            mins,
+                            &mut buf[row_off..row_off + N * 3],
+                        );
                     }
                 }
                 match style.format {
@@ -3721,5 +4021,154 @@ mod tests {
         assert!(dict.contains("'shape': (1, 2, 2)"));
         assert!(dict.ends_with('\n'));
         assert_eq!(&npy[total_hdr..], raw.as_ref());
+    }
+
+    #[test]
+    fn sample_rgb_nearest_row_clean_matches_scalar() {
+        use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
+        use std::sync::Arc;
+
+        let tw = 64u32;
+        let th = 64u32;
+        let n_px = (tw * th) as usize;
+        let mut u_arr = [0.0f32; 256];
+        let mut v_arr = [0.0f32; 256];
+        for i in 0..256 {
+            u_arr[i] = 1.2 + (i as f32) * 0.23;
+            v_arr[i] = 2.4 + (i as f32) * 0.22;
+        }
+        let plan = CoordPlan::Separable1D {
+            u: Box::new(u_arr),
+            v: Box::new(v_arr),
+            src_min_col: 1,
+            src_max_col: 62,
+            src_min_row: 2,
+            src_max_row: 62,
+            all_in_bounds: true,
+        };
+        let stats = BlockStats {
+            all_nodata: false,
+            no_nodata: true,
+            min: 0.0,
+            max: 255.0,
+        };
+
+        let check = |srcs: [BandSource<'_>; 3], inv: [f32; 3], mins: [f32; 3], label: &str| {
+            let mut fast = vec![0u8; 256 * 3];
+            let mut ref_row = vec![0u8; 256 * 3];
+            for py in [0usize, 17, 128, 255] {
+                sample_rgb_nearest_row_clean(&plan, py, &srcs, inv, mins, &mut fast);
+                for_each_pixel_in_row(&plan, py, |px, u, v| {
+                    ref_row[px * 3] = rescale_u8(sample_nearest::<true>(&srcs[0], u, v), inv[0], mins[0]);
+                    ref_row[px * 3 + 1] = rescale_u8(sample_nearest::<true>(&srcs[1], u, v), inv[1], mins[1]);
+                    ref_row[px * 3 + 2] = rescale_u8(sample_nearest::<true>(&srcs[2], u, v), inv[2], mins[2]);
+                });
+                assert_eq!(fast, ref_row, "{label} mismatch at py={py}");
+            }
+        };
+
+        // 1. Interleaved RgbU8Channel (identity + rescaled)
+        let rgb_vec: Vec<u8> = (0..n_px * 3).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let rgb_arc: Arc<[u8]> = Arc::from(rgb_vec);
+        let mk_rgb = |ch: u8| DecodedBand {
+            data: BandData::RgbU8Channel { rgb: rgb_arc.clone(), channel: ch, nodata: None },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let (b0, b1, b2) = (mk_rgb(0), mk_rgb(1), mk_rgb(2));
+        let (s0, s1, s2) = ([Some(&b0)], [Some(&b1)], [Some(&b2)]);
+        check(
+            [
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s0),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s1),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s2),
+            ],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            "RgbU8 identity",
+        );
+        check(
+            [
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s0),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s1),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s2),
+            ],
+            [1.5, 0.8, 2.0],
+            [10.0, 20.0, 5.0],
+            "RgbU8 rescaled",
+        );
+
+        // 2. Planar U8
+        let mk_u8 = |seed: usize| DecodedBand {
+            data: BandData::U8 {
+                data: (0..n_px).map(|i| ((i * seed + 7) % 256) as u8).collect(),
+                nodata: None,
+            },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let (u0, u1, u2) = (mk_u8(13), mk_u8(29), mk_u8(53));
+        let (su0, su1, su2) = ([Some(&u0)], [Some(&u1)], [Some(&u2)]);
+        check(
+            [
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &su0),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &su1),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &su2),
+            ],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            "U8 identity",
+        );
+
+        // 3. Planar U16
+        let mk_u16 = |seed: usize| DecodedBand {
+            data: BandData::U16 {
+                data: (0..n_px).map(|i| ((i * seed + 100) % 4096) as u16).collect(),
+                nodata: None,
+            },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let (w0, w1, w2) = (mk_u16(17), mk_u16(31), mk_u16(47));
+        let (sw0, sw1, sw2) = ([Some(&w0)], [Some(&w1)], [Some(&w2)]);
+        check(
+            [
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sw0),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sw1),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sw2),
+            ],
+            [255.0 / 3000.0; 3],
+            [100.0; 3],
+            "U16 rescaled",
+        );
+
+        // 4. Planar F32
+        let mk_f32 = |seed: f32| {
+            let mut slab = AlignedF32Slab::filled(n_px, 0.0);
+            for (i, v) in slab.as_mut_slice().iter_mut().enumerate() {
+                *v = (i as f32) * 0.01 * seed;
+            }
+            DecodedBand {
+                data: BandData::F32(slab),
+                width: tw,
+                height: th,
+                stats,
+            }
+        };
+        let (f0, f1, f2) = (mk_f32(1.0), mk_f32(1.7), mk_f32(2.3));
+        let (sf0, sf1, sf2) = ([Some(&f0)], [Some(&f1)], [Some(&f2)]);
+        check(
+            [
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sf0),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sf1),
+                BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sf2),
+            ],
+            [255.0 / 100.0; 3],
+            [0.0; 3],
+            "F32 rescaled",
+        );
     }
 }
