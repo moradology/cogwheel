@@ -2185,13 +2185,39 @@ where
             }
             .await,
 
-            // GET /stac/tiles & /stac/tiles/{tms}
-            (Method::GET, ["tiles"]) => Ok((
-                Bytes::from(list_tms_json(&host).to_string()),
-                "application/json",
-            )),
+            // GET /stac/tiles & /stac/tiles/{tms} (OGC TilesetList & Tileset, matching /cog/tiles*)
+            (Method::GET, ["tiles"]) => {
+                let body = serde_json::json!({
+                    "tilesets": [
+                        {
+                            "title": "WebMercatorQuad",
+                            "id": "WebMercatorQuad",
+                            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857"
+                        },
+                        {
+                            "title": "WorldCRS84Quad",
+                            "id": "WorldCRS84Quad",
+                            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+                        }
+                    ]
+                })
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
             (Method::GET, ["tiles", tms]) => {
-                get_tms_json(tms).map(|v| (Bytes::from(v.to_string()), "application/json"))
+                let crs_uri = if *tms == "WorldCRS84Quad" {
+                    "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+                } else {
+                    "http://www.opengis.net/def/crs/EPSG/0/3857"
+                };
+                let body = serde_json::json!({
+                    "title": tms,
+                    "id": tms,
+                    "crs": crs_uri,
+                    "dataType": "map",
+                })
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
             }
 
             // GET /stac/{tms}/tilejson.json & /stac/{tms}/map.html
