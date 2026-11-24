@@ -72,16 +72,27 @@ pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
         return false;
     }
 
+    // Unwrap GDAL `/vsicurl/http(s)://...` so it receives the exact same HTTP(S) canonicalization
+    // and prefix checks as bare `http(s)://` URLs; reject malformed `/vsicurl/` targets.
+    let (is_vsicurl, effective_uri) = if let Some(rest) = uri.strip_prefix("/vsicurl/") {
+        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+            return false;
+        }
+        (true, rest)
+    } else {
+        (false, uri)
+    };
+
     // For HTTP(S) URLs, inspect only the path component (before `?query` / `#fragment`) so valid
     // AWS SigV4 presigned URLs (`%2F` in `X-Amz-Credential`) and Azure SAS URLs (`%2F` in base64
     // `sig=`) are allowed. For cloud object URIs (`s3://`, `gs://`, `az://`, `abfs(s)://`, `/vsi*`)
     // and local paths, `?` and `#` are literal path/key bytes — inspect the entire URI so
     // `gs://allowed/public/?/../../../secret/key.tif` cannot bypass traversal checks.
-    let is_http = uri.starts_with("http://") || uri.starts_with("https://");
+    let is_http = effective_uri.starts_with("http://") || effective_uri.starts_with("https://");
     let inspect = if is_http {
-        uri.split(['?', '#']).next().unwrap_or(uri)
+        effective_uri.split(['?', '#']).next().unwrap_or(effective_uri)
     } else {
-        uri
+        effective_uri
     };
     let mut cur = inspect.to_string();
     for _ in 0..3 {
@@ -109,20 +120,22 @@ pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
         })
     };
 
-    if !matches_boundary(uri) {
+    if !(matches_boundary(uri) || (is_vsicurl && matches_boundary(effective_uri))) {
         return false;
     }
 
     // For HTTP(S) URLs, also canonicalize with `reqwest::Url::parse` (the exact parser used by
     // outbound requests) so WHATWG normalization cannot escape the allowed prefix.
     if is_http {
-        let Ok(parsed) = reqwest::Url::parse(uri) else {
+        let Ok(parsed) = reqwest::Url::parse(effective_uri) else {
             return false;
         };
         if parsed.path().split('/').any(|seg| seg == "..") {
             return false;
         }
-        if !matches_boundary(parsed.as_str()) {
+        let parsed_ok = matches_boundary(parsed.as_str())
+            || (is_vsicurl && matches_boundary(&format!("/vsicurl/{}", parsed.as_str())));
+        if !parsed_ok {
             return false;
         }
     }
@@ -230,6 +243,20 @@ mod tests {
         assert!(matches_any_prefix(
             &gcs_http,
             "https://storage.googleapis.com/public-bucket/scene.tif"
+        ));
+
+        // GDAL `/vsicurl/http(s)://...` prefix unwrapping and traversal protection.
+        assert!(matches_any_prefix(
+            &gcs_http,
+            "/vsicurl/https://storage.googleapis.com/public-bucket/scene.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &gcs_http,
+            "/vsicurl/https://storage.googleapis.com/public-bucket/../private/secret.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &list(&["/vsicurl/"]),
+            "/vsicurl/file:///etc/passwd"
         ));
     }
 }

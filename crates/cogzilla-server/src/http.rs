@@ -26,9 +26,10 @@ use crate::stac::{
     load_stac_item, resolve_stac_assets,
 };
 use crate::titiler::{
-    PolygonMask, build_cog_info, build_cog_info_geojson, build_map_html, build_tilejson,
-    compute_statistics, encode_rgba_output, query_point, render_mercator_bbox,
-    render_native_preview, render_wgs84_bbox,
+    PolygonMask, build_cog_info, build_cog_info_geojson, build_cog_validate, build_map_html,
+    build_tilejson, compute_statistics, encode_rgba_output, get_algorithm_json,
+    list_algorithms_json, query_point, render_mercator_bbox, render_native_preview,
+    render_wgs84_bbox,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -138,6 +139,7 @@ struct ParsedQuery {
     expr_raw: Option<String>,
     nodata: Option<f32>,
     unscale: bool,
+    strict: bool,
     return_mask: bool,
     buffer: u32,
     coord_crs_3857: bool,
@@ -176,6 +178,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         expr_raw: None,
         nodata: None,
         unscale: false,
+        strict: false,
         return_mask: true,
         buffer: 0,
         coord_crs_3857: false,
@@ -385,6 +388,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "unscale" => {
                 pq.unscale = v.eq_ignore_ascii_case("true") || v == "1";
+            }
+            "strict" => {
+                pq.strict = v.eq_ignore_ascii_case("true") || v == "1";
             }
             "return_mask" => {
                 pq.return_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
@@ -1391,6 +1397,7 @@ where
                 "/cog/info": { "get": { "summary": "COG metadata" } },
                 "/cog/info.geojson": { "get": { "summary": "COG GeoJSON metadata" } },
                 "/cog/bounds": { "get": { "summary": "COG WGS84 bounds" } },
+                "/cog/validate": { "get": { "summary": "Validate COG structure and layout" } },
                 "/cog/statistics": { "get": { "summary": "COG statistics" }, "post": { "summary": "Polygon-clipped COG statistics" } },
                 "/cog/tiles": { "get": { "summary": "List COG tilesets" } },
                 "/cog/tiles/{tileMatrixSetId}": { "get": { "summary": "COG tileset metadata" } },
@@ -1402,6 +1409,7 @@ where
                 "/cog/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}": { "get": { "summary": "Render COG bbox crop" } },
                 "/cog/feature/{width}x{height}.{format}": { "post": { "summary": "Render GeoJSON feature crop" } },
                 "/stac/assets": { "get": { "summary": "List STAC Item raster assets" } },
+                "/stac/bounds": { "get": { "summary": "STAC Item WGS84 bounds" } },
                 "/stac/info": { "get": { "summary": "STAC assets metadata" } },
                 "/stac/info.geojson": { "get": { "summary": "STAC GeoJSON metadata" } },
                 "/stac/asset_statistics": { "get": { "summary": "Per-asset STAC statistics" } },
@@ -1410,6 +1418,8 @@ where
                 "/stac/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "STAC TileJSON 3.0" } },
                 "/stac/point/{lon},{lat}": { "get": { "summary": "Sample STAC asset values at point" } },
                 "/stac/preview/{width}x{height}.{format}": { "get": { "summary": "Render STAC preview" } },
+                "/algorithms": { "get": { "summary": "List available raster algorithms" } },
+                "/algorithms/{algorithmId}": { "get": { "summary": "Get algorithm metadata and parameters" } },
                 "/colorMaps": { "get": { "summary": "List all 211 rio-tiler colormaps" } },
                 "/colorMaps/{colorMapId}": { "get": { "summary": "Get colormap RGBA LUT JSON or ?f=png colorbar" } },
                 "/tileMatrixSets": { "get": { "summary": "List OGC TileMatrixSets" } },
@@ -2035,6 +2045,23 @@ where
     }
 
     // ------------------------------------------------------------------------
+    // TiTiler AlgorithmFactory Router: /algorithms, /algorithms/{algorithmId}
+    // ------------------------------------------------------------------------
+    if method == Method::GET && segs.first() == Some(&"algorithms") {
+        let res = match segs.as_slice() {
+            ["algorithms"] => Ok((
+                Bytes::from(list_algorithms_json(&host).to_string()),
+                "application/json",
+            )),
+            ["algorithms", id] => {
+                get_algorithm_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+            }
+            _ => Err(EngineError::NotFound(path.clone())),
+        };
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+    }
+
+    // ------------------------------------------------------------------------
     // Full TiTiler STAC Item Router: /stac/* (MultiBaseTilerFactory compatible!)
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"stac") {
@@ -2047,6 +2074,35 @@ where
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let keys: Vec<&String> = item.assets.keys().collect();
                 Ok((Bytes::from(serde_json::json!(keys).to_string()), "application/json"))
+            }
+            .await,
+
+            // GET /stac/bounds?url=item.json
+            (Method::GET, ["bounds"]) => async {
+                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let bounds = if let Some(b) = item.bbox {
+                    b
+                } else {
+                    let (_, cogs, _) =
+                        resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                    let mut acc = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                    for cog in &cogs {
+                        let crs = engine.get_or_build_crs(cog)?;
+                        let full = cog.index.full_res();
+                        let b = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                        acc[0] = acc[0].min(b[0]);
+                        acc[1] = acc[1].min(b[1]);
+                        acc[2] = acc[2].max(b[2]);
+                        acc[3] = acc[3].max(b[3]);
+                    }
+                    if !acc.iter().all(|v| v.is_finite()) {
+                        return Err(EngineError::BadRequest("STAC item has no valid bounds".into()));
+                    }
+                    acc
+                };
+                let body = serde_json::json!({"bounds": bounds}).to_string();
+                Ok((Bytes::from(body), "application/json"))
             }
             .await,
 
@@ -2864,6 +2920,15 @@ where
                 let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let body = serde_json::json!({"bounds": bounds}).to_string();
                 Ok((Bytes::from(body), "application/json"))
+            }
+            .await,
+
+            // GET /cog/validate?url=...&strict=false
+            (Method::GET, ["validate"]) => async {
+                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let url = pq.urls.first().map(String::as_str).unwrap_or("");
+                let json = build_cog_validate(&engine, &cogs[0], url, pq.strict)?;
+                Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
 
@@ -3777,5 +3842,23 @@ mod tests {
             cogzilla_tiff::TiffError::Corrupt("not a tiff"),
         )));
         assert_eq!(r_tiff.status(), StatusCode::BAD_REQUEST);
+
+        // AlgorithmFactory JSON responses (/algorithms and /algorithms/{id})
+        let algs = list_algorithms_json("http://localhost:8080");
+        let list = algs["algorithms"].as_array().unwrap();
+        assert_eq!(list.len(), 5);
+        assert_eq!(list[0]["id"], "hillshade");
+        assert_eq!(
+            list[0]["links"][0]["href"],
+            "http://localhost:8080/algorithms/hillshade"
+        );
+        let hs = get_algorithm_json("hillshade").unwrap();
+        assert_eq!(hs["title"], "Hillshade");
+        assert_eq!(hs["inputs"]["nbands"], 1);
+        assert_eq!(hs["outputs"]["dtype"], "uint8");
+        assert!(matches!(
+            get_algorithm_json("nonexistent"),
+            Err(EngineError::NotFound(_))
+        ));
     }
 }

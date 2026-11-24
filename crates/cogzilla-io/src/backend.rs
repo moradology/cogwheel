@@ -240,19 +240,27 @@ impl CogSource {
             || uri.starts_with("/vsiaz/")
         {
             Err(IoError::InvalidUri(uri.to_string()))
-        } else if uri.starts_with("http://") || uri.starts_with("https://") {
+        } else if let Some(http_url) = uri
+            .strip_prefix("/vsicurl/")
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            .or_else(|| {
+                (uri.starts_with("http://") || uri.starts_with("https://")).then_some(uri)
+            })
+        {
             let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(3)
                 .min(10);
             Ok(Self::RemoteHttp {
-                url: uri.to_string(),
+                url: http_url.to_string(),
                 client,
                 max_retries,
                 metrics,
                 limiter,
             })
+        } else if uri.starts_with("/vsicurl/") {
+            Err(IoError::InvalidUri(uri.to_string()))
         } else {
             let local_path = uri.strip_prefix("file://").unwrap_or(uri);
             Self::open_local(local_path)

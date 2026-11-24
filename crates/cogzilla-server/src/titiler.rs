@@ -13,6 +13,40 @@ use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
 
+fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta) -> Vec<&'static str> {
+    let count = full.samples_per_pixel as usize;
+    let alpha_idx = cogzilla_codec::alpha_channel_index(count, &full.extra_samples);
+    match full.photometric {
+        // RGB (2) or YCbCr (6)
+        2 | 6 if count >= 3 => (0..count)
+            .map(|i| match i {
+                0 => "red",
+                1 => "green",
+                2 => "blue",
+                _ if Some(i) == alpha_idx => "alpha",
+                _ => "undefined",
+            })
+            .collect(),
+        // MinIsWhite (0) or MinIsBlack (1) with an explicit alpha channel (e.g. gray+alpha)
+        0 | 1 if alpha_idx.is_some() => (0..count)
+            .map(|i| {
+                if Some(i) == alpha_idx {
+                    "alpha"
+                } else if i == 0 {
+                    "gray"
+                } else {
+                    "undefined"
+                }
+            })
+            .collect(),
+        _ => match count {
+            3 => vec!["red", "green", "blue"],
+            4 => vec!["red", "green", "blue", "alpha"],
+            _ => vec!["gray"; count],
+        },
+    }
+}
+
 /// TiTiler-compatible `/cog/info` JSON payload built directly from our `CogIndex`.
 pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
@@ -31,11 +65,7 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
     let band_descriptions: Vec<_> = (1..=count)
         .map(|i| serde_json::json!([format!("b{i}"), format!("b{i}")]))
         .collect();
-    let colorinterp: Vec<&str> = match count {
-        3 => vec!["red", "green", "blue"],
-        4 => vec!["red", "green", "blue", "alpha"],
-        _ => vec!["gray"; count],
-    };
+    let colorinterp = infer_colorinterp(full);
     let overviews: Vec<u32> = cog
         .index
         .ifds
@@ -144,6 +174,261 @@ pub fn build_cog_info_geojson(
         },
         "properties": info,
     }))
+}
+
+/// TiTiler / `rio-cogeo`-compatible `/cog/validate` JSON payload.
+pub fn build_cog_validate(
+    engine: &TileEngine,
+    cog: &OpenedCog,
+    url: &str,
+    strict: bool,
+) -> Result<serde_json::Value, EngineError> {
+    let crs = engine.get_or_build_crs(cog)?;
+    let full = cog.index.full_res();
+    let coarsest = cog.index.ifds.last().unwrap();
+    let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
+        .max(full.height as f64 / coarsest.height.max(1) as f64);
+    let (minzoom, maxzoom) =
+        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    if full.is_stripped {
+        errors.push(
+            "The file is not tiled (strip-organized); COGs must use tiled IFD layout".into(),
+        );
+    }
+    if (full.width > 512 || full.height > 512) && cog.index.ifds.len() <= 1 {
+        warnings.push(
+            "The file is greater than 512x512 pixels, it is recommended to include internal overviews"
+                .into(),
+        );
+    }
+    for (idx, ifd) in cog.index.ifds.iter().enumerate().skip(1) {
+        if ifd.is_stripped {
+            errors.push(format!("Overview IFD {idx} is not tiled"));
+        }
+    }
+
+    let is_cog = errors.is_empty() && (!strict || warnings.is_empty());
+
+    let compression = match full.compression {
+        cogzilla_tiff::Compression::None => None,
+        cogzilla_tiff::Compression::Lzw => Some("LZW"),
+        cogzilla_tiff::Compression::Jpeg => Some("JPEG"),
+        cogzilla_tiff::Compression::Deflate => Some("DEFLATE"),
+        cogzilla_tiff::Compression::Zstd => Some("ZSTD"),
+        cogzilla_tiff::Compression::Webp => Some("WEBP"),
+    };
+    let color_space = match full.photometric {
+        0 => "MinIsWhite",
+        1 => "MinIsBlack",
+        2 => "RGB",
+        3 => "Palette",
+        5 => "CMYK",
+        6 => "YCbCr",
+        _ => "Unknown",
+    };
+    let interleave = match full.planar_config {
+        PlanarConfig::Chunky => "pixel",
+        PlanarConfig::Planar => "band",
+    };
+    let count = full.samples_per_pixel as usize;
+    let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
+    let colorinterp = infer_colorinterp(full);
+    let scales: Vec<f32> = (0..count)
+        .map(|i| cog.index.scales.get(i).copied().unwrap_or(1.0))
+        .collect();
+    let offsets: Vec<f32> = (0..count)
+        .map(|i| cog.index.offsets.get(i).copied().unwrap_or(0.0))
+        .collect();
+    let nodata_json = match cog.index.nodata {
+        Some(v) if v.is_nan() => serde_json::json!("nan"),
+        Some(v) => serde_json::json!(v),
+        None => serde_json::Value::Null,
+    };
+
+    let crs_str = if let Some(epsg) = cog
+        .index
+        .geo_keys
+        .projected_cs_type
+        .filter(|&c| c > 0 && c != 32767)
+    {
+        format!("EPSG:{epsg}")
+    } else if let Some(epsg) = cog
+        .index
+        .geo_keys
+        .geographic_type
+        .filter(|&c| c > 0 && c != 32767)
+    {
+        format!("EPSG:{epsg}")
+    } else {
+        "EPSG:4326".to_string()
+    };
+
+    let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
+    let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
+    let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
+    let (x11, y11) = full
+        .pixel_to_crs
+        .forward(full.width as f64, full.height as f64);
+    let native_bounds = [
+        x00.min(x10).min(x01).min(x11),
+        y00.min(y10).min(y01).min(y11),
+        x00.max(x10).max(x01).max(x11),
+        y00.max(y10).max(y01).max(y11),
+    ];
+    let (res_x, res_y) = full.pixel_resolution();
+
+    let ifds: Vec<serde_json::Value> = cog
+        .index
+        .ifds
+        .iter()
+        .enumerate()
+        .map(|(level, ifd)| {
+            let decimation = if level == 0 {
+                0
+            } else {
+                (full.width as f64 / ifd.width.max(1) as f64).round() as u32
+            };
+            serde_json::json!({
+                "Level": level,
+                "Width": ifd.width,
+                "Height": ifd.height,
+                "Blocksize": [ifd.tile_width, ifd.tile_height],
+                "Decimation": decimation,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "Path": url,
+        "Driver": "GTiff",
+        "COG": is_cog,
+        "Compression": compression,
+        "ColorSpace": color_space,
+        "COG_errors": errors,
+        "COG_warnings": warnings,
+        "Profile": {
+            "Bands": count,
+            "Width": full.width,
+            "Height": full.height,
+            "Tiled": !full.is_stripped,
+            "Dtype": full.sample_type.gdal_name(),
+            "Interleave": interleave,
+            "AlphaBand": has_alpha,
+            "InternalMask": full.mask_ifd.is_some(),
+            "Nodata": nodata_json,
+            "ColorInterp": colorinterp,
+            "ColorMap": false,
+            "Scales": scales,
+            "Offsets": offsets,
+        },
+        "GEO": {
+            "CRS": crs_str,
+            "BoundingBox": native_bounds,
+            "Origin": [full.pixel_to_crs.c, full.pixel_to_crs.f],
+            "Resolution": [res_x, res_y],
+            "MinZoom": minzoom,
+            "MaxZoom": maxzoom,
+        },
+        "Tags": {},
+        "IFD": ifds,
+    }))
+}
+
+const SUPPORTED_ALGORITHMS: &[&str] = &["hillshade", "slope", "aspect", "terrarium", "terrainrgb"];
+
+/// TiTiler 2.4 `AlgorithmFactory` `GET /algorithms` response.
+pub fn list_algorithms_json(host: &str) -> serde_json::Value {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", host.trim_end_matches('/'))
+    };
+    let algorithms: Vec<serde_json::Value> = SUPPORTED_ALGORITHMS
+        .iter()
+        .map(|&id| {
+            serde_json::json!({
+                "id": id,
+                "links": [
+                    {
+                        "href": format!("{origin}/algorithms/{id}"),
+                        "rel": "item",
+                        "type": "application/json",
+                        "title": format!("Definition of {id} Algorithm"),
+                    }
+                ]
+            })
+        })
+        .collect();
+    serde_json::json!({ "algorithms": algorithms })
+}
+
+/// TiTiler 2.4 `AlgorithmFactory` `GET /algorithms/{algorithmId}` response.
+pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
+    let meta = match id {
+        "hillshade" => serde_json::json!({
+            "title": "Hillshade",
+            "description": "Create hillshade from DEM dataset.",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 1, "dtype": "uint8", "min": null, "max": null },
+            "parameters": {
+                "azimuth": { "default": 315.0, "maximum": 360.0, "minimum": 0.0, "title": "Azimuth", "type": "number" },
+                "angle_altitude": { "default": 45.0, "maximum": 90.0, "minimum": -90.0, "title": "Angle Altitude", "type": "number" },
+                "buffer": { "default": 0, "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
+            }
+        }),
+        "slope" => serde_json::json!({
+            "title": "Slope",
+            "description": "Calculate degrees of slope from DEM dataset.",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 1, "dtype": "float32", "min": [0.0], "max": [90.0] },
+            "parameters": {
+                "buffer": { "default": 0, "description": "Buffer size for edge effects", "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
+            }
+        }),
+        "aspect" => serde_json::json!({
+            "title": "Aspect",
+            "description": "Calculate compass aspect in degrees (0-360) from DEM dataset.",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 1, "dtype": "float32", "min": [0.0], "max": [360.0] },
+            "parameters": {
+                "buffer": { "default": 0, "description": "Buffer size for edge effects", "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
+            }
+        }),
+        "terrarium" => serde_json::json!({
+            "title": "Terrarium",
+            "description": "Encode DEM into RGB (Mapzen Terrarium).",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 3, "dtype": "uint8", "min": null, "max": null },
+            "parameters": {
+                "nodata_height": { "anyOf": [{ "maximum": 99999.0, "minimum": -99999.0, "type": "number" }, { "type": "null" }], "default": null, "title": "Nodata Height" }
+            }
+        }),
+        "terrainrgb" => serde_json::json!({
+            "title": "TerrainRGB",
+            "description": "Encode DEM into RGB (Mapbox Terrain RGB).",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 3, "dtype": "uint8", "min": null, "max": null },
+            "parameters": {
+                "interval": { "default": 0.1, "maximum": 1.0, "minimum": 0.0, "title": "Interval", "type": "number" },
+                "baseval": { "default": -10000.0, "maximum": 99999.0, "minimum": -99999.0, "title": "Baseval", "type": "number" },
+                "nodata_height": { "anyOf": [{ "maximum": 99999.0, "minimum": -99999.0, "type": "number" }, { "type": "null" }], "default": null, "title": "Nodata Height" }
+            }
+        }),
+        _ => {
+            return Err(EngineError::NotFound(format!(
+                "unknown algorithm '{id}' (supported: {})",
+                SUPPORTED_ALGORITHMS.join(", ")
+            )));
+        }
+    };
+    Ok(meta)
 }
 
 /// TiTiler-compatible TileJSON 3.0.0 (`/cog/{tms}/tilejson.json`).
