@@ -249,6 +249,34 @@ impl AzureConfig {
     }
 }
 
+/// Stream a `reqwest::Response` body up to `max_bytes`, failing cleanly before OOM if exceeded.
+pub async fn read_response_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Bytes, IoError> {
+    if let Some(cl) = resp.content_length()
+        && cl > max_bytes as u64
+    {
+        return Err(IoError::Fs(std::io::Error::other(format!(
+            "remote response Content-Length {cl} exceeds limit of {max_bytes} bytes"
+        ))));
+    }
+    let init = resp
+        .content_length()
+        .map(|n| (n as usize).min(max_bytes).min(1024 * 1024))
+        .unwrap_or(0);
+    let mut out = bytes::BytesMut::with_capacity(init);
+    while let Some(chunk) = resp.chunk().await.map_err(IoError::Http)? {
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(IoError::Fs(std::io::Error::other(format!(
+                "remote response exceeded limit of {max_bytes} bytes"
+            ))));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out.freeze())
+}
+
 /// Fetch a byte range `[start, end)` from Google Cloud Storage with AIMD concurrency control and retry.
 pub async fn fetch_gcs_range(
     client: &reqwest::Client,
@@ -261,8 +289,59 @@ pub async fn fetch_gcs_range(
     metrics: &IoMetrics,
     limiter: &AimdLimiter,
 ) -> Result<Bytes, IoError> {
+    fetch_gcs_inner(
+        client,
+        bucket,
+        key,
+        cfg,
+        token_cache,
+        Some((start, end)),
+        None,
+        metrics,
+        limiter,
+    )
+    .await
+}
+
+/// Fetch a full object from Google Cloud Storage with AIMD concurrency control, retry, and a hard byte cap.
+pub async fn fetch_gcs_object_capped(
+    client: &reqwest::Client,
+    bucket: &str,
+    key: &str,
+    cfg: &GcsConfig,
+    token_cache: &GcsTokenCache,
+    max_bytes: usize,
+    metrics: &IoMetrics,
+    limiter: &AimdLimiter,
+) -> Result<Bytes, IoError> {
+    fetch_gcs_inner(
+        client,
+        bucket,
+        key,
+        cfg,
+        token_cache,
+        None,
+        Some(max_bytes),
+        metrics,
+        limiter,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_gcs_inner(
+    client: &reqwest::Client,
+    bucket: &str,
+    key: &str,
+    cfg: &GcsConfig,
+    token_cache: &GcsTokenCache,
+    range: Option<(u64, u64)>,
+    max_bytes: Option<usize>,
+    metrics: &IoMetrics,
+    limiter: &AimdLimiter,
+) -> Result<Bytes, IoError> {
     let url = format!("{}/{}/{}", cfg.endpoint, bucket, encode_path(key));
-    let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
+    let range_hdr = range.map(|(start, end)| format!("bytes={start}-{}", end.saturating_sub(1)));
     let bearer = if cfg.no_sign {
         None
     } else if let Some(t) = &cfg.bearer_token {
@@ -275,7 +354,10 @@ pub async fn fetch_gcs_range(
         let permit = limiter.acquire().await;
         metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
 
-        let mut req = client.get(&url).header("Range", &range_hdr);
+        let mut req = client.get(&url);
+        if let Some(rh) = &range_hdr {
+            req = req.header("Range", rh);
+        }
         if let Some(tok) = &bearer {
             req = req.header("Authorization", format!("Bearer {tok}"));
         }
@@ -314,7 +396,12 @@ pub async fn fetch_gcs_range(
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus { status, url });
         }
-        match resp.bytes().await {
+        let body_res = if let Some(cap) = max_bytes {
+            read_response_capped(resp, cap).await
+        } else {
+            resp.bytes().await.map_err(IoError::Http)
+        };
+        match body_res {
             Ok(data) => {
                 permit.on_success();
                 metrics
@@ -322,7 +409,7 @@ pub async fn fetch_gcs_range(
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 return Ok(data);
             }
-            Err(e) => {
+            Err(IoError::Http(e)) => {
                 if is_retryable_transport_error(&e) {
                     permit.on_throttle();
                     if attempt < cfg.max_retries {
@@ -332,6 +419,7 @@ pub async fn fetch_gcs_range(
                 }
                 return Err(IoError::Http(e));
             }
+            Err(e) => return Err(e),
         }
     }
     Err(IoError::HttpStatus { status: 503, url })
@@ -371,6 +459,30 @@ pub async fn fetch_azure_range(
     metrics: &IoMetrics,
     limiter: &AimdLimiter,
 ) -> Result<Bytes, IoError> {
+    fetch_azure_inner(client, target, cfg, Some((start, end)), None, metrics, limiter).await
+}
+
+/// Fetch a full object from Azure Blob Storage with AIMD concurrency control, retry, and a hard byte cap.
+pub async fn fetch_azure_object_capped(
+    client: &reqwest::Client,
+    target: &AzureTarget,
+    cfg: &AzureConfig,
+    max_bytes: usize,
+    metrics: &IoMetrics,
+    limiter: &AimdLimiter,
+) -> Result<Bytes, IoError> {
+    fetch_azure_inner(client, target, cfg, None, Some(max_bytes), metrics, limiter).await
+}
+
+async fn fetch_azure_inner(
+    client: &reqwest::Client,
+    target: &AzureTarget,
+    cfg: &AzureConfig,
+    range: Option<(u64, u64)>,
+    max_bytes: Option<usize>,
+    metrics: &IoMetrics,
+    limiter: &AimdLimiter,
+) -> Result<Bytes, IoError> {
     let base = cfg
         .endpoint_override
         .clone()
@@ -382,16 +494,16 @@ pub async fn fetch_azure_range(
             url.push_str(sas);
         }
     }
-    let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
+    let range_hdr = range.map(|(start, end)| format!("bytes={start}-{}", end.saturating_sub(1)));
 
     for attempt in 0..=cfg.max_retries {
         let permit = limiter.acquire().await;
         metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
 
-        let mut req = client
-            .get(&url)
-            .header("Range", &range_hdr)
-            .header("x-ms-version", AZURE_API_VERSION);
+        let mut req = client.get(&url).header("x-ms-version", AZURE_API_VERSION);
+        if let Some(rh) = &range_hdr {
+            req = req.header("Range", rh);
+        }
 
         if !cfg.no_sign && cfg.sas_token.is_none() {
             if let Some(tok) = &cfg.bearer_token {
@@ -403,7 +515,7 @@ pub async fn fetch_azure_range(
                     &target.account,
                     &target.container,
                     &target.blob,
-                    &range_hdr,
+                    range_hdr.as_deref().unwrap_or(""),
                     &date_hdr,
                     key,
                 ) else {
@@ -446,7 +558,12 @@ pub async fn fetch_azure_range(
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus { status, url });
         }
-        match resp.bytes().await {
+        let body_res = if let Some(cap) = max_bytes {
+            read_response_capped(resp, cap).await
+        } else {
+            resp.bytes().await.map_err(IoError::Http)
+        };
+        match body_res {
             Ok(data) => {
                 permit.on_success();
                 metrics
@@ -454,7 +571,7 @@ pub async fn fetch_azure_range(
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 return Ok(data);
             }
-            Err(e) => {
+            Err(IoError::Http(e)) => {
                 if is_retryable_transport_error(&e) {
                     permit.on_throttle();
                     if attempt < cfg.max_retries {
@@ -464,6 +581,7 @@ pub async fn fetch_azure_range(
                 }
                 return Err(IoError::Http(e));
             }
+            Err(e) => return Err(e),
         }
     }
     Err(IoError::HttpStatus { status: 503, url })

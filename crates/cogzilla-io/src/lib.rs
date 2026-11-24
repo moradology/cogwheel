@@ -11,8 +11,9 @@ pub use allowlist::{ALLOWED_URL_PREFIXES_ENV, allowlist_enabled, check_uri_allow
 pub use backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges};
 pub use cache::{BlockKey, SingleflightBlockCache};
 pub use cloud::{
-    AzureConfig, AzureTarget, GcsConfig, GcsTokenCache, fetch_azure_range, fetch_gcs_range,
-    parse_azure_uri, parse_gcs_uri,
+    AzureConfig, AzureTarget, GcsConfig, GcsTokenCache, fetch_azure_object_capped,
+    fetch_azure_range, fetch_gcs_object_capped, fetch_gcs_range, parse_azure_uri, parse_gcs_uri,
+    read_response_capped,
 };
 pub use disk_cache::{DiskBlockCache, DiskCacheStats};
 pub use limiter::{AimdLimiter, AimdPermit};

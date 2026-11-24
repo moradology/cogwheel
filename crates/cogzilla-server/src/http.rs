@@ -268,6 +268,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     pq.custom_colormap_json = Some(dec);
                 } else if let Some(cm) = ColormapName::from_str_opt(&dec) {
                     pq.colormap = cm;
+                    pq.colormap_explicit = true;
                 } else {
                     bad("expected a JSON colormap or a colormap name");
                 }
@@ -426,7 +427,7 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
             return Err(format!("parameter '{k}' is not supported on point routes"));
         }
-    } else if family == "stac" || !route("bbox") {
+    } else if !route("bbox") {
         if let Some(k) = has(&["coord_crs"]) {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
@@ -758,35 +759,11 @@ async fn load_mosaicjson(
     if let Some(cached) = engine.mosaicjson_cache.get(uri) {
         return Ok(cached.clone());
     }
-    let text = if uri.starts_with("http://") || uri.starts_with("https://") {
-        let resp = engine
-            .store
-            .client
-            .get(uri)
-            .send()
-            .await
-            .map_err(cogzilla_io::IoError::Http)?;
-        if !resp.status().is_success() {
-            return Err(EngineError::Io(cogzilla_io::IoError::HttpStatus {
-                status: resp.status().as_u16(),
-                url: uri.to_string(),
-            }));
-        }
-        resp.text().await.map_err(cogzilla_io::IoError::Http)?
-    } else if let Some((bucket, key)) = cogzilla_io::parse_s3_uri(uri) {
-        let cfg = engine
-            .store
-            .s3_cfg
-            .clone()
-            .unwrap_or_else(cogzilla_io::S3Config::from_env_full);
-        let bytes =
-            cogzilla_io::fetch_s3_object(&engine.store.client, bucket, key, &cfg, None, None)
-                .await?;
-        String::from_utf8_lossy(&bytes).into_owned()
-    } else {
-        let local_path = uri.strip_prefix("file://").unwrap_or(uri);
-        std::fs::read_to_string(local_path).map_err(cogzilla_io::IoError::Fs)?
-    };
+    let bytes = engine
+        .store
+        .fetch_uri_bytes(uri, MAX_POST_BODY_BYTES)
+        .await?;
+    let text = String::from_utf8_lossy(&bytes);
     let cat = Arc::new(MosaicJsonCatalog::from_json_str(&text).map_err(EngineError::BadRequest)?);
     if engine.mosaicjson_cache.len() >= 256 {
         engine.mosaicjson_cache.clear();
@@ -1131,9 +1108,12 @@ where
                         resp.status()
                     )));
                 }
-                let text = resp.text().await.map_err(|e| {
-                    EngineError::BadRequest(format!("STAC API response read failed: {e}"))
-                })?;
+                let body_bytes = cogzilla_io::read_response_capped(resp, MAX_POST_BODY_BYTES)
+                    .await
+                    .map_err(|e| {
+                        EngineError::BadRequest(format!("STAC API response read failed: {e}"))
+                    })?;
+                let text = String::from_utf8_lossy(&body_bytes);
                 load_catalog_json_str(&text).map_err(EngineError::BadRequest)?
             } else {
                 return Err(EngineError::BadRequest(
@@ -1198,7 +1178,7 @@ where
             ["mosaicjson", "tiles", "WebMercatorQuad", zs, xs, ys]
             | ["mosaicjson", "tiles", zs, xs, ys] => {
                 let cache_key = format!("{path}?{raw_query}");
-                engine
+                let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
                         let u = mj_url
@@ -1232,8 +1212,8 @@ where
                             Ok((b, ct))
                         }
                     })
-                    .await
-                    .map(|t| (t.bytes, t.content_type))
+                    .await;
+                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
             }
             _ => Err(EngineError::NotFound(path.clone())),
         };
@@ -1266,7 +1246,7 @@ where
                         "missing required ?url= parameter(s) for /mosaic/tiles".into(),
                     ))
                 } else {
-                    engine
+                    let cached = engine
                         .tile_cache
                         .get_or_render(cache_key, || async {
                             let first_cog = engine.store.open_uri(&pq.urls[0]).await?;
@@ -1278,8 +1258,8 @@ where
                             let b = engine.render_mosaic_tile(&pq.urls, &treq).await?;
                             Ok((b, ct))
                         })
-                        .await
-                        .map(|t| (t.bytes, t.content_type))
+                        .await;
+                    return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
                 }
             }
             _ => Err(EngineError::BadRequest(
@@ -1304,7 +1284,7 @@ where
             (None, _) => Err(EngineError::NotFound(format!("mosaic catalog '{cat_name}'"))),
             (Some(catalog), (Some(z), Some(x), Some((y, sc, ext)))) => {
                 let cache_key = format!("{path}?{raw_query}");
-                engine
+                let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
                         let tile = TileCoord { z, x, y };
@@ -1326,8 +1306,8 @@ where
                             Ok((b, ct))
                         }
                     })
-                    .await
-                    .map(|t| (t.bytes, t.content_type))
+                    .await;
+                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
             }
             _ => Err(EngineError::BadRequest(
                 "invalid /mosaic/{name}/tiles coordinate path".into(),
@@ -1349,7 +1329,7 @@ where
         let cache_key = format!("{path}?{raw_query}");
         let res = match parsed {
             (Some(z), Some(x), Some((y, sc, ext))) => {
-                engine
+                let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
                         if let Some(scene) = engine.get_scene(ds) {
@@ -1372,8 +1352,8 @@ where
                             Err(EngineError::NotFound(ds.to_string()))
                         }
                     })
-                    .await
-                    .map(|t| (t.bytes, t.content_type))
+                    .await;
+                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
             }
             _ => Err(EngineError::BadRequest(
                 "expected /tiles/{dataset}/{z}/{x}/{y}.{png|webp|f32}".to_string(),
@@ -1430,7 +1410,7 @@ where
             // GET /stac/assets?url=item.json
             (Method::GET, ["assets"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let keys: Vec<&String> = item.assets.keys().collect();
                 Ok((Bytes::from(serde_json::json!(keys).to_string()), "application/json"))
             }
@@ -1439,7 +1419,7 @@ where
             // GET /stac/info?url=item.json&assets=...
             (Method::GET, ["info"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut map = serde_json::Map::new();
@@ -1453,7 +1433,7 @@ where
             // GET /stac/info.geojson?url=item.json&assets=...
             (Method::GET, ["info.geojson"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut props = serde_json::Map::new();
@@ -1479,7 +1459,7 @@ where
             // GET /stac/asset_statistics (per-asset dict: {asset: {b1: ...}})
             (Method::GET, ["asset_statistics"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut map = serde_json::Map::new();
@@ -1493,7 +1473,7 @@ where
             // GET /stac/statistics (merged band dict: {b1: ..., b2: ...})
             (Method::GET, ["statistics"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut map = serde_json::Map::new();
@@ -1513,7 +1493,7 @@ where
             (Method::POST, ["statistics"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -1547,7 +1527,7 @@ where
             // GET /stac/{tms}/tilejson.json & /stac/{tms}/map.html
             (Method::GET, [tms, "tilejson.json"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
@@ -1563,15 +1543,17 @@ where
             }
 
             // GET /stac/tiles/{tms}/{z}/{x}/{y}[@scale][.{format}]
-            (Method::GET, ["tiles", tms, zs, xs, ys]) => {
+            // and alias GET /stac/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
+            (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
+                let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
-                engine
+                let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
                         let u = stac_url
                             .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                         let item =
-                            load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                            load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                         let (_, cogs, rewritten_expr) = resolve_stac_assets(
                             &engine,
                             &item,
@@ -1606,7 +1588,7 @@ where
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
-                        let needs_general = *tms == "WorldCRS84Quad"
+                        let needs_general = tms == "WorldCRS84Quad"
                             || pq_stac.buffer > 0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some();
@@ -1624,7 +1606,7 @@ where
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
                             let out_dim = treq.tile_size + 2 * pq_stac.buffer;
-                            let bbox = if *tms == "WorldCRS84Quad" {
+                            let bbox = if tms == "WorldCRS84Quad" {
                                 world_crs84_tile_bbox(z, x, y, pq_stac.buffer, treq.tile_size)
                             } else {
                                 web_mercator_buffered_wgs84_bbox(
@@ -1678,14 +1660,14 @@ where
                             Ok((data, ct))
                         }
                     })
-                    .await
-                    .map(|t| (t.bytes, t.content_type))
+                    .await;
+                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
             }
 
             // GET /stac/point/{lon},{lat}
             (Method::GET, ["point", coord]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let Some((lons, lats)) = coord.split_once(',') else {
@@ -1724,7 +1706,7 @@ where
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
                 let ext = p.strip_prefix("preview.").unwrap_or("png");
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -1738,10 +1720,25 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let bands = build_band_request(&pq_stac, db, is_u8)?;
+                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = pq_stac
+                    .custom_colormap_json
+                    .as_deref()
+                    .map(ColormapLut::from_json_str)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac
+                    .color_formula
+                    .as_deref()
+                    .map(ColorFormula::parse)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, None, None, pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1752,7 +1749,7 @@ where
                     return Err(EngineError::BadRequest("expected /stac/preview/{w}x{h}.{ext}".into()));
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -1763,10 +1760,25 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let bands = build_band_request(&pq_stac, db, is_u8)?;
+                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = pq_stac
+                    .custom_colormap_json
+                    .as_deref()
+                    .map(ColormapLut::from_json_str)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac
+                    .color_formula
+                    .as_deref()
+                    .map(ColorFormula::parse)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, None, None, pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1775,11 +1787,16 @@ where
 
             // GET /stac/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]
             (Method::GET, ["bbox", bbox_seg]) => async {
-                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((mut bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                if pq.coord_crs_3857 {
+                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
+                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
+                    bbox = [w, s, e, n];
+                }
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -1787,24 +1804,44 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let bands = build_band_request(&pq_stac, db, is_u8)?;
+                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = pq_stac
+                    .custom_colormap_json
+                    .as_deref()
+                    .map(ColormapLut::from_json_str)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac
+                    .color_formula
+                    .as_deref()
+                    .map(ColorFormula::parse)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, None, None, pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
             }
             .await,
             (Method::GET, ["bbox", bbox_seg, dims_ext]) => async {
-                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((mut bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                if pq.coord_crs_3857 {
+                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
+                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
+                    bbox = [w, s, e, n];
+                }
                 let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -1812,10 +1849,25 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let bands = build_band_request(&pq_stac, db, is_u8)?;
+                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = pq_stac
+                    .custom_colormap_json
+                    .as_deref()
+                    .map(ColormapLut::from_json_str)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac
+                    .color_formula
+                    .as_deref()
+                    .map(ColorFormula::parse)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, None, None, pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1837,7 +1889,7 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -1845,10 +1897,25 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let bands = build_band_request(&pq_stac, db, is_u8)?;
+                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = pq_stac
+                    .custom_colormap_json
+                    .as_deref()
+                    .map(ColormapLut::from_json_str)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac
+                    .color_formula
+                    .as_deref()
+                    .map(ColorFormula::parse)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, None, None, pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1862,7 +1929,7 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store.client, &u).await?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -1870,10 +1937,25 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let bands = build_band_request(&pq_stac, db, is_u8)?;
+                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = pq_stac
+                    .custom_colormap_json
+                    .as_deref()
+                    .map(ColormapLut::from_json_str)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac
+                    .color_formula
+                    .as_deref()
+                    .map(ColorFormula::parse)
+                    .transpose()
+                    .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, None, None, pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2000,7 +2082,7 @@ where
             (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
                 let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
-                engine
+                let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
                         let cogs = open_query_urls(&engine, &pq.urls).await?;
@@ -2091,8 +2173,8 @@ where
                             Ok((data, ct))
                         }
                     })
-                    .await
-                    .map(|t| (t.bytes, t.content_type))
+                    .await;
+                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
             }
 
             // 8. GET /cog/{tileMatrixSetId}/tilejson.json & /cog/tilejson.json
@@ -2330,19 +2412,6 @@ fn cache_control_header() -> &'static HeaderValue {
     })
 }
 
-/// Fast, deterministic FNV-1a 64-bit strong ETag for rendered tile bytes.
-fn compute_etag(bytes: &[u8]) -> String {
-    // Deterministic fixed-seed ahash (~20-30x faster than byte-at-a-time FNV-1a on large tiles)
-    let hasher = ahash::RandomState::with_seeds(
-        0x243f_6a88_85a3_08d3,
-        0x1319_8a2e_0370_7344,
-        0xa409_3822_299f_31d0,
-        0x082e_fa98_ec4e_6c89,
-    );
-    let h = hasher.hash_one(bytes);
-    format!("W/\"cgz-{h:016x}-{}\"", bytes.len())
-}
-
 fn etag_matches(if_none_match: &str, etag: &str) -> bool {
     let trimmed = if_none_match.trim();
     if trimmed == "*" {
@@ -2424,39 +2493,61 @@ fn to_http_response(
         Ok((bytes, content_type)) => {
             let is_binary_tile = content_type.starts_with("image/")
                 || content_type == "application/octet-stream";
-            if is_binary_tile {
-                let etag = compute_etag(&bytes);
-                if let Some(inm) = if_none_match {
-                    if etag_matches(inm, &etag) {
-                        engine
-                            .stats
-                            .http_304_not_modified
-                            .fetch_add(1, Ordering::Relaxed);
-                        let mut resp = Response::new(Full::new(Bytes::new()));
-                        *resp.status_mut() = StatusCode::NOT_MODIFIED;
-                        if let Ok(hv) = HeaderValue::from_str(&etag) {
-                            resp.headers_mut().insert(ETAG, hv);
-                        }
-                        resp.headers_mut()
-                            .insert(CACHE_CONTROL, cache_control_header().clone());
-                        resp.headers_mut()
-                            .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-                        return resp;
-                    }
-                }
-                let mut resp = plain_resp(StatusCode::OK, bytes, content_type);
-                if let Ok(hv) = HeaderValue::from_str(&etag) {
-                    resp.headers_mut().insert(ETAG, hv);
-                }
-                resp.headers_mut()
-                    .insert(CACHE_CONTROL, cache_control_header().clone());
-                resp
-            } else {
-                plain_resp(StatusCode::OK, bytes, content_type)
-            }
+            let etag = is_binary_tile.then(|| crate::tile_cache::compute_tile_etag(&bytes));
+            binary_or_plain_response(engine, bytes, content_type, etag, if_none_match)
         }
         Err(EngineError::Shared(inner)) => error_to_http_response(&inner),
         Err(e) => error_to_http_response(&e),
+    }
+}
+
+fn to_http_response_cached(
+    engine: &TileEngine,
+    res: Result<crate::tile_cache::CachedTile, EngineError>,
+    if_none_match: Option<&str>,
+) -> Response<Full<Bytes>> {
+    match res {
+        Ok(tile) => {
+            binary_or_plain_response(engine, tile.bytes, tile.content_type, tile.etag, if_none_match)
+        }
+        Err(EngineError::Shared(inner)) => error_to_http_response(&inner),
+        Err(e) => error_to_http_response(&e),
+    }
+}
+
+fn binary_or_plain_response(
+    engine: &TileEngine,
+    bytes: Bytes,
+    content_type: &'static str,
+    etag: Option<HeaderValue>,
+    if_none_match: Option<&str>,
+) -> Response<Full<Bytes>> {
+    if let Some(etag_hv) = etag {
+        if let Some(inm) = if_none_match {
+            if let Ok(etag_str) = etag_hv.to_str() {
+                if etag_matches(inm, etag_str) {
+                    engine
+                        .stats
+                        .http_304_not_modified
+                        .fetch_add(1, Ordering::Relaxed);
+                    let mut resp = Response::new(Full::new(Bytes::new()));
+                    *resp.status_mut() = StatusCode::NOT_MODIFIED;
+                    resp.headers_mut().insert(ETAG, etag_hv);
+                    resp.headers_mut()
+                        .insert(CACHE_CONTROL, cache_control_header().clone());
+                    resp.headers_mut()
+                        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+                    return resp;
+                }
+            }
+        }
+        let mut resp = plain_resp(StatusCode::OK, bytes, content_type);
+        resp.headers_mut().insert(ETAG, etag_hv);
+        resp.headers_mut()
+            .insert(CACHE_CONTROL, cache_control_header().clone());
+        resp
+    } else {
+        plain_resp(StatusCode::OK, bytes, content_type)
     }
 }
 
@@ -2514,5 +2605,29 @@ pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> s
                 .serve_connection(io, svc)
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colormap_param_sets_explicit_for_hillshade_and_stac_bbox_accepts_coord_crs() {
+        let pq = parse_query(Some("algorithm=hillshade&colormap=terrain"));
+        assert!(pq.colormap_explicit);
+        let bands = build_band_request(&pq, 1, false).expect("valid hillshade request");
+        match bands {
+            BandRequest::Dem { colormap, .. } => {
+                assert_ne!(colormap, ColormapName::Grayscale);
+                assert_eq!(colormap, ColormapName::from_str_opt("terrain").unwrap());
+            }
+            other => panic!("expected BandRequest::Dem, got {other:?}"),
+        }
+
+        // /stac/bbox must accept coord_crs=EPSG:3857 (matching /cog/bbox)
+        let pq_bbox = parse_query(Some("url=foo.json&coord_crs=EPSG:3857"));
+        let res = validate_query(&["stac", "bbox", "0,0,1000,1000.png"], &pq_bbox);
+        assert!(res.is_ok(), "unexpected error: {res:?}");
     }
 }

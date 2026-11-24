@@ -4,14 +4,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use hyper::header::HeaderValue;
 use tokio::sync::Notify;
 
 use crate::engine::EngineError;
+
+/// Fast, deterministic weak ETag (`W/"cgz-<ahash64>-<len>"`) for rendered tile bytes.
+pub fn compute_tile_etag(bytes: &[u8]) -> HeaderValue {
+    let hasher = ahash::RandomState::with_seeds(
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+        0xa409_3822_299f_31d0,
+        0x082e_fa98_ec4e_6c89,
+    );
+    let h = hasher.hash_one(bytes);
+    let s = format!("W/\"cgz-{h:016x}-{}\"", bytes.len());
+    HeaderValue::from_str(&s).expect("valid ASCII ETag")
+}
 
 #[derive(Clone)]
 pub struct CachedTile {
     pub bytes: Bytes,
     pub content_type: &'static str,
+    pub etag: Option<HeaderValue>,
 }
 
 struct ReadyEntry {
@@ -262,9 +277,13 @@ impl TileCache {
                         let f = render_opt.take().expect("render_fn called once");
                         return match f().await {
                             Ok((bytes, content_type)) => {
+                                let is_binary = content_type.starts_with("image/")
+                                    || content_type == "application/octet-stream";
+                                let etag = is_binary.then(|| compute_tile_etag(&bytes));
                                 let tile = CachedTile {
                                     bytes,
                                     content_type,
+                                    etag,
                                 };
                                 // Wake all singleflight waiters immediately BEFORE any LRU eviction scan.
                                 guard.complete(Ok(tile.clone()));

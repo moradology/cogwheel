@@ -518,38 +518,81 @@ impl TileEngine {
                     bands_1based[0].saturating_sub(1),
                     bands_1based[1].saturating_sub(1),
                 ];
+                for &b in &b0 {
+                    if b >= ifd.samples_per_pixel {
+                        return Err(EngineError::BadRequest(format!(
+                            "band {} out of range (dataset has {} bands)",
+                            b + 1,
+                            ifd.samples_per_pixel
+                        )));
+                    }
+                }
                 let style = RgbStyle {
                     rescale_min: *rescale_min,
                     rescale_max: *rescale_max,
                     resample: req.resample,
                     format: req.format,
                 };
-                let mut indices = Vec::with_capacity(grid_len);
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
-                        indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                match ifd.planar_config {
+                    PlanarConfig::Chunky => {
+                        let mut indices = Vec::with_capacity(grid_len);
+                        for ty in ty0..=ty1 {
+                            for tx in tx0..=tx1 {
+                                indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                            }
+                        }
+                        let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                        let a_refs: Vec<_> = tiles
+                            .iter()
+                            .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[0] as usize)))
+                            .collect();
+                        let b_refs: Vec<_> = tiles
+                            .iter()
+                            .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[1] as usize)))
+                            .collect();
+                        let srcs = [
+                            BandSource::new(
+                                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
+                                grid_w, grid_h, &a_refs,
+                            ),
+                            BandSource::new(
+                                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
+                                grid_w, grid_h, &b_refs,
+                            ),
+                        ];
+                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                    }
+                    PlanarConfig::Planar => {
+                        let mut indices = Vec::with_capacity(grid_len * 2);
+                        for &band in &b0 {
+                            for ty in ty0..=ty1 {
+                                for tx in tx0..=tx1 {
+                                    indices.push(Some(ifd.tile_index(tx, ty, band) as u32));
+                                }
+                            }
+                        }
+                        let all_tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                        let a_refs: Vec<_> = all_tiles[0..grid_len]
+                            .iter()
+                            .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                            .collect();
+                        let b_refs: Vec<_> = all_tiles[grid_len..grid_len * 2]
+                            .iter()
+                            .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                            .collect();
+                        let srcs = [
+                            BandSource::new(
+                                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
+                                grid_w, grid_h, &a_refs,
+                            ),
+                            BandSource::new(
+                                ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
+                                grid_w, grid_h, &b_refs,
+                            ),
+                        ];
+                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
                     }
                 }
-                let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
-                let a_refs: Vec<_> = tiles
-                    .iter()
-                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[0] as usize)))
-                    .collect();
-                let b_refs: Vec<_> = tiles
-                    .iter()
-                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[1] as usize)))
-                    .collect();
-                let srcs = [
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &a_refs,
-                    ),
-                    BandSource::new(
-                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
-                        grid_h, &b_refs,
-                    ),
-                ];
-                Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
             }
             BandRequest::Rgb {
                 bands_1based,

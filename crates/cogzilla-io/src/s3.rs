@@ -657,6 +657,45 @@ pub async fn fetch_s3_object_limited(
     range_header: Option<&str>,
     limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
 ) -> Result<bytes::Bytes, IoError> {
+    fetch_s3_inner(client, bucket, key, cfg, dynamic_creds, range_header, None, limiter).await
+}
+
+/// Same as [`fetch_s3_object_limited`], with a hard streaming byte cap (`max_bytes`) to prevent OOM.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_s3_object_capped(
+    client: &reqwest::Client,
+    bucket: &str,
+    key: &str,
+    cfg: &S3Config,
+    dynamic_creds: Option<&Arc<DynamicCredsCache>>,
+    range_header: Option<&str>,
+    max_bytes: usize,
+    limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
+) -> Result<bytes::Bytes, IoError> {
+    fetch_s3_inner(
+        client,
+        bucket,
+        key,
+        cfg,
+        dynamic_creds,
+        range_header,
+        Some(max_bytes),
+        limiter,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_s3_inner(
+    client: &reqwest::Client,
+    bucket: &str,
+    key: &str,
+    cfg: &S3Config,
+    dynamic_creds: Option<&Arc<DynamicCredsCache>>,
+    range_header: Option<&str>,
+    max_bytes: Option<usize>,
+    limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
+) -> Result<bytes::Bytes, IoError> {
     let mut region = bucket_region_cache()
         .get(bucket)
         .map(|r| r.clone())
@@ -746,14 +785,21 @@ pub async fn fetch_s3_object_limited(
         let status = resp.status().as_u16();
         if status == 200 || status == 206 {
             // The body can still fail after a good status line (connection reset mid-transfer).
-            match resp.bytes().await {
+            let body_res = if let Some(cap) = max_bytes {
+                crate::cloud::read_response_capped(resp, cap).await
+            } else {
+                resp.bytes().await.map_err(IoError::Http)
+            };
+            match body_res {
                 Ok(body) => {
                     if let Some(p) = permit {
                         p.on_success();
                     }
                     return Ok(body);
                 }
-                Err(e) if attempt < cfg.max_retries && is_retryable_transport_error(&e) => {
+                Err(IoError::Http(e))
+                    if attempt < cfg.max_retries && is_retryable_transport_error(&e) =>
+                {
                     if let Some(p) = permit {
                         p.on_throttle();
                     }
@@ -761,7 +807,7 @@ pub async fn fetch_s3_object_limited(
                     attempt += 1;
                     continue;
                 }
-                Err(e) => {
+                Err(IoError::Http(e)) => {
                     if let Some(p) = permit {
                         if is_retryable_transport_error(&e) {
                             p.on_throttle();
@@ -769,6 +815,7 @@ pub async fn fetch_s3_object_limited(
                     }
                     return Err(IoError::Http(e));
                 }
+                Err(e) => return Err(e),
             }
         }
 
