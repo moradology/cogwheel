@@ -1186,6 +1186,12 @@ impl TileEngine {
         cogs: &[Arc<OpenedCog>],
         req: &TileRequest,
     ) -> Result<Bytes, EngineError> {
+        if cogs.is_empty() || cogs.len() > 16 {
+            return Err(EngineError::BadRequest(format!(
+                "multi-COG compositing supports 1..=16 assets, got {}",
+                cogs.len()
+            )));
+        }
         let primary = &cogs[0];
         let crs = self.get_or_build_crs(primary)?;
         let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, N as u32);
@@ -1217,13 +1223,6 @@ impl TileEngine {
             for tx in tx0..=tx1 {
                 indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
             }
-        }
-
-        if cogs.is_empty() || cogs.len() > 16 {
-            return Err(EngineError::BadRequest(format!(
-                "multi-COG compositing supports 1..=16 assets, got {}",
-                cogs.len()
-            )));
         }
 
         // Fetch all co-registered COGs concurrently via JoinSet (supports 2..=16 assets).

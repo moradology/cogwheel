@@ -521,15 +521,12 @@ fn for_each_pixel_in_row<const N: usize, F: FnMut(usize, f32, f32)>(
                 let v_l = grid_v[row0 + gx] + (grid_v[row1 + gx] - grid_v[row0 + gx]) * ty;
                 let v_r = grid_v[row0 + gx + 1] + (grid_v[row1 + gx + 1] - grid_v[row0 + gx + 1]) * ty;
 
-                let du = (u_r - u_l) * inv_cell;
-                let dv = (v_r - v_l) * inv_cell;
-                let mut u = u_l;
-                let mut v = v_l;
+                let du = u_r - u_l;
+                let dv = v_r - v_l;
                 let base_x = gx * cell_px;
                 for k in 0..cell_px {
-                    f(base_x + k, u, v);
-                    u += du;
-                    v += dv;
+                    let tx = (k as f32) * inv_cell;
+                    f(base_x + k, u_l + du * tx, v_l + dv * tx);
                 }
             }
         }
@@ -947,16 +944,13 @@ fn fill_uv_row<const N: usize>(
                 let u_r = grid_u[row0 + gx + 1] + (grid_u[row1 + gx + 1] - grid_u[row0 + gx + 1]) * ty;
                 let v_l = grid_v[row0 + gx] + (grid_v[row1 + gx] - grid_v[row0 + gx]) * ty;
                 let v_r = grid_v[row0 + gx + 1] + (grid_v[row1 + gx + 1] - grid_v[row0 + gx + 1]) * ty;
-                let du = (u_r - u_l) * inv_cell;
-                let dv = (v_r - v_l) * inv_cell;
-                let mut u = u_l;
-                let mut v = v_l;
+                let du = u_r - u_l;
+                let dv = v_r - v_l;
                 let base_x = gx * cell_px;
                 for k in 0..cell_px {
-                    u_row[base_x + k] = u;
-                    v_row[base_x + k] = v;
-                    u += du;
-                    v += dv;
+                    let tx = (k as f32) * inv_cell;
+                    u_row[base_x + k] = u_l + du * tx;
+                    v_row[base_x + k] = v_l + dv * tx;
                 }
             }
         }
