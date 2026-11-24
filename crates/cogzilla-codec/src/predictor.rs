@@ -1343,7 +1343,16 @@ pub fn reconstruct_predictor1(
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let w = tile_w as usize;
     let h = tile_h as usize;
-    let pixels = w * h;
+    let pixels = w.checked_mul(h).expect("tile pixel count overflow");
+    let expected_bytes = pixels
+        .checked_mul(bands_in_tile)
+        .and_then(|n| n.checked_mul(4))
+        .expect("tile byte count overflow");
+    assert!(
+        raw.len() >= expected_bytes,
+        "reconstruct_predictor1: raw buffer too short ({} < {expected_bytes})",
+        raw.len()
+    );
 
     if bands_in_tile == 1 {
         let mut slab = AlignedF32Slab::new_uninit(pixels);

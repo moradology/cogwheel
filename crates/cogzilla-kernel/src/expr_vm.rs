@@ -215,6 +215,34 @@ impl ExprProgram {
         if sp > 0 { stack[sp - 1] } else { f32::NAN }
     }
 
+    /// Scanline-vectorized bytecode VM evaluation across `N` contiguous pixels (`[f32; N]`),
+    /// reusing a caller-provided scratch stack buffer to avoid zeroing 8–32 KiB per scanline.
+    pub fn eval_row_with_scratch<const N: usize>(
+        &self,
+        band_rows: &[[f32; N]],
+        scratch: &mut Vec<[f32; N]>,
+        out: &mut [f32; N],
+    ) {
+        const MAX_STACK: usize = 16;
+        let depth = self.max_depth as usize;
+        if depth > MAX_STACK || self.ops.is_empty() {
+            let mut vals = [0.0f32; 16];
+            let nb = band_rows.len().min(16);
+            for px in 0..N {
+                for b in 0..nb {
+                    vals[b] = band_rows[b][px];
+                }
+                out[px] = self.eval(&vals[..nb]);
+            }
+            return;
+        }
+        let needed = depth.max(1);
+        if scratch.len() < needed {
+            scratch.resize(needed, [0.0f32; N]);
+        }
+        self.eval_row_with_slice(band_rows, &mut scratch[..needed], out);
+    }
+
     /// Scanline-vectorized bytecode VM evaluation across `N` contiguous pixels (`[f32; N]`).
     /// Uses a compact 4-slot stack when `max_depth <= 4` (NDVI, NDWI, EVI, etc. — 4× less stack
     /// zeroing per scanline), falling back to 16 slots for deeper expressions.
@@ -233,18 +261,18 @@ impl ExprProgram {
         }
         if self.max_depth <= 4 {
             let mut stack = [[0.0f32; N]; 4];
-            self.eval_row_with_stack(band_rows, &mut stack, out);
+            self.eval_row_with_slice(band_rows, &mut stack, out);
         } else {
             let mut stack = [[0.0f32; N]; MAX_STACK];
-            self.eval_row_with_stack(band_rows, &mut stack, out);
+            self.eval_row_with_slice(band_rows, &mut stack, out);
         }
     }
 
     #[inline(always)]
-    fn eval_row_with_stack<const N: usize, const S: usize>(
+    fn eval_row_with_slice<const N: usize>(
         &self,
         band_rows: &[[f32; N]],
-        stack: &mut [[f32; N]; S],
+        stack: &mut [[f32; N]],
         out: &mut [f32; N],
     ) {
         let mut sp = 0usize;
