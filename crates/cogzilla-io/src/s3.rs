@@ -229,11 +229,14 @@ pub fn parse_aws_credentials_ini(text: &str, profile: &str) -> Option<AwsCredent
         }
         if let Some((k, v)) = line.split_once('=') {
             let key = k.trim().to_ascii_lowercase();
-            let val = v.trim().to_string();
+            let val = v.trim();
+            if val.is_empty() {
+                continue;
+            }
             match key.as_str() {
-                "aws_access_key_id" => ak = Some(val),
-                "aws_secret_access_key" => sk = Some(val),
-                "aws_session_token" => tok = Some(val),
+                "aws_access_key_id" => ak = Some(val.to_string()),
+                "aws_secret_access_key" => sk = Some(val.to_string()),
+                "aws_session_token" => tok = Some(val.to_string()),
                 _ => {}
             }
         }
@@ -307,10 +310,11 @@ impl DynamicCredsCache {
         }
 
         // 1. ECS Task Role (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or FULL_URI)
-        let ecs_url = if let Ok(rel) = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
-            Some(format!("http://169.254.170.2{rel}"))
-        } else {
-            std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok()
+        let ecs_url = match std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+            Ok(rel) if !rel.trim().is_empty() => Some(format!("http://169.254.170.2{}", rel.trim())),
+            _ => std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         };
 
         if let Some(url) = ecs_url {
@@ -449,7 +453,13 @@ pub fn parse_aws_json_credentials(body: &str) -> Option<AwsCredentials> {
 fn parse_iso8601_utc_epoch(s: &str) -> Option<u64> {
     let s = s.trim();
     let bytes = s.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' || bytes[16] != b':' {
+    if bytes.len() < 19
+        || !bytes[..19].is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     let year: i64 = s[0..4].parse().ok()?;
@@ -531,6 +541,31 @@ pub fn parse_s3_uri(uri: &str) -> Option<(&str, &str)> {
     Some((bucket, key))
 }
 
+/// Validate an AWS region identifier (e.g. `us-west-2`, `eu-central-1`) to block SSRF
+/// via spoofed `x-amz-bucket-region` response headers.
+fn is_valid_aws_region(region: &str) -> bool {
+    let bytes = region.as_bytes();
+    (3..=32).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && (bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !region.contains("--")
+}
+
+/// Normalize a host[:port] for SigV4 signing (lowercase + strip default `:443` / `:80`).
+fn normalize_sigv4_host(scheme: &str, host_str: &str) -> String {
+    let lower = host_str.to_ascii_lowercase();
+    if scheme.eq_ignore_ascii_case("https") {
+        lower.strip_suffix(":443").unwrap_or(&lower).to_string()
+    } else if scheme.eq_ignore_ascii_case("http") {
+        lower.strip_suffix(":80").unwrap_or(&lower).to_string()
+    } else {
+        lower
+    }
+}
+
 /// Build `(url, host, canonical_uri)` for an S3 bucket/key given `region` and `S3Config`.
 pub fn build_s3_endpoint(
     bucket: &str,
@@ -539,20 +574,23 @@ pub fn build_s3_endpoint(
     cfg: &S3Config,
 ) -> (String, String, String) {
     let encoded_key = encode_s3_canonical_uri(key);
+    let bucket_needs_path_style = bucket
+        .bytes()
+        .any(|b| b == b'.' || b == b'_' || b.is_ascii_uppercase());
     if let Some(ep) = cfg.endpoint_url.as_deref() {
         let ep_clean = ep.trim_end_matches('/');
+        let scheme = ep_clean.split("://").next().unwrap_or("https");
         let after_scheme = ep_clean.split("://").nth(1).unwrap_or(ep_clean);
         let (host_str, ep_path) = match after_scheme.find('/') {
             Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
             None => (after_scheme, ""),
         };
-        let host = host_str.to_string();
-        if cfg.force_path_style {
+        let host = normalize_sigv4_host(scheme, host_str);
+        if cfg.force_path_style || bucket_needs_path_style {
             let bucket_key = format!("/{bucket}{encoded_key}");
             let canonical_uri = format!("{ep_path}{bucket_key}");
-            (format!("{ep_clean}{bucket_key}"), host, canonical_uri)
+            (format!("{scheme}://{host}{canonical_uri}"), host, canonical_uri)
         } else {
-            let scheme = ep_clean.split("://").next().unwrap_or("https");
             let vhost = format!("{bucket}.{host}");
             let canonical_uri = format!("{ep_path}{encoded_key}");
             (
@@ -561,9 +599,9 @@ pub fn build_s3_endpoint(
                 canonical_uri,
             )
         }
-    } else if cfg.force_path_style || bucket.contains('.') {
-        // Dotted AWS bucket names fail wildcard TLS validation (`*.s3.<region>.amazonaws.com`)
-        // under virtual-hosted addressing, so automatically use path-style.
+    } else if cfg.force_path_style || bucket_needs_path_style {
+        // Dotted, underscored, or uppercase AWS bucket names fail wildcard TLS validation or
+        // SigV4 host normalization under virtual-hosted addressing, so automatically use path-style.
         let host = format!("s3.{region}.amazonaws.com");
         let canonical_uri = format!("/{bucket}{encoded_key}");
         (format!("https://{host}{canonical_uri}"), host, canonical_uri)
@@ -889,16 +927,20 @@ async fn fetch_s3_inner(
             }
         }
 
-        // Automatic S3 bucket region discovery on 301 / 400 with `x-amz-bucket-region`
+        // Automatic S3 bucket region discovery on 301 / 400 / 403 with `x-amz-bucket-region`.
+        // Strictly validate region syntax to prevent SSRF/credential exfiltration via spoofed headers.
         if !region_redirected && matches!(status, 301 | 400 | 403) {
             if let Some(discovered) = resp
                 .headers()
                 .get("x-amz-bucket-region")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && s != &region)
+                .filter(|s| is_valid_aws_region(s) && s != &region)
             {
-                bucket_region_cache().insert(bucket.to_string(), discovered.clone());
+                let cache = bucket_region_cache();
+                if cache.len() < 4096 {
+                    cache.insert(bucket.to_string(), discovered.clone());
+                }
                 region = discovered;
                 region_redirected = true;
                 drop(permit);
@@ -959,5 +1001,24 @@ mod uri_tests {
         assert_eq!(host, "s3.us-west-2.amazonaws.com");
         assert_eq!(canonical, "/my.dotted.bucket/a/b.tif");
         assert_eq!(url, "https://s3.us-west-2.amazonaws.com/my.dotted.bucket/a/b.tif");
+
+        // Underscored/uppercase buckets also use path-style and custom endpoints normalize host/port
+        let (_, host_u, _) = build_s3_endpoint("Legacy_Bucket", "a.tif", "us-east-1", &cfg);
+        assert_eq!(host_u, "s3.us-east-1.amazonaws.com");
+        let ep_cfg = S3Config {
+            endpoint_url: Some("https://MinIO.Local:443".into()),
+            force_path_style: true,
+            ..Default::default()
+        };
+        let (ep_url, ep_host, _) = build_s3_endpoint("bkt", "a.tif", "us-east-1", &ep_cfg);
+        assert_eq!(ep_host, "minio.local");
+        assert_eq!(ep_url, "https://minio.local/bkt/a.tif");
+
+        // Region header validation blocks SSRF payloads
+        assert!(is_valid_aws_region("us-west-2"));
+        assert!(is_valid_aws_region("eu-central-1"));
+        for bad in ["attacker.example?", "us-east-1/x#", "US-EAST-1", "a--b", "ab", ""] {
+            assert!(!is_valid_aws_region(bad), "expected region rejection for {bad}");
+        }
     }
 }
