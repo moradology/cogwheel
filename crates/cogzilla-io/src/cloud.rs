@@ -358,7 +358,7 @@ pub async fn read_response_capped(
         .map(|n| (n as usize).min(max_bytes).min(1024 * 1024))
         .unwrap_or(0);
     let mut out = bytes::BytesMut::with_capacity(init);
-    while let Some(chunk) = resp.chunk().await.map_err(IoError::Http)? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| IoError::Http(e.without_url()))? {
         if out.len().saturating_add(chunk.len()) > max_bytes {
             return Err(IoError::Fs(std::io::Error::other(format!(
                 "remote response exceeded limit of {max_bytes} bytes"
@@ -468,7 +468,7 @@ async fn fetch_gcs_inner(
                         continue;
                     }
                 }
-                return Err(IoError::Http(e));
+                return Err(IoError::Http(e.without_url()));
             }
         };
         let status = resp.status().as_u16();
@@ -483,16 +483,25 @@ async fn fetch_gcs_inner(
                 tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
                 continue;
             }
-            return Err(IoError::HttpStatus { status, url });
+            return Err(IoError::HttpStatus {
+                status,
+                url: crate::backend::redact_http_url(&url),
+            });
         }
         if status == 200
             && let Some((start, _)) = range
             && start > 0
         {
-            return Err(IoError::HttpStatus { status: 200, url });
+            return Err(IoError::HttpStatus {
+                status: 200,
+                url: crate::backend::redact_http_url(&url),
+            });
         }
         if status != 200 && status != 206 {
-            return Err(IoError::HttpStatus { status, url });
+            return Err(IoError::HttpStatus {
+                status,
+                url: crate::backend::redact_http_url(&url),
+            });
         }
         let eff_cap = max_bytes.or_else(|| {
             range.map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
@@ -518,12 +527,15 @@ async fn fetch_gcs_inner(
                         continue;
                     }
                 }
-                return Err(IoError::Http(e));
+                return Err(IoError::Http(e.without_url()));
             }
             Err(e) => return Err(e),
         }
     }
-    Err(IoError::HttpStatus { status: 503, url })
+    Err(IoError::HttpStatus {
+        status: 503,
+        url: crate::backend::redact_http_url(&url),
+    })
 }
 
 /// Compute Azure Blob SharedKey `Authorization` header (`SharedKey {account}:{b64_hmac_sha256}`).

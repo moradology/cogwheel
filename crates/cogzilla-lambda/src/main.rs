@@ -156,9 +156,9 @@ async fn lambda_handler(engine: Arc<TileEngine>, event: Request) -> Result<Respo
     let out_body = if rbytes.is_empty() {
         Body::Empty
     } else if is_binary_content_type(ct) {
-        Body::Binary(rbytes.to_vec())
+        Body::Binary(Vec::from(rbytes))
     } else {
-        match String::from_utf8(rbytes.to_vec()) {
+        match String::from_utf8(Vec::from(rbytes)) {
             Ok(s) => Body::Text(s),
             Err(e) => Body::Binary(e.into_bytes()),
         }

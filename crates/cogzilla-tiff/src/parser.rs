@@ -495,7 +495,9 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                 TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
                 TAG_STRIP_OFFSETS => strip_offsets = Some(entry.read_u64_vec(&r)?),
                 TAG_SAMPLES_PER_PIXEL => samples_per_pixel = to_u16(entry.read_u64_scalar(&r)?)?,
-                TAG_ROWS_PER_STRIP => rows_per_strip = to_u32(entry.read_u64_scalar(&r)?)?,
+                TAG_ROWS_PER_STRIP => {
+                    rows_per_strip = entry.read_u64_scalar(&r)?.min(u32::MAX as u64) as u32;
+                }
                 TAG_STRIP_BYTE_COUNTS => strip_byte_counts = Some(entry.read_u32_vec(&r)?),
                 TAG_PLANAR_CONFIG => {
                     planar_config = match entry.read_u64_scalar(&r)? {

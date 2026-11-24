@@ -119,9 +119,13 @@ pub async fn load_stac_item(
                 EngineError::NotFound(format!("STAC item HTTP 404: {url}"))
             }
             cogzilla_io::IoError::Fs(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => {
-                EngineError::NotFound(format!("cannot read STAC item '{uri}': {ioe}"))
+                let safe_uri = cogzilla_io::redact_http_url(uri);
+                EngineError::NotFound(format!("cannot read STAC item '{safe_uri}': {ioe}"))
             }
-            other => EngineError::BadRequest(format!("failed to fetch STAC item '{uri}': {other}")),
+            other => {
+                let safe_uri = cogzilla_io::redact_http_url(uri);
+                EngineError::BadRequest(format!("failed to fetch STAC item '{safe_uri}': {other}"))
+            }
         })?;
 
     let val: serde_json::Value = serde_json::from_slice(&raw_bytes)
@@ -179,7 +183,11 @@ pub async fn resolve_stac_assets(
     requested_assets: &[String],
     expr_raw: Option<&str>,
 ) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
-    let mut names: Vec<String> = requested_assets.to_vec();
+    let mut names: Vec<String> = if requested_assets.iter().any(|a| a == ":all:") {
+        item.assets.keys().take(16).cloned().collect()
+    } else {
+        requested_assets.to_vec()
+    };
 
     // If no explicit `?assets=` given, extract exact identifier tokens referenced in `?expression=`
     // using longest-prefix matching against known asset names (supporting both unspaced
@@ -373,6 +381,34 @@ pub fn get_colormap_png(id: &str) -> Result<Bytes, EngineError> {
         filter_sub_rgb_row(&row, &mut filtered[y * stride..(y + 1) * stride]);
     }
     Ok(encode_filtered_png(w as u32, h as u32, 2, &filtered))
+}
+
+/// Render a 256×20 colormap colorbar in PNG, JPEG, or WebP format.
+pub fn get_colormap_image(
+    id: &str,
+    format: cogzilla_kernel::OutputFormat,
+) -> Result<Bytes, EngineError> {
+    if matches!(format, cogzilla_kernel::OutputFormat::Png) {
+        return get_colormap_png(id);
+    }
+    let cm = ColormapName::from_str_opt(id)
+        .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
+    let lut = cm.lut();
+    let w = 256usize;
+    let h = 20usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let row_off = y * w * 4;
+        for x in 0..w {
+            let [r, g, b, a] = lut.rgba_u32[x].to_le_bytes();
+            let o = row_off + x * 4;
+            rgba[o] = r;
+            rgba[o + 1] = g;
+            rgba[o + 2] = b;
+            rgba[o + 3] = a;
+        }
+    }
+    Ok(crate::titiler::encode_rgba_output(w, h, &rgba, format, false))
 }
 
 // ============================================================================

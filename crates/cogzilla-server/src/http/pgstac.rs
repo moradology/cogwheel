@@ -1109,9 +1109,16 @@ async fn tile(
             } else {
                 full.samples_per_pixel
             };
-            let is_u8 = full.sample_type == cogzilla_tiff::SampleType::Uint8;
-            let (mut treq, content_type) =
-                build_tile_request(tile, scale, &explicit, &pq, default_bands, is_u8)?;
+            let (mut treq, content_type) = build_tile_request(
+                tile,
+                scale,
+                &explicit,
+                &pq,
+                default_bands,
+                full.sample_type,
+                false,
+                Some(&first),
+            )?;
             // As in TiTiler, `resampling` applies to a source already in the tile's projection
             // and `reproject` to one that has to be warped into it.
             treq.resample = match engine.get_or_build_crs(&first)? {

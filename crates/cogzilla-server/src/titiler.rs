@@ -28,7 +28,7 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .map(|i| serde_json::json!([format!("b{i}"), {}]))
         .collect();
     let band_descriptions: Vec<_> = (1..=count)
-        .map(|i| serde_json::json!([format!("b{i}"), ""]))
+        .map(|i| serde_json::json!([format!("b{i}"), format!("b{i}")]))
         .collect();
     let colorinterp: Vec<&str> = match count {
         3 => vec!["red", "green", "blue"],
@@ -43,11 +43,39 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .map(|ifd| (full.width as f64 / ifd.width.max(1) as f64).round() as u32)
         .collect();
 
+    let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
     let (nodata_type, nodata_value) = match cog.index.nodata {
-        Some(v) if v.is_nan() => ("Nodata", serde_json::json!("nan")),
-        Some(v) => ("Nodata", serde_json::json!(v)),
-        None => ("None", serde_json::Value::Null),
+        Some(v) if v.is_nan() => ("Nodata", Some(serde_json::json!("nan"))),
+        Some(v) => ("Nodata", Some(serde_json::json!(v))),
+        None if has_alpha => ("Alpha", None),
+        None if full.mask_ifd.is_some() => ("Mask", None),
+        None => ("None", None),
     };
+
+    let crs_uri = if let Some(epsg) = cog
+        .index
+        .geo_keys
+        .projected_cs_type
+        .filter(|&c| c > 0 && c != 32767)
+    {
+        format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
+    } else if let Some(epsg) = cog
+        .index
+        .geo_keys
+        .geographic_type
+        .filter(|&c| c > 0 && c != 32767)
+    {
+        format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
+    } else {
+        "http://www.opengis.net/def/crs/EPSG/0/4326".to_string()
+    };
+
+    let scales: Vec<f32> = (0..count)
+        .map(|i| cog.index.scales.get(i).copied().unwrap_or(1.0))
+        .collect();
+    let offsets: Vec<f32> = (0..count)
+        .map(|i| cog.index.offsets.get(i).copied().unwrap_or(0.0))
+        .collect();
 
     let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
     let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
@@ -62,8 +90,9 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         y00.max(y10).max(y01).max(y11),
     ];
 
-    Ok(serde_json::json!({
+    let mut info = serde_json::json!({
         "bounds": native_bounds,
+        "crs": crs_uri,
         "wgs84_bounds": bounds,
         "minzoom": minzoom,
         "maxzoom": maxzoom,
@@ -71,14 +100,19 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         "band_descriptions": band_descriptions,
         "dtype": full.sample_type.gdal_name(),
         "nodata_type": nodata_type,
-        "nodata_value": nodata_value,
         "colorinterp": colorinterp,
+        "scales": scales,
+        "offsets": offsets,
         "driver": "GTiff",
         "count": count,
         "width": full.width,
         "height": full.height,
         "overviews": overviews,
-    }))
+    });
+    if let Some(nv) = nodata_value {
+        info["nodata_value"] = nv;
+    }
+    Ok(info)
 }
 
 /// TiTiler-compatible `/cog/info.geojson` Feature wrapping the raster footprint polygon.
@@ -102,6 +136,7 @@ pub fn build_cog_info_geojson(
     };
     Ok(serde_json::json!({
         "type": "Feature",
+        "bbox": [w, s, e, n],
         "geometry": {
             "type": "Polygon",
             "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]
@@ -110,7 +145,7 @@ pub fn build_cog_info_geojson(
     }))
 }
 
-/// TiTiler-compatible TileJSON 2.2.0 (`/cog/{tms}/tilejson.json`).
+/// TiTiler-compatible TileJSON 3.0.0 (`/cog/{tms}/tilejson.json`).
 pub fn build_tilejson(
     engine: &TileEngine,
     cog: &OpenedCog,
@@ -126,11 +161,11 @@ pub fn build_tilejson(
         .max(full.height as f64 / coarsest.height.max(1) as f64);
     let (minzoom, maxzoom) =
         crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
-    let center = [
+    let center = serde_json::json!([
         0.5 * (bounds[0] + bounds[2]),
         0.5 * (bounds[1] + bounds[3]),
-        minzoom as f64,
-    ];
+        minzoom,
+    ]);
     let origin = if host.starts_with("http://") || host.starts_with("https://") {
         host.to_string()
     } else {
@@ -253,6 +288,7 @@ pub async fn query_point(
         "coordinates": [lon, lat],
         "values": values,
         "band_names": band_names,
+        "band_descriptions": band_names,
     }))
 }
 
@@ -1436,10 +1472,27 @@ impl PolygonMask {
             .get("coordinates")
             .ok_or_else(|| EngineError::BadRequest("GeoJSON missing coordinates".into()))?;
 
-        let parse_ring = |arr: &serde_json::Value| -> Result<Vec<(f64, f64)>, EngineError> {
+        const MAX_GEOJSON_VERTICES: usize = 65_536;
+        const MAX_GEOJSON_RINGS: usize = 4_096;
+        let mut total_vertices = 0usize;
+        let mut total_rings = 0usize;
+
+        let mut parse_ring = |arr: &serde_json::Value| -> Result<Vec<(f64, f64)>, EngineError> {
             let list = arr
                 .as_array()
                 .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON ring".into()))?;
+            total_rings += 1;
+            if total_rings > MAX_GEOJSON_RINGS {
+                return Err(EngineError::BadRequest(format!(
+                    "GeoJSON polygon exceeds max {MAX_GEOJSON_RINGS} rings"
+                )));
+            }
+            total_vertices = total_vertices.saturating_add(list.len());
+            if total_vertices > MAX_GEOJSON_VERTICES {
+                return Err(EngineError::BadRequest(format!(
+                    "GeoJSON polygon exceeds max {MAX_GEOJSON_VERTICES} vertices"
+                )));
+            }
             let mut ring = Vec::with_capacity(list.len());
             for pt in list {
                 let p = pt
@@ -1448,10 +1501,17 @@ impl PolygonMask {
                 if p.len() < 2 {
                     return Err(EngineError::BadRequest("coord needs [lon, lat]".into()));
                 }
-                ring.push((
-                    p[0].as_f64().unwrap_or(0.0),
-                    p[1].as_f64().unwrap_or(0.0),
-                ));
+                let (Some(lon), Some(lat)) = (p[0].as_f64(), p[1].as_f64()) else {
+                    return Err(EngineError::BadRequest(
+                        "GeoJSON coordinates must be numeric".into(),
+                    ));
+                };
+                if !lon.is_finite() || !lat.is_finite() {
+                    return Err(EngineError::BadRequest(
+                        "GeoJSON coordinates must be finite".into(),
+                    ));
+                }
+                ring.push((lon, lat));
             }
             Ok(ring)
         };
@@ -1504,8 +1564,10 @@ impl PolygonMask {
                 }
             }
         }
-        if !min_x.is_finite() {
-            return Err(EngineError::BadRequest("empty GeoJSON polygon".into()));
+        if !min_x.is_finite() || !min_y.is_finite() || min_x >= max_x || min_y >= max_y {
+            return Err(EngineError::BadRequest(
+                "empty or degenerate GeoJSON polygon".into(),
+            ));
         }
         let bbox = [min_x, min_y, max_x, max_y];
         Ok((Self { polygons, bbox }, bbox))
@@ -1556,37 +1618,60 @@ pub(crate) fn encode_rgba_output(
     format: OutputFormat,
     return_mask: bool,
 ) -> Bytes {
+    thread_local! {
+        static PNG_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    const MAX_TLS_SCRATCH: usize = 4 * 1024 * 1024;
     match format {
         OutputFormat::Png => {
-            if !return_mask {
-                let mut rgb = vec![0u8; w * h * 3];
-                for i in 0..(w * h) {
-                    if rgba[i * 4 + 3] != 0 {
-                        rgb[i * 3] = rgba[i * 4];
-                        rgb[i * 3 + 1] = rgba[i * 4 + 1];
-                        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+            PNG_SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let (ref mut filtered, ref mut rgb_row) = *guard;
+                let out = if !return_mask {
+                    let stride = 1 + w * 3;
+                    filtered.resize(h * stride, 0);
+                    rgb_row.resize(w * 3, 0);
+                    for py in 0..h {
+                        let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
+                        for (src, dst) in
+                            src_row.chunks_exact(4).zip(rgb_row.chunks_exact_mut(3))
+                        {
+                            if src[3] != 0 {
+                                dst[0] = src[0];
+                                dst[1] = src[1];
+                                dst[2] = src[2];
+                            } else {
+                                dst[0] = 0;
+                                dst[1] = 0;
+                                dst[2] = 0;
+                            }
+                        }
+                        filter_sub_rgb_row(
+                            rgb_row,
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
                     }
+                    encode_filtered_png(w as u32, h as u32, 2, filtered)
+                } else {
+                    let stride = 1 + w * 4;
+                    filtered.resize(h * stride, 0);
+                    for py in 0..h {
+                        filter_sub_rgba_row(
+                            &rgba[py * w * 4..(py + 1) * w * 4],
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
+                    }
+                    encode_filtered_png(w as u32, h as u32, 6, filtered)
+                };
+                if filtered.capacity() > MAX_TLS_SCRATCH {
+                    *filtered = Vec::new();
                 }
-                let stride = 1 + w * 3;
-                let mut filtered = vec![0u8; h * stride];
-                for py in 0..h {
-                    filter_sub_rgb_row(
-                        &rgb[py * w * 3..(py + 1) * w * 3],
-                        &mut filtered[py * stride..(py + 1) * stride],
-                    );
+                if rgb_row.capacity() > MAX_TLS_SCRATCH {
+                    *rgb_row = Vec::new();
                 }
-                encode_filtered_png(w as u32, h as u32, 2, &filtered)
-            } else {
-                let stride = 1 + w * 4;
-                let mut filtered = vec![0u8; h * stride];
-                for py in 0..h {
-                    filter_sub_rgba_row(
-                        &rgba[py * w * 4..(py + 1) * w * 4],
-                        &mut filtered[py * stride..(py + 1) * stride],
-                    );
-                }
-                encode_filtered_png(w as u32, h as u32, 6, &filtered)
-            }
+                out
+            })
         }
         OutputFormat::Webp { quality } => {
             if !return_mask {
@@ -1838,19 +1923,42 @@ async fn render_bbox_impl(
                 && v01.is_finite()
                 && v11.is_finite();
 
-            // Skip entire cell if all 4 corners are strictly outside the source image bounds,
-            // and fall back to exact per-pixel projection if the cell wraps across the antimeridian.
+            // Skip entire cell if all 4 corners + midpoint are strictly outside the source image
+            // bounds, and fall back to exact per-pixel projection if the cell has high curvature
+            // (> 0.05 px midpoint error) or wraps across the antimeridian / pole in X or Y.
             let mut use_bilinear = all_finite;
             if all_finite {
-                let cu_min = u00.min(u10).min(u01).min(u11) as f32;
-                let cu_max = u00.max(u10).max(u01).max(u11) as f32;
-                let cv_min = v00.min(v10).min(v01).min(v11) as f32;
-                let cv_max = v00.max(v10).max(v01).max(v11) as f32;
-                if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
-                    continue;
-                }
-                if ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f {
+                let x_mid = bbox[0] + (0.5 * (x0 + x1) as f64) * dlx;
+                let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
+                let (msx, msy) = to_src_crs(x_mid, y_mid);
+                let mid_ok = if msx.is_finite() && msy.is_finite() {
+                    let (mcol, mrow) = ifd.crs_to_pixel.forward(msx, msy);
+                    let mu = mcol - 0.5;
+                    let mv = mrow - 0.5;
+                    let u_avg = 0.25 * (u00 + u10 + u01 + u11);
+                    let v_avg = 0.25 * (v00 + v10 + v01 + v11);
+                    mu.is_finite()
+                        && mv.is_finite()
+                        && (mu - u_avg).abs() <= 0.05
+                        && (mv - v_avg).abs() <= 0.05
+                } else {
+                    false
+                };
+                if !mid_ok {
                     use_bilinear = false;
+                } else {
+                    let cu_min = u00.min(u10).min(u01).min(u11) as f32;
+                    let cu_max = u00.max(u10).max(u01).max(u11) as f32;
+                    let cv_min = v00.min(v10).min(v01).min(v11) as f32;
+                    let cv_max = v00.max(v10).max(v01).max(v11) as f32;
+                    if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
+                        continue;
+                    }
+                    if (ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f)
+                        || (ifd.height >= 64 && h > STEP * 2 && (cv_max - cv_min) > 0.5 * ifd_h_f)
+                    {
+                        use_bilinear = false;
+                    }
                 }
             }
 

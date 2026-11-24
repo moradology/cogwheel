@@ -256,7 +256,11 @@ impl ExprProgram {
                     sp += 1;
                 }
                 Op::LoadBand(slot) => {
-                    stack[sp] = band_rows[slot as usize];
+                    if let Some(row) = band_rows.get(slot as usize) {
+                        stack[sp] = *row;
+                    } else {
+                        stack[sp].fill(f32::NAN);
+                    }
                     sp += 1;
                 }
                 Op::Add => {
