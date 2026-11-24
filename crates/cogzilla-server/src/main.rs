@@ -52,13 +52,13 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let mut store = CogStore::new(args.cache_mb * 1024 * 1024);
+    let mut store = CogStore::new(args.cache_mb.saturating_mul(1024 * 1024));
     if args.disk_cache_mb > 0 {
         let dir = args
             .disk_cache_dir
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("cogzilla-disk-cache"));
-        match DiskBlockCache::open(&dir, args.disk_cache_mb * 1024 * 1024) {
+        match DiskBlockCache::open(&dir, args.disk_cache_mb.saturating_mul(1024 * 1024)) {
             Ok(dc) => {
                 tracing::info!(
                     dir = %dir.display(),
@@ -78,7 +78,7 @@ async fn main() {
     }
     let engine = Arc::new(TileEngine::with_store_and_tile_cache(
         Arc::new(store),
-        args.tile_cache_mb * 1024 * 1024,
+        args.tile_cache_mb.saturating_mul(1024 * 1024),
     ));
 
     for spec in &args.datasets {

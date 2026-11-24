@@ -327,6 +327,9 @@ pub fn encode_indexed_png(
         }
         write_chunk(&mut out, *b"IDAT", &enc.zlib_buf[..written]);
         out.put_slice(&PNG_IEND);
+        if enc.zlib_buf.capacity() > 4 * 1024 * 1024 {
+            enc.zlib_buf = Vec::new();
+        }
         out.freeze()
     })
 }
