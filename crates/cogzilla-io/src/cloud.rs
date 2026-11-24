@@ -57,7 +57,10 @@ pub fn parse_gcs_uri(uri: &str) -> Option<(&str, &str)> {
         .strip_prefix("gs://")
         .or_else(|| uri.strip_prefix("/vsigs/"))?;
     let (bucket, key) = rest.split_once('/')?;
-    if !is_valid_gcs_bucket(bucket) || key.is_empty() {
+    if !is_valid_gcs_bucket(bucket)
+        || key.is_empty()
+        || key.split(['/', '\\']).any(|seg| seg == "..")
+    {
         return None;
     }
     Some((bucket, key))
@@ -93,6 +96,7 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
         if !is_valid_azure_account(account)
             || !is_valid_azure_container(container)
             || blob.is_empty()
+            || blob.split(['/', '\\']).any(|seg| seg == "..")
         {
             return None;
         }
@@ -107,7 +111,7 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
         .strip_prefix("az://")
         .or_else(|| uri.strip_prefix("/vsiaz/"))?;
     let (first, tail) = rest.split_once('/')?;
-    if first.is_empty() || tail.is_empty() {
+    if first.is_empty() || tail.is_empty() || tail.split(['/', '\\']).any(|seg| seg == "..") {
         return None;
     }
     if let Some(acct) = account_override.filter(|s| !s.is_empty()) {

@@ -927,10 +927,10 @@ impl<const N: usize> CoordPlan<N> {
             if !any_in {
                 return None;
             }
-            let src_min_col = (min_u.floor() as i32 - 1).max(0);
-            let src_max_col = (max_u.ceil() as i32 + 1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32 - 1).max(0);
-            let src_max_row = (max_v.ceil() as i32 + 1).min(ifd_h as i32 - 1);
+            let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
+            let src_max_col = (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+            let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
+            let src_max_row = (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
             if src_min_col > src_max_col || src_min_row > src_max_row {
                 return None;
             }

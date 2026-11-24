@@ -430,12 +430,12 @@ impl MosaicJsonCatalog {
             .and_then(|v| v.as_object())
             .ok_or_else(|| "missing 'tiles' object in MosaicJSON".to_string())?;
 
-        let mut inferred_qk_zoom: Option<u8> = None;
+        let mut inferred_qk_zoom: Option<usize> = None;
         let mut tiles: HashMap<String, Vec<String>, ahash::RandomState> =
             HashMap::with_capacity_and_hasher(tiles_obj.len(), ahash::RandomState::new());
         for (qk, arr) in tiles_obj {
             if inferred_qk_zoom.is_none() {
-                inferred_qk_zoom = Some(qk.len() as u8);
+                inferred_qk_zoom = Some(qk.len());
             }
             if let Some(urls) = arr.as_array() {
                 let list: Vec<String> = urls

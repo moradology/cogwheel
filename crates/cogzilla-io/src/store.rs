@@ -454,7 +454,9 @@ impl CogStore {
                     // Speculative 128 KiB single-RTT header read; bounded at 32 MiB to prevent
                     // crafted non-COG / BigTIFF offsets from causing OOM or u64 overflow.
                     const MAX_HEADER_FETCH_BYTES: u64 = 32 * 1024 * 1024;
+                    const MAX_HEADER_FETCH_ITERS: u32 = 16;
                     let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
+                    let mut header_fetches = 0u32;
                     loop {
                         match parse_cog(&hdr) {
                             Ok(idx) => break idx,
@@ -463,6 +465,12 @@ impl CogStore {
                                 if required > MAX_HEADER_FETCH_BYTES {
                                     return Err(IoError::Tiff(TiffError::Corrupt(
                                         "TIFF header/IFD exceeds 32 MiB limit",
+                                    )));
+                                }
+                                header_fetches += 1;
+                                if header_fetches > MAX_HEADER_FETCH_ITERS {
+                                    return Err(IoError::Tiff(TiffError::Corrupt(
+                                        "TIFF header required too many incremental range fetches",
                                     )));
                                 }
                                 let target = required

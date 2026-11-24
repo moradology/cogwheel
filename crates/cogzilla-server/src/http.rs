@@ -2767,7 +2767,8 @@ fn to_http_response(
     match res {
         Ok((bytes, content_type)) => {
             let is_binary_tile = content_type.starts_with("image/")
-                || content_type == "application/octet-stream";
+                || content_type == "application/octet-stream"
+                || content_type == "application/x-npy";
             let etag = is_binary_tile.then(|| crate::tile_cache::compute_tile_etag(&bytes));
             binary_or_plain_response(engine, bytes, content_type, etag, if_none_match)
         }
