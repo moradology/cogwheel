@@ -1016,8 +1016,90 @@ impl<const N: usize> CoordPlan<N> {
                 src_max_row,
                 all_in_bounds,
             })
-        } else if tile.z <= 8 || (tile.x as u64) + 1 >= (1u64 << tile.z.min(30)) {
-            // Low-zoom projected tile (z=0..8): adaptive error-bounded quadtree subdivision.
+        } else {
+            // For z >= 9 (and not on the eastern antimeridian tile column), try the fast 17x17
+            // bilinear control grid first. If all 289 control points are finite, return `Grid2D`
+            // (or `None` if strictly outside the raster); if any control point hits a projection
+            // domain boundary (Sinusoidal/LAEA/UTM NaN), fall through to adaptive `Exact2D` so
+            // boundary 16x16 blocks are never dropped.
+            let try_grid_2d =
+                tile.z > 8 && ((tile.x as u64) + 1 < (1u64 << tile.z.min(30)));
+            if try_grid_2d {
+                let mut grid_u = [0.0f32; GRID_DIM * GRID_DIM];
+                let mut grid_v = [0.0f32; GRID_DIM * GRID_DIM];
+                let mut min_u = f32::INFINITY;
+                let mut max_u = f32::NEG_INFINITY;
+                let mut min_v = f32::INFINITY;
+                let mut max_v = f32::NEG_INFINITY;
+                let mut all_finite = true;
+
+                let cell_px = (N as f64) / ((GRID_DIM - 1) as f64);
+                for gy in 0..GRID_DIM {
+                    let py_f = (gy as f64) * cell_px;
+                    let my = max_y - (py_f + 0.5) * step_y;
+                    for gx in 0..GRID_DIM {
+                        let px_f = (gx as f64) * cell_px;
+                        let mx = min_x + (px_f + 0.5) * step_x;
+                        let (sx, sy) = crs.from_3857(mx, my);
+                        let (uu, vv) = if sx.is_finite() && sy.is_finite() {
+                            let (col, row) = crs_to_pixel.forward(sx, sy);
+                            ((col - 0.5) as f32, (row - 0.5) as f32)
+                        } else {
+                            (f32::NAN, f32::NAN)
+                        };
+                        grid_u[gy * GRID_DIM + gx] = uu;
+                        grid_v[gy * GRID_DIM + gx] = vv;
+                        if uu.is_finite() && vv.is_finite() {
+                            min_u = min_u.min(uu);
+                            max_u = max_u.max(uu);
+                            min_v = min_v.min(vv);
+                            max_v = max_v.max(vv);
+                        } else {
+                            all_finite = false;
+                        }
+                    }
+                }
+
+                if all_finite {
+                    if !min_u.is_finite()
+                        || max_u < -0.5
+                        || min_u > (ifd_w as f32 - 0.5)
+                        || max_v < -0.5
+                        || min_v > (ifd_h as f32 - 0.5)
+                    {
+                        return None;
+                    }
+
+                    let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
+                    let src_max_col =
+                        (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+                    let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
+                    let src_max_row =
+                        (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
+
+                    if src_min_col > src_max_col || src_min_row > src_max_row {
+                        return None;
+                    }
+
+                    let all_in_bounds = min_u >= 0.0
+                        && min_v >= 0.0
+                        && (max_u.floor() as i32).saturating_add(1) < ifd_w as i32
+                        && (max_v.floor() as i32).saturating_add(1) < ifd_h as i32;
+
+                    return Some(Self::Grid2D {
+                        grid_u,
+                        grid_v,
+                        src_min_col,
+                        src_max_col,
+                        src_min_row,
+                        src_max_row,
+                        all_in_bounds,
+                    });
+                }
+            }
+
+            // Low-zoom projected tile (z=0..8) or z>=9 tile straddling a projection boundary:
+            // adaptive error-bounded quadtree subdivision.
             // Subdivides wherever projection curvature exceeds 0.05 source pixels or hits a
             // domain boundary (poles / antimeridian), skips empty out-of-bounds cells in O(1),
             // and linearly interpolates smooth cells — 50–100× fewer trig calls than per-pixel
@@ -1266,73 +1348,6 @@ impl<const N: usize> CoordPlan<N> {
                 src_min_row,
                 src_max_row,
                 all_in_bounds: false,
-            })
-        } else {
-            // 17x17 control grid spanning pixel centers [0.5 .. N - 0.5] across 16 intervals
-            let mut grid_u = [0.0f32; GRID_DIM * GRID_DIM];
-            let mut grid_v = [0.0f32; GRID_DIM * GRID_DIM];
-            let mut min_u = f32::INFINITY;
-            let mut max_u = f32::NEG_INFINITY;
-            let mut min_v = f32::INFINITY;
-            let mut max_v = f32::NEG_INFINITY;
-
-            let cell_px = (N as f64) / ((GRID_DIM - 1) as f64);
-
-            for gy in 0..GRID_DIM {
-                let py_f = (gy as f64) * cell_px;
-                let my = max_y - (py_f + 0.5) * step_y;
-                for gx in 0..GRID_DIM {
-                    let px_f = (gx as f64) * cell_px;
-                    let mx = min_x + (px_f + 0.5) * step_x;
-                    let (sx, sy) = crs.from_3857(mx, my);
-                    let (col, row) = crs_to_pixel.forward(sx, sy);
-                    let uu = (col - 0.5) as f32;
-                    let vv = (row - 0.5) as f32;
-                    let idx = gy * GRID_DIM + gx;
-                    grid_u[idx] = uu;
-                    grid_v[idx] = vv;
-                    if uu.is_finite() && vv.is_finite() {
-                        min_u = min_u.min(uu);
-                        max_u = max_u.max(uu);
-                        min_v = min_v.min(vv);
-                        max_v = max_v.max(vv);
-                    }
-                }
-            }
-
-            if !min_u.is_finite()
-                || max_u < -0.5
-                || min_u > (ifd_w as f32 - 0.5)
-                || max_v < -0.5
-                || min_v > (ifd_h as f32 - 0.5)
-            {
-                return None;
-            }
-
-            let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
-            let src_max_col = (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
-            let src_max_row = (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
-
-            if src_min_col > src_max_col || src_min_row > src_max_row {
-                return None;
-            }
-
-            let all_finite = grid_u.iter().all(|x| x.is_finite()) && grid_v.iter().all(|y| y.is_finite());
-            let all_in_bounds = all_finite
-                && min_u >= 0.0
-                && min_v >= 0.0
-                && (max_u.floor() as i32).saturating_add(1) < ifd_w as i32
-                && (max_v.floor() as i32).saturating_add(1) < ifd_h as i32;
-
-            Some(Self::Grid2D {
-                grid_u,
-                grid_v,
-                src_min_col,
-                src_max_col,
-                src_min_row,
-                src_max_row,
-                all_in_bounds,
             })
         }
     }

@@ -626,6 +626,38 @@ impl BandStatsAcc {
         }
     }
 
+    fn push_tile_coords(
+        &mut self,
+        data: &cogzilla_codec::BandData,
+        tw: usize,
+        xs: &[usize],
+        ys: &[usize],
+        unscale: bool,
+        scale: f32,
+        offset: f32,
+        nodata_override: Option<f32>,
+    ) {
+        let nd_ov = nodata_override.filter(|v| !v.is_nan());
+        for &ly in ys {
+            let base = ly * tw;
+            for &lx in xs {
+                let mut v = data.get_f32(base + lx);
+                if v.is_finite() && nd_ov != Some(v) {
+                    match self {
+                        Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
+                        Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
+                        Self::Floats(vals) => {
+                            if unscale {
+                                v = v * scale + offset;
+                            }
+                            vals.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn finalize_hist(
         hist: &[u64],
         denom_pixels: usize,
@@ -1096,11 +1128,14 @@ fn compute_statistics_cpu(
     unscale: bool,
     nodata_override: Option<f32>,
     step: usize,
+    sample_dims: Option<(usize, usize)>,
     fetched: StatsTiles,
 ) -> serde_json::Value {
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
-    let total_pixels = if step > 1 {
+    let total_pixels = if let Some((ow, oh)) = sample_dims {
+        ow * oh
+    } else if step > 1 {
         (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
     } else {
         (ifd.width as usize) * (ifd.height as usize)
@@ -1119,6 +1154,31 @@ fn compute_statistics_cpu(
         total_pixels
     };
 
+    // Precompute exact target grid local coordinates per tile column/row when sampling
+    // unmasked full-image statistics at exact `(out_w, out_h)` (matching rio-tiler's max_size).
+    let (tile_xs, tile_ys): (Option<Vec<Vec<usize>>>, Option<Vec<Vec<usize>>>) =
+        if let Some((ow, oh)) = sample_dims {
+            let mut xs_by_tx = vec![Vec::new(); ifd.tiles_across as usize];
+            for px in 0..ow {
+                let col = (((px as f64 + 0.5) * (ifd.width as f64) / (ow as f64)).floor() as u32)
+                    .min(ifd.width - 1);
+                let tx = (col / ifd.tile_width) as usize;
+                let lx = (col % ifd.tile_width) as usize;
+                xs_by_tx[tx].push(lx);
+            }
+            let mut ys_by_ty = vec![Vec::new(); ifd.tiles_down as usize];
+            for py in 0..oh {
+                let row = (((py as f64 + 0.5) * (ifd.height as f64) / (oh as f64)).floor() as u32)
+                    .min(ifd.height - 1);
+                let ty = (row / ifd.tile_height) as usize;
+                let ly = (row % ifd.tile_height) as usize;
+                ys_by_ty[ty].push(ly);
+            }
+            (Some(xs_by_tx), Some(ys_by_ty))
+        } else {
+            (None, None)
+        };
+
     let mut per_band: Vec<BandStatsAcc> = (0..count)
         .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, capacity_hint))
         .collect();
@@ -1135,7 +1195,30 @@ fn compute_statistics_cpu(
                 let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                 let tw = ifd.tile_width as usize;
 
-                if step > 1 {
+                if let (Some(xs_all), Some(ys_all)) = (&tile_xs, &tile_ys) {
+                    let xs = &xs_all[tx as usize];
+                    let ys = &ys_all[ty as usize];
+                    if xs.is_empty() || ys.is_empty() {
+                        continue;
+                    }
+                    for b in 0..count.min(tile.bands.len()) {
+                        if tile.bands[b].stats.all_nodata {
+                            continue;
+                        }
+                        let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
+                        let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
+                        per_band[b].push_tile_coords(
+                            &tile.bands[b].data,
+                            tw,
+                            xs,
+                            ys,
+                            unscale,
+                            scale,
+                            offset,
+                            nodata_override,
+                        );
+                    }
+                } else if step > 1 {
                     let x0_tile = (tx * ifd.tile_width) as usize;
                     let y0_tile = (ty * ifd.tile_height) as usize;
                     let lx0 = (step - (x0_tile % step)) % step;
@@ -1233,7 +1316,23 @@ fn compute_statistics_cpu(
                     let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
                     let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                     let tw = ifd.tile_width as usize;
-                    if step > 1 {
+                    if let (Some(xs_all), Some(ys_all)) = (&tile_xs, &tile_ys) {
+                        let xs = &xs_all[tx as usize];
+                        let ys = &ys_all[ty as usize];
+                        if xs.is_empty() || ys.is_empty() {
+                            continue;
+                        }
+                        per_band[b].push_tile_coords(
+                            &band.data,
+                            tw,
+                            xs,
+                            ys,
+                            unscale,
+                            scale,
+                            offset,
+                            nodata_override,
+                        );
+                    } else if step > 1 {
                         let x0_tile = (tx * ifd.tile_width) as usize;
                         let y0_tile = (ty * ifd.tile_height) as usize;
                         let lx0 = (step - (x0_tile % step)) % step;
@@ -1371,33 +1470,82 @@ pub async fn compute_statistics(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let max_size = max_size.max(1);
-    let mut ifd_idx = cog.index.ifds.len() - 1;
-    let mut win_max_dim = cog.index.ifds[ifd_idx].width.max(cog.index.ifds[ifd_idx].height);
-    for (i, ifd) in cog.index.ifds.iter().enumerate() {
-        let dim = if let Some(pm) = poly_mask {
+    let (ifd_idx, step, sample_dims, total_pixels) = if let Some(pm) = poly_mask {
+        let mut idx = cog.index.ifds.len() - 1;
+        let mut win_max_dim = cog.index.ifds[idx].width.max(cog.index.ifds[idx].height);
+        for (i, ifd) in cog.index.ifds.iter().enumerate() {
             let (ww, wh) = polygon_window_dims(ifd, &crs, pm.bbox);
-            ww.max(wh)
-        } else {
-            ifd.width.max(ifd.height)
-        };
-        if dim <= max_size {
-            ifd_idx = i;
+            let dim = ww.max(wh);
+            if dim <= max_size {
+                idx = i;
+                win_max_dim = dim;
+                break;
+            }
             win_max_dim = dim;
-            break;
         }
-        win_max_dim = dim;
-    }
+        let ifd = &cog.index.ifds[idx];
+        let step = win_max_dim.div_ceil(max_size).max(1) as usize;
+        let total = if step > 1 {
+            (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
+        } else {
+            (ifd.width as usize) * (ifd.height as usize)
+        };
+        (idx, step, None, total)
+    } else {
+        // Unmasked full-image statistics: match rio-tiler's exact `max_size` target dimensions
+        // and select the coarsest IFD that is >= target dimensions (falling back to IFD 0).
+        let full = cog.index.full_res();
+        let (out_w, out_h) = if full.width.max(full.height) <= max_size {
+            (full.width as usize, full.height as usize)
+        } else if full.width >= full.height {
+            let h = ((full.height as f64 / full.width as f64) * max_size as f64)
+                .round()
+                .max(1.0) as usize;
+            (max_size as usize, h)
+        } else {
+            let w = ((full.width as f64 / full.height as f64) * max_size as f64)
+                .round()
+                .max(1.0) as usize;
+            (w, max_size as usize)
+        };
+        let mut idx = 0usize;
+        for (i, ifd) in cog.index.ifds.iter().enumerate() {
+            if (ifd.width as usize) >= out_w && (ifd.height as usize) >= out_h {
+                idx = i;
+            }
+        }
+        let ifd = &cog.index.ifds[idx];
+        let dims = if (ifd.width as usize) == out_w && (ifd.height as usize) == out_h {
+            None
+        } else {
+            Some((out_w, out_h))
+        };
+        (idx, 1usize, dims, out_w * out_h)
+    };
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
-    let step = win_max_dim.div_ceil(max_size).max(1) as usize;
-    let total_pixels = if step > 1 {
-        (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
-    } else {
-        (ifd.width as usize) * (ifd.height as usize)
-    };
 
     let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
     let tile_has_strided_sample = |tx: u32, ty: u32, x_max: usize, y_max: usize| -> bool {
+        if let Some((ow, oh)) = sample_dims {
+            let x0 = tx * ifd.tile_width;
+            let x1 = x0 + x_max as u32;
+            let y0 = ty * ifd.tile_height;
+            let y1 = y0 + y_max as u32;
+            let has_x = (0..ow).any(|px| {
+                let col = (((px as f64 + 0.5) * (ifd.width as f64) / (ow as f64)).floor() as u32)
+                    .min(ifd.width - 1);
+                col >= x0 && col < x1
+            });
+            if !has_x {
+                return false;
+            }
+            return (0..oh).any(|py| {
+                let row = (((py as f64 + 0.5) * (ifd.height as f64) / (oh as f64)).floor() as u32)
+                    .min(ifd.height - 1);
+                row >= y0 && row < y1
+            });
+        }
         if step == 1 {
             return true;
         }
@@ -1552,6 +1700,7 @@ pub async fn compute_statistics(
                     unscale,
                     nodata_override,
                     step,
+                    sample_dims,
                     fetched,
                 )
             })
@@ -1566,6 +1715,7 @@ pub async fn compute_statistics(
             unscale,
             nodata_override,
             step,
+            sample_dims,
             fetched,
         ))
     }
@@ -1819,7 +1969,47 @@ pub(crate) fn encode_rgba_output(
     }
 }
 
-/// Arbitrary-dimensions WGS84 bounding-box renderer backing `/cog/preview`, `/cog/bbox`,
+/// Native pixel-space preview renderer backing `/cog/preview*` and `/stac/preview*`,
+/// matching TiTiler / `rio-tiler`'s `Reader.preview()` (reads directly in source pixel space
+/// without reprojecting through an axis-aligned WGS84 bounding box).
+#[allow(clippy::too_many_arguments)]
+pub async fn render_native_preview(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox_wgs84: [f64; 4],
+    width: u32,
+    height: u32,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&ColormapLut>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    render_bbox_impl(
+        engine,
+        cogs,
+        bbox_wgs84,
+        false,
+        true,
+        width,
+        height,
+        None,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+        unscale,
+    )
+    .await
+}
+
+/// Arbitrary-dimensions WGS84 bounding-box renderer backing `/cog/bbox`,
 /// `POST /cog/feature`, and `WorldCRS84Quad` tiles.
 #[allow(clippy::too_many_arguments)]
 pub async fn render_wgs84_bbox(
@@ -1842,6 +2032,7 @@ pub async fn render_wgs84_bbox(
         engine,
         cogs,
         bbox,
+        false,
         false,
         width,
         height,
@@ -1881,6 +2072,7 @@ pub async fn render_mercator_bbox(
         cogs,
         bbox_3857,
         true,
+        false,
         width,
         height,
         None,
@@ -1902,6 +2094,7 @@ async fn render_bbox_impl(
     cogs: &[Arc<OpenedCog>],
     bbox: [f64; 4],
     bbox_is_3857: bool,
+    native_preview: bool,
     width: u32,
     height: u32,
     poly_mask: Option<&PolygonMask>,
@@ -1925,69 +2118,96 @@ async fn render_bbox_impl(
     let primary = &cogs[0];
     let crs = engine.get_or_build_crs(primary)?;
 
-    let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
-        if bbox_is_3857 {
-            crs.from_3857(x, y)
-        } else {
-            crs.from_lonlat_deg(x, y)
-        }
-    };
-
-    // Estimate target CRS resolution to pick optimal overview IFD.
-    // Probe bbox center first; if out of CRS domain (e.g. WorldCRS84Quad z=0/1 on a UTM COG >75°
-    // from center), fall back to the raster's own center clamped into bbox, then 4 quadrant probes.
     let cx = 0.5 * (bbox[0] + bbox[2]);
     let cy = 0.5 * (bbox[1] + bbox[3]);
     let dlx = (bbox[2] - bbox[0]) / (w as f64);
     let dly = (bbox[3] - bbox[1]) / (h as f64);
-    let probe_res = |px: f64, py: f64| -> (f64, f64) {
-        let (s0x, s0y) = to_src_crs(px, py);
-        let (s1x, s1y) = to_src_crs(px + dlx, py);
-        let (s2x, s2y) = to_src_crs(px, py + dly);
-        let rx = ((s1x - s0x).powi(2) + (s1y - s0y).powi(2)).sqrt();
-        let ry = ((s2x - s0x).powi(2) + (s2y - s0y).powi(2)).sqrt();
-        (rx, ry)
-    };
-    let (mut target_rx, mut target_ry) = probe_res(cx, cy);
-    if !target_rx.is_finite() || !target_ry.is_finite() {
+
+    let ifd_idx = if native_preview {
         let full = primary.index.full_res();
-        let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-        let (rcx_raw, rcy_raw) = if bbox_is_3857 {
-            let lat_rad = (0.5 * (rb[1] + rb[3])).clamp(-85.05112878, 85.05112878).to_radians();
-            let lon_rad = (0.5 * (rb[0] + rb[2])).to_radians();
-            const R: f64 = 6_378_137.0;
-            (R * lon_rad, R * (std::f64::consts::FRAC_PI_4 + 0.5 * lat_rad).tan().ln())
-        } else {
-            (0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]))
+        let rx0 = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d);
+        let ry0 = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e);
+        let target_rx = rx0 * (full.width as f64) / (w as f64);
+        let target_ry = ry0 * (full.height as f64) / (h as f64);
+        primary.index.select_ifd(target_rx, target_ry)
+    } else {
+        let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
+            if bbox_is_3857 {
+                crs.from_3857(x, y)
+            } else {
+                crs.from_lonlat_deg(x, y)
+            }
         };
-        let rcx = rcx_raw.clamp(bbox[0], bbox[2]);
-        let rcy = rcy_raw.clamp(bbox[1], bbox[3]);
-        let probes = [
-            (rcx, rcy),
-            (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
-            (bbox[0] + 0.75 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
-            (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.75 * (bbox[3] - bbox[1])),
-            (bbox[0] + 0.75 * (bbox[2] - bbox[0]), bbox[1] + 0.75 * (bbox[3] - bbox[1])),
-        ];
-        for (px, py) in probes {
-            let (rx, ry) = probe_res(px, py);
-            if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
-                target_rx = rx;
-                target_ry = ry;
-                break;
+
+        // Estimate target CRS resolution to pick optimal overview IFD.
+        // Probe bbox center first; if out of CRS domain (e.g. WorldCRS84Quad z=0/1 on a UTM COG >75°
+        // from center), fall back to the raster's own center clamped into bbox, then 4 quadrant probes.
+        let probe_res = |px: f64, py: f64| -> (f64, f64) {
+            let (s0x, s0y) = to_src_crs(px, py);
+            let (s1x, s1y) = to_src_crs(px + dlx, py);
+            let (s2x, s2y) = to_src_crs(px, py + dly);
+            let rx = ((s1x - s0x).powi(2) + (s1y - s0y).powi(2)).sqrt();
+            let ry = ((s2x - s0x).powi(2) + (s2y - s0y).powi(2)).sqrt();
+            (rx, ry)
+        };
+        let (mut target_rx, mut target_ry) = probe_res(cx, cy);
+        if !target_rx.is_finite() || !target_ry.is_finite() {
+            let full = primary.index.full_res();
+            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            let (rcx_raw, rcy_raw) = if bbox_is_3857 {
+                let lat_rad = (0.5 * (rb[1] + rb[3])).clamp(-85.05112878, 85.05112878).to_radians();
+                let lon_rad = (0.5 * (rb[0] + rb[2])).to_radians();
+                const R: f64 = 6_378_137.0;
+                (R * lon_rad, R * (std::f64::consts::FRAC_PI_4 + 0.5 * lat_rad).tan().ln())
+            } else {
+                (0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]))
+            };
+            let rcx = rcx_raw.clamp(bbox[0], bbox[2]);
+            let rcy = rcy_raw.clamp(bbox[1], bbox[3]);
+            let probes = [
+                (rcx, rcy),
+                (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
+                (bbox[0] + 0.75 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
+                (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.75 * (bbox[3] - bbox[1])),
+                (bbox[0] + 0.75 * (bbox[2] - bbox[0]), bbox[1] + 0.75 * (bbox[3] - bbox[1])),
+            ];
+            for (px, py) in probes {
+                let (rx, ry) = probe_res(px, py);
+                if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+                    target_rx = rx;
+                    target_ry = ry;
+                    break;
+                }
             }
         }
-    }
-    let ifd_idx = primary.index.select_ifd(target_rx, target_ry);
+        primary.index.select_ifd(target_rx, target_ry)
+    };
     crate::engine::validate_multi_cog_grid(cogs, ifd_idx)?;
     let ifd = &primary.index.ifds[ifd_idx];
 
-    // Precompute source pixel coordinates `(u, v)` using a coarse 16-px projection grid
-    // + bilinear interpolation (reduces UTM/LCC trig calls by ~225× while keeping <0.005 px error).
-    // Any grid cell with a non-finite corner falls back to exact per-pixel projection.
-    // Offload large grids or polygon-masked bboxes to the bounded heavy-CPU pool so Tokio worker
-    // threads stay responsive under concurrent `/bbox` and `/feature` load.
-    let build_uv_maps = {
+    // Precompute source pixel coordinates `(u, v)`.
+    // For native preview (`native_preview == true`), map directly in source pixel space without
+    // reprojecting through an axis-aligned WGS84 bbox (matching `rio-tiler`'s `Reader.preview()`).
+    // Otherwise use a coarse 16-px projection grid + bilinear interpolation.
+    let (u_map, v_map, min_u, max_u, min_v, max_v) = if native_preview {
+        let mut u_map = vec![0.0f32; w * h];
+        let mut v_map = vec![0.0f32; w * h];
+        let sx = (ifd.width as f64) / (w as f64);
+        let sy = (ifd.height as f64) / (h as f64);
+        let u_cols: Vec<f32> = (0..w).map(|px| ((px as f64 + 0.5) * sx - 0.5) as f32).collect();
+        for py in 0..h {
+            let vv = ((py as f64 + 0.5) * sy - 0.5) as f32;
+            let row_off = py * w;
+            u_map[row_off..row_off + w].copy_from_slice(&u_cols);
+            v_map[row_off..row_off + w].fill(vv);
+        }
+        let min_u = u_cols.first().copied().unwrap_or(0.0);
+        let max_u = u_cols.last().copied().unwrap_or(0.0);
+        let min_v = ((0.5 * sy) - 0.5) as f32;
+        let max_v = (((h as f64 - 0.5) * sy) - 0.5) as f32;
+        (u_map, v_map, min_u, max_u, min_v, max_v)
+    } else {
+        let build_uv_maps = {
         let crs = crs.clone();
         let crs_to_pixel = ifd.crs_to_pixel;
         let ifd_width = ifd.width;
@@ -2198,6 +2418,8 @@ async fn render_bbox_impl(
             .await?
     } else {
         build_uv_maps()
+    };
+    (u_map, v_map, min_u, max_u, min_v, max_v)
     };
 
     // Empty check

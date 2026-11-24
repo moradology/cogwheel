@@ -476,8 +476,8 @@ pub fn get_tms_json(id: &str) -> Result<serde_json::Value, EngineError> {
             }))
         }
         "WorldCRS84Quad" => {
-            let mut matrices = Vec::with_capacity(23);
-            for z in 0..=22u32 {
+            let mut matrices = Vec::with_capacity(24);
+            for z in 0..=23u32 {
                 let rows = 1u64 << z;
                 let cols = rows * 2;
                 let cell_size = 180.0 / ((rows * 256) as f64);
