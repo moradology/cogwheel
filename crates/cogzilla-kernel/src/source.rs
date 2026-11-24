@@ -301,4 +301,36 @@ impl<'a> BandSource<'a> {
         }
         None
     }
+
+    /// Fast pointer to the top-left `(x0 - 1, y0 - 1)` of a 4×4 Catmull-Rom cubic neighborhood
+    /// when all 16 pixels live strictly inside a single clean (`no_nodata`) `f32` block.
+    #[inline(always)]
+    pub fn interior_4x4_f32(&self, x0: i32, y0: i32) -> Option<(*const f32, usize)> {
+        if !self.no_nodata || x0 < 1 || y0 < 1 || x0 + 2 >= self.ifd_w || y0 + 2 >= self.ifd_h {
+            return None;
+        }
+        let ux = x0 as u32;
+        let uy = y0 as u32;
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (ux >> s, ux & self.mask_x),
+            None => (ux / self.tile_w, ux % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (uy >> s, uy & self.mask_y),
+            None => (uy / self.tile_h, uy % self.tile_h),
+        };
+        if lx >= 1 && lx + 2 < self.tile_w && ly >= 1 && ly + 2 < self.tile_h {
+            let gx = tx.wrapping_sub(self.tx0);
+            let gy = ty.wrapping_sub(self.ty0);
+            if gx < self.grid_w && gy < self.grid_h {
+                let bidx = (gy * self.grid_w + gx) as usize;
+                let blk = unsafe { *self.blocks.get_unchecked(bidx) }?;
+                let sl = blk.data.as_f32_slice()?;
+                let tw = self.tile_w as usize;
+                let off = (ly as usize - 1) * tw + (lx as usize - 1);
+                return Some((unsafe { sl.as_ptr().add(off) }, tw));
+            }
+        }
+        None
+    }
 }

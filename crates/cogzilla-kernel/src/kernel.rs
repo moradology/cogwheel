@@ -375,18 +375,18 @@ fn sample_nearest<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f3
     }
 }
 
-/// 4x4 Keys/Catmull-Rom bicubic kernel (`a = -0.5`, matching GDAL `GRA_Cubic`),
-/// falling back cleanly to nodata-aware bilinear near nodata or raster boundaries.
+/// Branchless Keys/Catmull-Rom bicubic weights (`a = -0.5`, matching GDAL `GRA_Cubic`)
+/// for fractional offset `t in [0.0, 1.0]`.
 #[inline(always)]
-fn cubic_weight(x: f32) -> f32 {
-    let ax = x.abs();
-    if ax < 1.0 {
-        (1.5 * ax - 2.5) * ax * ax + 1.0
-    } else if ax < 2.0 {
-        ((-0.5 * ax + 2.5) * ax - 4.0) * ax + 2.0
-    } else {
-        0.0
-    }
+fn cubic_weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [
+        (-0.5 * t3) + t2 - (0.5 * t),
+        (1.5 * t3) - (2.5 * t2) + 1.0,
+        (-1.5 * t3) + (2.0 * t2) + (0.5 * t),
+        (0.5 * t3) - (0.5 * t2),
+    ]
 }
 
 #[inline(always)]
@@ -396,19 +396,55 @@ pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
     }
     let (x0, fx) = fast_floor_i32(u);
     let (y0, fy) = fast_floor_i32(v);
+    let wx = cubic_weights(fx);
+    let wy = cubic_weights(fy);
 
-    let wx = [
-        cubic_weight(fx + 1.0),
-        cubic_weight(fx),
-        cubic_weight(1.0 - fx),
-        cubic_weight(2.0 - fx),
-    ];
-    let wy = [
-        cubic_weight(fy + 1.0),
-        cubic_weight(fy),
-        cubic_weight(1.0 - fy),
-        cubic_weight(2.0 - fy),
-    ];
+    // Fast SIMD path: all 16 samples lie strictly inside one clean f32 block -> 4 contiguous 16B loads!
+    if let Some((base_ptr, stride)) = src.interior_4x4_f32(x0, y0) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let vwx = vld1q_f32(wx.as_ptr());
+            let r0 = vld1q_f32(base_ptr);
+            let r1 = vld1q_f32(base_ptr.add(stride));
+            let r2 = vld1q_f32(base_ptr.add(stride * 2));
+            let r3 = vld1q_f32(base_ptr.add(stride * 3));
+            // Vertical blend of the 4 rows first: acc = r0*wy[0] + r1*wy[1] + r2*wy[2] + r3*wy[3]
+            let mut col = vmulq_n_f32(r0, wy[0]);
+            col = vfmaq_n_f32(col, r1, wy[1]);
+            col = vfmaq_n_f32(col, r2, wy[2]);
+            col = vfmaq_n_f32(col, r3, wy[3]);
+            return vaddvq_f32(vmulq_f32(col, vwx));
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let vwx = _mm_loadu_ps(wx.as_ptr());
+            let r0 = _mm_loadu_ps(base_ptr);
+            let r1 = _mm_loadu_ps(base_ptr.add(stride));
+            let r2 = _mm_loadu_ps(base_ptr.add(stride * 2));
+            let r3 = _mm_loadu_ps(base_ptr.add(stride * 3));
+            let col = _mm_add_ps(
+                _mm_add_ps(_mm_mul_ps(r0, _mm_set1_ps(wy[0])), _mm_mul_ps(r1, _mm_set1_ps(wy[1]))),
+                _mm_add_ps(_mm_mul_ps(r2, _mm_set1_ps(wy[2])), _mm_mul_ps(r3, _mm_set1_ps(wy[3]))),
+            );
+            let prod = _mm_mul_ps(col, vwx);
+            let shuf = _mm_movehl_ps(prod, prod);
+            let sums = _mm_add_ps(prod, shuf);
+            let shuf2 = _mm_shuffle_ps::<1>(sums, sums);
+            return _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+        }
+        #[allow(unreachable_code)]
+        unsafe {
+            let mut acc = 0.0f32;
+            for j in 0..4 {
+                let rp = base_ptr.add(j * stride);
+                let row = *rp * wx[0] + *rp.add(1) * wx[1] + *rp.add(2) * wx[2] + *rp.add(3) * wx[3];
+                acc += row * wy[j];
+            }
+            return acc;
+        }
+    }
 
     let mut acc = 0.0f32;
     for j in 0..4 {
@@ -2367,6 +2403,188 @@ fn eval_horn_3x3(
     }
 }
 
+/// SIMD Horn 3×3 hillshade row evaluator for clean (`no_nodata`) DEM tiles:
+/// processes 4 pixels/iter on ARM64 NEON or 8 pixels/iter on x86-64 AVX2 using pure contiguous
+/// vector loads from `row0`, `row1`, `row2` (`N + 2` floats each) and writes rescaled `u8` indices.
+#[inline(always)]
+fn eval_horn_hillshade_row_clean<const N: usize>(
+    row0: &[f32],
+    row1: &[f32],
+    row2: &[f32],
+    inv_8dx: f32,
+    azimuth_deg: f32,
+    altitude_deg: f32,
+    z_factor: f32,
+    inv_range: f32,
+    min_val: f32,
+    out_idx: &mut [u8],
+) {
+    let zenith = (90.0 - altitude_deg).to_radians();
+    let az = azimuth_deg.to_radians();
+    let sun_e = az.sin() * zenith.sin();
+    let sun_n = az.cos() * zenith.sin();
+    let sun_u = zenith.cos();
+    let neg_z_scale = -z_factor * inv_8dx;
+    let pos_z_scale = z_factor * inv_8dx;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let v_two = vdupq_n_f32(2.0);
+        let v_one = vdupq_n_f32(1.0);
+        let v_zero = vdupq_n_f32(0.0);
+        let v_255 = vdupq_n_f32(255.0);
+        let v_half = vdupq_n_f32(0.5);
+        let v_neg_zs = vdupq_n_f32(neg_z_scale);
+        let v_pos_zs = vdupq_n_f32(pos_z_scale);
+        let v_se = vdupq_n_f32(sun_e);
+        let v_sn = vdupq_n_f32(sun_n);
+        let v_su = vdupq_n_f32(sun_u);
+        let v_inv_r = vdupq_n_f32(inv_range);
+        let v_min = vdupq_n_f32(min_val);
+
+        let r0 = row0.as_ptr();
+        let r1 = row1.as_ptr();
+        let r2 = row2.as_ptr();
+        let mut tmp = [0u32; 4];
+        let mut px = 0usize;
+        while px + 4 <= N {
+            let nw = vld1q_f32(r0.add(px));
+            let n = vld1q_f32(r0.add(px + 1));
+            let ne = vld1q_f32(r0.add(px + 2));
+            let w = vld1q_f32(r1.add(px));
+            let e = vld1q_f32(r1.add(px + 2));
+            let sw = vld1q_f32(r2.add(px));
+            let s = vld1q_f32(r2.add(px + 1));
+            let se = vld1q_f32(r2.add(px + 2));
+
+            let east = vaddq_f32(vfmaq_f32(ne, v_two, e), se);
+            let west = vaddq_f32(vfmaq_f32(nw, v_two, w), sw);
+            let nx = vmulq_f32(vsubq_f32(east, west), v_neg_zs);
+
+            let south = vaddq_f32(vfmaq_f32(sw, v_two, s), se);
+            let north = vaddq_f32(vfmaq_f32(nw, v_two, n), ne);
+            let ny = vmulq_f32(vsubq_f32(south, north), v_pos_zs);
+
+            let len_sq = vfmaq_f32(vfmaq_f32(v_one, nx, nx), ny, ny);
+            let num = vfmaq_f32(vfmaq_f32(v_su, nx, v_se), ny, v_sn);
+            let dot = vdivq_f32(num, vsqrtq_f32(len_sq));
+            let hs = vminq_f32(vmulq_f32(vmaxq_f32(dot, v_zero), v_255), v_255);
+            let scaled = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(hs, v_min), v_inv_r), v_zero), v_255);
+            vst1q_u32(tmp.as_mut_ptr(), vcvtq_u32_f32(vaddq_f32(scaled, v_half)));
+            *out_idx.get_unchecked_mut(px) = tmp[0] as u8;
+            *out_idx.get_unchecked_mut(px + 1) = tmp[1] as u8;
+            *out_idx.get_unchecked_mut(px + 2) = tmp[2] as u8;
+            *out_idx.get_unchecked_mut(px + 3) = tmp[3] as u8;
+            px += 4;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe {
+                eval_horn_hillshade_row_clean_avx2::<N>(
+                    row0.as_ptr(),
+                    row1.as_ptr(),
+                    row2.as_ptr(),
+                    neg_z_scale,
+                    pos_z_scale,
+                    sun_e,
+                    sun_n,
+                    sun_u,
+                    inv_range,
+                    min_val,
+                    out_idx,
+                );
+            }
+            return;
+        }
+    }
+
+    #[allow(unreachable_code)]
+    for px in 0..N {
+        let c = px + 1;
+        let val = eval_horn_3x3(
+            row0[c - 1], row0[c], row0[c + 1],
+            row1[c - 1], row1[c], row1[c + 1],
+            row2[c - 1], row2[c], row2[c + 1],
+            inv_8dx,
+            DemAlgorithm::Hillshade { azimuth_deg, altitude_deg, z_factor },
+        );
+        out_idx[px] = rescale_u8(val, inv_range, min_val);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
+    r0: *const f32,
+    r1: *const f32,
+    r2: *const f32,
+    neg_z_scale: f32,
+    pos_z_scale: f32,
+    sun_e: f32,
+    sun_n: f32,
+    sun_u: f32,
+    inv_range: f32,
+    min_val: f32,
+    out_idx: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+    let v_two = _mm256_set1_ps(2.0);
+    let v_one = _mm256_set1_ps(1.0);
+    let v_zero = _mm256_setzero_ps();
+    let v_255 = _mm256_set1_ps(255.0);
+    let v_half = _mm256_set1_ps(0.5);
+    let v_neg_zs = _mm256_set1_ps(neg_z_scale);
+    let v_pos_zs = _mm256_set1_ps(pos_z_scale);
+    let v_se = _mm256_set1_ps(sun_e);
+    let v_sn = _mm256_set1_ps(sun_n);
+    let v_su = _mm256_set1_ps(sun_u);
+    let v_inv_r = _mm256_set1_ps(inv_range);
+    let v_min = _mm256_set1_ps(min_val);
+
+    let mut tmp = [0i32; 8];
+    let mut px = 0usize;
+    while px + 8 <= N {
+        let nw = _mm256_loadu_ps(r0.add(px));
+        let n = _mm256_loadu_ps(r0.add(px + 1));
+        let ne = _mm256_loadu_ps(r0.add(px + 2));
+        let w = _mm256_loadu_ps(r1.add(px));
+        let e = _mm256_loadu_ps(r1.add(px + 2));
+        let sw = _mm256_loadu_ps(r2.add(px));
+        let s = _mm256_loadu_ps(r2.add(px + 1));
+        let se = _mm256_loadu_ps(r2.add(px + 2));
+
+        let east = _mm256_add_ps(_mm256_fmadd_ps(v_two, e, ne), se);
+        let west = _mm256_add_ps(_mm256_fmadd_ps(v_two, w, nw), sw);
+        let nx = _mm256_mul_ps(_mm256_sub_ps(east, west), v_neg_zs);
+
+        let south = _mm256_add_ps(_mm256_fmadd_ps(v_two, s, sw), se);
+        let north = _mm256_add_ps(_mm256_fmadd_ps(v_two, n, nw), ne);
+        let ny = _mm256_mul_ps(_mm256_sub_ps(south, north), v_pos_zs);
+
+        let len_sq = _mm256_fmadd_ps(ny, ny, _mm256_fmadd_ps(nx, nx, v_one));
+        let num = _mm256_fmadd_ps(ny, v_sn, _mm256_fmadd_ps(nx, v_se, v_su));
+        let dot = _mm256_div_ps(num, _mm256_sqrt_ps(len_sq));
+        let hs = _mm256_min_ps(_mm256_mul_ps(_mm256_max_ps(dot, v_zero), v_255), v_255);
+        let scaled = _mm256_min_ps(
+            _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(hs, v_min), v_inv_r), v_zero),
+            v_255,
+        );
+        _mm256_storeu_si256(
+            tmp.as_mut_ptr() as *mut __m256i,
+            _mm256_cvttps_epi32(_mm256_add_ps(scaled, v_half)),
+        );
+        for k in 0..8 {
+            *out_idx.get_unchecked_mut(px + k) = tmp[k] as u8;
+        }
+        px += 8;
+    }
+}
+
 /// Render an on-the-fly DEM derivative tile (Hillshade, Slope, or Aspect) using Horn's 3×3
 /// stencil over a 1-pixel-padded resampled elevation buffer for seamless tile boundaries.
 pub fn render_dem_algorithm<const N: usize>(
@@ -2514,6 +2732,45 @@ pub fn render_dem_algorithm<const N: usize>(
                     sc.row_buf.resize(N, 0);
                 }
                 let mut has_nodata = false;
+                if clean {
+                    if let DemAlgorithm::Hillshade {
+                        azimuth_deg,
+                        altitude_deg,
+                        z_factor,
+                    } = alg
+                    {
+                        for py in 0..N {
+                            let r0 = py * pad;
+                            let r1 = (py + 1) * pad;
+                            let r2 = (py + 2) * pad;
+                            let row_idx = &mut sc.row_buf[..N];
+                            eval_horn_hillshade_row_clean::<N>(
+                                &elev[r0..r0 + pad],
+                                &elev[r1..r1 + pad],
+                                &elev[r2..r2 + pad],
+                                inv_8dx,
+                                azimuth_deg,
+                                altitude_deg,
+                                z_factor,
+                                inv_range,
+                                min_val,
+                                row_idx,
+                            );
+                            filter_sub_u8_row(
+                                row_idx,
+                                &mut sc.img_buf[py * stride..(py + 1) * stride],
+                            );
+                        }
+                        let plte = build_plte_opaque(lut);
+                        return encode_indexed_png(
+                            N as u32,
+                            N as u32,
+                            &plte,
+                            None,
+                            &sc.img_buf[..total],
+                        );
+                    }
+                }
                 for py in 0..N {
                     let r0 = py * pad;
                     let r1 = (py + 1) * pad;
@@ -2917,5 +3174,127 @@ mod tests {
             assert!((top_edge - expected).abs() < 1e-3, "top edge seam at px={py}: {top_edge} vs {expected}");
             assert!((bot_edge - expected).abs() < 1e-3, "bot edge seam at px={py}: {bot_edge} vs {expected}");
         }
+    }
+
+    #[test]
+    fn simd_cubic_and_horn_hillshade_match_scalar() {
+        let tw = 512u32;
+        let th = 512u32;
+        let len = (tw * th) as usize;
+        let mut slab = AlignedF32Slab::filled(len, 0.0);
+        for r in 0..th {
+            for c in 0..tw {
+                let x = c as f32 * 0.07;
+                let y = r as f32 * 0.09;
+                slab.as_mut_slice()[(r * tw + c) as usize] =
+                    1500.0 + 400.0 * x.sin() * y.cos() + 120.0 * (x * 1.7 + y * 0.5).cos();
+            }
+        }
+        let band = DecodedBand {
+            width: tw,
+            height: th,
+            data: BandData::F32(slab),
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 900.0,
+                max: 2100.0,
+            },
+        };
+        let blks = [Some(&band)];
+        let src = BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &blks);
+
+        // 1. Verify SIMD sample_cubic against scalar reference
+        for i in 0..64 {
+            let u = 10.13 + (i as f32) * 3.71;
+            let v = 12.29 + (i as f32) * 3.53;
+            let fast = sample_cubic(&src, u, v);
+            let (x0, fx) = fast_floor_i32(u);
+            let (y0, fy) = fast_floor_i32(v);
+            let wx = cubic_weights(fx);
+            let wy = cubic_weights(fy);
+            let mut ref_val = 0.0f32;
+            for j in 0..4 {
+                let mut r_acc = 0.0f32;
+                for k in 0..4 {
+                    r_acc += src.sample_checked(x0 + k - 1, y0 + j - 1) * wx[k as usize];
+                }
+                ref_val += r_acc * wy[j as usize];
+            }
+            assert!(
+                (fast - ref_val).abs() < 1e-3,
+                "cubic mismatch at ({u},{v}): fast={fast} ref={ref_val}"
+            );
+        }
+
+        // 2. Verify SIMD Horn 3x3 hillshade row against scalar eval_horn_3x3
+        let mut r0 = [0.0f32; 258];
+        let mut r1 = [0.0f32; 258];
+        let mut r2 = [0.0f32; 258];
+        for i in 0..258 {
+            r0[i] = src.sample_inbounds(i as u32 + 10, 10);
+            r1[i] = src.sample_inbounds(i as u32 + 10, 11);
+            r2[i] = src.sample_inbounds(i as u32 + 10, 12);
+        }
+        let mut simd_out = [0u8; 256];
+        let inv_8dx = 1.0 / (8.0 * 30.0);
+        eval_horn_hillshade_row_clean::<256>(
+            &r0, &r1, &r2, inv_8dx, 315.0, 45.0, 2.0, 1.0, 0.0, &mut simd_out,
+        );
+        for px in 0..256 {
+            let c = px + 1;
+            let s = eval_horn_3x3(
+                r0[c - 1], r0[c], r0[c + 1],
+                r1[c - 1], r1[c], r1[c + 1],
+                r2[c - 1], r2[c], r2[c + 1],
+                inv_8dx,
+                DemAlgorithm::Hillshade {
+                    azimuth_deg: 315.0,
+                    altitude_deg: 45.0,
+                    z_factor: 2.0,
+                },
+            );
+            let scalar_u8 = rescale_u8(s, 1.0, 0.0);
+            let diff = (simd_out[px] as i32 - scalar_u8 as i32).abs();
+            assert!(diff <= 1, "horn mismatch at px={px}: simd={} scalar={scalar_u8}", simd_out[px]);
+        }
+
+        // 3. Time 100 iterations of 256x256 cubic hillshade PNG
+        let mut u = [0.0f32; 256];
+        let mut v = [0.0f32; 256];
+        for i in 0..256 {
+            u[i] = 10.0 + (i as f32) * 1.5;
+            v[i] = 10.0 + (i as f32) * 1.5;
+        }
+        let plan = CoordPlan::Separable1D {
+            u: Box::new(u),
+            v: Box::new(v),
+            src_min_col: 10,
+            src_max_col: 400,
+            src_min_row: 10,
+            src_max_row: 400,
+            all_in_bounds: true,
+        };
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 255.0,
+            colormap: ColormapName::from_str_opt("gray").unwrap(),
+            resample: ResampleMode::Cubic,
+            format: OutputFormat::Png,
+        };
+        let alg = DemAlgorithm::Hillshade {
+            azimuth_deg: 315.0,
+            altitude_deg: 45.0,
+            z_factor: 2.0,
+        };
+        // warmup
+        let _ = render_dem_algorithm(&plan, &src, alg, 30.0, &style);
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            let png = render_dem_algorithm(&plan, &src, alg, 30.0, &style);
+            std::hint::black_box(png);
+        }
+        let avg_us = t0.elapsed().as_secs_f64() * 1e6 / 100.0;
+        eprintln!("256x256 cubic SIMD hillshade PNG avg: {avg_us:.1} µs");
     }
 }
