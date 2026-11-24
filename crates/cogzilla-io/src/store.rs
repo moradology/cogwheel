@@ -10,17 +10,13 @@ use cogzilla_codec::{
 use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog};
 use dashmap::DashMap;
 
-/// Return the 0-based alpha plane index if this IFD is a `PlanarConfig::Planar` RGBA COG
-/// (`samples_per_pixel >= 4` with `ExtraSamples` tag 338 containing 1 or 2).
+/// Return the 0-based alpha plane index if this IFD is a `PlanarConfig::Planar` COG with an
+/// alpha channel (`ExtraSamples` tag 338 containing 1 or 2, e.g. Gray+Alpha or RGBA).
 fn planar_alpha_plane(ifd: &IfdMeta) -> Option<usize> {
-    if ifd.planar_config == PlanarConfig::Planar
-        && ifd.samples_per_pixel >= 4
-        && ifd.extra_samples.iter().any(|&v| v == 1 || v == 2)
-    {
-        Some((ifd.samples_per_pixel - 1) as usize)
-    } else {
-        None
+    if ifd.planar_config != PlanarConfig::Planar {
+        return None;
     }
+    cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples)
 }
 
 /// Given a planar color-plane `tile_idx`, return `(offset, len)` of its paired alpha-plane tile.

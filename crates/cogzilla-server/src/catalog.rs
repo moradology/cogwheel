@@ -453,6 +453,11 @@ impl MosaicJsonCatalog {
             .map(|z| z as u8)
             .or(inferred_qk_zoom)
             .unwrap_or(minzoom);
+        if quadkey_zoom > 30 {
+            return Err(format!(
+                "MosaicJSON quadkey_zoom {quadkey_zoom} exceeds maximum supported zoom 30"
+            ));
+        }
 
         Ok(Self {
             version,
@@ -518,8 +523,22 @@ impl SceneCatalog for MosaicJsonCatalog {
                 }
             }
         } else {
-            // Very zoomed-out request: iterate indexed quadkeys directly
-            for urls in self.tiles.values() {
+            // Very zoomed-out request: iterate indexed quadkeys directly, filtering each key's
+            // decoded (tx, ty) against (cx0..=cx1, cy0..=cy1) so out-of-bbox scenes are excluded.
+            let mut matched: Vec<(&str, &Vec<String>)> = self
+                .tiles
+                .iter()
+                .filter_map(|(qk, urls)| {
+                    let (tx, ty) = quadkey_to_tile(qk)?;
+                    if tx >= cx0 && tx <= cx1 && ty >= cy0 && ty <= cy1 {
+                        Some((qk.as_str(), urls))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            matched.sort_unstable_by_key(|(qk, _)| *qk);
+            for (_, urls) in matched {
                 for u in urls {
                     if seen.insert(u.as_str()) {
                         out.push(u.clone());
@@ -533,6 +552,30 @@ impl SceneCatalog for MosaicJsonCatalog {
     fn len(&self) -> usize {
         self.tiles.len()
     }
+}
+
+/// Decode a Bing/MosaicJSON quadkey string into `(tx, ty)`.
+fn quadkey_to_tile(qk: &str) -> Option<(u32, u32)> {
+    if qk.len() > 30 {
+        return None;
+    }
+    let mut tx = 0u32;
+    let mut ty = 0u32;
+    for b in qk.bytes() {
+        tx <<= 1;
+        ty <<= 1;
+        match b {
+            b'0' => {}
+            b'1' => tx |= 1,
+            b'2' => ty |= 1,
+            b'3' => {
+                tx |= 1;
+                ty |= 1;
+            }
+            _ => return None,
+        }
+    }
+    Some((tx, ty))
 }
 
 /// Auto-detect and parse any supported catalog JSON format:

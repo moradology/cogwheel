@@ -189,6 +189,7 @@ pub struct MaskIfdMeta {
     pub tiles_down: u32,
     pub bits_per_sample: u16,
     pub compression: Compression,
+    pub predictor: Predictor,
     pub tile_offsets: Box<[u64]>,
     pub tile_byte_counts: Box<[u32]>,
 }
@@ -304,6 +305,9 @@ impl CogIndex {
     /// so we never alias by picking an overly coarse overview, nor over-fetch full-res when zoomed out).
     pub fn select_ifd(&self, target_rx: f64, target_ry: f64) -> usize {
         let target = target_rx.min(target_ry);
+        if !target.is_finite() || target <= 0.0 {
+            return self.ifds.len().saturating_sub(1);
+        }
         let mut best = 0usize;
         for (i, ifd) in self.ifds.iter().enumerate().skip(1) {
             let (rx, ry) = ifd.pixel_resolution();

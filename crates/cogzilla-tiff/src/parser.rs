@@ -547,6 +547,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                         tiles_down: height.div_ceil(tile_height),
                         bits_per_sample: mask_bps,
                         compression,
+                        predictor,
                         tile_offsets: offs,
                         tile_byte_counts: cnts,
                     });

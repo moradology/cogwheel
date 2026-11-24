@@ -1198,8 +1198,12 @@ where
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
                             let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            let nb = match treq.bands {
+                                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                                _ => 1,
+                            };
                             Ok((
-                                cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, 3),
+                                cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb),
                                 ct,
                             ))
                         } else {
@@ -1292,8 +1296,12 @@ where
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
                             let (treq, ct) = build_tile_request(tile, sc, ext, &pq, 3, true)?;
+                            let nb = match treq.bands {
+                                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                                _ => 1,
+                            };
                             Ok((
-                                cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, 3),
+                                cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb),
                                 ct,
                             ))
                         } else {
