@@ -1206,6 +1206,67 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
     mins: [f32; 3],
     row_rgb: &mut [u8],
 ) {
+    // Fast path 0: all 3 bands share ONE interleaved RGB8 slab (Sentinel-2 TCI, NAIP, JPEG/WebP RGB)
+    // -> 6 contiguous bytes per row pair (1 cache line instead of 3 separate streams!)
+    if let (Some((rgb0, 0, bc, br, st)), Some((rgb1, 1, _, _, _)), Some((rgb2, 2, _, _, _))) = (
+        srcs[0].single_block_rgb_u8(),
+        srcs[1].single_block_rgb_u8(),
+        srcs[2].single_block_rgb_u8(),
+    ) {
+        if std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
+            && std::ptr::eq(rgb0.as_ptr(), rgb2.as_ptr())
+            && srcs[0].same_grid_as(&srcs[1])
+            && srcs[0].same_grid_as(&srcs[2])
+        {
+            let mut u_row = [0.0f32; N];
+            let mut v_row = [0.0f32; N];
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
+            let bc_f = bc as f32;
+            let br_f = br as f32;
+            let ptr = rgb0.as_ptr();
+            let stride3 = st * 3;
+            let identity = mins == [0.0, 0.0, 0.0]
+                && (inv[0] - 1.0).abs() < 1e-6
+                && (inv[1] - 1.0).abs() < 1e-6
+                && (inv[2] - 1.0).abs() < 1e-6;
+            for px in 0..N {
+                let (x0, fx) = fast_floor_i32(u_row[px] - bc_f);
+                let (y0, fy) = fast_floor_i32(v_row[px] - br_f);
+                let p00 = (y0 as usize) * stride3 + (x0 as usize) * 3;
+                let p01 = p00 + stride3;
+                let w00 = (1.0 - fx) * (1.0 - fy);
+                let w10 = fx * (1.0 - fy);
+                let w01 = (1.0 - fx) * fy;
+                let w11 = fx * fy;
+                unsafe {
+                    let r = (*ptr.add(p00) as f32) * w00
+                        + (*ptr.add(p00 + 3) as f32) * w10
+                        + (*ptr.add(p01) as f32) * w01
+                        + (*ptr.add(p01 + 3) as f32) * w11;
+                    let g = (*ptr.add(p00 + 1) as f32) * w00
+                        + (*ptr.add(p00 + 4) as f32) * w10
+                        + (*ptr.add(p01 + 1) as f32) * w01
+                        + (*ptr.add(p01 + 4) as f32) * w11;
+                    let b = (*ptr.add(p00 + 2) as f32) * w00
+                        + (*ptr.add(p00 + 5) as f32) * w10
+                        + (*ptr.add(p01 + 2) as f32) * w01
+                        + (*ptr.add(p01 + 5) as f32) * w11;
+                    let off = px * 3;
+                    if identity {
+                        *row_rgb.get_unchecked_mut(off) = (r + 0.5) as u8;
+                        *row_rgb.get_unchecked_mut(off + 1) = (g + 0.5) as u8;
+                        *row_rgb.get_unchecked_mut(off + 2) = (b + 0.5) as u8;
+                    } else {
+                        *row_rgb.get_unchecked_mut(off) = rescale_u8(r, inv[0], mins[0]);
+                        *row_rgb.get_unchecked_mut(off + 1) = rescale_u8(g, inv[1], mins[1]);
+                        *row_rgb.get_unchecked_mut(off + 2) = rescale_u8(b, inv[2], mins[2]);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     // Fast path 1: all 3 bands live in a single clean block with matching native storage
     if let (Some((r, bc, br, st)), Some((g, _, _, _)), Some((b, _, _, _))) = (
         srcs[0].single_block_u8(),
@@ -1292,6 +1353,15 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
                         *data.get_unchecked(p00 + 1) as f32,
                         *data.get_unchecked(p01) as f32,
                         *data.get_unchecked(p01 + 1) as f32,
+                    )
+                },
+                cogzilla_codec::BandData::RgbU8Channel { rgb, channel, .. } => unsafe {
+                    let ch = *channel as usize;
+                    (
+                        *rgb.get_unchecked(p00 * 3 + ch) as f32,
+                        *rgb.get_unchecked((p00 + 1) * 3 + ch) as f32,
+                        *rgb.get_unchecked(p01 * 3 + ch) as f32,
+                        *rgb.get_unchecked((p01 + 1) * 3 + ch) as f32,
                     )
                 },
             };

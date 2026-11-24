@@ -1,7 +1,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 struct SendF32Ptr(*mut f32);
 unsafe impl Send for SendF32Ptr {}
@@ -171,6 +171,13 @@ pub enum BandData {
         data: Box<[u8]>,
         nodata: Option<u8>,
     },
+    /// Zero-deinterleave view into a shared interleaved RGB8 (`[R, G, B, ...]`) block
+    /// for chunky 3-band `uint8` COGs (Sentinel-2 TCI, NAIP, aerial JPEG/WebP RGB).
+    RgbU8Channel {
+        rgb: Arc<[u8]>,
+        channel: u8,
+        nodata: Option<u8>,
+    },
 }
 
 impl From<AlignedF32Slab> for BandData {
@@ -187,6 +194,7 @@ impl BandData {
             Self::F32(s) => s.len(),
             Self::U16 { data, .. } => data.len(),
             Self::U8 { data, .. } => data.len(),
+            Self::RgbU8Channel { rgb, .. } => rgb.len() / 3,
         }
     }
 
@@ -195,13 +203,14 @@ impl BandData {
         self.len() == 0
     }
 
-    /// Resident heap byte size of this band (1 B/px for `U8`, 2 B/px for `U16`, 4 B/px for `F32`).
+    /// Resident heap byte size of this band (1 B/px for `U8`/`RgbU8Channel`, 2 B/px for `U16`, 4 B/px for `F32`).
     #[inline(always)]
     pub fn byte_len(&self) -> usize {
         match self {
             Self::F32(s) => s.len() * 4,
             Self::U16 { data, .. } => data.len() * 2,
             Self::U8 { data, .. } => data.len(),
+            Self::RgbU8Channel { rgb, .. } => rgb.len() / 3,
         }
     }
 
@@ -238,6 +247,18 @@ impl BandData {
                     v as f32
                 }
             }
+            Self::RgbU8Channel {
+                rgb,
+                channel,
+                nodata,
+            } => {
+                let v = unsafe { *rgb.get_unchecked(idx * 3 + (*channel as usize)) };
+                if *nodata == Some(v) {
+                    f32::NAN
+                } else {
+                    v as f32
+                }
+            }
         }
     }
 
@@ -256,6 +277,18 @@ impl BandData {
             }
             Self::U8 { data, nodata } => {
                 let v = data[idx];
+                if *nodata == Some(v) {
+                    f32::NAN
+                } else {
+                    v as f32
+                }
+            }
+            Self::RgbU8Channel {
+                rgb,
+                channel,
+                nodata,
+            } => {
+                let v = rgb[idx * 3 + (*channel as usize)];
                 if *nodata == Some(v) {
                     f32::NAN
                 } else {
@@ -349,5 +382,39 @@ mod tests {
         let s2 = AlignedF32Slab::new_uninit(256 * 256);
         let p2 = s2.as_slice().as_ptr();
         assert_eq!(p1, p2, "expected 256x256 slab pointer to be recycled from free-list");
+    }
+
+    #[test]
+    fn chunky_3band_u8_uses_shared_interleaved_rgb_slab() {
+        let raw: Vec<u8> = (0..24u8).collect();
+        let bands = crate::predictor::reconstruct_u8(&raw, 4, 2, 3, false, None);
+        assert_eq!(bands.len(), 3);
+        let ptrs: Vec<*const u8> = bands
+            .iter()
+            .enumerate()
+            .map(|(ch, b)| match &b.data {
+                BandData::RgbU8Channel { rgb, channel, .. } => {
+                    assert_eq!(*channel as usize, ch);
+                    assert_eq!(b.data.byte_len(), 8);
+                    rgb.as_ptr()
+                }
+                _ => panic!("expected BandData::RgbU8Channel"),
+            })
+            .collect();
+        assert_eq!(ptrs[0], ptrs[1]);
+        assert_eq!(ptrs[1], ptrs[2]);
+        assert_eq!(bands[0].data.get_f32(3), 9.0);
+        assert_eq!(bands[1].data.get_f32(3), 10.0);
+        assert_eq!(bands[2].data.get_f32(3), 11.0);
+
+        let p2 = vec![
+            10, 20, 30, 1, 2, 3, 1, 2, 3, 1, 2, 3,
+            5, 6, 7, 5, 6, 7, 5, 6, 7, 5, 6, 7,
+        ];
+        let b_p2 = crate::predictor::reconstruct_u8(&p2, 4, 2, 3, true, None);
+        assert_eq!(b_p2[0].data.get_f32(3), 13.0);
+        assert_eq!(b_p2[1].data.get_f32(3), 26.0);
+        assert_eq!(b_p2[2].data.get_f32(3), 39.0);
+        assert_eq!(b_p2[0].data.get_f32(5), 10.0);
     }
 }

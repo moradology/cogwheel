@@ -190,6 +190,26 @@ impl<'a> BandSource<'a> {
                                     ),
                                 }
                             },
+                            cogzilla_codec::BandData::RgbU8Channel {
+                                rgb,
+                                channel,
+                                nodata,
+                            } => unsafe {
+                                let ch = *channel as usize;
+                                let a = *rgb.get_unchecked(p00 * 3 + ch);
+                                let b = *rgb.get_unchecked((p00 + 1) * 3 + ch);
+                                let c = *rgb.get_unchecked(p01 * 3 + ch);
+                                let d = *rgb.get_unchecked((p01 + 1) * 3 + ch);
+                                match *nodata {
+                                    None => (a as f32, b as f32, c as f32, d as f32),
+                                    Some(nd) => (
+                                        if a == nd { f32::NAN } else { a as f32 },
+                                        if b == nd { f32::NAN } else { b as f32 },
+                                        if c == nd { f32::NAN } else { c as f32 },
+                                        if d == nd { f32::NAN } else { d as f32 },
+                                    ),
+                                }
+                            },
                         }
                     }
                     None => (f32::NAN, f32::NAN, f32::NAN, f32::NAN),
@@ -256,6 +276,30 @@ impl<'a> BandSource<'a> {
             if let cogzilla_codec::BandData::U8 { data, nodata: None } = &blk.data {
                 return Some((
                     data.as_ref(),
+                    self.tx0 * self.tile_w,
+                    self.ty0 * self.tile_h,
+                    self.tile_w as usize,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Single-block interleaved RGB8 view `(rgb_slice, channel, base_col, base_row, stride)`
+    /// for clean chunky 3-band `uint8` COGs.
+    #[inline(always)]
+    pub fn single_block_rgb_u8(&self) -> Option<(&'a [u8], u8, u32, u32, usize)> {
+        if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
+            let blk = self.blocks[0]?;
+            if let cogzilla_codec::BandData::RgbU8Channel {
+                rgb,
+                channel,
+                nodata: None,
+            } = &blk.data
+            {
+                return Some((
+                    rgb.as_ref(),
+                    *channel,
                     self.tx0 * self.tile_w,
                     self.ty0 * self.tile_h,
                     self.tile_w as usize,

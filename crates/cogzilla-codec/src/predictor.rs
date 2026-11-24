@@ -2175,6 +2175,78 @@ pub fn reconstruct_u8(
     let h = tile_h as usize;
     let pixels = w * h;
 
+    // Zero-deinterleave fast path for chunky 3-band uint8 COGs (Sentinel-2 TCI, NAIP, JPEG/WebP RGB):
+    // keep pixels interleaved in one shared Arc<[u8]> instead of allocating and scattering into 3 slabs.
+    if bands_in_tile == 3 {
+        let mut buf = raw[..pixels * 3].to_vec();
+        let mut any_valid = [false; 3];
+        let mut any_nodata = [false; 3];
+        let mut min_u8 = [255u8; 3];
+        let mut max_u8 = [0u8; 3];
+
+        if horizontal_diff {
+            for y in 0..h {
+                let row = &mut buf[y * w * 3..(y + 1) * w * 3];
+                let mut acc = [0u8; 3];
+                for px in row.chunks_exact_mut(3) {
+                    acc[0] = acc[0].wrapping_add(px[0]);
+                    acc[1] = acc[1].wrapping_add(px[1]);
+                    acc[2] = acc[2].wrapping_add(px[2]);
+                    px[0] = acc[0];
+                    px[1] = acc[1];
+                    px[2] = acc[2];
+                }
+            }
+        }
+
+        if let Some(nd) = nd_u8 {
+            for px in buf.chunks_exact(3) {
+                for b in 0..3 {
+                    let v = px[b];
+                    if v == nd {
+                        any_nodata[b] = true;
+                    } else {
+                        any_valid[b] = true;
+                        if v < min_u8[b] { min_u8[b] = v; }
+                        if v > max_u8[b] { max_u8[b] = v; }
+                    }
+                }
+            }
+        } else {
+            any_valid = [pixels > 0; 3];
+            for px in buf.chunks_exact(3) {
+                if px[0] < min_u8[0] { min_u8[0] = px[0]; }
+                if px[0] > max_u8[0] { max_u8[0] = px[0]; }
+                if px[1] < min_u8[1] { min_u8[1] = px[1]; }
+                if px[1] > max_u8[1] { max_u8[1] = px[1]; }
+                if px[2] < min_u8[2] { min_u8[2] = px[2]; }
+                if px[2] > max_u8[2] { max_u8[2] = px[2]; }
+            }
+        }
+
+        let rgb: std::sync::Arc<[u8]> = buf.into_boxed_slice().into();
+        return (0..3u8)
+            .map(|b| {
+                let bi = b as usize;
+                DecodedBand {
+                    data: BandData::RgbU8Channel {
+                        rgb: rgb.clone(),
+                        channel: b,
+                        nodata: nd_u8,
+                    },
+                    width: tile_w,
+                    height: tile_h,
+                    stats: finalize_stats(
+                        any_valid[bi],
+                        any_nodata[bi],
+                        if any_valid[bi] { min_u8[bi] as f32 } else { f32::INFINITY },
+                        if any_valid[bi] { max_u8[bi] as f32 } else { f32::NEG_INFINITY },
+                    ),
+                }
+            })
+            .collect();
+    }
+
     let mut slabs: Vec<Box<[u8]>> = (0..bands_in_tile)
         .map(|_| vec![0u8; pixels].into_boxed_slice())
         .collect();
