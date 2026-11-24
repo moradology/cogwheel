@@ -258,6 +258,15 @@ impl DiskBlockCache {
             .flatten()
     }
 
+    /// Remove a stale or undecodable entry from the in-memory index and on-disk directory
+    /// so a subsequent remote refetch can overwrite it cleanly.
+    pub fn invalidate(&self, key: [u8; 16]) {
+        if let Some((_, meta)) = self.entries.remove(&key) {
+            self.current_bytes.fetch_sub(meta.bytes, Ordering::Relaxed);
+        }
+        let _ = fs::remove_file(self.entry_path(key));
+    }
+
     /// Queue a non-blocking background write of raw compressed block bytes.
     /// Never blocks or fails the caller; drops and increments `write_errors` if queue is full.
     pub fn put_async(&self, uri: &str, ifd_idx: u16, tile_idx: u32, data: Bytes) {

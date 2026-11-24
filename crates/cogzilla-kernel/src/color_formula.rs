@@ -66,6 +66,14 @@ fn flush_lut(
 
 impl ColorFormula {
     pub fn parse(formula: &str) -> Result<Self, String> {
+        const MAX_FORMULA_CHARS: usize = 2048;
+        const MAX_FORMULA_STAGES: usize = 32;
+        if formula.len() > MAX_FORMULA_CHARS {
+            return Err(format!(
+                "color_formula length ({}) exceeds limit ({MAX_FORMULA_CHARS})",
+                formula.len()
+            ));
+        }
         let tokens: Vec<&str> = formula
             .split(|c: char| c.is_whitespace() || c == ',')
             .filter(|t| !t.is_empty())
@@ -168,6 +176,12 @@ impl ColorFormula {
             }
         }
         flush_lut(&mut stages, &mut r_f, &mut g_f, &mut b_f, &mut has_lut);
+        if stages.len() > MAX_FORMULA_STAGES {
+            return Err(format!(
+                "color_formula has {} stages (max {MAX_FORMULA_STAGES})",
+                stages.len()
+            ));
+        }
         Ok(Self { stages })
     }
 
@@ -199,8 +213,11 @@ impl ColorFormula {
     }
 
     pub fn apply_buffer_in_place(&self, buf: &mut [u8], stride: usize) {
+        if stride < 3 {
+            return;
+        }
         let mut i = 0;
-        while i + 3 <= buf.len() {
+        while i + stride <= buf.len() {
             if stride == 4 && buf[i + 3] == 0 {
                 i += 4;
                 continue;

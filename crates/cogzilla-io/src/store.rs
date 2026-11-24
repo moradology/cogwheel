@@ -956,6 +956,7 @@ impl CogStore {
                                 let dc_c = dc.clone();
                                 let m = meta.clone();
                                 disk_set.spawn(async move {
+                                    let dc_inv = dc_c.clone();
                                     let read_res = tokio::task::spawn_blocking(move || {
                                         dc_c.read_verified_sync(key, &path)
                                     })
@@ -963,24 +964,29 @@ impl CogStore {
                                     .ok()
                                     .flatten();
                                     if let Some(compressed) = read_res {
-                                        if let Ok(decoded) = decode_tile_rows(
-                                            &compressed,
-                                            &m,
-                                            byte_order,
-                                            nodata,
-                                            rows,
-                                        ) {
-                                            let arc = Arc::new(decoded);
-                                            if let Some(guard) = guard_opt {
-                                                guard.complete(arc.clone());
+                                        if compressed.len() == count as usize {
+                                            if let Ok(decoded) = decode_tile_rows(
+                                                &compressed,
+                                                &m,
+                                                byte_order,
+                                                nodata,
+                                                rows,
+                                            ) {
+                                                let arc = Arc::new(decoded);
+                                                if let Some(guard) = guard_opt {
+                                                    guard.complete(arc.clone());
+                                                }
+                                                return Ok::<
+                                                    _,
+                                                    (usize, Option<InFlightGuard>, u64, u32),
+                                                >(
+                                                    (orig_slot, arc)
+                                                );
                                             }
-                                            return Ok::<
-                                                _,
-                                                (usize, Option<InFlightGuard>, u64, u32),
-                                            >(
-                                                (orig_slot, arc)
-                                            );
                                         }
+                                        // Stale length or undecodable payload: evict from disk cache
+                                        // so the remote refetch can persist the fresh block.
+                                        dc_inv.invalidate(key);
                                     }
                                     // Corrupt/evicted disk entry: fail-open and refetch from remote!
                                     Err((orig_slot, guard_opt, offset, count))
@@ -1101,22 +1107,24 @@ impl CogStore {
                                         if rel_end > data.len() {
                                             fetch_err =
                                                 Some(IoError::Tiff(TiffError::NeedMoreBytes {
-                                                    required: item.offset + item.len as u64,
-                                                    available: span.start + data.len() as u64,
+                                                    required: item
+                                                        .offset
+                                                        .saturating_add(item.len as u64),
+                                                    available: span
+                                                        .start
+                                                        .saturating_add(data.len() as u64),
                                                 }));
                                             continue;
                                         }
                                         let slice = data.slice(rel_start..rel_end);
-                                        if let Some(dc) = &self.disk_cache {
-                                            if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
-                                                dc.put_async(
-                                                    &cog.uri,
-                                                    ifd_idx as u16,
-                                                    *tidx,
-                                                    slice.clone(),
-                                                );
-                                            }
-                                        }
+                                        let disk_put = self.disk_cache.as_ref().and_then(|dc| {
+                                            tile_indices
+                                                .get(orig_slot)
+                                                .and_then(|o| *o)
+                                                .map(|tidx| {
+                                                    (dc.clone(), cog.uri.clone(), ifd_idx as u16, tidx)
+                                                })
+                                        });
                                         let rows = tile_indices[orig_slot]
                                             .map(|tidx| ifd.block_height(tidx))
                                             .unwrap_or(ifd.tile_height);
@@ -1128,6 +1136,9 @@ impl CogStore {
                                             None
                                         };
                                         decode_set.spawn(async move {
+                                            let slice_for_disk = disk_put
+                                                .as_ref()
+                                                .map(|_| slice.clone());
                                             let decoded = if let Some(sem) = sem {
                                                 let _permit =
                                                     sem.acquire_owned().await.map_err(|e| {
@@ -1151,6 +1162,13 @@ impl CogStore {
                                                     &slice, &m, byte_order, nodata, rows,
                                                 )?
                                             };
+                                            // Persist to tier-2 disk cache only AFTER decode succeeds
+                                            // so corrupt upstream payloads never poison disk.
+                                            if let (Some((dc, uri, ifd_u16, tidx)), Some(bytes)) =
+                                                (disk_put, slice_for_disk)
+                                            {
+                                                dc.put_async(&uri, ifd_u16, tidx, bytes);
+                                            }
                                             let arc = Arc::new(decoded);
                                             if let Some(g) = guard {
                                                 g.complete(arc.clone());
@@ -1335,24 +1353,14 @@ impl CogStore {
                                         if rel_end > data.len() {
                                             fetch_err =
                                                 Some(IoError::Tiff(TiffError::NeedMoreBytes {
-                                                    required: item.offset + item.len as u64,
-                                                    available: span.start + data.len() as u64,
+                                                    required: item
+                                                        .offset
+                                                        .saturating_add(item.len as u64),
+                                                    available: span
+                                                        .start
+                                                        .saturating_add(data.len() as u64),
                                                 }));
                                             continue;
-                                        }
-                                        if no_sidecar_mask {
-                                            if let Some(dc) = &self.disk_cache {
-                                                if let Some(Some(tidx)) =
-                                                    tile_indices.get(*orig_slot)
-                                                {
-                                                    dc.put_async(
-                                                        &cog.uri,
-                                                        ifd_idx as u16,
-                                                        *tidx,
-                                                        data.slice(rel_start..rel_end),
-                                                    );
-                                                }
-                                            }
                                         }
                                         let rows = tile_indices
                                             .get(*orig_slot)
@@ -1367,6 +1375,20 @@ impl CogStore {
                                             rows,
                                         ) {
                                             Ok(mut decoded) => {
+                                                if no_sidecar_mask {
+                                                    if let Some(dc) = &self.disk_cache {
+                                                        if let Some(Some(tidx)) =
+                                                            tile_indices.get(*orig_slot)
+                                                        {
+                                                            dc.put_async(
+                                                                &cog.uri,
+                                                                ifd_idx as u16,
+                                                                *tidx,
+                                                                data.slice(rel_start..rel_end),
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 if sparse_transparent_by_slot[idx_in_span] {
                                                     mark_tile_all_nodata(&mut decoded);
                                                 } else if let (Some(mask_ifd), Some(mbytes)) = (
@@ -1717,13 +1739,27 @@ impl CogStore {
 
         let local = uri.strip_prefix("file://").unwrap_or(uri);
         let meta = std::fs::metadata(local)?;
+        if !meta.is_file() {
+            return Err(IoError::Fs(std::io::Error::other(format!(
+                "local path '{local}' is not a regular file"
+            ))));
+        }
         if meta.len() > max_bytes as u64 {
             return Err(IoError::Fs(std::io::Error::other(format!(
                 "local file '{local}' size {} exceeds limit of {max_bytes} bytes",
                 meta.len()
             ))));
         }
-        let bytes = std::fs::read(local)?;
+        use std::io::Read;
+        let file = std::fs::File::open(local)?;
+        let mut bytes = Vec::with_capacity((meta.len() as usize).min(max_bytes));
+        file.take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(IoError::Fs(std::io::Error::other(format!(
+                "local file '{local}' exceeds limit of {max_bytes} bytes"
+            ))));
+        }
         Ok(bytes::Bytes::from(bytes))
     }
 }
