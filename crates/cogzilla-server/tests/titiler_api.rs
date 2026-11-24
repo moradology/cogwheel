@@ -59,7 +59,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("bad tilesize", format!("{tile}&tilesize=7")),
         ("unknown tms tile", format!("{base}/cog/tiles/UTM31WGS84Quad/10/163/395.png?url={sat_url}")),
         ("unknown tms tilejson", format!("{base}/cog/UTM31WGS84Quad/tilejson.json?url={sat_url}")),
-        ("statistics expression", format!("{base}/cog/statistics?url={sat_url}&expression=b1/b2")),
+        ("statistics algorithm", format!("{base}/cog/statistics?url={sat_url}&algorithm=hillshade")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
         ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
         ("point coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:32610")),
@@ -96,6 +96,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("algorithm normalizedIndex", format!("{tile}&algorithm=normalizedIndex&bidx=1,2")),
         ("algorithm median", format!("{tile}&algorithm=median")),
         ("algorithm bitonal", format!("{tile}&algorithm=bitonal&algorithm_params=%7B%22threshold%22:0.5%7D")),
+        ("statistics expression", format!("{base}/cog/statistics?url={sat_url}&expression=b1-b2;b2-b3")),
+        ("point multi-expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2;b2-b3")),
+        ("cog tile geotiff", format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1")),
+        ("cog preview geotiff", format!("{base}/cog/preview/64x64.tif?url={sat_url}&rescale=0,1")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");
@@ -126,6 +130,36 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     .await;
     assert_eq!(pt_b2["values"].as_array().unwrap().len(), 1);
     assert_eq!(pt_b2["band_names"][0], "b2");
+
+    // Multi-expression /cog/statistics and /cog/point + GeoTIFF .tif output validation
+    let st_expr = get_json(
+        &client,
+        format!("{base}/cog/statistics?url={sat_url}&expression=b1-b2;b2-b3"),
+    )
+    .await;
+    assert!(st_expr["b1-b2"]["mean"].is_number());
+    assert!(st_expr["b2-b3"]["mean"].is_number());
+
+    let pt_multi = get_json(
+        &client,
+        format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2;b2-b3"),
+    )
+    .await;
+    assert_eq!(pt_multi["values"].as_array().unwrap().len(), 2);
+    assert_eq!(pt_multi["band_names"], serde_json::json!(["b1-b2", "b2-b3"]));
+
+    let tif_resp = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tif_resp.headers().get("content-type").unwrap(), "image/tiff; application=geotiff");
+    let tif_bytes = tif_resp.bytes().await.unwrap();
+    assert_eq!(&tif_bytes[0..4], b"II\x2a\x00", "valid little-endian Classic TIFF magic");
+    let parsed_tif = cogzilla_tiff::parse_cog(&tif_bytes).unwrap();
+    assert_eq!(parsed_tif.full_res().width, 256);
+    assert_eq!(parsed_tif.full_res().height, 256);
+    assert_eq!(parsed_tif.geo_keys.projected_cs_type, Some(3857));
     let prev_300 = client
         .get(format!("{base}/cog/preview.png?url={sat_url}&width=300"))
         .send()
