@@ -36,7 +36,10 @@ impl ColorFormula {
                     }
                     let ch = parts[1].to_ascii_uppercase();
                     let g: f32 = parts[2].parse().map_err(|_| "invalid gamma value")?;
-                    let inv_g = 1.0 / g.max(1e-4);
+                    if !g.is_finite() || g <= 0.0 {
+                        return Err("gamma value must be a finite number > 0".into());
+                    }
+                    let inv_g = 1.0 / g;
                     has_lut = true;
                     for i in 0..256 {
                         if ch.contains('R') { r_f[i] = r_f[i].clamp(0.0, 1.0).powf(inv_g); }
@@ -51,6 +54,12 @@ impl ColorFormula {
                     let ch = parts[1].to_ascii_uppercase();
                     let contrast: f32 = parts[2].parse().map_err(|_| "invalid sigmoidal contrast")?;
                     let bias: f32 = parts[3].parse().map_err(|_| "invalid sigmoidal bias")?;
+                    if !contrast.is_finite() || contrast < 0.0 || !bias.is_finite() {
+                        return Err("sigmoidal contrast must be finite >= 0 and bias must be finite".into());
+                    }
+                    if contrast == 0.0 {
+                        continue;
+                    }
                     let alpha = bias;
                     let beta = contrast;
                     let sig = |x: f32| -> f32 {
@@ -71,7 +80,10 @@ impl ColorFormula {
                         return Err("Saturation requires: Saturation <proportion>".into());
                     }
                     let sat: f32 = parts[1].parse().map_err(|_| "invalid saturation value")?;
-                    saturation = Some(sat.max(0.0));
+                    if !sat.is_finite() || sat < 0.0 {
+                        return Err("saturation value must be finite >= 0".into());
+                    }
+                    saturation = Some(sat);
                 }
                 other => return Err(format!("unsupported color_formula op '{other}'")),
             }

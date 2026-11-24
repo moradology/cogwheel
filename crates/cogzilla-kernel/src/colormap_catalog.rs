@@ -243,5 +243,5 @@ pub fn catalog_lut(idx: u16) -> &'static ColormapLut {
         }
         v.into_boxed_slice()
     });
-    &luts[idx as usize]
+    &luts[(idx as usize).min(luts.len() - 1)]
 }

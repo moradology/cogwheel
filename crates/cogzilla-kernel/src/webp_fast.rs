@@ -5,6 +5,23 @@ use bytes::Bytes;
 /// Low-level `libwebp` encoder using fast tile-serving presets (`method = 1`),
 /// cutting lossy & lossless WebP encode time by ~2–4× vs `WebPEncodeRGB`'s `method = 4` default.
 fn encode_webp_impl(width: u32, height: u32, data: &[u8], has_alpha: bool, quality: Option<f32>) -> Bytes {
+    let bpp: usize = if has_alpha { 4 } else { 3 };
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp));
+    let stride = (width as usize).checked_mul(bpp);
+    let (Some(expected), Some(stride)) = (expected, stride) else {
+        return Bytes::new();
+    };
+    if width == 0
+        || height == 0
+        || data.len() < expected
+        || width > i32::MAX as u32
+        || height > i32::MAX as u32
+        || stride > i32::MAX as usize
+    {
+        return Bytes::new();
+    }
     unsafe {
         let mut config = match libwebp_sys::WebPConfig::new() {
             Ok(c) => c,
@@ -12,7 +29,8 @@ fn encode_webp_impl(width: u32, height: u32, data: &[u8], has_alpha: bool, quali
         };
         match quality {
             Some(q) => {
-                config.quality = q.clamp(0.0, 100.0);
+                let q_safe = if q.is_finite() { q } else { 82.0 };
+                config.quality = q_safe.clamp(0.0, 100.0);
                 config.method = 1; // Fast real-time tile encoding (~2-3x faster than default 4)
                 config.lossless = 0;
             }
@@ -36,9 +54,9 @@ fn encode_webp_impl(width: u32, height: u32, data: &[u8], has_alpha: bool, quali
         pic.use_argb = if quality.is_none() { 1 } else { 0 };
 
         let import_ok = if has_alpha {
-            libwebp_sys::WebPPictureImportRGBA(&mut pic, data.as_ptr(), (width * 4) as i32) != 0
+            libwebp_sys::WebPPictureImportRGBA(&mut pic, data.as_ptr(), stride as i32) != 0
         } else {
-            libwebp_sys::WebPPictureImportRGB(&mut pic, data.as_ptr(), (width * 3) as i32) != 0
+            libwebp_sys::WebPPictureImportRGB(&mut pic, data.as_ptr(), stride as i32) != 0
         };
         if !import_ok {
             libwebp_sys::WebPPictureFree(&mut pic);

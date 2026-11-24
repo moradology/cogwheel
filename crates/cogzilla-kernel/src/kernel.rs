@@ -611,10 +611,8 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
         {
             match style.format {
                 OutputFormat::RawF32 => {
-                    let mut out = BytesMut::zeroed(N * N * 4);
-                    let out_f32 = unsafe {
-                        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, N * N)
-                    };
+                    let mut out = BytesMut::with_capacity(N * N * 4);
+                    let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
                         let vy = v[py] - (base_row as f32);
                         let y0_f = vy.floor();
@@ -628,8 +626,11 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             r0,
                             r1,
                             fy,
-                            &mut out_f32[py * N..(py + 1) * N],
+                            &mut row_f32,
                         );
+                        for &val in &row_f32 {
+                            out.put_slice(&val.to_le_bytes());
+                        }
                     }
                     return out.freeze();
                 }
@@ -830,19 +831,18 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         sc.img_buf.resize(total, 0);
                     }
                     let buf = &mut sc.img_buf[..total];
-                    let buf_u32 = unsafe {
-                        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, N * N)
-                    };
                     for py in 0..N {
-                        let row_off = py * N;
+                        let row_off = py * N * 4;
                         for_each_pixel_in_row(plan, py, |px, u, v| {
                             let val = sample_val::<BILINEAR, false>(src, u, v);
-                            buf_u32[row_off + px] = if val.is_nan() {
+                            let px_u32 = if val.is_nan() {
                                 0
                             } else {
                                 let idx = rescale_u8(val, inv_range, min_val) as usize;
                                 unsafe { *lut.rgba_u32.get_unchecked(idx) }
                             };
+                            let off = row_off + px * 4;
+                            buf[off..off + 4].copy_from_slice(&px_u32.to_ne_bytes());
                         });
                     }
                     match style.format {
@@ -1799,19 +1799,18 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                     sc.img_buf.resize(total, 0);
                 }
                 let buf = &mut sc.img_buf[..total];
-                let buf_u32 = unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, N * N)
-                };
                 for py in 0..N {
-                    let row_off = py * N;
+                    let row_off = py * N * 4;
                     for_each_pixel_in_row(plan, py, |px, u, v| {
                         let val = eval_uv(u, v);
-                        buf_u32[row_off + px] = if val.is_nan() {
+                        let px_u32 = if val.is_nan() {
                             0
                         } else {
                             let idx = rescale_u8(val, inv_range, min_val) as usize;
                             unsafe { *lut.rgba_u32.get_unchecked(idx) }
                         };
+                        let off = row_off + px * 4;
+                        buf[off..off + 4].copy_from_slice(&px_u32.to_ne_bytes());
                     });
                 }
                 match style.format {
@@ -2236,21 +2235,20 @@ pub fn render_expr_vm<const N: usize>(
                     sc.img_buf.resize(total, 0);
                 }
                 let buf = &mut sc.img_buf[..total];
-                let buf_u32 = unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, N * N)
-                };
                 for py in 0..N {
                     sample_row(py, &mut band_rows);
                     prog.eval_row::<N>(&band_rows, &mut out_row);
-                    let row_off = py * N;
+                    let row_off = py * N * 4;
                     for px in 0..N {
                         let val = out_row[px];
-                        buf_u32[row_off + px] = if val.is_nan() {
+                        let px_u32 = if val.is_nan() {
                             0
                         } else {
                             let idx = rescale_u8(val, inv_range, min_val) as usize;
                             unsafe { *lut.rgba_u32.get_unchecked(idx) }
                         };
+                        let off = row_off + px * 4;
+                        buf[off..off + 4].copy_from_slice(&px_u32.to_ne_bytes());
                     }
                 }
                 match style.format {
