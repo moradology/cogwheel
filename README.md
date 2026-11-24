@@ -16,9 +16,11 @@
 | CPU per 1,000 tiles once source blocks are cached | **1.7 CPU-s** | 55.3 CPU-s | **32× less** |
 | Warm tiles per second over HTTP, 4-vCPU Linux | **3,363** | 85 | **40×** |
 | Warm tiles per second over HTTP, Apple M5 | **13,195** | 180 | **73×** |
+| Reprojected 3-band RGB / 3-asset STAC band-math tile (M5, warm) | **1.0–1.2 ms** | 45–50 ms | **43–46×** |
+| GeoJSON polygon statistics / 3-asset STAC point query (M5, warm) | **1.49 / 0.24 ms** | 112 / 18 ms | **75×** |
 | Memory at idle | **4 MiB** | 1,112 MiB | **278× less** |
 
-Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network. Each row comes from a single benchmark run; hardware, method and caveats are in [docs/benchmarks.md](docs/benchmarks.md).
+Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network (lossy WebP on 4-vCPU Linux is **10.9×** warm / **7.0×** cold vs GDAL). Each row comes from a single benchmark run; hardware, method and caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
 <p align="center">
   <img src="assets/terrain-gallery.jpg" alt="Mt. Rainier rendered four ways by cogzilla: hillshade, slope, aspect, and colormapped elevation" width="100%" />

@@ -34,7 +34,7 @@ Each cell is `cogzilla` against TiTiler on the same machine. The two columns dif
 
 - **The 4.3× is the number to plan with.** It is CPU for a tile the server has not seen, which is what an origin behind a CDN mostly serves. It ranged from 2.1× to 4.8× on four workloads (the fifth showed 8.3×, but its file was small enough to be partly cached) and does not depend on the network.
 - **The local multiples depend on the machine.** Warm PNG tiles are 39–75× on the M5 and 24–43× on the 4-vCPU Linux runner; HTTP throughput is 40–73× and 22–40×. The Linux figures are one run on a hosted shared runner (`generic` release build); GitHub assigns a different CPU model from run to run, and TiTiler's own time for the same tile has varied between 21 ms and 31 ms across runs. Quote the Linux range if you need one number for a typical cloud instance.
-- **Not every path is that far ahead.** On the Linux run, lossy WebP output was 4.6× faster and first-touch (cold) local tiles were 8.4–21.5× faster (low-zoom multi-file scenes are 23–32× faster with adaptive quadtree projection). One raw decode path remained slightly slower than GDAL on x86-64 (LZW with predictor 1 at 0.8×, `0.9×` with `target-cpu=native`; DEFLATE with predictor 2 is 1.1–1.2× and LZW with predictor 3 is 1.4×). Those are decode-only measurements, and a warm tile does no decoding.
+- **Not every path is that far ahead.** On the Linux x86-64 run (`45302863059`), lossy WebP output is **10.9×** faster warm (**7.0×** cold) vs GDAL, and first-touch (cold) local PNG tiles are 8.4–21.5× faster (low-zoom multi-file scenes are 23–32× faster with adaptive quadtree projection). One raw decode path remains slightly slower than GDAL on x86-64 (LZW with predictor 1 at `0.9×`; DEFLATE with predictor 2 is 1.1–1.2× and LZW with predictor 3 is 1.4×). Those are decode-only measurements, and a warm tile does no decoding.
 - **The S3 results are M5-only and from v0.1.0.** The CPU, memory and cost figures in the first table have not been repeated on x86, and have not been re-run since the rendering optimizations in 0.2.0.
 - **The larger multiples (13–62× on S3) need the cache to fit.** `cogzilla` keeps decoded blocks in memory and TiTiler keeps none, which is where the big multiples come from. With the default 512 MiB cache, three of the five S3 workloads outgrew it and fell back to S3. Size `--cache-mb` to your working set and budget about 250 MiB on top.
 - **No uncached latency win has been measured.** The S3 run was made from a home network, where both servers were limited by bandwidth and finished roughly level. Lower CPU should become lower latency in-region, but that run has not been done.
@@ -53,6 +53,23 @@ Serving on-the-fly hillshade tiles (cubic resampling, Horn 3×3, PNG encode per 
 | **3,372** | 9.3 ms | 19.5 ms | 0 |
 
 This is `cogzilla` alone: TiTiler was not run on this workload, so there is no multiple to quote.
+
+## Live TiTiler 2.4 differential oracle (endpoint latency & parity)
+
+Single-request warm loopback HTTP measurements from [benches/titiler_diff_oracle.py](../benches/titiler_diff_oracle.py) against a live TiTiler 2.4 instance on Apple M5 at commit `2bc38e1` (**39/39 checks passed**, local fixtures, no network):
+
+| Endpoint | `cogzilla` | TiTiler 2.4 | Gain | Parity |
+| :--- | ---: | ---: | ---: | :--- |
+| `GET /cog/tiles/WebMercatorQuad/...` (3-band UTM RGB PNG) | **1.17 ms** | 50.30 ms | **43.0×** | `mask=100%`, `PSNR=54.0 dB` |
+| `GET /cog/tiles/...?expression=(b1-b2)/(b1+b2)` | **0.86 ms** | 32.51 ms | **38.0×** | `mask=100%`, `PSNR=53.5 dB` |
+| `GET /stac/tiles/...?expression=(b1-b2)/(b1+b2)` (3-asset) | **0.96 ms** | 44.64 ms | **46.5×** | `mask=100%`, `PSNR=40.0 dB` |
+| `GET /cog/tiles/...?color_formula=Gamma RGB 1.5` | **1.41 ms** | 49.11 ms | **34.7×** | `mask=100%`, `PSNR=49.8 dB` |
+| `GET /cog/tiles/...?return_mask=false` | **1.26 ms** | 46.86 ms | **37.2×** | `mask=100%`, `PSNR=54.0 dB` |
+| `GET /cog/tiles/WorldCRS84Quad/...` | **1.84 ms** | 37.12 ms | **20.2×** | `mask=100%`, `PSNR=55.1 dB` |
+| `GET /cog/preview` / `/cog/bbox` / `POST /cog/feature` | **1.80–2.12 ms** | 21.1–28.0 ms | **11.7–14.5×** | `PSNR=44.2–52.5 dB` |
+| `GET /cog/statistics?max_size=512` | **2.95 ms** | 54.00 ms | **18.3×** | `mean_err=0.00000` |
+| `POST /cog/statistics` (GeoJSON polygon clip) | **1.49 ms** | 111.95 ms | **75.0×** | `mean_err=0.00003` |
+| `GET /stac/point/{lon},{lat}` (3-asset) | **0.24 ms** | 18.00 ms | **75.6×** | `max_val_err=0.0000000` |
 
 ## Sources
 
