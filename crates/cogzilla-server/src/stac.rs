@@ -56,6 +56,10 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
         || href.starts_with("abfs://")
         || href.starts_with("abfss://")
         || href.starts_with("file://")
+        || href.starts_with("/vsicurl/")
+        || href.starts_with("/vsis3/")
+        || href.starts_with("/vsigs/")
+        || href.starts_with("/vsiaz/")
     {
         return href.to_string();
     }
