@@ -421,6 +421,11 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             }
         };
         if let Some(tms) = tms {
+            if matches!(family, "mosaic" | "mosaicjson") && tms != "WebMercatorQuad" {
+                return Err(format!(
+                    "tile matrix set '{tms}' is not supported on /{family} routes (use WebMercatorQuad)"
+                ));
+            }
             if !SUPPORTED_TMS.contains(&tms) {
                 return Err(format!(
                     "tile matrix set '{tms}' is not supported (use WebMercatorQuad or WorldCRS84Quad)"
@@ -480,15 +485,15 @@ fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCo
     if cogs.is_empty() {
         return;
     }
-    let adj = |b1: u16, slot: usize, mn: f32, mx: f32| -> (f32, f32) {
+    let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+        let i = b1.saturating_sub(1) as usize;
         let (sc, off) = if cogs.len() > 1 {
-            let c = &cogs[slot.min(cogs.len() - 1)];
+            let c = &cogs[i.min(cogs.len() - 1)];
             (
                 c.index.scales.first().copied().unwrap_or(1.0),
                 c.index.offsets.first().copied().unwrap_or(0.0),
             )
         } else {
-            let i = b1.saturating_sub(1) as usize;
             (
                 cogs[0].index.scales.get(i).copied().unwrap_or(1.0),
                 cogs[0].index.offsets.get(i).copied().unwrap_or(0.0),
@@ -506,7 +511,7 @@ fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCo
             rescale,
             ..
         } => {
-            *rescale = adj(*band_1based, 0, rescale.0, rescale.1);
+            *rescale = adj(*band_1based, rescale.0, rescale.1);
         }
         BandRequest::Rgb {
             bands_1based,
@@ -514,7 +519,7 @@ fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCo
             rescale_max,
         } => {
             for k in 0..3 {
-                let (mn, mx) = adj(bands_1based[k], k, rescale_min[k], rescale_max[k]);
+                let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
                 rescale_min[k] = mn;
                 rescale_max[k] = mx;
             }
@@ -1025,16 +1030,18 @@ where
     }
 
     if method == Method::GET && path == "/docs" {
-        const SWAGGER_HTML: &str = r#"<!DOCTYPE html>
+        let html = format!(
+            r#"<!DOCTYPE html>
 <html><head><title>cogzilla API Docs</title>
 <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
 </head><body><div id="swagger-ui"></div>
 <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-<script>SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui'});</script>
-</body></html>"#;
+<script>SwaggerUIBundle({{url:'{forwarded_prefix}/openapi.json',dom_id:'#swagger-ui'}});</script>
+</body></html>"#
+        );
         return Ok(plain_resp(
             StatusCode::OK,
-            Bytes::from_static(SWAGGER_HTML.as_bytes()),
+            Bytes::from(html),
             "text/html; charset=utf-8",
         ));
     }
@@ -1657,7 +1664,7 @@ where
             }
             .await,
             (Method::GET, [tms, "map.html"]) => {
-                let tj_url = format!("/stac/{tms}/tilejson.json?{raw_query}");
+                let tj_url = format!("{forwarded_prefix}/stac/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
 
@@ -2381,7 +2388,7 @@ where
 
             // 9. GET /cog/{tileMatrixSetId}/map.html
             (Method::GET, [tms, "map.html"]) => {
-                let tj_url = format!("/cog/{tms}/tilejson.json?{raw_query}");
+                let tj_url = format!("{forwarded_prefix}/cog/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
 
