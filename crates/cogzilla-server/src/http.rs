@@ -108,6 +108,9 @@ fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
         parts[2].parse::<f64>().ok()?,
         parts[3].parse::<f64>().ok()?,
     ];
+    if !b.iter().all(|v| v.is_finite()) || b[0] >= b[2] || b[1] >= b[3] {
+        return None;
+    }
     Some((b, ext))
 }
 
@@ -243,10 +246,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "bidx" | "indexes" => {
                 for part in percent_decode(v).split(',') {
-                    if let Ok(b) = part.parse::<u16>() {
-                        pq.bidx.push(b);
-                    } else {
-                        bad("expected band numbers");
+                    match part.parse::<u16>() {
+                        Ok(0) => bad("band indices are 1-based (>= 1)"),
+                        Ok(b) => pq.bidx.push(b),
+                        Err(_) => bad("expected band numbers"),
                     }
                 }
             }
@@ -458,12 +461,26 @@ fn parse_ext_format(
 }
 
 /// Fold GDAL `scale`/`offset` into rescale bounds when `?unscale=true` (zero per-pixel cost!).
-fn apply_unscale(bands: &mut BandRequest, scales: &[f32], offsets: &[f32]) {
-    let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
-        let i = b1.saturating_sub(1) as usize;
-        let sc = scales.get(i).copied().unwrap_or(1.0);
-        let off = offsets.get(i).copied().unwrap_or(0.0);
-        if (sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9 {
+/// Supports both single multi-band COGs and multi-asset STAC/multi-COG composites.
+fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCog>]) {
+    if cogs.is_empty() {
+        return;
+    }
+    let adj = |b1: u16, slot: usize, mn: f32, mx: f32| -> (f32, f32) {
+        let (sc, off) = if cogs.len() > 1 {
+            let c = &cogs[slot.min(cogs.len() - 1)];
+            (
+                c.index.scales.first().copied().unwrap_or(1.0),
+                c.index.offsets.first().copied().unwrap_or(0.0),
+            )
+        } else {
+            let i = b1.saturating_sub(1) as usize;
+            (
+                cogs[0].index.scales.get(i).copied().unwrap_or(1.0),
+                cogs[0].index.offsets.get(i).copied().unwrap_or(0.0),
+            )
+        };
+        if (sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9 || sc.abs() < 1e-12 {
             (mn, mx)
         } else {
             ((mn - off) / sc, (mx - off) / sc)
@@ -475,7 +492,7 @@ fn apply_unscale(bands: &mut BandRequest, scales: &[f32], offsets: &[f32]) {
             rescale,
             ..
         } => {
-            *rescale = adj(*band_1based, rescale.0, rescale.1);
+            *rescale = adj(*band_1based, 0, rescale.0, rescale.1);
         }
         BandRequest::Rgb {
             bands_1based,
@@ -483,7 +500,7 @@ fn apply_unscale(bands: &mut BandRequest, scales: &[f32], offsets: &[f32]) {
             rescale_max,
         } => {
             for k in 0..3 {
-                let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                let (mn, mx) = adj(bands_1based[k], k, rescale_min[k], rescale_max[k]);
                 rescale_min[k] = mn;
                 rescale_max[k] = mx;
             }
@@ -866,7 +883,13 @@ where
     B::Error: std::fmt::Display,
 {
     let is_head = *req.method() == Method::HEAD;
-    let resp = handle_request_inner(engine, req, is_head).await?;
+    let is_post = *req.method() == Method::POST;
+    let mut resp = handle_request_inner(engine, req, is_head).await?;
+    if is_post {
+        // RFC 9110: POST responses depend on the request body and must not carry public Cache-Control/ETag.
+        resp.headers_mut().remove(CACHE_CONTROL);
+        resp.headers_mut().remove(ETAG);
+    }
     if is_head {
         let (mut parts, body) = resp.into_parts();
         if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
@@ -1581,11 +1604,7 @@ where
                             is_u8,
                         )?;
                         if pq_stac.unscale {
-                            apply_unscale(
-                                &mut treq.bands,
-                                &cogs[0].index.scales,
-                                &cogs[0].index.offsets,
-                            );
+                            apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
                         let needs_general = *tms == "WorldCRS84Quad"
                             || pq_stac.buffer > 0
@@ -1977,7 +1996,9 @@ where
             }
 
             // 6 & 7. GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{format}]
-            (Method::GET, ["tiles", tms, zs, xs, ys]) => {
+            //        and alias GET /cog/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
+            (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
+                let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
                 engine
                     .tile_cache
@@ -2000,14 +2021,10 @@ where
                         let (mut treq, ct) =
                             build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
                         if pq.unscale {
-                            apply_unscale(
-                                &mut treq.bands,
-                                &cogs[0].index.scales,
-                                &cogs[0].index.offsets,
-                            );
+                            apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
 
-                        let needs_general_path = *tms == "WorldCRS84Quad"
+                        let needs_general_path = tms == "WorldCRS84Quad"
                             || pq.buffer > 0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some();
@@ -2026,7 +2043,7 @@ where
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
                             let out_dim = treq.tile_size + 2 * pq.buffer;
-                            let bbox = if *tms == "WorldCRS84Quad" {
+                            let bbox = if tms == "WorldCRS84Quad" {
                                 world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size)
                             } else {
                                 web_mercator_buffered_wgs84_bbox(z, x, y, pq.buffer, treq.tile_size)
@@ -2073,36 +2090,6 @@ where
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             Ok((data, ct))
                         }
-                    })
-                    .await
-                    .map(|t| (t.bytes, t.content_type))
-            }
-
-            // Alias: GET /cog/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
-            (Method::GET, ["tiles", zs, xs, ys]) => {
-                let cache_key = format!("{path}?{raw_query}");
-                engine
-                    .tile_cache
-                    .get_or_render(cache_key, || async {
-                        let cogs = open_query_urls(&engine, &pq.urls).await?;
-                        let (Some(z), Some(x), Some((y, sc, ext))) = (
-                            zs.parse::<u8>().ok(),
-                            xs.parse::<u32>().ok(),
-                            parse_y_scale_ext(ys),
-                        ) else {
-                            return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
-                        };
-                        let db = if cogs.len() > 1 {
-                            cogs.len() as u16
-                        } else {
-                            cogs[0].index.full_res().samples_per_pixel
-                        };
-                        let is_u8 = cogs[0].index.full_res().sample_type
-                            == cogzilla_tiff::SampleType::Uint8;
-                        let (treq, ct) =
-                            build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
-                        let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                        Ok((data, ct))
                     })
                     .await
                     .map(|t| (t.bytes, t.content_type))
@@ -2162,7 +2149,7 @@ where
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
-                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                    apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
@@ -2187,7 +2174,7 @@ where
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
-                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                    apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
@@ -2217,7 +2204,7 @@ where
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
-                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                    apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
@@ -2248,7 +2235,7 @@ where
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
-                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                    apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
@@ -2275,7 +2262,7 @@ where
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
-                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                    apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
@@ -2302,7 +2289,7 @@ where
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
-                    apply_unscale(&mut bands, &cogs[0].index.scales, &cogs[0].index.offsets);
+                    apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
@@ -2345,11 +2332,14 @@ fn cache_control_header() -> &'static HeaderValue {
 
 /// Fast, deterministic FNV-1a 64-bit strong ETag for rendered tile bytes.
 fn compute_etag(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    // Deterministic fixed-seed ahash (~20-30x faster than byte-at-a-time FNV-1a on large tiles)
+    let hasher = ahash::RandomState::with_seeds(
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+        0xa409_3822_299f_31d0,
+        0x082e_fa98_ec4e_6c89,
+    );
+    let h = hasher.hash_one(bytes);
     format!("W/\"cgz-{h:016x}-{}\"", bytes.len())
 }
 

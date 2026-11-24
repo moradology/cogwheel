@@ -28,6 +28,8 @@ pub struct ExprProgram {
     pub ops: Vec<Op>,
     /// Unique 1-based band indices referenced by the expression, in slot order `0..used_bands.len()`.
     pub used_bands: Vec<u16>,
+    /// Peak VM stack depth computed at compile time (<= 32).
+    pub max_depth: u8,
 }
 
 const MAX_PARSE_DEPTH: usize = 64;
@@ -80,6 +82,7 @@ impl ExprProgram {
         Ok(Self {
             ops: p.ops,
             used_bands: p.used_bands,
+            max_depth: max_depth as u8,
         })
     }
 
@@ -199,29 +202,11 @@ impl ExprProgram {
     }
 
     /// Scanline-vectorized bytecode VM evaluation across `N` contiguous pixels (`[f32; N]`).
-    /// Each bytecode op runs a tight `0..N` slice loop that LLVM auto-vectorizes into
-    /// NEON/AVX2 FMA instructions, eliminating per-pixel VM dispatch overhead (4–8× faster).
+    /// Uses a compact 4-slot stack when `max_depth <= 4` (NDVI, NDWI, EVI, etc. — 4× less stack
+    /// zeroing per scanline), falling back to 16 slots for deeper expressions.
     pub fn eval_row<const N: usize>(&self, band_rows: &[[f32; N]], out: &mut [f32; N]) {
         const MAX_STACK: usize = 16;
-        // Guard against pathologically deep expressions (>16 nested stack slots)
-        let mut max_depth = 0usize;
-        let mut depth = 0usize;
-        for &op in &self.ops {
-            match op {
-                Op::PushConst(_) | Op::LoadBand(_) => {
-                    depth += 1;
-                    max_depth = max_depth.max(depth);
-                }
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Pow | Op::Min | Op::Max => {
-                    depth = depth.saturating_sub(1);
-                }
-                Op::Clip => {
-                    depth = depth.saturating_sub(2);
-                }
-                _ => {}
-            }
-        }
-        if max_depth > MAX_STACK || self.ops.is_empty() {
+        if (self.max_depth as usize) > MAX_STACK || self.ops.is_empty() {
             let mut vals = [0.0f32; 16];
             let nb = band_rows.len().min(16);
             for px in 0..N {
@@ -232,8 +217,22 @@ impl ExprProgram {
             }
             return;
         }
+        if self.max_depth <= 4 {
+            let mut stack = [[0.0f32; N]; 4];
+            self.eval_row_with_stack(band_rows, &mut stack, out);
+        } else {
+            let mut stack = [[0.0f32; N]; MAX_STACK];
+            self.eval_row_with_stack(band_rows, &mut stack, out);
+        }
+    }
 
-        let mut stack = [[0.0f32; N]; MAX_STACK];
+    #[inline(always)]
+    fn eval_row_with_stack<const N: usize, const S: usize>(
+        &self,
+        band_rows: &[[f32; N]],
+        stack: &mut [[f32; N]; S],
+        out: &mut [f32; N],
+    ) {
         let mut sp = 0usize;
 
         for &op in &self.ops {

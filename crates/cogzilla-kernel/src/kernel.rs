@@ -600,7 +600,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
     src: &BandSource<'_>,
     style: &SingleBandStyle,
 ) -> Bytes {
-    let range = (style.rescale_max - style.rescale_min).max(1e-12);
+    let range = safe_rescale_denom(style.rescale_min, style.rescale_max);
     let inv_range = 255.0 / range;
     let min_val = style.rescale_min;
 
@@ -1452,9 +1452,9 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
     style: &RgbStyle,
 ) -> Bytes {
     let inv = [
-        255.0 / (style.rescale_max[0] - style.rescale_min[0]).max(1e-12),
-        255.0 / (style.rescale_max[1] - style.rescale_min[1]).max(1e-12),
-        255.0 / (style.rescale_max[2] - style.rescale_min[2]).max(1e-12),
+        255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
+        255.0 / safe_rescale_denom(style.rescale_min[1], style.rescale_max[1]),
+        255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
 
@@ -1646,9 +1646,9 @@ fn render_rgb_cubic<const N: usize>(
     style: &RgbStyle,
 ) -> Bytes {
     let inv = [
-        255.0 / (style.rescale_max[0] - style.rescale_min[0]).max(1e-12),
-        255.0 / (style.rescale_max[1] - style.rescale_min[1]).max(1e-12),
-        255.0 / (style.rescale_max[2] - style.rescale_min[2]).max(1e-12),
+        255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
+        255.0 / safe_rescale_denom(style.rescale_min[1], style.rescale_max[1]),
+        255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
     match style.format {
@@ -1738,7 +1738,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
     style: &SingleBandStyle,
     eval_uv: F,
 ) -> Bytes {
-    let range = (style.rescale_max - style.rescale_min).max(1e-12);
+    let range = safe_rescale_denom(style.rescale_min, style.rescale_max);
     let inv_range = 255.0 / range;
     let min_val = style.rescale_min;
 
@@ -1875,9 +1875,9 @@ pub fn render_sar_rgb<const N: usize>(
         && srcs[1].is_clean_inbounds(c0, c1, r0, r1);
 
     let inv = [
-        255.0 / (style.rescale_max[0] - style.rescale_min[0]).max(1e-12),
-        255.0 / (style.rescale_max[1] - style.rescale_min[1]).max(1e-12),
-        255.0 / (style.rescale_max[2] - style.rescale_min[2]).max(1e-12),
+        255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
+        255.0 / safe_rescale_denom(style.rescale_min[1], style.rescale_max[1]),
+        255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
     let bilinear = style.resample == ResampleMode::Bilinear;
@@ -2127,7 +2127,7 @@ pub fn render_expr_vm<const N: usize>(
     let nb = srcs.len().min(16);
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let all_clean = plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
-    let range = (style.rescale_max - style.rescale_min).max(1e-12);
+    let range = safe_rescale_denom(style.rescale_min, style.rescale_max);
     let inv_range = 255.0 / range;
     let inv_range_254 = 254.0 / range;
     let min_val = style.rescale_min;
@@ -2305,7 +2305,8 @@ pub fn render_terrain_tile<const N: usize>(
     format: OutputFormat,
 ) -> Bytes {
     if src.all_nodata {
-        return empty_tile_bytes(N as u32, format, 3);
+        let nb = if format == OutputFormat::RawF32 { 1 } else { 3 };
+        return empty_tile_bytes(N as u32, format, nb);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
@@ -2394,22 +2395,49 @@ pub fn render_terrain_tile<const N: usize>(
             out.freeze()
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
-            let mut rgba = vec![0u8; N * N * 4];
-            for py in 0..N {
-                let row_off = py * N * 4;
-                for_each_pixel_in_row(plan, py, |px, u, v| {
-                    let elev = sample_px(u, v);
-                    let off = row_off + px * 4;
-                    if !elev.is_nan() {
-                        let [r, g, b] = encode_px(elev);
-                        rgba[off] = r;
-                        rgba[off + 1] = g;
-                        rgba[off + 2] = b;
-                        rgba[off + 3] = 255;
+            SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let sc = &mut *guard;
+                let total = N * N * 4;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                let rgba = &mut sc.img_buf[..total];
+                if clean {
+                    for py in 0..N {
+                        let row_off = py * N * 4;
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let [r, g, b] = encode_px(sample_px(u, v));
+                            let off = row_off + px * 4;
+                            rgba[off] = r;
+                            rgba[off + 1] = g;
+                            rgba[off + 2] = b;
+                            rgba[off + 3] = 255;
+                        });
                     }
-                });
-            }
-            encode_rgba_tile(&rgba, N as u32, clean, format)
+                } else {
+                    for py in 0..N {
+                        let row_off = py * N * 4;
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let elev = sample_px(u, v);
+                            let off = row_off + px * 4;
+                            if elev.is_nan() {
+                                rgba[off] = 0;
+                                rgba[off + 1] = 0;
+                                rgba[off + 2] = 0;
+                                rgba[off + 3] = 0;
+                            } else {
+                                let [r, g, b] = encode_px(elev);
+                                rgba[off] = r;
+                                rgba[off + 1] = g;
+                                rgba[off + 2] = b;
+                                rgba[off + 3] = 255;
+                            }
+                        });
+                    }
+                }
+                encode_rgba_tile(rgba, N as u32, clean, format)
+            })
         }
     }
 }
@@ -2429,9 +2457,17 @@ pub enum DemAlgorithm {
     Aspect,
 }
 
+/// Rescale denominator preserving sign for inverted stretches (`?rescale=255,0`) and negative
+/// GDAL `scale` (`?unscale=true`), while avoiding division by zero on degenerate `min == max`.
+#[inline(always)]
+pub fn safe_rescale_denom(min: f32, max: f32) -> f32 {
+    let d = max - min;
+    if d.abs() < 1e-12 { 1e-12 } else { d }
+}
+
 /// Evaluate a 3×3 Horn stencil centered at `(z_nw..z_se)` with ground spacing `pixel_size_m`.
 #[inline(always)]
-fn eval_horn_3x3(
+pub fn eval_horn_3x3(
     z_nw: f32,
     z_n: f32,
     z_ne: f32,
@@ -2784,7 +2820,7 @@ pub fn render_dem_algorithm<const N: usize>(
         );
 
         let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
-        let inv_range = 255.0 / (style.rescale_max - style.rescale_min).max(1e-12);
+        let inv_range = 255.0 / safe_rescale_denom(style.rescale_min, style.rescale_max);
         let min_val = style.rescale_min;
         let lut = style.colormap.lut();
 

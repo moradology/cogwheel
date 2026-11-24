@@ -1618,9 +1618,47 @@ pub async fn render_wgs84_bbox(
         if format == OutputFormat::RawF32 {
             let mut out = BytesMut::with_capacity(w * h * 4);
             match bands {
+                BandRequest::Dem {
+                    band_1based,
+                    algorithm,
+                    ..
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let mut elev = vec![f32::NAN; w * h];
+                    for i in 0..(w * h) {
+                        elev[i] = sample(&src, u_map[i], v_map[i]);
+                    }
+                    let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                    let px_m = ((dlx * 111_320.0 * lat_rad.cos()).abs()
+                        .max((dly * 111_320.0).abs()))
+                        .max(1e-3) as f32;
+                    let inv_8dx = 1.0 / (8.0 * px_m);
+                    for py in 0..h {
+                        let ym = py.saturating_sub(1);
+                        let yp = (py + 1).min(h - 1);
+                        for px in 0..w {
+                            let xm = px.saturating_sub(1);
+                            let xp = (px + 1).min(w - 1);
+                            let val = cogzilla_kernel::eval_horn_3x3(
+                                elev[ym * w + xm],
+                                elev[ym * w + px],
+                                elev[ym * w + xp],
+                                elev[py * w + xm],
+                                elev[py * w + px],
+                                elev[py * w + xp],
+                                elev[yp * w + xm],
+                                elev[yp * w + px],
+                                elev[yp * w + xp],
+                                inv_8dx,
+                                *algorithm,
+                            );
+                            out.put_slice(&val.to_le_bytes());
+                        }
+                    }
+                }
                 BandRequest::Single { band_1based, .. }
-                | BandRequest::Terrain { band_1based, .. }
-                | BandRequest::Dem { band_1based, .. } => {
+                | BandRequest::Terrain { band_1based, .. } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
                     for i in 0..(w * h) {
@@ -1715,7 +1753,7 @@ pub async fn render_wgs84_bbox(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs).with_nodata_override(nodata_override);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let v = sample(&src, u_map[i], v_map[i]);
                     if !v.is_nan() {
@@ -1754,23 +1792,51 @@ pub async fn render_wgs84_bbox(
             }
             BandRequest::Dem {
                 band_1based,
+                algorithm,
                 rescale,
                 colormap,
-                ..
             } => {
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs).with_nodata_override(nodata_override);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
+                let mut elev = vec![f32::NAN; w * h];
                 for i in 0..(w * h) {
-                    let v = sample(&src, u_map[i], v_map[i]);
-                    if !v.is_nan() {
-                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let c = lut.rgb[idx];
-                        rgba[i * 4] = c[0];
-                        rgba[i * 4 + 1] = c[1];
-                        rgba[i * 4 + 2] = c[2];
-                        rgba[i * 4 + 3] = 255;
+                    elev[i] = sample(&src, u_map[i], v_map[i]);
+                }
+                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                let px_m = ((dlx * 111_320.0 * lat_rad.cos()).abs()
+                    .max((dly * 111_320.0).abs()))
+                    .max(1e-3) as f32;
+                let inv_8dx = 1.0 / (8.0 * px_m);
+                for py in 0..h {
+                    let ym = py.saturating_sub(1);
+                    let yp = (py + 1).min(h - 1);
+                    for px in 0..w {
+                        let xm = px.saturating_sub(1);
+                        let xp = (px + 1).min(w - 1);
+                        let v = cogzilla_kernel::eval_horn_3x3(
+                            elev[ym * w + xm],
+                            elev[ym * w + px],
+                            elev[ym * w + xp],
+                            elev[py * w + xm],
+                            elev[py * w + px],
+                            elev[py * w + xp],
+                            elev[yp * w + xm],
+                            elev[yp * w + px],
+                            elev[yp * w + xp],
+                            inv_8dx,
+                            *algorithm,
+                        );
+                        if !v.is_nan() {
+                            let i = py * w + px;
+                            let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                            let c = lut.rgb[idx];
+                            rgba[i * 4] = c[0];
+                            rgba[i * 4 + 1] = c[1];
+                            rgba[i * 4 + 2] = c[2];
+                            rgba[i * 4 + 3] = 255;
+                        }
                     }
                 }
             }
@@ -1786,9 +1852,9 @@ pub async fn render_wgs84_bbox(
                 let s1 = make_src!(&r1);
                 let s2 = make_src!(&r2);
                 let inv = [
-                    255.0 / (rescale_max[0] - rescale_min[0]).max(1e-12),
-                    255.0 / (rescale_max[1] - rescale_min[1]).max(1e-12),
-                    255.0 / (rescale_max[2] - rescale_min[2]).max(1e-12),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[0], rescale_max[0]),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
                 for i in 0..(w * h) {
                     let r = sample(&s0, u_map[i], v_map[i]);
@@ -1812,9 +1878,9 @@ pub async fn render_wgs84_bbox(
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
                 let inv = [
-                    255.0 / (rescale_max[0] - rescale_min[0]).max(1e-12),
-                    255.0 / (rescale_max[1] - rescale_min[1]).max(1e-12),
-                    255.0 / (rescale_max[2] - rescale_min[2]).max(1e-12),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[0], rescale_max[0]),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
                 for i in 0..(w * h) {
                     let vv = fast_db_from_power(sample(&s0, u_map[i], v_map[i]));
@@ -1840,7 +1906,7 @@ pub async fn render_wgs84_bbox(
                     .collect();
                 let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let mut vals = [0.0f32; 16];
                 let nb = srcs.len().min(16);
                 for i in 0..(w * h) {
@@ -1867,7 +1933,7 @@ pub async fn render_wgs84_bbox(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs).with_nodata_override(nodata_override);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
                     if !v.is_nan() {
@@ -1891,7 +1957,7 @@ pub async fn render_wgs84_bbox(
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let a = sample(&s0, u_map[i], v_map[i]);
                     let b = sample(&s1, u_map[i], v_map[i]);
@@ -1923,7 +1989,7 @@ pub async fn render_wgs84_bbox(
                 let s1 = make_src!(&r1);
                 let s2 = make_src!(&r2);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
-                let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
+                let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let a = sample(&s0, u_map[i], v_map[i]);
                     let b = sample(&s1, u_map[i], v_map[i]);
