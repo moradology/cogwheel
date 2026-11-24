@@ -1,0 +1,75 @@
+# Reference stack for the pgSTAC baseline: a pgSTAC database and the stock
+# titiler-pgstac server, pinned to the versions cogzilla's pgSTAC work targets.
+#
+#   docker compose -f benches/pgstac/docker-compose.yml up -d
+#   benches/.venv/bin/python benches/pgstac_load.py
+#   benches/.venv/bin/python benches/pgstac_baseline.py
+#
+# titiler-pgstac runs one worker by default so repeated requests deterministically hit
+# its per-process asset-list cache; set TITILER_WORKERS for throughput runs.
+#
+# The credentials below are throwaway values for this local, loopback-only stack.
+name: cogzilla-pgstac
+
+services:
+  database:
+    image: ghcr.io/stac-utils/pgstac:v0.10.2
+    environment:
+      POSTGRES_USER: username
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: postgis
+      PGUSER: username
+      PGPASSWORD: password
+      PGDATABASE: postgis
+    ports:
+      - "127.0.0.1:${PGSTAC_PORT:-5439}:5432"
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c work_mem=64MB
+      -c effective_cache_size=3GB
+      -c random_page_cost=1.1
+      -c max_connections=100
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U username -d postgis && psql -U username -d postgis -tAc 'SELECT pgstac.get_version()'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  titiler-pgstac:
+    image: ghcr.io/stac-utils/titiler-pgstac:3.2.2
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      PGUSER: username
+      PGPASSWORD: password
+      PGHOST: database
+      PGPORT: "5432"
+      PGDATABASE: postgis
+      DB_MIN_CONN_SIZE: "1"
+      DB_MAX_CONN_SIZE: "10"
+      # GDAL tuned per TiTiler's own guidance for remote COGs.
+      AWS_NO_SIGN_REQUEST: "YES"
+      CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ".tif,.TIF,.tiff"
+      GDAL_CACHEMAX: "200"
+      GDAL_DISABLE_READDIR_ON_OPEN: "EMPTY_DIR"
+      GDAL_INGESTED_BYTES_AT_OPEN: "32768"
+      GDAL_HTTP_MERGE_CONSECUTIVE_RANGES: "YES"
+      GDAL_HTTP_MULTIPLEX: "YES"
+      GDAL_HTTP_VERSION: "2"
+      VSI_CACHE: "TRUE"
+      VSI_CACHE_SIZE: "536870912"
+      MOSAIC_CONCURRENCY: "${MOSAIC_CONCURRENCY:-10}"
+    ports:
+      - "127.0.0.1:${TITILER_PGSTAC_PORT:-18821}:8081"
+    command: >
+      uvicorn titiler.pgstac.main:app
+      --host 0.0.0.0 --port 8081
+      --workers ${TITILER_WORKERS:-1}
+      --log-level warning
+
+volumes:
+  pgdata:
