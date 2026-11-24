@@ -20,6 +20,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
 mod pgstac;
+mod point_expr;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
@@ -1454,7 +1455,14 @@ where
     let segs = item_rest.unwrap_or(segs);
 
     if let Err(msg) = validate_query(&segs, &pq) {
-        return Ok(plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain"));
+        if pgstac_item.is_none() {
+            return Ok(plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain"));
+        }
+        // Item routes answer in JSON, and do band math on point values themselves.
+        let point_math = segs.get(1) == Some(&"point") && msg.contains("'expression'");
+        if !point_math {
+            return Ok(pgstac::bad_request(msg));
+        }
     }
 
     // titiler-pgstac's routes: /searches/... and /collections/...
@@ -2776,14 +2784,16 @@ where
             return Ok(match res {
                 Err(e) => pgstac::engine_error(&e),
                 Ok((body, ct)) => {
-                    let fixed = pgstac::item_fixup(
+                    match pgstac::item_fixup(
                         &segs[1..],
                         pgstac_item_extent.as_ref(),
                         &raw_query,
                         body,
                         ct,
-                    );
-                    to_http_response(&engine, Ok(fixed), if_none_match.as_deref())
+                    ) {
+                        Ok(fixed) => to_http_response(&engine, Ok(fixed), if_none_match.as_deref()),
+                        Err(resp) => resp,
+                    }
                 }
             });
         }

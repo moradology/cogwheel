@@ -111,6 +111,11 @@ fn db_error(err: &PgStacError) -> Resp {
     }
 }
 
+/// A `400` in titiler-pgstac's error shape.
+pub(super) fn bad_request(message: String) -> Resp {
+    detail(StatusCode::BAD_REQUEST, message)
+}
+
 pub(super) fn engine_error(err: &EngineError) -> Resp {
     match err {
         EngineError::Shared(inner) => engine_error(inner),
@@ -539,7 +544,8 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 }
 
 /// The pgSTAC routes: path, method and summary.
-const OPENAPI_ROUTES: [(&str, &str, &str); 44] = [
+const OPENAPI_ROUTES: [(&str, &str, &str); 45] = [
+    ("/collections/{collection_id}/items/{item_id}/renders/{render_id}", "get", "One of a pgSTAC item's renders"),
     ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC search mosaic over a bounding box"),
     ("/searches/{search_id}/feature.{format}", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature"),
     ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC collection mosaic over a bounding box"),
@@ -1584,6 +1590,21 @@ async fn feature_image(
     part_image(ctx, pg, hash, &geometry, bbox, Some(&mask), size, ext, pq, pairs).await
 }
 
+/// Turn the stacked band values of a point into the results of `expression`, with the
+/// names and descriptions TiTiler gives them.
+#[allow(clippy::type_complexity)]
+fn point_expression(
+    expression: &str,
+    values: &[Value],
+    descriptions: &[String],
+) -> Result<(Vec<Value>, Vec<String>, Vec<String>), String> {
+    let numbers: Vec<Option<f64>> = values.iter().map(Value::as_f64).collect();
+    let (results, described) = super::point_expr::apply(expression, &numbers, descriptions)?;
+    let names = (1..=results.len()).map(|i| format!("b{i}")).collect();
+    let values = results.into_iter().map(|v| v.map_or(Value::Null, |v| json!(v))).collect();
+    Ok((values, names, described))
+}
+
 /// How many items of a point query are read at once.
 const POINT_ITEMS_IN_FLIGHT: usize = 8;
 
@@ -1616,14 +1637,13 @@ async fn point_values(
             "per-asset options (assets=name|bidx=...|expression=...) are not supported yet",
         );
     }
-    for unsupported in ["expression", "asset_as_band"] {
-        if query_value(pairs, unsupported).is_some() {
-            return detail(
-                StatusCode::BAD_REQUEST,
-                format!("parameter '{unsupported}' is not supported on pgSTAC point routes yet"),
-            );
-        }
+    if query_value(pairs, "asset_as_band").is_some() {
+        return detail(
+            StatusCode::BAD_REQUEST,
+            "parameter 'asset_as_band' is not supported on pgSTAC point routes yet",
+        );
     }
+    let expression = query_value(pairs, "expression").map(str::to_string);
     let (lon, lat) = if pq.coord_crs_3857 {
         mercator_to_lonlat_deg(x, y)
     } else {
@@ -1671,6 +1691,7 @@ async fn point_values(
     for (idx, (name, hrefs)) in jobs.into_iter().enumerate() {
         let engine = ctx.engine.clone();
         let gate = gate.clone();
+        let expression = expression.clone();
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
             let mut values = Vec::new();
@@ -1688,7 +1709,12 @@ async fn point_values(
                     descriptions.push(format!("{asset}_b{}", i + 1));
                 }
             }
-            let band_names: Vec<String> = (1..=values.len()).map(|i| format!("b{i}")).collect();
+            let mut band_names: Vec<String> = (1..=values.len()).map(|i| format!("b{i}")).collect();
+            if let Some(expression) = &expression {
+                (values, band_names, descriptions) =
+                    point_expression(expression, &values, &descriptions)
+                        .map_err(EngineError::BadRequest)?;
+            }
             let entry = json!({
                 "name": name,
                 "values": values,
@@ -2029,20 +2055,20 @@ pub(super) fn item_fixup(
     raw_query: &str,
     body: Bytes,
     content_type: &'static str,
-) -> (Bytes, &'static str) {
+) -> Result<(Bytes, &'static str), Resp> {
     // TiTiler names the media type after the extension that was asked for.
     if let ["tiles", .., last] = sub
         && last.ends_with(".jpg")
         && content_type == "image/jpeg"
     {
-        return (body, "image/jpg");
+        return Ok((body, "image/jpg"));
     }
     let wants_json = matches!(sub, ["info" | "info.geojson"] | ["point", _] | [_, "tilejson.json"]);
     if !wants_json {
-        return (body, content_type);
+        return Ok((body, content_type));
     }
     let Ok(mut doc) = serde_json::from_slice::<Value>(&body) else {
-        return (body, content_type);
+        return Ok((body, content_type));
     };
     // Per-asset fields the `/stac` routes add and titiler-pgstac does not have.
     let strip = |assets: Option<&mut serde_json::Map<String, Value>>| {
@@ -2074,6 +2100,25 @@ pub(super) fn item_fixup(
                     *name = json!(format!("b{}", i + 1));
                 }
             }
+            // The `/stac` handler returns the bands as they are; band math is applied here.
+            let pairs = query_pairs(raw_query);
+            if let Some(expression) = query_value(&pairs, "expression") {
+                let values = doc["values"].as_array().cloned().unwrap_or_default();
+                let descriptions: Vec<String> = doc["band_descriptions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|d| d.as_str().map(str::to_string))
+                    .collect();
+                match point_expression(expression, &values, &descriptions) {
+                    Ok((values, names, described)) => {
+                        doc["values"] = json!(values);
+                        doc["band_names"] = json!(names);
+                        doc["band_descriptions"] = json!(described);
+                    }
+                    Err(message) => return Err(detail(StatusCode::BAD_REQUEST, message)),
+                }
+            }
         }
         [_, "tilejson.json"] => {
             if let Some(e) = extent {
@@ -2092,7 +2137,7 @@ pub(super) fn item_fixup(
         }
         _ => {}
     }
-    (Bytes::from(doc.to_string()), content_type)
+    Ok((Bytes::from(doc.to_string()), content_type))
 }
 
 /// The asset media types rio-tiler reads by default. An asset with no type is taken too.
@@ -2126,6 +2171,107 @@ fn readable_assets(item: &Value) -> Vec<String> {
         .collect();
     jsonb_key_order(&mut names);
     names
+}
+
+/// Python's `urlencode(obj, doseq=True)` over a JSON object, keys in jsonb order.
+fn urlencode_doseq(obj: &serde_json::Map<String, Value>) -> String {
+    let mut keys: Vec<String> = obj.keys().cloned().collect();
+    jsonb_key_order(&mut keys);
+    let mut out = Vec::new();
+    for k in keys {
+        match &obj[&k] {
+            Value::Array(items) => {
+                out.extend(items.iter().map(|i| format!("{}={}", quote_plus(&k), quote_plus(&py_str(i)))));
+            }
+            other => out.push(format!("{}={}", quote_plus(&k), quote_plus(&py_str(other)))),
+        }
+    }
+    out.join("&")
+}
+
+/// One of an item's STAC renders, the way TiTiler presents it.
+struct ItemRender {
+    name: String,
+    /// The render with `asset_bidx` and `asset_expression` folded into the asset names.
+    params: serde_json::Map<String, Value>,
+    /// Whether it can make a tile request: it has to name assets.
+    valid: bool,
+}
+
+/// The renders in an item's properties, in jsonb key order.
+fn item_renders(item: &Value) -> Vec<ItemRender> {
+    let Some(renders) = item.pointer("/properties/renders").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let as_list = |v: &Value| match v {
+        Value::Array(a) => a.clone(),
+        other => vec![other.clone()],
+    };
+    let mut names: Vec<String> = renders.keys().cloned().collect();
+    jsonb_key_order(&mut names);
+    let mut out = Vec::new();
+    for name in names {
+        let Some(render) = renders[&name].as_object() else {
+            continue;
+        };
+        let mut params = render.clone();
+        let assets: Vec<String> = match params.get("assets") {
+            Some(v) if py_truthy(v) => as_list(v).iter().map(py_str).collect(),
+            _ => Vec::new(),
+        };
+        if !assets.is_empty() {
+            let mut options: Vec<Vec<String>> = vec![Vec::new(); assets.len()];
+            for (key, label) in [("asset_bidx", "bidx"), ("asset_expression", "expression")] {
+                let Some(value) = params.remove(key) else {
+                    continue;
+                };
+                for entry in as_list(&value) {
+                    let entry = py_str(&entry);
+                    if let Some((asset, opt)) = entry.split_once('|')
+                        && let Some(i) = assets.iter().position(|a| a == asset)
+                    {
+                        options[i].push(format!("{label}={opt}"));
+                    }
+                }
+            }
+            let merged: Vec<Value> = assets
+                .iter()
+                .zip(&options)
+                .map(|(a, o)| if o.is_empty() { json!(a) } else { json!(format!("{a}|{}", o.join("|"))) })
+                .collect();
+            params.insert("assets".into(), Value::Array(merged));
+        }
+        out.push(ItemRender { name, params, valid: !assets.is_empty() });
+    }
+    out
+}
+
+/// A render as `GET {base}/renders/{id}` returns it. TiTiler puts the item into every link
+/// as `url=`, and for an item read from pgSTAC that is its Python name, `<Item id=...>`.
+fn item_render_json(host: &str, base: &str, item_id: &str, render: &ItemRender) -> Value {
+    let url = format!("url={}", quote_plus(&format!("<Item id={item_id}>")));
+    let mut links = vec![json!({
+        "href": format!("{host}{base}/renders/{}?{url}", render.name),
+        "rel": "self",
+        "type": "application/json",
+        "title": format!("STAC Renders metadata for {}", render.name)
+    })];
+    if render.valid {
+        let qs = urlencode_doseq(&render.params);
+        links.push(json!({
+            "href": format!("{host}{base}/%7BtileMatrixSetId%7D/tilejson.json?{url}&{qs}"),
+            "rel": "tilesets-map",
+            "templated": true,
+            "title": format!("tilejson file for {}", render.name)
+        }));
+        links.push(json!({
+            "href": format!("{host}{base}/WMTSCapabilities.xml?{url}&{qs}"),
+            "rel": "tilesets-map",
+            "templated": true,
+            "title": format!("WMTS service for {}", render.name)
+        }));
+    }
+    json!({ "valid": render.valid, "params": render.params, "links": links })
 }
 
 /// Routes of the item family that titiler-pgstac refuses without `assets`.
@@ -2187,22 +2333,26 @@ pub(super) async fn item_route(
     match rest {
         ["assets"] if get => return Done(json_resp(StatusCode::OK, &json!(readable))),
         ["renders"] if get => {
-            let renders = doc.pointer("/properties/renders").and_then(Value::as_object);
-            if renders.is_some_and(|r| !r.is_empty()) {
-                return Done(detail(
-                    StatusCode::BAD_REQUEST,
-                    "items with STAC renders are not supported on this route yet",
-                ));
-            }
+            let renders: serde_json::Map<String, Value> = item_renders(&doc)
+                .iter()
+                .map(|r| (r.name.clone(), item_render_json(ctx.host, &base, &item_id, r)))
+                .collect();
             return Done(json_resp(
                 StatusCode::OK,
-                &json!({ "renders": {}, "links": [{
+                &json!({ "renders": renders, "links": [{
                     "href": format!("{}{base}/renders", ctx.host),
                     "rel": "self",
                     "type": "application/json",
                     "title": "List STAC Renders metadata"
                 }]}),
             ));
+        }
+        ["renders", render_id] if get => {
+            let wanted = percent_decode(render_id);
+            return Done(match item_renders(&doc).iter().find(|r| r.name == wanted) {
+                Some(r) => json_resp(StatusCode::OK, &item_render_json(ctx.host, &base, &item_id, r)),
+                None => detail(StatusCode::NOT_FOUND, "Render not found"),
+            });
         }
         ["WMTSCapabilities.xml"] if get => {
             let extent = match item_extent(ctx, &doc, &item, &readable, pq).await {
@@ -2214,7 +2364,12 @@ pub(super) async fn item_route(
                 bounds: extent.wgs84,
                 minzoom: extent.minzoom,
                 maxzoom: extent.maxzoom,
-                default_layers: Vec::new(),
+                // Each render that can make a tile is a layer.
+                default_layers: item_renders(&doc)
+                    .into_iter()
+                    .filter(|r| r.valid)
+                    .map(|r| (r.name, urlencode_doseq(&r.params)))
+                    .collect(),
             };
             return Done(wmts(ctx, &base, source, &pairs));
         }
@@ -2764,7 +2919,8 @@ mod tests {
     fn item_answers_are_reshaped_like_titiler_pgstac() {
         let extent = ItemExtent { wgs84: [5.0, 43.0, 7.0, 44.0], mercator: None, minzoom: 7, maxzoom: 13 };
         let fix = |sub: &[&str], query: &str, body: Value| {
-            let (bytes, _) = item_fixup(sub, Some(&extent), query, Bytes::from(body.to_string()), "application/json");
+            let (bytes, _) =
+                item_fixup(sub, Some(&extent), query, Bytes::from(body.to_string()), "application/json").unwrap();
             serde_json::from_slice::<Value>(&bytes).unwrap()
         };
         let info = json!({ "visual": { "dtype": "uint8", "minzoom": 9, "maxzoom": 14, "wgs84_bounds": [1, 2, 3, 4] } });
@@ -2787,9 +2943,9 @@ mod tests {
         assert_eq!((&fixed["minzoom"], &fixed["maxzoom"]), (&json!(9), &json!(13)));
 
         // Tiles are passed through; only the media type of `.jpg` changes.
-        let jpg = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.jpg"], None, "", Bytes::from_static(b"x"), "image/jpeg");
+        let jpg = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.jpg"], None, "", Bytes::from_static(b"x"), "image/jpeg").unwrap();
         assert_eq!(jpg.1, "image/jpg");
-        let png = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.png"], None, "", Bytes::from_static(b"x"), "image/png");
+        let png = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.png"], None, "", Bytes::from_static(b"x"), "image/png").unwrap();
         assert_eq!((png.0.as_ref(), png.1), (b"x".as_ref(), "image/png"));
 
         assert!(item_route_needs_assets(&["info"]));
@@ -2888,6 +3044,70 @@ mod tests {
         assert_eq!(part_size_from_query(&query_pairs("max_size=64")).unwrap(), query(Some(64), None, None));
         assert!(part_size_from_query(&query_pairs("width=wide")).is_err());
         assert!(part_size_from_query(&query_pairs("height=0")).is_err());
+    }
+
+    #[test]
+    fn item_renders_are_presented_like_titiler() {
+        let item = json!({ "properties": { "renders": {
+            "ndvi": { "title": "NDVI", "assets": ["red", "nir"], "expression": "(nir-red)/(nir+red)",
+                      "rescale": [[-1, 1]], "colormap_name": "viridis" },
+            "one_band": { "assets": ["red"], "asset_bidx": ["red|1"], "minmax_zoom": [8, 12] },
+            "no_assets": { "expression": "b1*2" },
+            "rgb": { "assets": "visual" }
+        }}});
+        let renders = item_renders(&item);
+        // jsonb key order; a single asset name is a list of one.
+        let names: Vec<&str> = renders.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["rgb", "ndvi", "one_band", "no_assets"]);
+        assert_eq!(renders[0].params["assets"], json!(["visual"]));
+        assert_eq!(renders[2].params["assets"], json!(["red|bidx=1"]));
+        assert!(renders[2].params.get("asset_bidx").is_none());
+        assert!(!renders[3].valid && renders[1].valid);
+
+        // The query string is Python's urlencode of the render, lists repeated.
+        assert_eq!(
+            urlencode_doseq(&renders[1].params),
+            "title=NDVI&assets=red&assets=nir&rescale=%5B-1%2C+1%5D&expression=%28nir-red%29%2F%28nir%2Bred%29&colormap_name=viridis"
+        );
+        assert_eq!(urlencode_doseq(&renders[2].params), "assets=red%7Cbidx%3D1&minmax_zoom=8&minmax_zoom=12");
+
+        let doc = item_render_json("http://h", "/collections/c/items/i", "i", &renders[1]);
+        assert_eq!(doc["valid"], true);
+        assert_eq!(doc["links"][0]["href"], "http://h/collections/c/items/i/renders/ndvi?url=%3CItem+id%3Di%3E");
+        assert_eq!(doc["links"][1]["rel"], "tilesets-map");
+        assert!(doc["links"][1]["href"].as_str().unwrap().starts_with(
+            "http://h/collections/c/items/i/%7BtileMatrixSetId%7D/tilejson.json?url=%3CItem+id%3Di%3E&title=NDVI&"
+        ));
+        assert!(doc["links"][2]["href"].as_str().unwrap().contains("/WMTSCapabilities.xml?url="));
+        // A render that cannot make a tile has only its own link.
+        let doc = item_render_json("http://h", "/collections/c/items/i", "i", &renders[3]);
+        assert_eq!((doc["valid"].clone(), doc["links"].as_array().unwrap().len()), (json!(false), 1));
+        assert!(item_renders(&json!({ "properties": {} })).is_empty());
+    }
+
+    #[test]
+    fn point_values_take_band_math() {
+        let values = [json!(1060.0), json!(2386.0)];
+        let names = ["red_b1".to_string(), "nir_b1".to_string()];
+        let (v, band_names, described) = point_expression("(b2-b1)/(b2+b1);b1*2", &values, &names).unwrap();
+        assert_eq!(v, [json!(0.3847939640162507), json!(2120.0)]);
+        assert_eq!(band_names, ["b1", "b2"]);
+        assert_eq!(described, ["(nir_b1-red_b1)/(nir_b1+red_b1)", "red_b1*2"]);
+        // A band without a value gives an empty result, and asset names are not band names.
+        let (v, _, _) = point_expression("b1+b2", &[Value::Null, json!(1.0)], &names).unwrap();
+        assert_eq!(v, [Value::Null]);
+        assert_eq!(point_expression("nir-red", &values, &names).unwrap_err(), "Invalid band/asset name 'nir'");
+
+        // On item routes the expression is applied to the `/stac` handler's answer.
+        let body = json!({ "coordinates": [1.0, 2.0], "values": [1060.0, 2386.0],
+                           "band_names": ["red_b1", "nir_b1"], "band_descriptions": ["red_b1", "nir_b1"] });
+        let fix = |query: &str| item_fixup(&["point", "1,2"], None, query, Bytes::from(body.to_string()), "application/json");
+        let (bytes, _) = fix("assets=red&assets=nir&expression=b2-b1").unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["values"], json!([1326.0]));
+        assert_eq!(doc["band_names"], json!(["b1"]));
+        assert_eq!(doc["band_descriptions"], json!(["nir_b1-red_b1"]));
+        assert_eq!(fix("assets=red&expression=nope").unwrap_err().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
