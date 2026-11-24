@@ -51,6 +51,10 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
     if href.starts_with("http://")
         || href.starts_with("https://")
         || href.starts_with("s3://")
+        || href.starts_with("gs://")
+        || href.starts_with("az://")
+        || href.starts_with("abfs://")
+        || href.starts_with("abfss://")
         || href.starts_with("file://")
         || href.starts_with('/')
     {
@@ -59,6 +63,10 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
     if item_uri.starts_with("http://")
         || item_uri.starts_with("https://")
         || item_uri.starts_with("s3://")
+        || item_uri.starts_with("gs://")
+        || item_uri.starts_with("az://")
+        || item_uri.starts_with("abfs://")
+        || item_uri.starts_with("abfss://")
     {
         let base = match item_uri.rfind('/') {
             Some(idx) => &item_uri[..=idx],
@@ -217,21 +225,45 @@ pub async fn resolve_stac_assets(
     }
     let cogs: Vec<Arc<OpenedCog>> = opened.into_iter().map(|o| o.unwrap()).collect();
 
-    // Rewrite asset names in expression (e.g. `(B4-B3)/(B4+B3)` -> `(b1-b2)/(b1+b2)`)
-    let rewritten_expr = expr_raw.map(|expr| {
-        // Sort by descending key length so `B10` is replaced before `B1`
-        let mut pairs: Vec<(usize, &String)> = names.iter().enumerate().collect();
-        pairs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        let mut out = expr.to_string();
-        for (i, name) in pairs {
-            if !name.eq_ignore_ascii_case(&format!("b{}", i + 1)) {
-                out = out.replace(name.as_str(), &format!("b{}", i + 1));
-            }
-        }
-        out
-    });
+    // Single-pass identifier-boundary rewrite (e.g. `(B4-B3)/(B4+B3)` -> `(b1-b2)/(b1+b2)`),
+    // preventing sequential double-replacement bugs when asset names overlap (`?assets=b2,b1`).
+    let rewritten_expr = expr_raw.map(|expr| rewrite_stac_expr(expr, &names));
 
     Ok((names, cogs, rewritten_expr))
+}
+
+/// Single-pass identifier-boundary replacement of STAC asset names with `b1`, `b2`, ...
+pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+            {
+                // Stop before `-` unless a known asset name actually contains `-`
+                if bytes[i] == b'-' && !names.iter().any(|n| n.contains('-')) {
+                    break;
+                }
+                i += 1;
+            }
+            let tok = &expr[start..i];
+            if let Some(pos) = names.iter().position(|n| n == tok) {
+                out.push('b');
+                out.push_str(&(pos + 1).to_string());
+            } else {
+                out.push_str(tok);
+            }
+        } else {
+            let ch = expr[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -392,5 +424,24 @@ pub fn get_tms_json(id: &str) -> Result<serde_json::Value, EngineError> {
         other => Err(EngineError::NotFound(format!(
             "unknown TileMatrixSet '{other}' (supported: WebMercatorQuad, WorldCRS84Quad)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stac_expr_rewriter_is_single_pass_and_respects_boundaries() {
+        // Overlapping asset names (`b2`, `b1`) must NOT double-replace and collapse!
+        let names = vec!["b2".to_string(), "b1".to_string()];
+        assert_eq!(rewrite_stac_expr("(b2-b1)/(b2+b1)", &names), "(b1-b2)/(b1+b2)");
+
+        // Short asset names (`r`, `g`, `b`) must NOT clobber function names (`abs`, `sqrt`)
+        let rgb = vec!["r".to_string(), "g".to_string(), "b".to_string()];
+        assert_eq!(
+            rewrite_stac_expr("sqrt(abs(r - b)) + g", &rgb),
+            "sqrt(abs(b1 - b3)) + b2"
+        );
     }
 }

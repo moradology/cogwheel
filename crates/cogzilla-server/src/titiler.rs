@@ -49,11 +49,18 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         None => ("None", serde_json::Value::Null),
     };
 
-    let (x0, y0) = full.pixel_to_crs.forward(0.0, 0.0);
-    let (x1, y1) = full
+    let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
+    let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
+    let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
+    let (x11, y11) = full
         .pixel_to_crs
         .forward(full.width as f64, full.height as f64);
-    let native_bounds = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+    let native_bounds = [
+        x00.min(x10).min(x01).min(x11),
+        y00.min(y10).min(y01).min(y11),
+        x00.max(x10).max(x01).max(x11),
+        y00.max(y10).max(y01).max(y11),
+    ];
 
     Ok(serde_json::json!({
         "bounds": native_bounds,
@@ -80,13 +87,19 @@ pub fn build_cog_info_geojson(
     cog: &OpenedCog,
 ) -> Result<serde_json::Value, EngineError> {
     let info = build_cog_info(engine, cog)?;
-    let b = info["wgs84_bounds"].as_array().unwrap();
-    let (w, s, e, n) = (
-        b[0].as_f64().unwrap(),
-        b[1].as_f64().unwrap(),
-        b[2].as_f64().unwrap(),
-        b[3].as_f64().unwrap(),
-    );
+    let b = info["wgs84_bounds"]
+        .as_array()
+        .ok_or_else(|| EngineError::BadRequest("invalid wgs84_bounds".into()))?;
+    let (Some(w), Some(s), Some(e), Some(n)) = (
+        b.first().and_then(|v| v.as_f64()),
+        b.get(1).and_then(|v| v.as_f64()),
+        b.get(2).and_then(|v| v.as_f64()),
+        b.get(3).and_then(|v| v.as_f64()),
+    ) else {
+        return Err(EngineError::BadRequest(
+            "dataset has non-finite wgs84 bounds".into(),
+        ));
+    };
     Ok(serde_json::json!({
         "type": "Feature",
         "geometry": {
@@ -1266,6 +1279,7 @@ pub async fn render_wgs84_bbox(
     let target_rx = ((s1x - s0x).powi(2) + (s1y - s0y).powi(2)).sqrt();
     let target_ry = ((s2x - s0x).powi(2) + (s2y - s0y).powi(2)).sqrt();
     let ifd_idx = primary.index.select_ifd(target_rx, target_ry);
+    crate::engine::validate_multi_cog_grid(cogs, ifd_idx)?;
     let ifd = &primary.index.ifds[ifd_idx];
 
     // Precompute source pixel coordinates `(u, v)` using a coarse 16-px projection grid
@@ -1591,7 +1605,99 @@ pub async fn render_wgs84_bbox(
                     grid_h,
                     $refs,
                 )
+                .with_nodata_override(nodata_override)
             };
+        }
+
+        // Real RawF32 output for single-band / expression / DEM / Terrain requests
+        if format == OutputFormat::RawF32 {
+            let mut out = BytesMut::with_capacity(w * h * 4);
+            match bands {
+                BandRequest::Single { band_1based, .. }
+                | BandRequest::Terrain { band_1based, .. }
+                | BandRequest::Dem { band_1based, .. } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    for i in 0..(w * h) {
+                        out.put_slice(&sample(&src, u_map[i], v_map[i]).to_le_bytes());
+                    }
+                }
+                BandRequest::CustomExpr { prog, .. } => {
+                    let ref_vecs: Vec<_> = prog
+                        .used_bands
+                        .iter()
+                        .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                        .collect();
+                    let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                    let mut vals = [0.0f32; 16];
+                    let nb = srcs.len().min(16);
+                    for i in 0..(w * h) {
+                        for k in 0..nb {
+                            vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                        }
+                        out.put_slice(&prog.eval(&vals[..nb]).to_le_bytes());
+                    }
+                }
+                BandRequest::Spectral1 {
+                    expr, band_1based, ..
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    for i in 0..(w * h) {
+                        out.put_slice(&expr.eval1(sample(&src, u_map[i], v_map[i])).to_le_bytes());
+                    }
+                }
+                BandRequest::Spectral2 {
+                    expr, bands_1based, ..
+                } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let s0 = make_src!(&r0);
+                    let s1 = make_src!(&r1);
+                    for i in 0..(w * h) {
+                        let a = sample(&s0, u_map[i], v_map[i]);
+                        let b = sample(&s1, u_map[i], v_map[i]);
+                        let v = if a.is_nan() || b.is_nan() { f32::NAN } else { expr.eval2(a, b) };
+                        out.put_slice(&v.to_le_bytes());
+                    }
+                }
+                BandRequest::Spectral3 {
+                    expr, bands_1based, ..
+                } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let r2 = get_band_refs(bands_1based[2], 2);
+                    let s0 = make_src!(&r0);
+                    let s1 = make_src!(&r1);
+                    let s2 = make_src!(&r2);
+                    for i in 0..(w * h) {
+                        let a = sample(&s0, u_map[i], v_map[i]);
+                        let b = sample(&s1, u_map[i], v_map[i]);
+                        let c = sample(&s2, u_map[i], v_map[i]);
+                        let v = if a.is_nan() || b.is_nan() || c.is_nan() {
+                            f32::NAN
+                        } else {
+                            expr.eval3(a, b, c)
+                        };
+                        out.put_slice(&v.to_le_bytes());
+                    }
+                }
+                BandRequest::Rgb { bands_1based, .. } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let s0 = make_src!(&r0);
+                    for i in 0..(w * h) {
+                        out.put_slice(&sample(&s0, u_map[i], v_map[i]).to_le_bytes());
+                    }
+                }
+                BandRequest::SarRgb { bands_1based, .. } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let s0 = make_src!(&r0);
+                    for i in 0..(w * h) {
+                        out.put_slice(&fast_db_from_power(sample(&s0, u_map[i], v_map[i])).to_le_bytes());
+                    }
+                }
+            }
+            return out.freeze();
         }
 
         let mut rgba = vec![0u8; w * h * 4];
@@ -1725,11 +1831,10 @@ pub async fn render_wgs84_bbox(
                 let ref_vecs: Vec<_> = prog
                     .used_bands
                     .iter()
-                    .enumerate()
-                    .map(|(slot, &b)| get_band_refs(b, slot))
+                    .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
                     .collect();
                 let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                let lut = colormap.lut();
+                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
                 let mut vals = [0.0f32; 16];
                 let nb = srcs.len().min(16);
@@ -1780,7 +1885,7 @@ pub async fn render_wgs84_bbox(
                 let r1 = get_band_refs(bands_1based[1], 1);
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
-                let lut = colormap.lut();
+                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
                 for i in 0..(w * h) {
                     let a = sample(&s0, u_map[i], v_map[i]);
@@ -1812,7 +1917,7 @@ pub async fn render_wgs84_bbox(
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
                 let s2 = make_src!(&r2);
-                let lut = colormap.lut();
+                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / (rescale.1 - rescale.0).max(1e-12);
                 for i in 0..(w * h) {
                     let a = sample(&s0, u_map[i], v_map[i]);

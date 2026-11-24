@@ -114,6 +114,46 @@ pub struct TileEngine {
     pub stats: Arc<EngineStats>,
 }
 
+/// Verify that all secondary COGs in a multi-COG / STAC composite share the exact same overview
+/// index, image dimensions, and internal tile grid as `cogs[0]` so `BandSource` never reads OOB.
+pub(crate) fn validate_multi_cog_grid(
+    cogs: &[Arc<OpenedCog>],
+    ifd_idx: usize,
+) -> Result<(), EngineError> {
+    if cogs.len() <= 1 {
+        return Ok(());
+    }
+    let primary_ifd = &cogs[0].index.ifds[ifd_idx];
+    for (k, c) in cogs.iter().enumerate().skip(1) {
+        let Some(other) = c.index.ifds.get(ifd_idx) else {
+            return Err(EngineError::BadRequest(format!(
+                "multi-COG asset #{k} has {} overviews, fewer than primary asset (need IFD {ifd_idx})",
+                c.index.ifds.len()
+            )));
+        };
+        if other.width != primary_ifd.width
+            || other.height != primary_ifd.height
+            || other.tile_width != primary_ifd.tile_width
+            || other.tile_height != primary_ifd.tile_height
+            || other.tiles_across != primary_ifd.tiles_across
+            || other.tiles_down != primary_ifd.tiles_down
+        {
+            return Err(EngineError::BadRequest(format!(
+                "multi-COG asset #{k} grid ({}x{}, tile {}x{}) does not match primary ({}x{}, tile {}x{})",
+                other.width,
+                other.height,
+                other.tile_width,
+                other.tile_height,
+                primary_ifd.width,
+                primary_ifd.height,
+                primary_ifd.tile_width,
+                primary_ifd.tile_height
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl TileEngine {
     pub fn new(cache_max_bytes: usize) -> Self {
         Self::with_store(Arc::new(CogStore::new(cache_max_bytes)))
@@ -927,6 +967,7 @@ impl TileEngine {
         let crs = self.get_or_build_crs(primary)?;
         let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, N as u32);
         let ifd_idx = primary.index.select_ifd(target_rx, target_ry);
+        validate_multi_cog_grid(cogs, ifd_idx)?;
         let ifd = &primary.index.ifds[ifd_idx];
 
         let Some(plan) = CoordPlan::<N>::build(
@@ -1021,7 +1062,31 @@ impl TileEngine {
                             resample: req.resample,
                             format: req.format,
                         };
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                        let mut ordered = Vec::with_capacity(prog.used_bands.len());
+                        for &b in &prog.used_bands {
+                            let idx = b.saturating_sub(1) as usize;
+                            let refs = match idx {
+                                0 => &r0,
+                                1 => &r1,
+                                _ => {
+                                    return Err(EngineError::BadRequest(format!(
+                                        "expression references band b{b}, but only 2 assets were provided"
+                                    )));
+                                }
+                            };
+                            ordered.push(BandSource::new(
+                                ifd.width,
+                                ifd.height,
+                                ifd.tile_width,
+                                ifd.tile_height,
+                                tx0,
+                                ty0,
+                                grid_w,
+                                grid_h,
+                                refs,
+                            ));
+                        }
+                        Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
                     }
                     _ => Err(EngineError::BadRequest(
                         "2-asset scene requires expr=sar_rgb, ndvi, ndwi, nbr, savi, ratio, diff, or custom expression"
@@ -1103,7 +1168,32 @@ impl TileEngine {
                             resample: req.resample,
                             format: req.format,
                         };
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                        let mut ordered = Vec::with_capacity(prog.used_bands.len());
+                        for &b in &prog.used_bands {
+                            let idx = b.saturating_sub(1) as usize;
+                            let refs = match idx {
+                                0 => &r0,
+                                1 => &r1,
+                                2 => &r2,
+                                _ => {
+                                    return Err(EngineError::BadRequest(format!(
+                                        "expression references band b{b}, but only 3 assets were provided"
+                                    )));
+                                }
+                            };
+                            ordered.push(BandSource::new(
+                                ifd.width,
+                                ifd.height,
+                                ifd.tile_width,
+                                ifd.tile_height,
+                                tx0,
+                                ty0,
+                                grid_w,
+                                grid_h,
+                                refs,
+                            ));
+                        }
+                        Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
                     }
                     _ => Err(EngineError::BadRequest(
                         "3-asset scene requires RGB, expr=evi, or custom expression".to_string(),
