@@ -36,6 +36,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import xml.etree.ElementTree as ET
 
@@ -468,6 +469,36 @@ def main() -> int:
         cql = ("filter=%7B%22op%22%3A%22%3C%22%2C%22args%22%3A%5B%7B%22property%22%3A%22eo%3Acloud_cover%22%7D%2C20%5D%7D"
                "&filter-lang=cql2-json")
         o.check("collection info with a CQL2 JSON filter", "json", f"{col}/info?{cql}")
+        # CQL2 text is the default language: the search has to get the same JSON and hash.
+        for label, text in [
+            ("a comparison", "eo:cloud_cover < 20"),
+            ("and, or, not", "eo:cloud_cover <= 10.5 AND (platform = 'sentinel-2b' OR NOT s2:mgrs_tile = '32TMR')"),
+            ("between, in, like", "eo:cloud_cover BETWEEN 5 AND 40 AND platform IN ('sentinel-2a', 'sentinel-2b') AND s2:mgrs_tile LIKE '32T%'"),
+            ("is null and negations", "view:sun_elevation IS NOT NULL AND platform NOT LIKE 'landsat%' AND eo:cloud_cover NOT BETWEEN 90 AND 100"),
+            ("arithmetic and a function", "eo:cloud_cover + 1 < 2 * 20 - -1 AND casei(platform) = casei('SENTINEL-2B')"),
+            ("a timestamp with an offset", "datetime > TIMESTAMP('2024-12-01T00:00:00+01:00') AND datetime < TIMESTAMP('2025-01-01T00:00:00.500Z')"),
+            ("a temporal operator and an interval", "T_DURING(datetime, INTERVAL('2024-12-01T00:00:00Z', '2025-01-01T00:00:00Z'))"),
+            ("a point", f"S_INTERSECTS(geometry, POINT({lon} {lat}))"),
+            ("polygons", f"S_INTERSECTS(geometry, POLYGON(({lon - 0.1} {lat - 0.1}, {lon + 0.1} {lat - 0.1}, {lon} {lat + 0.1}, {lon - 0.1} {lat - 0.1}))) OR S_WITHIN(geometry, MULTIPOLYGON((({lon - 2} {lat - 2}, {lon + 2} {lat - 2}, {lon + 2} {lat + 2}, {lon - 2} {lat + 2}, {lon - 2} {lat - 2}))))"),
+            ("a quoted property", "\"eo:cloud_cover\" < 20 and id <> 'it''s'"),
+        ]:
+            o.check(f"collection info with CQL2 text: {label}", "json", f"{col}/info?filter={quote(text)}")
+        text = quote("eo:cloud_cover < 20 AND s2:mgrs_tile = '32TMR'")
+        o.check("collection info with filter-lang=cql2-text", "json", f"{col}/info?filter={text}&filter-lang=cql2-text")
+        o.check("items in a tile, CQL2 text filter", "ids",
+                f"{col}/tiles/WebMercatorQuad/10/{tiles[10].x}/{tiles[10].y}/assets?filter={text}")
+        o.check("items in a tile, CQL2 text with geometry and time", "ids",
+                f"{col}/tiles/WebMercatorQuad/10/{tiles[10].x}/{tiles[10].y}/assets?filter="
+                + quote(f"S_INTERSECTS(geometry, POINT({lon} {lat})) AND datetime >= TIMESTAMP('2024-12-15T00:00:00Z')"))
+        o.check("collection tile, CQL2 text filter", "image",
+                f"{col}/tiles/WebMercatorQuad/12/{t12.x}/{t12.y}.png?assets=visual&filter={text}")
+        # pgSTAC 0.10 does not take a BBOX operand: both servers pass its error on.
+        o.check("CQL2 text with a BBOX operand", "status",
+                f"{col}/info?filter=" + quote(f"S_INTERSECTS(geometry, BBOX({lon - 2}, {lat - 2}, {lon + 2}, {lat + 2}))"))
+        o.check("CQL2 text that does not parse", "status", f"{col}/info?filter={quote('eo:cloud_cover <')}")
+        o.check("CQL2 text that is not a predicate", "status", f"{col}/info?filter={quote('eo:cloud_cover + 1')}")
+        o.check("CQL2 text with a bad timestamp", "status", f"{col}/info?filter=" + quote("datetime > TIMESTAMP('yesterday')"))
+        o.check("an unknown filter-lang", "status", f"{col}/info?filter={text}&filter-lang=cql2-nope")
         o.check("collection tilejson", "json", f"{col}/WebMercatorQuad/tilejson.json?assets=visual")
         o.check("collection tilejson with a bbox", "json",
                 f"{col}/WebMercatorQuad/tilejson.json?assets=visual&bbox=6,44,8,46&minzoom=6&maxzoom=7")
