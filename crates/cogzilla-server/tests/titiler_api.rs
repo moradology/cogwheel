@@ -70,7 +70,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("non-colormap orientation", format!("{base}/cog/info?url={sat_url}&orientation=vertical")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
-        assert_eq!(resp.status().as_u16(), 400, "{what} should be rejected: {url}");
+        assert_eq!(resp.status().as_u16(), 422, "{what} should be rejected with 422: {url}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+        assert!(body["detail"][0]["msg"].is_string(), "422 response should match FastAPI JSON schema");
     }
     // Supported spellings and parameters this server does not know are still accepted.
     for (what, url) in [
@@ -101,6 +104,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("point multi-expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2;b2-b3")),
         ("cog tile geotiff", format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1")),
         ("cog preview geotiff", format!("{base}/cog/preview/64x64.tif?url={sat_url}&rescale=0,1")),
+        ("cog tile 3-band rgb expr", format!("{tile}&expression=b3*1.0;b2*1.0;b1*1.0&rescale=0,1")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");
@@ -161,6 +165,14 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     assert_eq!(parsed_tif.full_res().width, 256);
     assert_eq!(parsed_tif.full_res().height, 256);
     assert_eq!(parsed_tif.geo_keys.projected_cs_type, Some(3857));
+
+    // Out-of-bounds /cog/tiles returns 404 Not Found (matching TiTiler TileOutsideBounds)
+    let oob_resp = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/0/0.png?url={sat_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oob_resp.status().as_u16(), 404);
     let prev_300 = client
         .get(format!("{base}/cog/preview.png?url={sat_url}&width=300"))
         .send()

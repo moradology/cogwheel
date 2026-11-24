@@ -3563,7 +3563,9 @@ async fn render_bbox_impl(
         return Ok(match format {
             OutputFormat::RawF32 | OutputFormat::Npy => {
                 let nb: usize = match bands {
-                    BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                    BandRequest::Rgb { .. }
+                    | BandRequest::SarRgb { .. }
+                    | BandRequest::CustomExprRgb { .. } => 3,
                     _ => 1,
                 };
                 let hdr = if format == OutputFormat::Npy {
@@ -3653,6 +3655,13 @@ async fn render_bbox_impl(
             BandRequest::CustomExpr { prog, .. } => {
                 for &b in &prog.used_bands {
                     check_band(b)?;
+                }
+            }
+            BandRequest::CustomExprRgb { progs, .. } => {
+                for prog in progs {
+                    for &b in &prog.used_bands {
+                        check_band(b)?;
+                    }
                 }
             }
         }
@@ -4038,6 +4047,24 @@ async fn render_bbox_impl(
                         out.put_slice(&prog.eval(&vals[..nb]).to_le_bytes());
                     }
                 }
+                BandRequest::CustomExprRgb { progs, .. } => {
+                    for prog in progs {
+                        let ref_vecs: Vec<_> = prog
+                            .used_bands
+                            .iter()
+                            .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                            .collect();
+                        let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                        let mut vals = [0.0f32; 16];
+                        let nb = srcs.len().min(16);
+                        for i in 0..(w * h) {
+                            for k in 0..nb {
+                                vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                            }
+                            out.put_slice(&prog.eval(&vals[..nb]).to_le_bytes());
+                        }
+                    }
+                }
                 BandRequest::Spectral1 {
                     expr, band_1based, ..
                 } => {
@@ -4116,7 +4143,9 @@ async fn render_bbox_impl(
             let raw = out.freeze();
             if format == OutputFormat::Npy {
                 let nb = match bands {
-                    BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                    BandRequest::Rgb { .. }
+                    | BandRequest::SarRgb { .. }
+                    | BandRequest::CustomExprRgb { .. } => 3,
                     _ => 1,
                 };
                 return cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32);
@@ -4299,6 +4328,56 @@ async fn render_bbox_impl(
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
                         rgba[i * 4 + 3] = a;
+                    }
+                }
+            }
+            BandRequest::CustomExprRgb {
+                progs,
+                rescale_min,
+                rescale_max,
+            } => {
+                let all_refs: Vec<Vec<_>> = progs
+                    .iter()
+                    .map(|prog| {
+                        prog.used_bands
+                            .iter()
+                            .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                            .collect()
+                    })
+                    .collect();
+                let all_srcs: Vec<Vec<_>> = all_refs
+                    .iter()
+                    .map(|rvec| rvec.iter().map(|r| make_src!(r)).collect())
+                    .collect();
+                let inv = [
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[0], rescale_max[0]),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
+                    255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
+                ];
+                let mut vals = [0.0f32; 16];
+                for i in 0..(w * h) {
+                    let mut rgb = [0.0f32; 3];
+                    let mut ok = true;
+                    for c in 0..3 {
+                        let srcs = &all_srcs[c];
+                        let nb = srcs.len().min(16);
+                        for k in 0..nb {
+                            vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                        }
+                        let v = progs[c].eval(&vals[..nb]);
+                        if v.is_nan() {
+                            ok = false;
+                            break;
+                        }
+                        rgb[c] = v;
+                    }
+                    if ok {
+                        rgba[i * 4] = ((rgb[0] - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 1] =
+                            ((rgb[1] - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 2] =
+                            ((rgb[2] - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                        rgba[i * 4 + 3] = 255;
                     }
                 }
             }

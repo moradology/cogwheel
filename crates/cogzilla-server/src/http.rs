@@ -946,6 +946,43 @@ fn bbox_to_wgs84(
     Ok([min_lon, min_lat, max_lon, max_lat])
 }
 
+/// Check whether a requested tile intersects the dataset's WGS84 footprint (used to return
+/// TiTiler-compatible `404 Not Found` on out-of-bounds `/cog/tiles` and `/stac/tiles` requests).
+fn tile_intersects_cog(
+    engine: &TileEngine,
+    cog: &cogzilla_io::OpenedCog,
+    tms: &str,
+    tile: TileCoord,
+    buffer: u32,
+    tile_size: u32,
+) -> Result<bool, EngineError> {
+    let crs = engine.get_or_build_crs(cog)?;
+    let full = cog.index.full_res();
+    let [cw, cs, ce, cn] = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+    if !cw.is_finite() || !cs.is_finite() || !ce.is_finite() || !cn.is_finite() {
+        return Ok(true);
+    }
+    let [tw, ts, te, tn] = if tms == "WorldCRS84Quad" {
+        world_crs84_tile_bbox(tile.z, tile.x, tile.y, buffer, tile_size)
+    } else {
+        let [mx0, my0, mx1, my1] =
+            web_mercator_buffered_3857_bbox(tile.z, tile.x, tile.y, buffer, tile_size);
+        let (lon0, lat0) = mercator_to_lonlat_deg(mx0, my0);
+        let (lon1, lat1) = mercator_to_lonlat_deg(mx1, my1);
+        [lon0.min(lon1), lat0.min(lat1), lon0.max(lon1), lat0.max(lat1)]
+    };
+    if tn < cs || ts > cn {
+        return Ok(false);
+    }
+    let lon_overlaps = if cw <= ce {
+        te >= cw && tw <= ce
+    } else {
+        // Antimeridian-crossing dataset: [cw..180] U [-180..ce]
+        te >= cw || tw <= ce
+    };
+    Ok(lon_overlaps)
+}
+
 fn wrap_geotiff(
     data: Bytes,
     ct: &'static str,
@@ -1343,7 +1380,45 @@ fn build_band_request(
             });
         }
         // Arbitrary TiTiler expression -> compile to bytecode VM!
-        let prog = ExprProgram::compile(raw_expr).map_err(EngineError::BadRequest)?;
+        // Supports single expressions (`(b1-b2)/(b1+b2)`) and `;`-separated 3-band RGB
+        // expressions (`b3*2;b2*2;b1*2`).
+        let parts: Vec<&str> = raw_expr
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() == 3 {
+            let p0 = ExprProgram::compile(parts[0]).map_err(EngineError::BadRequest)?;
+            let p1 = ExprProgram::compile(parts[1]).map_err(EngineError::BadRequest)?;
+            let p2 = ExprProgram::compile(parts[2]).map_err(EngineError::BadRequest)?;
+            let (rmin, rmax) = match pq.rescale.len() {
+                0 => {
+                    let (lo, hi) = default_rescale_for_dtype(sample_type, false);
+                    ([lo; 3], [hi; 3])
+                }
+                1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
+                3 => (
+                    [pq.rescale[0].0, pq.rescale[1].0, pq.rescale[2].0],
+                    [pq.rescale[0].1, pq.rescale[1].1, pq.rescale[2].1],
+                ),
+                n => {
+                    return Err(EngineError::BadRequest(format!(
+                        "expected 1 or 3 rescale pairs for 3-band expression, got {n}"
+                    )));
+                }
+            };
+            return Ok(BandRequest::CustomExprRgb {
+                progs: [p0, p1, p2],
+                rescale_min: rmin,
+                rescale_max: rmax,
+            });
+        } else if parts.len() != 1 {
+            return Err(EngineError::BadRequest(format!(
+                "multi-band tile expression must have 1 or 3 semicolon-separated expressions (got {})",
+                parts.len()
+            )));
+        }
+        let prog = ExprProgram::compile(parts[0]).map_err(EngineError::BadRequest)?;
         let rescale = pq.rescale.first().copied().unwrap_or((-1.0, 1.0));
         return Ok(BandRequest::CustomExpr {
             prog,
@@ -1623,6 +1698,7 @@ async fn render_mosaic_tile_styled(
     let needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0
+        || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
 
     if needs_bbox_mosaic && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
@@ -2123,7 +2199,21 @@ where
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     if let Err(msg) = validate_query(&segs, &pq) {
-        return Ok(plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain"));
+        let body = serde_json::json!({
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["query"],
+                    "msg": msg,
+                }
+            ]
+        })
+        .to_string();
+        return Ok(plain_resp(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Bytes::from(body),
+            "application/json",
+        ));
     }
 
     // ------------------------------------------------------------------------
@@ -3246,10 +3336,16 @@ where
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
+                        if !tile_intersects_cog(&engine, &cogs[0], tms, TileCoord { z, x, y }, pq_stac.buffer, treq.tile_size)? {
+                            return Err(EngineError::NotFound(format!(
+                                "Tile {z}/{x}/{y} is outside image bounds"
+                            )));
+                        }
                         let needs_general = tms == "WorldCRS84Quad"
                             || pq_stac.buffer > 0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some()
+                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512);
                         if needs_general {
                             let custom_lut = pq_stac
@@ -3937,10 +4033,16 @@ where
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
 
+                        if !tile_intersects_cog(&engine, &cogs[0], tms, TileCoord { z, x, y }, pq.buffer, treq.tile_size)? {
+                            return Err(EngineError::NotFound(format!(
+                                "Tile {z}/{x}/{y} is outside image bounds"
+                            )));
+                        }
                         let needs_general_path = tms == "WorldCRS84Quad"
                             || pq.buffer > 0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some()
+                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512);
 
                         if needs_general_path {
