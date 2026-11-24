@@ -204,6 +204,18 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     let narrowed = get_json(&client, format!("{base}/searches/{id}/tiles/WebMercatorQuad?minzoom=6&maxzoom=6")).await;
     assert_eq!(narrowed["tileMatrixSetLimits"].as_array().unwrap().len(), 1);
 
+    // WMTS: one layer from the query string, limited to the search's zooms and bounds.
+    let wmts = client.get(format!("{base}/searches/{id}/WMTSCapabilities.xml?assets=visual&tile_format=jpg")).send().await.unwrap();
+    assert_eq!(wmts.status().as_u16(), 200);
+    assert_eq!(wmts.headers()["content-type"], "application/xml");
+    let xml = String::from_utf8(wmts.bytes().await.unwrap().to_vec()).unwrap();
+    assert!(xml.contains(&format!("<ows:Identifier>{id}_WebMercatorQuad_default</ows:Identifier>")));
+    assert!(xml.contains(&format!("template=\"{base}/searches/{id}/tiles/WebMercatorQuad/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.jpg?assets=visual\"")));
+    assert_eq!(xml.matches("<TileMatrixLimits>").count(), 7);
+    assert!(xml.contains("<ows:LowerCorner>5.0 43.5</ows:LowerCorner>"));
+    let no_layer = client.get(format!("{base}/searches/{id}/WMTSCapabilities.xml")).send().await.unwrap();
+    assert_eq!(no_layer.status().as_u16(), 400);
+
     // Item lists for a box and a point: nothing is there, and malformed paths are not routes.
     for path in ["bbox/6,44,8,46/assets", "point/8.5,45.75/assets", "point/8.5,45.75/assets?items_limit=3"] {
         let items = get_json(&client, format!("{base}/searches/{id}/{path}")).await;
@@ -415,6 +427,17 @@ async fn item_routes_match_titiler_pgstac_shapes() {
     assert_eq!(map.status().as_u16(), 200);
     assert!(String::from_utf8_lossy(&map.bytes().await.unwrap())
         .contains(&format!("/collections/{cid}/items/{iid}/WebMercatorQuad/tilejson.json?assets=visual")));
+
+    // WMTS for the item: its bbox at every zoom, and a 400 when nothing can make a tile.
+    let wmts = client.get(format!("{it}/WMTSCapabilities.xml?assets=visual")).send().await.unwrap();
+    assert_eq!(wmts.status().as_u16(), 200);
+    let xml = String::from_utf8(wmts.bytes().await.unwrap().to_vec()).unwrap();
+    assert!(xml.contains("<ows:Identifier>TiTiler_WebMercatorQuad_default</ows:Identifier>"));
+    assert!(xml.contains(&format!("template=\"{it}/tiles/WebMercatorQuad/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.png?assets=visual\"")));
+    assert_eq!(xml.matches("<TileMatrixLimits>").count(), 25);
+    assert!(xml.contains("<ows:UpperCorner>8.0 46.0</ows:UpperCorner>"));
+    let no_layer = client.get(format!("{it}/WMTSCapabilities.xml")).send().await.unwrap();
+    assert_eq!(no_layer.status().as_u16(), 400);
 
     // Lookups.
     for (path, message) in [

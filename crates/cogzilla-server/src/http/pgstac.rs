@@ -538,6 +538,9 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 /// The pgSTAC routes, as entries for the OpenAPI document's `paths`.
 pub(super) fn openapi_paths() -> Value {
     json!({
+        "/searches/{search_id}/WMTSCapabilities.xml": { "get": { "summary": "pgSTAC search WMTS capabilities" } },
+        "/collections/{collection_id}/WMTSCapabilities.xml": { "get": { "summary": "pgSTAC collection WMTS capabilities" } },
+        "/collections/{collection_id}/items/{item_id}/WMTSCapabilities.xml": { "get": { "summary": "pgSTAC item WMTS capabilities" } },
         "/collections/{collection_id}/items/{item_id}/assets": { "get": { "summary": "Assets of a pgSTAC item" } },
         "/collections/{collection_id}/items/{item_id}/info": { "get": { "summary": "pgSTAC item asset metadata" } },
         "/collections/{collection_id}/items/{item_id}/info.geojson": { "get": { "summary": "pgSTAC item asset metadata as GeoJSON" } },
@@ -832,6 +835,214 @@ fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, Strin
             "accessConstraints": "unclassified"
         }]}),
     )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// A float the way Python prints it (`-180.0`, not `-180`).
+fn py_float(v: f64) -> String {
+    json!(v).to_string()
+}
+
+/// What the WMTS document needs to know about the thing being tiled.
+struct WmtsSource<'a> {
+    /// Prefix of every layer name: the search hash, or `TiTiler` for an item.
+    title: &'a str,
+    bounds: [f64; 4],
+    minzoom: i64,
+    maxzoom: i64,
+    /// Layers from `defaults`, as name and tile query string.
+    default_layers: Vec<(String, String)>,
+}
+
+/// `GET {base}/WMTSCapabilities.xml`: the RESTful WMTS description TiTiler writes, for the
+/// one tile matrix set these routes serve. Each layer in `defaults` is a WMTS layer, and so
+/// is the request's own query string when it can make a tile.
+fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, String)]) -> Resp {
+    const TMS: &str = "WebMercatorQuad";
+    let tile_format = query_value(pairs, "tile_format").unwrap_or("png");
+    let media_type = match tile_format {
+        "png" => "image/png",
+        "jpeg" => "image/jpeg",
+        "jpg" => "image/jpg",
+        "webp" => "image/webp",
+        "npy" => "application/x-binary",
+        "tif" | "tiff" | "jp2" | "pngraw" => {
+            return detail(
+                StatusCode::BAD_REQUEST,
+                format!("tile_format={tile_format} is not supported on pgSTAC routes (use png, jpg, jpeg, webp or npy)"),
+            );
+        }
+        _ => {
+            return invalid_param(
+                "query",
+                "tile_format",
+                "Input should be 'png', 'npy', 'tif', 'tiff', 'jpeg', 'jpg', 'jp2', 'webp' or 'pngraw'",
+            );
+        }
+    };
+    let use_epsg = match query_value(pairs, "use_epsg").map(parse_bool) {
+        None => false,
+        Some(Some(b)) => b,
+        Some(None) => {
+            return invalid_param("query", "use_epsg", "Input should be a valid boolean");
+        }
+    };
+    // `zooms=WebMercatorQuad::min,max` overrides the zoom range of the query-string layer.
+    let mut zoom_override = None;
+    for (_, v) in pairs.iter().filter(|(k, _)| k == "zooms") {
+        let parsed = v.split_once("::").and_then(|(tms, range)| {
+            let (lo, hi) = range.split_once(',')?;
+            Some((tms, lo.trim().parse::<i64>().ok()?, hi.trim().parse::<i64>().ok()?))
+        });
+        match parsed {
+            Some((TMS, lo, hi)) => zoom_override = Some((lo, hi)),
+            Some(_) => {}
+            None => {
+                return invalid_param(
+                    "query",
+                    "zooms",
+                    "Value error, invalid zooms: expected tileMatrixSetId::minzoom,maxzoom",
+                );
+            }
+        }
+    }
+
+    // Layers: (name, tile query string, zoom range).
+    let mut layers: Vec<(String, String, (i64, i64))> = source
+        .default_layers
+        .into_iter()
+        .map(|(name, qs)| {
+            // The tile size is the service's to choose, not the layer's.
+            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.starts_with("tilesize=")).collect();
+            (name, qs.join("&"), (source.minzoom, source.maxzoom))
+        })
+        .collect();
+    const NOT_TILE_PARAMS: [&str; 10] = [
+        "tile_format", "use_epsg", "tilesize", "zooms", "service", "request", "acceptversions",
+        "sections", "updatesequence", "acceptformats",
+    ];
+    if query_value(pairs, "assets").is_some_and(|a| !a.is_empty()) {
+        let qs: Vec<String> = pairs
+            .iter()
+            .filter(|(k, _)| !NOT_TILE_PARAMS.contains(&k.to_ascii_lowercase().as_str()))
+            .map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v)))
+            .collect();
+        layers.push((
+            "default".into(),
+            qs.join("&"),
+            zoom_override.unwrap_or((source.minzoom, source.maxzoom)),
+        ));
+    }
+    if layers.is_empty() {
+        return detail(
+            StatusCode::BAD_REQUEST,
+            "Could not find any valid layers in metadata or construct one from Query Parameters.",
+        );
+    }
+
+    let host = ctx.host;
+    let this_url = xml_escape(&if ctx.raw_query.is_empty() {
+        format!("{host}{base}/WMTSCapabilities.xml")
+    } else {
+        format!("{host}{base}/WMTSCapabilities.xml?{}", ctx.raw_query)
+    });
+    let operation = |name: &str| {
+        format!(
+            r#"        <ows:Operation name="{name}">
+            <ows:DCP>
+                <ows:HTTP>
+                    <ows:Get xlink:href="{this_url}">
+                        <ows:Constraint name="GetEncoding">
+                            <ows:AllowedValues>
+                                <ows:Value>RESTful</ows:Value>
+                            </ows:AllowedValues>
+                        </ows:Constraint>
+                    </ows:Get>
+                </ows:HTTP>
+            </ows:DCP>
+        </ows:Operation>
+"#
+        )
+    };
+    let mut xml = String::with_capacity(16 * 1024);
+    xml.push_str(r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:gml="http://www.opengis.net/gml" xsi:schemaLocation="http://www.opengis.net/wmts/1.0 http://schemas.opengis.net/wmts/1.0/wmtsGetCapabilities_response.xsd" version="1.0.0">
+    <ows:ServiceIdentification>
+        <ows:Title>Web Map Tile Service by TiTiler</ows:Title>
+        <ows:ServiceType>OGC WMTS</ows:ServiceType>
+        <ows:ServiceTypeVersion>1.0.0</ows:ServiceTypeVersion>
+    </ows:ServiceIdentification>
+    <ows:ServiceProvider>
+        <ows:ProviderName>TiTiler</ows:ProviderName>
+        <ows:ProviderSite xlink:href="https://developmentseed.org/titiler/"/>
+        <ows:ServiceContact/>
+    </ows:ServiceProvider>
+    <ows:OperationsMetadata>
+"#);
+    xml.push_str(&operation("GetCapabilities"));
+    xml.push_str(&operation("GetTile"));
+    xml.push_str("    </ows:OperationsMetadata>\n    <Contents>\n");
+    let [w, s, e, n] = source.bounds;
+    for (name, qs, (minzoom, maxzoom)) in &layers {
+        let id = xml_escape(&format!("{}_{TMS}_{name}", source.title));
+        let template = xml_escape(&if qs.is_empty() {
+            format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}")
+        } else {
+            format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}?{qs}")
+        });
+        xml.push_str(&format!(
+            r#"        <Layer>
+            <ows:Title>{id}</ows:Title>
+            <ows:Identifier>{id}</ows:Identifier>
+            <ows:WGS84BoundingBox crs="urn:ogc:def:crs:OGC:2:84">
+                <ows:LowerCorner>{} {}</ows:LowerCorner>
+                <ows:UpperCorner>{} {}</ows:UpperCorner>
+            </ows:WGS84BoundingBox>
+            <Style isDefault="true">
+                <ows:Title>{id}</ows:Title>
+                <ows:Identifier>{id}</ows:Identifier>
+            </Style>
+            <Format>{media_type}</Format>
+            <TileMatrixSetLink>
+                <TileMatrixSet>{TMS}</TileMatrixSet>
+                <TileMatrixSetLimits>
+"#,
+            py_float(w),
+            py_float(s),
+            py_float(e),
+            py_float(n)
+        ));
+        for z in (*minzoom).clamp(0, 30)..=(*maxzoom).clamp(0, 30) {
+            let l = tile_limits(z, source.bounds);
+            xml.push_str(&format!(
+                "                    <TileMatrixLimits>\n                        <TileMatrix>{z}</TileMatrix>\n                        <MinTileRow>{}</MinTileRow>\n                        <MaxTileRow>{}</MaxTileRow>\n                        <MinTileCol>{}</MinTileCol>\n                        <MaxTileCol>{}</MaxTileCol>\n                    </TileMatrixLimits>\n",
+                l["minTileRow"], l["maxTileRow"], l["minTileCol"], l["maxTileCol"]
+            ));
+        }
+        xml.push_str(&format!(
+            "                </TileMatrixSetLimits>\n            </TileMatrixSetLink>\n            <ResourceURL format=\"{media_type}\" resourceType=\"tile\" template=\"{template}\" />\n        </Layer>\n"
+        ));
+    }
+    let crs = if use_epsg { "EPSG:3857" } else { "http://www.opengis.net/def/crs/EPSG/0/3857" };
+    xml.push_str(&format!(
+        "        <TileMatrixSet>\n            <ows:Identifier>{TMS}</ows:Identifier>\n            <ows:SupportedCRS>{crs}</ows:SupportedCRS>\n"
+    ));
+    for z in 0..=24u32 {
+        let side = 1u64 << z;
+        xml.push_str(&format!(
+            "            <TileMatrix>\n                <ows:Identifier>{z}</ows:Identifier>\n                <ScaleDenominator>{}</ScaleDenominator>\n                <TopLeftCorner>-20037508.342789244 20037508.342789244</TopLeftCorner>\n                <TileWidth>256</TileWidth>\n                <TileHeight>256</TileHeight>\n                <MatrixWidth>{side}</MatrixWidth>\n                <MatrixHeight>{side}</MatrixHeight>\n            </TileMatrix>\n",
+            py_float(559_082_264.028_717_8 / side as f64)
+        ));
+    }
+    xml.push_str(&format!(
+        "        </TileMatrixSet>\n    </Contents>\n    <ServiceMetadataURL xlink:href=\"{this_url}\" />\n</Capabilities>"
+    ));
+    let mut resp = Response::new(Full::new(Bytes::from(xml)));
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
 }
 
 /// Only WGS84 coordinates are taken on the bbox and point routes for now.
@@ -1477,7 +1688,7 @@ fn readable_assets(item: &Value) -> Vec<String> {
 /// Routes of the item family that titiler-pgstac refuses without `assets`.
 fn item_route_needs_assets(rest: &[&str]) -> bool {
     match rest {
-        ["info" | "info.geojson" | "statistics" | "asset_statistics" | "WMTSCapabilities.xml"] => true,
+        ["info" | "info.geojson" | "statistics" | "asset_statistics"] => true,
         ["point", _] | ["bbox", ..] | ["tiles", _, _, _, _] => true,
         [_, "tilejson.json" | "map.html"] => true,
         [first, ..] => {
@@ -1549,6 +1760,20 @@ pub(super) async fn item_route(
                     "title": "List STAC Renders metadata"
                 }]}),
             ));
+        }
+        ["WMTSCapabilities.xml"] if get => {
+            let extent = match item_extent(ctx, &doc, &item, &readable, pq).await {
+                Ok(e) => e,
+                Err(r) => return Done(r),
+            };
+            let source = WmtsSource {
+                title: "TiTiler",
+                bounds: extent.wgs84,
+                minzoom: extent.minzoom,
+                maxzoom: extent.maxzoom,
+                default_layers: Vec::new(),
+            };
+            return Done(wmts(ctx, &base, source, &pairs));
         }
         ["tiles"] | ["tiles", _] if get => {
             if let ["tiles", tms] = rest
@@ -1711,6 +1936,20 @@ async fn mosaic_route(
             resp.headers_mut()
                 .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
             resp
+        }
+        ["WMTSCapabilities.xml"] => {
+            let (minzoom, maxzoom, bounds) = match mosaic_extent(&rec.metadata, &[]) {
+                Ok(e) => e,
+                Err(r) => return r,
+            };
+            let source = WmtsSource {
+                title: &rec.hash,
+                bounds,
+                minzoom,
+                maxzoom,
+                default_layers: layer_queries(&rec.metadata, true),
+            };
+            wmts(ctx, base, source, pairs)
         }
         ["tiles"] | ["tiles", _] if query_value(pairs, "f") == Some("html") => detail(
             StatusCode::BAD_REQUEST,
@@ -2058,6 +2297,71 @@ mod tests {
         assert!(!item_route_needs_assets(&["assets"]));
         assert!(!item_route_needs_assets(&["tiles", "WebMercatorQuad"]));
         assert!(!item_route_needs_assets(&["nope"]));
+    }
+
+    #[test]
+    fn wmts_lists_default_layers_and_the_query_layer() {
+        let engine = Arc::new(TileEngine::new(1 << 20));
+        let raw_query = "assets=visual&rescale=0,255&tilesize=512&tile_format=jpg&zooms=WebMercatorQuad::8,9";
+        let ctx = Ctx {
+            engine: &engine,
+            host: "http://example.test",
+            forwarded_prefix: "",
+            path: "/searches/abc/WMTSCapabilities.xml",
+            raw_query,
+            if_none_match: None,
+        };
+        let source = || WmtsSource {
+            title: "abc",
+            bounds: [5.0, 43.5, 12.0, 48.0],
+            minzoom: 7,
+            maxzoom: 8,
+            default_layers: vec![("rgb".into(), "tilesize=256&assets=visual".into())],
+        };
+        // The body is already in memory, so collecting it is ready on the first poll.
+        fn ready<F: std::future::Future>(f: F) -> F::Output {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match std::pin::pin!(f).as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(v) => v,
+                std::task::Poll::Pending => panic!("body was not ready"),
+            }
+        }
+        let body = |resp: Resp| {
+            use http_body_util::BodyExt;
+            let bytes = ready(resp.into_body().collect()).unwrap().to_bytes();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        let resp = wmts(&ctx, "/searches/abc", source(), &query_pairs(raw_query));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[CONTENT_TYPE], "application/xml");
+        let xml = body(resp);
+        // The layer from `defaults` keeps the mosaic's zooms and loses its tile size.
+        assert!(xml.contains("<ows:Identifier>abc_WebMercatorQuad_rgb</ows:Identifier>"));
+        assert!(xml.contains(r#"template="http://example.test/searches/abc/tiles/WebMercatorQuad/{TileMatrix}/{TileCol}/{TileRow}.jpg?assets=visual" />"#));
+        assert!(xml.contains("<TileMatrix>7</TileMatrix>"));
+        // The query-string layer drops the WMTS-only parameters and takes the zoom override.
+        assert!(xml.contains("<ows:Identifier>abc_WebMercatorQuad_default</ows:Identifier>"));
+        assert!(xml.contains(r#"{TileRow}.jpg?assets=visual&amp;rescale=0%2C255" />"#));
+        assert!(xml.contains("<TileMatrix>9</TileMatrix>"));
+        assert!(xml.contains("<MinTileRow>177</MinTileRow>"));
+        assert_eq!(xml.matches("<Layer>").count(), 2);
+        assert_eq!(xml.matches("<Format>image/jpg</Format>").count(), 2);
+        assert!(xml.contains("<ows:LowerCorner>5.0 43.5</ows:LowerCorner>"));
+        assert!(xml.contains("<ows:SupportedCRS>http://www.opengis.net/def/crs/EPSG/0/3857</ows:SupportedCRS>"));
+        assert!(xml.contains("<ScaleDenominator>559082264.0287178</ScaleDenominator>"));
+        assert!(xml.contains("<ScaleDenominator>33.323899747652874</ScaleDenominator>"));
+        assert!(xml.contains("WMTSCapabilities.xml?assets=visual&amp;rescale=0,255&amp;tilesize=512"));
+
+        // Nothing that can make a tile, an unknown format, and a format these routes cannot write.
+        let bare = WmtsSource { default_layers: Vec::new(), ..source() };
+        assert_eq!(wmts(&ctx, "/searches/abc", bare, &[]).status(), StatusCode::BAD_REQUEST);
+        let status = |q: &str| wmts(&ctx, "/searches/abc", source(), &query_pairs(q)).status();
+        assert_eq!(status("tile_format=nope"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("tile_format=tif"), StatusCode::BAD_REQUEST);
+        assert_eq!(status("use_epsg=maybe"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("zooms=WebMercatorQuad"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status(""), StatusCode::OK);
     }
 
     #[test]
