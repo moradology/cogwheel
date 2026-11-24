@@ -8,7 +8,7 @@ set -euo pipefail
 #   ./deploy.sh                                    # deploy public demo (latest release)
 #   ./deploy.sh --bucket my-cogs                   # grant s3:GetObject on s3://my-cogs/*
 #   ./deploy.sh --allow-prefixes s3://my-cogs/     # lock down allowed URL prefixes
-#   ./deploy.sh --version v0.5.0 --name my-tiler   # custom version / function name
+#   ./deploy.sh --version v0.5.1 --name my-tiler   # custom version / function name
 #   ./deploy.sh --zip /path/to/bootstrap.zip       # deploy a locally built zip
 #   ./deploy.sh --destroy                          # delete the Lambda function
 
