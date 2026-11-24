@@ -147,7 +147,7 @@ impl<'a> BandSource<'a> {
     /// only 1 block lookup and 1 `BandData` dispatch instead of 4!
     #[inline(always)]
     pub fn sample_quad_inbounds(&self, ux0: u32, uy0: u32) -> (f32, f32, f32, f32) {
-        if self.scale_offset.is_some() {
+        if self.scale_offset.is_some() || self.nodata_override.is_some() {
             return (
                 self.sample_inbounds(ux0, uy0),
                 self.sample_inbounds(ux0 + 1, uy0),
@@ -268,7 +268,11 @@ impl<'a> BandSource<'a> {
     /// and bypass per-pixel tile-grid indexing completely!
     #[inline(always)]
     pub fn single_block_flat(&self) -> Option<(&'a [f32], u32, u32, usize)> {
-        if self.grid_w == 1 && self.grid_h == 1 && self.scale_offset.is_none() {
+        if self.grid_w == 1
+            && self.grid_h == 1
+            && self.scale_offset.is_none()
+            && self.nodata_override.is_none()
+        {
             let blk = self.blocks[0]?;
             if blk.width < 2 || blk.height < 2 {
                 return None;
@@ -481,5 +485,14 @@ mod tests {
         let u16_blocks = [Some(&u16_band)];
         let src_u16 = BandSource::new(2, 2, 2, 2, 0, 0, 1, 1, &u16_blocks);
         assert!(src_u16.single_block_u16().is_some());
+
+        // nodata_override must disable single_block_flat and apply in sample_quad_inbounds.
+        let src_nd = BandSource::new(2, 2, 2, 2, 0, 0, 1, 1, &blocks).with_nodata_override(Some(200.0));
+        assert!(src_nd.single_block_flat().is_none());
+        let (a, b, c, d) = src_nd.sample_quad_inbounds(0, 0);
+        assert_eq!(a, 100.0);
+        assert!(b.is_nan());
+        assert!(c.is_nan());
+        assert_eq!(d, 400.0);
     }
 }
