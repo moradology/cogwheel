@@ -45,6 +45,12 @@ impl PgStacError {
     }
 }
 
+/// Order object keys the way Postgres `jsonb` does: shorter keys first, then bytewise.
+/// A list built from a `jsonb` object's keys has to keep this order to hash the same.
+pub fn jsonb_key_order(keys: &mut [String]) {
+    keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes())));
+}
+
 /// One row of `pgstac.searches`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchRecord {
@@ -235,6 +241,7 @@ pub struct PgStac {
     pool: Pool,
     items: Option<TtlCache<Arc<Vec<MosaicItem>>>>,
     searches: Option<TtlCache<Arc<SearchRecord>>>,
+    collections: Option<TtlCache<Arc<Value>>>,
 }
 
 impl PgStac {
@@ -260,6 +267,7 @@ impl PgStac {
             pool,
             items: TtlCache::from_env(),
             searches: TtlCache::from_env(),
+            collections: TtlCache::from_env(),
         })
     }
 
@@ -297,6 +305,51 @@ impl PgStac {
         let stmt = client.prepare_cached(&sql).await?;
         let row = client.query_one(&stmt, &[search, metadata]).await?;
         search_from_row(&row)
+    }
+
+    /// [`Self::register_search`] behind the time-limited cache, for searches that are
+    /// derived from the request on every call (a collection's mosaic). `key` must
+    /// identify the search and metadata.
+    pub async fn register_search_cached(
+        &self,
+        key: &str,
+        search: &Value,
+        metadata: &Value,
+    ) -> Result<Arc<SearchRecord>, PgStacError> {
+        let key = format!("register|{key}");
+        if let Some(hit) = self.searches.as_ref().and_then(|c| c.get(&key)) {
+            return Ok(hit);
+        }
+        let rec = Arc::new(self.register_search(search, metadata).await?);
+        if let Some(cache) = &self.searches {
+            cache.put(key, rec.clone());
+        }
+        Ok(rec)
+    }
+
+    /// [`Self::get_collection`] behind the time-limited cache. Only collections that exist
+    /// are remembered.
+    pub async fn get_collection_cached(&self, id: &str) -> Result<Option<Arc<Value>>, PgStacError> {
+        if let Some(hit) = self.collections.as_ref().and_then(|c| c.get(id)) {
+            return Ok(Some(hit));
+        }
+        let Some(found) = self.get_collection(id).await? else {
+            return Ok(None);
+        };
+        let found = Arc::new(found);
+        if let Some(cache) = &self.collections {
+            cache.put(id.to_string(), found.clone());
+        }
+        Ok(Some(found))
+    }
+
+    /// A collection's JSON, or `None` when pgSTAC has no collection with that id.
+    pub async fn get_collection(&self, id: &str) -> Result<Option<Value>, PgStacError> {
+        let client = self.client().await?;
+        let stmt = client.prepare_cached("SELECT get_collection($1::text)").await?;
+        let row = client.query_one(&stmt, &[&id]).await?;
+        let value: Option<Value> = row.try_get(0).map_err(|e| PgStacError::Shape(e.to_string()))?;
+        Ok(value.filter(|v| !v.is_null()))
     }
 
     /// Look a registered search up by its hash.
@@ -473,6 +526,14 @@ mod tests {
         assert!(cache.entries.lock().len() <= 2);
         std::thread::sleep(Duration::from_millis(40));
         assert!(cache.get("c").is_none());
+    }
+
+    #[test]
+    fn keys_sort_like_jsonb() {
+        let mut keys: Vec<String> =
+            ["visual", "red", "aot-jp2", "nir", "blue", "aot"].iter().map(|s| s.to_string()).collect();
+        jsonb_key_order(&mut keys);
+        assert_eq!(keys, ["aot", "nir", "red", "blue", "visual", "aot-jp2"]);
     }
 
     #[test]

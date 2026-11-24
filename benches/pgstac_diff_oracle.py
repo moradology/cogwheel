@@ -154,6 +154,13 @@ class Oracle:
         elif kind == "json":
             diff = first_diff(normalize(cz.json(), COGZILLA), normalize(tt.json(), TITILER))
             ok, note = diff is None, diff or f"{cz.status_code}, bodies equal"
+        elif kind == "tilesets":
+            # cogzilla serves these routes in Web Mercator only, so only that entry is compared.
+            ours = normalize(cz.json(), COGZILLA)
+            theirs = normalize(tt.json(), TITILER)
+            theirs["tilesets"] = [t for t in theirs["tilesets"] if "WebMercatorQuad TileMatrixSet" in t["title"]]
+            diff = first_diff(ours, theirs)
+            ok, note = diff is None, diff or "WebMercatorQuad entry equal"
         elif kind == "ids":
             a, b = [i["id"] for i in cz.json()], [i["id"] for i in tt.json()]
             ok = a == b
@@ -289,6 +296,73 @@ def main() -> int:
         o.check("tile for an unknown tile matrix set", "status",
                 f"/searches/{sid}/tiles/Nope/12/{t12.x}/{t12.y}?assets=visual")
         o.check("unknown route", "status", f"/searches/{sid}/nope")
+
+        print("tilesets and item lists")
+        o.check("tileset list", "tilesets", f"/searches/{sid}/tiles")
+        o.check("tileset list keeps the query", "tilesets", f"/searches/{sid_meta}/tiles?assets=visual&rescale=0,255")
+        o.check("tileset", "json", f"/searches/{sid}/tiles/WebMercatorQuad")
+        o.check("tileset from search metadata", "json", f"/searches/{sid_meta}/tiles/WebMercatorQuad?assets=visual")
+        o.check("tileset with a zoom range", "json", f"/searches/{sid_meta}/tiles/WebMercatorQuad?minzoom=5&maxzoom=7")
+        o.check("tileset for an unknown tile matrix set", "status", f"/searches/{sid}/tiles/Nope")
+        o.check("tileset for an unknown search", "json", "/searches/deadbeef/tiles/WebMercatorQuad")
+        box = f"{lon - 0.05:.4f},{lat - 0.05:.4f},{lon + 0.05:.4f},{lat + 0.05:.4f}"
+        o.check("items in a bbox", "ids", f"/searches/{sid}/bbox/{box}/assets")
+        o.check("items in a bbox with limits", "ids", f"/searches/{sid}/bbox/{box}/assets?items_limit=7&skipcovered=false")
+        o.check("items in a bbox, filtered search", "ids", f"/searches/{sid_meta}/bbox/{box}/assets")
+        o.check("items in a bbox outside the data", "json", f"/searches/{sid}/bbox/-100,10,-99,11/assets")
+        o.check("bbox with three numbers", "json", f"/searches/{sid}/bbox/1,2,3/assets")
+        o.check("items at a point", "ids", f"/searches/{sid}/point/{lon:.4f},{lat:.4f}/assets")
+        o.check("items at a point with a limit", "ids", f"/searches/{sid}/point/{lon:.4f},{lat:.4f}/assets?items_limit=5")
+        o.check("items at a point outside the data", "json", f"/searches/{sid}/point/-100,10/assets")
+        o.check("items at a point for an unknown search", "json", "/searches/deadbeef/point/1,2/assets")
+
+        print("collection")
+        col = f"/collections/{collection}"
+        o.check("collection info", "json", f"{col}/info")
+        o.check("collection info for an unknown collection", "json", "/collections/nope/info")
+        o.check("collection info with ids", "json", f"{col}/info?ids=a,b")
+        o.check("collection info with a bbox", "json", f"{col}/info?bbox=6,44,8,46")
+        o.check("collection info with a bad bbox", "status", f"{col}/info?bbox=6,44,8")
+        o.check("collection info with a datetime", "json",
+                f"{col}/info?datetime=2024-06-01T00:00:00Z/2024-08-31T23:59:59Z")
+        o.check("collection info with sortby", "json",
+                f"{col}/info?sortby=%2Bproperties.eo:cloud_cover,-datetime")
+        cloud = "query=%7B%22eo%3Acloud_cover%22%3A%7B%22lt%22%3A20%7D%7D"
+        o.check("collection info with a query", "json", f"{col}/info?{cloud}")
+        cql = ("filter=%7B%22op%22%3A%22%3C%22%2C%22args%22%3A%5B%7B%22property%22%3A%22eo%3Acloud_cover%22%7D%2C20%5D%7D"
+               "&filter-lang=cql2-json")
+        o.check("collection info with a CQL2 JSON filter", "json", f"{col}/info?{cql}")
+        o.check("collection tilejson", "json", f"{col}/WebMercatorQuad/tilejson.json?assets=visual")
+        o.check("collection tilejson with a bbox", "json",
+                f"{col}/WebMercatorQuad/tilejson.json?assets=visual&bbox=6,44,8,46&minzoom=6&maxzoom=7")
+        o.check("collection tilejson for an unknown collection", "json",
+                "/collections/nope/WebMercatorQuad/tilejson.json?assets=visual")
+        o.check("collection map viewer", "status", f"{col}/WebMercatorQuad/map.html?assets=visual")
+        o.check("collection tileset list", "tilesets", f"{col}/tiles?assets=visual")
+        o.check("collection tileset", "json", f"{col}/tiles/WebMercatorQuad?assets=visual&minzoom=4&maxzoom=9")
+        o.check("collection tileset with a bbox", "json",
+                f"{col}/tiles/WebMercatorQuad?bbox=6,44,8,46&minzoom=6&maxzoom=7")
+        ctile = f"{col}/tiles/WebMercatorQuad/12/{t12.x}/{t12.y}"
+        o.check("collection items for a tile", "ids", f"{ctile}/assets")
+        o.check("collection items for a tile with a query", "ids", f"{ctile}/assets?{cloud}")
+        o.check("collection items for a tile with a datetime", "ids",
+                f"{ctile}/assets?datetime=2024-06-01T00:00:00Z/2024-08-31T23:59:59Z")
+        o.check("collection items for a tile, sorted", "ids", f"{ctile}/assets?sortby=%2Bproperties.eo:cloud_cover")
+        o.check("collection items in a bbox", "ids", f"{col}/bbox/{box}/assets")
+        o.check("collection items at a point", "ids", f"{col}/point/{lon:.4f},{lat:.4f}/assets?items_limit=20")
+        o.check("collection tile", "image", f"{ctile}.png?assets=visual")
+        o.check("collection tile, format from the pixels", "image", f"{ctile}?assets=visual")
+        o.check("collection tile with a query", "image", f"{ctile}.png?assets=visual&{cloud}")
+        o.check("collection tile, three assets", "image",
+                f"{ctile}.png?assets=red&assets=green&assets=blue&rescale=0,3000")
+        o.check("collection tile without assets", "json", f"{ctile}.png")
+        o.check("collection tile outside the data", "status",
+                f"{col}/tiles/WebMercatorQuad/10/100/100.png?assets=visual")
+        o.check("collection tile for an unknown collection", "json",
+                f"/collections/nope/tiles/WebMercatorQuad/12/{t12.x}/{t12.y}?assets=visual")
+        o.check("collection tile for an unknown tile matrix set", "status",
+                f"{col}/tiles/Nope/12/{t12.x}/{t12.y}?assets=visual")
+        o.check("collection unknown route", "status", f"{col}/nope")
     finally:
         proc.terminate()
         proc.wait(timeout=10)
