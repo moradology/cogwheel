@@ -56,24 +56,36 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
         || href.starts_with("abfs://")
         || href.starts_with("abfss://")
         || href.starts_with("file://")
-        || href.starts_with('/')
     {
         return href.to_string();
     }
-    if item_uri.starts_with("http://")
+    let is_remote_item = item_uri.starts_with("http://")
         || item_uri.starts_with("https://")
         || item_uri.starts_with("s3://")
         || item_uri.starts_with("gs://")
         || item_uri.starts_with("az://")
         || item_uri.starts_with("abfs://")
-        || item_uri.starts_with("abfss://")
-    {
+        || item_uri.starts_with("abfss://");
+    if is_remote_item {
         let path_only = item_uri.split(['?', '#']).next().unwrap_or(item_uri);
+        if href.starts_with('/') {
+            // Root-relative href against remote scheme://authority origin
+            if let Some(scheme_end) = path_only.find("://") {
+                let after_scheme = scheme_end + 3;
+                let origin_end = path_only[after_scheme..]
+                    .find('/')
+                    .map(|p| after_scheme + p)
+                    .unwrap_or(path_only.len());
+                return format!("{}{}", &path_only[..origin_end], href);
+            }
+        }
         let base = match path_only.rfind('/') {
             Some(idx) => &path_only[..=idx],
             None => path_only,
         };
         format!("{base}{}", href.trim_start_matches("./"))
+    } else if href.starts_with('/') {
+        href.to_string()
     } else {
         let local = item_uri.strip_prefix("file://").unwrap_or(item_uri);
         let parent = Path::new(local).parent().unwrap_or_else(|| Path::new("."));
@@ -169,31 +181,36 @@ pub async fn resolve_stac_assets(
 ) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
     let mut names: Vec<String> = requested_assets.to_vec();
 
-    // If no explicit `?assets=` given, extract exact identifier tokens referenced in `?expression=`,
-    // otherwise default to all raster assets (up to 3).
+    // If no explicit `?assets=` given, extract exact identifier tokens referenced in `?expression=`
+    // using longest-prefix matching against known asset names (supporting both unspaced
+    // subtraction like `nir-red` and hyphenated asset names like `SR-B5-SR-B4`), otherwise
+    // default to all raster assets (up to 3).
     if names.is_empty() {
         if let Some(expr) = expr_raw {
+            let mut known: Vec<&str> = item.assets.keys().map(|s| s.as_str()).collect();
+            known.sort_by(|a, b| b.len().cmp(&a.len()));
             let mut seen = std::collections::HashSet::new();
             let bytes = expr.as_bytes();
             let mut i = 0usize;
             while i < bytes.len() {
-                if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_alphanumeric()
-                            || bytes[i] == b'_'
-                            || bytes[i] == b'-')
-                    {
-                        i += 1;
+                let prev_is_ident =
+                    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if !prev_is_ident && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                    let rest = &expr[i..];
+                    if let Some(&matched) = known.iter().find(|&&name| {
+                        rest.starts_with(name)
+                            && !bytes
+                                .get(i + name.len())
+                                .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                    }) {
+                        if seen.insert(matched) {
+                            names.push(matched.to_string());
+                        }
+                        i += matched.len();
+                        continue;
                     }
-                    let tok = &expr[start..i];
-                    if item.assets.contains_key(tok) && seen.insert(tok) {
-                        names.push(tok.to_string());
-                    }
-                } else {
-                    i += 1;
                 }
+                i += 1;
             }
         }
         if names.is_empty() {
@@ -242,36 +259,39 @@ pub async fn resolve_stac_assets(
     Ok((names, cogs, rewritten_expr))
 }
 
-/// Single-pass identifier-boundary replacement of STAC asset names with `b1`, `b2`, ...
+/// Single-pass longest-prefix identifier-boundary replacement of STAC asset names with
+/// `b1`, `b2`, ... (handles both unspaced subtraction `nir-red` and hyphenated names `SR-B5-SR-B4`).
 pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
+    let mut ordered: Vec<(usize, &str)> = names
+        .iter()
+        .enumerate()
+        .map(|(idx, n)| (idx + 1, n.as_str()))
+        .collect();
+    ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
     let bytes = expr.as_bytes();
     let mut out = String::with_capacity(expr.len());
     let mut i = 0;
     while i < bytes.len() {
-        let b = bytes[i];
-        if b.is_ascii_alphabetic() || b == b'_' {
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
-            {
-                // Stop before `-` unless a known asset name actually contains `-`
-                if bytes[i] == b'-' && !names.iter().any(|n| n.contains('-')) {
-                    break;
-                }
-                i += 1;
-            }
-            let tok = &expr[start..i];
-            if let Some(pos) = names.iter().position(|n| n == tok) {
+        let prev_is_ident =
+            i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !prev_is_ident && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let rest = &expr[i..];
+            if let Some(&(band_1based, matched)) = ordered.iter().find(|&&(_, name)| {
+                rest.starts_with(name)
+                    && !bytes
+                        .get(i + name.len())
+                        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+            }) {
                 out.push('b');
-                out.push_str(&(pos + 1).to_string());
-            } else {
-                out.push_str(tok);
+                out.push_str(&band_1based.to_string());
+                i += matched.len();
+                continue;
             }
-        } else {
-            let ch = expr[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
         }
+        let ch = expr[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -464,13 +484,24 @@ mod tests {
             "sqrt(abs(b1 - b3)) + b2"
         );
 
-        // resolve_href must ignore slashes inside signed query strings
+        // Unspaced subtraction with hyphenated asset names (`SR-B5-SR-B4`) must rewrite cleanly
+        let hyphenated = vec!["SR-B5".to_string(), "SR-B4".to_string()];
+        assert_eq!(
+            rewrite_stac_expr("(SR-B5-SR-B4)/(SR-B5+SR-B4)", &hyphenated),
+            "(b1-b2)/(b1+b2)"
+        );
+
+        // resolve_href must ignore slashes inside signed query strings and resolve root-relative hrefs
         assert_eq!(
             resolve_href(
                 "https://host.example/items/scene.json?sig=a/b/c",
                 "./B10.tif"
             ),
             "https://host.example/items/B10.tif"
+        );
+        assert_eq!(
+            resolve_href("https://host.example/stac/items/scene.json", "/data/B10.tif"),
+            "https://host.example/data/B10.tif"
         );
     }
 }
