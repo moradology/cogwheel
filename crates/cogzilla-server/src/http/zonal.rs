@@ -155,8 +155,11 @@ fn burn_line(from: (f64, f64), to: (f64, f64), width: i64, height: i64, out: &mu
             x_end -= y_end / slope;
         }
     }
-    // Step from cell to cell.
-    while x >= 0.0 && x < x_end {
+    // Step from cell to cell. Every step enters a new column or a new row, so the walk is
+    // bounded by the size of the grid; the budget only stops a walk that rounding stalls.
+    let mut budget = 4 * (width + height) + 64;
+    while x >= 0.0 && x < x_end && budget > 0 {
+        budget -= 1;
         let (col, row) = (x.floor() as i64, y.floor() as i64);
         if row >= 0 && row < height && col < width {
             out.push((row as u32, col as u32));
@@ -412,6 +415,9 @@ mod tests {
         assert_eq!(counts[0], 100);
         // Sub-columns 10 (centre inside) and 11 (the edge at 11.0 runs along its left side).
         assert_eq!(counts[1], 20);
+        // Vertices far outside the grid: the walk is clipped to it and still ends.
+        let huge = vec![vec![(-1.0e9, -1.0e9), (2.0e9, -1.0e9), (0.0, 2.0e9), (-1.0e9, -1.0e9)]];
+        assert_eq!(cover_counts(&huge, 2, 1, 10), [100, 100]);
         // A polygon away from the grid touches nothing.
         let far = vec![vec![(10.0, 10.0), (12.0, 10.0), (12.0, 12.0), (10.0, 10.0)]];
         assert!(cover_counts(&far, 2, 1, 10).iter().all(|c| *c == 0));
