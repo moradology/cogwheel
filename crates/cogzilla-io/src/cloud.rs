@@ -165,8 +165,15 @@ impl GcsConfig {
         let endpoint = std::env::var("GS_ENDPOINT_URL")
             .or_else(|_| std::env::var("STORAGE_EMULATOR_HOST"))
             .ok()
-            .map(|s| s.trim_end_matches('/').to_string())
+            .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    s
+                } else {
+                    format!("http://{s}")
+                }
+            })
             .unwrap_or_else(|| "https://storage.googleapis.com".to_string());
         let no_sign = std::env::var("GS_NO_SIGN_REQUEST")
             .map(|v| v.eq_ignore_ascii_case("YES") || v.eq_ignore_ascii_case("true") || v == "1")
@@ -292,14 +299,19 @@ pub async fn fetch_gcs_range(
         };
         let status = resp.status().as_u16();
         if is_retryable_status(status) {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
             permit.on_throttle();
             if attempt < cfg.max_retries {
-                tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
                 continue;
             }
             return Err(IoError::HttpStatus { status, url });
         }
-        if !resp.status().is_success() {
+        if status != 200 && status != 206 {
             return Err(IoError::HttpStatus { status, url });
         }
         match resp.bytes().await {
@@ -387,16 +399,19 @@ pub async fn fetch_azure_range(
             } else if let Some(key) = &cfg.access_key {
                 let date_hdr = format_rfc1123_now();
                 req = req.header("x-ms-date", &date_hdr);
-                if let Some(auth) = sign_azure_shared_key(
+                let Some(auth) = sign_azure_shared_key(
                     &target.account,
                     &target.container,
                     &target.blob,
                     &range_hdr,
                     &date_hdr,
                     key,
-                ) {
-                    req = req.header("Authorization", auth);
-                }
+                ) else {
+                    return Err(IoError::InvalidUri(
+                        "invalid base64 AZURE_STORAGE_ACCESS_KEY".to_string(),
+                    ));
+                };
+                req = req.header("Authorization", auth);
             }
         }
 
@@ -416,14 +431,19 @@ pub async fn fetch_azure_range(
         };
         let status = resp.status().as_u16();
         if is_retryable_status(status) {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
             permit.on_throttle();
             if attempt < cfg.max_retries {
-                tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
                 continue;
             }
             return Err(IoError::HttpStatus { status, url });
         }
-        if !resp.status().is_success() {
+        if status != 200 && status != 206 {
             return Err(IoError::HttpStatus { status, url });
         }
         match resp.bytes().await {

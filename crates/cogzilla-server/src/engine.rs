@@ -185,6 +185,10 @@ impl TileEngine {
         self.catalogs.get(name).map(|v| v.clone())
     }
 
+    pub fn catalog_count(&self) -> usize {
+        self.catalogs.len()
+    }
+
     /// Pre-register a multi-COG satellite scene (e.g., Landsat `[B4, B3, B2]` or SAR `[VV, VH]`).
     pub fn register_local_scene<P: AsRef<Path>>(
         &self,

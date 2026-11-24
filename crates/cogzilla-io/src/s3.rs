@@ -383,15 +383,55 @@ pub fn parse_aws_json_credentials(body: &str) -> Option<AwsCredentials> {
 
     let access_key = extract_str(body, "AccessKeyId")?;
     let secret_key = extract_str(body, "SecretAccessKey")?;
-    let session_token = extract_str(body, "Token");
-    // Refresh after 15 minutes if Expiration isn't parsed in detail
-    let expires_at = Some(Instant::now() + Duration::from_secs(900));
+    let session_token = extract_str(body, "Token").filter(|s| !s.is_empty());
+    let ttl_secs = extract_str(body, "Expiration")
+        .and_then(|s| parse_iso8601_utc_epoch(&s))
+        .and_then(|exp_epoch| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(exp_epoch.saturating_sub(now))
+        })
+        .unwrap_or(900)
+        .min(21_600);
+    let expires_at = Some(Instant::now() + Duration::from_secs(ttl_secs));
     Some(AwsCredentials {
         access_key,
         secret_key,
         session_token,
         expires_at,
     })
+}
+
+/// Minimal ISO-8601 UTC timestamp parser (`YYYY-MM-DDTHH:MM:SSZ`) returning Unix epoch seconds.
+fn parse_iso8601_utc_epoch(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    let hour: u64 = s[11..13].parse().ok()?;
+    let min: u64 = s[14..16].parse().ok()?;
+    let sec: u64 = s[17..19].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Howard Hinnant's civil-from-days inverse (days since 1970-01-01)
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m_adj = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m_adj + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400 + hour * 3600 + min * 60 + sec)
 }
 
 /// Global lock-free cache mapping `bucket -> discovered AWS region` (populated automatically

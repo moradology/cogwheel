@@ -131,10 +131,15 @@ pub fn build_tilejson(
         0.5 * (bounds[1] + bounds[3]),
         minzoom as f64,
     ];
-    let tile_url = if raw_query.is_empty() {
-        format!("http://{host}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}")
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
     } else {
-        format!("http://{host}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}")
+        format!("http://{host}")
+    };
+    let tile_url = if raw_query.is_empty() {
+        format!("{origin}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}")
+    } else {
+        format!("{origin}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}")
     };
     Ok(serde_json::json!({
         "tilejson": "3.0.0",

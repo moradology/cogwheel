@@ -287,13 +287,18 @@ pub const AVAILABLE_COLORMAPS: &[&str] = &[
 ];
 
 pub fn list_colormaps_json(host: &str) -> serde_json::Value {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    };
     let items: Vec<serde_json::Value> = cogzilla_kernel::colormap_catalog::COLORMAP_CATALOG_NAMES
         .iter()
         .map(|id| {
             serde_json::json!({
                 "id": id,
                 "links": [{
-                    "href": format!("http://{host}/colorMaps/{id}"),
+                    "href": format!("{origin}/colorMaps/{id}"),
                     "rel": "item",
                     "type": "application/json",
                     "title": format!("Definition of {id} ColorMap")
@@ -342,13 +347,18 @@ pub fn get_colormap_png(id: &str) -> Result<Bytes, EngineError> {
 // ============================================================================
 
 pub fn list_tms_json(host: &str) -> serde_json::Value {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    };
     serde_json::json!({
         "tileMatrixSets": [
             {
                 "id": "WebMercatorQuad",
                 "title": "Google Maps Compatible for the World",
                 "links": [{
-                    "href": format!("http://{host}/tileMatrixSets/WebMercatorQuad"),
+                    "href": format!("{origin}/tileMatrixSets/WebMercatorQuad"),
                     "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
                     "type": "application/json"
                 }]
@@ -357,7 +367,7 @@ pub fn list_tms_json(host: &str) -> serde_json::Value {
                 "id": "WorldCRS84Quad",
                 "title": "CRS84 for the World",
                 "links": [{
-                    "href": format!("http://{host}/tileMatrixSets/WorldCRS84Quad"),
+                    "href": format!("{origin}/tileMatrixSets/WorldCRS84Quad"),
                     "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
                     "type": "application/json"
                 }]

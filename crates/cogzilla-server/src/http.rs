@@ -888,12 +888,21 @@ where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
-    let host = req
+    let proto = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim())
+        .filter(|&s| s.eq_ignore_ascii_case("https") || s.eq_ignore_ascii_case("http"))
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "http".to_string());
+    let host_raw = req
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1:8080")
-        .to_string();
+        .unwrap_or("127.0.0.1:8080");
+    let host = format!("{proto}://{host_raw}");
     let if_none_match = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -904,6 +913,8 @@ where
     } else {
         req.method().clone()
     };
+    let is_post = method == Method::POST;
+    let if_none_match = if is_post { None } else { if_none_match };
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
 
@@ -1108,7 +1119,13 @@ where
             };
 
             let count = catalog.len();
+            if engine.catalog_count() >= 256 && engine.get_catalog(&name).is_none() {
+                return Err(EngineError::BadRequest(
+                    "maximum registered mosaic catalogs (256) reached".into(),
+                ));
+            }
             engine.register_catalog(name.clone(), catalog);
+            engine.tile_cache.clear();
             let body = serde_json::json!({
                 "name": name,
                 "scenes": count,
@@ -1141,7 +1158,7 @@ where
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let tile_url =
-                    format!("http://{host}/mosaicjson/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
+                    format!("{host}/mosaicjson/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
                 let tj = serde_json::json!({
                     "tilejson": "3.0.0",
                     "version": mj.version,
@@ -1511,7 +1528,7 @@ where
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
-                let tile_url = format!("http://{host}/stac/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
+                let tile_url = format!("{host}/stac/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
                 tj["tiles"] = serde_json::json!([tile_url]);
                 tj["name"] = serde_json::json!(item.id);
                 Ok((Bytes::from(tj.to_string()), "application/json"))
@@ -2333,7 +2350,7 @@ fn compute_etag(bytes: &[u8]) -> String {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    format!("\"cgz-{h:016x}-{}\"", bytes.len())
+    format!("W/\"cgz-{h:016x}-{}\"", bytes.len())
 }
 
 fn etag_matches(if_none_match: &str, etag: &str) -> bool {
@@ -2341,9 +2358,10 @@ fn etag_matches(if_none_match: &str, etag: &str) -> bool {
     if trimmed == "*" {
         return true;
     }
+    let target = etag.strip_prefix("W/").unwrap_or(etag);
     for part in trimmed.split(',') {
         let cand = part.trim().strip_prefix("W/").unwrap_or(part.trim());
-        if cand == etag {
+        if cand == target {
             return true;
         }
     }
