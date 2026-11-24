@@ -431,6 +431,200 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
     Ok(meta)
 }
 
+/// Escape XML text and attribute special characters.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Build an OGC WMTS 1.0.0 `WMTSCapabilities.xml` document for `/cog`, `/stac`, or `/mosaicjson`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_wmts_capabilities(
+    host: &str,
+    family: &str,
+    tms: &str,
+    title: &str,
+    bounds: [f64; 4],
+    minzoom: u8,
+    maxzoom: u8,
+    tile_format: &str,
+    tile_scale: u32,
+    tile_query: &str,
+    capabilities_query: &str,
+    use_epsg: bool,
+) -> String {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", host.trim_end_matches('/'))
+    };
+    let scale_str = if tile_scale > 1 {
+        format!("@{tile_scale}x")
+    } else {
+        String::new()
+    };
+    let media_type = match tile_format {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "npy" => "application/x-binary",
+        "f32" | "bin" | "raw" => "application/octet-stream",
+        _ => "image/png",
+    };
+    let q_tile = if tile_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{tile_query}")
+    };
+    let q_cap = if capabilities_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{capabilities_query}")
+    };
+    let capabilities_url = xml_escape(&format!(
+        "{origin}/{family}/{tms}/WMTSCapabilities.xml{q_cap}"
+    ));
+    let tile_template = xml_escape(&format!(
+        "{origin}/{family}/tiles/{tms}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}{scale_str}.{tile_format}{q_tile}"
+    ));
+    let tile_base = xml_escape(&format!("{origin}/{family}/tiles/{tms}"));
+    let title_esc = xml_escape(title);
+    let tile_px = 256u32 * tile_scale.clamp(1, 4);
+
+    let (crs_urn, max_tms_z) = if tms == "WorldCRS84Quad" {
+        let crs = if use_epsg {
+            "urn:ogc:def:crs:EPSG::4326"
+        } else {
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        };
+        (crs, 23u8)
+    } else {
+        let crs = if use_epsg {
+            "urn:ogc:def:crs:EPSG::3857"
+        } else {
+            "http://www.opengis.net/def/crs/EPSG/0/3857"
+        };
+        (crs, 24u8)
+    };
+
+    let z0 = minzoom.min(max_tms_z);
+    let z1 = maxzoom.max(z0).min(max_tms_z);
+    let mut matrices_xml = String::new();
+    for z in z0..=z1 {
+        if tms == "WorldCRS84Quad" {
+            let rows = 1u64 << z;
+            let cols = 2u64 << z;
+            let deg_per_px = 180.0 / ((rows as f64) * 256.0);
+            let scale_denom = (deg_per_px * 111_319.490_793_273_58) / 0.00028;
+            matrices_xml.push_str(&format!(
+                "            <TileMatrix>\n\
+                 \x20               <ows:Identifier>{z}</ows:Identifier>\n\
+                 \x20               <ScaleDenominator>{scale_denom:.6}</ScaleDenominator>\n\
+                 \x20               <TopLeftCorner>-180.0 90.0</TopLeftCorner>\n\
+                 \x20               <TileWidth>{tile_px}</TileWidth>\n\
+                 \x20               <TileHeight>{tile_px}</TileHeight>\n\
+                 \x20               <MatrixWidth>{cols}</MatrixWidth>\n\
+                 \x20               <MatrixHeight>{rows}</MatrixHeight>\n\
+                 \x20           </TileMatrix>\n"
+            ));
+        } else {
+            let n = 1u64 << z;
+            let res = (2.0 * cogzilla_proj::ORIGIN_SHIFT) / ((n as f64) * 256.0);
+            let scale_denom = res / 0.00028;
+            matrices_xml.push_str(&format!(
+                "            <TileMatrix>\n\
+                 \x20               <ows:Identifier>{z}</ows:Identifier>\n\
+                 \x20               <ScaleDenominator>{scale_denom:.6}</ScaleDenominator>\n\
+                 \x20               <TopLeftCorner>-20037508.342789244 20037508.342789244</TopLeftCorner>\n\
+                 \x20               <TileWidth>{tile_px}</TileWidth>\n\
+                 \x20               <TileHeight>{tile_px}</TileHeight>\n\
+                 \x20               <MatrixWidth>{n}</MatrixWidth>\n\
+                 \x20               <MatrixHeight>{n}</MatrixHeight>\n\
+                 \x20           </TileMatrix>\n"
+            ));
+        }
+    }
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Capabilities xmlns="http://www.opengis.net/wmts/1.0"
+    xmlns:ows="http://www.opengis.net/ows/1.1"
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:gml="http://www.opengis.net/gml"
+    xsi:schemaLocation="http://www.opengis.net/wmts/1.0 http://schemas.opengis.net/wmts/1.0/wmtsGetCapabilities_response.xsd"
+    version="1.0.0">
+    <ows:ServiceIdentification>
+        <ows:Title>{title_esc}</ows:Title>
+        <ows:ServiceType>OGC WMTS</ows:ServiceType>
+        <ows:ServiceTypeVersion>1.0.0</ows:ServiceTypeVersion>
+    </ows:ServiceIdentification>
+    <ows:OperationsMetadata>
+        <ows:Operation name="GetCapabilities">
+            <ows:DCP>
+                <ows:HTTP>
+                    <ows:Get xlink:href="{capabilities_url}">
+                        <ows:Constraint name="GetEncoding">
+                            <ows:AllowedValues>
+                                <ows:Value>RESTful</ows:Value>
+                            </ows:AllowedValues>
+                        </ows:Constraint>
+                    </ows:Get>
+                </ows:HTTP>
+            </ows:DCP>
+        </ows:Operation>
+        <ows:Operation name="GetTile">
+            <ows:DCP>
+                <ows:HTTP>
+                    <ows:Get xlink:href="{tile_base}">
+                        <ows:Constraint name="GetEncoding">
+                            <ows:AllowedValues>
+                                <ows:Value>RESTful</ows:Value>
+                            </ows:AllowedValues>
+                        </ows:Constraint>
+                    </ows:Get>
+                </ows:HTTP>
+            </ows:DCP>
+        </ows:Operation>
+    </ows:OperationsMetadata>
+    <Contents>
+        <Layer>
+            <ows:Title>{title_esc}</ows:Title>
+            <ows:Identifier>cogeo</ows:Identifier>
+            <ows:WGS84BoundingBox crs="urn:ogc:def:crs:OGC:2:84">
+                <ows:LowerCorner>{} {}</ows:LowerCorner>
+                <ows:UpperCorner>{} {}</ows:UpperCorner>
+            </ows:WGS84BoundingBox>
+            <Style isDefault="true">
+                <ows:Identifier>default</ows:Identifier>
+            </Style>
+            <Format>{media_type}</Format>
+            <TileMatrixSetLink>
+                <TileMatrixSet>{tms}</TileMatrixSet>
+            </TileMatrixSetLink>
+            <ResourceURL format="{media_type}" resourceType="tile" template="{tile_template}"/>
+        </Layer>
+        <TileMatrixSet>
+            <ows:Title>{tms}</ows:Title>
+            <ows:Identifier>{tms}</ows:Identifier>
+            <ows:SupportedCRS>{crs_urn}</ows:SupportedCRS>
+{matrices_xml}        </TileMatrixSet>
+    </Contents>
+</Capabilities>
+"#,
+        bounds[0], bounds[1], bounds[2], bounds[3]
+    )
+}
+
 /// TiTiler-compatible TileJSON 3.0.0 (`/cog/{tms}/tilejson.json`).
 pub fn build_tilejson(
     engine: &TileEngine,

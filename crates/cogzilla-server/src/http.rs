@@ -8,6 +8,7 @@ use cogzilla_kernel::{
     ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram, OutputFormat,
     ResampleMode, SpectralExpr, TerrainEncoding,
 };
+use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
 use hyper::header::{
@@ -27,9 +28,9 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, build_cog_info, build_cog_info_geojson, build_cog_validate, build_map_html,
-    build_tilejson, compute_statistics, encode_rgba_output, get_algorithm_json,
-    list_algorithms_json, query_point, render_mercator_bbox, render_native_preview,
-    render_wgs84_bbox,
+    build_tilejson, build_wmts_capabilities, compute_statistics, encode_rgba_output,
+    get_algorithm_json, list_algorithms_json, query_point, render_mercator_bbox,
+    render_native_preview, render_wgs84_bbox,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -134,6 +135,10 @@ struct ParsedQuery {
     reproject: ResampleMode,
     tile_size: u32,
     max_size: u32,
+    width: Option<u32>,
+    height: Option<u32>,
+    orientation_vertical: bool,
+    use_epsg: bool,
     webp_quality: Option<f32>,
     jpeg_quality: u8,
     expr_raw: Option<String>,
@@ -173,6 +178,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         reproject: ResampleMode::Nearest,
         tile_size: 256,
         max_size: 1024,
+        width: None,
+        height: None,
+        orientation_vertical: false,
+        use_epsg: false,
         webp_quality: None,
         jpeg_quality: 85,
         expr_raw: None,
@@ -518,8 +527,24 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("unsupported tile_format (use png, webp, jpg, f32, or npy)");
                 }
             }
+            "width" => match v.parse::<u32>() {
+                Ok(n) if (1..=4096).contains(&n) => pq.width = Some(n),
+                _ => bad("expected width in 1..=4096"),
+            },
+            "height" => match v.parse::<u32>() {
+                Ok(n) if (1..=4096).contains(&n) => pq.height = Some(n),
+                _ => bad("expected height in 1..=4096"),
+            },
+            "orientation" => match v.to_ascii_lowercase().as_str() {
+                "horizontal" => pq.orientation_vertical = false,
+                "vertical" => pq.orientation_vertical = true,
+                _ => bad("expected horizontal or vertical"),
+            },
+            "use_epsg" => {
+                pq.use_epsg = v.eq_ignore_ascii_case("true") || v == "1";
+            }
             "dst_crs" | "crs" | "histogram_bins" | "histogram_range" | "categorical" | "c"
-            | "p" | "cover_scale" | "height" | "width" | "orientation" => {
+            | "p" | "cover_scale" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
@@ -557,10 +582,13 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         }
     }
 
-    // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html
+    // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html,
+    // {family}/{tms}/WMTSCapabilities.xml
     if family != "tiles" && family != "colorMaps" {
         let last = segs.last().copied().unwrap_or("");
-        let tms = if (last == "tilejson.json" || last == "map.html") && segs.len() >= 3 {
+        let tms = if matches!(last, "tilejson.json" | "map.html" | "WMTSCapabilities.xml")
+            && segs.len() >= 3
+        {
             Some(segs[segs.len() - 2])
         } else {
             match segs.iter().position(|s| *s == "tiles") {
@@ -583,11 +611,26 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     }
 
     let has = |names: &[&str]| pq.keys.iter().find(|k| names.contains(&k.as_str())).cloned();
-    // Only match route sub-endpoints on `/cog/...` and `/stac/...` so dataset/catalog names like
-    // `/tiles/statistics/0/0/0.png` or `/mosaic/point/tiles/0/0/0.png` are never misclassified.
+    // Only match route sub-endpoints on `/cog/...`, `/stac/...`, and `/mosaicjson/...` so
+    // dataset/catalog names like `/tiles/statistics/0/0/0.png` are never misclassified.
     let route = |name: &str| {
-        matches!(segs[0], "cog" | "stac") && segs.get(1) == Some(&name)
+        matches!(segs[0], "cog" | "stac" | "mosaicjson")
+            && segs
+                .get(1)
+                .is_some_and(|s| *s == name || s.starts_with(&format!("{name}.")))
     };
+    if family != "colorMaps" {
+        if let Some(k) = has(&["orientation"]) {
+            return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
+        }
+    }
+    if !(route("preview") || route("bbox") || route("feature")) {
+        if let Some(k) = has(&["width", "height"]) {
+            return Err(format!(
+                "parameter '{k}' is only supported on preview, bbox, and feature routes"
+            ));
+        }
+    }
     if route("statistics") || route("asset_statistics") {
         if let Some(k) = has(&["expression", "expr", "index", "algorithm", "bidx", "indexes"]) {
             return Err(format!("parameter '{k}' is not supported on statistics routes"));
@@ -603,15 +646,20 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         }
     }
     if route("bbox") && segs.len() >= 4 {
-        if let Some(k) = has(&["max_size"]) {
+        if let Some(k) = has(&["max_size", "width", "height"]) {
+            return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
+        }
+    }
+    if (route("preview") || route("feature")) && segs.len() >= 3 {
+        if let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
     }
     let last_seg = segs.last().copied().unwrap_or("");
-    if last_seg != "tilejson.json" && last_seg != "map.html" {
+    if !matches!(last_seg, "tilejson.json" | "map.html" | "WMTSCapabilities.xml") {
         if let Some(k) = has(&["minzoom", "maxzoom", "tile_format", "tile_scale"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on tilejson.json and map.html routes"
+                "parameter '{k}' is only supported on tilejson.json, map.html, and WMTSCapabilities.xml routes"
             ));
         }
     } else if let (Some(minz), Some(maxz)) = (pq.minzoom, pq.maxzoom)
@@ -620,6 +668,42 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         return Err(format!("minzoom ({minz}) must be <= maxzoom ({maxz})"));
     }
     Ok(())
+}
+
+/// Apply optional `?width=` / `?height=` overrides onto aspect-preserving default dimensions.
+fn resolve_query_dims(default_w: u32, default_h: u32, q_w: Option<u32>, q_h: Option<u32>) -> (u32, u32) {
+    match (q_w, q_h) {
+        (Some(w), Some(h)) => (w.clamp(1, 4096), h.clamp(1, 4096)),
+        (Some(w), None) => {
+            let w = w.clamp(1, 4096);
+            let h = ((w as f64 * (default_h as f64 / default_w.max(1) as f64)).round() as u32)
+                .clamp(1, 4096);
+            (w, h)
+        }
+        (None, Some(h)) => {
+            let h = h.clamp(1, 4096);
+            let w = ((h as f64 * (default_w as f64 / default_h.max(1) as f64)).round() as u32)
+                .clamp(1, 4096);
+            (w, h)
+        }
+        (None, None) => (default_w, default_h),
+    }
+}
+
+/// Strip TileJSON/WMTS-only query parameters so they are not forwarded into tile URL templates.
+fn filter_tile_template_query(raw_query: &str) -> String {
+    raw_query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split('=').next().unwrap_or("");
+            !pair.is_empty()
+                && !matches!(
+                    k,
+                    "minzoom" | "maxzoom" | "tile_format" | "tile_scale" | "use_epsg"
+                )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Apply TiTiler `minzoom`, `maxzoom`, `tile_format`, and `tile_scale` query overrides to a
@@ -1606,11 +1690,29 @@ where
 
     // ------------------------------------------------------------------------
     // TiTiler MosaicJSON Router:
-    //   GET /mosaicjson/info?url=...
-    //   GET /mosaicjson/{tms}/tilejson.json?url=...
-    //   GET /mosaicjson/tiles/{tms}/{z}/{x}/{y}[@scale][.{ext}]?url=...
-    //   GET /mosaicjson/tiles/{z}/{x}/{y}[@scale][.{ext}]?url=...
+    //   GET  /mosaicjson/info?url=...
+    //   GET  /mosaicjson/bounds?url=...
+    //   GET  /mosaicjson/tiles?url=...
+    //   GET  /mosaicjson/tiles/{tms}?url=...
+    //   GET  /mosaicjson/point/{lon},{lat}?url=...
+    //   GET  /mosaicjson/{tms}/tilejson.json?url=...
+    //   GET  /mosaicjson/{tms}/WMTSCapabilities.xml?url=...
+    //   GET  /mosaicjson/{tms}/map.html?url=...
+    //   GET  /mosaicjson/tiles/{tms}/{z}/{x}/{y}[@scale][.{ext}]?url=...
+    //   POST /mosaicjson/validate
     // ------------------------------------------------------------------------
+    if method == Method::POST && segs.as_slice() == ["mosaicjson", "validate"] {
+        let res: Result<(Bytes, &'static str), EngineError> = async {
+            let body_bytes = read_limited_body(req.into_body()).await?;
+            let text = std::str::from_utf8(&body_bytes)
+                .map_err(|e| EngineError::BadRequest(format!("invalid UTF-8 body: {e}")))?;
+            let mj = MosaicJsonCatalog::from_json_str(text).map_err(EngineError::BadRequest)?;
+            Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
+        }
+        .await;
+        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+    }
+
     if method == Method::GET && segs.first() == Some(&"mosaicjson") {
         let mj_url = pq.urls.first().cloned();
         let res: Result<(Bytes, &'static str), EngineError> = match segs.as_slice() {
@@ -1620,6 +1722,109 @@ where
                 Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
             }
             .await,
+            ["mosaicjson", "bounds"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let body = serde_json::json!({ "bounds": mj.bounds }).to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "tiles"] => {
+                let body = serde_json::json!({
+                    "tilesets": [
+                        {
+                            "title": "WebMercatorQuad",
+                            "id": "WebMercatorQuad",
+                            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857"
+                        }
+                    ]
+                })
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
+            ["mosaicjson", "tiles", tms] => {
+                let body = serde_json::json!({
+                    "title": tms,
+                    "tileMatrixSetId": tms,
+                    "dataType": "map",
+                    "crs": "http://www.opengis.net/def/crs/EPSG/0/3857"
+                })
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
+            ["mosaicjson", "point", coord] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let Some((lons, lats)) = coord.split_once(',') else {
+                    return Err(EngineError::BadRequest(
+                        "expected /mosaicjson/point/{lon},{lat}".into(),
+                    ));
+                };
+                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
+                    return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
+                };
+                let (lon, lat, mx, my) = if pq.coord_crs_3857 {
+                    let (lo, la) = mercator_to_lonlat_deg(x, y);
+                    (lo, la, x, y)
+                } else {
+                    let (mx, my) = lonlat_deg_to_mercator(x, y);
+                    (x, y, mx, my)
+                };
+                let urls = mj.query_bbox_3857(mx, my, mx, my);
+                let mut assets_out = Vec::new();
+                for asset_url in urls.into_iter().take(16) {
+                    let cog = engine.store.open_uri(&asset_url).await?;
+                    match query_point(&engine, &cog, lon, lat, pq.unscale, pq.nodata).await {
+                        Ok(pt) => {
+                            let vals = pt["values"].clone();
+                            let names = pt["band_names"].clone();
+                            assets_out.push(serde_json::json!([asset_url, vals, names]));
+                        }
+                        Err(EngineError::NotFound(_)) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                if assets_out.is_empty() {
+                    return Err(EngineError::NotFound(
+                        "point outside all MosaicJSON scenes".into(),
+                    ));
+                }
+                let body = serde_json::json!({
+                    "coordinates": [x, y],
+                    "assets": assets_out,
+                })
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
+            .await,
+            ["mosaicjson", _, "WMTSCapabilities.xml"] | ["mosaicjson", "WMTSCapabilities.xml"] => {
+                async {
+                    let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
+                    let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                    let mj = load_mosaicjson(&engine, &u).await?;
+                    let minz = pq.minzoom.unwrap_or(mj.minzoom);
+                    let maxz = pq.maxzoom.unwrap_or(mj.maxzoom).max(minz);
+                    let fmt = pq.tile_format.as_deref().unwrap_or("png");
+                    let scale = pq.tile_scale.unwrap_or(1);
+                    let tile_q = filter_tile_template_query(&raw_query);
+                    let xml = build_wmts_capabilities(
+                        &host,
+                        "mosaicjson",
+                        tms,
+                        "MosaicJSON",
+                        mj.bounds,
+                        minz,
+                        maxz,
+                        fmt,
+                        scale,
+                        &tile_q,
+                        &raw_query,
+                        pq.use_epsg,
+                    );
+                    Ok((Bytes::from(xml), "application/xml"))
+                }
+                .await
+            }
             ["mosaicjson", _, "tilejson.json"] | ["mosaicjson", "tilejson.json"] => async {
                 let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -2009,15 +2214,22 @@ where
                 None | Some("json") => {
                     get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
                 }
-                Some("png") => get_colormap_image(id, OutputFormat::Png).map(|b| (b, "image/png")),
-                Some("jpg" | "jpeg") => {
-                    get_colormap_image(id, OutputFormat::Jpeg { quality: pq.jpeg_quality })
-                        .map(|b| (b, "image/jpeg"))
+                Some("png") => {
+                    get_colormap_image(id, OutputFormat::Png, pq.orientation_vertical)
+                        .map(|b| (b, "image/png"))
                 }
-                Some("webp") => {
-                    get_colormap_image(id, OutputFormat::Webp { quality: pq.webp_quality })
-                        .map(|b| (b, "image/webp"))
-                }
+                Some("jpg" | "jpeg") => get_colormap_image(
+                    id,
+                    OutputFormat::Jpeg { quality: pq.jpeg_quality },
+                    pq.orientation_vertical,
+                )
+                .map(|b| (b, "image/jpeg")),
+                Some("webp") => get_colormap_image(
+                    id,
+                    OutputFormat::Webp { quality: pq.webp_quality },
+                    pq.orientation_vertical,
+                )
+                .map(|b| (b, "image/webp")),
                 Some(other) => Err(EngineError::BadRequest(format!(
                     "unsupported colormap format '{other}' (use json, png, jpg, or webp)"
                 ))),
@@ -2402,6 +2614,50 @@ where
                 let tj_url = format!("{forwarded_prefix}/stac/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
+                async {
+                    let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
+                    let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                    let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                    let (_, cogs, _) =
+                        resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref())
+                            .await?;
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let full = cogs[0].index.full_res();
+                    let bounds = item
+                        .bbox
+                        .unwrap_or_else(|| crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height));
+                    let coarsest = cogs[0].index.ifds.last().unwrap();
+                    let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
+                        .max(full.height as f64 / coarsest.height.max(1) as f64);
+                    let (def_min, def_max) = if tms == "WorldCRS84Quad" {
+                        crs.world_crs84_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                    } else {
+                        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                    };
+                    let minz = pq.minzoom.unwrap_or(def_min);
+                    let maxz = pq.maxzoom.unwrap_or(def_max).max(minz);
+                    let fmt = pq.tile_format.as_deref().unwrap_or("png");
+                    let scale = pq.tile_scale.unwrap_or(1);
+                    let tile_q = filter_tile_template_query(&raw_query);
+                    let xml = build_wmts_capabilities(
+                        &host,
+                        "stac",
+                        tms,
+                        &item.id,
+                        bounds,
+                        minz,
+                        maxz,
+                        fmt,
+                        scale,
+                        &tile_q,
+                        &raw_query,
+                        pq.use_epsg,
+                    );
+                    Ok((Bytes::from(xml), "application/xml"))
+                }
+                .await
+            }
 
             // GET /stac/tiles/{tms}/{z}/{x}/{y}[@scale][.{format}]
             // and alias GET /stac/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
@@ -2618,8 +2874,9 @@ where
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let scale = (pq_stac.max_size as f64) / (full.width.max(full.height) as f64);
-                let out_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
+                let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -2724,7 +2981,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, pq_stac.max_size);
+                let (def_w, def_h) = aspect_preserving_dims(bbox, pq_stac.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let data = if pq_stac.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
@@ -2874,7 +3132,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, s);
+                let (def_w, def_h) = aspect_preserving_dims(bbox, s);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
@@ -3231,6 +3490,44 @@ where
                 let tj_url = format!("{forwarded_prefix}/cog/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
+                async {
+                    let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
+                    let cogs = open_query_urls(&engine, &pq.urls).await?;
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let full = cogs[0].index.full_res();
+                    let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let coarsest = cogs[0].index.ifds.last().unwrap();
+                    let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
+                        .max(full.height as f64 / coarsest.height.max(1) as f64);
+                    let (def_min, def_max) = if tms == "WorldCRS84Quad" {
+                        crs.world_crs84_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                    } else {
+                        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                    };
+                    let minz = pq.minzoom.unwrap_or(def_min);
+                    let maxz = pq.maxzoom.unwrap_or(def_max).max(minz);
+                    let fmt = pq.tile_format.as_deref().unwrap_or("png");
+                    let scale = pq.tile_scale.unwrap_or(1);
+                    let tile_q = filter_tile_template_query(&raw_query);
+                    let xml = build_wmts_capabilities(
+                        &host,
+                        "cog",
+                        tms,
+                        "Cloud Optimized GeoTIFF",
+                        bounds,
+                        minz,
+                        maxz,
+                        fmt,
+                        scale,
+                        &tile_q,
+                        &raw_query,
+                        pq.use_epsg,
+                    );
+                    Ok((Bytes::from(xml), "application/xml"))
+                }
+                .await
+            }
 
             // 10. GET /cog/point/{lon},{lat} (supports coord_crs=EPSG:3857)
             (Method::GET, ["point", coord]) => async {
@@ -3266,8 +3563,9 @@ where
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
-                let out_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
+                let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -3332,7 +3630,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size);
+                let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let data = if pq.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
@@ -3410,7 +3709,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size);
+                let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
@@ -3860,5 +4160,50 @@ mod tests {
             get_algorithm_json("nonexistent"),
             Err(EngineError::NotFound(_))
         ));
+
+        // WMTSCapabilities.xml generation & XML escaping
+        let xml = build_wmts_capabilities(
+            "http://localhost:8080",
+            "cog",
+            "WebMercatorQuad",
+            "Test & <Layer>",
+            [-122.7, 37.7, -122.5, 37.8],
+            8,
+            10,
+            "webp",
+            2,
+            "url=https://ex.com/a.tif&rescale=0,100",
+            "url=https://ex.com/a.tif&rescale=0,100&tile_format=webp&tile_scale=2",
+            false,
+        );
+        assert!(xml.contains("xmlns=\"http://www.opengis.net/wmts/1.0\""));
+        assert!(xml.contains("Test &amp; &lt;Layer&gt;"));
+        assert!(xml.contains(
+            "http://localhost:8080/cog/tiles/WebMercatorQuad/{TileMatrix}/{TileCol}/{TileRow}@2x.webp?url=https://ex.com/a.tif&amp;rescale=0,100"
+        ));
+        assert!(xml.contains("<TileWidth>512</TileWidth>"));
+        assert!(xml.contains("<ows:Identifier>8</ows:Identifier>"));
+        assert!(xml.contains("<ows:Identifier>10</ows:Identifier>"));
+
+        // Vertical colormap PNG (20x256) + orientation/width/height query validation
+        let vpng = get_colormap_image("viridis", OutputFormat::Png, true).unwrap();
+        assert_eq!(&vpng[0..8], b"\x89PNG\r\n\x1a\n");
+        let w = u32::from_be_bytes([vpng[16], vpng[17], vpng[18], vpng[19]]);
+        let h = u32::from_be_bytes([vpng[20], vpng[21], vpng[22], vpng[23]]);
+        assert_eq!((w, h), (20, 256));
+
+        let pq_wh = parse_query(Some("url=a.tif&width=320&height=240"));
+        assert!(validate_query(&["cog", "preview.png"], &pq_wh).is_ok());
+        assert!(validate_query(&["cog", "preview", "256x256.png"], &pq_wh).is_err());
+        assert_eq!(resolve_query_dims(512, 256, Some(200), None), (200, 100));
+        assert_eq!(resolve_query_dims(512, 256, None, Some(100)), (200, 100));
+
+        let pq_ori = parse_query(Some("f=png&orientation=vertical"));
+        assert!(validate_query(&["colorMaps", "viridis"], &pq_ori).is_ok());
+        assert!(validate_query(&["cog", "info"], &pq_ori).is_err());
+
+        let pq_wmts = parse_query(Some("url=a.tif&minzoom=4&maxzoom=12&tile_format=png&tile_scale=2"));
+        assert!(validate_query(&["cog", "WebMercatorQuad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
+        assert!(validate_query(&["mosaicjson", "WorldCRS84Quad", "WMTSCapabilities.xml"], &pq_wmts).is_err());
     }
 }

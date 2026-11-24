@@ -64,10 +64,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("point expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1/b2")),
         ("point coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:32610")),
         ("preview dst_crs", format!("{base}/cog/preview.png?url={sat_url}&dst_crs=epsg:4326")),
-        ("preview width", format!("{base}/cog/preview.png?url={sat_url}&width=300")),
+        ("preview explicit dims width", format!("{base}/cog/preview/256x256.png?url={sat_url}&width=300")),
         ("bbox explicit dims max_size", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8/256x256.png?url={sat_url}&max_size=2000")),
         ("info.geojson crs", format!("{base}/cog/info.geojson?url={sat_url}&crs=epsg:32610")),
-        ("colormap orientation", format!("{base}/colorMaps/viridis?f=png&orientation=vertical")),
+        ("non-colormap orientation", format!("{base}/cog/info?url={sat_url}&orientation=vertical")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 400, "{what} should be rejected: {url}");
@@ -82,10 +82,41 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("hillshade", format!("{tile}&bidx=1&algorithm=hillshade")),
         ("WorldCRS84Quad", format!("{base}/cog/WorldCRS84Quad/tilejson.json?url={sat_url}")),
         ("point coord_crs 4326", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&coord_crs=epsg:4326")),
+        ("preview width query", format!("{base}/cog/preview.png?url={sat_url}&width=300")),
+        ("colormap vertical orientation", format!("{base}/colorMaps/viridis?f=png&orientation=vertical")),
+        ("algorithms list", format!("{base}/algorithms")),
+        ("algorithm hillshade", format!("{base}/algorithms/hillshade")),
+        ("cog validate", format!("{base}/cog/validate?url={sat_url}")),
+        ("cog wmts", format!("{base}/cog/WebMercatorQuad/WMTSCapabilities.xml?url={sat_url}")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");
     }
+    let prev_300 = client
+        .get(format!("{base}/cog/preview.png?url={sat_url}&width=300"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(u32::from_be_bytes(prev_300[16..20].try_into().unwrap()), 300, "width=300 yields 300 px PNG");
+    let vcm = client
+        .get(format!("{base}/colorMaps/viridis?f=png&orientation=vertical"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            u32::from_be_bytes(vcm[16..20].try_into().unwrap()),
+            u32::from_be_bytes(vcm[20..24].try_into().unwrap()),
+        ),
+        (20, 256),
+        "orientation=vertical yields 20x256 PNG"
+    );
     let big = client.get(format!("{tile}&tilesize=512&rescale=0,1")).send().await.unwrap().bytes().await.unwrap();
     assert_eq!(u32::from_be_bytes(big[16..20].try_into().unwrap()), 512, "tilesize=512 yields a 512 px PNG");
 

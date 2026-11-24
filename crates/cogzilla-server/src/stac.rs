@@ -437,45 +437,57 @@ pub fn get_colormap_json(id: &str) -> Result<serde_json::Value, EngineError> {
     Ok(serde_json::Value::Object(map))
 }
 
-pub fn get_colormap_png(id: &str) -> Result<Bytes, EngineError> {
+pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> {
     let cm = ColormapName::from_str_opt(id)
         .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
     let lut = cm.lut();
-    let w = 256usize;
-    let h = 20usize;
-    let mut row = vec![0u8; w * 3];
-    for x in 0..w {
-        let c = lut.rgb[x];
-        row[x * 3] = c[0];
-        row[x * 3 + 1] = c[1];
-        row[x * 3 + 2] = c[2];
-    }
+    let (w, h) = if vertical { (20usize, 256usize) } else { (256usize, 20usize) };
     let stride = 1 + w * 3;
     let mut filtered = vec![0u8; h * stride];
-    for y in 0..h {
-        filter_sub_rgb_row(&row, &mut filtered[y * stride..(y + 1) * stride]);
+    let mut row = vec![0u8; w * 3];
+    if vertical {
+        for y in 0..h {
+            let c = lut.rgb[y];
+            for x in 0..w {
+                row[x * 3] = c[0];
+                row[x * 3 + 1] = c[1];
+                row[x * 3 + 2] = c[2];
+            }
+            filter_sub_rgb_row(&row, &mut filtered[y * stride..(y + 1) * stride]);
+        }
+    } else {
+        for x in 0..w {
+            let c = lut.rgb[x];
+            row[x * 3] = c[0];
+            row[x * 3 + 1] = c[1];
+            row[x * 3 + 2] = c[2];
+        }
+        for y in 0..h {
+            filter_sub_rgb_row(&row, &mut filtered[y * stride..(y + 1) * stride]);
+        }
     }
     Ok(encode_filtered_png(w as u32, h as u32, 2, &filtered))
 }
 
-/// Render a 256×20 colormap colorbar in PNG, JPEG, or WebP format.
+/// Render a 256×20 (horizontal) or 20×256 (vertical) colormap colorbar in PNG, JPEG, or WebP.
 pub fn get_colormap_image(
     id: &str,
     format: cogzilla_kernel::OutputFormat,
+    vertical: bool,
 ) -> Result<Bytes, EngineError> {
     if matches!(format, cogzilla_kernel::OutputFormat::Png) {
-        return get_colormap_png(id);
+        return get_colormap_png(id, vertical);
     }
     let cm = ColormapName::from_str_opt(id)
         .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
     let lut = cm.lut();
-    let w = 256usize;
-    let h = 20usize;
+    let (w, h) = if vertical { (20usize, 256usize) } else { (256usize, 20usize) };
     let mut rgba = vec![0u8; w * h * 4];
     for y in 0..h {
         let row_off = y * w * 4;
         for x in 0..w {
-            let [r, g, b, a] = lut.rgba_u32[x].to_le_bytes();
+            let idx = if vertical { y } else { x };
+            let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
             let o = row_off + x * 4;
             rgba[o] = r;
             rgba[o + 1] = g;
