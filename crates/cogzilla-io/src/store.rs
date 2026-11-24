@@ -537,51 +537,127 @@ impl CogStore {
             }
         }
 
-        // Fetch & decode all owned misses (parallel multi-core decode when >= 2 blocks!)
+        // Fetch & decode all owned misses (bounded multi-core decode when beneficial)
         if !owned.is_empty() {
             let is_local = matches!(cog.source, CogSource::LocalMmap { .. });
-            if is_local && owned.len() >= 2 && ifd.mask_ifd.is_none() {
-                let decode_meta = Arc::new(clone_for_decode(ifd));
-                let byte_order = cog.index.byte_order;
-                let nodata = cog.index.nodata;
-                let mut decode_set = tokio::task::JoinSet::new();
+            let num_workers = tokio::runtime::Handle::current()
+                .metrics()
+                .num_workers()
+                .max(1);
+            let expected_bytes = (ifd.tile_width as usize)
+                .saturating_mul(ifd.tile_height as usize)
+                .saturating_mul(ifd.samples_per_pixel as usize)
+                .saturating_mul(ifd.sample_type.bytes_per_sample());
+            let trivial_block = ifd.compression == cogzilla_tiff::Compression::None
+                && ifd.predictor == cogzilla_tiff::Predictor::None
+                && expected_bytes <= 256 * 1024;
 
-                for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
-                    let src = cog.source.clone();
-                    let meta = decode_meta.clone();
-                    decode_set.spawn(async move {
-                        let Some(slice) = src.local_slice(offset, count) else {
+            if is_local {
+                if num_workers >= 2
+                    && owned.len() >= 2
+                    && !trivial_block
+                    && ifd.mask_ifd.is_none()
+                {
+                    let decode_meta = Arc::new(clone_for_decode(ifd));
+                    let byte_order = cog.index.byte_order;
+                    let nodata = cog.index.nodata;
+                    let mut decode_set = tokio::task::JoinSet::new();
+                    let mut decode_err: Option<IoError> = None;
+
+                    for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
+                        if decode_set.len() >= num_workers {
+                            if let Some(res) = decode_set.join_next().await {
+                                match res {
+                                    Ok(Ok((s, arc))) => results[s] = Some(arc),
+                                    Ok(Err(e)) => decode_err = Some(e),
+                                    Err(e) => {
+                                        decode_err = Some(IoError::Fs(std::io::Error::other(
+                                            format!("local decode task failed: {e}"),
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        let src = cog.source.clone();
+                        let meta = decode_meta.clone();
+                        decode_set.spawn(async move {
+                            let Some(slice) = src.local_slice(offset, count) else {
+                                return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                    required: offset + count as u64,
+                                    available: 0,
+                                }));
+                            };
+                            let decoded = decode_tile(slice, &meta, byte_order, nodata)?;
+                            let arc = Arc::new(decoded);
+                            if let Some(guard) = guard_opt {
+                                guard.complete(arc.clone());
+                            }
+                            Ok::<_, IoError>((orig_slot, arc))
+                        });
+                    }
+
+                    while let Some(res) = decode_set.join_next().await {
+                        match res {
+                            Ok(Ok((orig_slot, arc))) => {
+                                results[orig_slot] = Some(arc);
+                            }
+                            Ok(Err(e)) => decode_err = Some(e),
+                            Err(e) => {
+                                decode_err = Some(IoError::Fs(std::io::Error::other(format!(
+                                    "local decode task failed: {e}"
+                                ))));
+                            }
+                        }
+                    }
+                    if let Some(e) = decode_err {
+                        return Err(e);
+                    }
+                } else {
+                    // Zero-copy inline mmap decode (covers single-block, 1-vCPU, trivial
+                    // uncompressed blocks, and local COGs with an internal mask_ifd).
+                    let byte_order = cog.index.byte_order;
+                    let nodata = cog.index.nodata;
+                    for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
+                        let Some(slice) = cog.source.local_slice(offset, count) else {
                             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
                                 required: offset + count as u64,
                                 available: 0,
                             }));
                         };
-                        let decoded = decode_tile(slice, &meta, byte_order, nodata)?;
+                        let mut decoded = decode_tile(slice, ifd, byte_order, nodata)?;
+                        if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                            if mask_ifd.tile_width == ifd.tile_width
+                                && mask_ifd.tile_height == ifd.tile_height
+                            {
+                                if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                                    let per_plane = (ifd.tiles_across as usize)
+                                        * (ifd.tiles_down as usize);
+                                    let mask_idx = (*tidx as usize) % per_plane.max(1);
+                                    if let Some((moff, mlen)) = mask_ifd.tile_byte_range(mask_idx) {
+                                        let Some(mslice) = cog.source.local_slice(moff, mlen)
+                                        else {
+                                            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                                required: moff + mlen as u64,
+                                                available: 0,
+                                            }));
+                                        };
+                                        let mask = decode_mask_tile(mslice, mask_ifd)?;
+                                        apply_mask_to_tile(&mut decoded, &mask);
+                                    }
+                                }
+                            }
+                        }
                         let arc = Arc::new(decoded);
                         if let Some(guard) = guard_opt {
                             guard.complete(arc.clone());
                         }
-                        Ok::<_, IoError>((orig_slot, arc))
-                    });
-                }
-
-                let mut decode_err: Option<IoError> = None;
-                while let Some(res) = decode_set.join_next().await {
-                    match res {
-                        Ok(Ok((orig_slot, arc))) => {
-                            results[orig_slot] = Some(arc);
-                        }
-                        Ok(Err(e)) => decode_err = Some(e),
-                        Err(_) => {}
+                        results[orig_slot] = Some(arc);
                     }
-                }
-                if let Some(e) = decode_err {
-                    return Err(e);
                 }
             } else {
                 // Tier-2 compressed-block disk cache lookup for remote sources (RAM miss -> disk hit).
                 // Synchronously probe the in-memory index first so 100% cold misses do 0 JoinSet/spawn_blocking hops!
-                if !is_local && ifd.mask_ifd.is_none() {
+                if ifd.mask_ifd.is_none() {
                     if let Some(dc) = &self.disk_cache {
                         let prev_owned = std::mem::take(&mut owned);
                         let mut disk_candidates = Vec::new();
@@ -661,41 +737,84 @@ impl CogStore {
                             len,
                         })
                         .collect();
-                    let spans = coalesce_ranges(reqs, RANGE_GAP_THRESHOLD, MAX_COALESCED_SPAN);
+                    let mut spans =
+                        coalesce_ranges(reqs, RANGE_GAP_THRESHOLD, MAX_COALESCED_SPAN);
 
-                    let mut span_futs = Vec::with_capacity(spans.len());
-                    for span in spans {
-                        let src = cog.source.clone();
-                        span_futs.push(async move {
-                            let data = src.fetch_range(span.start, span.end).await?;
-                            Ok::<_, IoError>((span, data))
-                        });
-                    }
-
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for fut in span_futs {
-                        join_set.spawn(fut);
-                    }
-
-                    // Parallel decode set for multi-block remote spans (overlaps decode with remaining downloads!)
+                    // Parallel decode set capped at `num_workers` in-flight so wide requests
+                    // overlap download+decode without flooding Tokio's async workers.
                     let mut decode_set: tokio::task::JoinSet<
                         Result<(usize, Arc<DecodedTile>), IoError>,
                     > = tokio::task::JoinSet::new();
                     let mut decode_meta_opt: Option<Arc<IfdMeta>> = None;
                     let byte_order = cog.index.byte_order;
                     let nodata = cog.index.nodata;
-
                     let mut fetch_err: Option<IoError> = None;
-                    while let Some(res) = join_set.join_next().await {
-                        match res {
-                            Ok(Ok((span, data))) => {
-                                let can_parallel =
-                                    span.items.len() >= 2 && ifd.mask_ifd.is_none();
+
+                    // Fast path: 1 coalesced span -> await fetch_range directly (no JoinSet spawn)
+                    let mut single_span = if spans.len() == 1 {
+                        let span = spans.pop().unwrap();
+                        let data = cog.source.fetch_range(span.start, span.end).await?;
+                        Some((span, data))
+                    } else {
+                        None
+                    };
+
+                    let mut join_set = tokio::task::JoinSet::new();
+                    if single_span.is_none() {
+                        for span in spans {
+                            let src = cog.source.clone();
+                            join_set.spawn(async move {
+                                let data = src.fetch_range(span.start, span.end).await?;
+                                Ok::<_, IoError>((span, data))
+                            });
+                        }
+                    }
+
+                    loop {
+                        let next_span = if let Some(pair) = single_span.take() {
+                            Some(Ok(pair))
+                        } else {
+                            match join_set.join_next().await {
+                                Some(Ok(r)) => Some(r),
+                                Some(Err(e)) => {
+                                    fetch_err = Some(IoError::Fs(std::io::Error::other(format!(
+                                        "remote fetch task failed: {e}"
+                                    ))));
+                                    continue;
+                                }
+                                None => None,
+                            }
+                        };
+                        let Some(span_res) = next_span else {
+                            break;
+                        };
+                        match span_res {
+                            Ok((span, data)) => {
+                                let has_more_fetches = !join_set.is_empty();
+                                let can_parallel = ifd.mask_ifd.is_none()
+                                    && !trivial_block
+                                    && ((num_workers >= 2 && span.items.len() >= 2)
+                                        || has_more_fetches);
                                 if can_parallel {
                                     let meta = decode_meta_opt
                                         .get_or_insert_with(|| Arc::new(clone_for_decode(ifd)))
                                         .clone();
                                     for item in span.items {
+                                        if decode_set.len() >= num_workers {
+                                            if let Some(res) = decode_set.join_next().await {
+                                                match res {
+                                                    Ok(Ok((s, arc))) => results[s] = Some(arc),
+                                                    Ok(Err(e)) => fetch_err = Some(e),
+                                                    Err(e) => {
+                                                        fetch_err = Some(IoError::Fs(
+                                                            std::io::Error::other(format!(
+                                                                "remote decode task failed: {e}"
+                                                            )),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
                                         let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
                                         let orig_slot = *orig_slot;
                                         let rel_start = (item.offset - span.start) as usize;
@@ -709,18 +828,14 @@ impl CogStore {
                                             continue;
                                         }
                                         let slice = data.slice(rel_start..rel_end);
-                                        if !is_local {
-                                            if let Some(dc) = &self.disk_cache {
-                                                if let Some(Some(tidx)) =
-                                                    tile_indices.get(orig_slot)
-                                                {
-                                                    dc.put_async(
-                                                        &cog.uri,
-                                                        ifd_idx as u16,
-                                                        *tidx,
-                                                        slice.clone(),
-                                                    );
-                                                }
+                                        if let Some(dc) = &self.disk_cache {
+                                            if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                                                dc.put_async(
+                                                    &cog.uri,
+                                                    ifd_idx as u16,
+                                                    *tidx,
+                                                    slice.clone(),
+                                                );
                                             }
                                         }
                                         let guard = guard_opt.take();
@@ -736,7 +851,93 @@ impl CogStore {
                                         });
                                     }
                                 } else {
-                                    for item in span.items {
+                                    // If this IFD has a separate 1-bit transparency mask_ifd, coalesce
+                                    // and fetch all needed mask ranges for this span concurrently first.
+                                    let mut mask_bytes_by_slot: Vec<Option<bytes::Bytes>> =
+                                        vec![None; span.items.len()];
+                                    if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                                        if mask_ifd.tile_width == ifd.tile_width
+                                            && mask_ifd.tile_height == ifd.tile_height
+                                        {
+                                            let per_plane = (ifd.tiles_across as usize)
+                                                * (ifd.tiles_down as usize);
+                                            let mut mreqs = Vec::new();
+                                            for (idx_in_span, item) in span.items.iter().enumerate()
+                                            {
+                                                let orig_slot = owned[item.slot].0;
+                                                if let Some(Some(tidx)) =
+                                                    tile_indices.get(orig_slot)
+                                                {
+                                                    let mask_idx =
+                                                        (*tidx as usize) % per_plane.max(1);
+                                                    if let Some((moff, mlen)) =
+                                                        mask_ifd.tile_byte_range(mask_idx)
+                                                    {
+                                                        mreqs.push(TileByteReq {
+                                                            slot: idx_in_span,
+                                                            offset: moff,
+                                                            len: mlen,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            if !mreqs.is_empty() {
+                                                let mspans = coalesce_ranges(
+                                                    mreqs,
+                                                    RANGE_GAP_THRESHOLD,
+                                                    MAX_COALESCED_SPAN,
+                                                );
+                                                let mut mset = tokio::task::JoinSet::new();
+                                                for ms in mspans {
+                                                    let src = cog.source.clone();
+                                                    mset.spawn(async move {
+                                                        let b = src
+                                                            .fetch_range(ms.start, ms.end)
+                                                            .await?;
+                                                        Ok::<_, IoError>((ms, b))
+                                                    });
+                                                }
+                                                while let Some(mres) = mset.join_next().await {
+                                                    match mres {
+                                                        Ok(Ok((ms, mb))) => {
+                                                            for mi in ms.items {
+                                                                let rs =
+                                                                    (mi.offset - ms.start) as usize;
+                                                                let re = rs + mi.len as usize;
+                                                                if re <= mb.len() {
+                                                                    mask_bytes_by_slot[mi.slot] =
+                                                                        Some(mb.slice(rs..re));
+                                                                } else {
+                                                                    fetch_err = Some(IoError::Tiff(
+                                                                        TiffError::NeedMoreBytes {
+                                                                            required: mi.offset
+                                                                                + mi.len as u64,
+                                                                            available: ms.start
+                                                                                + mb.len() as u64,
+                                                                        },
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(Err(e)) => fetch_err = Some(e),
+                                                        Err(e) => {
+                                                            fetch_err = Some(IoError::Fs(
+                                                                std::io::Error::other(format!(
+                                                                    "mask fetch task failed: {e}"
+                                                                )),
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if fetch_err.is_some() {
+                                        continue;
+                                    }
+
+                                    for (idx_in_span, item) in span.items.into_iter().enumerate() {
                                         let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
                                         let rel_start = (item.offset - span.start) as usize;
                                         let rel_end = rel_start + item.len as usize;
@@ -748,7 +949,7 @@ impl CogStore {
                                                 }));
                                             continue;
                                         }
-                                        if !is_local && ifd.mask_ifd.is_none() {
+                                        if ifd.mask_ifd.is_none() {
                                             if let Some(dc) = &self.disk_cache {
                                                 if let Some(Some(tidx)) =
                                                     tile_indices.get(*orig_slot)
@@ -769,41 +970,17 @@ impl CogStore {
                                             nodata,
                                         ) {
                                             Ok(mut decoded) => {
-                                                if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                                                    if mask_ifd.tile_width == ifd.tile_width
-                                                        && mask_ifd.tile_height == ifd.tile_height
-                                                    {
-                                                        if let Some(Some(tidx)) =
-                                                            tile_indices.get(*orig_slot)
-                                                        {
-                                                            let per_plane =
-                                                                (ifd.tiles_across as usize)
-                                                                    * (ifd.tiles_down as usize);
-                                                            let mask_idx =
-                                                                (*tidx as usize) % per_plane.max(1);
-                                                            if let Some((moff, mlen)) =
-                                                                mask_ifd.tile_byte_range(mask_idx)
-                                                            {
-                                                                if let Ok(mbytes) = cog
-                                                                    .source
-                                                                    .fetch_range(
-                                                                        moff,
-                                                                        moff + mlen as u64,
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    if let Ok(mask) =
-                                                                        decode_mask_tile(
-                                                                            &mbytes, mask_ifd,
-                                                                        )
-                                                                    {
-                                                                        apply_mask_to_tile(
-                                                                            &mut decoded,
-                                                                            &mask,
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
+                                                if let (Some(mask_ifd), Some(mbytes)) = (
+                                                    ifd.mask_ifd.as_deref(),
+                                                    mask_bytes_by_slot[idx_in_span].as_ref(),
+                                                ) {
+                                                    match decode_mask_tile(mbytes, mask_ifd) {
+                                                        Ok(mask) => {
+                                                            apply_mask_to_tile(&mut decoded, &mask);
+                                                        }
+                                                        Err(e) => {
+                                                            fetch_err = Some(IoError::Codec(e));
+                                                            continue;
                                                         }
                                                     }
                                                 }
@@ -820,8 +997,7 @@ impl CogStore {
                                     }
                                 }
                             }
-                            Ok(Err(e)) => fetch_err = Some(e),
-                            Err(_) => {}
+                            Err(e) => fetch_err = Some(e),
                         }
                     }
 
@@ -831,7 +1007,11 @@ impl CogStore {
                                 results[orig_slot] = Some(arc);
                             }
                             Ok(Err(e)) => fetch_err = Some(e),
-                            Err(_) => {}
+                            Err(e) => {
+                                fetch_err = Some(IoError::Fs(std::io::Error::other(format!(
+                                    "remote decode task failed: {e}"
+                                ))));
+                            }
                         }
                     }
 
