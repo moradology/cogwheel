@@ -285,6 +285,7 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("point/8.5,45.75?assets=visual%7Cbidx%3D3,1", 204),
         ("point/8.5,45.75?assets=visual%7Cbidx%3Dx", 422),
         ("point/8.5,45.75?assets=visual&asset_as_band=perhaps", 422),
+        ("point/8.5,45.75?assets=,", 422),
         ("point/8.5,45.75?assets=visual&coord_crs=epsg:32632", 400),
         ("point/8.5,45.75?assets=visual&items_limit=many", 422),
         ("point/8.5?assets=visual", 404),

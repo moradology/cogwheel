@@ -1361,6 +1361,9 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
     }
     let assets = parse_assets(pairs)?;
+    if assets.is_empty() {
+        return Err(missing_query_param("assets"));
+    }
     let asset_as_band = match query_value(pairs, "asset_as_band") {
         None => false,
         Some(v) => parse_bool(v)
@@ -2489,6 +2492,7 @@ async fn point_values(
         return detail(StatusCode::BAD_REQUEST, e.clone());
     }
     let specs = match parse_assets(pairs) {
+        Ok(specs) if specs.is_empty() => return missing_query_param("assets"),
         Ok(specs) => specs,
         Err(r) => return r,
     };
@@ -4146,6 +4150,8 @@ mod tests {
             assert_eq!(run(q).unwrap_err(), StatusCode::BAD_REQUEST, "{q}");
         }
         assert_eq!(run("assets=red&asset_as_band=perhaps").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
+        // An `assets` that names nothing is a missing parameter.
+        assert_eq!(run("assets=,").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
