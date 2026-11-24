@@ -117,16 +117,34 @@ fn strip_stage_prefix(
 /// shared `handle_bytes_request` and encodes binary image/raster payloads as `Body::Binary`
 /// (automatic `isBase64Encoded: true` for Function URLs, API Gateway v1/v2, and ALB).
 async fn lambda_handler(engine: Arc<TileEngine>, event: Request) -> Result<Response<Body>, Error> {
-    let stage = event.request_context_ref().and_then(|ctx| match ctx {
-        RequestContext::ApiGatewayV1(c) => c.stage.clone(),
-        RequestContext::ApiGatewayV2(c) => c.stage.clone(),
-        _ => None,
-    });
+    let (stage, public_path) = match event.request_context_ref() {
+        Some(RequestContext::ApiGatewayV1(c)) => (c.stage.clone(), c.path.clone()),
+        Some(RequestContext::ApiGatewayV2(c)) => (c.stage.clone(), c.http.path.clone()),
+        _ => (None, None),
+    };
     let (mut parts, body) = event.into_parts();
-    let (new_uri, stage_prefix) = strip_stage_prefix(&parts.uri, stage.as_deref());
+    let (mut new_uri, stage_prefix) = strip_stage_prefix(&parts.uri, stage.as_deref());
+    // API GW v2 stage root without trailing slash (`rawPath == "/{stage}"`): `lambda_http`
+    // prepends `/{stage}` to produce `/{stage}/{stage}`, so strip the second copy cleanly.
+    if let Some(ref prefix) = stage_prefix {
+        if public_path.as_deref() == Some(prefix.as_str()) && new_uri.path() == prefix.as_str() {
+            let (norm_uri, _) = strip_stage_prefix(&new_uri, stage.as_deref());
+            new_uri = norm_uri;
+        }
+    }
     parts.uri = new_uri;
+    // Only inject `x-forwarded-prefix: /{stage}` when the public request path actually begins
+    // with `/{stage}` (avoids breaking custom domains mapped to a named stage).
     if let Some(prefix) = stage_prefix {
-        if !parts.headers.contains_key("x-forwarded-prefix") {
+        let public_has_stage = match public_path.as_deref() {
+            Some(p) => {
+                p == prefix.as_str()
+                    || p.strip_prefix(prefix.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
+            None => true,
+        };
+        if public_has_stage && !parts.headers.contains_key("x-forwarded-prefix") {
             if let Ok(hv) = lambda_http::http::HeaderValue::from_str(&prefix) {
                 parts.headers.insert("x-forwarded-prefix", hv);
             }
