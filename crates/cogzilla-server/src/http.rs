@@ -1440,37 +1440,105 @@ where
         let cache_key = format!("{path}?{raw_query}");
         let res = match parsed {
             (Some(z), Some(x), Some((y, sc, ext))) => {
-                let cached = engine
-                    .tile_cache
-                    .get_or_render(cache_key, || async {
-                        if let Some(scene) = engine.get_scene(ds) {
-                            let db = scene.len() as u16;
-                            let is_u8 = scene[0].index.full_res().sample_type
+                if z > 30 {
+                    Err(EngineError::BadRequest(format!(
+                        "invalid zoom level z={z} (expected 0..=30)"
+                    )))
+                } else {
+                    let cached = engine
+                        .tile_cache
+                        .get_or_render(cache_key, || async {
+                            let cogs: Vec<Arc<cogzilla_io::OpenedCog>> =
+                                if let Some(scene) = engine.get_scene(ds) {
+                                    scene
+                                } else if let Some(cog) = engine.store.get_registered(ds) {
+                                    vec![cog]
+                                } else {
+                                    return Err(EngineError::NotFound(ds.to_string()));
+                                };
+                            let db = if cogs.len() > 1 {
+                                cogs.len() as u16
+                            } else {
+                                cogs[0].index.full_res().samples_per_pixel
+                            };
+                            let is_u8 = cogs[0].index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
                             let (mut treq, ct) =
                                 build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
                             if pq.unscale {
-                                apply_unscale_cogs(&mut treq.bands, &scene);
+                                apply_unscale_cogs(&mut treq.bands, &cogs);
                             }
-                            let b = engine.render_multi_cog_tile(&scene, &treq).await?;
-                            Ok((b, ct))
-                        } else if let Some(cog) = engine.store.get_registered(ds) {
-                            let db = cog.index.full_res().samples_per_pixel;
-                            let is_u8 = cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
-                            let (mut treq, ct) =
-                                build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
-                            if pq.unscale {
-                                apply_unscale_cogs(&mut treq.bands, std::slice::from_ref(&cog));
+                            let needs_general_path = pq.nodata.is_some()
+                                || pq.custom_colormap_json.is_some()
+                                || pq.buffer > 0
+                                || (treq.tile_size != 256 && treq.tile_size != 512);
+                            if needs_general_path {
+                                let custom_lut = pq
+                                    .custom_colormap_json
+                                    .as_deref()
+                                    .map(ColormapLut::from_json_str)
+                                    .transpose()
+                                    .map_err(EngineError::BadRequest)?;
+                                let cf = pq
+                                    .color_formula
+                                    .as_deref()
+                                    .map(ColorFormula::parse)
+                                    .transpose()
+                                    .map_err(EngineError::BadRequest)?;
+                                let out_dim = treq.tile_size + 2 * pq.buffer;
+                                let bbox_3857 = web_mercator_buffered_3857_bbox(
+                                    z,
+                                    x,
+                                    y,
+                                    pq.buffer,
+                                    treq.tile_size,
+                                );
+                                let data = render_mercator_bbox(
+                                    &engine,
+                                    &cogs,
+                                    bbox_3857,
+                                    out_dim,
+                                    out_dim,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq.return_mask,
+                                    pq.unscale,
+                                )
+                                .await?;
+                                Ok((data, ct))
+                            } else if (pq.color_formula.is_some() || !pq.return_mask)
+                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                            {
+                                let cf = pq
+                                    .color_formula
+                                    .as_deref()
+                                    .map(ColorFormula::parse)
+                                    .transpose()
+                                    .map_err(EngineError::BadRequest)?;
+                                let orig_format = treq.format;
+                                treq.format = OutputFormat::RawRgba;
+                                let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                                let dim = treq.tile_size as usize;
+                                let data = if let Some(cf) = cf {
+                                    let mut buf = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut buf, 4);
+                                    encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
+                                } else {
+                                    encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
+                                };
+                                Ok((data, ct))
+                            } else {
+                                let b = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                                Ok((b, ct))
                             }
-                            let b = engine.render_tile(&cog, &treq).await?;
-                            Ok((b, ct))
-                        } else {
-                            Err(EngineError::NotFound(ds.to_string()))
-                        }
-                    })
-                    .await;
-                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                        })
+                        .await;
+                    return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                }
             }
             _ => Err(EngineError::BadRequest(
                 "expected /tiles/{dataset}/{z}/{x}/{y}.{png|webp|f32}".to_string(),
@@ -2868,15 +2936,45 @@ pub async fn serve(engine: Arc<TileEngine>, addr: SocketAddr) -> std::io::Result
     serve_listener(engine, listener).await
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> std::io::Result<()> {
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Transient socket errors (EMFILE/ENFILE/ECONNABORTED) must never crash the server.
-                tracing::warn!(error = %e, "TCP accept error; backing off briefly");
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                continue;
+        let (stream, _) = tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received; stopping listener");
+                return Ok(());
+            }
+            accept_res = listener.accept() => match accept_res {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Transient socket errors (EMFILE/ENFILE/ECONNABORTED) must never crash the server.
+                    tracing::warn!(error = %e, "TCP accept error; backing off briefly");
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    continue;
+                }
             }
         };
         let _ = stream.set_nodelay(true);
@@ -2884,9 +2982,12 @@ pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> s
         let eng = engine.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| handle_request(eng.clone(), req));
-            let _ = ServerBuilder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await;
+            let mut builder = ServerBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_secs(15));
+            let _ = builder.serve_connection(io, svc).await;
         });
     }
 }
