@@ -27,7 +27,7 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, build_cog_info, build_cog_info_geojson, build_map_html, build_tilejson,
-    compute_statistics, query_point, render_wgs84_bbox,
+    compute_statistics, encode_rgba_output, query_point, render_wgs84_bbox,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -1489,9 +1489,7 @@ where
                         let needs_general = *tms == "WorldCRS84Quad"
                             || pq_stac.buffer > 0
                             || pq_stac.nodata.is_some()
-                            || pq_stac.custom_colormap_json.is_some()
-                            || pq_stac.color_formula.is_some()
-                            || !pq_stac.return_mask;
+                            || pq_stac.custom_colormap_json.is_some();
                         if needs_general {
                             let custom_lut = pq_stac
                                 .custom_colormap_json
@@ -1533,6 +1531,27 @@ where
                                 pq_stac.return_mask,
                             )
                             .await?;
+                            Ok((data, ct))
+                        } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
+                            && treq.format != OutputFormat::RawF32
+                        {
+                            let cf = pq_stac
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let orig_format = treq.format;
+                            treq.format = OutputFormat::RawRgba;
+                            let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let dim = treq.tile_size as usize;
+                            let data = if let Some(cf) = cf {
+                                let mut buf = raw.to_vec();
+                                cf.apply_buffer_in_place(&mut buf, 4);
+                                encode_rgba_output(dim, dim, &buf, orig_format, pq_stac.return_mask)
+                            } else {
+                                encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
+                            };
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -1905,9 +1924,7 @@ where
                         let needs_general_path = *tms == "WorldCRS84Quad"
                             || pq.buffer > 0
                             || pq.nodata.is_some()
-                            || pq.custom_colormap_json.is_some()
-                            || pq.color_formula.is_some()
-                            || !pq.return_mask;
+                            || pq.custom_colormap_json.is_some();
 
                         if needs_general_path {
                             let custom_lut = pq
@@ -1944,6 +1961,27 @@ where
                                 pq.return_mask,
                             )
                             .await?;
+                            Ok((data, ct))
+                        } else if (pq.color_formula.is_some() || !pq.return_mask)
+                            && treq.format != OutputFormat::RawF32
+                        {
+                            let cf = pq
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let orig_format = treq.format;
+                            treq.format = OutputFormat::RawRgba;
+                            let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let dim = treq.tile_size as usize;
+                            let data = if let Some(cf) = cf {
+                                let mut buf = raw.to_vec();
+                                cf.apply_buffer_in_place(&mut buf, 4);
+                                encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
+                            } else {
+                                encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
+                            };
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
