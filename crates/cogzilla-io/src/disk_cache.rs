@@ -20,7 +20,7 @@ struct DiskEntry {
 }
 
 struct WriteJob {
-    key_hex: String,
+    key: [u8; 16],
     data: Bytes,
 }
 
@@ -46,7 +46,7 @@ pub struct DiskCacheStats {
 pub struct DiskBlockCache {
     dir: PathBuf,
     max_bytes: u64,
-    entries: DashMap<String, DiskEntry, ahash::RandomState>,
+    entries: DashMap<[u8; 16], DiskEntry, ahash::RandomState>,
     current_bytes: AtomicU64,
     clock: AtomicU64,
     evicting: AtomicBool,
@@ -95,23 +95,32 @@ impl DiskBlockCache {
                     let Some(c) = writer_cache.upgrade() else {
                         break;
                     };
-                    c.write_sync(&job.key_hex, &job.data);
+                    c.write_sync(job.key, &job.data);
                 }
             });
 
         Ok(cache)
     }
 
-    pub fn key_hex(uri: &str, ifd_idx: u16, tile_idx: u32) -> String {
+    #[inline]
+    pub fn key_bytes(uri: &str, ifd_idx: u16, tile_idx: u32) -> [u8; 16] {
         let mut h = Sha256::new();
         h.update(uri.as_bytes());
         h.update(b"\0");
         h.update(ifd_idx.to_le_bytes());
         h.update(tile_idx.to_le_bytes());
-        hex::encode(&h.finalize()[..16]) // 128-bit hex (32 chars)
+        let digest = h.finalize();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        out
     }
 
-    fn entry_path(&self, key_hex: &str) -> PathBuf {
+    pub fn key_hex(uri: &str, ifd_idx: u16, tile_idx: u32) -> String {
+        hex::encode(Self::key_bytes(uri, ifd_idx, tile_idx))
+    }
+
+    fn entry_path(&self, key: [u8; 16]) -> PathBuf {
+        let key_hex = hex::encode(key);
         self.dir.join(&key_hex[..2]).join(format!("{key_hex}.cgz"))
     }
 
@@ -124,7 +133,7 @@ impl DiskBlockCache {
         let Ok(top) = fs::read_dir(&self.dir) else {
             return;
         };
-        let mut found: Vec<(u64, String, PathBuf, u64)> = Vec::new();
+        let mut found: Vec<(u64, [u8; 16], PathBuf, u64)> = Vec::new();
         for sub in top.flatten() {
             let sub_path = sub.path();
             if !sub_path.is_dir() {
@@ -145,7 +154,11 @@ impl DiskBlockCache {
                 let Some(key_hex) = fname.strip_suffix(".cgz") else {
                     continue;
                 };
-                if key_hex.len() < 4 {
+                if key_hex.len() != 32 {
+                    continue;
+                }
+                let mut key = [0u8; 16];
+                if hex::decode_to_slice(key_hex, &mut key).is_err() {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
@@ -156,17 +169,17 @@ impl DiskBlockCache {
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    found.push((mtime, key_hex.to_string(), p, sz));
+                    found.push((mtime, key, p, sz));
                 }
             }
         }
         // Assign monotonically increasing logical stamps in mtime order so LRU survives restart
         found.sort_unstable_by_key(|(mtime, _, _, _)| *mtime);
         let mut total = 0u64;
-        for (_, key_hex, path, sz) in found {
+        for (_, key, path, sz) in found {
             let stamp = self.tick();
             self.entries.insert(
-                key_hex,
+                key,
                 DiskEntry {
                     path,
                     bytes: sz,
@@ -178,24 +191,30 @@ impl DiskBlockCache {
         self.current_bytes.store(total, Ordering::Release);
     }
 
-    /// Synchronous read + CRC32 verification (call from `spawn_blocking` on async paths).
-    /// Returns `Some(compressed_bytes)` on a valid hit, or `None` on miss/corruption.
-    pub fn get_sync(&self, uri: &str, ifd_idx: u16, tile_idx: u32) -> Option<Bytes> {
-        let key_hex = Self::key_hex(uri, ifd_idx, tile_idx);
-        let path = {
-            let Some(entry) = self.entries.get(&key_hex) else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
-            };
-            entry.last_used.store(self.tick(), Ordering::Relaxed);
-            entry.path.clone()
+    /// Fast synchronous in-memory index check. Returns `Some((key, path))` if the block is
+    /// present in the disk cache index, or increments `misses` and returns `None` immediately
+    /// without touching the filesystem or Tokio's blocking pool.
+    #[inline]
+    pub fn lookup_path(&self, uri: &str, ifd_idx: u16, tile_idx: u32) -> Option<([u8; 16], PathBuf)> {
+        let key = Self::key_bytes(uri, ifd_idx, tile_idx);
+        let Some(entry) = self.entries.get(&key) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
         };
+        entry.last_used.store(self.tick(), Ordering::Relaxed);
+        Some((key, entry.path.clone()))
+    }
 
-        let raw = match fs::read(&path) {
+    /// Synchronous read + CRC32 verification for a pre-looked-up disk entry (call from
+    /// `spawn_blocking` on async paths). Zero-copy slice into the read `Vec<u8>`.
+    pub fn read_verified_sync(&self, key: [u8; 16], path: &Path) -> Option<Bytes> {
+        let raw = match fs::read(path) {
             Ok(b) => b,
-            Err(_) => {
-                self.read_errors.fetch_add(1, Ordering::Relaxed);
-                self.remove_entry(&key_hex);
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    self.read_errors.fetch_add(1, Ordering::Relaxed);
+                    self.remove_entry(key);
+                }
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -203,28 +222,35 @@ impl DiskBlockCache {
 
         if raw.len() < HEADER_LEN || raw[..4] != MAGIC {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
-            self.remove_entry(&key_hex);
+            self.remove_entry(key);
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let expected_crc = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        let payload = &raw[HEADER_LEN..];
-        if crc32fast::hash(payload) != expected_crc {
+        if crc32fast::hash(&raw[HEADER_LEN..]) != expected_crc {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
-            self.remove_entry(&key_hex);
+            self.remove_entry(key);
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
         self.hits.fetch_add(1, Ordering::Relaxed);
-        Some(Bytes::copy_from_slice(payload))
+        Some(Bytes::from(raw).slice(HEADER_LEN..))
     }
 
-    /// Async wrapper running [`Self::get_sync`] on Tokio's blocking pool so disk reads never
-    /// stall async worker threads.
-    pub async fn get(self: &Arc<Self>, uri: String, ifd_idx: u16, tile_idx: u32) -> Option<Bytes> {
+    /// Synchronous read + CRC32 verification (call from `spawn_blocking` on async paths).
+    /// Returns `Some(compressed_bytes)` on a valid hit, or `None` on miss/corruption.
+    pub fn get_sync(&self, uri: &str, ifd_idx: u16, tile_idx: u32) -> Option<Bytes> {
+        let (key, path) = self.lookup_path(uri, ifd_idx, tile_idx)?;
+        self.read_verified_sync(key, &path)
+    }
+
+    /// Async wrapper: checks the in-memory index synchronously first (zero blocking-pool hops on
+    /// misses), and only dispatches to `spawn_blocking` when a cached file actually exists.
+    pub async fn get(self: &Arc<Self>, uri: &str, ifd_idx: u16, tile_idx: u32) -> Option<Bytes> {
+        let (key, path) = self.lookup_path(uri, ifd_idx, tile_idx)?;
         let c = self.clone();
-        tokio::task::spawn_blocking(move || c.get_sync(&uri, ifd_idx, tile_idx))
+        tokio::task::spawn_blocking(move || c.read_verified_sync(key, &path))
             .await
             .ok()
             .flatten()
@@ -236,11 +262,11 @@ impl DiskBlockCache {
         if (data.len() + HEADER_LEN) as u64 > self.max_bytes {
             return;
         }
-        let key_hex = Self::key_hex(uri, ifd_idx, tile_idx);
-        if self.entries.contains_key(&key_hex) {
+        let key = Self::key_bytes(uri, ifd_idx, tile_idx);
+        if self.entries.contains_key(&key) {
             return;
         }
-        if self.tx.try_send(WriteJob { key_hex, data }).is_err() {
+        if self.tx.try_send(WriteJob { key, data }).is_err() {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -250,12 +276,12 @@ impl DiskBlockCache {
         if (data.len() + HEADER_LEN) as u64 > self.max_bytes {
             return;
         }
-        let key_hex = Self::key_hex(uri, ifd_idx, tile_idx);
-        self.write_sync(&key_hex, data);
+        let key = Self::key_bytes(uri, ifd_idx, tile_idx);
+        self.write_sync(key, data);
     }
 
-    fn write_sync(&self, key_hex: &str, data: &[u8]) {
-        let path = self.entry_path(key_hex);
+    fn write_sync(&self, key: [u8; 16], data: &[u8]) {
+        let path = self.entry_path(key);
         if let Some(parent) = path.parent() {
             if fs::create_dir_all(parent).is_err() {
                 self.write_errors.fetch_add(1, Ordering::Relaxed);
@@ -286,7 +312,7 @@ impl DiskBlockCache {
         let old_sz = self
             .entries
             .insert(
-                key_hex.to_string(),
+                key,
                 DiskEntry {
                     path,
                     bytes: new_sz,
@@ -314,8 +340,8 @@ impl DiskBlockCache {
         }
     }
 
-    fn remove_entry(&self, key_hex: &str) {
-        if let Some((_, entry)) = self.entries.remove(key_hex) {
+    fn remove_entry(&self, key: [u8; 16]) {
+        if let Some((_, entry)) = self.entries.remove(&key) {
             let _ = fs::remove_file(&entry.path);
             let _ = self
                 .current_bytes
@@ -353,19 +379,19 @@ impl DiskBlockCache {
                     let excess = cur - self.max_bytes;
                     let target_drop = excess.max(self.max_bytes / 4);
 
-                    let mut candidates: Vec<(u64, String)> = self
+                    let mut candidates: Vec<(u64, [u8; 16])> = self
                         .entries
                         .iter()
-                        .map(|e| (e.value().last_used.load(Ordering::Relaxed), e.key().clone()))
+                        .map(|e| (e.value().last_used.load(Ordering::Relaxed), *e.key()))
                         .collect();
                     candidates.sort_unstable_by_key(|(stamp, _)| *stamp);
 
                     let mut dropped = 0u64;
-                    for (_, key_hex) in candidates {
+                    for (_, key) in candidates {
                         if dropped >= target_drop {
                             break;
                         }
-                        if let Some((_, entry)) = self.entries.remove(&key_hex) {
+                        if let Some((_, entry)) = self.entries.remove(&key) {
                             let _ = fs::remove_file(&entry.path);
                             dropped += entry.bytes;
                             removed_any = true;
@@ -436,8 +462,8 @@ mod tests {
         assert_eq!(c2.stats().hits, 1);
 
         // Corrupt a byte on disk: must detect CRC mismatch, delete entry, and fail-open as miss!
-        let key_hex = DiskBlockCache::key_hex("s3://bucket/a.tif", 0, 7);
-        let p = c2.entry_path(&key_hex);
+        let key = DiskBlockCache::key_bytes("s3://bucket/a.tif", 0, 7);
+        let p = c2.entry_path(key);
         let mut raw = fs::read(&p).unwrap();
         raw[HEADER_LEN] ^= 0xFF;
         fs::write(&p, raw).unwrap();

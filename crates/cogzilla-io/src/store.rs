@@ -579,52 +579,73 @@ impl CogStore {
                     return Err(e);
                 }
             } else {
-                // Tier-2 compressed-block disk cache lookup for remote sources (RAM miss -> disk hit)
+                // Tier-2 compressed-block disk cache lookup for remote sources (RAM miss -> disk hit).
+                // Synchronously probe the in-memory index first so 100% cold misses do 0 JoinSet/spawn_blocking hops!
                 if !is_local && ifd.mask_ifd.is_none() {
                     if let Some(dc) = &self.disk_cache {
-                        let meta = Arc::new(clone_for_decode(ifd));
-                        let byte_order = cog.index.byte_order;
-                        let nodata = cog.index.nodata;
-                        let mut disk_set = tokio::task::JoinSet::new();
                         let prev_owned = std::mem::take(&mut owned);
+                        let mut disk_candidates = Vec::new();
                         for item in prev_owned {
-                            let (orig_slot, guard_opt, offset, count) = item;
-                            let tidx = tile_indices[orig_slot].unwrap();
-                            let dc_c = dc.clone();
-                            let uri = cog.uri.clone();
-                            let m = meta.clone();
-                            disk_set.spawn(async move {
-                                if let Some(compressed) =
-                                    dc_c.get(uri, ifd_idx as u16, tidx).await
-                                {
-                                    match decode_tile(&compressed, &m, byte_order, nodata) {
-                                        Ok(decoded) => {
+                            let tidx = tile_indices[item.0].unwrap();
+                            if let Some((key, path)) =
+                                dc.lookup_path(&cog.uri, ifd_idx as u16, tidx)
+                            {
+                                disk_candidates.push((item, key, path));
+                            } else {
+                                owned.push(item);
+                            }
+                        }
+
+                        if !disk_candidates.is_empty() {
+                            let meta = Arc::new(clone_for_decode(ifd));
+                            let byte_order = cog.index.byte_order;
+                            let nodata = cog.index.nodata;
+                            let mut disk_set = tokio::task::JoinSet::new();
+                            for (item, key, path) in disk_candidates {
+                                let (orig_slot, guard_opt, offset, count) = item;
+                                let dc_c = dc.clone();
+                                let m = meta.clone();
+                                disk_set.spawn(async move {
+                                    let read_res = tokio::task::spawn_blocking(move || {
+                                        dc_c.read_verified_sync(key, &path)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                    if let Some(compressed) = read_res {
+                                        if let Ok(decoded) =
+                                            decode_tile(&compressed, &m, byte_order, nodata)
+                                        {
                                             let arc = Arc::new(decoded);
                                             if let Some(guard) = guard_opt {
                                                 guard.complete(arc.clone());
                                             }
-                                            return Ok::<_, (usize, Option<InFlightGuard>, u64, u32)>(
-                                                (orig_slot, arc),
+                                            return Ok::<
+                                                _,
+                                                (usize, Option<InFlightGuard>, u64, u32),
+                                            >(
+                                                (orig_slot, arc)
                                             );
                                         }
-                                        Err(_) => {
-                                            // Corrupt/unreadable disk entry: fail-open and refetch!
-                                            return Err((orig_slot, guard_opt, offset, count));
-                                        }
+                                    }
+                                    // Corrupt/evicted disk entry: fail-open and refetch from remote!
+                                    Err((orig_slot, guard_opt, offset, count))
+                                });
+                            }
+                            while let Some(res) = disk_set.join_next().await {
+                                match res {
+                                    Ok(Ok((orig_slot, arc))) => {
+                                        results[orig_slot] = Some(arc);
+                                    }
+                                    Ok(Err(miss)) => {
+                                        owned.push(miss);
+                                    }
+                                    Err(e) => {
+                                        return Err(IoError::Fs(std::io::Error::other(format!(
+                                            "disk cache decode task failed: {e}"
+                                        ))));
                                     }
                                 }
-                                Err((orig_slot, guard_opt, offset, count))
-                            });
-                        }
-                        while let Some(res) = disk_set.join_next().await {
-                            match res {
-                                Ok(Ok((orig_slot, arc))) => {
-                                    results[orig_slot] = Some(arc);
-                                }
-                                Ok(Err(miss)) => {
-                                    owned.push(miss);
-                                }
-                                Err(_) => {}
                             }
                         }
                     }
@@ -895,7 +916,7 @@ impl CogStore {
         let is_local = matches!(cog.source, CogSource::LocalMmap { .. });
         if !is_local {
             if let Some(dc) = &self.disk_cache {
-                if let Some(cached) = dc.get(cog.uri.clone(), ifd_idx as u16, tile_idx).await {
+                if let Some(cached) = dc.get(&cog.uri, ifd_idx as u16, tile_idx).await {
                     return Ok(cached);
                 }
             }
