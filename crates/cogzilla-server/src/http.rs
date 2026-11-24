@@ -141,11 +141,15 @@ struct ParsedQuery {
     buffer: u32,
     coord_crs_3857: bool,
     format_param: Option<String>,
+    minzoom: Option<u8>,
+    maxzoom: Option<u8>,
+    tile_format: Option<String>,
     algorithm: Option<String>,
     azimuth: f32,
     altitude: f32,
     z_factor: f32,
     colormap_explicit: bool,
+    colormap_name_set: bool,
     /// Parameter names present in the query, for per-route validation.
     keys: Vec<String>,
     /// Values that could not be parsed or name something unsupported.
@@ -174,11 +178,15 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         buffer: 0,
         coord_crs_3857: false,
         format_param: None,
+        minzoom: None,
+        maxzoom: None,
+        tile_format: None,
         algorithm: None,
         azimuth: 315.0,
         altitude: 45.0,
         z_factor: 1.0,
         colormap_explicit: false,
+        colormap_name_set: false,
         keys: Vec::new(),
         errors: Vec::new(),
     };
@@ -226,7 +234,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             }
                         }
                         if let Some(val) = obj
-                            .get("z_factor")
+                            .get("z_exaggeration")
+                            .or_else(|| obj.get("z_factor"))
                             .or_else(|| obj.get("zfactor"))
                         {
                             match val.as_f64().map(|z| z as f32) {
@@ -277,7 +286,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "rescale" => {
                 let decoded = percent_decode(v);
                 for group in decoded.split(';') {
-                    match group.split_once(',').map(|(a, b)| (a.parse::<f32>(), b.parse::<f32>())) {
+                    let cleaned = group.trim().trim_matches(|c| c == '[' || c == ']');
+                    match cleaned
+                        .split_once(',')
+                        .map(|(a, b)| (a.trim().parse::<f32>(), b.trim().parse::<f32>()))
+                    {
                         Some((Ok(mn), Ok(mx))) if mn.is_finite() && mx.is_finite() => {
                             pq.rescale.push((mn, mx));
                         }
@@ -300,6 +313,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if let Some(cm) = ColormapName::from_str_opt(&percent_decode(v)) {
                     pq.colormap = cm;
                     pq.colormap_explicit = true;
+                    pq.colormap_name_set = true;
                 } else {
                     bad("unknown colormap (see /colorMaps)");
                 }
@@ -309,12 +323,19 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "nodata" => {
                 let dec = percent_decode(v);
-                if let Ok(nd) = dec.parse::<f32>()
+                let trimmed = dec.trim();
+                if trimmed.eq_ignore_ascii_case("nan") {
+                    pq.nodata = Some(f32::NAN);
+                } else if trimmed.eq_ignore_ascii_case("inf") || trimmed.eq_ignore_ascii_case("+inf") {
+                    pq.nodata = Some(f32::INFINITY);
+                } else if trimmed.eq_ignore_ascii_case("-inf") {
+                    pq.nodata = Some(f32::NEG_INFINITY);
+                } else if let Ok(nd) = trimmed.parse::<f32>()
                     && nd.is_finite()
                 {
                     pq.nodata = Some(nd);
                 } else {
-                    bad("expected a finite number");
+                    bad("expected a number, nan, inf, or -inf");
                 }
             }
             "unscale" => {
@@ -418,13 +439,32 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("padding is not supported");
                 }
             }
+            "minzoom" => match v.parse::<u8>() {
+                Ok(z) if z <= 30 => pq.minzoom = Some(z),
+                _ => bad("expected minzoom in 0..=30"),
+            },
+            "maxzoom" => match v.parse::<u8>() {
+                Ok(z) if z <= 30 => pq.maxzoom = Some(z),
+                _ => bad("expected maxzoom in 0..=30"),
+            },
+            "tile_format" => {
+                let fmt = percent_decode(v).to_ascii_lowercase();
+                if parse_ext_format(&fmt, None, 85).is_ok() {
+                    pq.tile_format = Some(fmt);
+                } else {
+                    bad("unsupported tile_format (use png, webp, jpg, f32, or npy)");
+                }
+            }
             "dst_crs" | "crs" | "histogram_bins" | "histogram_range" | "categorical" | "c"
-            | "p" | "cover_scale" | "height" | "width" | "minzoom" | "maxzoom" | "tile_format"
-            | "orientation" => {
+            | "p" | "cover_scale" | "height" | "width" | "orientation" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
         }
+    }
+    // TiTiler precedence: colormap_name wins over inline JSON colormap when both are supplied.
+    if pq.colormap_name_set {
+        pq.custom_colormap_json = None;
     }
     pq.errors = pq_errors;
     pq
@@ -504,7 +544,62 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             return Err(format!("parameter '{k}' is not supported on bbox routes"));
         }
     }
+    let last_seg = segs.last().copied().unwrap_or("");
+    if last_seg != "tilejson.json" && last_seg != "map.html" {
+        if let Some(k) = has(&["minzoom", "maxzoom", "tile_format"]) {
+            return Err(format!(
+                "parameter '{k}' is only supported on tilejson.json and map.html routes"
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Apply TiTiler `minzoom`, `maxzoom`, and `tile_format` query overrides to a TileJSON document,
+/// stripping those TileJSON-only params from the forwarded tile URL template.
+fn apply_tilejson_overrides(
+    tj: &mut serde_json::Value,
+    pq: &ParsedQuery,
+    host: &str,
+    route_prefix: &str,
+    tms: &str,
+    raw_query: &str,
+) {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    };
+    let filtered_query: String = raw_query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split('=').next().unwrap_or("");
+            !pair.is_empty() && !matches!(k, "minzoom" | "maxzoom" | "tile_format")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let ext_suffix = pq
+        .tile_format
+        .as_deref()
+        .map(|f| format!(".{f}"))
+        .unwrap_or_default();
+    let tile_url = if filtered_query.is_empty() {
+        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}")
+    } else {
+        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}?{filtered_query}")
+    };
+    tj["tiles"] = serde_json::json!([tile_url]);
+    if let Some(minz) = pq.minzoom {
+        tj["minzoom"] = serde_json::json!(minz);
+        if let Some(center) = tj.get_mut("center").and_then(|v| v.as_array_mut())
+            && center.len() >= 3
+        {
+            center[2] = serde_json::json!(minz);
+        }
+    }
+    if let Some(maxz) = pq.maxzoom {
+        tj["maxzoom"] = serde_json::json!(maxz);
+    }
 }
 
 fn parse_ext_format(
@@ -1894,48 +1989,107 @@ where
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
-                let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
+                let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
-                let (mask, _) = PolygonMask::from_geojson(&geojson)?;
-                let mask = Arc::new(mask);
-                let n = names.len();
-                let mut set = tokio::task::JoinSet::new();
-                for (idx, cog) in cogs.into_iter().enumerate() {
+
+                let compute_stac_merged_stats = |mask: Arc<PolygonMask>| {
+                    let cogs_c = cogs.clone();
                     let eng = engine.clone();
-                    let mask_c = mask.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    set.spawn(async move {
-                        let st = compute_statistics(
-                            &eng,
-                            &cog,
-                            max_size,
-                            Some(&mask_c),
-                            unscale,
-                            nodata,
-                        )
-                        .await?;
-                        Ok::<_, EngineError>((idx, st))
-                    });
-                }
-                let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
-                while let Some(res) = set.join_next().await {
-                    let (idx, st) = res.map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
-                    ordered[idx] = Some(st);
-                }
-                let mut map = serde_json::Map::new();
-                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
-                    if let Some(st) = st {
-                        map.insert(name, st);
+                    let n = names.len();
+                    async move {
+                        let mut set = tokio::task::JoinSet::new();
+                        for (idx, cog) in cogs_c.into_iter().enumerate() {
+                            let eng_c = eng.clone();
+                            let mask_c = mask.clone();
+                            set.spawn(async move {
+                                let st = compute_statistics(
+                                    &eng_c,
+                                    &cog,
+                                    max_size,
+                                    Some(&mask_c),
+                                    unscale,
+                                    nodata,
+                                )
+                                .await?;
+                                Ok::<_, EngineError>((idx, st))
+                            });
+                        }
+                        let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
+                        while let Some(res) = set.join_next().await {
+                            let (idx, st) = res
+                                .map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
+                            ordered[idx] = Some(st);
+                        }
+                        // Merge bands across assets into b1..bN to match TiTiler's POST /stac/statistics.
+                        let mut merged = serde_json::Map::new();
+                        let mut b_counter = 1usize;
+                        for st in ordered.into_iter().flatten() {
+                            if let Some(obj) = st.as_object() {
+                                for (_k, v) in obj {
+                                    merged.insert(format!("b{b_counter}"), v.clone());
+                                    b_counter += 1;
+                                }
+                            }
+                        }
+                        Ok::<_, EngineError>(serde_json::Value::Object(merged))
+                    }
+                };
+
+                if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                    let features = geojson
+                        .get_mut("features")
+                        .and_then(|v| v.as_array_mut())
+                        .ok_or_else(|| {
+                            EngineError::BadRequest("FeatureCollection missing 'features' array".into())
+                        })?;
+                    if features.len() > 64 {
+                        return Err(EngineError::BadRequest(format!(
+                            "FeatureCollection exceeds max 64 features (got {})",
+                            features.len()
+                        )));
+                    }
+                    for feat in features.iter_mut() {
+                        let (mask, _) = PolygonMask::from_geojson(feat)?;
+                        let stats = compute_stac_merged_stats(Arc::new(mask)).await?;
+                        if let Some(props) =
+                            feat.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = feat.as_object_mut() {
+                            obj.insert(
+                                "properties".into(),
+                                serde_json::json!({"statistics": stats}),
+                            );
+                        }
+                    }
+                    Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                } else {
+                    let (mask, _) = PolygonMask::from_geojson(&geojson)?;
+                    let stats = compute_stac_merged_stats(Arc::new(mask)).await?;
+                    if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                        if let Some(props) =
+                            geojson.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = geojson.as_object_mut() {
+                            obj.insert(
+                                "properties".into(),
+                                serde_json::json!({"statistics": stats}),
+                            );
+                        }
+                        Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                    } else {
+                        let feat = serde_json::json!({
+                            "type": "Feature",
+                            "geometry": geojson,
+                            "properties": { "statistics": stats },
+                        });
+                        Ok((Bytes::from(feat.to_string()), "application/geo+json"))
                     }
                 }
-                let feat = serde_json::json!({
-                    "type": "Feature",
-                    "geometry": geojson.get("geometry").cloned().unwrap_or(geojson),
-                    "properties": { "statistics": map },
-                });
-                Ok((Bytes::from(feat.to_string()), "application/geo+json"))
             }
             .await,
 
@@ -1955,8 +2109,7 @@ where
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
-                let tile_url = format!("{host}/stac/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
-                tj["tiles"] = serde_json::json!([tile_url]);
+                apply_tilejson_overrides(&mut tj, &pq, &host, "stac", tms, &raw_query);
                 tj["name"] = serde_json::json!(item.id);
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
@@ -2158,9 +2311,10 @@ where
                     }
                 }
                 let body = serde_json::json!({
-                    "coordinates": [lon, lat],
+                    "coordinates": [x, y],
                     "values": all_vals,
                     "band_names": all_names,
+                    "band_descriptions": all_names,
                 })
                 .to_string();
                 Ok((Bytes::from(body), "application/json"))
@@ -2517,30 +2671,75 @@ where
                 } else {
                     let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                         .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
-                    let (mask, _) = PolygonMask::from_geojson(&geojson)?;
-                    let stats = compute_statistics(
-                        &engine,
-                        &cogs[0],
-                        pq.max_size,
-                        Some(&mask),
-                        pq.unscale,
-                        pq.nodata,
-                    )
-                    .await?;
-                    if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
-                        if let Some(props) = geojson.get_mut("properties").and_then(|v| v.as_object_mut()) {
-                            props.insert("statistics".into(), stats);
-                        } else if let Some(obj) = geojson.as_object_mut() {
-                            obj.insert("properties".into(), serde_json::json!({"statistics": stats}));
+                    if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                        let features = geojson
+                            .get_mut("features")
+                            .and_then(|v| v.as_array_mut())
+                            .ok_or_else(|| {
+                                EngineError::BadRequest(
+                                    "FeatureCollection missing 'features' array".into(),
+                                )
+                            })?;
+                        if features.len() > 64 {
+                            return Err(EngineError::BadRequest(format!(
+                                "FeatureCollection exceeds max 64 features (got {})",
+                                features.len()
+                            )));
+                        }
+                        for feat in features.iter_mut() {
+                            let (mask, _) = PolygonMask::from_geojson(feat)?;
+                            let stats = compute_statistics(
+                                &engine,
+                                &cogs[0],
+                                pq.max_size,
+                                Some(&mask),
+                                pq.unscale,
+                                pq.nodata,
+                            )
+                            .await?;
+                            if let Some(props) =
+                                feat.get_mut("properties").and_then(|v| v.as_object_mut())
+                            {
+                                props.insert("statistics".into(), stats);
+                            } else if let Some(obj) = feat.as_object_mut() {
+                                obj.insert(
+                                    "properties".into(),
+                                    serde_json::json!({"statistics": stats}),
+                                );
+                            }
                         }
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                     } else {
-                        let feat = serde_json::json!({
-                            "type": "Feature",
-                            "geometry": geojson,
-                            "properties": { "statistics": stats },
-                        });
-                        Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                        let (mask, _) = PolygonMask::from_geojson(&geojson)?;
+                        let stats = compute_statistics(
+                            &engine,
+                            &cogs[0],
+                            pq.max_size,
+                            Some(&mask),
+                            pq.unscale,
+                            pq.nodata,
+                        )
+                        .await?;
+                        if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                            if let Some(props) =
+                                geojson.get_mut("properties").and_then(|v| v.as_object_mut())
+                            {
+                                props.insert("statistics".into(), stats);
+                            } else if let Some(obj) = geojson.as_object_mut() {
+                                obj.insert(
+                                    "properties".into(),
+                                    serde_json::json!({"statistics": stats}),
+                                );
+                            }
+                            Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                        } else {
+                            let feat = serde_json::json!({
+                                "type": "Feature",
+                                "geometry": geojson,
+                                "properties": { "statistics": stats },
+                            });
+                            Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                        }
                     }
                 }
             }
@@ -2719,13 +2918,16 @@ where
             // 8. GET /cog/{tileMatrixSetId}/tilejson.json & /cog/tilejson.json
             (Method::GET, [tms, "tilejson.json"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
+                let mut json = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
+                apply_tilejson_overrides(&mut json, &pq, &host, "cog", tms, &raw_query);
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
             (Method::GET, ["tilejson.json"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = build_tilejson(&engine, &cogs[0], &host, "WebMercatorQuad", &raw_query)?;
+                let mut json =
+                    build_tilejson(&engine, &cogs[0], &host, "WebMercatorQuad", &raw_query)?;
+                apply_tilejson_overrides(&mut json, &pq, &host, "cog", "WebMercatorQuad", &raw_query);
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
@@ -2750,7 +2952,11 @@ where
                 } else {
                     (x, y)
                 };
-                let json = query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
+                let mut json =
+                    query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
+                if pq.coord_crs_3857 {
+                    json["coordinates"] = serde_json::json!([x, y]);
+                }
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
@@ -3278,6 +3484,30 @@ mod tests {
                 .unwrap();
         assert_eq!(ct, "image/webp");
         assert!(matches!(treq.format, OutputFormat::Webp { .. }));
+
+        // TiTiler query param parity: nodata=nan/inf/-inf, z_exaggeration, [0,1000] rescale,
+        // colormap_name precedence over inline colormap, and tilejson minzoom/maxzoom/tile_format.
+        let pq_nd = parse_query(Some("nodata=nan&rescale=[0,%201000]&algorithm_params=%7B%22z_exaggeration%22:2.5%7D"));
+        assert!(pq_nd.errors.is_empty());
+        assert!(pq_nd.nodata.unwrap().is_nan());
+        assert_eq!(pq_nd.rescale, vec![(0.0, 1000.0)]);
+        assert!((pq_nd.z_factor - 2.5).abs() < 1e-6);
+
+        let pq_cm = parse_query(Some("colormap=%7B%220%22:[0,0,0,255]%7D&colormap_name=viridis"));
+        assert!(pq_cm.errors.is_empty());
+        assert!(pq_cm.custom_colormap_json.is_none());
+        assert_eq!(pq_cm.colormap, ColormapName::from_str_opt("viridis").unwrap());
+
+        let pq_tj = parse_query(Some("url=a.tif&minzoom=4&maxzoom=14&tile_format=webp"));
+        assert!(pq_tj.errors.is_empty());
+        assert!(validate_query(&["cog", "WebMercatorQuad", "tilejson.json"], &pq_tj).is_ok());
+        assert!(validate_query(&["cog", "tiles", "WebMercatorQuad", "4", "0", "0.png"], &pq_tj).is_err());
+        let mut tj = serde_json::json!({"minzoom": 0, "maxzoom": 10, "center": [0.0, 0.0, 0], "tiles": []});
+        apply_tilejson_overrides(&mut tj, &pq_tj, "http://host", "cog", "WebMercatorQuad", "url=a.tif&minzoom=4&maxzoom=14&tile_format=webp");
+        assert_eq!(tj["minzoom"], 4);
+        assert_eq!(tj["maxzoom"], 14);
+        assert_eq!(tj["center"][2], 4);
+        assert_eq!(tj["tiles"][0], "http://host/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.webp?url=a.tif");
 
         // HTTP status mapping for upstream 404, local NotFound, and invalid TIFF
         let r404 = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::HttpStatus {
