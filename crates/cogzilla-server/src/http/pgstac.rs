@@ -1,4 +1,5 @@
-//! titiler-pgstac's `/searches` and `/collections/{id}` mosaic routes, on the compatibility path.
+//! titiler-pgstac's `/searches` and `/collections/{id}` mosaic routes, on the compatibility path,
+//! and the item layer in front of the `/stac` handlers for `/collections/{id}/items/{id}`.
 //!
 //! The items behind a tile come from pgSTAC's own `geojsonsearch`, called with the
 //! arguments titiler-pgstac passes, and are rendered by the existing mosaic engine.
@@ -15,6 +16,7 @@ use cogzilla_kernel::{OutputFormat, ResampleMode};
 use cogzilla_pgstac::{
     MosaicItem, PgStac, PgStacError, SearchLimits, SearchOrder, SearchRecord, jsonb_key_order,
 };
+use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{CrsModel, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::Full;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
@@ -26,7 +28,7 @@ use super::{
     percent_decode, read_limited_body, to_http_response_cached,
 };
 use crate::engine::{EngineError, TileEngine};
-use crate::stac::rewrite_stac_expr;
+use crate::stac::{StacItem, rewrite_stac_expr, stac_item_from_json};
 use crate::titiler::{build_map_html, encode_rgba_output};
 
 /// Most scenes one tile may read. titiler-pgstac's default `items_limit` is 100.
@@ -106,7 +108,7 @@ fn db_error(err: &PgStacError) -> Resp {
     }
 }
 
-fn engine_error(err: &EngineError) -> Resp {
+pub(super) fn engine_error(err: &EngineError) -> Resp {
     match err {
         EngineError::Shared(inner) => engine_error(inner),
         EngineError::NotFound(msg) => detail(StatusCode::NOT_FOUND, msg.clone()),
@@ -536,6 +538,21 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 /// The pgSTAC routes, as entries for the OpenAPI document's `paths`.
 pub(super) fn openapi_paths() -> Value {
     json!({
+        "/collections/{collection_id}/items/{item_id}/assets": { "get": { "summary": "Assets of a pgSTAC item" } },
+        "/collections/{collection_id}/items/{item_id}/info": { "get": { "summary": "pgSTAC item asset metadata" } },
+        "/collections/{collection_id}/items/{item_id}/info.geojson": { "get": { "summary": "pgSTAC item asset metadata as GeoJSON" } },
+        "/collections/{collection_id}/items/{item_id}/statistics": { "get": { "summary": "pgSTAC item statistics" } },
+        "/collections/{collection_id}/items/{item_id}/asset_statistics": { "get": { "summary": "pgSTAC item per-asset statistics" } },
+        "/collections/{collection_id}/items/{item_id}/tiles": { "get": { "summary": "pgSTAC item tilesets" } },
+        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}": { "get": { "summary": "pgSTAC item tileset description" } },
+        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC item tile" } },
+        "/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC item TileJSON 3.0" } },
+        "/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC item map viewer" } },
+        "/collections/{collection_id}/items/{item_id}/point/{lon},{lat}": { "get": { "summary": "pgSTAC item values at a point" } },
+        "/collections/{collection_id}/items/{item_id}/preview.{format}": { "get": { "summary": "pgSTAC item preview" } },
+        "/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}": { "get": { "summary": "pgSTAC item image for a bounding box" } },
+        "/collections/{collection_id}/items/{item_id}/feature.{format}": { "post": { "summary": "pgSTAC item image for a GeoJSON feature" } },
+        "/collections/{collection_id}/items/{item_id}/renders": { "get": { "summary": "pgSTAC item renders" } },
         "/searches/register": { "post": { "summary": "Register a pgSTAC search" } },
         "/searches/": { "get": { "summary": "List registered pgSTAC searches" } },
         "/searches/{search_id}/info": { "get": { "summary": "pgSTAC search metadata" } },
@@ -699,7 +716,7 @@ async fn collection_mosaic(
 /// Zoom range and bounds of a mosaic: the query string, then the search metadata, then
 /// the whole tile matrix set.
 fn mosaic_extent(
-    rec: &SearchRecord,
+    metadata: &Value,
     pairs: &[(String, String)],
 ) -> Result<(i64, i64, [f64; 4]), Resp> {
     let zoom = |name: &str| -> Result<Option<i64>, Resp> {
@@ -711,11 +728,10 @@ fn mosaic_extent(
                 .map_err(|_| invalid_param("query", name, "Input should be a valid integer")),
         }
     };
-    let meta_i64 = |k: &str| rec.metadata.get(k).and_then(Value::as_i64);
+    let meta_i64 = |k: &str| metadata.get(k).and_then(Value::as_i64);
     let minzoom = zoom("minzoom")?.or_else(|| meta_i64("minzoom")).unwrap_or(0);
     let maxzoom = zoom("maxzoom")?.or_else(|| meta_i64("maxzoom")).unwrap_or(24);
-    let bounds: [f64; 4] = rec
-        .metadata
+    let bounds: [f64; 4] = metadata
         .get("bounds")
         .and_then(Value::as_array)
         .filter(|a| a.len() == 4)
@@ -754,8 +770,14 @@ fn bounding_box(bounds: [f64; 4]) -> Value {
 }
 
 /// `GET {base}/tiles/{tms}`: the OGC tileset description for one tile matrix set.
-fn tileset(ctx: &Ctx<'_>, base: &str, rec: &SearchRecord, tms: &str, pairs: &[(String, String)]) -> Resp {
-    let (minzoom, maxzoom, bounds) = match mosaic_extent(rec, pairs) {
+fn tileset(
+    ctx: &Ctx<'_>,
+    base: &str,
+    metadata: &Value,
+    tms: &str,
+    pairs: &[(String, String)],
+) -> Resp {
+    let (minzoom, maxzoom, bounds) = match mosaic_extent(metadata, pairs) {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -786,8 +808,8 @@ fn tileset(ctx: &Ctx<'_>, base: &str, rec: &SearchRecord, tms: &str, pairs: &[(S
 
 /// `GET {base}/tiles`: the tilesets on offer. TiTiler lists thirteen tile matrix sets;
 /// these routes serve Web Mercator only, so that is the one listed.
-fn tilesets(ctx: &Ctx<'_>, base: &str, rec: &SearchRecord, pairs: &[(String, String)]) -> Resp {
-    let (_, _, bounds) = match mosaic_extent(rec, pairs) {
+fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, String)]) -> Resp {
+    let (_, _, bounds) = match mosaic_extent(metadata, pairs) {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -882,7 +904,7 @@ fn tilejson(
     if !pairs.iter().any(|(k, _)| k == "assets") {
         return missing_query_param("assets");
     }
-    let (minzoom, maxzoom, bounds) = match mosaic_extent(rec, pairs) {
+    let (minzoom, maxzoom, bounds) = match mosaic_extent(&rec.metadata, pairs) {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -1155,6 +1177,460 @@ async fn tile(
     }
 }
 
+/// What the router does with `/collections/{c}/items/{i}/...`.
+pub(super) enum ItemRoute {
+    /// Run the `/stac` handlers over this item, then pass the answer through [`item_fixup`].
+    Stac(Arc<StacItem>, Option<ItemExtent>),
+    /// Already answered.
+    Done(Resp),
+}
+
+/// Where an item lies and the zooms it is worth tiling at, as rio-tiler's STAC reader
+/// derives them: from the projection extension when the item has it, else from its bbox.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ItemExtent {
+    wgs84: [f64; 4],
+    /// The same extent in Web Mercator, when every edge can be placed there.
+    mercator: Option<[f64; 4]>,
+    minzoom: i64,
+    maxzoom: i64,
+}
+
+/// A raster grid in its own coordinate system: `[west, south, east, north]` and its size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProjGrid {
+    bounds: [f64; 4],
+    width: f64,
+    height: f64,
+}
+
+/// `proj:code`/`proj:epsg` of an item's properties or of one asset, as one comparable string.
+fn proj_crs_string(obj: &Value) -> Option<String> {
+    if let Some(code) = obj.get("proj:code").and_then(Value::as_str) {
+        return Some(code.to_string());
+    }
+    obj.get("proj:epsg").and_then(Value::as_i64).map(|e| format!("EPSG:{e}"))
+}
+
+fn proj_grid_of(obj: &Value) -> Option<ProjGrid> {
+    let t: Vec<f64> = obj
+        .get("proj:transform")?
+        .as_array()?
+        .iter()
+        .map(Value::as_f64)
+        .collect::<Option<_>>()?;
+    let shape: Vec<f64> =
+        obj.get("proj:shape")?.as_array()?.iter().map(Value::as_f64).collect::<Option<_>>()?;
+    if t.len() < 6 || shape.len() != 2 || t[0] == 0.0 || t[4] == 0.0 {
+        return None;
+    }
+    let (height, width) = (shape[0], shape[1]);
+    let (x0, y0) = (t[2], t[5]);
+    let (x1, y1) = (x0 + t[0] * width, y0 + t[4] * height);
+    Some(ProjGrid { bounds: [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)], width, height })
+}
+
+/// The grid rio-tiler gives an item: the union of its assets' grids at the finest asset's
+/// resolution, or the item-level projection fields. `None` when the item does not say.
+fn item_proj_grid(item: &Value, readable: &[String]) -> Option<ProjGrid> {
+    let props = item.get("properties")?;
+    let item_crs = proj_crs_string(props);
+    let mut grids: Vec<(ProjGrid, f64, f64)> = Vec::new();
+    let mut crs_strings: Vec<String> = item_crs.iter().cloned().collect();
+    for name in readable {
+        let asset = &item["assets"][name];
+        if let (Some(grid), Some(t)) = (proj_grid_of(asset), asset.get("proj:transform")) {
+            match proj_crs_string(asset).or_else(|| item_crs.clone()) {
+                Some(crs) => crs_strings.push(crs),
+                None => return None,
+            }
+            let xres = t[0].as_f64().unwrap_or(0.0);
+            let yres = t[4].as_f64().unwrap_or(0.0);
+            grids.push((grid, xres, yres));
+        }
+    }
+    if !grids.is_empty() && crs_strings.iter().all(|c| c == &crs_strings[0]) {
+        let fold = |i: usize, f: fn(f64, f64) -> f64, init: f64| {
+            grids.iter().fold(init, |acc, (g, _, _)| f(acc, g.bounds[i]))
+        };
+        let bounds = [
+            fold(0, f64::min, f64::INFINITY),
+            fold(1, f64::min, f64::INFINITY),
+            fold(2, f64::max, f64::NEG_INFINITY),
+            fold(3, f64::max, f64::NEG_INFINITY),
+        ];
+        let (_, xres, yres) = grids.iter().copied().min_by(|a, b| {
+            (a.1.abs(), a.2.abs()).partial_cmp(&(b.1.abs(), b.2.abs())).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        let height = ((bounds[3] - bounds[1]) / yres).floor().abs();
+        let width = ((bounds[2] - bounds[0]) / xres).floor().abs();
+        return Some(ProjGrid { bounds, width, height });
+    }
+    item_crs.as_ref()?;
+    proj_grid_of(props)
+}
+
+/// Twenty-one points along each edge of a box.
+fn edge_points(b: [f64; 4]) -> Vec<(f64, f64)> {
+    let mut pts = Vec::with_capacity(84);
+    for i in 0..=20 {
+        let f = i as f64 / 20.0;
+        let (x, y) = (b[0] + f * (b[2] - b[0]), b[1] + f * (b[3] - b[1]));
+        pts.extend([(x, b[3]), (x, b[1]), (b[0], y), (b[2], y)]);
+    }
+    pts
+}
+
+/// Extent and zoom range of a grid, following rio-tiler: bounds from twenty-one points per
+/// edge, zooms from the size the grid would have once warped to Web Mercator.
+fn grid_extent(crs: &CrsModel, grid: ProjGrid) -> ItemExtent {
+    let lonlat: Vec<(f64, f64)> =
+        edge_points(grid.bounds).iter().map(|&(x, y)| crs.to_lonlat_deg(x, y)).collect();
+    let span = |pts: &[(f64, f64)]| -> Option<[f64; 4]> {
+        if pts.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+            return None;
+        }
+        Some(pts.iter().fold(
+            [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            |a, p| [a[0].min(p.0), a[1].min(p.1), a[2].max(p.0), a[3].max(p.1)],
+        ))
+    };
+    let wgs84 = span(&lonlat).unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+    let merc_pts: Vec<(f64, f64)> = if matches!(crs, CrsModel::Epsg3857) {
+        edge_points(grid.bounds)
+    } else {
+        lonlat.iter().map(|&(lon, lat)| lonlat_deg_to_mercator(lon, lat)).collect()
+    };
+    let mercator = span(&merc_pts);
+    // The same rule `/cog` and `/stac` TileJSON use, on the item's grid.
+    let pixel_to_crs = cogzilla_tiff::Affine2D {
+        a: (grid.bounds[2] - grid.bounds[0]) / grid.width,
+        b: 0.0,
+        c: grid.bounds[0],
+        d: 0.0,
+        e: -(grid.bounds[3] - grid.bounds[1]) / grid.height,
+        f: grid.bounds[3],
+    };
+    let (minzoom, maxzoom) =
+        crs.web_mercator_zoom_range(&pixel_to_crs, grid.width as u32, grid.height as u32, 1.0);
+    ItemExtent { wgs84, mercator, minzoom: i64::from(minzoom), maxzoom: i64::from(maxzoom) }
+}
+
+/// The extent of an item. The coordinate system comes from one of its rasters: the first
+/// asset asked for, or the first that can be read.
+async fn item_extent(
+    ctx: &Ctx<'_>,
+    doc: &Value,
+    item: &StacItem,
+    readable: &[String],
+    pq: &ParsedQuery,
+) -> Result<ItemExtent, Resp> {
+    let Some(grid) = item_proj_grid(doc, readable) else {
+        // No projection metadata: rio-tiler falls back to the item's bbox and every zoom.
+        let b = item.bbox.unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+        let (x0, y0) = lonlat_deg_to_mercator(b[0], b[1]);
+        let (x1, y1) = lonlat_deg_to_mercator(b[2], b[3]);
+        let mercator = [x0, y0, x1, y1].iter().all(|v| v.is_finite()).then_some([x0, y0, x1, y1]);
+        return Ok(ItemExtent { wgs84: b, mercator, minzoom: 0, maxzoom: 24 });
+    };
+    let wanted = pq.assets.first().map(|a| a.split('|').next().unwrap_or(a).to_string());
+    let href = match &wanted {
+        Some(name) => item.assets.get(name),
+        None => readable.iter().find_map(|name| item.assets.get(name)),
+    };
+    let Some(href) = href else {
+        return Err(detail(StatusCode::NOT_FOUND, "the item has no readable raster asset"));
+    };
+    let crs = async {
+        let cog = ctx.engine.store.open_uri(href).await?;
+        ctx.engine.get_or_build_crs(&cog)
+    }
+    .await
+    .map_err(|e| engine_error(&e))?;
+    Ok(grid_extent(&crs, grid))
+}
+
+/// An item tile asked for without an extension: a JPEG when every pixel is valid and a
+/// PNG when some are not, as TiTiler chooses.
+pub(super) async fn item_tile_auto_format(
+    engine: &TileEngine,
+    cogs: &[Arc<cogzilla_io::OpenedCog>],
+    mut treq: crate::engine::TileRequest,
+    pq: &ParsedQuery,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let formula = pq
+        .color_formula
+        .as_deref()
+        .map(cogzilla_kernel::ColorFormula::parse)
+        .transpose()
+        .map_err(EngineError::BadRequest)?;
+    treq.format = OutputFormat::RawRgba;
+    let mut rgba = engine.render_multi_cog_tile(cogs, &treq).await?.to_vec();
+    if let Some(formula) = formula {
+        formula.apply_buffer_in_place(&mut rgba, 4);
+    }
+    let dim = treq.tile_size as usize;
+    let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
+    let (format, content_type) =
+        parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?;
+    Ok((encode_rgba_output(dim, dim, &rgba, format, pq.return_mask), content_type))
+}
+
+/// Make a `/stac` answer read the way titiler-pgstac's item routes do.
+pub(super) fn item_fixup(
+    sub: &[&str],
+    extent: Option<&ItemExtent>,
+    raw_query: &str,
+    body: Bytes,
+    content_type: &'static str,
+) -> (Bytes, &'static str) {
+    // TiTiler names the media type after the extension that was asked for.
+    if let ["tiles", .., last] = sub
+        && last.ends_with(".jpg")
+        && content_type == "image/jpeg"
+    {
+        return (body, "image/jpg");
+    }
+    let wants_json = matches!(sub, ["info" | "info.geojson"] | ["point", _] | [_, "tilejson.json"]);
+    if !wants_json {
+        return (body, content_type);
+    }
+    let Ok(mut doc) = serde_json::from_slice::<Value>(&body) else {
+        return (body, content_type);
+    };
+    // Per-asset fields the `/stac` routes add and titiler-pgstac does not have.
+    let strip = |assets: Option<&mut serde_json::Map<String, Value>>| {
+        for info in assets.into_iter().flat_map(|m| m.values_mut()) {
+            if let Some(info) = info.as_object_mut() {
+                for key in ["minzoom", "maxzoom", "wgs84_bounds"] {
+                    info.remove(key);
+                }
+            }
+        }
+    };
+    match sub {
+        ["info"] => strip(doc.as_object_mut()),
+        ["info.geojson"] => {
+            strip(doc.get_mut("properties").and_then(Value::as_object_mut));
+            // The feature is the item's extent, not its footprint.
+            if let Some(e) = extent {
+                let [w, s, e_, n] = e.wgs84;
+                doc["bbox"] = json!([w, s, e_, n]);
+                doc["geometry"] = json!({
+                    "type": "Polygon",
+                    "coordinates": [[[w, s], [e_, s], [e_, n], [w, n], [w, s]]]
+                });
+            }
+        }
+        ["point", _] => {
+            if let Some(names) = doc.get_mut("band_names").and_then(Value::as_array_mut) {
+                for (i, name) in names.iter_mut().enumerate() {
+                    *name = json!(format!("b{}", i + 1));
+                }
+            }
+        }
+        [_, "tilejson.json"] => {
+            if let Some(e) = extent {
+                let pairs = query_pairs(raw_query);
+                doc["bounds"] = json!(e.wgs84);
+                if query_value(&pairs, "minzoom").is_none() {
+                    doc["minzoom"] = json!(e.minzoom);
+                }
+                if query_value(&pairs, "maxzoom").is_none() {
+                    doc["maxzoom"] = json!(e.maxzoom);
+                }
+                let minzoom = doc["minzoom"].clone();
+                doc["center"] =
+                    json!([(e.wgs84[0] + e.wgs84[2]) / 2.0, (e.wgs84[1] + e.wgs84[3]) / 2.0, minzoom]);
+            }
+        }
+        _ => {}
+    }
+    (Bytes::from(doc.to_string()), content_type)
+}
+
+/// The asset media types rio-tiler reads by default. An asset with no type is taken too.
+const READABLE_ASSET_TYPES: [&str; 12] = [
+    "image/tiff; application=geotiff",
+    "image/tiff; application=geotiff; profile=cloud-optimized",
+    "image/tiff; profile=cloud-optimized; application=geotiff",
+    "image/vnd.stac.geotiff; cloud-optimized=true",
+    "image/tiff",
+    "image/x.geotiff",
+    "image/jp2",
+    "application/x-hdf5",
+    "application/x-hdf",
+    "application/vnd+zarr",
+    "application/x-netcdf",
+    "application/netcdf",
+];
+
+/// The asset names titiler-pgstac offers for an item, in the order it lists them.
+fn readable_assets(item: &Value) -> Vec<String> {
+    let Some(assets) = item.get("assets").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = assets
+        .iter()
+        .filter(|(_, a)| match a.get("type").and_then(Value::as_str) {
+            Some(t) if !t.is_empty() => READABLE_ASSET_TYPES.contains(&t),
+            _ => true,
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    jsonb_key_order(&mut names);
+    names
+}
+
+/// Routes of the item family that titiler-pgstac refuses without `assets`.
+fn item_route_needs_assets(rest: &[&str]) -> bool {
+    match rest {
+        ["info" | "info.geojson" | "statistics" | "asset_statistics" | "WMTSCapabilities.xml"] => true,
+        ["point", _] | ["bbox", ..] | ["tiles", _, _, _, _] => true,
+        [_, "tilejson.json" | "map.html"] => true,
+        [first, ..] => {
+            *first == "preview"
+                || first.starts_with("preview.")
+                || *first == "feature"
+                || first.starts_with("feature.")
+        }
+        [] => false,
+    }
+}
+
+/// Resolve the item behind `/collections/{collection}/items/{item_id}/...` and answer what
+/// is specific to titiler-pgstac. Everything else goes to the `/stac` handlers.
+pub(super) async fn item_route(
+    ctx: &Ctx<'_>,
+    method: &Method,
+    collection: &str,
+    item_id: &str,
+    rest: &[&str],
+    pq: &ParsedQuery,
+) -> ItemRoute {
+    use ItemRoute::Done;
+    let Some(pg) = ctx.engine.pgstac() else {
+        return Done(detail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pgSTAC is not configured: set DATABASE_URL, or PGHOST and the other PG* variables",
+        ));
+    };
+    let base = format!("/collections/{collection}/items/{item_id}");
+    let (collection, item_id) = (percent_decode(collection), percent_decode(item_id));
+    let doc = match pg.get_item_cached(&collection, &item_id).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => {
+            return Done(detail(
+                StatusCode::NOT_FOUND,
+                format!("No item '{item_id}' found in '{collection}' collection"),
+            ));
+        }
+        Err(e) => return Done(db_error(&e)),
+    };
+    let readable = readable_assets(&doc);
+    let self_href = doc
+        .get("links")
+        .and_then(Value::as_array)
+        .and_then(|links| links.iter().find(|l| l["rel"] == "self"))
+        .and_then(|l| l["href"].as_str())
+        .unwrap_or("");
+    let item = Arc::new(stac_item_from_json(&doc, self_href));
+    let get = *method == Method::GET;
+    let pairs = query_pairs(ctx.raw_query);
+
+    match rest {
+        ["assets"] if get => return Done(json_resp(StatusCode::OK, &json!(readable))),
+        ["renders"] if get => {
+            let renders = doc.pointer("/properties/renders").and_then(Value::as_object);
+            if renders.is_some_and(|r| !r.is_empty()) {
+                return Done(detail(
+                    StatusCode::BAD_REQUEST,
+                    "items with STAC renders are not supported on this route yet",
+                ));
+            }
+            return Done(json_resp(
+                StatusCode::OK,
+                &json!({ "renders": {}, "links": [{
+                    "href": format!("{}{base}/renders", ctx.host),
+                    "rel": "self",
+                    "type": "application/json",
+                    "title": "List STAC Renders metadata"
+                }]}),
+            ));
+        }
+        ["tiles"] | ["tiles", _] if get => {
+            if let ["tiles", tms] = rest
+                && let Err(r) = check_tms(tms)
+            {
+                return Done(r);
+            }
+            if query_value(&pairs, "f") == Some("html") {
+                return Done(detail(
+                    StatusCode::BAD_REQUEST,
+                    "f=html is not supported on tileset routes (use f=json)",
+                ));
+            }
+            let extent = match item_extent(ctx, &doc, &item, &readable, pq).await {
+                Ok(e) => e,
+                Err(r) => return Done(r),
+            };
+            let metadata = json!({
+                "bounds": extent.wgs84, "minzoom": extent.minzoom, "maxzoom": extent.maxzoom
+            });
+            return Done(match rest {
+                ["tiles", tms] => tileset(ctx, &base, &metadata, tms, &pairs),
+                _ => tilesets(ctx, &base, &metadata, &pairs),
+            });
+        }
+        _ => {}
+    }
+
+    if item_route_needs_assets(rest) {
+        if pq.assets.is_empty() {
+            return Done(missing_query_param("assets"));
+        }
+        for asset in &pq.assets {
+            let name = asset.split('|').next().unwrap_or(asset);
+            if !readable.iter().any(|r| r == name) {
+                let known: Vec<String> = readable.iter().map(|r| format!("'{r}'")).collect();
+                return Done(detail(
+                    StatusCode::NOT_FOUND,
+                    format!("'{name}' is not valid, should be one of [{}]", known.join(", ")),
+                ));
+            }
+        }
+    }
+    // The routes whose answer depends on where the item lies.
+    let needs_extent = matches!(rest, ["info.geojson"] | ["tiles", _, _, _, _] | [_, "tilejson.json"]);
+    let extent = if needs_extent {
+        match item_extent(ctx, &doc, &item, &readable, pq).await {
+            Ok(e) => Some(e),
+            Err(r) => return Done(r),
+        }
+    } else {
+        None
+    };
+    // A tile that does not touch the item is a 404, as in rio-tiler's `tile_exists`.
+    if let (["tiles", "WebMercatorQuad", zs, xs, ys], Some(m)) =
+        (rest, extent.as_ref().and_then(|e| e.mercator))
+        && let (Ok(z), Ok(x), Some((y, _, _))) =
+            (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+        && z <= 30
+        && u64::from(x) < (1u64 << z)
+        && u64::from(y) < (1u64 << z)
+    {
+        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
+        let touches = min_x < m[2] && max_x > m[0] && max_y > m[1] && min_y < m[3];
+        if !touches {
+            return Done(detail(
+                StatusCode::NOT_FOUND,
+                format!("Tile(x={x}, y={y}, z={z}) is outside bounds"),
+            ));
+        }
+    }
+    ItemRoute::Stac(item, extent)
+}
+
 /// Serve a request whose path starts with `/searches`.
 pub(super) async fn handle<B>(
     ctx: Ctx<'_>,
@@ -1181,7 +1657,7 @@ where
     match segs {
         ["searches", "register"] if *method == Method::POST => register(&ctx, pg, req).await,
         ["searches"] | ["searches", ""] | ["searches", "list"] if get => list(&ctx, pg, &pairs).await,
-        // The item routes are not served yet.
+        // Item routes with a path are answered before this is reached.
         ["collections", _, "items", ..] => not_found(),
         [family @ ("searches" | "collections"), id, rest @ ..] if get && !rest.is_empty() => {
             // A tile matrix set in the path is validated before anything is looked up.
@@ -1248,8 +1724,8 @@ async fn mosaic_route(
             StatusCode::BAD_REQUEST,
             "f=html is not supported on tileset routes (use f=json)",
         ),
-        ["tiles"] => tilesets(ctx, base, rec, pairs),
-        ["tiles", tms] => tileset(ctx, base, rec, tms, pairs),
+        ["tiles"] => tilesets(ctx, base, &rec.metadata, pairs),
+        ["tiles", tms] => tileset(ctx, base, &rec.metadata, tms, pairs),
         ["tiles", _, zs, xs, ys, "assets"] => {
             let coord = match ys.parse::<u32>() {
                 Ok(y) => parse_zxy(zs, xs, y),
@@ -1453,6 +1929,143 @@ mod tests {
         // Registration links keep asset_bidx as its own parameter.
         assert!(layer_queries(&metadata, false)[1].1.ends_with("&assets=red&asset_bidx=red%7C1"));
         assert!(layer_queries(&json!({ "name": "x" }), true).is_empty());
+    }
+
+    fn utm(epsg: u16) -> CrsModel {
+        let keys = cogzilla_tiff::GeoKeys {
+            model_type: Some(1),
+            projected_cs_type: Some(epsg),
+            ..Default::default()
+        };
+        CrsModel::from_geo_keys(&keys).unwrap()
+    }
+
+    #[test]
+    fn item_zooms_follow_rio_tiler() {
+        // Expected values are rio-tiler 9.4's for the same grids (rasterio's
+        // calculate_default_transform, then zoom_for_res).
+        let zooms = |crs: &CrsModel, width: f64, height: f64, bounds: [f64; 4]| {
+            let e = grid_extent(crs, ProjGrid { bounds, width, height });
+            (e.minzoom, e.maxzoom)
+        };
+        let s2 = [699_960.0, 4_790_220.0, 809_760.0, 4_900_020.0];
+        assert_eq!(zooms(&utm(32631), 10980.0, 10980.0, s2), (7, 13));
+        assert_eq!(zooms(&utm(32631), 5490.0, 5490.0, s2), (7, 12));
+        assert_eq!(zooms(&utm(32631), 1830.0, 1830.0, s2), (8, 11));
+        assert_eq!(
+            zooms(&utm(32632), 10980.0, 10980.0, [399_960.0, 5_090_220.0, 509_760.0, 5_200_020.0]),
+            (7, 13)
+        );
+        assert_eq!(
+            zooms(&utm(32633), 10980.0, 10980.0, [499_980.0, 6_790_200.0, 609_780.0, 6_900_000.0]),
+            (7, 13)
+        );
+        assert_eq!(
+            zooms(&utm(32619), 7621.0, 7791.0, [300_000.0, 100_000.0, 528_630.0, 333_730.0]),
+            (7, 12)
+        );
+        assert_eq!(
+            zooms(&utm(32755), 10980.0, 10980.0, [300_000.0, 5_690_220.0, 409_800.0, 5_800_020.0]),
+            (8, 14)
+        );
+        assert_eq!(zooms(&CrsModel::Geographic, 3600.0, 1800.0, [-10.0, 30.0, 26.0, 48.0]), (3, 7));
+        assert_eq!(
+            zooms(&CrsModel::Epsg3857, 4096.0, 2048.0, [500_000.0, 5_300_000.0, 622_304.0, 5_361_152.0]),
+            (9, 12)
+        );
+
+        // The extent of the Sentinel-2 tile in WGS84, as rasterio's transform_bounds gives it.
+        let e = grid_extent(&utm(32631), ProjGrid { bounds: s2, width: 10980.0, height: 10980.0 });
+        let want = [5.462735477681616, 43.201211354944526, 6.875738946301351, 44.22597512756446];
+        for (got, want) in e.wgs84.iter().zip(want) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        assert!(e.mercator.is_some());
+    }
+
+    #[test]
+    fn item_grid_comes_from_the_projection_extension() {
+        let tiff = "image/tiff; application=geotiff; profile=cloud-optimized";
+        let item = json!({
+            "properties": { "proj:epsg": 32631 },
+            "assets": {
+                "visual": { "href": "v.tif", "type": tiff, "proj:shape": [10980, 10980],
+                            "proj:transform": [10, 0, 699960, 0, -10, 4900020] },
+                "aot": { "href": "a.tif", "type": tiff, "proj:shape": [5490, 5490],
+                         "proj:transform": [20, 0, 699960, 0, -20, 4900020] },
+                "aot-jp2": { "href": "a.jp2", "type": "image/jp2" },
+                "untyped": { "href": "u.bin" },
+                "thumbnail": { "href": "t.jpg", "type": "image/jpeg" },
+                "granule_metadata": { "href": "m.xml", "type": "application/xml" }
+            }
+        });
+        // jsonb key order, with the media types rio-tiler reads and untyped assets.
+        let readable = readable_assets(&item);
+        assert_eq!(readable, ["aot", "visual", "aot-jp2", "untyped"]);
+        // The union of the assets' grids at the finest asset's resolution.
+        let grid = item_proj_grid(&item, &readable).unwrap();
+        assert_eq!(grid.bounds, [699_960.0, 4_790_220.0, 809_760.0, 4_900_020.0]);
+        assert_eq!((grid.width, grid.height), (10980.0, 10980.0));
+
+        // Item-level fields are used when no asset has its own.
+        let item_level = json!({
+            "properties": { "proj:code": "EPSG:32631", "proj:shape": [100, 200],
+                            "proj:transform": [30, 0, 500000, 0, -30, 4000000] },
+            "assets": { "data": { "href": "d.tif" } }
+        });
+        let grid = item_proj_grid(&item_level, &["data".to_string()]).unwrap();
+        assert_eq!(grid.bounds, [500_000.0, 3_997_000.0, 506_000.0, 4_000_000.0]);
+        assert_eq!((grid.width, grid.height), (200.0, 100.0));
+
+        // Assets in different coordinate systems, or no projection fields: nothing to go on.
+        let mixed = json!({
+            "properties": { "proj:epsg": 32631 },
+            "assets": { "a": { "href": "a.tif", "proj:epsg": 32632, "proj:shape": [10, 10],
+                               "proj:transform": [10, 0, 0, 0, -10, 0] } }
+        });
+        assert!(item_proj_grid(&mixed, &["a".to_string()]).is_none());
+        let bare = json!({ "properties": {}, "assets": { "a": { "href": "a.tif" } } });
+        assert!(item_proj_grid(&bare, &["a".to_string()]).is_none());
+    }
+
+    #[test]
+    fn item_answers_are_reshaped_like_titiler_pgstac() {
+        let extent = ItemExtent { wgs84: [5.0, 43.0, 7.0, 44.0], mercator: None, minzoom: 7, maxzoom: 13 };
+        let fix = |sub: &[&str], query: &str, body: Value| {
+            let (bytes, _) = item_fixup(sub, Some(&extent), query, Bytes::from(body.to_string()), "application/json");
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let info = json!({ "visual": { "dtype": "uint8", "minzoom": 9, "maxzoom": 14, "wgs84_bounds": [1, 2, 3, 4] } });
+        assert_eq!(fix(&["info"], "", info.clone()), json!({ "visual": { "dtype": "uint8" } }));
+
+        let feature = fix(&["info.geojson"], "", json!({ "type": "Feature", "geometry": null, "properties": info }));
+        assert_eq!(feature["bbox"], json!([5.0, 43.0, 7.0, 44.0]));
+        assert_eq!(feature["geometry"]["coordinates"][0][2], json!([7.0, 44.0]));
+        assert_eq!(feature["properties"], json!({ "visual": { "dtype": "uint8" } }));
+
+        let point = fix(&["point", "6,43"], "", json!({ "band_names": ["red_b1", "nir_b1"], "values": [1.0, 2.0] }));
+        assert_eq!(point["band_names"], json!(["b1", "b2"]));
+
+        let tj = json!({ "minzoom": 9, "maxzoom": 14, "bounds": [0, 0, 1, 1], "center": [0.5, 0.5, 9] });
+        let fixed = fix(&["WebMercatorQuad", "tilejson.json"], "assets=visual", tj.clone());
+        assert_eq!((&fixed["minzoom"], &fixed["maxzoom"]), (&json!(7), &json!(13)));
+        assert_eq!(fixed["center"], json!([6.0, 43.5, 7]));
+        // Zooms given in the query string stand.
+        let fixed = fix(&["WebMercatorQuad", "tilejson.json"], "assets=visual&minzoom=10", tj);
+        assert_eq!((&fixed["minzoom"], &fixed["maxzoom"]), (&json!(9), &json!(13)));
+
+        // Tiles are passed through; only the media type of `.jpg` changes.
+        let jpg = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.jpg"], None, "", Bytes::from_static(b"x"), "image/jpeg");
+        assert_eq!(jpg.1, "image/jpg");
+        let png = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.png"], None, "", Bytes::from_static(b"x"), "image/png");
+        assert_eq!((png.0.as_ref(), png.1), (b"x".as_ref(), "image/png"));
+
+        assert!(item_route_needs_assets(&["info"]));
+        assert!(item_route_needs_assets(&["preview.png"]));
+        assert!(item_route_needs_assets(&["tiles", "WebMercatorQuad", "1", "2", "3"]));
+        assert!(!item_route_needs_assets(&["assets"]));
+        assert!(!item_route_needs_assets(&["tiles", "WebMercatorQuad"]));
+        assert!(!item_route_needs_assets(&["nope"]));
     }
 
     #[test]

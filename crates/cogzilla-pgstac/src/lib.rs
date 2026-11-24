@@ -242,6 +242,7 @@ pub struct PgStac {
     items: Option<TtlCache<Arc<Vec<MosaicItem>>>>,
     searches: Option<TtlCache<Arc<SearchRecord>>>,
     collections: Option<TtlCache<Arc<Value>>>,
+    item_docs: Option<TtlCache<Arc<Value>>>,
 }
 
 impl PgStac {
@@ -268,6 +269,7 @@ impl PgStac {
             items: TtlCache::from_env(),
             searches: TtlCache::from_env(),
             collections: TtlCache::from_env(),
+            item_docs: TtlCache::from_env(),
         })
     }
 
@@ -339,6 +341,37 @@ impl PgStac {
         let found = Arc::new(found);
         if let Some(cache) = &self.collections {
             cache.put(id.to_string(), found.clone());
+        }
+        Ok(Some(found))
+    }
+
+    /// One item's full JSON, as pgSTAC's `get_item` returns it, or `None` when the collection
+    /// has no item with that id.
+    pub async fn get_item(&self, collection: &str, id: &str) -> Result<Option<Value>, PgStacError> {
+        let client = self.client().await?;
+        let stmt = client.prepare_cached("SELECT get_item($1::text, $2::text)").await?;
+        let row = client.query_one(&stmt, &[&id, &collection]).await?;
+        let value: Option<Value> = row.try_get(0).map_err(|e| PgStacError::Shape(e.to_string()))?;
+        Ok(value.filter(|v| !v.is_null()))
+    }
+
+    /// [`Self::get_item`] behind the time-limited cache. Only items that exist are remembered.
+    pub async fn get_item_cached(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Arc<Value>>, PgStacError> {
+        // A NUL cannot occur in either id, so the key is unambiguous.
+        let key = format!("{collection}\0{id}");
+        if let Some(hit) = self.item_docs.as_ref().and_then(|c| c.get(&key)) {
+            return Ok(Some(hit));
+        }
+        let Some(found) = self.get_item(collection, id).await? else {
+            return Ok(None);
+        };
+        let found = Arc::new(found);
+        if let Some(cache) = &self.item_docs {
+            cache.put(key, found.clone());
         }
         Ok(Some(found))
     }
