@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use cogzilla_kernel::{OutputFormat, ResampleMode};
+use cogzilla_kernel::{ColormapName, OutputFormat, ResampleMode};
 use cogzilla_pgstac::{
     MosaicItem, PgStac, PgStacError, SearchLimits, SearchOrder, SearchRecord, jsonb_key_order,
 };
@@ -28,7 +28,9 @@ use super::{
     parse_ext_format, parse_wxh_ext, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
-use crate::engine::{EngineError, TileEngine};
+use super::point_expr::Program;
+use super::zonal::{self, Bins, StatsOptions};
+use crate::engine::{BandRequest, EngineError, TileEngine};
 use crate::stac::{StacItem, rewrite_stac_expr, stac_item_from_json};
 use crate::titiler::{
     PolygonMask, build_map_html, encode_rgba_output, query_point, render_wgs84_bbox,
@@ -544,7 +546,9 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 }
 
 /// The pgSTAC routes: path, method and summary.
-const OPENAPI_ROUTES: [(&str, &str, &str); 45] = [
+const OPENAPI_ROUTES: [(&str, &str, &str); 47] = [
+    ("/searches/{search_id}/statistics", "post", "Statistics of a pgSTAC search mosaic under GeoJSON features"),
+    ("/collections/{collection_id}/statistics", "post", "Statistics of a pgSTAC collection mosaic under GeoJSON features"),
     ("/collections/{collection_id}/items/{item_id}/renders/{render_id}", "get", "One of a pgSTAC item's renders"),
     ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC search mosaic over a bounding box"),
     ("/searches/{search_id}/feature.{format}", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature"),
@@ -1078,6 +1082,16 @@ fn check_coord_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
     }
 }
 
+fn check_dst_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
+    match query_value(pairs, "dst_crs") {
+        Some(dst) if !matches!(dst.to_ascii_lowercase().as_str(), "epsg:4326" | "ogc:crs84") => Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// `GET {base}/bbox/{minx},{miny},{maxx},{maxy}/assets` and `GET {base}/point/{lon},{lat}/assets`.
 async fn geometry_assets(
     pg: &PgStac,
@@ -1399,13 +1413,8 @@ async fn part_image(
     if let Err(r) = check_coord_crs(pairs) {
         return r;
     }
-    if let Some(dst) = query_value(pairs, "dst_crs")
-        && !matches!(dst.to_ascii_lowercase().as_str(), "epsg:4326" | "ogc:crs84")
-    {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
-        );
+    if let Err(r) = check_dst_crs(pairs) {
+        return r;
     }
     // The extension in the path, then `format=`; with neither, the pixels decide.
     let explicit = ext.map(str::to_string).or_else(|| pq.format_param.clone());
@@ -1579,15 +1588,622 @@ async fn feature_image(
     let Some(geojson) = body.and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
         return invalid_param("body", "body", "Input should be a valid GeoJSON Feature");
     };
-    let geometry = match geojson.get("type").and_then(Value::as_str) {
-        Some("Feature") => geojson.get("geometry").cloned().unwrap_or(Value::Null),
-        _ => geojson.clone(),
-    };
     let (mask, bbox) = match PolygonMask::from_geojson(&geojson) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
     };
-    part_image(ctx, pg, hash, &geometry, bbox, Some(&mask), size, ext, pq, pairs).await
+    // As in titiler-pgstac, the items are those of the feature's bounding box.
+    part_image(ctx, pg, hash, &bbox_polygon(bbox), bbox, Some(&mask), size, ext, pq, pairs).await
+}
+
+/// GDAL's default grid for a raster warped to WGS84: where it starts and its pixel size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Wgs84Grid {
+    west: f64,
+    north: f64,
+    res: f64,
+}
+
+/// The corner of the raster's extent in WGS84, from points along each edge as GDAL samples
+/// them (one every fifty pixels, between twenty and a hundred steps), and the resolution
+/// of [`wgs84_resolution`].
+fn wgs84_grid(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<Wgs84Grid> {
+    let res = wgs84_resolution(crs, cog)?;
+    let full = cog.index.full_res();
+    let (w, h) = (f64::from(full.width), f64::from(full.height));
+    let (mut west, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
+    let steps = ((w.min(h) / 50.0 + 0.5) as u32).clamp(20, 100);
+    for i in 0..=steps {
+        let f = f64::from(i) / f64::from(steps);
+        for (col, row) in [(f * w, 0.0), (f * w, h), (0.0, f * h), (w, f * h)] {
+            let (x, y) = full.pixel_to_crs.forward(col, row);
+            let (lon, lat) = crs.to_lonlat_deg(x, y);
+            if lon.is_finite() && lat.is_finite() {
+                west = west.min(lon);
+                north = north.max(lat);
+            }
+        }
+    }
+    (west.is_finite() && north.is_finite()).then_some(Wgs84Grid { west, north, res })
+}
+
+impl Wgs84Grid {
+    /// rio-tiler's `align_bounds_with_dataset`: the box grown outwards to whole pixels.
+    fn align(&self, [w, s, e, n]: [f64; 4]) -> [f64; 4] {
+        let col0 = ((w - self.west) / self.res).floor();
+        let col1 = ((e - self.west) / self.res).ceil();
+        let row0 = ((self.north - n) / self.res).floor();
+        let row1 = ((self.north - s) / self.res).ceil();
+        [
+            self.west + col0 * self.res,
+            self.north - row1 * self.res,
+            self.west + col1 * self.res,
+            self.north - row0 * self.res,
+        ]
+    }
+}
+
+/// The overview GDAL reads when a window of `native` pixels is asked for at `out` pixels:
+/// the most reduced one whose reduction stays under 1.2 times that of the less reduced
+/// axis. `sizes` are the raster's levels, the full resolution first.
+fn gdal_overview_level(sizes: &[(u32, u32)], native: (u64, u64), out: (usize, usize)) -> usize {
+    let Some(&(full_w, full_h)) = sizes.first() else {
+        return 0;
+    };
+    let wanted = (native.0 as f64 / out.0.max(1) as f64).min(native.1 as f64 / out.1.max(1) as f64);
+    let (mut best, mut best_factor) = (0usize, 0f64);
+    for (level, &(w, h)) in sizes.iter().enumerate().skip(1) {
+        let factor = (f64::from(full_w) / f64::from(w.max(1))).min(f64::from(full_h) / f64::from(h.max(1)));
+        if factor < wanted * 1.2 && factor > best_factor {
+            (best, best_factor) = (level, factor);
+        }
+    }
+    best
+}
+
+/// GDAL's approximate transformer along one output row: the exact source position at the
+/// two ends, a straight line between them when the middle is within an eighth of a pixel
+/// of it, otherwise the same on each half. `exact` gives the position for a column.
+fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)]) {
+    let mut todo = vec![(0usize, out.len())];
+    while let Some((lo, hi)) = todo.pop() {
+        let points = hi - lo;
+        if points <= 5 {
+            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+                *slot = exact(lo + k);
+            }
+            continue;
+        }
+        let middle = (points - 1) / 2;
+        let ((u0, v0), (um, vm), (u1, v1)) = (exact(lo), exact(lo + middle), exact(hi - 1));
+        let span = (points - 1) as f64;
+        let (du, dv) = ((u1 - u0) / span, (v1 - v0) / span);
+        let error = (u0 + du * middle as f64 - um).abs() + (v0 + dv * middle as f64 - vm).abs();
+        if error.is_finite() && error <= 0.125 {
+            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+                *slot = (u0 + du * k as f64, v0 + dv * k as f64);
+            }
+        } else if error.is_finite() {
+            todo.push((lo, lo + middle));
+            todo.push((lo + middle, hi));
+        } else {
+            // Part of the row is outside the projection: no line to draw.
+            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+                *slot = exact(lo + k);
+            }
+        }
+    }
+}
+
+/// Every band of one raster on a WGS84 grid, read the way GDAL's nearest-neighbour warp
+/// reads it: from the overview GDAL would pick, each output pixel taking the source pixel
+/// its centre falls in. A pixel outside the raster, or without data, is NaN. `native` is
+/// the size of the grid at the raster's own resolution.
+async fn warp_nearest(
+    engine: &TileEngine,
+    cog: &Arc<cogzilla_io::OpenedCog>,
+    crs: &CrsModel,
+    bounds: [f64; 4],
+    (width, height): (usize, usize),
+    native: (u64, u64),
+    unscale: bool,
+) -> Result<Vec<Vec<f32>>, EngineError> {
+    let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
+    let level = gdal_overview_level(&sizes, native, (width, height));
+    let ifd = &cog.index.ifds[level];
+    let bands = ifd.samples_per_pixel as usize;
+    let (dx, dy) = ((bounds[2] - bounds[0]) / width as f64, (bounds[3] - bounds[1]) / height as f64);
+
+    // Where each output pixel reads from, as (column, row) of the level.
+    let mut cells: Vec<(i32, i32)> = Vec::with_capacity(width * height);
+    let mut row_positions = vec![(0f64, 0f64); width];
+    let (mut c0, mut c1, mut r0, mut r1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    for j in 0..height {
+        let lat = bounds[3] - (j as f64 + 0.5) * dy;
+        let exact = |i: usize| {
+            let (x, y) = crs.from_lonlat_deg(bounds[0] + (i as f64 + 0.5) * dx, lat);
+            ifd.crs_to_pixel.forward(x, y)
+        };
+        approx_scanline(&exact, &mut row_positions);
+        let (w, h) = (f64::from(ifd.width), f64::from(ifd.height));
+        let inside = |u: f64, v: f64| u >= 0.0 && v >= 0.0 && u + 1e-10 <= w && v + 1e-10 <= h;
+        for (i, &(mut u, mut v)) in row_positions.iter().enumerate() {
+            // A position less than a pixel outside the raster is worked out again exactly.
+            if !inside(u, v) && u > -1.0 && v > -1.0 && u < w + 1.0 && v < h + 1.0 {
+                (u, v) = exact(i);
+            }
+            if u.is_finite() && v.is_finite() && inside(u, v) {
+                let col = ((u + 1e-10).floor() as i32).min(ifd.width as i32 - 1);
+                let row = ((v + 1e-10).floor() as i32).min(ifd.height as i32 - 1);
+                (c0, c1, r0, r1) = (c0.min(col), c1.max(col), r0.min(row), r1.max(row));
+                cells.push((col, row));
+            } else {
+                cells.push((-1, -1));
+            }
+        }
+    }
+    if c0 > c1 {
+        return Ok(vec![vec![f32::NAN; width * height]; bands]);
+    }
+
+    let (tx0, tx1) = (c0 as u32 / ifd.tile_width, c1 as u32 / ifd.tile_width);
+    let (ty0, ty1) = (r0 as u32 / ifd.tile_height, r1 as u32 / ifd.tile_height);
+    let (grid_w, grid_h) = (tx1 - tx0 + 1, ty1 - ty0 + 1);
+    let planar = ifd.planar_config == cogzilla_tiff::PlanarConfig::Planar;
+    let fetches = if planar { bands } else { 1 };
+    let mut tiles = Vec::with_capacity(fetches);
+    for plane in 0..fetches {
+        let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                indices.push(Some(ifd.tile_index(tx, ty, plane as u16) as u32));
+            }
+        }
+        tiles.push(engine.store.get_blocks(cog, level, &indices).await?);
+    }
+
+    let mut planes = Vec::with_capacity(bands);
+    for band in 0..bands {
+        let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = if planar {
+            tiles[band].iter().map(|t| t.as_ref().and_then(|t| t.bands.first())).collect()
+        } else {
+            tiles[0].iter().map(|t| t.as_ref().and_then(|t| t.bands.get(band))).collect()
+        };
+        let mut source = cogzilla_kernel::BandSource::new(
+            ifd.width,
+            ifd.height,
+            ifd.tile_width,
+            ifd.tile_height,
+            tx0,
+            ty0,
+            grid_w,
+            grid_h,
+            &blocks,
+        );
+        if unscale {
+            let scale = cog.index.scales.get(band).copied().unwrap_or(1.0);
+            let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
+            source = source.with_scale_offset(scale, offset);
+        }
+        planes.push(cells.iter().map(|&(col, row)| source.sample_checked(col, row)).collect());
+    }
+    Ok(planes)
+}
+
+/// Every band of one raster on a WGS84 grid through the shared renderer, for the
+/// resampling methods other than nearest neighbour.
+async fn resampled_planes(
+    engine: &Arc<TileEngine>,
+    cog: &Arc<cogzilla_io::OpenedCog>,
+    bounds: [f64; 4],
+    (width, height): (usize, usize),
+    resample: ResampleMode,
+    unscale: bool,
+) -> Result<Vec<Vec<f32>>, EngineError> {
+    let mut planes = Vec::new();
+    for band in 1..=cog.index.full_res().samples_per_pixel {
+        let one = BandRequest::Single {
+            band_1based: band,
+            rescale: (0.0, 1.0),
+            colormap: ColormapName::Grayscale,
+        };
+        let raw = render_wgs84_bbox(
+            engine,
+            std::slice::from_ref(cog),
+            bounds,
+            width as u32,
+            height as u32,
+            None,
+            &one,
+            resample,
+            OutputFormat::RawF32,
+            None,
+            None,
+            None,
+            false,
+            unscale,
+        )
+        .await?;
+        if raw.len() != width * height * 4 {
+            return Err(EngineError::BadRequest("unexpected array size from the renderer".into()));
+        }
+        planes.push(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+    }
+    Ok(planes)
+}
+
+/// A plane brought to another size by taking, for each pixel, the one its centre falls in.
+fn resize_nearest(plane: Vec<f32>, (w, h): (usize, usize), (out_w, out_h): (usize, usize)) -> Vec<f32> {
+    if (w, h) == (out_w, out_h) {
+        return plane;
+    }
+    let mut out = Vec::with_capacity(out_w * out_h);
+    for j in 0..out_h {
+        let row = ((j * 2 + 1) * h / (out_h * 2)).min(h - 1) * w;
+        out.extend((0..out_w).map(|i| plane[row + ((i * 2 + 1) * w / (out_w * 2)).min(w - 1)]));
+    }
+    out
+}
+
+/// The most pixels one feature's statistics may read.
+const MAX_STATS_PIXELS: u64 = 8_388_608;
+/// The finest grid the coverage of a feature is worked out on, per side.
+const MAX_COVER_SIDE: u64 = 65_536;
+
+/// TiTiler's statistics, histogram and `cover_scale` parameters.
+fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Resp> {
+    let mut opts = StatsOptions::default();
+    if let Some(v) = query_value(pairs, "categorical") {
+        opts.categorical = parse_bool(v).ok_or_else(|| {
+            invalid_param("query", "categorical", "Input should be a valid boolean")
+        })?;
+    }
+    let all = |name: &'static str| pairs.iter().filter(move |(k, _)| k == name).map(|(_, v)| v.as_str());
+    for v in all("c") {
+        let c = v.parse::<f64>().ok().filter(|c| c.is_finite());
+        opts.categories
+            .push(c.ok_or_else(|| invalid_param("query", "c", "Input should be a valid number"))?);
+    }
+    let percentiles: Result<Vec<i64>, Resp> = all("p")
+        .map(|v| {
+            v.parse::<i64>()
+                .ok()
+                .filter(|p| (0..=100).contains(p))
+                .ok_or_else(|| invalid_param("query", "p", "Input should be a valid integer"))
+        })
+        .collect();
+    let percentiles = percentiles?;
+    if !percentiles.is_empty() {
+        opts.percentiles = percentiles;
+    }
+    if let Some(v) = query_value(pairs, "histogram_bins") {
+        let bad = || invalid_param("query", "histogram_bins", r"String should match pattern '^\d+(,\d+)*$'");
+        let parts: Option<Vec<u32>> = v.split(',').map(|p| p.parse::<u32>().ok()).collect();
+        opts.bins = match parts.as_deref() {
+            Some([n]) if (1..=65_536).contains(n) => Bins::Count(*n as usize),
+            Some(edges) if edges.len() > 1 && edges.windows(2).all(|w| w[0] <= w[1]) => {
+                Bins::Edges(edges.iter().map(|e| f64::from(*e)).collect())
+            }
+            _ => return Err(bad()),
+        };
+    }
+    if let Some(v) = query_value(pairs, "histogram_range") {
+        let range = v
+            .split_once(',')
+            .and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))
+            .filter(|(a, b)| a.is_finite() && b.is_finite() && a <= b);
+        opts.range = Some(range.ok_or_else(|| {
+            invalid_param("query", "histogram_range", "Input should be two numbers, the lower one first")
+        })?);
+    }
+    let cover_scale = match query_value(pairs, "cover_scale") {
+        None => 10,
+        Some(v) => v.parse::<usize>().ok().filter(|n| (1..=1000).contains(n)).ok_or_else(|| {
+            invalid_param("query", "cover_scale", "Input should be an integer from 1 to 1000")
+        })?,
+    };
+    Ok((opts, cover_scale))
+}
+
+/// What one feature's statistics need besides the feature.
+struct StatsRequest<'a> {
+    query: MosaicQuery,
+    size: PartSize,
+    opts: StatsOptions,
+    cover_scale: usize,
+    assets: &'a [String],
+    expression: Option<&'a str>,
+    unscale: bool,
+}
+
+/// The statistics of one feature and the items they were read from, or `None` when the
+/// search has nothing under the feature.
+async fn feature_statistics(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    hash: &str,
+    feature: &Value,
+    req: &StatsRequest<'_>,
+) -> Result<Option<(Value, Vec<String>)>, Resp> {
+    let (mask, bbox) = PolygonMask::from_geojson(feature).map_err(|e| engine_error(&e))?;
+    // As in titiler-pgstac, the items are those of the feature's bounding box.
+    let items = pg
+        .items_for_geometry(&bbox_polygon(bbox), hash, req.query.limits)
+        .await
+        .map_err(|e| db_error(&e))?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut scenes: Vec<(String, Vec<String>)> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
+    for item in items.iter().take(MAX_SCENES_PER_TILE) {
+        let mut hrefs = Vec::with_capacity(req.assets.len());
+        for asset in req.assets {
+            match item.asset_href(asset) {
+                Some(href) => hrefs.push(href.to_string()),
+                None => return Err(unknown_asset(asset, item)),
+            }
+        }
+        let name = match &item.collection {
+            Some(c) => format!("{c}/{}", item.id),
+            None => item.id.clone(),
+        };
+        scenes.push((name, hrefs));
+    }
+
+    let engine = ctx.engine;
+    let computed: Result<Option<(Value, Vec<String>)>, EngineError> = async {
+        // The mosaic: one plane per band, a pixel nothing has filled yet being NaN.
+        let mut canvas: Vec<Vec<f64>> = Vec::new();
+        let mut descriptions: Vec<String> = Vec::new();
+        let mut program: Option<Program> = None;
+        let mut used: Vec<String> = Vec::new();
+        let (mut width, mut height, mut bounds) = (0usize, 0usize, bbox);
+        for (name, hrefs) in scenes {
+            let mut cogs = Vec::with_capacity(hrefs.len());
+            for href in &hrefs {
+                cogs.push(engine.store.open_uri(href).await?);
+            }
+            let mut planes: Vec<Vec<f32>> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            let mut missing = false;
+            'assets: for (asset, cog) in req.assets.iter().zip(&cogs) {
+                // As rio-tiler does, every raster is read on its own grid: the feature's box
+                // grown to whole pixels of the raster as GDAL would warp it to WGS84. The
+                // first one read sets the size of the result.
+                let crs = engine.get_or_build_crs(cog)?;
+                let grid = wgs84_grid(&crs, cog).ok_or_else(|| {
+                    EngineError::BadRequest(format!("cannot place asset '{asset}' in WGS84"))
+                })?;
+                let own_bounds = grid.align(bbox);
+                let own = PartSize::Query { max_size: None, width: None, height: None };
+                let native = part_dims(own, own_bounds, grid.res);
+                let (w, h) = part_dims(req.size, own_bounds, grid.res);
+                if w * h > MAX_STATS_PIXELS || w.max(h) * req.cover_scale as u64 > MAX_COVER_SIDE {
+                    return Err(EngineError::BadRequest(format!(
+                        "the feature would be read at {w}x{h} pixels with cover_scale {}; pass max_size, or width and height",
+                        req.cover_scale
+                    )));
+                }
+                let size = (w as usize, h as usize);
+                if width == 0 {
+                    (width, height, bounds) = (size.0, size.1, own_bounds);
+                }
+                // As on tiles: `resampling` for a source already in the output's projection,
+                // `reproject` for one that has to be warped into it.
+                let resample = match crs {
+                    CrsModel::Geographic => req.query.resampling,
+                    _ => req.query.reproject,
+                };
+                let read = if resample == ResampleMode::Nearest {
+                    warp_nearest(engine, cog, &crs, own_bounds, size, native, req.unscale).await
+                } else {
+                    resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
+                };
+                match read {
+                    Ok(read) => {
+                        names.extend((1..=read.len()).map(|band| format!("{asset}_b{band}")));
+                        planes.extend(read.into_iter().map(|p| resize_nearest(p, size, (width, height))));
+                    }
+                    // The item's footprint meets the box but this raster does not.
+                    Err(EngineError::NotFound(_)) => {
+                        missing = true;
+                        break 'assets;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if missing {
+                continue;
+            }
+            if canvas.is_empty() {
+                if let Some(expression) = req.expression {
+                    let parsed = Program::parse(expression, planes.len()).map_err(EngineError::BadRequest)?;
+                    descriptions = parsed.describe(&names);
+                    program = Some(parsed);
+                } else {
+                    descriptions = names;
+                }
+                canvas = vec![vec![f64::NAN; width * height]; descriptions.len()];
+            }
+            match &program {
+                Some(program) => {
+                    let mut pixel = vec![0f64; planes.len()];
+                    for i in 0..width * height {
+                        if canvas.iter().all(|band| !band[i].is_nan()) {
+                            continue;
+                        }
+                        for (value, plane) in pixel.iter_mut().zip(&planes) {
+                            *value = f64::from(plane[i]);
+                        }
+                        for (part, band) in canvas.iter_mut().enumerate() {
+                            if band[i].is_nan() {
+                                let v = program.eval(part, &pixel);
+                                if v.is_finite() {
+                                    band[i] = v;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if planes.len() != canvas.len() {
+                        return Err(EngineError::BadRequest(
+                            "the items under the feature do not have the same number of bands".into(),
+                        ));
+                    }
+                    for (band, plane) in canvas.iter_mut().zip(&planes) {
+                        for (dst, src) in band.iter_mut().zip(plane) {
+                            if dst.is_nan() && src.is_finite() {
+                                *dst = f64::from(*src);
+                            }
+                        }
+                    }
+                }
+            }
+            used.push(name);
+            if canvas.iter().all(|band| band.iter().all(|v| !v.is_nan())) {
+                break;
+            }
+        }
+        if canvas.is_empty() {
+            return Ok(None);
+        }
+
+        // The polygon on the image's grid: once for the mask, once finer for the coverage.
+        let (sx, sy) = (
+            width as f64 / (bounds[2] - bounds[0]),
+            height as f64 / (bounds[3] - bounds[1]),
+        );
+        let rings: Vec<zonal::Ring> = mask
+            .polygons
+            .iter()
+            .flatten()
+            .map(|ring| {
+                ring.iter().map(|&(lon, lat)| ((lon - bounds[0]) * sx, (bounds[3] - lat) * sy)).collect()
+            })
+            .collect();
+        let (opts, cover_scale) = (req.opts.clone(), req.cover_scale);
+        let stats = engine
+            .store
+            .run_heavy_cpu(move || {
+                let inside = zonal::cover_counts(&rings, width, height, 1);
+                let cells = (cover_scale * cover_scale) as f32;
+                let coverage: Vec<f32> = zonal::cover_counts(&rings, width, height, cover_scale)
+                    .iter()
+                    .map(|c| *c as f32 / cells)
+                    .collect();
+                let mut out = serde_json::Map::new();
+                for (n, (band, description)) in canvas.iter_mut().zip(&descriptions).enumerate() {
+                    for (v, hit) in band.iter_mut().zip(&inside) {
+                        if *hit == 0 {
+                            *v = f64::NAN;
+                        }
+                    }
+                    out.insert(
+                        format!("b{}", n + 1),
+                        zonal::band_statistics(band, &coverage, description, &opts),
+                    );
+                }
+                Value::Object(out)
+            })
+            .await?;
+        Ok(Some((stats, used)))
+    }
+    .await;
+    computed.map_err(|e| engine_error(&e))
+}
+
+/// `POST {base}/statistics`: statistics of the mosaic under each feature of a GeoJSON
+/// Feature or FeatureCollection, added to the feature's properties with the items used.
+async fn mosaic_statistics(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    hash: &str,
+    body: Option<&Bytes>,
+    mut pq: ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    // Read here; the shared parser does not know them on this route.
+    const OWN: [&str; 8] = [
+        "'width'", "'height'", "'categorical'", "'c'", "'p'", "'histogram_bins'",
+        "'histogram_range'", "'cover_scale'",
+    ];
+    pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)));
+    let query = match check_mosaic_query(&pq, pairs) {
+        Ok(q) => q,
+        Err(r) => return r,
+    };
+    if let Err(r) = check_coord_crs(pairs).and_then(|()| check_dst_crs(pairs)) {
+        return r;
+    }
+    if query_value(pairs, "algorithm").is_some() {
+        return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet");
+    }
+    let size = match part_size_from_query(pairs) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (opts, cover_scale) = match stats_options(pairs) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let bad_body = || invalid_param("body", "body", "Input should be a GeoJSON Feature or FeatureCollection");
+    let Some(geojson) = body.and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return bad_body();
+    };
+    let is_feature = |v: &Value| v.get("type").and_then(Value::as_str) == Some("Feature") && v.get("geometry").is_some();
+    let (features, single): (Vec<Value>, bool) = match geojson.get("type").and_then(Value::as_str) {
+        Some("Feature") if is_feature(&geojson) => (vec![geojson], true),
+        Some("FeatureCollection") => match geojson.get("features").and_then(Value::as_array) {
+            Some(list) if list.iter().all(is_feature) => (list.clone(), false),
+            _ => return bad_body(),
+        },
+        _ => return bad_body(),
+    };
+    let req = StatsRequest {
+        query,
+        size,
+        opts,
+        cover_scale,
+        assets: &pq.assets,
+        expression: query_value(pairs, "expression"),
+        unscale: pq.unscale,
+    };
+    let mut out = Vec::with_capacity(features.len());
+    for feature in &features {
+        let (stats, used) = match feature_statistics(ctx, pg, hash, feature, &req).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return no_content(),
+            Err(r) => return r,
+        };
+        // TiTiler's order: the statistics, the feature's own properties, the items used.
+        let mut properties = serde_json::Map::new();
+        properties.insert("statistics".into(), stats);
+        for (k, v) in feature.get("properties").and_then(Value::as_object).into_iter().flatten() {
+            if k != "statistics" && k != "used_assets" {
+                properties.insert(k.clone(), v.clone());
+            }
+        }
+        properties.insert("used_assets".into(), json!(used));
+        let mut one = serde_json::Map::new();
+        one.insert("type".into(), json!("Feature"));
+        one.insert("geometry".into(), feature["geometry"].clone());
+        one.insert("properties".into(), Value::Object(properties));
+        for key in ["id", "bbox"] {
+            if let Some(v) = feature.get(key).filter(|v| !v.is_null()) {
+                one.insert(key.into(), v.clone());
+            }
+        }
+        out.push(Value::Object(one));
+    }
+    let doc = if single {
+        out.pop().unwrap_or(Value::Null)
+    } else {
+        json!({ "type": "FeatureCollection", "features": out })
+    };
+    let mut resp = json_resp(StatusCode::OK, &doc);
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/geo+json"));
+    resp
 }
 
 /// Turn the stacked band values of a point into the results of `expression`, with the
@@ -2523,11 +3139,12 @@ async fn mosaic_route(
     pairs: &[(String, String)],
 ) -> Resp {
     let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
-    // The only route that takes a body.
-    let is_feature = |rest: &[&str]| {
-        rest.first().is_some_and(|f| *f == "feature" || f.starts_with("feature."))
+    // The routes that take a body.
+    let takes_body = |rest: &[&str]| {
+        rest == ["statistics"]
+            || rest.first().is_some_and(|f| *f == "feature" || f.starts_with("feature."))
     };
-    if body.is_some() != is_feature(rest) {
+    if body.is_some() != takes_body(rest) {
         return if body.is_some() {
             not_found()
         } else {
@@ -2650,6 +3267,7 @@ async fn mosaic_route(
             part_image(ctx, pg, &rec.hash, &polygon, bbox, None, PartSize::Exact(w, h), ext, pq, pairs)
                 .await
         }
+        ["statistics"] => mosaic_statistics(ctx, pg, &rec.hash, body, pq, pairs).await,
         ["point", lonlat] => point_values(ctx, pg, &rec.hash, lonlat, &pq, pairs).await,
         ["point", lonlat, "assets"] => {
             let coords = lonlat
@@ -3108,6 +3726,94 @@ mod tests {
         assert_eq!(doc["band_names"], json!(["b1"]));
         assert_eq!(doc["band_descriptions"], json!(["nir_b1-red_b1"]));
         assert_eq!(fix("assets=red&expression=nope").unwrap_err().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn statistics_grid_follows_gdal() {
+        // A Sentinel-2 10 m raster: full resolution and four overviews.
+        let levels = [(10980, 10980), (5490, 5490), (2745, 2745), (1373, 1373), (687, 687)];
+        // Read at its own size, or a little reduced: the full resolution.
+        assert_eq!(gdal_overview_level(&levels, (541, 542), (541, 542)), 0);
+        assert_eq!(gdal_overview_level(&levels, (541, 542), (512, 512)), 0);
+        // Reduced 1.8 times: the half-size level is within 1.2 times of that.
+        assert_eq!(gdal_overview_level(&levels, (541, 542), (300, 300)), 1);
+        // Reduced 8.45 times: the eighth, not the sixteenth.
+        assert_eq!(gdal_overview_level(&levels, (541, 542), (64, 64)), 3);
+        // The less reduced axis decides.
+        assert_eq!(gdal_overview_level(&levels, (1000, 4000), (500, 500)), 1);
+        assert_eq!(gdal_overview_level(&levels, (10000, 10000), (100, 100)), 4);
+        assert_eq!(gdal_overview_level(&levels[..1], (1000, 1000), (10, 10)), 0);
+
+        // The box grows outwards to whole pixels of the grid.
+        let grid = Wgs84Grid { west: 0.0, north: 10.0, res: 0.5 };
+        assert_eq!(grid.align([0.6, 8.1, 1.9, 9.4]), [0.5, 8.0, 2.0, 9.5]);
+        assert_eq!(grid.align([0.5, 8.0, 2.0, 9.5]), [0.5, 8.0, 2.0, 9.5]);
+
+        // Nearest-neighbour resize, both ways.
+        let plane = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        assert_eq!(resize_nearest(plane.clone(), (4, 2), (2, 1)), [6.0, 8.0]);
+        assert_eq!(resize_nearest(plane.clone(), (4, 2), (2, 2)), [2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(resize_nearest(vec![1.0, 2.0], (2, 1), (4, 1)), [1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(resize_nearest(plane.clone(), (4, 2), (4, 2)), plane);
+    }
+
+    #[test]
+    fn scanlines_are_approximated_like_gdal() {
+        // A straight row is its two ends joined, whatever lies between.
+        let mut out = vec![(0.0, 0.0); 100];
+        approx_scanline(&|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01), &mut out);
+        assert!((out[50].0 - 101.0).abs() < 1e-9 && (out[50].1 - 6.5).abs() < 1e-9);
+
+        // A gently curved row is still one straight line: the middle is 0.1 off, under
+        // the eighth of a pixel GDAL allows.
+        let bend = |i: usize| (i as f64, 0.4 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
+        approx_scanline(&bend, &mut out);
+        assert_eq!(out[49].1, 0.0);
+        assert!((bend(49).1 - 0.1).abs() < 0.001);
+
+        // A sharper curve is split until every piece is within the allowance.
+        let curve = |i: usize| (i as f64, 40.0 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
+        approx_scanline(&curve, &mut out);
+        for (i, got) in out.iter().enumerate() {
+            assert!((got.1 - curve(i).1).abs() <= 0.125, "column {i}: {} vs {}", got.1, curve(i).1);
+        }
+        // Five points or fewer are worked out one by one, and so is a row that leaves
+        // the projection.
+        let mut short = vec![(0.0, 0.0); 5];
+        approx_scanline(&curve, &mut short);
+        assert_eq!(short[2], curve(2));
+        let broken = |i: usize| if i < 30 { (f64::NAN, f64::NAN) } else { (i as f64, 1.0) };
+        approx_scanline(&broken, &mut out);
+        assert!(out[10].0.is_nan());
+        assert_eq!(out[60], (60.0, 1.0));
+    }
+
+    #[test]
+    fn statistics_options_are_titilers() {
+        let pairs = |q: &str| query_pairs(q);
+        let (opts, cover) = stats_options(&pairs("assets=red")).unwrap();
+        assert_eq!((opts.categorical, opts.percentiles.clone(), opts.bins.clone(), opts.range, cover),
+                   (false, vec![2, 98], Bins::Count(10), None, 10));
+        let (opts, cover) = stats_options(&pairs(
+            "categorical=true&c=1&c=2.5&p=5&p=95&histogram_bins=4&histogram_range=0,2000.5&cover_scale=4",
+        ))
+        .unwrap();
+        assert!(opts.categorical);
+        assert_eq!(opts.categories, [1.0, 2.5]);
+        assert_eq!(opts.percentiles, [5, 95]);
+        assert_eq!(opts.bins, Bins::Count(4));
+        assert_eq!(opts.range, Some((0.0, 2000.5)));
+        assert_eq!(cover, 4);
+        let (opts, _) = stats_options(&pairs("histogram_bins=0,100,255")).unwrap();
+        assert_eq!(opts.bins, Bins::Edges(vec![0.0, 100.0, 255.0]));
+        for bad in [
+            "categorical=maybe", "c=x", "p=101", "p=1.5", "histogram_bins=ten", "histogram_bins=0",
+            "histogram_bins=3,2,1", "histogram_range=5", "histogram_range=9,1", "cover_scale=0",
+            "cover_scale=1001",
+        ] {
+            let resp = stats_options(&pairs(bad)).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        }
     }
 
     #[test]
