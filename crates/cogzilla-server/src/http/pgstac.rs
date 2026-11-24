@@ -14,7 +14,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cogzilla_kernel::{ColormapName, OutputFormat, ResampleMode};
 use cogzilla_pgstac::{
-    MosaicItem, PgStac, PgStacError, SearchLimits, SearchOrder, SearchRecord, jsonb_key_order,
+    Lookup, MosaicItem, PgStac, PgStacError, SampleGrid, SearchLimits, SearchOrder, SearchRecord,
+    jsonb_key_order,
 };
 use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{CrsModel, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
@@ -200,6 +201,46 @@ fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
     boolean("exitwhenfull", &mut limits.exitwhenfull)?;
     boolean("skipcovered", &mut limits.skipcovered)?;
     Ok(limits)
+}
+
+/// `item_lookup`, a `cogzilla` parameter: which lookup lists the items of this request.
+fn parse_lookup(pairs: &[(String, String)]) -> Result<Lookup, Resp> {
+    match query_value(pairs, "item_lookup") {
+        None => Ok(Lookup::Configured),
+        Some("lean") => Ok(Lookup::Lean),
+        Some("geojsonsearch") => Ok(Lookup::Reference),
+        Some(other) => Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("item_lookup '{other}' is not known (use lean or geojsonsearch)"),
+        )),
+    }
+}
+
+/// Where a map tile samples its outline.
+fn tile_grid(scale: Option<u32>, pq: &ParsedQuery) -> Option<SampleGrid> {
+    let side = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
+    SampleGrid::for_image(side, side, true)
+}
+
+/// Where a `bbox` or `feature` image samples its box. `None` when the size follows the
+/// data's own resolution, which is not known before the items are.
+fn part_grid(size: PartSize, bbox: [f64; 4]) -> Option<SampleGrid> {
+    let ratio = (bbox[3] - bbox[1]) / (bbox[2] - bbox[0]);
+    if !(ratio.is_finite() && ratio > 0.0) {
+        return None;
+    }
+    // rio-tiler takes the ratio from whole pixel counts; the box's own is that but for
+    // rounding, which must not tip a size over to the next pixel.
+    let scaled = |side: u32, by: f64| (f64::from(side) * by - 1e-6).ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
+    let (width, height) = match size {
+        PartSize::Exact(w, h) | PartSize::Query { width: Some(w), height: Some(h), .. } => (w, h),
+        PartSize::Query { width: Some(w), .. } => (w, scaled(w, ratio)),
+        PartSize::Query { height: Some(h), .. } => (scaled(h, 1.0 / ratio), h),
+        PartSize::Query { max_size: Some(m), .. } if ratio > 1.0 => (scaled(m, 1.0 / ratio), m),
+        PartSize::Query { max_size: Some(m), .. } => (m, scaled(m, ratio)),
+        PartSize::Query { .. } => return None,
+    };
+    SampleGrid::for_image(width, height, false)
 }
 
 /// The tile's outline in WGS84 as a GeoJSON polygon, which is what `geojsonsearch` takes.
@@ -1121,14 +1162,36 @@ async fn geometry_assets(
     hash: &str,
     geometry: Value,
     limits: SearchLimits,
+    pairs: &[(String, String)],
+    grid: Option<SampleGrid>,
 ) -> Resp {
-    match pg.items_for_geometry(&geometry, hash, limits).await {
+    match listed_items(pg, hash, &geometry, limits, pairs, grid).await {
         Ok(items) => json_resp(
             StatusCode::OK,
             &Value::Array(items.iter().map(MosaicItem::to_json).collect()),
         ),
-        Err(e) => db_error(&e),
+        Err(r) => r,
     }
+}
+
+/// The items of an `assets` route. They are `geojsonsearch`'s, whole, as titiler-pgstac
+/// lists them. With `item_lookup=lean` they are instead what the lean lookup would hand a
+/// picture sampled on `grid`: ids and the hrefs of the assets named, nothing else.
+async fn listed_items(
+    pg: &PgStac,
+    hash: &str,
+    geometry: &Value,
+    limits: SearchLimits,
+    pairs: &[(String, String)],
+    grid: Option<SampleGrid>,
+) -> Result<Arc<Vec<MosaicItem>>, Resp> {
+    let found = if parse_lookup(pairs)? == Lookup::Lean {
+        let names: Vec<String> = parse_assets(pairs)?.into_iter().map(|a| a.name).collect();
+        pg.items_for_pixels(geometry, hash, limits, &names, grid, Lookup::Lean).await
+    } else {
+        pg.items_for_geometry(geometry, hash, limits).await
+    };
+    found.map_err(|e| db_error(&e))
 }
 
 /// The tile matrix sets TiTiler registers by default.
@@ -1355,6 +1418,8 @@ struct MosaicQuery {
     resampling: ResampleMode,
     /// Method for a source that has to be reprojected (`reproject`).
     reproject: ResampleMode,
+    /// Which lookup lists the items (`item_lookup`).
+    lookup: Lookup,
 }
 
 /// TiTiler's two resampling parameters. Both default to nearest neighbour.
@@ -1422,6 +1487,7 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         ));
     }
     Ok(MosaicQuery {
+        lookup: parse_lookup(pairs)?,
         assets,
         asset_as_band,
         limits: parse_limits(pairs)?,
@@ -1479,16 +1545,6 @@ fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<Stri
     Ok(names)
 }
 
-async fn tile_items(
-    pg: &PgStac,
-    id: &str,
-    tile: TileCoord,
-    limits: SearchLimits,
-) -> Result<Arc<Vec<MosaicItem>>, Resp> {
-    pg.items_for_geometry(&tile_polygon(tile), id, limits)
-        .await
-        .map_err(|e| db_error(&e))
-}
 
 /// `Ok(None)` is a tile past the edge of the grid. That is not an error in
 /// titiler-pgstac: no item covers it, so the answer is empty.
@@ -1507,7 +1563,10 @@ async fn tile_assets(pg: &PgStac, id: &str, tile: TileCoord, pairs: &[(String, S
         Ok(l) => l,
         Err(r) => return r,
     };
-    match tile_items(pg, id, tile, limits).await {
+    // `tilesize` matters only to the lean lookup, which samples the tile as its picture would.
+    let side = query_value(pairs, "tilesize").and_then(|v| v.parse::<u32>().ok()).unwrap_or(256);
+    let grid = SampleGrid::for_image(side, side, true);
+    match listed_items(pg, id, &tile_polygon(tile), limits, pairs, grid).await {
         Ok(items) => json_resp(
             StatusCode::OK,
             &Value::Array(items.iter().map(MosaicItem::to_json).collect()),
@@ -1644,7 +1703,8 @@ async fn part_image(
     // A JPEG has no mask to carry the polygon, and TiTiler then writes the whole box.
     let mask = if matches!(format, Some((OutputFormat::Jpeg { .. }, _))) { None } else { mask };
 
-    let items = match pg.items_for_geometry(geometry, hash, query.limits).await {
+    let grid = part_grid(size, bbox);
+    let items = match pg.items_for_pixels(geometry, hash, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -2183,9 +2243,13 @@ async fn feature_statistics(
     req: &StatsRequest<'_>,
 ) -> Result<Option<(Value, Vec<String>)>, Resp> {
     let (mask, bbox) = PolygonMask::from_geojson(feature).map_err(|e| engine_error(&e))?;
-    // As in titiler-pgstac, the items are those of the feature's bounding box.
+    // As in titiler-pgstac, the items are those of the feature's bounding box. Each raster
+    // is read on a grid of its own, which no one set of sample points stands for, so the
+    // numbers come from pgSTAC's list unless the request asks for the lean one.
+    let names: Vec<String> = req.query.assets.iter().map(|a| a.name.clone()).collect();
+    let lookup = if req.query.lookup == Lookup::Lean { Lookup::Lean } else { Lookup::Reference };
     let items = pg
-        .items_for_geometry(&bbox_polygon(bbox), hash, req.query.limits)
+        .items_for_pixels(&bbox_polygon(bbox), hash, req.query.limits, &names, part_grid(req.size, bbox), lookup)
         .await
         .map_err(|e| db_error(&e))?;
     if items.is_empty() {
@@ -2541,7 +2605,12 @@ async fn point_values(
     limits.exitwhenfull = false;
     limits.skipcovered = false;
     let point = json!({ "type": "Point", "coordinates": [lon, lat] });
-    let items = match pg.items_for_geometry(&point, hash, limits).await {
+    let lookup = match parse_lookup(pairs) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+    let items = match pg.items_for_pixels(&point, hash, limits, &names, None, lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -2652,9 +2721,10 @@ async fn tile(
         Ok(names) => names,
         Err(r) => return r,
     };
-    let items = match tile_items(pg, id, tile, query.limits).await {
+    let grid = tile_grid(scale, &pq);
+    let items = match pg.items_for_pixels(&tile_polygon(tile), id, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
-        Err(r) => return r,
+        Err(e) => return db_error(&e),
     };
     if items.is_empty() {
         return no_content();
@@ -3533,7 +3603,15 @@ async fn mosaic_route(
                 "type": "Polygon",
                 "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]]
             });
-            geometry_assets(pg, &rec.hash, polygon, limits).await
+            // A size matters only to the lean lookup, and this route has no size of its own:
+            // without a usable one the box is sampled as a 1024-pixel picture would be.
+            let size = match part_size_from_query(pairs) {
+                Ok(PartSize::Query { max_size: None, width: None, height: None }) | Err(_) => {
+                    PartSize::Query { max_size: Some(1024), width: None, height: None }
+                }
+                Ok(size) => size,
+            };
+            geometry_assets(pg, &rec.hash, polygon, limits, pairs, part_grid(size, [w, s, e, n])).await
         }
         ["bbox", seg, dims] => {
             let (Some((bbox, None)), Some((w, h, ext))) = (parse_bbox4(seg), parse_wxh_ext(dims))
@@ -3565,7 +3643,7 @@ async fn mosaic_route(
             limits.exitwhenfull = false;
             limits.skipcovered = false;
             let point = json!({ "type": "Point", "coordinates": [lon, lat] });
-            geometry_assets(pg, &rec.hash, point, limits).await
+            geometry_assets(pg, &rec.hash, point, limits, pairs, None).await
         }
         _ => not_found(),
     }
@@ -3960,6 +4038,21 @@ mod tests {
         assert_eq!(part_dims(query(Some(4096), None, None), bbox, res), (1802, 901));
         // A tall box is limited by its height.
         assert_eq!(part_dims(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2], res), (50, 100));
+
+        // The lean lookup samples the box as the picture will: the same sizes, wherever
+        // they do not depend on the data.
+        let grid = |w, h| SampleGrid::for_image(w, h, false);
+        assert_eq!(part_grid(query(Some(256), None, None), bbox), grid(256, 128));
+        assert_eq!(part_grid(query(None, Some(300), None), bbox), grid(300, 150));
+        assert_eq!(part_grid(query(None, None, Some(90)), bbox), grid(180, 90));
+        assert_eq!(part_grid(query(None, Some(300), Some(200)), bbox), grid(300, 200));
+        assert_eq!(part_grid(PartSize::Exact(64, 48), bbox), grid(64, 48));
+        assert_eq!(part_grid(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2]), grid(50, 100));
+        assert!(grid(64, 48).is_some());
+        // The data's own resolution is not known yet, and a picture this large is not sampled.
+        assert_eq!(part_grid(query(None, None, None), bbox), None);
+        assert_eq!(part_grid(PartSize::Exact(5000, 10), bbox), None);
+        assert_eq!(part_grid(PartSize::Exact(64, 48), [0.0, 0.0, 0.0, 1.0]), None);
 
         // `max_size` is dropped once a width or a height is given, as in rio-tiler.
         let pairs = query_pairs("max_size=64&width=300");
