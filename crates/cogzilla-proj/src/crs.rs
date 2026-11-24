@@ -106,72 +106,138 @@ impl CrsModel {
                 Some(_) => return Err(unsupported("linear units other than metres or feet")),
             };
             let missing = |what: &str| unsupported(&format!("{what} is missing"));
+            let require_finite = |v: f64, what: &str| -> Result<f64, ProjError> {
+                if v.is_finite() {
+                    Ok(v)
+                } else {
+                    Err(unsupported(&format!("{what} must be finite")))
+                }
+            };
+            let require_lat = |v: f64, open_poles: bool, what: &str| -> Result<f64, ProjError> {
+                let valid = if open_poles {
+                    v.is_finite() && v.abs() < 90.0 - 1e-9
+                } else {
+                    v.is_finite() && v.abs() <= 90.0
+                };
+                if valid {
+                    Ok(v)
+                } else {
+                    Err(unsupported(&format!("{what} out of range")))
+                }
+            };
+            let require_scale = |v: f64| -> Result<f64, ProjError> {
+                if v.is_finite() && v > 0.0 {
+                    Ok(v)
+                } else {
+                    Err(unsupported("scale factor must be finite and positive"))
+                }
+            };
             let lon0 = gk.false_origin_long.or(gk.nat_origin_long).or(gk.center_long);
             let lat0 = gk.false_origin_lat.or(gk.nat_origin_lat).or(gk.center_lat);
-            let fe = gk
-                .false_origin_easting
-                .or(gk.false_easting)
-                .or(gk.center_easting)
-                .unwrap_or(0.0);
-            let fn_m = gk
-                .false_origin_northing
-                .or(gk.false_northing)
-                .or(gk.center_northing)
-                .unwrap_or(0.0);
+            let fe = require_finite(
+                gk.false_origin_easting
+                    .or(gk.false_easting)
+                    .or(gk.center_easting)
+                    .unwrap_or(0.0),
+                "false easting",
+            )?;
+            let fn_m = require_finite(
+                gk.false_origin_northing
+                    .or(gk.false_northing)
+                    .or(gk.center_northing)
+                    .unwrap_or(0.0),
+                "false northing",
+            )?;
             return match ct {
                 // CT_TransverseMercator
                 1 => {
-                    let mut tm = TransverseMercator::new(
-                        ellip,
+                    let lon0 = require_finite(
                         lon0.ok_or_else(|| missing("central meridian"))?,
-                        lat0.unwrap_or(0.0),
-                        gk.scale_at_nat_origin.unwrap_or(1.0),
-                        fe,
-                        fn_m,
-                    );
+                        "central meridian",
+                    )?;
+                    let lat0 = require_lat(lat0.unwrap_or(0.0), false, "latitude of origin")?;
+                    let k0 = require_scale(gk.scale_at_nat_origin.unwrap_or(1.0))?;
+                    let mut tm = TransverseMercator::new(ellip, lon0, lat0, k0, fe, fn_m);
                     tm.unit = unit;
                     Ok(Self::TransverseMercator(tm))
                 }
                 // CT_LambertConfConic_2SP
                 8 => {
-                    let p1 = gk.std_parallel_1.ok_or_else(|| missing("standard parallel"))?;
-                    let mut lcc = LambertConformalConic::new_2sp(
-                        ellip,
-                        p1,
+                    let p1 = require_lat(
+                        gk.std_parallel_1.ok_or_else(|| missing("standard parallel"))?,
+                        true,
+                        "standard parallel 1",
+                    )?;
+                    let p2 = require_lat(
                         gk.std_parallel_2.unwrap_or(p1),
+                        true,
+                        "standard parallel 2",
+                    )?;
+                    if (p1 + p2).abs() < 1e-9 {
+                        return Err(unsupported(
+                            "LCC standard parallels are symmetric across the equator",
+                        ));
+                    }
+                    let lat0 = require_lat(
                         lat0.ok_or_else(|| missing("latitude of origin"))?,
+                        true,
+                        "latitude of origin",
+                    )?;
+                    let lon0 = require_finite(
                         lon0.ok_or_else(|| missing("central meridian"))?,
-                        fe,
-                        fn_m,
-                    );
+                        "central meridian",
+                    )?;
+                    let mut lcc =
+                        LambertConformalConic::new_2sp(ellip, p1, p2, lat0, lon0, fe, fn_m);
                     lcc.unit = unit;
                     Ok(Self::LambertConformalConic(lcc))
                 }
                 // CT_LambertConfConic_1SP (CT_LambertConfConic_Helmert)
                 9 => {
-                    let mut lcc = LambertConformalConic::new_1sp(
-                        ellip,
+                    let lat0 = require_lat(
                         lat0.ok_or_else(|| missing("latitude of origin"))?,
+                        true,
+                        "latitude of origin",
+                    )?;
+                    if lat0.abs() < 1e-9 {
+                        return Err(unsupported("LCC 1SP latitude of origin cannot be zero"));
+                    }
+                    let lon0 = require_finite(
                         lon0.ok_or_else(|| missing("central meridian"))?,
-                        gk.scale_at_nat_origin.unwrap_or(1.0),
-                        fe,
-                        fn_m,
-                    );
+                        "central meridian",
+                    )?;
+                    let k0 = require_scale(gk.scale_at_nat_origin.unwrap_or(1.0))?;
+                    let mut lcc = LambertConformalConic::new_1sp(ellip, lat0, lon0, k0, fe, fn_m);
                     lcc.unit = unit;
                     Ok(Self::LambertConformalConic(lcc))
                 }
                 // CT_AlbersEqualArea
                 11 => {
-                    let p1 = gk.std_parallel_1.ok_or_else(|| missing("standard parallel"))?;
-                    let mut alb = AlbersEqualArea::new(
-                        ellip,
-                        p1,
+                    let p1 = require_lat(
+                        gk.std_parallel_1.ok_or_else(|| missing("standard parallel"))?,
+                        false,
+                        "standard parallel 1",
+                    )?;
+                    let p2 = require_lat(
                         gk.std_parallel_2.unwrap_or(p1),
+                        false,
+                        "standard parallel 2",
+                    )?;
+                    if (p1 + p2).abs() < 1e-9 {
+                        return Err(unsupported(
+                            "Albers standard parallels are symmetric across the equator",
+                        ));
+                    }
+                    let lat0 = require_lat(
                         lat0.ok_or_else(|| missing("latitude of origin"))?,
+                        false,
+                        "latitude of origin",
+                    )?;
+                    let lon0 = require_finite(
                         lon0.ok_or_else(|| missing("central meridian"))?,
-                        fe,
-                        fn_m,
-                    );
+                        "central meridian",
+                    )?;
+                    let mut alb = AlbersEqualArea::new(ellip, p1, p2, lat0, lon0, fe, fn_m);
                     alb.unit = unit;
                     Ok(Self::Albers(alb))
                 }
@@ -179,16 +245,21 @@ impl CrsModel {
                 // the natural origin latitude and the central meridian as the
                 // "straight vertical pole longitude".
                 15 => {
-                    let lat_ts = gk
-                        .nat_origin_lat
-                        .or(gk.std_parallel_1)
-                        .ok_or_else(|| missing("latitude of true scale"))?;
-                    let lon0 = gk
-                        .straight_vert_pole_long
-                        .or(gk.nat_origin_long)
-                        .or(gk.center_long)
-                        .ok_or_else(|| missing("central meridian"))?;
-                    let k0 = gk.scale_at_nat_origin.unwrap_or(1.0);
+                    let lat_ts = require_lat(
+                        gk.nat_origin_lat
+                            .or(gk.std_parallel_1)
+                            .ok_or_else(|| missing("latitude of true scale"))?,
+                        false,
+                        "latitude of true scale",
+                    )?;
+                    let lon0 = require_finite(
+                        gk.straight_vert_pole_long
+                            .or(gk.nat_origin_long)
+                            .or(gk.center_long)
+                            .ok_or_else(|| missing("central meridian"))?,
+                        "central meridian",
+                    )?;
+                    let k0 = require_scale(gk.scale_at_nat_origin.unwrap_or(1.0))?;
                     let mut ps = if lat_ts.abs() > 90.0 - 1e-9 {
                         PolarStereographic::new_pole_scale(ellip, lat_ts < 0.0, k0, lon0, fe, fn_m)
                     } else if (k0 - 1.0).abs() > 1e-12 {
@@ -203,30 +274,32 @@ impl CrsModel {
                 }
                 // CT_LambertAzimEqualArea
                 10 => {
-                    let mut p = LambertAzimuthalEqualArea::new(
-                        ellip,
+                    let lat0 = require_lat(
                         gk.center_lat
                             .or(gk.nat_origin_lat)
                             .ok_or_else(|| missing("latitude of origin"))?,
+                        false,
+                        "latitude of origin",
+                    )?;
+                    let lon0 = require_finite(
                         gk.center_long
                             .or(gk.nat_origin_long)
                             .ok_or_else(|| missing("central meridian"))?,
-                        fe,
-                        fn_m,
-                    );
+                        "central meridian",
+                    )?;
+                    let mut p = LambertAzimuthalEqualArea::new(ellip, lat0, lon0, fe, fn_m);
                     p.unit = unit;
                     Ok(Self::Laea(p))
                 }
                 // CT_Sinusoidal
                 24 => {
-                    let mut p = Sinusoidal::new(
-                        ellip,
+                    let lon0 = require_finite(
                         gk.center_long
                             .or(gk.nat_origin_long)
                             .ok_or_else(|| missing("central meridian"))?,
-                        fe,
-                        fn_m,
-                    );
+                        "central meridian",
+                    )?;
+                    let mut p = Sinusoidal::new(ellip, lon0, fe, fn_m);
                     p.unit = unit;
                     Ok(Self::Sinusoidal(p))
                 }
@@ -442,19 +515,22 @@ impl CrsModel {
             visit(w, t * h);
         }
 
-        // Check whether North or South Pole lies inside the raster footprint (polar CRSes)
-        if let Some(crs_to_pixel) = pixel_to_crs.invert() {
-            for &pole_lat in &[90.0_f64, -90.0_f64] {
-                let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
-                if px_crs.is_finite() && py_crs.is_finite() {
-                    let (col, row) = crs_to_pixel.forward(px_crs, py_crs);
-                    if col >= 0.0 && col <= w && row >= 0.0 && row <= h {
-                        min_lon = -180.0;
-                        max_lon = 180.0;
-                        if pole_lat > 0.0 {
-                            max_lat = 90.0;
-                        } else {
-                            min_lat = -90.0;
+        // Check whether North or South Pole lies inside the raster footprint (polar CRSes).
+        // Skip for Web Mercator (clamps ±90° to ±85.0511°) and Geographic (rectangular lon/lat).
+        if !matches!(self, Self::Epsg3857 | Self::Geographic) {
+            if let Some(crs_to_pixel) = pixel_to_crs.invert() {
+                for &pole_lat in &[90.0_f64, -90.0_f64] {
+                    let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
+                    if px_crs.is_finite() && py_crs.is_finite() {
+                        let (col, row) = crs_to_pixel.forward(px_crs, py_crs);
+                        if col >= 0.0 && col <= w && row >= 0.0 && row <= h {
+                            min_lon = -180.0;
+                            max_lon = 180.0;
+                            if pole_lat > 0.0 {
+                                max_lat = 90.0;
+                            } else {
+                                min_lat = -90.0;
+                            }
                         }
                     }
                 }
@@ -588,11 +664,13 @@ impl<const N: usize> CoordPlan<N> {
                 _ => unreachable!(),
             }
 
-            // Include +/- 1 pixel margin for bilinear/cubic neighbor lookups across block seams
-            let src_min_col = (min_u.floor() as i32 - 1).max(0);
-            let src_max_col = ((max_u.ceil() as i32) + 1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32 - 1).max(0);
-            let src_max_row = ((max_v.ceil() as i32) + 1).min(ifd_h as i32 - 1);
+            // Include +/- 1 pixel margin for bilinear/cubic neighbor lookups across block seams.
+            // Use saturating arithmetic so extreme low-zoom coordinates on high-res COGs
+            // (|u| > i32::MAX) never panic in debug or wrap to i32::MIN in release.
+            let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
+            let src_max_col = (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+            let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
+            let src_max_row = (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
 
             if max_u < -0.5 || min_u > (ifd_w as f32 - 0.5) || max_v < -0.5 || min_v > (ifd_h as f32 - 0.5) {
                 return None;
@@ -603,8 +681,8 @@ impl<const N: usize> CoordPlan<N> {
 
             let all_in_bounds = min_u >= 0.0
                 && min_v >= 0.0
-                && (max_u.floor() as i32 + 1) < ifd_w as i32
-                && (max_v.floor() as i32 + 1) < ifd_h as i32;
+                && (max_u.floor() as i32).saturating_add(1) < ifd_w as i32
+                && (max_v.floor() as i32).saturating_add(1) < ifd_h as i32;
 
             Some(Self::Separable1D {
                 u,
@@ -908,10 +986,10 @@ impl<const N: usize> CoordPlan<N> {
                 return None;
             }
 
-            let src_min_col = (min_u.floor() as i32 - 1).max(0);
-            let src_max_col = (max_u.ceil() as i32 + 1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32 - 1).max(0);
-            let src_max_row = (max_v.ceil() as i32 + 1).min(ifd_h as i32 - 1);
+            let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
+            let src_max_col = (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+            let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
+            let src_max_row = (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
 
             if src_min_col > src_max_col || src_min_row > src_max_row {
                 return None;
@@ -921,8 +999,8 @@ impl<const N: usize> CoordPlan<N> {
             let all_in_bounds = all_finite
                 && min_u >= 0.0
                 && min_v >= 0.0
-                && (max_u.floor() as i32 + 1) < ifd_w as i32
-                && (max_v.floor() as i32 + 1) < ifd_h as i32;
+                && (max_u.floor() as i32).saturating_add(1) < ifd_w as i32
+                && (max_v.floor() as i32).saturating_add(1) < ifd_h as i32;
 
             Some(Self::Grid2D {
                 grid_u,
@@ -1207,4 +1285,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn coord_plan_high_res_low_zoom_does_not_overflow_i32() {
+        // 1 cm/px EPSG:3857 COG near mx = -13.6e6 queried at z=0 produces max_u > 3e9 (> i32::MAX).
+        let pixel_to_crs = Affine2D {
+            a: 0.01,
+            b: 0.0,
+            c: -13_600_000.0,
+            d: 0.0,
+            e: -0.01,
+            f: 4_500_000.0,
+        };
+        let crs_to_pixel = pixel_to_crs.invert().unwrap();
+        let plan = CoordPlan::<256>::build(
+            &CrsModel::Epsg3857,
+            &crs_to_pixel,
+            1024,
+            1024,
+            TileCoord { z: 0, x: 0, y: 0 },
+        );
+        assert!(plan.is_some(), "high-res COG at z=0 must not overflow i32 and drop tile");
+    }
+
+    #[test]
+    fn wgs84_bounds_does_not_expand_narrow_mercator_or_geographic_strips() {
+        // Narrow EPSG:3857 strip touching (0°, 85.0511°)
+        let merc_aff = Affine2D {
+            a: 1000.0,
+            b: 0.0,
+            c: -100_000.0,
+            d: 0.0,
+            e: -1000.0,
+            f: 20_037_508.342_789_244,
+        };
+        let mb = CrsModel::Epsg3857.wgs84_bounds(&merc_aff, 200, 200);
+        assert!(mb[0] > -2.0 && mb[2] < 2.0, "unexpected mercator bounds expansion: {mb:?}");
+
+        // Narrow Geographic strip touching (0°, 90°)
+        let geo_aff = Affine2D {
+            a: 0.1,
+            b: 0.0,
+            c: -5.0,
+            d: 0.0,
+            e: -0.1,
+            f: 90.0,
+        };
+        let gb = CrsModel::Geographic.wgs84_bounds(&geo_aff, 100, 100);
+        assert!(gb[0] >= -5.1 && gb[2] <= 5.1, "unexpected geographic bounds expansion: {gb:?}");
+    }
+
+    #[test]
+    fn refuses_degenerate_and_non_finite_user_defined_geokeys() {
+        let cases = [
+            (
+                "LCC 2SP symmetric parallels (n == 0)",
+                keys(|k| {
+                    k.projected_cs_type = Some(32767);
+                    k.proj_coord_trans = Some(8);
+                    k.std_parallel_1 = Some(30.0);
+                    k.std_parallel_2 = Some(-30.0);
+                    k.false_origin_lat = Some(0.0);
+                    k.false_origin_long = Some(0.0);
+                }),
+            ),
+            (
+                "LCC 1SP lat0 == 0",
+                keys(|k| {
+                    k.projected_cs_type = Some(32767);
+                    k.proj_coord_trans = Some(9);
+                    k.nat_origin_lat = Some(0.0);
+                    k.nat_origin_long = Some(0.0);
+                }),
+            ),
+            (
+                "TM zero scale factor",
+                keys(|k| {
+                    k.projected_cs_type = Some(32767);
+                    k.proj_coord_trans = Some(1);
+                    k.nat_origin_long = Some(0.0);
+                    k.scale_at_nat_origin = Some(0.0);
+                }),
+            ),
+            (
+                "PolarStereo NaN lat_ts",
+                keys(|k| {
+                    k.projected_cs_type = Some(32767);
+                    k.proj_coord_trans = Some(15);
+                    k.nat_origin_lat = Some(f64::NAN);
+                    k.straight_vert_pole_long = Some(0.0);
+                }),
+            ),
+        ];
+        for (what, gk) in cases {
+            assert!(CrsModel::from_geo_keys(&gk).is_err(), "{what} should be refused");
+        }
+    }
 }
