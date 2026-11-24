@@ -658,9 +658,10 @@ impl PgStac {
 }
 
 /// The lean lookup reads pgSTAC's tables directly, so it is on by default only for the
-/// versions it was compared with `geojsonsearch` on.
+/// release lines it has been run against `geojsonsearch` on: 0.10 (a catalog of 46,476
+/// items, and the HTTP tests) and 0.9 (the HTTP tests, in CI on 0.9.11).
 fn lean_checked_version(version: &str) -> bool {
-    version.starts_with("0.10.")
+    version.starts_with("0.10.") || version.starts_with("0.9.")
 }
 
 #[cfg(test)]
@@ -720,6 +721,17 @@ mod tests {
             ["visual", "red", "aot-jp2", "nir", "blue", "aot"].iter().map(|s| s.to_string()).collect();
         jsonb_key_order(&mut keys);
         assert_eq!(keys, ["aot", "nir", "red", "blue", "visual", "aot-jp2"]);
+    }
+
+    #[test]
+    fn lean_lookup_is_on_for_the_lines_it_was_run_on() {
+        for version in ["0.9.0", "0.9.11", "0.10.2"] {
+            assert!(lean_checked_version(version), "{version}");
+        }
+        // Not 0.8, not what comes after 0.10, and not a version that merely starts alike.
+        for version in ["0.8.6", "0.11.0", "0.90.1", "0.100.0", "1.0.0", "", "unreleased"] {
+            assert!(!lean_checked_version(version), "{version}");
+        }
     }
 
     #[test]
