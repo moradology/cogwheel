@@ -145,6 +145,7 @@ struct ParsedQuery {
     minzoom: Option<u8>,
     maxzoom: Option<u8>,
     tile_format: Option<String>,
+    tile_scale: Option<u32>,
     algorithm: Option<String>,
     azimuth: f32,
     altitude: f32,
@@ -182,6 +183,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         minzoom: None,
         maxzoom: None,
         tile_format: None,
+        tile_scale: None,
         algorithm: None,
         azimuth: 315.0,
         altitude: 45.0,
@@ -206,12 +208,53 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             // Do not convert `+` to space in `url=` (S3 keys and Azure SAS tokens often contain literal `+`)
             "url" => pq.urls.push(percent_decode_opts(v, false)),
             "assets" => {
-                for a in percent_decode(v).split(',') {
-                    if !a.is_empty() {
-                        pq.assets.push(a.to_string());
+                let dec = percent_decode(v);
+                if dec.contains('|') {
+                    // TiTiler `assets=name|bidx=1,2,3` or `assets=name|indexes=1,2,3`
+                    let mut parts = dec.split('|');
+                    if let Some(name) = parts.next()
+                        && !name.is_empty()
+                    {
+                        pq.assets.push(name.to_string());
+                    }
+                    for opt in parts {
+                        if let Some(bidx_str) = opt
+                            .strip_prefix("bidx=")
+                            .or_else(|| opt.strip_prefix("indexes="))
+                        {
+                            for tok in bidx_str.split(',') {
+                                match tok.trim().parse::<u16>() {
+                                    Ok(b) if b >= 1 => pq.bidx.push(b),
+                                    _ => bad("expected positive integer band indices in |bidx="),
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for a in dec.split(',') {
+                        if !a.is_empty() {
+                            pq.assets.push(a.to_string());
+                        }
                     }
                 }
             }
+            "asset_bidx" => {
+                let dec = percent_decode(v);
+                if let Some((_name, bidx_str)) = dec.split_once('|') {
+                    for tok in bidx_str.split(',') {
+                        match tok.trim().parse::<u16>() {
+                            Ok(b) if b >= 1 => pq.bidx.push(b),
+                            _ => bad("expected positive integer band indices in asset_bidx"),
+                        }
+                    }
+                } else {
+                    bad("expected asset_bidx=name|1,2,3");
+                }
+            }
+            "asset_as_band" => match percent_decode(v).to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "false" | "0" | "no" => {}
+                _ => bad("expected boolean"),
+            },
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm_params" => {
@@ -393,6 +436,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 Ok(sc) if (1..=4).contains(&sc) => pq.tile_size = sc * 256,
                 _ => bad("expected scale in 1..=4"),
             },
+            "tile_scale" => match v.parse::<u32>() {
+                Ok(sc) if (1..=4).contains(&sc) => pq.tile_scale = Some(sc),
+                _ => bad("expected tile_scale in 1..=4"),
+            },
             "max_size" => {
                 if let Ok(ms) = v.parse::<u32>() {
                     pq.max_size = ms.clamp(1, 4096);
@@ -555,7 +602,7 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     }
     let last_seg = segs.last().copied().unwrap_or("");
     if last_seg != "tilejson.json" && last_seg != "map.html" {
-        if let Some(k) = has(&["minzoom", "maxzoom", "tile_format"]) {
+        if let Some(k) = has(&["minzoom", "maxzoom", "tile_format", "tile_scale"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on tilejson.json and map.html routes"
             ));
@@ -568,8 +615,8 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     Ok(())
 }
 
-/// Apply TiTiler `minzoom`, `maxzoom`, and `tile_format` query overrides to a TileJSON document,
-/// stripping those TileJSON-only params from the forwarded tile URL template.
+/// Apply TiTiler `minzoom`, `maxzoom`, `tile_format`, and `tile_scale` query overrides to a
+/// TileJSON document, stripping those TileJSON-only params from the forwarded tile URL template.
 fn apply_tilejson_overrides(
     tj: &mut serde_json::Value,
     pq: &ParsedQuery,
@@ -587,19 +634,25 @@ fn apply_tilejson_overrides(
         .split('&')
         .filter(|pair| {
             let k = pair.split('=').next().unwrap_or("");
-            !pair.is_empty() && !matches!(k, "minzoom" | "maxzoom" | "tile_format")
+            !pair.is_empty() && !matches!(k, "minzoom" | "maxzoom" | "tile_format" | "tile_scale")
         })
         .collect::<Vec<_>>()
         .join("&");
+    let scale_suffix = match pq.tile_scale {
+        Some(sc) if sc > 1 => format!("@{sc}x"),
+        _ => String::new(),
+    };
     let ext_suffix = pq
         .tile_format
         .as_deref()
         .map(|f| format!(".{f}"))
         .unwrap_or_default();
     let tile_url = if filtered_query.is_empty() {
-        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}")
+        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{scale_suffix}{ext_suffix}")
     } else {
-        format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}?{filtered_query}")
+        format!(
+            "{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{scale_suffix}{ext_suffix}?{filtered_query}"
+        )
     };
     tj["tiles"] = serde_json::json!([tile_url]);
     let cur_min = tj.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
@@ -812,12 +865,17 @@ fn build_band_request(
                         [1, 2]
                     };
                     let (rmin, rmax) = match pq.rescale.len() {
+                        0 => ([-20.0, -25.0, 0.0], [0.0, -5.0, 15.0]),
+                        1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
                         3 => (
                             [pq.rescale[0].0, pq.rescale[1].0, pq.rescale[2].0],
                             [pq.rescale[0].1, pq.rescale[1].1, pq.rescale[2].1],
                         ),
-                        1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
-                        _ => ([-20.0, -25.0, 0.0], [0.0, -5.0, 15.0]),
+                        n => {
+                            return Err(EngineError::BadRequest(format!(
+                                "expected 1 or 3 rescale pairs for 3-band SAR RGB output, got {n}"
+                            )));
+                        }
                     };
                     BandRequest::SarRgb {
                         bands_1based: bs,
@@ -865,6 +923,13 @@ fn build_band_request(
         });
     }
 
+    if !pq.bidx.is_empty() && pq.bidx.len() != 1 && pq.bidx.len() != 3 {
+        return Err(EngineError::BadRequest(format!(
+            "unsupported bidx count {} (expected 1 or 3 bands)",
+            pq.bidx.len()
+        )));
+    }
+
     if pq.bidx.len() == 3 || (pq.bidx.is_empty() && default_bands >= 3) {
         let bs = if pq.bidx.len() == 3 {
             [pq.bidx[0], pq.bidx[1], pq.bidx[2]]
@@ -872,14 +937,19 @@ fn build_band_request(
             [1, 2, 3]
         };
         let (rmin, rmax) = match pq.rescale.len() {
+            0 => {
+                let (lo, hi) = default_rescale_for_dtype(sample_type, false);
+                ([lo; 3], [hi; 3])
+            }
+            1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
             3 => (
                 [pq.rescale[0].0, pq.rescale[1].0, pq.rescale[2].0],
                 [pq.rescale[0].1, pq.rescale[1].1, pq.rescale[2].1],
             ),
-            1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
-            _ => {
-                let (lo, hi) = default_rescale_for_dtype(sample_type, false);
-                ([lo; 3], [hi; 3])
+            n => {
+                return Err(EngineError::BadRequest(format!(
+                    "expected 1 or 3 rescale pairs for 3-band RGB output, got {n}"
+                )));
             }
         };
         Ok(BandRequest::Rgb {
@@ -888,6 +958,12 @@ fn build_band_request(
             rescale_max: rmax,
         })
     } else {
+        if pq.rescale.len() > 1 {
+            return Err(EngineError::BadRequest(format!(
+                "expected 1 rescale pair for single-band output, got {}",
+                pq.rescale.len()
+            )));
+        }
         let b = pq.bidx.first().copied().unwrap_or(1);
         let default_range = default_rescale_for_dtype(sample_type, true);
         let rescale = pq.rescale.first().copied().unwrap_or(default_range);
@@ -1219,6 +1295,12 @@ where
         .map(|s| s.trim())
         .filter(|&s| s.eq_ignore_ascii_case("https") || s.eq_ignore_ascii_case("http"))
         .map(|s| s.to_ascii_lowercase())
+        .or_else(|| {
+            req.uri()
+                .scheme_str()
+                .filter(|&s| s.eq_ignore_ascii_case("https") || s.eq_ignore_ascii_case("http"))
+                .map(|s| s.to_ascii_lowercase())
+        })
         .unwrap_or_else(|| "http".to_string());
     let host_raw = req
         .headers()
@@ -1527,7 +1609,8 @@ where
                 Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
             }
             .await,
-            ["mosaicjson", tms, "tilejson.json"] => async {
+            ["mosaicjson", _, "tilejson.json"] | ["mosaicjson", "tilejson.json"] => async {
+                let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let center = serde_json::json!([
@@ -1549,6 +1632,12 @@ where
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
+            ["mosaicjson", _, "map.html"] | ["mosaicjson", "map.html"] => {
+                let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
+                let tj_url =
+                    format!("{forwarded_prefix}/mosaicjson/{tms}/tilejson.json?{raw_query}");
+                Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
+            }
             ["mosaicjson", "tiles", "WebMercatorQuad", zs, xs, ys]
             | ["mosaicjson", "tiles", zs, xs, ys] => {
                 let cache_key = format!("{path}?{raw_query}");
@@ -2238,8 +2327,9 @@ where
                 Ok((Bytes::from(body), "application/json"))
             }
 
-            // GET /stac/{tms}/tilejson.json & /stac/{tms}/map.html
-            (Method::GET, [tms, "tilejson.json"]) => async {
+            // GET /stac/{tms}/tilejson.json, /stac/tilejson.json, /stac/{tms}/map.html, /stac/map.html
+            (Method::GET, [_, "tilejson.json"]) | (Method::GET, ["tilejson.json"]) => async {
+                let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, _) =
@@ -2250,7 +2340,8 @@ where
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
-            (Method::GET, [tms, "map.html"]) => {
+            (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) => {
+                let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let tj_url = format!("{forwarded_prefix}/stac/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
@@ -3068,8 +3159,9 @@ where
             }
             .await,
 
-            // 9. GET /cog/{tileMatrixSetId}/map.html
-            (Method::GET, [tms, "map.html"]) => {
+            // 9. GET /cog/{tileMatrixSetId}/map.html & /cog/map.html
+            (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) => {
+                let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let tj_url = format!("{forwarded_prefix}/cog/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }

@@ -208,15 +208,49 @@ pub async fn resolve_stac_assets(
                 if !prev_is_ident && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
                     let rest = &expr[i..];
                     if let Some(&matched) = known.iter().find(|&&name| {
-                        rest.starts_with(name)
-                            && !bytes
-                                .get(i + name.len())
-                                .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                        if !rest.starts_with(name) {
+                            return false;
+                        }
+                        let after = i + name.len();
+                        if !bytes
+                            .get(after)
+                            .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                        {
+                            return true;
+                        }
+                        // Also match TiTiler's default `{asset}_b{k}` band syntax (e.g. `nir_b1`).
+                        if bytes.get(after) == Some(&b'_') && bytes.get(after + 1) == Some(&b'b') {
+                            let mut j = after + 2;
+                            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                            if j > after + 2
+                                && !bytes
+                                    .get(j)
+                                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                            {
+                                return true;
+                            }
+                        }
+                        false
                     }) {
                         if seen.insert(matched) {
                             names.push(matched.to_string());
                         }
                         i += matched.len();
+                        if bytes.get(i) == Some(&b'_') && bytes.get(i + 1) == Some(&b'b') {
+                            let mut j = i + 2;
+                            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                            if j > i + 2
+                                && !bytes
+                                    .get(j)
+                                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                            {
+                                i = j;
+                            }
+                        }
                         continue;
                     }
                 }
@@ -276,7 +310,8 @@ pub async fn resolve_stac_assets(
 }
 
 /// Single-pass longest-prefix identifier-boundary replacement of STAC asset names with
-/// `b1`, `b2`, ... (handles both unspaced subtraction `nir-red` and hyphenated names `SR-B5-SR-B4`).
+/// `b1`, `b2`, ... (handles TiTiler's default `{asset}_b{i}` syntax, bare `{asset}` when
+/// `asset_as_band=true`, unspaced subtraction `nir-red`, and hyphenated names `SR-B5-SR-B4`).
 pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
     let mut ordered: Vec<(usize, &str)> = names
         .iter()
@@ -285,6 +320,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
         .collect();
     ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
+    let single_asset = names.len() == 1;
     let bytes = expr.as_bytes();
     let mut out = String::with_capacity(expr.len());
     let mut i = 0;
@@ -293,6 +329,39 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
             i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
         if !prev_is_ident && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
             let rest = &expr[i..];
+            // 1. Check TiTiler default `{asset}_b{k}` first (e.g. `nir_b1`, `visual_b3`).
+            let mut matched_band_suffix: Option<(usize, usize)> = None;
+            for &(asset_1based, name) in &ordered {
+                if !rest.starts_with(name) {
+                    continue;
+                }
+                let after = i + name.len();
+                if bytes.get(after) == Some(&b'_') && bytes.get(after + 1) == Some(&b'b') {
+                    let mut j = after + 2;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > after + 2
+                        && !bytes
+                            .get(j)
+                            .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                    {
+                        if let Ok(band_k) = expr[after + 2..j].parse::<usize>() {
+                            let target_band = if single_asset { band_k } else { asset_1based };
+                            matched_band_suffix = Some((target_band, j - i));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some((target_band, consumed)) = matched_band_suffix {
+                out.push('b');
+                out.push_str(&target_band.to_string());
+                i += consumed;
+                continue;
+            }
+
+            // 2. Bare `{asset}` (TiTiler `asset_as_band=true` & backward-compatible shorthand).
             if let Some(&(band_1based, matched)) = ordered.iter().find(|&&(_, name)| {
                 rest.starts_with(name)
                     && !bytes
@@ -533,6 +602,18 @@ mod tests {
         assert_eq!(
             rewrite_stac_expr("(SR-B5-SR-B4)/(SR-B5+SR-B4)", &hyphenated),
             "(b1-b2)/(b1+b2)"
+        );
+
+        // TiTiler default `{asset}_b{i}` syntax for both multi-asset and single multi-band assets
+        let nir_red = vec!["nir".to_string(), "red".to_string()];
+        assert_eq!(
+            rewrite_stac_expr("(nir_b1-red_b1)/(nir_b1+red_b1)", &nir_red),
+            "(b1-b2)/(b1+b2)"
+        );
+        let visual = vec!["visual".to_string()];
+        assert_eq!(
+            rewrite_stac_expr("(visual_b3-visual_b1)/(visual_b3+visual_b1)", &visual),
+            "(b3-b1)/(b3+b1)"
         );
 
         // resolve_href must ignore slashes inside signed query strings and resolve root-relative hrefs
