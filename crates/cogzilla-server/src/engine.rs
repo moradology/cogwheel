@@ -74,6 +74,11 @@ pub enum BandRequest {
         rescale: (f32, f32),
         colormap: ColormapName,
     },
+    CustomExprRgb {
+        progs: [ExprProgram; 3],
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+    },
     Terrain {
         band_1based: u16,
         encoding: TerrainEncoding,
@@ -1083,6 +1088,9 @@ impl TileEngine {
                     }
                 }
             }
+            BandRequest::CustomExprRgb { .. } => Err(EngineError::BadRequest(
+                "3-band custom expressions are rendered via bbox pipeline".into(),
+            )),
             BandRequest::CustomExpr {
                 prog,
                 rescale,
@@ -1494,6 +1502,9 @@ impl TileEngine {
                 };
                 Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
             }
+            BandRequest::CustomExprRgb { .. } => Err(EngineError::BadRequest(
+                "3-band custom expressions are rendered via bbox pipeline".into(),
+            )),
             BandRequest::CustomExpr {
                 prog,
                 rescale,
