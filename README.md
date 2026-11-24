@@ -23,10 +23,10 @@
 Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network (lossy WebP on 4-vCPU Linux is **10.9×** warm / **7.0×** cold vs GDAL). Each row comes from a single benchmark run; hardware, method and caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
 <p align="center">
-  <img src="assets/terrain-gallery.jpg" alt="Mt. Rainier rendered four ways by cogzilla: hillshade, slope, aspect, and colormapped elevation" width="100%" />
+  <img src="assets/terrain-gallery.jpg" alt="Mt. Rainier rendered six ways by cogzilla: colormapped elevation, hillshade, slope, aspect, Terrarium RGB and Mapbox Terrain-RGB" width="100%" />
 </p>
 
-Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from one file. Nothing is pre-rendered: every tile is resampled, shaded, colormapped and encoded when it is requested, at 3,372 hillshade tiles per second on an M5 once the source blocks are cached.
+Mt. Rainier from the public Copernicus 30 m DEM on S3, six ways from one file: colormapped elevation, hillshade, slope, aspect, and the Terrarium and Mapbox Terrain-RGB encodings that drive 3D terrain in MapLibre. Nothing is pre-rendered: every tile is resampled, shaded, colormapped and encoded when it is requested, at 3,372 hillshade tiles per second on an M5 once the source blocks are cached.
 
 ## Try the demo
 
