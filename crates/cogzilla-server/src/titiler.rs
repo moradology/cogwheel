@@ -1604,7 +1604,9 @@ pub(crate) fn encode_rgba_output(
             }
         }
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
-        OutputFormat::RawF32 | OutputFormat::RawRgba => Bytes::copy_from_slice(rgba),
+        OutputFormat::RawF32 | OutputFormat::Npy | OutputFormat::RawRgba => {
+            Bytes::copy_from_slice(rgba)
+        }
     }
 }
 
@@ -1931,12 +1933,21 @@ async fn render_bbox_impl(
     // Empty check
     if !min_u.is_finite() {
         return Ok(match format {
-            OutputFormat::RawF32 => {
+            OutputFormat::RawF32 | OutputFormat::Npy => {
                 let nb: usize = match bands {
                     BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
                     _ => 1,
                 };
-                let mut b = BytesMut::with_capacity(nb * w * h * 4);
+                let hdr = if format == OutputFormat::Npy {
+                    Some(cogzilla_kernel::encode_npy_f32_header(nb, h as u32, w as u32))
+                } else {
+                    None
+                };
+                let hdr_len = hdr.as_ref().map_or(0, |v| v.len());
+                let mut b = BytesMut::with_capacity(hdr_len + nb * w * h * 4);
+                if let Some(hdr) = hdr {
+                    b.put_slice(&hdr);
+                }
                 for _ in 0..(nb * w * h) {
                     b.put_slice(&f32::NAN.to_le_bytes());
                 }
@@ -1947,10 +1958,21 @@ async fn render_bbox_impl(
         });
     }
 
-    let c0 = (min_u.floor() as i32 - 1).max(0) as u32;
-    let c1 = (max_u.ceil() as i32 + 1).min(ifd.width as i32 - 1).max(0) as u32;
-    let r0 = (min_v.floor() as i32 - 1).max(0) as u32;
-    let r1 = (max_v.ceil() as i32 + 1).min(ifd.height as i32 - 1).max(0) as u32;
+    let pad = if matches!(bands, BandRequest::Dem { .. }) {
+        3
+    } else {
+        1
+    };
+    let c0 = (min_u.floor() as i32).saturating_sub(pad).max(0) as u32;
+    let c1 = (max_u.ceil() as i32)
+        .saturating_add(pad)
+        .min(ifd.width as i32 - 1)
+        .max(0) as u32;
+    let r0 = (min_v.floor() as i32).saturating_sub(pad).max(0) as u32;
+    let r1 = (max_v.ceil() as i32)
+        .saturating_add(pad)
+        .min(ifd.height as i32 - 1)
+        .max(0) as u32;
     let tx0 = c0 / ifd.tile_width;
     let tx1 = (c1 / ifd.tile_width).min(ifd.tiles_across.saturating_sub(1));
     let ty0 = r0 / ifd.tile_height;
@@ -2229,8 +2251,105 @@ async fn render_bbox_impl(
             }};
         }
 
-        // Real RawF32 output for single-band / expression / DEM / Terrain requests
-        if format == OutputFormat::RawF32 {
+        // Sample a (w + 2) x (h + 2) elevation ring by linearly extrapolating (u, v) 1 px past
+        // each edge so Horn 3x3 gradients stay seamless across adjacent tiles (WorldCRS84Quad /
+        // render_mercator_bbox) and non-square bboxes.
+        let sample_dem_ring = |src: &BandSource<'_>| -> Vec<f32> {
+            let rw = w + 2;
+            let rh = h + 2;
+            let mut ring = vec![f32::NAN; rw * rh];
+            for py in 0..h {
+                let row = py * w;
+                let rrow = (py + 1) * rw;
+                for px in 0..w {
+                    ring[rrow + px + 1] = sample(src, u_map[row + px], v_map[row + px]);
+                }
+                let (u_l, v_l) = if w >= 2 {
+                    (2.0 * u_map[row] - u_map[row + 1], 2.0 * v_map[row] - v_map[row + 1])
+                } else {
+                    (u_map[row], v_map[row])
+                };
+                let (u_r, v_r) = if w >= 2 {
+                    (
+                        2.0 * u_map[row + w - 1] - u_map[row + w - 2],
+                        2.0 * v_map[row + w - 1] - v_map[row + w - 2],
+                    )
+                } else {
+                    (u_map[row + w - 1], v_map[row + w - 1])
+                };
+                ring[rrow] = sample(src, u_l, v_l);
+                ring[rrow + w + 1] = sample(src, u_r, v_r);
+            }
+            let extrap_row = |src_y0: usize, src_y1: usize, dst_ry: usize, ring: &mut [f32]| {
+                let r0 = src_y0 * w;
+                let r1 = src_y1 * w;
+                let dr = dst_ry * rw;
+                for rx in 0..rw {
+                    let px_signed = rx as isize - 1;
+                    let (u0, v0, u1, v1) = if px_signed < 0 {
+                        if w >= 2 {
+                            (
+                                2.0 * u_map[r0] - u_map[r0 + 1],
+                                2.0 * v_map[r0] - v_map[r0 + 1],
+                                2.0 * u_map[r1] - u_map[r1 + 1],
+                                2.0 * v_map[r1] - v_map[r1 + 1],
+                            )
+                        } else {
+                            (u_map[r0], v_map[r0], u_map[r1], v_map[r1])
+                        }
+                    } else if (px_signed as usize) >= w {
+                        if w >= 2 {
+                            (
+                                2.0 * u_map[r0 + w - 1] - u_map[r0 + w - 2],
+                                2.0 * v_map[r0 + w - 1] - v_map[r0 + w - 2],
+                                2.0 * u_map[r1 + w - 1] - u_map[r1 + w - 2],
+                                2.0 * v_map[r1 + w - 1] - v_map[r1 + w - 2],
+                            )
+                        } else {
+                            (
+                                u_map[r0 + w - 1],
+                                v_map[r0 + w - 1],
+                                u_map[r1 + w - 1],
+                                v_map[r1 + w - 1],
+                            )
+                        }
+                    } else {
+                        let p = px_signed as usize;
+                        (u_map[r0 + p], v_map[r0 + p], u_map[r1 + p], v_map[r1 + p])
+                    };
+                    let (u, v) = if h >= 2 {
+                        (2.0 * u0 - u1, 2.0 * v0 - v1)
+                    } else {
+                        (u0, v0)
+                    };
+                    ring[dr + rx] = sample(src, u, v);
+                }
+            };
+            extrap_row(0, 1.min(h - 1), 0, &mut ring);
+            extrap_row(h - 1, h.saturating_sub(2), h + 1, &mut ring);
+            ring
+        };
+
+        let dem_inv_8dxy = || -> (f32, f32) {
+            let (dx_m, dy_m) = if bbox_is_3857 {
+                let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
+                let cos_lat = center_lat.to_radians().cos().max(0.05);
+                (
+                    (dlx.abs() * cos_lat).max(1e-3) as f32,
+                    (dly.abs() * cos_lat).max(1e-3) as f32,
+                )
+            } else {
+                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                (
+                    (dlx.abs() * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
+                    (dly.abs() * 111_320.0).max(1e-3) as f32,
+                )
+            };
+            (1.0 / (8.0 * dx_m), 1.0 / (8.0 * dy_m))
+        };
+
+        // Real RawF32 / Npy output for single-band / expression / DEM / Terrain / RGB requests
+        if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
             let mut out = BytesMut::with_capacity(w * h * 4);
             match bands {
                 BandRequest::Dem {
@@ -2240,37 +2359,26 @@ async fn render_bbox_impl(
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    let mut elev = vec![f32::NAN; w * h];
-                    for i in 0..(w * h) {
-                        elev[i] = sample(&src, u_map[i], v_map[i]);
-                    }
-                    let px_m = if bbox_is_3857 {
-                        let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
-                        (dlx.abs().max(dly.abs()) * center_lat.to_radians().cos()).max(1e-3) as f32
-                    } else {
-                        let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                        ((dlx * 111_320.0 * lat_rad.cos()).abs()
-                            .max((dly * 111_320.0).abs()))
-                            .max(1e-3) as f32
-                    };
-                    let inv_8dx = 1.0 / (8.0 * px_m);
+                    let ring = sample_dem_ring(&src);
+                    let rw = w + 2;
+                    let (inv_8dx, inv_8dy) = dem_inv_8dxy();
                     for py in 0..h {
-                        let ym = py.saturating_sub(1);
-                        let yp = (py + 1).min(h - 1);
+                        let r0 = py * rw;
+                        let r1 = (py + 1) * rw;
+                        let r2 = (py + 2) * rw;
                         for px in 0..w {
-                            let xm = px.saturating_sub(1);
-                            let xp = (px + 1).min(w - 1);
-                            let val = cogzilla_kernel::eval_horn_3x3(
-                                elev[ym * w + xm],
-                                elev[ym * w + px],
-                                elev[ym * w + xp],
-                                elev[py * w + xm],
-                                elev[py * w + px],
-                                elev[py * w + xp],
-                                elev[yp * w + xm],
-                                elev[yp * w + px],
-                                elev[yp * w + xp],
+                            let val = cogzilla_kernel::eval_horn_3x3_aniso(
+                                ring[r0 + px],
+                                ring[r0 + px + 1],
+                                ring[r0 + px + 2],
+                                ring[r1 + px],
+                                ring[r1 + px + 1],
+                                ring[r1 + px + 2],
+                                ring[r2 + px],
+                                ring[r2 + px + 1],
+                                ring[r2 + px + 2],
                                 inv_8dx,
+                                inv_8dy,
                                 *algorithm,
                             );
                             out.put_slice(&val.to_le_bytes());
@@ -2376,7 +2484,15 @@ async fn render_bbox_impl(
                     out.put_slice(&diff_plane);
                 }
             }
-            return out.freeze();
+            let raw = out.freeze();
+            if format == OutputFormat::Npy {
+                let nb = match bands {
+                    BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                    _ => 1,
+                };
+                return cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32);
+            }
+            return raw;
         }
 
         let mut rgba = vec![0u8; w * h * 4];
@@ -2436,37 +2552,26 @@ async fn render_bbox_impl(
                 let src = make_src!(&refs);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                let mut elev = vec![f32::NAN; w * h];
-                for i in 0..(w * h) {
-                    elev[i] = sample(&src, u_map[i], v_map[i]);
-                }
-                let px_m = if bbox_is_3857 {
-                    let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
-                    (dlx.abs().max(dly.abs()) * center_lat.to_radians().cos()).max(1e-3) as f32
-                } else {
-                    let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                    ((dlx * 111_320.0 * lat_rad.cos()).abs()
-                        .max((dly * 111_320.0).abs()))
-                        .max(1e-3) as f32
-                };
-                let inv_8dx = 1.0 / (8.0 * px_m);
+                let ring = sample_dem_ring(&src);
+                let rw = w + 2;
+                let (inv_8dx, inv_8dy) = dem_inv_8dxy();
                 for py in 0..h {
-                    let ym = py.saturating_sub(1);
-                    let yp = (py + 1).min(h - 1);
+                    let r0 = py * rw;
+                    let r1 = (py + 1) * rw;
+                    let r2 = (py + 2) * rw;
                     for px in 0..w {
-                        let xm = px.saturating_sub(1);
-                        let xp = (px + 1).min(w - 1);
-                        let v = cogzilla_kernel::eval_horn_3x3(
-                            elev[ym * w + xm],
-                            elev[ym * w + px],
-                            elev[ym * w + xp],
-                            elev[py * w + xm],
-                            elev[py * w + px],
-                            elev[py * w + xp],
-                            elev[yp * w + xm],
-                            elev[yp * w + px],
-                            elev[yp * w + xp],
+                        let v = cogzilla_kernel::eval_horn_3x3_aniso(
+                            ring[r0 + px],
+                            ring[r0 + px + 1],
+                            ring[r0 + px + 2],
+                            ring[r1 + px],
+                            ring[r1 + px + 1],
+                            ring[r1 + px + 2],
+                            ring[r2 + px],
+                            ring[r2 + px + 1],
+                            ring[r2 + px + 2],
                             inv_8dx,
+                            inv_8dy,
                             *algorithm,
                         );
                         if !v.is_nan() {

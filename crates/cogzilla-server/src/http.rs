@@ -484,7 +484,8 @@ fn parse_ext_format(
             "image/webp",
         )),
         "jpg" | "jpeg" => Ok((OutputFormat::Jpeg { quality: jpeg_quality }, "image/jpeg")),
-        "f32" | "bin" | "raw" | "npy" => Ok((OutputFormat::RawF32, "application/octet-stream")),
+        "f32" | "bin" | "raw" => Ok((OutputFormat::RawF32, "application/octet-stream")),
+        "npy" => Ok((OutputFormat::Npy, "application/x-npy")),
         other => Err(EngineError::BadRequest(format!(
             "unsupported format '.{other}' (use .png, .webp, .jpg, or .f32)"
         ))),
@@ -1836,7 +1837,7 @@ where
                             };
                             Ok((data, ct))
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
-                            && treq.format != OutputFormat::RawF32
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
                         {
                             let cf = pq_stac
                                 .color_formula
@@ -2416,7 +2417,7 @@ where
                             };
                             Ok((data, ct))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
-                            && treq.format != OutputFormat::RawF32
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
                         {
                             let cf = pq
                                 .color_formula
