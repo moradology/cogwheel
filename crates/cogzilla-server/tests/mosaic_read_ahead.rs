@@ -176,4 +176,31 @@ async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     // Read together, later scenes may be asked for, and the tile is the same.
     let eager = engine.render_mosaic_scenes_ahead(&scenes("eager"), &inside, MOSAIC_SCENES_AHEAD).await.unwrap();
     assert_eq!(full, eager);
+
+    // That tile was full after its first scene, so the five behind it were dropped part way
+    // through being read. Nothing they left behind may hold up the next tile to want them.
+    seen.take();
+    let again = tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.render_mosaic_scenes_ahead(&scenes("eager"), &edge, MOSAIC_SCENES_AHEAD),
+    )
+    .await
+    .expect("scenes dropped mid-read must be readable afterwards")
+    .unwrap();
+    assert_eq!(again, single);
+    // And many tiles at once, each dropping scenes as it fills, all come back.
+    let engine = Arc::new(engine);
+    let mut tiles = tokio::task::JoinSet::new();
+    for n in 0..16 {
+        let (engine, scenes, inside, edge) = (engine.clone(), scenes(&format!("storm{}-", n % 4)), inside.clone(), edge.clone());
+        tiles.spawn(async move {
+            let req = if n % 2 == 0 { inside } else { edge };
+            engine.render_mosaic_scenes_ahead(&scenes, &req, MOSAIC_SCENES_AHEAD).await.map(|b| (n % 2, b))
+        });
+    }
+    let all = tokio::time::timeout(Duration::from_secs(60), tiles.join_all()).await.expect("no tile may hang");
+    for result in all {
+        let (kind, bytes) = result.unwrap();
+        assert_eq!(bytes, if kind == 0 { full.clone() } else { single.clone() });
+    }
 }
