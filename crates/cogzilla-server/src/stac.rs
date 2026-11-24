@@ -99,6 +99,65 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
     }
 }
 
+/// Build the item from its parsed JSON. Relative asset hrefs are resolved against `item_uri`.
+pub fn stac_item_from_json(val: &serde_json::Value, item_uri: &str) -> StacItem {
+    let id = val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stac-item")
+        .to_string();
+    let bbox = val.get("bbox").and_then(|v| v.as_array()).and_then(|a| {
+        if a.len() >= 4 {
+            Some([
+                a[0].as_f64()?,
+                a[1].as_f64()?,
+                a[2].as_f64()?,
+                a[3].as_f64()?,
+            ])
+        } else {
+            None
+        }
+    });
+    let geometry = val.get("geometry").cloned();
+
+    let mut assets = BTreeMap::new();
+    if let Some(obj) = val.get("assets").and_then(|v| v.as_object()) {
+        for (k, a) in obj {
+            if is_raster_asset(k, a) {
+                if let Some(href) = a.get("href").and_then(|v| v.as_str()) {
+                    assets.insert(k.clone(), resolve_href(item_uri, href));
+                }
+            }
+        }
+    }
+
+    StacItem {
+        id,
+        bbox,
+        geometry,
+        assets,
+    }
+}
+
+/// Where a `/stac`-style request gets its item: the `url` parameter, or an item the caller
+/// already holds (one read from pgSTAC).
+pub enum StacSource {
+    Url(Option<String>),
+    Item(Arc<StacItem>),
+}
+
+impl StacSource {
+    pub async fn load(self, engine: &TileEngine) -> Result<Arc<StacItem>, EngineError> {
+        match self {
+            StacSource::Item(item) => Ok(item),
+            StacSource::Url(url) => {
+                let u = url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                load_stac_item(&engine.stac_cache, &engine.store, &u).await
+            }
+        }
+    }
+}
+
 /// Maximum STAC Item JSON size (16 MiB) to prevent OOM on hostile/oversized metadata URLs.
 pub const MAX_STAC_JSON_BYTES: usize = 16 * 1024 * 1024;
 
@@ -136,42 +195,7 @@ pub async fn load_stac_item(
     let val: serde_json::Value = serde_json::from_slice(&raw_bytes)
         .map_err(|e| EngineError::BadRequest(format!("invalid STAC JSON: {e}")))?;
 
-    let id = val
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("stac-item")
-        .to_string();
-    let bbox = val.get("bbox").and_then(|v| v.as_array()).and_then(|a| {
-        if a.len() >= 4 {
-            Some([
-                a[0].as_f64()?,
-                a[1].as_f64()?,
-                a[2].as_f64()?,
-                a[3].as_f64()?,
-            ])
-        } else {
-            None
-        }
-    });
-    let geometry = val.get("geometry").cloned();
-
-    let mut assets = BTreeMap::new();
-    if let Some(obj) = val.get("assets").and_then(|v| v.as_object()) {
-        for (k, a) in obj {
-            if is_raster_asset(k, a) {
-                if let Some(href) = a.get("href").and_then(|v| v.as_str()) {
-                    assets.insert(k.clone(), resolve_href(uri, href));
-                }
-            }
-        }
-    }
-
-    let item = Arc::new(StacItem {
-        id,
-        bbox,
-        geometry,
-        assets,
-    });
+    let item = Arc::new(stac_item_from_json(&val, uri));
     if cache.len() >= 1024 {
         cache.clear();
     }

@@ -25,8 +25,8 @@ mod pgstac;
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
 use crate::stac::{
-    get_colormap_image, get_colormap_json, get_tms_json, list_colormaps_json, list_tms_json,
-    load_stac_item, resolve_stac_assets,
+    StacItem, StacSource, get_colormap_image, get_colormap_json, get_tms_json,
+    list_colormaps_json, list_tms_json, resolve_stac_assets,
 };
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
@@ -2819,6 +2819,37 @@ where
 
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
 
+    // titiler-pgstac's item routes, /collections/{c}/items/{i}/..., are the /stac router over
+    // an item read from pgSTAC instead of from `url`.
+    let mut pgstac_item: Option<Arc<StacItem>> = None;
+    let mut pgstac_item_extent: Option<pgstac::ItemExtent> = None;
+    let mut stac_prefix = String::from("stac");
+    let item_rest: Option<Vec<&str>> = match segs.as_slice() {
+        ["collections", c, "items", i, rest @ ..] if !rest.is_empty() => {
+            let ctx = pgstac::Ctx {
+                engine: &engine,
+                host: &host,
+                forwarded_prefix: &forwarded_prefix,
+                path: &path,
+                raw_query: &raw_query,
+                if_none_match: if_none_match.as_deref(),
+            };
+            match pgstac::item_route(&ctx, &method, c, i, rest, &pq).await {
+                pgstac::ItemRoute::Done(resp) => return Ok(resp),
+                pgstac::ItemRoute::Stac(item, extent) => {
+                    pgstac_item = Some(item);
+                    pgstac_item_extent = extent;
+                    stac_prefix = format!("collections/{c}/items/{i}");
+                    let mut as_stac = vec!["stac"];
+                    as_stac.extend_from_slice(rest);
+                    Some(as_stac)
+                }
+            }
+        }
+        _ => None,
+    };
+    let segs = item_rest.unwrap_or(segs);
+
     if let Err(msg) = validate_query(&segs, &pq) {
         let body = serde_json::json!({
             "detail": [
@@ -3912,13 +3943,15 @@ where
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"stac") {
         let sub = &segs[1..];
-        let stac_url = pq.urls.first().cloned();
         let stac_x_assets = pq.assets.clone();
+        let stac_source = match pgstac_item.take() {
+            Some(item) => StacSource::Item(item),
+            None => StacSource::Url(pq.urls.first().cloned()),
+        };
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // GET /stac/assets?url=item.json
             (Method::GET, ["assets"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let keys: Vec<&String> = item.assets.keys().collect();
                 Ok((Bytes::from(serde_json::json!(keys).to_string()), "application/json"))
             }
@@ -3960,8 +3993,7 @@ where
 
             // GET /stac/info?url=item.json&assets=...
             (Method::GET, ["info"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut map = serde_json::Map::new();
@@ -3974,8 +4006,7 @@ where
 
             // GET /stac/info.geojson?url=item.json&assets=...
             (Method::GET, ["info.geojson"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut props = serde_json::Map::new();
@@ -4000,8 +4031,7 @@ where
 
             // GET /stac/asset_statistics (per-asset dict: {asset: {b1: ...}})
             (Method::GET, ["asset_statistics"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = names.len();
@@ -4049,8 +4079,7 @@ where
             .await,
             // GET /stac/statistics (merged band dict: {b1: ..., b2: ...})
             (Method::GET, ["statistics"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = cogs.len();
@@ -4104,9 +4133,8 @@ where
             }
             .await,
             (Method::POST, ["statistics"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -4269,19 +4297,19 @@ where
             // GET /stac/{tms}/tilejson.json, /stac/tilejson.json, /stac/{tms}/map.html, /stac/map.html
             (Method::GET, [_, "tilejson.json"]) | (Method::GET, ["tilejson.json"]) => async {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
-                apply_tilejson_overrides(&mut tj, &pq, &host, "stac", tms, &raw_query);
+                apply_tilejson_overrides(&mut tj, &pq, &host, &stac_prefix, tms, &raw_query);
                 tj["name"] = serde_json::json!(item.id);
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
             (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) => {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                let tj_url = format!("{forwarded_prefix}/stac/{tms}/tilejson.json?{raw_query}");
+                let tj_url =
+                    format!("{forwarded_prefix}/{stac_prefix}/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
             // GET /stac/map (OGC API - Maps)
@@ -4379,10 +4407,7 @@ where
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
-                        let u = stac_url
-                            .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                        let item =
-                            load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                        let item = stac_source.load(&engine).await?;
                         let (names, cogs, rewritten_expr) = resolve_stac_assets(
                             &engine,
                             &item,
@@ -4417,6 +4442,12 @@ where
                             tms,
                             Some(&cogs[0]),
                         )?;
+                        // titiler-pgstac's item routes name the media type after the extension
+                        // and, without one, choose the format from the pixels.
+                        let item_route = stac_prefix != "stac";
+                        let ct = if item_route && ext == Some("jpg") { "image/jpg" } else { ct };
+                        let item_auto_format =
+                            item_route && ext.is_none() && pq_stac.format_param.is_none();
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
@@ -4505,6 +4536,8 @@ where
                             };
                             let data = wrap_geotiff_fmt(data, ct, treq.format, out_dim, out_dim, bbox, epsg, pq_stac.return_mask);
                             Ok((data, ct))
+                        } else if item_auto_format {
+                            pgstac::item_tile_auto_format(&engine, &cogs, treq, &pq_stac).await
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
                         {
@@ -4536,6 +4569,11 @@ where
                         }
                     })
                     .await;
+                if stac_prefix != "stac"
+                    && let Err(e) = &cached
+                {
+                    return Ok(pgstac::engine_error(e));
+                }
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_x_assets(&mut resp, &stac_x_assets);
                 return Ok(resp);
@@ -4543,8 +4581,7 @@ where
 
             // GET /stac/point/{lon},{lat}
             (Method::GET, ["point", coord]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let Some((lons, lats)) = coord.split_once(',') else {
@@ -4603,8 +4640,7 @@ where
             // GET /stac/preview[/{w}x{h}][.{ext}]
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
                 let ext_opt = p.strip_prefix("preview.");
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4659,8 +4695,7 @@ where
                 let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected /stac/preview/{w}x{h}.{ext}".into()));
                 };
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4713,8 +4748,7 @@ where
                 let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4788,8 +4822,7 @@ where
                 let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4853,12 +4886,12 @@ where
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).ok_or_else(|| {
                     EngineError::BadRequest("expected /stac/feature/{w}x{h}.{ext}".into())
                 })?;
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4908,12 +4941,12 @@ where
             async {
                 let ext_opt = feat_ext.strip_prefix("feature.");
                 let s = pq.max_size;
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4963,6 +4996,24 @@ where
 
             _ => Err(EngineError::NotFound(path.clone())),
         };
+        // titiler-pgstac answers errors as JSON `{"detail": ...}`.
+        if stac_prefix != "stac" {
+            return Ok(match res {
+                Err(e) => pgstac::engine_error(&e),
+                Ok((body, ct)) => {
+                    let fixed = pgstac::item_fixup(
+                        &segs[1..],
+                        pgstac_item_extent.as_ref(),
+                        &raw_query,
+                        body,
+                        ct,
+                    );
+                    let mut resp = to_http_response(&engine, Ok(fixed), if_none_match.as_deref());
+                    attach_x_assets(&mut resp, &stac_x_assets);
+                    resp
+                }
+            });
+        }
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         attach_x_assets(&mut resp, &stac_x_assets);
         return Ok(resp);

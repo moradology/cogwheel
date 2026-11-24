@@ -1,4 +1,4 @@
-//! HTTP tests for the pgSTAC `/searches` and `/collections` routes.
+//! HTTP tests for the pgSTAC `/searches`, `/collections` and item routes.
 //!
 //! The first test needs nothing. The others talk to a real pgSTAC database and run only
 //! when `COGZILLA_TEST_DATABASE_URL` is set, for example against the reference stack in
@@ -9,8 +9,9 @@
 //!     cargo test -p cogzilla-server --test pgstac_api
 //! ```
 //!
-//! They read no rasters. They leave one empty collection, `cogzilla-test-collection`, and a
-//! few rows in `pgstac.searches`.
+//! They read no rasters. They leave two collections (`cogzilla-test-collection`, empty, and
+//! `cogzilla-test-items`, with one item whose assets do not exist) and a few rows in
+//! `pgstac.searches`.
 
 use std::sync::Arc;
 
@@ -57,6 +58,8 @@ async fn search_routes_say_so_when_no_database_is_configured() {
         "/searches/abc/tiles",
         "/collections/abc/info",
         "/collections/abc/point/1,2/assets",
+        "/collections/abc/items/def/assets",
+        "/collections/abc/items/def/tiles/WebMercatorQuad/0/0/0?assets=visual",
     ] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 503, "{path}");
@@ -335,4 +338,124 @@ async fn collection_routes_match_titiler_pgstac_shapes() {
         let resp = client.get(format!("{col}/{path}")).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), status, "{path}");
     }
+}
+
+#[tokio::test]
+async fn item_routes_match_titiler_pgstac_shapes() {
+    let Ok(url) = std::env::var("COGZILLA_TEST_DATABASE_URL") else {
+        eprintln!("COGZILLA_TEST_DATABASE_URL not set; skipping pgSTAC item test");
+        return;
+    };
+    // One item with no projection metadata, so its extent is its bbox and no raster is opened.
+    let cid = "cogzilla-test-items";
+    let iid = "cogzilla-test-item";
+    let tiff = "image/tiff; application=geotiff; profile=cloud-optimized";
+    let collection = json!({
+        "id": cid, "type": "Collection", "stac_version": "1.0.0",
+        "description": "cogzilla HTTP test", "license": "proprietary", "links": [],
+        "extent": {
+            "spatial": { "bbox": [[5.0, 43.5, 12.0, 48.0]] },
+            "temporal": { "interval": [[null, null]] }
+        }
+    });
+    let item = json!({
+        "type": "Feature", "stac_version": "1.0.0", "id": iid, "collection": cid,
+        "bbox": [6.0, 44.0, 8.0, 46.0],
+        "geometry": { "type": "Polygon", "coordinates": [[[6.0, 44.0], [8.0, 44.0], [8.0, 46.0], [6.0, 46.0], [6.0, 44.0]]] },
+        "properties": { "datetime": "2024-06-01T00:00:00Z" },
+        "links": [],
+        "assets": {
+            "visual": { "href": "https://example.invalid/cogzilla-test/visual.tif", "type": tiff },
+            "red": { "href": "https://example.invalid/cogzilla-test/red.tif", "type": tiff },
+            "red-jp2": { "href": "https://example.invalid/cogzilla-test/red.jp2", "type": "image/jp2" },
+            "untyped": { "href": "https://example.invalid/cogzilla-test/untyped.tif" },
+            "thumbnail": { "href": "https://example.invalid/cogzilla-test/thumb.jpg", "type": "image/jpeg" },
+            "metadata": { "href": "https://example.invalid/cogzilla-test/meta.xml", "type": "application/xml" }
+        }
+    });
+    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()])
+        .await
+        .unwrap();
+    db.execute("SELECT pgstac.upsert_item($1::text::jsonb)", &[&item.to_string()]).await.unwrap();
+
+    let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+    let config = PgStacConfig::from_connection_string(&url).unwrap();
+    assert!(engine.set_pgstac(Arc::new(PgStac::new(config).unwrap())));
+    let base = start(engine).await;
+    let client = reqwest::Client::new();
+    let it = format!("{base}/collections/{cid}/items/{iid}");
+
+    // The assets rio-tiler would read, in jsonb key order: typed rasters and untyped assets.
+    let assets = get_json(&client, format!("{it}/assets")).await;
+    assert_eq!(assets, json!(["red", "visual", "red-jp2", "untyped"]));
+
+    let renders = get_json(&client, format!("{it}/renders")).await;
+    assert_eq!(renders["renders"], json!({}));
+    assert_eq!(renders["links"][0]["href"], json!(format!("{it}/renders")));
+
+    // Without projection metadata the tileset covers the item's bbox at every zoom.
+    let set = get_json(&client, format!("{it}/tiles/WebMercatorQuad?assets=visual")).await;
+    assert_eq!(set["boundingBox"]["lowerLeft"], json!([6.0, 44.0]));
+    assert_eq!(set["boundingBox"]["upperRight"], json!([8.0, 46.0]));
+    assert_eq!(set["tileMatrixSetLimits"].as_array().unwrap().len(), 25);
+    assert_eq!(
+        set["tileMatrixSetLimits"][7],
+        json!({ "tileMatrix": "7", "minTileRow": 45, "maxTileRow": 46, "minTileCol": 66, "maxTileCol": 66 })
+    );
+    assert_eq!(set["links"][0]["href"], json!(format!("{it}/tiles/WebMercatorQuad")));
+    assert_eq!(
+        set["links"][1]["href"],
+        json!(format!("{it}/tiles/WebMercatorQuad/%7Bz%7D/%7Bx%7D/%7By%7D?assets=visual"))
+    );
+    let list = get_json(&client, format!("{it}/tiles")).await;
+    assert_eq!(list["tilesets"][0]["links"][0]["href"], json!(format!("{it}/tiles/WebMercatorQuad")));
+    let map = client.get(format!("{it}/WebMercatorQuad/map.html?assets=visual")).send().await.unwrap();
+    assert_eq!(map.status().as_u16(), 200);
+    assert!(String::from_utf8_lossy(&map.bytes().await.unwrap())
+        .contains(&format!("/collections/{cid}/items/{iid}/WebMercatorQuad/tilejson.json?assets=visual")));
+
+    // Lookups.
+    for (path, message) in [
+        (format!("/collections/{cid}/items/nope/assets"), format!("No item 'nope' found in '{cid}' collection")),
+        (format!("/collections/nope/items/{iid}/info?assets=visual"), format!("No item '{iid}' found in 'nope' collection")),
+    ] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "{path}");
+        assert_eq!(body_json(resp).await["detail"], json!(message), "{path}");
+    }
+
+    // `assets` is required, and has to name an asset of the item.
+    for path in [
+        "info", "info.geojson", "statistics", "asset_statistics", "point/7,45", "preview.png",
+        "bbox/6,44,7,45.png", "WebMercatorQuad/tilejson.json", "tiles/WebMercatorQuad/7/66/45.png",
+        "tiles/WebMercatorQuad/7/66/45?expression=visual_b1",
+    ] {
+        let resp = client.get(format!("{it}/{path}")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 422, "{path}");
+        let body = body_json(resp).await;
+        assert_eq!(body["detail"][0]["loc"], json!(["query", "assets"]), "{path}");
+    }
+    let unknown = client.get(format!("{it}/info?assets=nope")).send().await.unwrap();
+    assert_eq!(unknown.status().as_u16(), 404);
+    assert_eq!(
+        body_json(unknown).await["detail"],
+        "'nope' is not valid, should be one of ['red', 'visual', 'red-jp2', 'untyped']"
+    );
+
+    // A tile that does not touch the item is refused before anything is read.
+    let outside = client.get(format!("{it}/tiles/WebMercatorQuad/5/0/0.png?assets=visual")).send().await.unwrap();
+    assert_eq!(outside.status().as_u16(), 404);
+    assert_eq!(body_json(outside).await["detail"], "Tile(x=0, y=0, z=5) is outside bounds");
+
+    // Anything else is the /stac router's answer, as JSON.
+    let unreadable = client.get(format!("{it}/tiles/WebMercatorQuad/7/66/45.png?assets=visual")).send().await.unwrap();
+    assert!(unreadable.status().as_u16() >= 400);
+    assert!(body_json(unreadable).await["detail"].is_string());
+    let nope = client.get(format!("{it}/nope")).send().await.unwrap();
+    assert_eq!(nope.status().as_u16(), 404);
+    assert!(body_json(nope).await["detail"].is_string());
+    let bare = client.get(format!("{base}/collections/{cid}/items/{iid}")).send().await.unwrap();
+    assert_eq!(bare.status().as_u16(), 404);
 }

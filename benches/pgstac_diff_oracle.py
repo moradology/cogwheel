@@ -134,6 +134,27 @@ def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     return mask >= 99.0 and psnr >= 25.0, f"mask {mask:.2f}%, PSNR {psnr:.1f} dB"
 
 
+def stats_diff(a, b, path="$"):
+    """Statistics come from differently resampled pixels: compare structure exactly and the
+    summary numbers loosely (5% of the reference, or 2 units)."""
+    if isinstance(b, dict):
+        if not isinstance(a, dict) or set(a) != set(b):
+            return f"{path}: keys differ: {sorted(set(a) ^ set(b)) if isinstance(a, dict) else type(a).__name__}"
+        for k in b:
+            if k in ("histogram", "majority", "minority", "unique", "count", "sum",
+                     "masked_pixels", "valid_pixels", "valid_percent"):
+                continue
+            d = stats_diff(a[k], b[k], f"{path}.{k}")
+            if d:
+                return d
+        return None
+    if isinstance(b, (int, float)) and not isinstance(b, bool):
+        if not isinstance(a, (int, float)) or abs(a - b) > max(2.0, 0.05 * abs(b)):
+            return f"{path}: {a} vs {b}"
+        return None
+    return None if a == b else f"{path}: {a!r} vs {b!r}"
+
+
 class Oracle:
     def __init__(self, timeout: float):
         self.client = httpx.Client(timeout=timeout)
@@ -144,7 +165,10 @@ class Oracle:
         r = self.client.request(method, base + path, json=body)
         return r, (time.perf_counter() - t0) * 1e3
 
-    def check(self, name: str, kind: str, path: str, method: str = "GET", body=None):
+    def check(self, name: str, kind: str, path: str, method: str = "GET", body=None, known: str = ""):
+        """Send one request to both servers. `known` names a difference that is understood and
+        not fixed yet: the check is then reported as KNOWN instead of failing the run, and as
+        a failure again once the two servers agree, so the note cannot go stale."""
         tt, tt_ms = self.fetch(TITILER, method, path, body)
         cz, cz_ms = self.fetch(COGZILLA, method, path, body)
         ok, note = True, ""
@@ -162,6 +186,9 @@ class Oracle:
             theirs["tilesets"] = [t for t in theirs["tilesets"] if "WebMercatorQuad TileMatrixSet" in t["title"]]
             diff = first_diff(ours, theirs)
             ok, note = diff is None, diff or "WebMercatorQuad entry equal"
+        elif kind == "stats":
+            diff = stats_diff(cz.json(), tt.json())
+            ok, note = diff is None, diff or "same bands and fields, numbers within tolerance"
         elif kind == "ids":
             a, b = [i["id"] for i in cz.json()], [i["id"] for i in tt.json()]
             ok = a == b
@@ -176,11 +203,15 @@ class Oracle:
             else:
                 ok, note = compare_images(cz.content, tt.content)
                 note = f"{ct_cz}, {note}"
+        status = "PASS" if ok else "FAIL"
+        if known:
+            status, note = ("KNOWN", f"{note} [{known}]") if not ok else ("FAIL", f"agrees now, drop the note [{known}]")
         self.rows.append({
-            "name": name, "kind": kind, "method": method, "path": path, "ok": ok, "note": note,
+            "name": name, "kind": kind, "method": method, "path": path, "ok": status == "PASS",
+            "status": status, "note": note,
             "cogzilla_ms": round(cz_ms, 1), "titiler_ms": round(tt_ms, 1),
         })
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {note}", flush=True)
+        print(f"  {status}  {name}: {note}", flush=True)
         return cz, tt
 
 
@@ -392,19 +423,75 @@ def main() -> int:
         o.check("collection tile for an unknown tile matrix set", "status",
                 f"{col}/tiles/Nope/12/{t12.x}/{t12.y}?assets=visual")
         o.check("collection unknown route", "status", f"{col}/nope")
+
+        print("item")
+        with psycopg.connect(env["DATABASE_URL"], autocommit=True) as conn:
+            item_id, ib = conn.execute(
+                "SELECT id, content->'bbox' FROM pgstac.items WHERE collection = %s"
+                " AND (content->'properties'->>'eo:cloud_cover')::float < 5 ORDER BY datetime DESC, id LIMIT 1",
+                [collection],
+            ).fetchone()
+        ilon, ilat = (ib[0] + ib[2]) / 2, (ib[1] + ib[3]) / 2
+        it = f"/collections/{collection}/items/{item_id}"
+        ti = mercantile.tile(ilon, ilat, 11)
+        itile = f"{it}/tiles/WebMercatorQuad/{ti.z}/{ti.x}/{ti.y}"
+        ibox = f"{ilon - 0.1:.4f},{ilat - 0.1:.4f},{ilon + 0.1:.4f},{ilat + 0.1:.4f}"
+        o.check("item assets", "json", f"{it}/assets")
+        o.check("item for an unknown id", "json", f"/collections/{collection}/items/nope/info?assets=visual")
+        o.check("item in an unknown collection", "json", f"/collections/nope/items/{item_id}/assets")
+        o.check("item info", "json", f"{it}/info?assets=visual")
+        o.check("item info, two assets", "json", f"{it}/info?assets=red&assets=nir")
+        o.check("item info without assets", "json", f"{it}/info")
+        o.check("item info with an unknown asset", "json", f"{it}/info?assets=nope")
+        o.check("item info.geojson", "json", f"{it}/info.geojson?assets=visual")
+        o.check("item renders", "json", f"{it}/renders")
+        o.check("item tileset list", "tilesets", f"{it}/tiles?assets=visual")
+        o.check("item tileset", "json", f"{it}/tiles/WebMercatorQuad?assets=visual")
+        o.check("item map viewer", "status", f"{it}/WebMercatorQuad/map.html?assets=visual")
+        o.check("item tile", "image", f"{itile}.png?assets=visual")
+        o.check("item tile, format from the pixels", "image", f"{itile}?assets=visual")
+        o.check("item tile, jpg", "image", f"{itile}.jpg?assets=visual")
+        full = mercantile.tile(ilon, ilat, 14)
+        ifull = f"{it}/tiles/WebMercatorQuad/{full.z}/{full.x}/{full.y}"
+        o.check("item tile, fully covered, format from the pixels", "image", f"{ifull}?assets=visual")
+        o.check("item tile, fully covered, format=png", "image", f"{ifull}?assets=visual&format=png")
+        o.check("item tile, three assets", "image", f"{itile}.png?assets=red&assets=green&assets=blue&rescale=0,3000")
+        o.check("item tile, one band with a colormap", "image",
+                f"{itile}.png?assets=nir&rescale=0,5000&colormap_name=viridis")
+        o.check("item tile, tilesize=512", "image", f"{itile}.png?assets=visual&tilesize=512")
+        o.check("item tile without assets", "json", f"{itile}.png")
+        o.check("item tile with expression only", "status", f"{itile}.png?expression=(nir-red)/(nir%2Bred)")
+        o.check("item tile outside the item", "status", f"{it}/tiles/WebMercatorQuad/5/0/0.png?assets=visual")
+        o.check("item preview", "image", f"{it}/preview.png?assets=visual&max_size=256",
+                known="shared /stac preview: the picture does not fill max_size")
+        o.check("item preview, sized", "image", f"{it}/preview/200x200.png?assets=visual",
+                known="shared /stac preview: the picture does not fill max_size")
+        o.check("item bbox", "image", f"{it}/bbox/{ibox}/256x256.png?assets=visual")
+        o.check("item point", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual")
+        o.check("item point, two assets", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir")
+        o.check("item point outside the item", "status", f"{it}/point/0,0?assets=visual",
+                known="titiler-pgstac answers 500 for a point outside the item; cogzilla answers 404")
+        o.check("item statistics", "stats", f"{it}/statistics?assets=visual&max_size=128",
+                known="shared /stac statistics: the sample is smaller than max_size, and merged bands are described as b1, not visual_b1")
+        o.check("item asset statistics", "stats", f"{it}/asset_statistics?assets=red&max_size=128",
+                known="shared /stac statistics: the sample is smaller than max_size, and merged bands are described as b1, not visual_b1")
+        o.check("item unknown route", "status", f"{it}/nope")
     finally:
         proc.terminate()
         proc.wait(timeout=10)
 
-    passed = sum(r["ok"] for r in o.rows)
+    passed = sum(r["status"] == "PASS" for r in o.rows)
+    known = sum(r["status"] == "KNOWN" for r in o.rows)
+    failed = len(o.rows) - passed - known
     out = RESULTS / f"oracle-{time.strftime('%Y%m%d-%H%M%S')}.json"
     RESULTS.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"passed": passed, "total": len(o.rows), "checks": o.rows}, indent=1))
-    print(f"\n{passed} of {len(o.rows)} checks pass. raw: {out}")
+    out.write_text(json.dumps(
+        {"passed": passed, "known": known, "failed": failed, "total": len(o.rows), "checks": o.rows}, indent=1))
+    print(f"\n{passed} of {len(o.rows)} checks agree, {known} known differences, {failed} failures. raw: {out}")
     for r in o.rows:
-        if not r["ok"]:
-            print(f"  FAIL  {r['name']}: {r['note']}\n        {r['method']} {r['path']}")
-    return 0 if passed == len(o.rows) else 1
+        if r["status"] != "PASS":
+            print(f"  {r['status']}  {r['name']}: {r['note']}\n        {r['method']} {r['path']}")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
