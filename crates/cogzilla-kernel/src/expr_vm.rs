@@ -288,7 +288,13 @@ impl ExprProgram {
                     let lhs = &mut lo[sp - 1];
                     let rhs = &hi[0];
                     for i in 0..N {
-                        lhs[i] = lhs[i].powf(rhs[i]);
+                        let a = lhs[i];
+                        let b = rhs[i];
+                        lhs[i] = if a.is_nan() || b.is_nan() {
+                            f32::NAN
+                        } else {
+                            a.powf(b)
+                        };
                     }
                 }
                 Op::Neg => {

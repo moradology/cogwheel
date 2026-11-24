@@ -485,21 +485,25 @@ pub fn build_s3_endpoint(
     let encoded_key = encode_s3_canonical_uri(key);
     if let Some(ep) = cfg.endpoint_url.as_deref() {
         let ep_clean = ep.trim_end_matches('/');
-        let host = ep_clean
-            .split("://")
-            .nth(1)
-            .unwrap_or(ep_clean)
-            .split('/')
-            .next()
-            .unwrap_or(ep_clean)
-            .to_string();
+        let after_scheme = ep_clean.split("://").nth(1).unwrap_or(ep_clean);
+        let (host_str, ep_path) = match after_scheme.find('/') {
+            Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
+            None => (after_scheme, ""),
+        };
+        let host = host_str.to_string();
         if cfg.force_path_style {
-            let canonical_uri = format!("/{bucket}{encoded_key}");
-            (format!("{ep_clean}{canonical_uri}"), host, canonical_uri)
+            let bucket_key = format!("/{bucket}{encoded_key}");
+            let canonical_uri = format!("{ep_path}{bucket_key}");
+            (format!("{ep_clean}{bucket_key}"), host, canonical_uri)
         } else {
             let scheme = ep_clean.split("://").next().unwrap_or("https");
             let vhost = format!("{bucket}.{host}");
-            (format!("{scheme}://{vhost}{encoded_key}"), vhost, encoded_key)
+            let canonical_uri = format!("{ep_path}{encoded_key}");
+            (
+                format!("{scheme}://{vhost}{canonical_uri}"),
+                vhost,
+                canonical_uri,
+            )
         }
     } else if cfg.force_path_style {
         let host = format!("s3.{region}.amazonaws.com");

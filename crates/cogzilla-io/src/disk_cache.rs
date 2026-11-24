@@ -213,8 +213,10 @@ impl DiskBlockCache {
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     self.read_errors.fetch_add(1, Ordering::Relaxed);
-                    self.remove_entry(key);
                 }
+                // Always prune missing/unreadable entries (e.g. external /tmp cleanup) so ghost
+                // keys don't leak current_bytes or permanently block put_async re-insertion.
+                self.remove_entry(key);
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }

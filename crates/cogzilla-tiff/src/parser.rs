@@ -759,9 +759,23 @@ fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
         let Some(tag_end) = rest.find('>') else { break };
         let attrs = &rest[..tag_end];
         rest = &rest[tag_end + 1..];
+        // Self-closing `<Item .../>` has no body; do not swallow up to a later `</Item>`!
+        if attrs.trim_end().ends_with('/') {
+            continue;
+        }
         let Some(val_end) = rest.find("</Item>") else { break };
         let val_str = rest[..val_end].trim();
         rest = &rest[val_end + 7..];
+
+        // Ignore items belonging to a non-default GDAL metadata domain (e.g. domain="xml:ESRI").
+        if let Some(dp) = attrs.find("domain=\"") {
+            let dval = &attrs[dp + 8..];
+            if let Some(dom) = dval.split('"').next()
+                && !dom.is_empty()
+            {
+                continue;
+            }
+        }
 
         let is_scale = attrs.contains("name=\"SCALE\"") || attrs.contains("name=\"scale\"");
         let is_offset = attrs.contains("name=\"OFFSET\"") || attrs.contains("name=\"offset\"");
@@ -771,6 +785,9 @@ fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
         let Ok(v) = val_str.parse::<f32>() else {
             continue;
         };
+        if !v.is_finite() || (is_scale && v == 0.0) {
+            continue;
+        }
         let sample_idx = attrs.find("sample=\"").and_then(|sp| {
             let s = &attrs[sp + 8..];
             s.split('"').next()?.parse::<usize>().ok()
@@ -790,6 +807,24 @@ fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdal_metadata_handles_self_closing_items_and_non_default_domains() {
+        let xml = r#"<GDALMetadata>
+            <Item name="DESCRIPTION" sample="0"/>
+            <Item name="SCALE" sample="0">0.0001</Item>
+            <Item name="OFFSET" sample="0">-0.2</Item>
+            <Item name="SCALE" sample="0" domain="xml:ESRI">999.0</Item>
+            <Item name="SCALE" sample="1">0.0</Item>
+        </GDALMetadata>"#;
+        let mut scales = [1.0f32; 2];
+        let mut offsets = [0.0f32; 2];
+        parse_gdal_scale_offset(xml, &mut scales, &mut offsets);
+        assert!((scales[0] - 0.0001).abs() < 1e-7);
+        assert!((offsets[0] + 0.2).abs() < 1e-6);
+        // Zero scale on band 1 must be ignored (keep default 1.0)
+        assert_eq!(scales[1], 1.0);
+    }
 
     #[test]
     fn hostile_bigtiff_num_entries_overflow_is_rejected_cleanly() {

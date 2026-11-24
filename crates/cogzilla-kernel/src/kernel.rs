@@ -2162,9 +2162,41 @@ pub fn render_expr_vm<const N: usize>(
     let inv_range_254 = 254.0 / range;
     let min_val = style.rescale_min;
 
+    let flat_bands: Vec<Option<(&[f32], u32, u32, usize)>> = if style.resample
+        == ResampleMode::Bilinear
+        && all_clean
+    {
+        srcs[..nb].iter().map(|s| s.single_block_flat()).collect()
+    } else {
+        Vec::new()
+    };
+
     let sample_row = |py: usize, band_rows: &mut [[f32; N]]| {
         match (style.resample, all_clean) {
             (ResampleMode::Bilinear, true) => {
+                if let CoordPlan::Separable1D { u, v, .. } = plan
+                    && !flat_bands.is_empty()
+                    && flat_bands.iter().all(|f| f.is_some())
+                {
+                    let vy = v[py];
+                    for b in 0..nb {
+                        let (slice, bc, br, stride) = flat_bands[b].unwrap();
+                        let (y0_raw, fy) = fast_floor_i32(vy - br as f32);
+                        let max_y = ((slice.len() / stride) as i32 - 2).max(0);
+                        let y0 = y0_raw.clamp(0, max_y) as usize;
+                        let r0_off = y0 * stride;
+                        let r1_off = r0_off + stride;
+                        bilinear_row_flat_dispatch::<N>(
+                            u,
+                            bc,
+                            &slice[r0_off..r0_off + stride],
+                            &slice[r1_off..r1_off + stride],
+                            fy,
+                            &mut band_rows[b],
+                        );
+                    }
+                    return;
+                }
                 for_each_pixel_in_row(plan, py, |px, u, v| {
                     for b in 0..nb {
                         band_rows[b][px] = sample_bilinear::<true>(&srcs[b], u, v);
@@ -2878,6 +2910,43 @@ pub fn render_dem_algorithm<const N: usize>(
             (2.0 * u_row[N - 1] - u_prev[N - 1]) + (u_row[N - 1] - u_row[N - 2]),
             (2.0 * v_row[N - 1] - v_prev[N - 1]) + (v_row[N - 1] - v_row[N - 2]),
         );
+
+        // When interior pixels are all valid (`clean == true`) but the tile abuts a DEM raster
+        // edge, `sample_border` writes `f32::NAN` into the 1-px extrapolated stencil ring.
+        // Clamp any NaN border cell to its adjacent interior pixel (matching `eval_horn_3x3`'s
+        // edge-fill) so the branchless SIMD hillshade path never turns raster-edge borders black.
+        if clean {
+            for py in 0..N {
+                let row_off = (py + 1) * pad;
+                if elev[row_off].is_nan() {
+                    elev[row_off] = elev[row_off + 1];
+                }
+                if elev[row_off + N + 1].is_nan() {
+                    elev[row_off + N + 1] = elev[row_off + N];
+                }
+            }
+            for px in 0..N {
+                let c = px + 1;
+                if elev[c].is_nan() {
+                    elev[c] = elev[pad + c];
+                }
+                if elev[(N + 1) * pad + c].is_nan() {
+                    elev[(N + 1) * pad + c] = elev[N * pad + c];
+                }
+            }
+            if elev[0].is_nan() {
+                elev[0] = elev[pad + 1];
+            }
+            if elev[pad - 1].is_nan() {
+                elev[pad - 1] = elev[pad + N];
+            }
+            if elev[(N + 1) * pad].is_nan() {
+                elev[(N + 1) * pad] = elev[N * pad + 1];
+            }
+            if elev[(N + 1) * pad + pad - 1].is_nan() {
+                elev[(N + 1) * pad + pad - 1] = elev[N * pad + N];
+            }
+        }
 
         let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
         let inv_range = 255.0 / safe_rescale_denom(style.rescale_min, style.rescale_max);
