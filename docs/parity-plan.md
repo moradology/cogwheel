@@ -2,6 +2,12 @@
 
 Written 2026-11-23 against cogzilla `ea0d248` (v0.5.2), TiTiler 2.3.0, titiler-pgstac 3.2.2 and pgSTAC 0.10.2.
 
+## Progress
+
+- **2026-11-24, E1 part one.** The `cogzilla-pgstac` crate and the core `/searches` routes (register, list, info, TileJSON, map, tiles, tile assets) are in, on the compatibility path. `benches/pgstac_diff_oracle.py` compares them with a live titiler-pgstac: 51 of 51 checks agree, including identical search ids and identical item lists per tile. Still to do in E1: point, bbox, feature, statistics, WMTS and `/tiles` listings on `/searches`, then the `/collections/{id}` and item families. Mosaic options that need workstreams B and D (pixel selection, per-asset options, mixed grids) answer `400` until then.
+- **Found while doing it: resampling.** TiTiler resamples with nearest neighbour by default and cogzilla with bilinear, which accounts for much of the picture difference the baseline reported. The new routes default to nearest, and the oracle's 16 tile pairs then have a median PSNR of 37.5 dB against titiler-pgstac (30.1 to 43.4). `/cog` and `/stac` still default to bilinear; that belongs to C.1.
+- **Found while doing it: `resampling` against `reproject`.** For a source that has to be reprojected, which is most of them, TiTiler takes the method from `reproject` and `resampling=bilinear` changes nothing. On `/cog` and `/stac`, cogzilla applies `resampling` either way and rejects `reproject`; the new routes follow TiTiler. The rest belongs to C.2.
+
 ## Goal
 
 1. **Complete parity with TiTiler's HTTP API.** Every route, parameter and built-in option TiTiler ships answers the same way from cogzilla.

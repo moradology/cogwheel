@@ -49,4 +49,20 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_ACCESS_KEY`, `AZURE_STORAGE_ACCESS_TOKEN`, `AZURE_NO_SIGN_REQUEST` | Azure Blob (`az://`, `abfs[s]://`, `/vsiaz/`) SAS token, Bearer token, or SharedKey HMAC-SHA256 signing. |
 | `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
 
+### pgSTAC database
+
+The `/searches` routes need a [pgSTAC](https://github.com/stac-utils/pgstac) database. They are off, and answer `503`, until one is configured with the same variables titiler-pgstac 2 and later read. No connection is opened until the first request that needs one, so a database that is down does not stop the server from starting or from serving `/cog` and `/stac`.
+
+| Variable | Purpose |
+| :--- | :--- |
+| `DATABASE_URL` | A `postgresql://user:password@host:port/dbname` URL. Takes precedence over the variables below. |
+| `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` | The libpq variables. pgSTAC support turns on when `PGHOST` or `PGDATABASE` is set. |
+| `PGSSLMODE` (or `sslmode=` in the URL) | `disable`, `prefer` (the default) and `require` behave as in libpq: `prefer` and `require` encrypt without checking the server's certificate. `verify-ca` and `verify-full` check it. |
+| `PGSSLROOTCERT` | PEM file of certificate authorities for the verifying modes. Without it the public web roots are used, which a managed database's private authority is usually not in. |
+| `DB_MAX_CONN_SIZE` | Largest number of open connections. Default 10. |
+| `PGSTAC_SEARCH_PATH` | Schemas searched for pgSTAC's functions and tables. Default `pgstac,public`. |
+| `TITILER_PGSTAC_CACHE_TTL`, `TITILER_PGSTAC_CACHE_MAXSIZE`, `TITILER_PGSTAC_CACHE_DISABLE` | The per-process cache of item lists and search lookups, with titiler-pgstac's names and defaults (300 seconds, 512 entries, enabled). |
+
+The database role needs to read the `pgstac` schema and execute its functions. `POST /searches/register` stores a row in `pgstac.searches`, and pgSTAC's own search function updates that table's use counters on every tile, so a role without write access to it needs pgSTAC's read-only mode switched on.
+
 Operational endpoints: `GET /` for the landing page with demo maps, `GET /healthz` for liveness, `GET /stats` for JSON counters, `GET /metrics` for Prometheus exposition, `POST /mosaic/register` for dynamic catalog / STAC-API search registration, and `GET /docs` with `GET /openapi.json` for the route list.
