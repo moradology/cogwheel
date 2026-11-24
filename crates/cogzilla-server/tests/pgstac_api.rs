@@ -72,6 +72,33 @@ async fn search_routes_say_so_when_no_database_is_configured() {
 }
 
 #[tokio::test]
+async fn openapi_lists_every_pgstac_operation() {
+    let base = start(Arc::new(TileEngine::new(8 * 1024 * 1024))).await;
+    let spec = get_json(&reqwest::Client::new(), format!("{base}/openapi.json")).await;
+    let paths = spec["paths"].as_object().unwrap();
+    // A path with two methods lists both.
+    let statistics = &paths["/collections/{collection_id}/items/{item_id}/statistics"];
+    assert!(statistics["get"]["summary"].is_string() && statistics["post"]["summary"].is_string(), "{statistics}");
+    for (path, method) in [
+        ("/searches/list", "get"),
+        ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get"),
+        ("/searches/{search_id}/feature", "post"),
+        ("/searches/{search_id}/feature/{width}x{height}.{format}", "post"),
+        ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get"),
+        ("/collections/{collection_id}/items/{item_id}/preview/{width}x{height}.{format}", "get"),
+    ] {
+        assert!(paths[path][method]["summary"].is_string(), "{method} {path}");
+    }
+    // titiler-pgstac 3.2 has 63 operations under these two prefixes.
+    let listed: usize = paths
+        .iter()
+        .filter(|(path, _)| path.starts_with("/searches") || path.starts_with("/collections"))
+        .map(|(_, methods)| methods.as_object().map_or(0, |m| m.len()))
+        .sum();
+    assert_eq!(listed, 63);
+}
+
+#[tokio::test]
 async fn search_routes_match_titiler_pgstac_shapes() {
     let Ok(url) = std::env::var("COGZILLA_TEST_DATABASE_URL") else {
         eprintln!("COGZILLA_TEST_DATABASE_URL not set; skipping pgSTAC HTTP test");
@@ -252,6 +279,11 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     }
     let not_geojson = client.post(format!("{base}/searches/{id}/feature.png?assets=visual")).body("nope").send().await.unwrap();
     assert_eq!(not_geojson.status().as_u16(), 422);
+    // The body is a Feature: a bare geometry or an empty object is not one.
+    for body in [&triangle["geometry"], &json!({})] {
+        let resp = post_json(&client, format!("{base}/searches/{id}/feature.png?assets=visual"), body).await;
+        assert_eq!(resp.status().as_u16(), 422, "{body}");
+    }
 
     // Statistics under features: nothing to read, and the parameters are checked first.
     let collection = json!({ "type": "FeatureCollection", "features": [triangle.clone()] });
