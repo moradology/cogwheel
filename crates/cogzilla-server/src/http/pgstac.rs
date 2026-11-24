@@ -1110,9 +1110,10 @@ async fn tile(
                 full.samples_per_pixel
             };
             let (mut treq, content_type) = build_tile_request(
+                Some(engine.as_ref()),
                 tile,
                 scale,
-                &explicit,
+                (!explicit.is_empty()).then_some(explicit.as_str()),
                 &pq,
                 default_bands,
                 full.sample_type,
@@ -1265,7 +1266,7 @@ async fn mosaic_route(
                 return detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
             };
             // Without an extension the format is chosen from the rendered pixels.
-            let ext = if ys.contains('.') { ext } else { "" };
+            let ext = ext.unwrap_or("");
             match parse_zxy(zs, xs, y) {
                 Err(r) => r,
                 Ok(None) if pq.assets.is_empty() => missing_query_param("assets"),

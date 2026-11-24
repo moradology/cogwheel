@@ -581,65 +581,307 @@ impl CrsModel {
         [min_lon, min_lat, max_lon, max_lat]
     }
 
-    /// Estimate TiTiler-compatible `(minzoom, maxzoom)` in WebMercatorQuad for a raster.
+    /// Estimate TiTiler-compatible `(minzoom, maxzoom)` in `WebMercatorQuad` for a raster,
+    /// matching `rio-tiler`'s `SpatialMixin` (`GDALSuggestedWarpOutput2` diagonal resolution,
+    /// `get_maximum_overview_level(..., minsize=256)`, and `morecantile.zoom_for_res("auto")`).
     pub fn web_mercator_zoom_range(
         &self,
         pixel_to_crs: &Affine2D,
         width: u32,
         height: u32,
-        overview_factor: f64,
+        _overview_factor: f64,
     ) -> (u8, u8) {
-        // Compute local Web Mercator pixel size via a 1-pixel Jacobian at the raster center
-        // (immune to [-180, 180] longitude expansion on polar and antimeridian-crossing rasters).
-        let cx = (width as f64) * 0.5;
-        let cy = (height as f64) * 0.5;
-        let step_px = (width.min(height) as f64 * 0.01).clamp(1.0, 64.0);
+        const CELL0_MERC: f64 = 156_543.033_928_040_97;
+        const MAX_Z_MERC: u8 = 24;
+
+        let wf = (width.max(1)) as f64;
+        let hf = (height.max(1)) as f64;
+
         let to_merc = |col: f64, row: f64| -> Option<(f64, f64)> {
             let (sx, sy) = pixel_to_crs.forward(col, row);
-            let (lon, lat) = self.to_lonlat_deg(sx, sy);
-            if lon.is_finite() && lat.is_finite() {
-                Some(lonlat_deg_to_mercator(lon, lat))
+            let (mx, my) = match self {
+                Self::Epsg3857 => (sx, sy),
+                _ => {
+                    let (lon, lat) = self.to_lonlat_deg(sx, sy);
+                    if !lon.is_finite() || !lat.is_finite() {
+                        return None;
+                    }
+                    lonlat_deg_to_mercator(lon, lat)
+                }
+            };
+            if mx.is_finite() && my.is_finite() {
+                Some((mx, my))
             } else {
                 None
             }
         };
-        let px_m = if let (Some((mx0, my0)), Some((mxx, myx)), Some((mxy, myy))) = (
-            to_merc(cx, cy),
-            to_merc(cx + step_px, cy),
-            to_merc(cx, cy + step_px),
-        ) {
-            let wrap_dx = |dx: f64| -> f64 {
-                if dx > ORIGIN_SHIFT {
-                    dx - 2.0 * ORIGIN_SHIFT
-                } else if dx < -ORIGIN_SHIFT {
-                    dx + 2.0 * ORIGIN_SHIFT
-                } else {
-                    dx
-                }
-            };
-            let dx_m = wrap_dx(mxx - mx0).hypot(myx - my0) / step_px;
-            let dy_m = wrap_dx(mxy - mx0).hypot(myy - my0) / step_px;
-            let local = dx_m.min(dy_m).max(dx_m.max(dy_m) * 0.5);
-            if local.is_finite() && local > 1e-3 {
-                local
-            } else {
-                let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
-                let (a0, b0) = lonlat_deg_to_mercator(w, s);
-                let (a1, b1) = lonlat_deg_to_mercator(e, n);
-                (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / (width.max(height) as f64)
-            }
+
+        let (res, warp_w, warp_h) = if matches!(self, Self::Epsg3857) {
+            let dx = pixel_to_crs.a.hypot(pixel_to_crs.d);
+            let dy = pixel_to_crs.b.hypot(pixel_to_crs.e);
+            (dx.max(dy).max(1e-6), wf, hf)
         } else {
-            let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
-            let (a0, b0) = lonlat_deg_to_mercator(w, s);
-            let (a1, b1) = lonlat_deg_to_mercator(e, n);
-            (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / (width.max(height) as f64)
+            // Sample 21 points along each of the 4 edges (matching GDAL / rasterio transform_bounds)
+            // to compute warped Web Mercator extent and diagonal resolution.
+            let mut min_x = f64::INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            let mut all_ok = true;
+            let mut crosses_antimeridian = false;
+            let mut prev_x: Option<f64> = None;
+
+            for edge in 0..4 {
+                prev_x = None;
+                for i in 0..=20 {
+                    let t = i as f64 / 20.0;
+                    let (col, row) = match edge {
+                        0 => (t * wf, 0.0),
+                        1 => (t * wf, hf),
+                        2 => (0.0, t * hf),
+                        _ => (wf, t * hf),
+                    };
+                    if let Some((mx, my)) = to_merc(col, row) {
+                        if let Some(px) = prev_x {
+                            if (mx - px).abs() > ORIGIN_SHIFT {
+                                crosses_antimeridian = true;
+                            }
+                        }
+                        prev_x = Some(mx);
+                        min_x = min_x.min(mx);
+                        max_x = max_x.max(mx);
+                        min_y = min_y.min(my);
+                        max_y = max_y.max(my);
+                    } else {
+                        all_ok = false;
+                    }
+                }
+            }
+            let _ = prev_x;
+
+            let ul = to_merc(0.0, 0.0);
+            let lr = to_merc(wf, hf);
+            let diag_ok = all_ok
+                && !crosses_antimeridian
+                && matches!((ul, lr), (Some((ux, uy)), Some((lx, ly)))
+                    if (lx - ux).abs() < ORIGIN_SHIFT && (lx - ux).hypot(ly - uy) > 1e-3);
+
+            if diag_ok {
+                let (ux, uy) = ul.unwrap();
+                let (lx, ly) = lr.unwrap();
+                let res = (lx - ux).hypot(ly - uy) / wf.hypot(hf);
+                let ww = ((max_x - min_x) / res + 0.5).floor().max(1.0);
+                let wh = ((max_y - min_y) / res + 0.5).floor().max(1.0);
+                (res, ww, wh)
+            } else {
+                // Safe fallback for polar / antimeridian-crossing / partially out-of-domain rasters:
+                // local 1-pixel Jacobian at the raster center.
+                let cx = wf * 0.5;
+                let cy = hf * 0.5;
+                let step_px = (wf.min(hf) * 0.01).clamp(1.0, 64.0);
+                let px_m = if let (Some((mx0, my0)), Some((mxx, myx)), Some((mxy, myy))) = (
+                    to_merc(cx, cy),
+                    to_merc(cx + step_px, cy),
+                    to_merc(cx, cy + step_px),
+                ) {
+                    let wrap_dx = |dx: f64| -> f64 {
+                        if dx > ORIGIN_SHIFT {
+                            dx - 2.0 * ORIGIN_SHIFT
+                        } else if dx < -ORIGIN_SHIFT {
+                            dx + 2.0 * ORIGIN_SHIFT
+                        } else {
+                            dx
+                        }
+                    };
+                    let dx_m = wrap_dx(mxx - mx0).hypot(myx - my0) / step_px;
+                    let dy_m = wrap_dx(mxy - mx0).hypot(myy - my0) / step_px;
+                    let local = dx_m.max(dy_m);
+                    if local.is_finite() && local > 1e-3 {
+                        local
+                    } else {
+                        let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                        let (a0, b0) = lonlat_deg_to_mercator(w, s);
+                        let (a1, b1) = lonlat_deg_to_mercator(e, n);
+                        (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
+                    }
+                } else {
+                    let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                    let (a0, b0) = lonlat_deg_to_mercator(w, s);
+                    let (a1, b1) = lonlat_deg_to_mercator(e, n);
+                    (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
+                };
+                (px_m, wf, hf)
+            }
         };
-        let world_px0 = (2.0 * ORIGIN_SHIFT) / 256.0;
-        let maxzoom = (world_px0 / px_m).log2().ceil().clamp(0.0, 22.0) as u8;
-        let minzoom_f = (world_px0 / (px_m * overview_factor.max(1.0))).log2().floor();
-        let minzoom = minzoom_f.clamp(0.0, maxzoom as f64) as u8;
+
+        let ov_level = max_overview_level(warp_w, warp_h, 256.0);
+        let maxzoom = zoom_for_res(res, CELL0_MERC, MAX_Z_MERC);
+        let minzoom = zoom_for_res(res * f64::from(1u32 << ov_level), CELL0_MERC, MAX_Z_MERC)
+            .min(maxzoom);
         (minzoom, maxzoom)
     }
+
+    /// Estimate TiTiler-compatible `(minzoom, maxzoom)` for OGC `WorldCRS84Quad`
+    /// (`cellSize(z=0) = 180° / 256 = 0.703125°`, `maxzoom = 23`), matching `rio-tiler`
+    /// and `morecantile.zoom_for_res("auto")` while guarding polar `1/cos(lat)` singularities.
+    pub fn world_crs84_zoom_range(
+        &self,
+        pixel_to_crs: &Affine2D,
+        width: u32,
+        height: u32,
+        _overview_factor: f64,
+    ) -> (u8, u8) {
+        const CELL0_CRS84: f64 = 180.0 / 256.0;
+        const MAX_Z_CRS84: u8 = 23;
+
+        let wf = (width.max(1)) as f64;
+        let hf = (height.max(1)) as f64;
+
+        let (res, warp_w, warp_h) = if matches!(self, Self::Geographic) {
+            let dx = pixel_to_crs.a.hypot(pixel_to_crs.d);
+            let dy = pixel_to_crs.b.hypot(pixel_to_crs.e);
+            (dx.max(dy).max(1e-8), wf, hf)
+        } else {
+            let to_ll = |col: f64, row: f64| -> Option<(f64, f64)> {
+                let (sx, sy) = pixel_to_crs.forward(col, row);
+                let (lon, lat) = self.to_lonlat_deg(sx, sy);
+                if lon.is_finite() && lat.is_finite() {
+                    Some((lon, lat))
+                } else {
+                    None
+                }
+            };
+
+            let mut min_x = f64::INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            let mut all_ok = true;
+            let mut crosses_antimeridian = false;
+            let mut max_abs_lat = 0.0_f64;
+
+            for edge in 0..4 {
+                let mut prev_lon: Option<f64> = None;
+                for i in 0..=20 {
+                    let t = i as f64 / 20.0;
+                    let (col, row) = match edge {
+                        0 => (t * wf, 0.0),
+                        1 => (t * wf, hf),
+                        2 => (0.0, t * hf),
+                        _ => (wf, t * hf),
+                    };
+                    if let Some((lon, lat)) = to_ll(col, row) {
+                        if let Some(pl) = prev_lon {
+                            if (lon - pl).abs() > 180.0 {
+                                crosses_antimeridian = true;
+                            }
+                        }
+                        prev_lon = Some(lon);
+                        max_abs_lat = max_abs_lat.max(lat.abs());
+                        min_x = min_x.min(lon);
+                        max_x = max_x.max(lon);
+                        min_y = min_y.min(lat);
+                        max_y = max_y.max(lat);
+                    } else {
+                        all_ok = false;
+                    }
+                }
+            }
+
+            let ul = to_ll(0.0, 0.0);
+            let lr = to_ll(wf, hf);
+            // Use warped diagonal resolution for mid-latitude rasters; near poles (>80°)
+            // or across the antimeridian, fall back to the cos(lat)-scaled local Jacobian
+            // to avoid the 1/cos(lat) longitude blow-up.
+            let diag_ok = all_ok
+                && !crosses_antimeridian
+                && max_abs_lat < 80.0
+                && matches!((ul, lr), (Some((ux, uy)), Some((lx, ly)))
+                    if (lx - ux).abs() < 180.0 && (lx - ux).hypot(ly - uy) > 1e-8);
+
+            if diag_ok {
+                let (ux, uy) = ul.unwrap();
+                let (lx, ly) = lr.unwrap();
+                let res = (lx - ux).hypot(ly - uy) / wf.hypot(hf);
+                let ww = ((max_x - min_x) / res + 0.5).floor().max(1.0);
+                let wh = ((max_y - min_y) / res + 0.5).floor().max(1.0);
+                (res, ww, wh)
+            } else {
+                let cx = wf * 0.5;
+                let cy = hf * 0.5;
+                let step_px = (wf.min(hf) * 0.01).clamp(1.0, 64.0);
+                let px_deg = if let (Some((lon0, lat0)), Some((lonx, latx)), Some((lony, laty))) = (
+                    to_ll(cx, cy),
+                    to_ll(cx + step_px, cy),
+                    to_ll(cx, cy + step_px),
+                ) {
+                    let wrap_dlon = |d: f64| -> f64 {
+                        if d > 180.0 {
+                            d - 360.0
+                        } else if d < -180.0 {
+                            d + 360.0
+                        } else {
+                            d
+                        }
+                    };
+                    let cos_lat = lat0.to_radians().cos().abs();
+                    let dx = (wrap_dlon(lonx - lon0) * cos_lat).hypot(latx - lat0) / step_px;
+                    let dy = (wrap_dlon(lony - lon0) * cos_lat).hypot(laty - lat0) / step_px;
+                    let local = dx.max(dy);
+                    if local.is_finite() && local > 1e-8 {
+                        local
+                    } else {
+                        let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                        (n - s).abs().max((e - w).abs() * cos_lat).max(1e-6) / wf.max(hf)
+                    }
+                } else {
+                    let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                    (e - w).abs().max((n - s).abs()).max(1e-6) / wf.max(hf)
+                };
+                (px_deg, wf, hf)
+            }
+        };
+
+        let ov_level = max_overview_level(warp_w, warp_h, 256.0);
+        let maxzoom = zoom_for_res(res, CELL0_CRS84, MAX_Z_CRS84);
+        let minzoom = zoom_for_res(res * f64::from(1u32 << ov_level), CELL0_CRS84, MAX_Z_CRS84)
+            .min(maxzoom);
+        (minzoom, maxzoom)
+    }
+}
+
+/// Maximum virtual overview level whose smallest dimension stays above `minsize` pixels,
+/// matching `rio_tiler.io.base.get_maximum_overview_level`.
+#[inline]
+fn max_overview_level(width: f64, height: f64, minsize: f64) -> u32 {
+    let mut level = 0u32;
+    while level < 30 && (width.min(height) / f64::from(1u32 << level)).floor() > minsize {
+        level += 1;
+    }
+    level
+}
+
+/// Closest TMS zoom level for a target pixel resolution `res` in TMS units, matching
+/// GDAL's COG driver and `morecantile.TileMatrixSet.zoom_for_res(..., zoom_level_strategy="auto")`.
+#[inline]
+fn zoom_for_res(res: f64, cell0: f64, max_z: u8) -> u8 {
+    if !res.is_finite() || res <= 0.0 {
+        return max_z;
+    }
+    let cell = |z: u8| cell0 / (1u64 << z) as f64;
+    let mut zoom = 0u8;
+    for z in 0..=max_z {
+        zoom = z;
+        let cz = cell(z);
+        if res > cz || (res - cz).abs() / cz <= 1e-8 {
+            break;
+        }
+    }
+    let cz = cell(zoom);
+    if zoom > 0 && (res - cz).abs() / cz > 1e-8 && (cell(zoom - 1) / res) < (res / cz) {
+        zoom -= 1;
+    }
+    zoom
 }
 
 /// Control grid dimension: `17x17` points = `16x16` bilinear cells across any tile.
@@ -1483,5 +1725,77 @@ mod tests {
         assert_eq!(b[2], 180.0);
         let (_minz, maxz) = crs.web_mercator_zoom_range(&aff, 10_000, 10_000, 16.0);
         assert!(maxz >= 13, "10m antimeridian raster should have maxzoom >= 13, got {maxz}");
+
+        // Polar-centered Polar Stereographic (EPSG:3413) 100m raster at North Pole (lat=90°):
+        // world_crs84_zoom_range must not collapse to 0 from the 1/cos(lat) longitude singularity.
+        let polar = CrsModel::from_geo_keys(&keys(|k| {
+            k.projected_cs_type = Some(3413);
+        }))
+        .unwrap();
+        let polar_aff = Affine2D {
+            a: 100.0,
+            b: 0.0,
+            c: -50_000.0,
+            d: 0.0,
+            e: -100.0,
+            f: 50_000.0,
+        };
+        let (p_minz, p_maxz) = polar.world_crs84_zoom_range(&polar_aff, 1000, 1000, 8.0);
+        assert!(p_maxz >= 9 && p_minz <= p_maxz, "100m polar raster should have CRS84 maxzoom >= 9, got ({p_minz}, {p_maxz})");
+    }
+
+    #[test]
+    fn sentinel2_and_mercator_zoom_range_match_titiler() {
+        // Verify zoom_for_res boundary behavior against morecantile.
+        const CELL0_MERC: f64 = 156_543.033_928_040_97;
+        assert_eq!(zoom_for_res(CELL0_MERC, CELL0_MERC, 24), 0);
+        assert_eq!(zoom_for_res(13.834, CELL0_MERC, 24), 13);
+        assert_eq!(zoom_for_res(13.834 * 64.0, CELL0_MERC, 24), 7);
+        assert_eq!(zoom_for_res(9.554_628_535_647_032, CELL0_MERC, 24), 14);
+        assert_eq!(zoom_for_res(0.000_1, CELL0_MERC, 24), 24);
+
+        // Nine ground-truth grids matching rio-tiler 9.4 (7 UTM, 1 geographic, 1 Web Mercator).
+        let utm = |epsg: u16| {
+            CrsModel::from_geo_keys(&keys(|k| {
+                k.projected_cs_type = Some(epsg);
+            }))
+            .unwrap()
+        };
+        let zooms = |crs: &CrsModel, width: u32, height: u32, bounds: [f64; 4]| {
+            let aff = Affine2D {
+                a: (bounds[2] - bounds[0]) / width as f64,
+                b: 0.0,
+                c: bounds[0],
+                d: 0.0,
+                e: -(bounds[3] - bounds[1]) / height as f64,
+                f: bounds[3],
+            };
+            crs.web_mercator_zoom_range(&aff, width, height, 16.0)
+        };
+        let s2 = [699_960.0, 4_790_220.0, 809_760.0, 4_900_020.0];
+        assert_eq!(zooms(&utm(32631), 10_980, 10_980, s2), (7, 13));
+        assert_eq!(zooms(&utm(32631), 5_490, 5_490, s2), (7, 12));
+        assert_eq!(zooms(&utm(32631), 1_830, 1_830, s2), (8, 11));
+        assert_eq!(
+            zooms(&utm(32632), 10_980, 10_980, [399_960.0, 5_090_220.0, 509_760.0, 5_200_020.0]),
+            (7, 13)
+        );
+        assert_eq!(
+            zooms(&utm(32633), 10_980, 10_980, [499_980.0, 6_790_200.0, 609_780.0, 6_900_000.0]),
+            (7, 13)
+        );
+        assert_eq!(
+            zooms(&utm(32619), 7_621, 7_791, [300_000.0, 100_000.0, 528_630.0, 333_730.0]),
+            (7, 12)
+        );
+        assert_eq!(
+            zooms(&utm(32755), 10_980, 10_980, [300_000.0, 5_690_220.0, 409_800.0, 5_800_020.0]),
+            (8, 14)
+        );
+        assert_eq!(zooms(&CrsModel::Geographic, 3_600, 1_800, [-10.0, 30.0, 26.0, 48.0]), (3, 7));
+        assert_eq!(
+            zooms(&CrsModel::Epsg3857, 4_096, 2_048, [500_000.0, 5_300_000.0, 622_304.0, 5_361_152.0]),
+            (9, 12)
+        );
     }
 }

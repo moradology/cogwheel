@@ -159,8 +159,11 @@ pub fn build_tilejson(
     let coarsest = cog.index.ifds.last().unwrap();
     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
         .max(full.height as f64 / coarsest.height.max(1) as f64);
-    let (minzoom, maxzoom) =
-        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
+    let (minzoom, maxzoom) = if tms == "WorldCRS84Quad" {
+        crs.world_crs84_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+    } else {
+        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+    };
     let center = serde_json::json!([
         0.5 * (bounds[0] + bounds[2]),
         0.5 * (bounds[1] + bounds[3]),
@@ -629,6 +632,7 @@ impl BandStatsAcc {
         unscale: bool,
         scale: f32,
         offset: f32,
+        description: &str,
     ) -> serde_json::Value {
         let valid_px: usize = hist.iter().map(|&c| c as usize).sum();
         let masked_px = denom_pixels.saturating_sub(valid_px);
@@ -640,10 +644,12 @@ impl BandStatsAcc {
         if valid_px == 0 {
             return serde_json::json!({
                 "min": null, "max": null, "mean": null, "count": 0, "sum": 0.0,
-                "std": null, "median": null, "valid_percent": 0.0,
+                "std": null, "median": null, "majority": null, "minority": null,
+                "unique": 0, "valid_percent": 0.0,
                 "masked_pixels": masked_px, "valid_pixels": 0,
                 "percentile_2": null, "percentile_98": null,
                 "histogram": [[], []],
+                "description": description,
             });
         }
         let reverse = unscale && scale < 0.0;
@@ -665,6 +671,11 @@ impl BandStatsAcc {
         let mut p98 = f32::NAN;
         let mut sum = 0.0f64;
         let mut cum = 0usize;
+        let mut unique = 0usize;
+        let mut maj_val = f32::NAN;
+        let mut maj_cnt = 0usize;
+        let mut min_val = f32::NAN;
+        let mut min_cnt = usize::MAX;
 
         let n = hist.len();
         for step in 0..n {
@@ -673,7 +684,16 @@ impl BandStatsAcc {
             if c == 0 {
                 continue;
             }
+            unique += 1;
             let v = to_val(k);
+            if c > maj_cnt {
+                maj_cnt = c;
+                maj_val = v;
+            }
+            if c < min_cnt {
+                min_cnt = c;
+                min_val = v;
+            }
             if min.is_nan() {
                 min = v;
             }
@@ -720,12 +740,16 @@ impl BandStatsAcc {
             "sum": sum,
             "std": std,
             "median": median,
+            "majority": maj_val,
+            "minority": min_val,
+            "unique": unique,
             "valid_percent": valid_pct,
             "masked_pixels": masked_px,
             "valid_pixels": valid_px,
             "percentile_2": p2,
             "percentile_98": p98,
             "histogram": [counts, edges],
+            "description": description,
         })
     }
 
@@ -736,6 +760,7 @@ impl BandStatsAcc {
         scale: f32,
         offset: f32,
         nodata_override: Option<f32>,
+        description: &str,
     ) -> serde_json::Value {
         match self {
             Self::HistU8(mut hist) => {
@@ -744,7 +769,7 @@ impl BandStatsAcc {
                         hist[nd as usize] = 0;
                     }
                 }
-                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset)
+                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset, description)
             }
             Self::HistU16(mut hist) => {
                 if let Some(nd) = nodata_override {
@@ -752,7 +777,7 @@ impl BandStatsAcc {
                         hist[nd as usize] = 0;
                     }
                 }
-                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset)
+                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset, description)
             }
             Self::Floats(mut vals) => {
                 let valid_px = vals.len();
@@ -765,23 +790,49 @@ impl BandStatsAcc {
                 if valid_px == 0 {
                     return serde_json::json!({
                         "min": null, "max": null, "mean": null, "count": 0, "sum": 0.0,
-                        "std": null, "median": null, "valid_percent": 0.0,
+                        "std": null, "median": null, "majority": null, "minority": null,
+                        "unique": 0, "valid_percent": 0.0,
                         "masked_pixels": masked_px, "valid_pixels": 0,
                         "percentile_2": null, "percentile_98": null,
                         "histogram": [[], []],
+                        "description": description,
                     });
                 }
-                let mut min = f32::INFINITY;
-                let mut max = f32::NEG_INFINITY;
+                vals.sort_unstable_by(|a, b| a.total_cmp(b));
+                let min = vals[0];
+                let max = vals[valid_px - 1];
                 let mut sum = 0.0f64;
+                let mut unique = 0usize;
+                let mut maj_val = min;
+                let mut maj_cnt = 0usize;
+                let mut min_val = min;
+                let mut min_cnt = usize::MAX;
+                let mut run_val = min;
+                let mut run_cnt = 0usize;
                 for &v in &vals {
-                    if v < min {
-                        min = v;
-                    }
-                    if v > max {
-                        max = v;
-                    }
                     sum += v as f64;
+                    if v == run_val {
+                        run_cnt += 1;
+                    } else {
+                        unique += 1;
+                        if run_cnt > maj_cnt {
+                            maj_cnt = run_cnt;
+                            maj_val = run_val;
+                        }
+                        if run_cnt < min_cnt {
+                            min_cnt = run_cnt;
+                            min_val = run_val;
+                        }
+                        run_val = v;
+                        run_cnt = 1;
+                    }
+                }
+                unique += 1;
+                if run_cnt > maj_cnt {
+                    maj_val = run_val;
+                }
+                if run_cnt < min_cnt {
+                    min_val = run_val;
                 }
                 let mean = sum / (valid_px as f64);
                 let min_f64 = min as f64;
@@ -798,24 +849,12 @@ impl BandStatsAcc {
                 }
                 let std = (var_sum / (valid_px as f64)).sqrt();
 
-                // O(N) Quickselect for median, p2, p98 (bit-exact match with full sort)
                 let p2_idx = ((valid_px as f64) * 0.02) as usize;
                 let med_idx = valid_px / 2;
                 let p98_idx = (((valid_px as f64) * 0.98) as usize).min(valid_px - 1);
-                let (left, med_ref, right) = vals.select_nth_unstable_by(med_idx, |a, b| a.total_cmp(b));
-                let median = *med_ref;
-                let p2 = if p2_idx < med_idx {
-                    *left.select_nth_unstable_by(p2_idx, |a, b| a.total_cmp(b)).1
-                } else {
-                    median
-                };
-                let p98 = if p98_idx > med_idx {
-                    *right
-                        .select_nth_unstable_by(p98_idx - med_idx - 1, |a, b| a.total_cmp(b))
-                        .1
-                } else {
-                    median
-                };
+                let median = vals[med_idx];
+                let p2 = vals[p2_idx];
+                let p98 = vals[p98_idx];
                 let edges: Vec<f64> = (0..=10)
                     .map(|i| min_f64 + span * (i as f64 / 10.0))
                     .collect();
@@ -827,12 +866,16 @@ impl BandStatsAcc {
                     "sum": sum,
                     "std": std,
                     "median": median,
+                    "majority": maj_val,
+                    "minority": min_val,
+                    "unique": unique,
                     "valid_percent": valid_pct,
                     "masked_pixels": masked_px,
                     "valid_pixels": valid_px,
                     "percentile_2": p2,
                     "percentile_98": p98,
                     "histogram": [counts, edges],
+                    "description": description,
                 })
             }
         }
@@ -1260,19 +1303,64 @@ fn compute_statistics_cpu(
     for (b, acc) in per_band.into_iter().enumerate() {
         let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
         let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
-        out.insert(
-            format!("b{}", b + 1),
-            acc.finalize(denom_pixels, unscale, scale, offset, nodata_override),
-        );
+        let bname = format!("b{}", b + 1);
+        let val = acc.finalize(denom_pixels, unscale, scale, offset, nodata_override, &bname);
+        out.insert(bname, val);
     }
 
     serde_json::Value::Object(out)
 }
 
-/// TiTiler-compatible `/cog/statistics` computed from the coarsest overview <= `max_size`.
+/// Project a WGS84 polygon bbox into an IFD's pixel space and return its clipped `(win_w, win_h)`.
+fn polygon_window_dims(
+    ifd: &cogzilla_tiff::IfdMeta,
+    crs: &cogzilla_proj::CrsModel,
+    bbox: [f64; 4],
+) -> (u32, u32) {
+    let [w, s, e, n] = bbox;
+    let mx = 0.5 * (w + e);
+    let my = 0.5 * (s + n);
+    let pts = [
+        (w, s),
+        (e, s),
+        (w, n),
+        (e, n),
+        (mx, s),
+        (mx, n),
+        (w, my),
+        (e, my),
+    ];
+    let mut cmin = f64::INFINITY;
+    let mut cmax = f64::NEG_INFINITY;
+    let mut rmin = f64::INFINITY;
+    let mut rmax = f64::NEG_INFINITY;
+    for (lon, lat) in pts {
+        let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+        if sx.is_finite() && sy.is_finite() {
+            let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
+            if col.is_finite() && row.is_finite() {
+                cmin = cmin.min(col);
+                cmax = cmax.max(col);
+                rmin = rmin.min(row);
+                rmax = rmax.max(row);
+            }
+        }
+    }
+    if !cmin.is_finite() {
+        return (ifd.width, ifd.height);
+    }
+    let c0 = cmin.floor().clamp(0.0, ifd.width as f64);
+    let c1 = cmax.ceil().clamp(0.0, ifd.width as f64);
+    let r0 = rmin.floor().clamp(0.0, ifd.height as f64);
+    let r1 = rmax.ceil().clamp(0.0, ifd.height as f64);
+    (((c1 - c0).max(1.0)) as u32, ((r1 - r0).max(1.0)) as u32)
+}
+
+/// TiTiler-compatible `/cog/statistics` computed from the finest overview whose target window
+/// fits within `max_size` (for `POST /statistics` with a polygon, sized to the polygon's pixel
+/// window rather than the whole raster so small polygons sample at full native resolution).
 /// When the coarsest IFD still exceeds `max_size` (e.g. an overview-less GeoTIFF), stride-decimates
-/// by `step = ceil(max_dim / max_size)` so memory and I/O stay bounded to `<= max_size^2` samples.
-/// When `poly_mask` is `Some`, clips statistics strictly to pixels inside the posted GeoJSON polygon.
+/// by `step = ceil(win_max_dim / max_size)` so memory and I/O stay bounded to `<= max_size^2` samples.
 pub async fn compute_statistics(
     engine: &TileEngine,
     cog: &Arc<OpenedCog>,
@@ -1284,15 +1372,24 @@ pub async fn compute_statistics(
     let crs = engine.get_or_build_crs(cog)?;
     let max_size = max_size.max(1);
     let mut ifd_idx = cog.index.ifds.len() - 1;
+    let mut win_max_dim = cog.index.ifds[ifd_idx].width.max(cog.index.ifds[ifd_idx].height);
     for (i, ifd) in cog.index.ifds.iter().enumerate() {
-        if ifd.width.max(ifd.height) <= max_size {
+        let dim = if let Some(pm) = poly_mask {
+            let (ww, wh) = polygon_window_dims(ifd, &crs, pm.bbox);
+            ww.max(wh)
+        } else {
+            ifd.width.max(ifd.height)
+        };
+        if dim <= max_size {
             ifd_idx = i;
+            win_max_dim = dim;
             break;
         }
+        win_max_dim = dim;
     }
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
-    let step = ifd.width.max(ifd.height).div_ceil(max_size).max(1) as usize;
+    let step = win_max_dim.div_ceil(max_size).max(1) as usize;
     let total_pixels = if step > 1 {
         (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
     } else {
@@ -1311,38 +1408,65 @@ pub async fn compute_statistics(
         lx0 < x_max && ly0 < y_max
     };
 
-    let mut mask_total_pixels = 0usize;
-    let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
-        let mut masks = Vec::with_capacity(n_tiles);
-        for ty in 0..ifd.tiles_down {
-            for tx in 0..ifd.tiles_across {
-                let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
-                let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
-                if !tile_has_strided_sample(tx, ty, x_max, y_max) {
-                    masks.push(None);
-                    continue;
+    let (tile_masks, mask_total_pixels): (Option<Vec<Option<Vec<u8>>>>, usize) =
+        if let Some(pm) = poly_mask {
+            let build_masks = {
+                let ifd = ifd.clone();
+                let crs = crs.clone();
+                let pm = pm.clone();
+                move || {
+                    let mut masks = Vec::with_capacity(n_tiles);
+                    let mut inside_total = 0usize;
+                    for ty in 0..ifd.tiles_down {
+                        for tx in 0..ifd.tiles_across {
+                            let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+                            let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+                            let has_sample = if step == 1 {
+                                true
+                            } else {
+                                let x0_tile = (tx * ifd.tile_width) as usize;
+                                let y0_tile = (ty * ifd.tile_height) as usize;
+                                let lx0 = (step - (x0_tile % step)) % step;
+                                let ly0 = (step - (y0_tile % step)) % step;
+                                lx0 < x_max && ly0 < y_max
+                            };
+                            if !has_sample {
+                                masks.push(None);
+                                continue;
+                            }
+                            let built = if step > 1 {
+                                let x0_tile = (tx * ifd.tile_width) as usize;
+                                let y0_tile = (ty * ifd.tile_height) as usize;
+                                let lx0 = (step - (x0_tile % step)) % step;
+                                let ly0 = (step - (y0_tile % step)) % step;
+                                build_tile_polygon_mask_strided(
+                                    &ifd, &crs, &pm, tx, ty, x_max, y_max, lx0, ly0, step,
+                                )
+                            } else {
+                                build_tile_polygon_mask(&ifd, &crs, &pm, tx, ty, x_max, y_max)
+                            };
+                            if let Some((bits, inside)) = built {
+                                inside_total += inside;
+                                masks.push(Some(bits));
+                            } else {
+                                masks.push(None);
+                            }
+                        }
+                    }
+                    (Some(masks), inside_total)
                 }
-                let built = if step > 1 {
-                    let x0_tile = (tx * ifd.tile_width) as usize;
-                    let y0_tile = (ty * ifd.tile_height) as usize;
-                    let lx0 = (step - (x0_tile % step)) % step;
-                    let ly0 = (step - (y0_tile % step)) % step;
-                    build_tile_polygon_mask_strided(
-                        ifd, &crs, pm, tx, ty, x_max, y_max, lx0, ly0, step,
-                    )
-                } else {
-                    build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
-                };
-                if let Some((bits, inside)) = built {
-                    mask_total_pixels += inside;
-                    masks.push(Some(bits));
-                } else {
-                    masks.push(None);
-                }
+            };
+            if n_tiles >= 4 || total_pixels >= 65_536 {
+                engine
+                    .store
+                    .run_heavy_cpu(build_masks)
+                    .await?
+            } else {
+                build_masks()
             }
-        }
-        masks
-    });
+        } else {
+            (None, 0)
+        };
 
     let fetched = match ifd.planar_config {
         PlanarConfig::Chunky => {
@@ -1861,126 +1985,196 @@ async fn render_bbox_impl(
     // Precompute source pixel coordinates `(u, v)` using a coarse 16-px projection grid
     // + bilinear interpolation (reduces UTM/LCC trig calls by ~225× while keeping <0.005 px error).
     // Any grid cell with a non-finite corner falls back to exact per-pixel projection.
-    let mut u_map = vec![f32::NAN; w * h];
-    let mut v_map = vec![f32::NAN; w * h];
-    let mut min_u = f32::INFINITY;
-    let mut max_u = f32::NEG_INFINITY;
-    let mut min_v = f32::INFINITY;
-    let mut max_v = f32::NEG_INFINITY;
-
-    const STEP: usize = 16;
-    let gw = w.div_ceil(STEP) + 1;
-    let gh = h.div_ceil(STEP) + 1;
-    let mut grid_u = vec![f64::NAN; gw * gh];
-    let mut grid_v = vec![f64::NAN; gw * gh];
-    for gy in 0..gh {
-        let py_f = (gy * STEP).min(h) as f64;
-        let y_coord = bbox[3] - py_f * dly;
-        for gx in 0..gw {
-            let px_f = (gx * STEP).min(w) as f64;
-            let x_coord = bbox[0] + px_f * dlx;
-            let (sx, sy) = to_src_crs(x_coord, y_coord);
-            if sx.is_finite() && sy.is_finite() {
-                let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
-                grid_u[gy * gw + gx] = col - 0.5;
-                grid_v[gy * gw + gx] = row - 0.5;
-            }
-        }
-    }
-
-    let ifd_w_f = ifd.width as f32;
-    let ifd_h_f = ifd.height as f32;
-
-    for gy in 0..(gh - 1) {
-        let y0 = gy * STEP;
-        let y1 = ((gy + 1) * STEP).min(h);
-        if y0 >= y1 {
-            continue;
-        }
-        let inv_dy = 1.0 / ((y1 - y0) as f64);
-        for gx in 0..(gw - 1) {
-            let x0 = gx * STEP;
-            let x1 = ((gx + 1) * STEP).min(w);
-            if x0 >= x1 {
-                continue;
-            }
-            let inv_dx = 1.0 / ((x1 - x0) as f64);
-            let i00 = gy * gw + gx;
-            let u00 = grid_u[i00];
-            let u10 = grid_u[i00 + 1];
-            let u01 = grid_u[i00 + gw];
-            let u11 = grid_u[i00 + gw + 1];
-            let v00 = grid_v[i00];
-            let v10 = grid_v[i00 + 1];
-            let v01 = grid_v[i00 + gw];
-            let v11 = grid_v[i00 + gw + 1];
-            let all_finite = u00.is_finite()
-                && u10.is_finite()
-                && u01.is_finite()
-                && u11.is_finite()
-                && v00.is_finite()
-                && v10.is_finite()
-                && v01.is_finite()
-                && v11.is_finite();
-
-            // Skip entire cell if all 4 corners + midpoint are strictly outside the source image
-            // bounds, and fall back to exact per-pixel projection if the cell has high curvature
-            // (> 0.05 px midpoint error) or wraps across the antimeridian / pole in X or Y.
-            let mut use_bilinear = all_finite;
-            if all_finite {
-                let x_mid = bbox[0] + (0.5 * (x0 + x1) as f64) * dlx;
-                let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
-                let (msx, msy) = to_src_crs(x_mid, y_mid);
-                let mid_ok = if msx.is_finite() && msy.is_finite() {
-                    let (mcol, mrow) = ifd.crs_to_pixel.forward(msx, msy);
-                    let mu = mcol - 0.5;
-                    let mv = mrow - 0.5;
-                    let u_avg = 0.25 * (u00 + u10 + u01 + u11);
-                    let v_avg = 0.25 * (v00 + v10 + v01 + v11);
-                    mu.is_finite()
-                        && mv.is_finite()
-                        && (mu - u_avg).abs() <= 0.05
-                        && (mv - v_avg).abs() <= 0.05
+    // Offload large grids or polygon-masked bboxes to the bounded heavy-CPU pool so Tokio worker
+    // threads stay responsive under concurrent `/bbox` and `/feature` load.
+    let build_uv_maps = {
+        let crs = crs.clone();
+        let crs_to_pixel = ifd.crs_to_pixel;
+        let ifd_width = ifd.width;
+        let ifd_height = ifd.height;
+        let poly_mask = poly_mask.cloned();
+        move || {
+            let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
+                if bbox_is_3857 {
+                    crs.from_3857(x, y)
                 } else {
-                    false
-                };
-                if !mid_ok {
-                    use_bilinear = false;
-                } else {
-                    let cu_min = u00.min(u10).min(u01).min(u11) as f32;
-                    let cu_max = u00.max(u10).max(u01).max(u11) as f32;
-                    let cv_min = v00.min(v10).min(v01).min(v11) as f32;
-                    let cv_max = v00.max(v10).max(v01).max(v11) as f32;
-                    if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
-                        continue;
-                    }
-                    if (ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f)
-                        || (ifd.height >= 64 && h > STEP * 2 && (cv_max - cv_min) > 0.5 * ifd_h_f)
-                    {
-                        use_bilinear = false;
+                    crs.from_lonlat_deg(x, y)
+                }
+            };
+            let mut u_map = vec![f32::NAN; w * h];
+            let mut v_map = vec![f32::NAN; w * h];
+            let mut min_u = f32::INFINITY;
+            let mut max_u = f32::NEG_INFINITY;
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+
+            const STEP: usize = 16;
+            let gw = w.div_ceil(STEP) + 1;
+            let gh = h.div_ceil(STEP) + 1;
+            let mut grid_u = vec![f64::NAN; gw * gh];
+            let mut grid_v = vec![f64::NAN; gw * gh];
+            for gy in 0..gh {
+                let py_f = (gy * STEP).min(h) as f64;
+                let y_coord = bbox[3] - py_f * dly;
+                for gx in 0..gw {
+                    let px_f = (gx * STEP).min(w) as f64;
+                    let x_coord = bbox[0] + px_f * dlx;
+                    let (sx, sy) = to_src_crs(x_coord, y_coord);
+                    if sx.is_finite() && sy.is_finite() {
+                        let (col, row) = crs_to_pixel.forward(sx, sy);
+                        grid_u[gy * gw + gx] = col - 0.5;
+                        grid_v[gy * gw + gx] = row - 0.5;
                     }
                 }
             }
 
-            for py in y0..y1 {
-                let row_off = py * w;
-                let ty = (py as f64 + 0.5 - y0 as f64) * inv_dy;
-                let lat = bbox[3] - (py as f64 + 0.5) * dly;
-                if use_bilinear {
-                    let ul = u00 + (u01 - u00) * ty;
-                    let ur = u10 + (u11 - u10) * ty;
-                    let vl = v00 + (v01 - v00) * ty;
-                    let vr = v10 + (v11 - v10) * ty;
-                    let du = (ur - ul) * inv_dx;
-                    let dv = (vr - vl) * inv_dx;
-                    let mut u_cur = ul + 0.5 * du;
-                    let mut v_cur = vl + 0.5 * dv;
-                    if let Some(pm) = poly_mask {
-                        for px in x0..x1 {
-                            let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                            if pm.contains(lon, lat) {
-                                let uu = u_cur as f32;
-                                let vv = v_cur as f32;
+            let ifd_w_f = ifd_width as f32;
+            let ifd_h_f = ifd_height as f32;
+
+            for gy in 0..(gh - 1) {
+                let y0 = gy * STEP;
+                let y1 = ((gy + 1) * STEP).min(h);
+                if y0 >= y1 {
+                    continue;
+                }
+                let inv_dy = 1.0 / ((y1 - y0) as f64);
+                for gx in 0..(gw - 1) {
+                    let x0 = gx * STEP;
+                    let x1 = ((gx + 1) * STEP).min(w);
+                    if x0 >= x1 {
+                        continue;
+                    }
+                    let inv_dx = 1.0 / ((x1 - x0) as f64);
+                    let i00 = gy * gw + gx;
+                    let u00 = grid_u[i00];
+                    let u10 = grid_u[i00 + 1];
+                    let u01 = grid_u[i00 + gw];
+                    let u11 = grid_u[i00 + gw + 1];
+                    let v00 = grid_v[i00];
+                    let v10 = grid_v[i00 + 1];
+                    let v01 = grid_v[i00 + gw];
+                    let v11 = grid_v[i00 + gw + 1];
+                    let all_finite = u00.is_finite()
+                        && u10.is_finite()
+                        && u01.is_finite()
+                        && u11.is_finite()
+                        && v00.is_finite()
+                        && v10.is_finite()
+                        && v01.is_finite()
+                        && v11.is_finite();
+
+                    // Skip entire cell if all 4 corners + midpoint are strictly outside the source image
+                    // bounds, and fall back to exact per-pixel projection if the cell has high curvature
+                    // (> 0.05 px midpoint error) or wraps across the antimeridian / pole in X or Y.
+                    let mut use_bilinear = all_finite;
+                    if all_finite {
+                        let x_mid = bbox[0] + (0.5 * (x0 + x1) as f64) * dlx;
+                        let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
+                        let (msx, msy) = to_src_crs(x_mid, y_mid);
+                        let mid_ok = if msx.is_finite() && msy.is_finite() {
+                            let (mcol, mrow) = crs_to_pixel.forward(msx, msy);
+                            let mu = mcol - 0.5;
+                            let mv = mrow - 0.5;
+                            let u_avg = 0.25 * (u00 + u10 + u01 + u11);
+                            let v_avg = 0.25 * (v00 + v10 + v01 + v11);
+                            mu.is_finite()
+                                && mv.is_finite()
+                                && (mu - u_avg).abs() <= 0.05
+                                && (mv - v_avg).abs() <= 0.05
+                        } else {
+                            false
+                        };
+                        if !mid_ok {
+                            use_bilinear = false;
+                        } else {
+                            let cu_min = u00.min(u10).min(u01).min(u11) as f32;
+                            let cu_max = u00.max(u10).max(u01).max(u11) as f32;
+                            let cv_min = v00.min(v10).min(v01).min(v11) as f32;
+                            let cv_max = v00.max(v10).max(v01).max(v11) as f32;
+                            if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f
+                            {
+                                continue;
+                            }
+                            if (ifd_width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f)
+                                || (ifd_height >= 64
+                                    && h > STEP * 2
+                                    && (cv_max - cv_min) > 0.5 * ifd_h_f)
+                            {
+                                use_bilinear = false;
+                            }
+                        }
+                    }
+
+                    for py in y0..y1 {
+                        let row_off = py * w;
+                        let ty = (py as f64 + 0.5 - y0 as f64) * inv_dy;
+                        let lat = bbox[3] - (py as f64 + 0.5) * dly;
+                        if use_bilinear {
+                            let ul = u00 + (u01 - u00) * ty;
+                            let ur = u10 + (u11 - u10) * ty;
+                            let vl = v00 + (v01 - v00) * ty;
+                            let vr = v10 + (v11 - v10) * ty;
+                            let du = (ur - ul) * inv_dx;
+                            let dv = (vr - vl) * inv_dx;
+                            let mut u_cur = ul + 0.5 * du;
+                            let mut v_cur = vl + 0.5 * dv;
+                            if let Some(ref pm) = poly_mask {
+                                for px in x0..x1 {
+                                    let lon = bbox[0] + (px as f64 + 0.5) * dlx;
+                                    if pm.contains(lon, lat) {
+                                        let uu = u_cur as f32;
+                                        let vv = v_cur as f32;
+                                        if uu >= -1.0
+                                            && uu <= ifd_w_f
+                                            && vv >= -1.0
+                                            && vv <= ifd_h_f
+                                        {
+                                            u_map[row_off + px] = uu;
+                                            v_map[row_off + px] = vv;
+                                            min_u = min_u.min(uu);
+                                            max_u = max_u.max(uu);
+                                            min_v = min_v.min(vv);
+                                            max_v = max_v.max(vv);
+                                        }
+                                    }
+                                    u_cur += du;
+                                    v_cur += dv;
+                                }
+                            } else {
+                                for px in x0..x1 {
+                                    let uu = u_cur as f32;
+                                    let vv = v_cur as f32;
+                                    if uu >= -1.0
+                                        && uu <= ifd_w_f
+                                        && vv >= -1.0
+                                        && vv <= ifd_h_f
+                                    {
+                                        u_map[row_off + px] = uu;
+                                        v_map[row_off + px] = vv;
+                                        min_u = min_u.min(uu);
+                                        max_u = max_u.max(uu);
+                                        min_v = min_v.min(vv);
+                                        max_v = max_v.max(vv);
+                                    }
+                                    u_cur += du;
+                                    v_cur += dv;
+                                }
+                            }
+                        } else {
+                            for px in x0..x1 {
+                                let lon = bbox[0] + (px as f64 + 0.5) * dlx;
+                                if let Some(ref pm) = poly_mask {
+                                    if !pm.contains(lon, lat) {
+                                        continue;
+                                    }
+                                }
+                                let (sx, sy) = to_src_crs(lon, lat);
+                                if !sx.is_finite() || !sy.is_finite() {
+                                    continue;
+                                }
+                                let (col, row) = crs_to_pixel.forward(sx, sy);
+                                let uu = (col - 0.5) as f32;
+                                let vv = (row - 0.5) as f32;
                                 if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {
                                     u_map[row_off + px] = uu;
                                     v_map[row_off + px] = vv;
@@ -1990,53 +2184,21 @@ async fn render_bbox_impl(
                                     max_v = max_v.max(vv);
                                 }
                             }
-                            u_cur += du;
-                            v_cur += dv;
-                        }
-                    } else {
-                        for px in x0..x1 {
-                            let uu = u_cur as f32;
-                            let vv = v_cur as f32;
-                            if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {
-                                u_map[row_off + px] = uu;
-                                v_map[row_off + px] = vv;
-                                min_u = min_u.min(uu);
-                                max_u = max_u.max(uu);
-                                min_v = min_v.min(vv);
-                                max_v = max_v.max(vv);
-                            }
-                            u_cur += du;
-                            v_cur += dv;
-                        }
-                    }
-                } else {
-                    for px in x0..x1 {
-                        let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                        if let Some(pm) = poly_mask {
-                            if !pm.contains(lon, lat) {
-                                continue;
-                            }
-                        }
-                        let (sx, sy) = to_src_crs(lon, lat);
-                        if !sx.is_finite() || !sy.is_finite() {
-                            continue;
-                        }
-                        let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
-                        let uu = (col - 0.5) as f32;
-                        let vv = (row - 0.5) as f32;
-                        if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {
-                            u_map[row_off + px] = uu;
-                            v_map[row_off + px] = vv;
-                            min_u = min_u.min(uu);
-                            max_u = max_u.max(uu);
-                            min_v = min_v.min(vv);
-                            max_v = max_v.max(vv);
                         }
                     }
                 }
             }
+            (u_map, v_map, min_u, max_u, min_v, max_v)
         }
-    }
+    };
+    let (u_map, v_map, min_u, max_u, min_v, max_v) = if w * h >= 65_536 || poly_mask.is_some() {
+        engine
+            .store
+            .run_heavy_cpu(build_uv_maps)
+            .await?
+    } else {
+        build_uv_maps()
+    };
 
     // Empty check
     if !min_u.is_finite() {
