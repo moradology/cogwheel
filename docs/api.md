@@ -31,7 +31,7 @@
 - Tile matrix sets are `WebMercatorQuad` and `WorldCRS84Quad`; TiTiler's other eleven are rejected.
 - Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, and `cover_scale`.
 - Statistics support `bidx`/`indexes`, custom percentiles (`p`), `histogram_bins`, `histogram_range`, `categorical`, `c`, and (on `/cog/statistics`) `;`-separated `expression`; `algorithm` is rejected on statistics routes. Point queries support `bidx`/`indexes` and `;`-separated `expression`. `POST /statistics` and `POST /feature` both support a single Feature, geometry, or `FeatureCollection` (up to 64 features).
-- `coord_crs` accepts `EPSG:4326` and `EPSG:3857`, on point queries and `/bbox`. `max_size` is supported on format-only `/bbox` routes (and rejected when explicit `{w}x{h}` dimensions are given).
+- `coord_crs` accepts `EPSG:4326`/`CRS84`, `EPSG:3857`, and all 3,260+ supported EPSG codes on point queries and `/bbox`. `max_size` is supported on format-only `/bbox` routes (and rejected when explicit `{w}x{h}` dimensions are given). `POST /feature` also supports `?shape_mask=true|false`.
 - `tilesize` accepts 64 to 2048.
 - Output formats are `png`, `pngraw`, `jpg`, `webp`, `tif`/`tiff` (GeoTIFF), `npy` and raw `f32`. JPEG 2000 is not available.
 - `expression` supports arithmetic, comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`), `where(cond, a, b)`, and functions (`sqrt`, `log10`, `ln`, `log2`, `db`, `exp`, `abs`, `ceil`, `floor`, `round`, `min`, `max`, `clip`), plus `;`-separated multi-band outputs on `/point` and `/cog/statistics`.
