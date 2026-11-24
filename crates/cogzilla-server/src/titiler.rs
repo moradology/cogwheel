@@ -6,7 +6,8 @@ use cogzilla_kernel::jpeg_fast::encode_jpeg_rgba;
 use cogzilla_kernel::png_fast::{encode_filtered_png, filter_sub_rgb_row, filter_sub_rgba_row};
 use cogzilla_kernel::webp_fast::{encode_webp_rgb, encode_webp_rgba};
 use cogzilla_kernel::{
-    BandSource, ColorFormula, ColormapLut, OutputFormat, ResampleMode, fast_db_from_power,
+    BandSource, ColorFormula, ColormapName, CustomColormap, OutputFormat, ResampleMode,
+    fast_db_from_power,
 };
 use cogzilla_tiff::PlanarConfig;
 
@@ -1983,7 +1984,7 @@ pub async fn render_native_preview(
     resample: ResampleMode,
     format: OutputFormat,
     nodata_override: Option<f32>,
-    custom_lut: Option<&ColormapLut>,
+    custom_lut: Option<&CustomColormap>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
@@ -2023,7 +2024,7 @@ pub async fn render_wgs84_bbox(
     resample: ResampleMode,
     format: OutputFormat,
     nodata_override: Option<f32>,
-    custom_lut: Option<&ColormapLut>,
+    custom_lut: Option<&CustomColormap>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
@@ -2062,7 +2063,7 @@ pub async fn render_mercator_bbox(
     resample: ResampleMode,
     format: OutputFormat,
     nodata_override: Option<f32>,
-    custom_lut: Option<&ColormapLut>,
+    custom_lut: Option<&CustomColormap>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
@@ -2102,7 +2103,7 @@ async fn render_bbox_impl(
     resample: ResampleMode,
     format: OutputFormat,
     nodata_override: Option<f32>,
-    custom_lut: Option<&ColormapLut>,
+    custom_lut: Option<&CustomColormap>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
@@ -2604,7 +2605,7 @@ async fn render_bbox_impl(
                            v_map: Vec<f32>,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
                            bands: &BandRequest,
-                           custom_lut: Option<&ColormapLut>,
+                           custom_lut: Option<&CustomColormap>,
                            color_formula: Option<&ColorFormula>|
           -> Bytes {
         let ifd_w_i = ifd_width as i32;
@@ -2676,8 +2677,9 @@ async fn render_bbox_impl(
             }
         };
 
-        let apply_source_unscale =
-            unscale && crate::engine::needs_source_unscale(bands, format);
+        let apply_source_unscale = unscale
+            && (crate::engine::needs_source_unscale(bands, format)
+                || custom_lut.is_some_and(CustomColormap::uses_direct_lookup));
 
         // Helper to build BandSource for 1-based band index across single (chunky/planar) or multi-COG
         let get_band_refs = |b_1based: u16,
@@ -2987,6 +2989,15 @@ async fn render_bbox_impl(
             return raw;
         }
 
+        let map_color = |v: f32, rmin: f32, inv: f32, default_cmap: ColormapName| -> [u8; 4] {
+            if let Some(cmap) = custom_lut {
+                cmap.lookup(v, rmin, inv)
+            } else {
+                let idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+                default_cmap.lut().rgba_u32[idx].to_le_bytes()
+            }
+        };
+
         let mut rgba = vec![0u8; w * h * 4];
         match bands {
             BandRequest::Single {
@@ -2996,13 +3007,11 @@ async fn render_bbox_impl(
             } => {
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
-                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let v = sample(&src, u_map[i], v_map[i]);
                     if !v.is_nan() {
-                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                        let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -3042,7 +3051,6 @@ async fn render_bbox_impl(
             } => {
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
-                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let ring = sample_dem_ring(&src);
                 let rw = w + 2;
@@ -3068,8 +3076,7 @@ async fn render_bbox_impl(
                         );
                         if !v.is_nan() {
                             let i = py * w + px;
-                            let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                            let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                            let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
                             rgba[i * 4] = r;
                             rgba[i * 4 + 1] = g;
                             rgba[i * 4 + 2] = b;
@@ -3143,7 +3150,6 @@ async fn render_bbox_impl(
                     .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
                     .collect();
                 let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let mut vals = [0.0f32; 16];
                 let nb = srcs.len().min(16);
@@ -3153,8 +3159,7 @@ async fn render_bbox_impl(
                     }
                     let v = prog.eval(&vals[..nb]);
                     if !v.is_nan() {
-                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                        let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -3170,13 +3175,11 @@ async fn render_bbox_impl(
             } => {
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
-                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
                     if !v.is_nan() {
-                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                        let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -3194,7 +3197,6 @@ async fn render_bbox_impl(
                 let r1 = get_band_refs(bands_1based[1], 1);
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
-                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let a = sample(&s0, u_map[i], v_map[i]);
@@ -3205,8 +3207,7 @@ async fn render_bbox_impl(
                         expr.eval2(a, b)
                     };
                     if !v.is_nan() {
-                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let [r, g, b, al] = lut.rgba_u32[idx].to_le_bytes();
+                        let [r, g, b, al] = map_color(v, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -3226,7 +3227,6 @@ async fn render_bbox_impl(
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
                 let s2 = make_src!(&r2);
-                let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let a = sample(&s0, u_map[i], v_map[i]);
@@ -3238,8 +3238,7 @@ async fn render_bbox_impl(
                         expr.eval3(a, b, c)
                     };
                     if !v.is_nan() {
-                        let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let [r, g, b, al] = lut.rgba_u32[idx].to_le_bytes();
+                        let [r, g, b, al] = map_color(v, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
