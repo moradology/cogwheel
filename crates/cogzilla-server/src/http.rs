@@ -151,8 +151,10 @@ struct ParsedQuery {
     unscale: bool,
     strict: bool,
     return_mask: bool,
+    shape_mask: bool,
     buffer: u32,
     coord_crs_3857: bool,
+    coord_crs: Option<cogzilla_proj::CrsModel>,
     format_param: Option<String>,
     minzoom: Option<u8>,
     maxzoom: Option<u8>,
@@ -200,8 +202,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         unscale: false,
         strict: false,
         return_mask: true,
+        shape_mask: true,
         buffer: 0,
         coord_crs_3857: false,
+        coord_crs: None,
         format_param: None,
         minzoom: None,
         maxzoom: None,
@@ -422,6 +426,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "return_mask" => {
                 pq.return_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
             }
+            "shape_mask" => {
+                pq.shape_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
+            }
             "buffer" => {
                 if let Ok(buf) = v.parse::<f32>()
                     && buf.is_finite()
@@ -432,10 +439,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "coord_crs" => {
-                let dec = percent_decode(v).to_ascii_lowercase();
-                pq.coord_crs_3857 = dec.contains("3857");
-                if !(dec.contains("3857") || dec.contains("4326") || dec.contains("crs84")) {
-                    bad("only EPSG:4326 and EPSG:3857 are supported");
+                let dec = percent_decode(v);
+                match parse_coord_crs(&dec) {
+                    Ok(crs) => {
+                        pq.coord_crs_3857 = matches!(crs, cogzilla_proj::CrsModel::Epsg3857);
+                        pq.coord_crs = Some(crs);
+                    }
+                    Err(msg) => bad(&msg),
                 }
             }
             "resample" | "resampling" => {
@@ -853,6 +863,88 @@ fn apply_tilejson_overrides(
 }
 
 const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
+
+/// Parse a TiTiler `coord_crs` string (`EPSG:32610`, `CRS84`, `http://.../EPSG/0/32610`,
+/// `urn:ogc:def:crs:EPSG::32610`, etc.) into a `CrsModel` using our 3,260+ EPSG table.
+fn parse_coord_crs(raw: &str) -> Result<cogzilla_proj::CrsModel, String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "crs84" || lower.ends_with(":crs84") || lower.ends_with("/crs84") {
+        return Ok(cogzilla_proj::CrsModel::Geographic);
+    }
+    let digits = lower
+        .rsplit([':', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let Ok(code) = digits.parse::<u16>() else {
+        return Err(format!("unsupported coord_crs '{raw}' (expected EPSG:<code> or CRS84)"));
+    };
+    cogzilla_proj::CrsModel::from_epsg(code)
+        .map_err(|e| format!("unsupported coord_crs '{raw}': {e}"))
+}
+
+fn coord_to_lonlat(
+    x: f64,
+    y: f64,
+    coord_crs: Option<&cogzilla_proj::CrsModel>,
+) -> Result<(f64, f64), EngineError> {
+    let (lon, lat) = match coord_crs {
+        None | Some(cogzilla_proj::CrsModel::Geographic) => (x, y),
+        Some(cogzilla_proj::CrsModel::Epsg3857) => mercator_to_lonlat_deg(x, y),
+        Some(crs) => crs.to_lonlat_deg(x, y),
+    };
+    if !lon.is_finite() || !lat.is_finite() {
+        return Err(EngineError::BadRequest(
+            "point coordinates could not be transformed to WGS84".into(),
+        ));
+    }
+    Ok((lon, lat))
+}
+
+fn bbox_to_wgs84(
+    bbox: [f64; 4],
+    coord_crs: Option<&cogzilla_proj::CrsModel>,
+) -> Result<[f64; 4], EngineError> {
+    let Some(crs) = coord_crs else {
+        return Ok(bbox);
+    };
+    if matches!(crs, cogzilla_proj::CrsModel::Geographic) {
+        return Ok(bbox);
+    }
+    let [x0, y0, x1, y1] = bbox;
+    let mx = 0.5 * (x0 + x1);
+    let my = 0.5 * (y0 + y1);
+    let pts = [
+        (x0, y0),
+        (x1, y0),
+        (x0, y1),
+        (x1, y1),
+        (mx, y0),
+        (mx, y1),
+        (x0, my),
+        (x1, my),
+    ];
+    let mut min_lon = f64::INFINITY;
+    let mut min_lat = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    for (x, y) in pts {
+        let (lo, la) = crs.to_lonlat_deg(x, y);
+        if lo.is_finite() && la.is_finite() {
+            min_lon = min_lon.min(lo);
+            max_lon = max_lon.max(lo);
+            min_lat = min_lat.min(la);
+            max_lat = max_lat.max(la);
+        }
+    }
+    if !min_lon.is_finite() || min_lon >= max_lon || min_lat >= max_lat {
+        return Err(EngineError::BadRequest(
+            "bbox coordinates could not be transformed to WGS84".into(),
+        ));
+    }
+    Ok([min_lon, min_lat, max_lon, max_lat])
+}
 
 fn wrap_geotiff(
     data: Bytes,
@@ -2199,12 +2291,11 @@ where
                 let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
                     return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
-                let (lon, lat, mx, my) = if pq.coord_crs_3857 {
-                    let (lo, la) = mercator_to_lonlat_deg(x, y);
-                    (lo, la, x, y)
+                let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
+                let (mx, my) = if pq.coord_crs_3857 {
+                    (x, y)
                 } else {
-                    let (mx, my) = lonlat_deg_to_mercator(x, y);
-                    (x, y, mx, my)
+                    lonlat_deg_to_mercator(lon, lat)
                 };
                 let urls = mj.query_bbox_3857(mx, my, mx, my);
                 let mut assets_out = Vec::new();
@@ -3278,11 +3369,7 @@ where
                 let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
                     return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
-                let (lon, lat) = if pq.coord_crs_3857 {
-                    mercator_to_lonlat_deg(x, y)
-                } else {
-                    (x, y)
-                };
+                let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
                 let n = names.len();
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
@@ -3361,6 +3448,7 @@ where
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -3402,6 +3490,7 @@ where
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -3442,21 +3531,25 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let (def_w, def_h) = aspect_preserving_dims(bbox, pq_stac.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
-                let data = if pq_stac.coord_crs_3857 {
+                let (data, out_bbox, epsg) = if pq_stac.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
-                    render_mercator_bbox(
+                    let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, bbox, 3857u16)
                 } else {
+                    let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
-                    render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    let d = render_wgs84_bbox(
+                        &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, wgs_bbox, 4326u16)
                 };
+                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -3493,21 +3586,25 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let data = if pq_stac.coord_crs_3857 {
+                let (data, out_bbox, epsg) = if pq_stac.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
-                    render_mercator_bbox(
+                    let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, bbox, 3857u16)
                 } else {
+                    let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
-                    render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    let d = render_wgs84_bbox(
+                        &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, wgs_bbox, 4326u16)
                 };
+                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -3548,11 +3645,13 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let mask_opt = pq_stac.shape_mask.then_some(&mask);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -3594,11 +3693,13 @@ where
                 let (def_w, def_h) = aspect_preserving_dims(bbox, s);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let mask_opt = pq_stac.shape_mask.then_some(&mask);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4014,14 +4115,10 @@ where
                 let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
                     return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
-                let (lon, lat) = if pq.coord_crs_3857 {
-                    mercator_to_lonlat_deg(x, y)
-                } else {
-                    (x, y)
-                };
+                let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
                 let mut json =
                     query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
-                if pq.coord_crs_3857 {
+                if pq.coord_crs.is_some() {
                     json["coordinates"] = serde_json::json!([x, y]);
                 }
                 apply_point_filters(&mut json, pq.expr_raw.as_deref(), &pq.bidx)?;
@@ -4111,23 +4208,25 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
-                let data = if pq.coord_crs_3857 {
+                let (data, out_bbox, epsg) = if pq.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
-                    render_mercator_bbox(
+                    let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, bbox, 3857u16)
                 } else {
+                    let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
-                    render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    let d = render_wgs84_bbox(
+                        &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, wgs_bbox, 4326u16)
                 };
-                let epsg = if pq.coord_crs_3857 { 3857 } else { 4326 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, epsg, pq.return_mask);
+                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4150,23 +4249,25 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let data = if pq.coord_crs_3857 {
+                let (data, out_bbox, epsg) = if pq.coord_crs_3857 {
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
-                    render_mercator_bbox(
+                    let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, bbox, 3857u16)
                 } else {
+                    let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
-                    render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    let d = render_wgs84_bbox(
+                        &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
-                    .await?
+                    .await?;
+                    (d, wgs_bbox, 4326u16)
                 };
-                let epsg = if pq.coord_crs_3857 { 3857 } else { 4326 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, epsg, pq.return_mask);
+                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4195,8 +4296,9 @@ where
                 let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let mask_opt = pq.shape_mask.then_some(&mask);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -4225,8 +4327,9 @@ where
                 let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let mask_opt = pq.shape_mask.then_some(&mask);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;

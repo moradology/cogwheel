@@ -37,6 +37,26 @@ pub enum CrsModel {
 impl CrsModel {
     /// Construct a `CrsModel` from parsed GeoTIFF `GeoKeys`.
     ///
+    /// Construct a `CrsModel` directly from an EPSG code (supporting `4326`, `3857`, all 270+
+    /// WGS84-compatible geographic codes, and all 3,260+ supported projected EPSG codes).
+    pub fn from_epsg(code: u16) -> Result<Self, ProjError> {
+        if code == 4326 || crate::epsg_table::WGS84_LIKE_GCS.binary_search(&code).is_ok() {
+            return Ok(Self::Geographic);
+        }
+        if matches!(code, 3857 | 3785) {
+            return Ok(Self::Epsg3857);
+        }
+        if let Some(def) = crate::epsg::lookup(code) {
+            return Ok(def.to_model());
+        }
+        Err(ProjError::UnsupportedCrs {
+            reason: format!("EPSG:{code} is not in the supported list"),
+            projected: Some(code),
+            geographic: None,
+            coord_trans: None,
+        })
+    }
+
     /// Anything this crate cannot place correctly is an error. Coordinates are
     /// treated as WGS84 with no datum shift, so a CRS is only accepted when its
     /// datum is WGS84 or one that agrees with it to about two metres (NAD83,
