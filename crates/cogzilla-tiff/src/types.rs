@@ -197,11 +197,22 @@ pub struct MaskIfdMeta {
     pub bits_per_sample: u16,
     pub compression: Compression,
     pub predictor: Predictor,
+    pub is_stripped: bool,
     pub tile_offsets: Box<[u64]>,
     pub tile_byte_counts: Box<[u32]>,
 }
 
 impl MaskIfdMeta {
+    #[inline(always)]
+    pub fn block_height(&self, mask_idx: usize) -> u32 {
+        if !self.is_stripped || self.tiles_across == 0 {
+            return self.tile_height;
+        }
+        let ty = (mask_idx as u32) / self.tiles_across;
+        let row_start = ty.saturating_mul(self.tile_height);
+        self.height.saturating_sub(row_start).min(self.tile_height).max(1)
+    }
+
     #[inline(always)]
     pub fn tile_byte_range(&self, tile_idx: usize) -> Option<(u64, u32)> {
         let count = *self.tile_byte_counts.get(tile_idx)?;
@@ -248,6 +259,22 @@ pub struct IfdMeta {
 }
 
 impl IfdMeta {
+    /// Actual row count stored in block `tile_idx`.
+    /// Tiled TIFFs always store `tile_height` rows per tile (padded on the bottom edge),
+    /// whereas stripped TIFFs store `min(tile_height, height - strip_row * tile_height)`
+    /// rows in the final strip of each plane.
+    #[inline(always)]
+    pub fn block_height(&self, tile_idx: u32) -> u32 {
+        if !self.is_stripped || self.tiles_across == 0 || self.tiles_down == 0 {
+            return self.tile_height;
+        }
+        let per_plane = self.tiles_across * self.tiles_down;
+        let xy = tile_idx % per_plane;
+        let ty = xy / self.tiles_across;
+        let y0 = ty.saturating_mul(self.tile_height);
+        self.height.saturating_sub(y0).min(self.tile_height).max(1)
+    }
+
     /// Tile linear index in `tile_offsets` / `tile_byte_counts`.
     /// For `Chunky`, `band` is ignored (all bands live in the same tile).
     /// For `Planar`, `band` is 0-based (`0..samples_per_pixel`).

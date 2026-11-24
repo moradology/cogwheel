@@ -534,27 +534,54 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             }
         }
 
-        // Capture internal transparency mask IFDs (bit 2 of NewSubfileType == 4)
+        // Capture internal transparency mask IFDs (bit 2 of NewSubfileType == 4),
+        // supporting both tiled and stripped mask IFDs.
         if (subfile_type & 4) != 0 {
             let mask_bps = bits_per_sample
                 .as_deref()
                 .and_then(|v| v.first().copied())
                 .unwrap_or(1);
-            if tile_width > 0 && tile_height > 0 && (mask_bps == 1 || mask_bps == 8) {
-                if let (Some(offs), Some(cnts)) = (tile_offsets, tile_byte_counts) {
-                    mask_ifds.push(MaskIfdMeta {
-                        width,
-                        height,
-                        tile_width,
-                        tile_height,
-                        tiles_across: width.div_ceil(tile_width),
-                        tiles_down: height.div_ceil(tile_height),
-                        bits_per_sample: mask_bps,
-                        compression,
-                        predictor,
-                        tile_offsets: offs,
-                        tile_byte_counts: cnts,
-                    });
+            if mask_bps == 1 || mask_bps == 8 {
+                if tile_width > 0 && tile_height > 0 {
+                    if let (Some(offs), Some(cnts)) = (tile_offsets, tile_byte_counts) {
+                        mask_ifds.push(MaskIfdMeta {
+                            width,
+                            height,
+                            tile_width,
+                            tile_height,
+                            tiles_across: width.div_ceil(tile_width),
+                            tiles_down: height.div_ceil(tile_height),
+                            bits_per_sample: mask_bps,
+                            compression,
+                            predictor,
+                            is_stripped: false,
+                            tile_offsets: offs,
+                            tile_byte_counts: cnts,
+                        });
+                    }
+                } else if let (Some(offs), Some(cnts)) = (strip_offsets, strip_byte_counts) {
+                    let rps = if rows_per_strip == 0 {
+                        height
+                    } else {
+                        rows_per_strip
+                    }
+                    .clamp(1, height.max(1));
+                    if width > 0 && height > 0 {
+                        mask_ifds.push(MaskIfdMeta {
+                            width,
+                            height,
+                            tile_width: width,
+                            tile_height: rps,
+                            tiles_across: 1,
+                            tiles_down: height.div_ceil(rps),
+                            bits_per_sample: mask_bps,
+                            compression,
+                            predictor,
+                            is_stripped: true,
+                            tile_offsets: offs,
+                            tile_byte_counts: cnts,
+                        });
+                    }
                 }
             }
             continue;

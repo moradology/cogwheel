@@ -17,6 +17,8 @@ pub struct BandSource<'a> {
     pub no_nodata: bool,
     /// Optional runtime `?nodata=` override; when `Some(nd)`, values equal to `nd` become `NaN`.
     pub nodata_override: Option<f32>,
+    /// Optional GDAL `scale`/`offset` applied when `?unscale=true` (`v * scale + offset`).
+    pub scale_offset: Option<(f32, f32)>,
     /// Fast path when tile_w/tile_h are powers of two (e.g. 256 or 512).
     shift_x: Option<u32>,
     mask_x: u32,
@@ -66,6 +68,7 @@ impl<'a> BandSource<'a> {
             all_nodata,
             no_nodata,
             nodata_override: None,
+            scale_offset: None,
             shift_x: tile_w.is_power_of_two().then(|| tile_w.trailing_zeros()),
             mask_x: tile_w.wrapping_sub(1),
             shift_y: tile_h.is_power_of_two().then(|| tile_h.trailing_zeros()),
@@ -84,19 +87,22 @@ impl<'a> BandSource<'a> {
         self
     }
 
+    #[inline(always)]
+    pub fn with_scale_offset(mut self, scale: f32, offset: f32) -> Self {
+        if scale != 1.0 || offset != 0.0 {
+            self.scale_offset = Some((scale, offset));
+            self.no_nodata = false;
+        }
+        self
+    }
+
     /// Sample source pixel `(col, row)` with bounds check. Out-of-bounds returns `f32::NAN`.
     #[inline(always)]
     pub fn sample_checked(&self, col: i32, row: i32) -> f32 {
         if col < 0 || row < 0 || col >= self.ifd_w || row >= self.ifd_h {
             return f32::NAN;
         }
-        let v = self.sample_inbounds(col as u32, row as u32);
-        if let Some(nd) = self.nodata_override {
-            if v == nd {
-                return f32::NAN;
-            }
-        }
-        v
+        self.sample_inbounds(col as u32, row as u32)
     }
 
     /// Sample source pixel `(col, row)` guaranteed in `[0..ifd_w, 0..ifd_h]`.
@@ -116,13 +122,24 @@ impl<'a> BandSource<'a> {
             return f32::NAN;
         }
         let bidx = (gy * self.grid_w + gx) as usize;
-        match unsafe { *self.blocks.get_unchecked(bidx) } {
+        let v = match unsafe { *self.blocks.get_unchecked(bidx) } {
             Some(blk) => {
                 let pidx = (ly as usize) * (self.tile_w as usize) + (lx as usize);
                 unsafe { blk.data.get_f32_unchecked(pidx) }
             }
             None => f32::NAN,
+        };
+        if let Some(nd) = self.nodata_override {
+            if v == nd {
+                return f32::NAN;
+            }
         }
+        if let Some((sc, off)) = self.scale_offset {
+            if !v.is_nan() {
+                return v * sc + off;
+            }
+        }
+        v
     }
 
     /// Fast 2×2 bilinear quad fetch when all 4 taps `(ux0..=ux0+1, uy0..=uy0+1)` are in-bounds.
@@ -130,6 +147,14 @@ impl<'a> BandSource<'a> {
     /// only 1 block lookup and 1 `BandData` dispatch instead of 4!
     #[inline(always)]
     pub fn sample_quad_inbounds(&self, ux0: u32, uy0: u32) -> (f32, f32, f32, f32) {
+        if self.scale_offset.is_some() {
+            return (
+                self.sample_inbounds(ux0, uy0),
+                self.sample_inbounds(ux0 + 1, uy0),
+                self.sample_inbounds(ux0, uy0 + 1),
+                self.sample_inbounds(ux0 + 1, uy0 + 1),
+            );
+        }
         let (tx, lx) = match self.shift_x {
             Some(s) => (ux0 >> s, ux0 & self.mask_x),
             None => (ux0 / self.tile_w, ux0 % self.tile_w),
@@ -237,8 +262,11 @@ impl<'a> BandSource<'a> {
     /// and bypass per-pixel tile-grid indexing completely!
     #[inline(always)]
     pub fn single_block_flat(&self) -> Option<(&'a [f32], u32, u32, usize)> {
-        if self.grid_w == 1 && self.grid_h == 1 {
+        if self.grid_w == 1 && self.grid_h == 1 && self.scale_offset.is_none() {
             let blk = self.blocks[0]?;
+            if blk.width < 2 || blk.height < 2 {
+                return None;
+            }
             let slice = blk.data.as_f32_slice()?;
             Some((
                 slice,
@@ -256,6 +284,9 @@ impl<'a> BandSource<'a> {
     pub fn single_block_u16(&self) -> Option<(&'a [u16], u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
             let blk = self.blocks[0]?;
+            if blk.width < 2 || blk.height < 2 {
+                return None;
+            }
             if let cogzilla_codec::BandData::U16 { data, nodata: None } = &blk.data {
                 return Some((
                     data.as_ref(),
@@ -273,6 +304,9 @@ impl<'a> BandSource<'a> {
     pub fn single_block_u8(&self) -> Option<(&'a [u8], u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
             let blk = self.blocks[0]?;
+            if blk.width < 2 || blk.height < 2 {
+                return None;
+            }
             if let cogzilla_codec::BandData::U8 { data, nodata: None } = &blk.data {
                 return Some((
                     data.as_ref(),
@@ -291,6 +325,9 @@ impl<'a> BandSource<'a> {
     pub fn single_block_rgb_u8(&self) -> Option<(&'a [u8], u8, u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
             let blk = self.blocks[0]?;
+            if blk.width < 2 || blk.height < 2 {
+                return None;
+            }
             if let cogzilla_codec::BandData::RgbU8Channel {
                 rgb,
                 channel,
@@ -376,5 +413,45 @@ impl<'a> BandSource<'a> {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
+
+    #[test]
+    fn band_source_scale_offset_applies_consistently_and_disables_raw_fastpaths() {
+        let mut slab = AlignedF32Slab::new_uninit(4);
+        slab.as_mut_slice().copy_from_slice(&[100.0, 200.0, f32::NAN, 400.0]);
+        let band = DecodedBand {
+            width: 2,
+            height: 2,
+            data: BandData::F32(slab),
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: false,
+                min: 100.0,
+                max: 400.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        let src = BandSource::new(2, 2, 2, 2, 0, 0, 1, 1, &blocks).with_scale_offset(0.01, -0.5);
+        assert!(!src.no_nodata);
+        assert!(src.single_block_flat().is_none());
+        assert!((src.sample_checked(0, 0) - 0.5).abs() < 1e-6);
+        assert!((src.sample_inbounds(1, 0) - 1.5).abs() < 1e-6);
+        assert!(src.sample_checked(0, 1).is_nan());
+        let (a, b, c, d) = src.sample_quad_inbounds(0, 0);
+        assert!((a - 0.5).abs() < 1e-6);
+        assert!((b - 1.5).abs() < 1e-6);
+        assert!(c.is_nan());
+        assert!((d - 3.5).abs() < 1e-6);
+
+        // Identity scale/offset (1.0, 0.0) must remain a no-op so fast paths stay active.
+        let src_id = BandSource::new(2, 2, 2, 2, 0, 0, 1, 1, &blocks).with_scale_offset(1.0, 0.0);
+        assert!(src_id.scale_offset.is_none());
+        assert!(src_id.single_block_flat().is_some());
     }
 }

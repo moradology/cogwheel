@@ -93,6 +93,16 @@ pub struct TileRequest {
     pub bands: BandRequest,
     pub resample: ResampleMode,
     pub format: OutputFormat,
+    pub unscale: bool,
+}
+
+/// Returns `true` when `?unscale=true` must be applied per-sample in `BandSource` (rather than
+/// being zero-cost folded into `Single`/`Rgb` rescale bounds): raw float output (`.npy`), DEM
+/// algorithms, terrain encodings, spectral indices, SAR dB, and custom band-math expressions.
+#[inline]
+pub(crate) fn needs_source_unscale(bands: &BandRequest, format: OutputFormat) -> bool {
+    format == OutputFormat::RawF32
+        || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
 }
 
 #[derive(Default)]
@@ -311,6 +321,15 @@ impl TileEngine {
                     .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
                     .collect();
 
+                let apply_unscale = req.unscale && needs_source_unscale(&req.bands, req.format);
+                let (sc, off) = if apply_unscale {
+                    (
+                        cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
+                        cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
+                    )
+                } else {
+                    (1.0, 0.0)
+                };
                 let src = BandSource::new(
                     ifd.width,
                     ifd.height,
@@ -321,7 +340,8 @@ impl TileEngine {
                     grid_w,
                     grid_h,
                     &block_refs,
-                );
+                )
+                .with_scale_offset(sc, off);
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -372,6 +392,14 @@ impl TileEngine {
                     .iter()
                     .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
                     .collect();
+                let (sc, off) = if req.unscale {
+                    (
+                        cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
+                        cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
+                    )
+                } else {
+                    (1.0, 0.0)
+                };
                 let src = BandSource::new(
                     ifd.width,
                     ifd.height,
@@ -382,7 +410,8 @@ impl TileEngine {
                     d_gw,
                     d_gh,
                     &block_refs,
-                );
+                )
+                .with_scale_offset(sc, off);
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -434,6 +463,14 @@ impl TileEngine {
                     .iter()
                     .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
                     .collect();
+                let (sc, off) = if req.unscale {
+                    (
+                        cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
+                        cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
+                    )
+                } else {
+                    (1.0, 0.0)
+                };
                 let src = BandSource::new(
                     ifd.width,
                     ifd.height,
@@ -444,7 +481,8 @@ impl TileEngine {
                     d_gw,
                     d_gh,
                     &block_refs,
-                );
+                )
+                .with_scale_offset(sc, off);
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -496,10 +534,19 @@ impl TileEngine {
                     .iter()
                     .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
                     .collect();
+                let (sc, off) = if req.unscale {
+                    (
+                        cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
+                        cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
+                    )
+                } else {
+                    (1.0, 0.0)
+                };
                 let src = BandSource::new(
                     ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
                     grid_h, &block_refs,
-                );
+                )
+                .with_scale_offset(sc, off);
                 let style = SingleBandStyle {
                     rescale_min: rescale.0,
                     rescale_max: rescale.1,
@@ -533,6 +580,16 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                let so = |b: u16| -> (f32, f32) {
+                    if req.unscale {
+                        (
+                            cog.index.scales.get(b as usize).copied().unwrap_or(1.0),
+                            cog.index.offsets.get(b as usize).copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    }
+                };
                 match ifd.planar_config {
                     PlanarConfig::Chunky => {
                         let mut indices = Vec::with_capacity(grid_len);
@@ -550,15 +607,19 @@ impl TileEngine {
                             .iter()
                             .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[1] as usize)))
                             .collect();
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &a_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                         ];
                         Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
                     }
@@ -580,15 +641,19 @@ impl TileEngine {
                             .iter()
                             .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                             .collect();
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &a_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                         ];
                         Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
                     }
@@ -644,19 +709,37 @@ impl TileEngine {
                             .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[2] as usize)))
                             .collect();
 
+                        let apply_unscale =
+                            req.unscale && needs_source_unscale(&req.bands, req.format);
+                        let so = |b: u16| -> (f32, f32) {
+                            if apply_unscale {
+                                (
+                                    cog.index.scales.get(b as usize).copied().unwrap_or(1.0),
+                                    cog.index.offsets.get(b as usize).copied().unwrap_or(0.0),
+                                )
+                            } else {
+                                (1.0, 0.0)
+                            }
+                        };
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
+                        let (s2, o2) = so(b0[2]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &r_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &g_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s2, o2),
                         ];
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
@@ -687,19 +770,37 @@ impl TileEngine {
                             .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                             .collect();
 
+                        let apply_unscale =
+                            req.unscale && needs_source_unscale(&req.bands, req.format);
+                        let so = |b: u16| -> (f32, f32) {
+                            if apply_unscale {
+                                (
+                                    cog.index.scales.get(b as usize).copied().unwrap_or(1.0),
+                                    cog.index.offsets.get(b as usize).copied().unwrap_or(0.0),
+                                )
+                            } else {
+                                (1.0, 0.0)
+                            }
+                        };
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
+                        let (s2, o2) = so(b0[2]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &r_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &g_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s2, o2),
                         ];
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
@@ -734,6 +835,16 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                let so = |b: u16| -> (f32, f32) {
+                    if req.unscale {
+                        (
+                            cog.index.scales.get(b as usize).copied().unwrap_or(1.0),
+                            cog.index.offsets.get(b as usize).copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    }
+                };
                 match ifd.planar_config {
                     PlanarConfig::Chunky => {
                         let mut indices = Vec::with_capacity(grid_len);
@@ -751,15 +862,19 @@ impl TileEngine {
                             .iter()
                             .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[1] as usize)))
                             .collect();
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &a_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                         ];
                         Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
                     }
@@ -781,15 +896,19 @@ impl TileEngine {
                             .iter()
                             .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                             .collect();
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &a_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                         ];
                         Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
                     }
@@ -843,19 +962,35 @@ impl TileEngine {
                             .iter()
                             .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[2] as usize)))
                             .collect();
+                        let so = |b: u16| -> (f32, f32) {
+                            if req.unscale {
+                                (
+                                    cog.index.scales.get(b as usize).copied().unwrap_or(1.0),
+                                    cog.index.offsets.get(b as usize).copied().unwrap_or(0.0),
+                                )
+                            } else {
+                                (1.0, 0.0)
+                            }
+                        };
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
+                        let (s2, o2) = so(b0[2]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &r_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &g_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s2, o2),
                         ];
                         Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
                     }
@@ -881,19 +1016,35 @@ impl TileEngine {
                             .iter()
                             .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                             .collect();
+                        let so = |b: u16| -> (f32, f32) {
+                            if req.unscale {
+                                (
+                                    cog.index.scales.get(b as usize).copied().unwrap_or(1.0),
+                                    cog.index.offsets.get(b as usize).copied().unwrap_or(0.0),
+                                )
+                            } else {
+                                (1.0, 0.0)
+                            }
+                        };
+                        let (s0, o0) = so(b0[0]);
+                        let (s1, o1) = so(b0[1]);
+                        let (s2, o2) = so(b0[2]);
                         let srcs = [
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &r_refs,
-                            ),
+                            )
+                            .with_scale_offset(s0, o0),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &g_refs,
-                            ),
+                            )
+                            .with_scale_offset(s1, o1),
                             BandSource::new(
                                 ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0,
                                 grid_w, grid_h, &b_refs,
-                            ),
+                            )
+                            .with_scale_offset(s2, o2),
                         ];
                         Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
                     }
@@ -942,11 +1093,22 @@ impl TileEngine {
                         }
                         let srcs: Vec<BandSource<'_>> = band_vecs
                             .iter()
-                            .map(|refs| {
+                            .enumerate()
+                            .map(|(k, refs)| {
+                                let b0 = prog.used_bands[k].saturating_sub(1) as usize;
+                                let (sc, off) = if req.unscale {
+                                    (
+                                        cog.index.scales.get(b0).copied().unwrap_or(1.0),
+                                        cog.index.offsets.get(b0).copied().unwrap_or(0.0),
+                                    )
+                                } else {
+                                    (1.0, 0.0)
+                                };
                                 BandSource::new(
                                     ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0,
                                     ty0, grid_w, grid_h, refs,
                                 )
+                                .with_scale_offset(sc, off)
                             })
                             .collect();
                         Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
@@ -974,11 +1136,22 @@ impl TileEngine {
                         }
                         let srcs: Vec<BandSource<'_>> = band_vecs
                             .iter()
-                            .map(|refs| {
+                            .enumerate()
+                            .map(|(k, refs)| {
+                                let b0 = prog.used_bands[k].saturating_sub(1) as usize;
+                                let (sc, off) = if req.unscale {
+                                    (
+                                        cog.index.scales.get(b0).copied().unwrap_or(1.0),
+                                        cog.index.offsets.get(b0).copied().unwrap_or(0.0),
+                                    )
+                                } else {
+                                    (1.0, 0.0)
+                                };
                                 BandSource::new(
                                     ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0,
                                     ty0, grid_w, grid_h, refs,
                                 )
+                                .with_scale_offset(sc, off)
                             })
                             .collect();
                         Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
@@ -1061,15 +1234,30 @@ impl TileEngine {
                     .iter()
                     .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                     .collect();
+                let apply_unscale = req.unscale && needs_source_unscale(&req.bands, req.format);
+                let cog_so = |slot: usize| -> (f32, f32) {
+                    if apply_unscale {
+                        (
+                            cogs[slot].index.scales.first().copied().unwrap_or(1.0),
+                            cogs[slot].index.offsets.first().copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    }
+                };
+                let (s0, o0) = cog_so(0);
+                let (s1, o1) = cog_so(1);
                 let srcs = [
                     BandSource::new(
                         ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
                         grid_h, &r0,
-                    ),
+                    )
+                    .with_scale_offset(s0, o0),
                     BandSource::new(
                         ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
                         grid_h, &r1,
-                    ),
+                    )
+                    .with_scale_offset(s1, o1),
                 ];
                 match &req.bands {
                     BandRequest::SarRgb {
@@ -1124,17 +1312,21 @@ impl TileEngine {
                                     )));
                                 }
                             };
-                            ordered.push(BandSource::new(
-                                ifd.width,
-                                ifd.height,
-                                ifd.tile_width,
-                                ifd.tile_height,
-                                tx0,
-                                ty0,
-                                grid_w,
-                                grid_h,
-                                refs,
-                            ));
+                            let (sc, off) = cog_so(idx);
+                            ordered.push(
+                                BandSource::new(
+                                    ifd.width,
+                                    ifd.height,
+                                    ifd.tile_width,
+                                    ifd.tile_height,
+                                    tx0,
+                                    ty0,
+                                    grid_w,
+                                    grid_h,
+                                    refs,
+                                )
+                                .with_scale_offset(sc, off),
+                            );
                         }
                         Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
                     }
@@ -1163,19 +1355,36 @@ impl TileEngine {
                     .iter()
                     .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                     .collect();
+                let apply_unscale = req.unscale && needs_source_unscale(&req.bands, req.format);
+                let cog_so = |slot: usize| -> (f32, f32) {
+                    if apply_unscale {
+                        (
+                            cogs[slot].index.scales.first().copied().unwrap_or(1.0),
+                            cogs[slot].index.offsets.first().copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    }
+                };
+                let (s0, o0) = cog_so(0);
+                let (s1, o1) = cog_so(1);
+                let (s2, o2) = cog_so(2);
                 let srcs = [
                     BandSource::new(
                         ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
                         grid_h, &r0,
-                    ),
+                    )
+                    .with_scale_offset(s0, o0),
                     BandSource::new(
                         ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
                         grid_h, &r1,
-                    ),
+                    )
+                    .with_scale_offset(s1, o1),
                     BandSource::new(
                         ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w,
                         grid_h, &r2,
-                    ),
+                    )
+                    .with_scale_offset(s2, o2),
                 ];
                 match &req.bands {
                     BandRequest::Spectral3 {
@@ -1231,17 +1440,21 @@ impl TileEngine {
                                     )));
                                 }
                             };
-                            ordered.push(BandSource::new(
-                                ifd.width,
-                                ifd.height,
-                                ifd.tile_width,
-                                ifd.tile_height,
-                                tx0,
-                                ty0,
-                                grid_w,
-                                grid_h,
-                                refs,
-                            ));
+                            let (sc, off) = cog_so(idx);
+                            ordered.push(
+                                BandSource::new(
+                                    ifd.width,
+                                    ifd.height,
+                                    ifd.tile_width,
+                                    ifd.tile_height,
+                                    tx0,
+                                    ty0,
+                                    grid_w,
+                                    grid_h,
+                                    refs,
+                                )
+                                .with_scale_offset(sc, off),
+                            );
                         }
                         Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
                     }
@@ -1606,6 +1819,7 @@ mod tests {
             bands: rgb_id.clone(),
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Jpeg { quality: 85 },
+            unscale: false,
         };
         assert_eq!(
             aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_jpeg, None, &req_jpeg),
@@ -1618,6 +1832,7 @@ mod tests {
             bands: rgb_id.clone(),
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Webp { quality: Some(85.0) },
+            unscale: false,
         };
         assert_eq!(
             aligned_passthrough_tile_coord::<256>(&CrsModel::Epsg3857, &ifd_webp, None, &req_webp),
@@ -1727,6 +1942,7 @@ mod tests {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Jpeg { quality: 85 },
+            unscale: false,
         };
         let out = engine.render_tile(&cog, &req).await.unwrap();
         let _ = std::fs::remove_file(&tmp_path);

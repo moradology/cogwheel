@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cogzilla_codec::{
-    DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile, decode_tile,
+    DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile_rows,
+    decode_tile_rows,
 };
 use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog};
 use dashmap::DashMap;
@@ -565,8 +566,14 @@ impl CogStore {
                 LookupResult::Hit(hit) => out[slot] = Some(hit),
                 LookupResult::Owner => {
                     let guard = self.cache.guard(key);
-                    let mut decoded =
-                        decode_tile(slice, ifd, cog.index.byte_order, cog.index.nodata)?;
+                    let rows = ifd.block_height(tile_idx);
+                    let mut decoded = decode_tile_rows(
+                        slice,
+                        ifd,
+                        cog.index.byte_order,
+                        cog.index.nodata,
+                        rows,
+                    )?;
                     if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
                         if mask_ifd.tile_width == ifd.tile_width
                             && mask_ifd.tile_height == ifd.tile_height
@@ -577,7 +584,11 @@ impl CogStore {
                             match mask_tile_range(mask_ifd, mask_idx) {
                                 SidecarTileRange::Present(moff, mlen) => {
                                     if let Some(mslice) = cog.source.local_slice(moff, mlen) {
-                                        if let Ok(mask) = decode_mask_tile(mslice, mask_ifd) {
+                                        if let Ok(mask) = decode_mask_tile_rows(
+                                            mslice,
+                                            mask_ifd,
+                                            mask_ifd.block_height(mask_idx),
+                                        ) {
                                             apply_mask_to_tile(&mut decoded, &mask);
                                         }
                                     }
@@ -593,9 +604,13 @@ impl CogStore {
                         match planar_alpha_tile_range(ifd, tile_idx, alpha_plane) {
                             SidecarTileRange::Present(aoff, alen) => {
                                 if let Some(aslice) = cog.source.local_slice(aoff, alen) {
-                                    if let Ok(alpha_tile) =
-                                        decode_tile(aslice, ifd, cog.index.byte_order, None)
-                                    {
+                                    if let Ok(alpha_tile) = decode_tile_rows(
+                                        aslice,
+                                        ifd,
+                                        cog.index.byte_order,
+                                        None,
+                                        rows,
+                                    ) {
                                         if let Some(ab) = alpha_tile.bands.first() {
                                             apply_alpha_band_to_tile(&mut decoded, ab);
                                         }
@@ -701,6 +716,9 @@ impl CogStore {
                     let mut decode_err: Option<IoError> = None;
 
                     for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
+                        let rows = tile_indices[orig_slot]
+                            .map(|tidx| ifd.block_height(tidx))
+                            .unwrap_or(ifd.tile_height);
                         let sem = self.heavy_cpu_sem.clone();
                         let src = cog.source.clone();
                         let meta = decode_meta.clone();
@@ -717,7 +735,9 @@ impl CogStore {
                                         available: 0,
                                     }));
                                 };
-                                Ok::<_, IoError>(decode_tile(slice, &meta, byte_order, nodata)?)
+                                Ok::<_, IoError>(decode_tile_rows(
+                                    slice, &meta, byte_order, nodata, rows,
+                                )?)
                             })
                             .await
                             .map_err(|e| {
@@ -772,6 +792,9 @@ impl CogStore {
                                 }
                             }
                         }
+                        let rows = tile_indices[orig_slot]
+                            .map(|tidx| ifd.block_height(tidx))
+                            .unwrap_or(ifd.tile_height);
                         let src = cog.source.clone();
                         let meta = decode_meta.clone();
                         decode_set.spawn(async move {
@@ -781,7 +804,8 @@ impl CogStore {
                                     available: 0,
                                 }));
                             };
-                            let decoded = decode_tile(slice, &meta, byte_order, nodata)?;
+                            let decoded =
+                                decode_tile_rows(slice, &meta, byte_order, nodata, rows)?;
                             let arc = Arc::new(decoded);
                             if let Some(guard) = guard_opt {
                                 guard.complete(arc.clone());
@@ -818,7 +842,10 @@ impl CogStore {
                                 available: 0,
                             }));
                         };
-                        let mut decoded = decode_tile(slice, ifd, byte_order, nodata)?;
+                        let rows = tile_indices[orig_slot]
+                            .map(|tidx| ifd.block_height(tidx))
+                            .unwrap_or(ifd.tile_height);
+                        let mut decoded = decode_tile_rows(slice, ifd, byte_order, nodata, rows)?;
                         if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
                             if mask_ifd.tile_width == ifd.tile_width
                                 && mask_ifd.tile_height == ifd.tile_height
@@ -838,7 +865,11 @@ impl CogStore {
                                                     },
                                                 ));
                                             };
-                                            let mask = decode_mask_tile(mslice, mask_ifd)?;
+                                            let mask = decode_mask_tile_rows(
+                                                mslice,
+                                                mask_ifd,
+                                                mask_ifd.block_height(mask_idx),
+                                            )?;
                                             apply_mask_to_tile(&mut decoded, &mask);
                                         }
                                         SidecarTileRange::SparseTransparent => {
@@ -861,7 +892,7 @@ impl CogStore {
                                             }));
                                         };
                                         let alpha_tile =
-                                            decode_tile(aslice, ifd, byte_order, None)?;
+                                            decode_tile_rows(aslice, ifd, byte_order, None, rows)?;
                                         if let Some(ab) = alpha_tile.bands.first() {
                                             apply_alpha_band_to_tile(&mut decoded, ab);
                                         }
@@ -905,6 +936,9 @@ impl CogStore {
                             let mut disk_set = tokio::task::JoinSet::new();
                             for (item, key, path) in disk_candidates {
                                 let (orig_slot, guard_opt, offset, count) = item;
+                                let rows = tile_indices[orig_slot]
+                                    .map(|tidx| ifd.block_height(tidx))
+                                    .unwrap_or(ifd.tile_height);
                                 let dc_c = dc.clone();
                                 let m = meta.clone();
                                 disk_set.spawn(async move {
@@ -915,9 +949,13 @@ impl CogStore {
                                     .ok()
                                     .flatten();
                                     if let Some(compressed) = read_res {
-                                        if let Ok(decoded) =
-                                            decode_tile(&compressed, &m, byte_order, nodata)
-                                        {
+                                        if let Ok(decoded) = decode_tile_rows(
+                                            &compressed,
+                                            &m,
+                                            byte_order,
+                                            nodata,
+                                            rows,
+                                        ) {
                                             let arc = Arc::new(decoded);
                                             if let Some(guard) = guard_opt {
                                                 guard.complete(arc.clone());
@@ -1065,6 +1103,9 @@ impl CogStore {
                                                 );
                                             }
                                         }
+                                        let rows = tile_indices[orig_slot]
+                                            .map(|tidx| ifd.block_height(tidx))
+                                            .unwrap_or(ifd.tile_height);
                                         let guard = guard_opt.take();
                                         let m = meta.clone();
                                         let sem = if heavy_block {
@@ -1081,7 +1122,9 @@ impl CogStore {
                                                         )))
                                                     })?;
                                                 tokio::task::spawn_blocking(move || {
-                                                    decode_tile(&slice, &m, byte_order, nodata)
+                                                    decode_tile_rows(
+                                                        &slice, &m, byte_order, nodata, rows,
+                                                    )
                                                 })
                                                 .await
                                                 .map_err(|e| {
@@ -1090,7 +1133,9 @@ impl CogStore {
                                                     )))
                                                 })??
                                             } else {
-                                                decode_tile(&slice, &m, byte_order, nodata)?
+                                                decode_tile_rows(
+                                                    &slice, &m, byte_order, nodata, rows,
+                                                )?
                                             };
                                             let arc = Arc::new(decoded);
                                             if let Some(g) = guard {
@@ -1295,11 +1340,17 @@ impl CogStore {
                                                 }
                                             }
                                         }
-                                        match decode_tile(
+                                        let rows = tile_indices
+                                            .get(*orig_slot)
+                                            .and_then(|o| *o)
+                                            .map(|tidx| ifd.block_height(tidx))
+                                            .unwrap_or(ifd.tile_height);
+                                        match decode_tile_rows(
                                             &data[rel_start..rel_end],
                                             ifd,
                                             byte_order,
                                             nodata,
+                                            rows,
                                         ) {
                                             Ok(mut decoded) => {
                                                 if sparse_transparent_by_slot[idx_in_span] {
@@ -1308,7 +1359,21 @@ impl CogStore {
                                                     ifd.mask_ifd.as_deref(),
                                                     mask_bytes_by_slot[idx_in_span].as_ref(),
                                                 ) {
-                                                    match decode_mask_tile(mbytes, mask_ifd) {
+                                                    let mask_rows = tile_indices
+                                                        .get(*orig_slot)
+                                                        .and_then(|o| *o)
+                                                        .map(|tidx| {
+                                                            let per_plane = (ifd.tiles_across
+                                                                as usize)
+                                                                * (ifd.tiles_down as usize);
+                                                            mask_ifd.block_height(
+                                                                (tidx as usize) % per_plane.max(1),
+                                                            )
+                                                        })
+                                                        .unwrap_or(mask_ifd.tile_height);
+                                                    match decode_mask_tile_rows(
+                                                        mbytes, mask_ifd, mask_rows,
+                                                    ) {
                                                         Ok(mask) => {
                                                             apply_mask_to_tile(&mut decoded, &mask);
                                                         }
@@ -1321,8 +1386,9 @@ impl CogStore {
                                                 if let Some(abytes) =
                                                     alpha_bytes_by_slot[idx_in_span].as_ref()
                                                 {
-                                                    match decode_tile(abytes, ifd, byte_order, None)
-                                                    {
+                                                    match decode_tile_rows(
+                                                        abytes, ifd, byte_order, None, rows,
+                                                    ) {
                                                         Ok(alpha_tile) => {
                                                             if let Some(ab) =
                                                                 alpha_tile.bands.first()

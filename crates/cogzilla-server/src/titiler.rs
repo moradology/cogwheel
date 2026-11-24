@@ -160,6 +160,7 @@ pub async fn query_point(
     cog: &OpenedCog,
     lon: f64,
     lat: f64,
+    unscale: bool,
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
@@ -188,17 +189,30 @@ pub async fn query_point(
     let ly = (row as u32) % ifd.tile_height;
     let pidx = (ly as usize) * (ifd.tile_width as usize) + (lx as usize);
 
+    let maybe_unscale = |b: usize, v: f32| -> f32 {
+        if unscale && !v.is_nan() {
+            let sc = cog.index.scales.get(b).copied().unwrap_or(1.0);
+            let off = cog.index.offsets.get(b).copied().unwrap_or(0.0);
+            v * sc + off
+        } else {
+            v
+        }
+    };
+
     let mut values: Vec<serde_json::Value> = Vec::with_capacity(count);
     match ifd.planar_config {
         PlanarConfig::Chunky => {
             let idx = ifd.tile_index(tx, ty, 0) as u32;
             let tiles = engine.store.get_blocks(cog, 0, &[Some(idx)]).await?;
             for b in 0..count {
-                let v = tiles[0]
-                    .as_ref()
-                    .and_then(|t| t.bands.get(b))
-                    .map(|band| band.data.get_f32(pidx))
-                    .unwrap_or(f32::NAN);
+                let v = maybe_unscale(
+                    b,
+                    tiles[0]
+                        .as_ref()
+                        .and_then(|t| t.bands.get(b))
+                        .map(|band| band.data.get_f32(pidx))
+                        .unwrap_or(f32::NAN),
+                );
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
                 } else {
@@ -212,11 +226,14 @@ pub async fn query_point(
                 .collect();
             let tiles = engine.store.get_blocks(cog, 0, &indices).await?;
             for b in 0..count {
-                let v = tiles[b]
-                    .as_ref()
-                    .and_then(|t| t.bands.first())
-                    .map(|band| band.data.get_f32(pidx))
-                    .unwrap_or(f32::NAN);
+                let v = maybe_unscale(
+                    b,
+                    tiles[b]
+                        .as_ref()
+                        .and_then(|t| t.bands.first())
+                        .map(|band| band.data.get_f32(pidx))
+                        .unwrap_or(f32::NAN),
+                );
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
                 } else {
@@ -1316,6 +1333,7 @@ pub async fn render_wgs84_bbox(
     custom_lut: Option<&ColormapLut>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
+    unscale: bool,
 ) -> Result<Bytes, EngineError> {
     render_bbox_impl(
         engine,
@@ -1332,6 +1350,7 @@ pub async fn render_wgs84_bbox(
         custom_lut,
         color_formula,
         return_mask,
+        unscale,
     )
     .await
 }
@@ -1352,6 +1371,7 @@ pub async fn render_mercator_bbox(
     custom_lut: Option<&ColormapLut>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
+    unscale: bool,
 ) -> Result<Bytes, EngineError> {
     render_bbox_impl(
         engine,
@@ -1368,6 +1388,7 @@ pub async fn render_mercator_bbox(
         custom_lut,
         color_formula,
         return_mask,
+        unscale,
     )
     .await
 }
@@ -1388,6 +1409,7 @@ async fn render_bbox_impl(
     custom_lut: Option<&ColormapLut>,
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
+    unscale: bool,
 ) -> Result<Bytes, EngineError> {
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
@@ -1742,6 +1764,26 @@ async fn render_bbox_impl(
     let ifd_tile_width = ifd.tile_width;
     let ifd_tile_height = ifd.tile_height;
     let num_cogs = cogs.len();
+    let band_scale_offsets: Vec<(f32, f32)> = if num_cogs > 1 {
+        cogs.iter()
+            .map(|c| {
+                (
+                    c.index.scales.first().copied().unwrap_or(1.0),
+                    c.index.offsets.first().copied().unwrap_or(0.0),
+                )
+            })
+            .collect()
+    } else {
+        let n = primary.index.scales.len().max(primary.index.offsets.len());
+        (0..n)
+            .map(|i| {
+                (
+                    primary.index.scales.get(i).copied().unwrap_or(1.0),
+                    primary.index.offsets.get(i).copied().unwrap_or(0.0),
+                )
+            })
+            .collect()
+    };
 
     let render_cpu = move |u_map: Vec<f32>,
                            v_map: Vec<f32>,
@@ -1819,38 +1861,57 @@ async fn render_bbox_impl(
             }
         };
 
+        let apply_source_unscale =
+            unscale && crate::engine::needs_source_unscale(bands, format);
+
         // Helper to build BandSource for 1-based band index across single (chunky/planar) or multi-COG
-        let get_band_refs =
-            |b_1based: u16, asset_slot: usize| -> Vec<Option<&cogzilla_codec::DecodedBand>> {
-                if num_cogs > 1 {
-                    let slot = asset_slot.min(num_cogs - 1);
-                    cog_tiles[slot]
+        let get_band_refs = |b_1based: u16,
+                             asset_slot: usize|
+         -> (Vec<Option<&cogzilla_codec::DecodedBand>>, (f32, f32)) {
+            let so = if !apply_source_unscale {
+                (1.0, 0.0)
+            } else if num_cogs > 1 {
+                band_scale_offsets
+                    .get(asset_slot.min(num_cogs - 1))
+                    .copied()
+                    .unwrap_or((1.0, 0.0))
+            } else {
+                band_scale_offsets
+                    .get(b_1based.saturating_sub(1) as usize)
+                    .copied()
+                    .unwrap_or((1.0, 0.0))
+            };
+            let refs = if num_cogs > 1 {
+                let slot = asset_slot.min(num_cogs - 1);
+                cog_tiles[slot]
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                    .collect()
+            } else if is_single_planar {
+                let b0 = b_1based.saturating_sub(1);
+                if let Some(pos) = planar_bands.iter().position(|&b| b == b0) {
+                    let start = pos * grid_len;
+                    let end = (start + grid_len).min(cog_tiles[0].len());
+                    cog_tiles[0][start..end]
                         .iter()
                         .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                         .collect()
-                } else if is_single_planar {
-                    let b0 = b_1based.saturating_sub(1);
-                    if let Some(pos) = planar_bands.iter().position(|&b| b == b0) {
-                        let start = pos * grid_len;
-                        let end = (start + grid_len).min(cog_tiles[0].len());
-                        cog_tiles[0][start..end]
-                            .iter()
-                            .map(|o| o.as_ref().and_then(|t| t.bands.first()))
-                            .collect()
-                    } else {
-                        vec![None; grid_len]
-                    }
                 } else {
-                    let b0 = b_1based.saturating_sub(1) as usize;
-                    cog_tiles[0]
-                        .iter()
-                        .map(|o| o.as_ref().and_then(|t| t.bands.get(b0)))
-                        .collect()
+                    vec![None; grid_len]
                 }
+            } else {
+                let b0 = b_1based.saturating_sub(1) as usize;
+                cog_tiles[0]
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0)))
+                    .collect()
             };
+            (refs, so)
+        };
 
         macro_rules! make_src {
-            ($refs:expr) => {
+            ($refs:expr) => {{
+                let (ref blocks, (sc, off)) = *$refs;
                 BandSource::new(
                     ifd_width,
                     ifd_height,
@@ -1860,10 +1921,11 @@ async fn render_bbox_impl(
                     ty0,
                     grid_w,
                     grid_h,
-                    $refs,
+                    blocks,
                 )
                 .with_nodata_override(nodata_override)
-            };
+                .with_scale_offset(sc, off)
+            }};
         }
 
         // Real RawF32 output for single-band / expression / DEM / Terrain requests

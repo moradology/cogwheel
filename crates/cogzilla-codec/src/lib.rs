@@ -73,12 +73,28 @@ pub fn decode_tile(
     byte_order: ByteOrder,
     nodata: Option<f32>,
 ) -> Result<DecodedTile, CodecError> {
+    decode_tile_rows(compressed, ifd, byte_order, nodata, ifd.tile_height)
+}
+
+/// Decompress and reconstruct a single TIFF tile or strip with an explicit row count `actual_rows`
+/// (which is `< ifd.tile_height` for the final partial strip of a stripped TIFF).
+///
+/// Decoding only `actual_rows` avoids trailing zero-padding in `BlockStats`, prevents false
+/// `alpha == 0` detection on stripped RGBA rasters, and eliminates stale scratch bytes on WebP strips.
+pub fn decode_tile_rows(
+    compressed: &[u8],
+    ifd: &IfdMeta,
+    byte_order: ByteOrder,
+    nodata: Option<f32>,
+    actual_rows: u32,
+) -> Result<DecodedTile, CodecError> {
+    let tile_h = actual_rows.min(ifd.tile_height).max(1);
     let bands_in_tile = match ifd.planar_config {
         PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
         PlanarConfig::Planar => 1,
     };
     let expected_bytes = (ifd.tile_width as usize)
-        .checked_mul(ifd.tile_height as usize)
+        .checked_mul(tile_h as usize)
         .and_then(|n| n.checked_mul(bands_in_tile))
         .and_then(|n| n.checked_mul(ifd.sample_type.bytes_per_sample()))
         .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
@@ -96,7 +112,7 @@ pub fn decode_tile(
             SampleType::Float32 => predictor::reconstruct_predictor1(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 nodata,
@@ -104,7 +120,7 @@ pub fn decode_tile(
             SampleType::Uint16 => predictor::reconstruct_u16(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 false,
@@ -113,7 +129,7 @@ pub fn decode_tile(
             SampleType::Int16 => predictor::reconstruct_i16(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 false,
@@ -122,7 +138,7 @@ pub fn decode_tile(
             SampleType::Uint8 => predictor::reconstruct_u8(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 false,
                 nodata,
@@ -130,7 +146,7 @@ pub fn decode_tile(
             SampleType::Int8 => predictor::reconstruct_i8(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 false,
                 nodata,
@@ -138,7 +154,7 @@ pub fn decode_tile(
             SampleType::Uint32 => predictor::reconstruct_int32(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 false,
@@ -148,7 +164,7 @@ pub fn decode_tile(
             SampleType::Int32 => predictor::reconstruct_int32(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 true,
@@ -160,7 +176,7 @@ pub fn decode_tile(
                 predictor::reconstruct_f64(
                     &mut copy,
                     ifd.tile_width,
-                    ifd.tile_height,
+                    tile_h,
                     bands_in_tile,
                     byte_order,
                     Predictor::None,
@@ -270,7 +286,7 @@ pub fn decode_tile(
 
                 let opts = DecoderOptions::default()
                     .set_max_width(ifd.tile_width as usize)
-                    .set_max_height(ifd.tile_height as usize);
+                    .set_max_height(tile_h as usize);
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(jpeg_bytes, opts);
                 dec.decode_headers()
                     .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
@@ -328,7 +344,7 @@ pub fn decode_tile(
             (SampleType::Float32, Predictor::None) => predictor::reconstruct_predictor1(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 nodata,
@@ -336,7 +352,7 @@ pub fn decode_tile(
             (SampleType::Float32, Predictor::HorizontalInt) => predictor::reconstruct_predictor2(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 nodata,
@@ -344,14 +360,14 @@ pub fn decode_tile(
             (SampleType::Float32, Predictor::FloatingPoint) => predictor::reconstruct_predictor3(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 nodata,
             ),
             (SampleType::Uint16, Predictor::None) => predictor::reconstruct_u16(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 false,
@@ -360,7 +376,7 @@ pub fn decode_tile(
             (SampleType::Uint16, Predictor::HorizontalInt) => predictor::reconstruct_u16(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 true,
@@ -369,7 +385,7 @@ pub fn decode_tile(
             (SampleType::Uint16, Predictor::FloatingPoint) => predictor::reconstruct_u16(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 false,
@@ -378,7 +394,7 @@ pub fn decode_tile(
             (SampleType::Int16, p) => predictor::reconstruct_i16(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 p == Predictor::HorizontalInt,
@@ -387,7 +403,7 @@ pub fn decode_tile(
             (SampleType::Uint8, p) => predictor::reconstruct_u8(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 p == Predictor::HorizontalInt,
                 nodata,
@@ -395,7 +411,7 @@ pub fn decode_tile(
             (SampleType::Int8, p) => predictor::reconstruct_i8(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 p == Predictor::HorizontalInt,
                 nodata,
@@ -403,7 +419,7 @@ pub fn decode_tile(
             (SampleType::Uint32, p) => predictor::reconstruct_int32(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 false,
@@ -413,7 +429,7 @@ pub fn decode_tile(
             (SampleType::Int32, p) => predictor::reconstruct_int32(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 true,
@@ -423,7 +439,7 @@ pub fn decode_tile(
             (SampleType::Float64, p) => predictor::reconstruct_f64(
                 raw_slice,
                 ifd.tile_width,
-                ifd.tile_height,
+                tile_h,
                 bands_in_tile,
                 byte_order,
                 p,
@@ -514,8 +530,18 @@ fn apply_alpha_slice_to_band(b: &mut DecodedBand, alpha: &[f32]) {
 /// Decompress a 1-bit (packed MSB-first per row) or 8-bit internal transparency mask tile
 /// (`NewSubfileType & 4 != 0`) into a `tile_width * tile_height` byte mask (`0` = transparent, `255` = opaque).
 pub fn decode_mask_tile(compressed: &[u8], mask: &MaskIfdMeta) -> Result<Vec<u8>, CodecError> {
+    decode_mask_tile_rows(compressed, mask, mask.tile_height)
+}
+
+/// Decompress a 1-bit or 8-bit internal transparency mask tile or strip with an explicit row count
+/// `actual_rows` (which is `< mask.tile_height` for the final partial strip of a stripped mask IFD).
+pub fn decode_mask_tile_rows(
+    compressed: &[u8],
+    mask: &MaskIfdMeta,
+    actual_rows: u32,
+) -> Result<Vec<u8>, CodecError> {
     let w = mask.tile_width as usize;
-    let h = mask.tile_height as usize;
+    let h = actual_rows.min(mask.tile_height).max(1) as usize;
     let row_bytes = if mask.bits_per_sample == 1 {
         w.div_ceil(8)
     } else {
@@ -723,6 +749,7 @@ mod tests {
             bits_per_sample: 8,
             compression: Compression::None,
             predictor: Predictor::HorizontalInt,
+            is_stripped: false,
             tile_offsets: Box::new([0]),
             tile_byte_counts: Box::new([8]),
         };
@@ -734,5 +761,66 @@ mod tests {
         assert_eq!(alpha_channel_index(2, &[2]), Some(1));
         assert_eq!(alpha_channel_index(4, &[1]), Some(3));
         assert_eq!(alpha_channel_index(4, &[0]), None);
+    }
+
+    #[test]
+    fn decode_tile_rows_clamps_partial_final_strip_stats_and_rgba_alpha() {
+        // 2x5 stripped RGBA image with tile_height=4: final strip has actual_rows=1 (2 pixels = 8 bytes).
+        // All alpha values in that 1 row are 255 (opaque), so stats must stay no_nodata=true
+        // and min=100.0 (not polluted by zero-padded rows 1..4!).
+        let ifd = IfdMeta {
+            width: 2,
+            height: 5,
+            tile_width: 2,
+            tile_height: 4,
+            tiles_across: 1,
+            tiles_down: 2,
+            samples_per_pixel: 4,
+            sample_type: SampleType::Uint8,
+            planar_config: PlanarConfig::Chunky,
+            compression: Compression::None,
+            predictor: Predictor::None,
+            photometric: 2,
+            extra_samples: vec![2],
+            jpeg_tables: None,
+            mask_ifd: None,
+            is_stripped: true,
+            pixel_to_crs: cogzilla_tiff::Affine2D {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 0.0,
+                e: 1.0,
+                f: 0.0,
+            },
+            crs_to_pixel: cogzilla_tiff::Affine2D {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 0.0,
+                e: 1.0,
+                f: 0.0,
+            },
+            tile_offsets: Box::new([0, 32]),
+            tile_byte_counts: Box::new([32, 8]),
+        };
+        assert_eq!(ifd.block_height(0), 4);
+        assert_eq!(ifd.block_height(1), 1);
+
+        let raw_last_strip = [100u8, 120, 140, 255, 200, 210, 220, 255];
+        let tile = decode_tile_rows(
+            &raw_last_strip,
+            &ifd,
+            ByteOrder::Little,
+            None,
+            ifd.block_height(1),
+        )
+        .unwrap();
+        assert_eq!(tile.bands[0].height, 1);
+        assert_eq!(tile.bands[0].data.len(), 2);
+        assert!(tile.bands[0].stats.no_nodata);
+        assert_eq!(tile.bands[0].stats.min, 100.0);
+        assert_eq!(tile.bands[0].stats.max, 200.0);
+        assert_eq!(tile.bands[3].stats.min, 255.0);
     }
 }
