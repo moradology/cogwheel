@@ -975,6 +975,11 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
         let mut ys = [0i32; 4];
         let mut out_r = [0u32; 4];
         let mut out_g = [0u32; 4];
+        let max_x = (stride as i32 - 2).max(0);
+        let max_y = ((r_slice.len() / stride) as i32 - 2).max(0);
+        let v_zero_i = vdupq_n_s32(0);
+        let v_max_x = vdupq_n_s32(max_x);
+        let v_max_y = vdupq_n_s32(max_y);
         let mut out_b = [0u32; 4];
 
         let mut px = 0usize;
@@ -985,8 +990,10 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
             let y0_f = vrndmq_f32(v);
             let fx = vsubq_f32(u, x0_f);
             let fy = vsubq_f32(v, y0_f);
-            vst1q_s32(xs.as_mut_ptr(), vcvtq_s32_f32(x0_f));
-            vst1q_s32(ys.as_mut_ptr(), vcvtq_s32_f32(y0_f));
+            let vx = vminq_s32(vmaxq_s32(vcvtq_s32_f32(x0_f), v_zero_i), v_max_x);
+            let vy = vminq_s32(vmaxq_s32(vcvtq_s32_f32(y0_f), v_zero_i), v_max_y);
+            vst1q_s32(xs.as_mut_ptr(), vx);
+            vst1q_s32(ys.as_mut_ptr(), vy);
 
             let p0 = (ys[0] as usize) * stride + (xs[0] as usize);
             let p1 = (ys[1] as usize) * stride + (xs[1] as usize);
@@ -1061,10 +1068,15 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     }
 
     #[allow(unreachable_code)]
-    for px in 0..N {
-        let (x0, fx) = fast_floor_i32(u_row[px] - bc);
-        let (y0, fy) = fast_floor_i32(v_row[px] - br);
-        let p00 = (y0 as usize) * stride + (x0 as usize);
+    {
+        let max_x = (stride as i32 - 2).max(0);
+        let max_y = ((r_slice.len() / stride) as i32 - 2).max(0);
+        for px in 0..N {
+        let (x0_raw, fx) = fast_floor_i32(u_row[px] - bc);
+        let (y0_raw, fy) = fast_floor_i32(v_row[px] - br);
+        let x0 = x0_raw.clamp(0, max_x) as usize;
+        let y0 = y0_raw.clamp(0, max_y) as usize;
+        let p00 = y0 * stride + x0;
         let p01 = p00 + stride;
         unsafe {
             let r00 = to_f32(*r_ptr.add(p00));
@@ -1095,6 +1107,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
             *row_rgb.get_unchecked_mut(off) = rescale_u8(r, inv[0], mins[0]);
             *row_rgb.get_unchecked_mut(off + 1) = rescale_u8(g, inv[1], mins[1]);
             *row_rgb.get_unchecked_mut(off + 2) = rescale_u8(b, inv[2], mins[2]);
+        }
         }
     }
 }
@@ -1132,6 +1145,11 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
     let mut ys = [0i32; 8];
     let mut out_r = [0i32; 8];
     let mut out_g = [0i32; 8];
+    let max_x = (stride as i32 - 2).max(0);
+    let max_y = ((r_slice.len() / stride) as i32 - 2).max(0);
+    let v_zero_i = _mm256_setzero_si256();
+    let v_max_x = _mm256_set1_epi32(max_x);
+    let v_max_y = _mm256_set1_epi32(max_y);
     let mut out_b = [0i32; 8];
 
     let mut px = 0usize;
@@ -1142,8 +1160,10 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
         let y0_f = _mm256_floor_ps(v);
         let fx = _mm256_sub_ps(u, x0_f);
         let fy = _mm256_sub_ps(v, y0_f);
-        _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, _mm256_cvtps_epi32(x0_f));
-        _mm256_storeu_si256(ys.as_mut_ptr() as *mut __m256i, _mm256_cvtps_epi32(y0_f));
+        let vx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero_i), v_max_x);
+        let vy = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(y0_f), v_zero_i), v_max_y);
+        _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, vx);
+        _mm256_storeu_si256(ys.as_mut_ptr() as *mut __m256i, vy);
 
         let mut p = [0usize; 8];
         for k in 0..8 {
@@ -1229,10 +1249,14 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
                 && (inv[0] - 1.0).abs() < 1e-6
                 && (inv[1] - 1.0).abs() < 1e-6
                 && (inv[2] - 1.0).abs() < 1e-6;
+            let max_x = (st as i32 - 2).max(0);
+            let max_y = ((rgb0.len() / stride3) as i32 - 2).max(0);
             for px in 0..N {
-                let (x0, fx) = fast_floor_i32(u_row[px] - bc_f);
-                let (y0, fy) = fast_floor_i32(v_row[px] - br_f);
-                let p00 = (y0 as usize) * stride3 + (x0 as usize) * 3;
+                let (x0_raw, fx) = fast_floor_i32(u_row[px] - bc_f);
+                let (y0_raw, fy) = fast_floor_i32(v_row[px] - br_f);
+                let x0 = x0_raw.clamp(0, max_x) as usize;
+                let y0 = y0_raw.clamp(0, max_y) as usize;
+                let p00 = y0 * stride3 + x0 * 3;
                 let p01 = p00 + stride3;
                 let w00 = (1.0 - fx) * (1.0 - fy);
                 let w10 = fx * (1.0 - fy);
@@ -1965,6 +1989,7 @@ pub fn render_sar_rgb<const N: usize>(
                 OutputFormat::Webp { quality } => {
                     encode_webp_rgba(N as u32, N as u32, buf, quality)
                 }
+                OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
                 _ => unreachable!(),
             }
         }),

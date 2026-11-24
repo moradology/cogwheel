@@ -30,18 +30,52 @@ pub struct ExprProgram {
     pub used_bands: Vec<u16>,
 }
 
+const MAX_PARSE_DEPTH: usize = 64;
+const MAX_VM_STACK: usize = 32;
+const MAX_EXPR_BANDS: usize = 16;
+
 impl ExprProgram {
     pub fn compile(input: &str) -> Result<Self, String> {
         let tokens = tokenize(input)?;
         let mut p = Parser {
             tokens: &tokens,
             pos: 0,
+            depth: 0,
             ops: Vec::with_capacity(tokens.len()),
             used_bands: Vec::new(),
         };
         p.parse_expr()?;
         if p.pos < p.tokens.len() {
             return Err(format!("unexpected trailing token at position {}", p.pos));
+        }
+        if p.used_bands.len() > MAX_EXPR_BANDS {
+            return Err(format!(
+                "expression references {} distinct bands (max {MAX_EXPR_BANDS})",
+                p.used_bands.len()
+            ));
+        }
+        // Validate peak VM stack depth so eval() can never overflow its fixed 32-slot stack.
+        let mut max_depth = 0usize;
+        let mut depth = 0usize;
+        for &op in &p.ops {
+            match op {
+                Op::PushConst(_) | Op::LoadBand(_) => {
+                    depth += 1;
+                    max_depth = max_depth.max(depth);
+                }
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Pow | Op::Min | Op::Max => {
+                    depth = depth.saturating_sub(1);
+                }
+                Op::Clip => {
+                    depth = depth.saturating_sub(2);
+                }
+                _ => {}
+            }
+        }
+        if max_depth > MAX_VM_STACK {
+            return Err(format!(
+                "expression nesting depth ({max_depth}) exceeds limit ({MAX_VM_STACK})"
+            ));
         }
         Ok(Self {
             ops: p.ops,
@@ -52,7 +86,7 @@ impl ExprProgram {
     /// Zero-alloc in-register stack VM evaluation for a single pixel's sampled band values.
     #[inline(always)]
     pub fn eval(&self, bands: &[f32]) -> f32 {
-        let mut stack = [0.0f32; 32];
+        let mut stack = [0.0f32; MAX_VM_STACK];
         let mut sp = 0usize;
         for &op in &self.ops {
             match op {
@@ -61,7 +95,7 @@ impl ExprProgram {
                     sp += 1;
                 }
                 Op::LoadBand(slot) => {
-                    let v = unsafe { *bands.get_unchecked(slot as usize) };
+                    let v = bands.get(slot as usize).copied().unwrap_or(f32::NAN);
                     if v.is_nan() {
                         return f32::NAN;
                     }
@@ -91,7 +125,13 @@ impl ExprProgram {
                 }
                 Op::Pow => {
                     sp -= 1;
-                    stack[sp - 1] = stack[sp - 1].powf(stack[sp]);
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() {
+                        f32::NAN
+                    } else {
+                        a.powf(b)
+                    };
                 }
                 Op::Neg => {
                     stack[sp - 1] = -stack[sp - 1];
@@ -123,17 +163,35 @@ impl ExprProgram {
                 }
                 Op::Min => {
                     sp -= 1;
-                    stack[sp - 1] = stack[sp - 1].min(stack[sp]);
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() {
+                        f32::NAN
+                    } else {
+                        a.min(b)
+                    };
                 }
                 Op::Max => {
                     sp -= 1;
-                    stack[sp - 1] = stack[sp - 1].max(stack[sp]);
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() {
+                        f32::NAN
+                    } else {
+                        a.max(b)
+                    };
                 }
                 Op::Clip => {
                     let hi = stack[sp - 1];
                     let lo = stack[sp - 2];
                     sp -= 2;
-                    stack[sp - 1] = stack[sp - 1].clamp(lo, hi);
+                    let x = stack[sp - 1];
+                    stack[sp - 1] = if x.is_nan() || lo.is_nan() || hi.is_nan() {
+                        f32::NAN
+                    } else {
+                        let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                        x.clamp(a, b)
+                    };
                 }
             }
         }
@@ -320,7 +378,8 @@ impl ExprProgram {
                         target[i] = if x.is_nan() || a.is_nan() || b.is_nan() {
                             f32::NAN
                         } else {
-                            x.clamp(a, b)
+                            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                            x.clamp(lo, hi)
                         };
                     }
                     sp -= 2;
@@ -435,6 +494,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
 struct Parser<'a> {
     tokens: &'a [Tok],
     pos: usize,
+    depth: usize,
     ops: Vec<Op>,
     used_bands: Vec<u16>,
 }
@@ -442,6 +502,16 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Tok> {
         self.tokens.get(self.pos)
+    }
+
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(format!(
+                "expression nesting exceeds maximum depth ({MAX_PARSE_DEPTH})"
+            ));
+        }
+        Ok(())
     }
 
     fn band_slot(&mut self, band_1based: u16) -> u8 {
@@ -455,37 +525,42 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Result<(), String> {
-        self.parse_term()?;
-        while let Some(tok) = self.peek().cloned() {
-            match tok {
-                Tok::Plus => {
-                    self.pos += 1;
-                    self.parse_term()?;
-                    self.ops.push(Op::Add);
+        self.enter()?;
+        let res = (|| {
+            self.parse_term()?;
+            while let Some(tok) = self.peek().cloned() {
+                match tok {
+                    Tok::Plus => {
+                        self.pos += 1;
+                        self.parse_term()?;
+                        self.ops.push(Op::Add);
+                    }
+                    Tok::Minus => {
+                        self.pos += 1;
+                        self.parse_term()?;
+                        self.ops.push(Op::Sub);
+                    }
+                    _ => break,
                 }
-                Tok::Minus => {
-                    self.pos += 1;
-                    self.parse_term()?;
-                    self.ops.push(Op::Sub);
-                }
-                _ => break,
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn parse_term(&mut self) -> Result<(), String> {
-        self.parse_power()?;
+        self.parse_unary()?;
         while let Some(tok) = self.peek().cloned() {
             match tok {
                 Tok::Star => {
                     self.pos += 1;
-                    self.parse_power()?;
+                    self.parse_unary()?;
                     self.ops.push(Op::Mul);
                 }
                 Tok::Slash => {
                     self.pos += 1;
-                    self.parse_power()?;
+                    self.parse_unary()?;
                     self.ops.push(Op::Div);
                 }
                 _ => break,
@@ -494,18 +569,10 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_power(&mut self) -> Result<(), String> {
-        self.parse_unary()?;
-        if matches!(self.peek(), Some(Tok::Caret)) {
-            self.pos += 1;
-            self.parse_power()?;
-            self.ops.push(Op::Pow);
-        }
-        Ok(())
-    }
-
+    // Standard math/Python precedence: `-x^2 == -(x^2)` and `2^-3 == 2^(-3)`.
     fn parse_unary(&mut self) -> Result<(), String> {
-        match self.peek() {
+        self.enter()?;
+        let res = match self.peek() {
             Some(Tok::Minus) => {
                 self.pos += 1;
                 self.parse_unary()?;
@@ -516,8 +583,20 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 self.parse_unary()
             }
-            _ => self.parse_primary(),
+            _ => self.parse_power(),
+        };
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_power(&mut self) -> Result<(), String> {
+        self.parse_primary()?;
+        if matches!(self.peek(), Some(Tok::Caret)) {
+            self.pos += 1;
+            self.parse_unary()?;
+            self.ops.push(Op::Pow);
         }
+        Ok(())
     }
 
     fn parse_primary(&mut self) -> Result<(), String> {
@@ -614,6 +693,32 @@ mod tests {
 
         let db = ExprProgram::compile("10 * log10(b1)").unwrap();
         assert!((db.eval(&[0.01]) - (-20.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn expr_vm_safety_precedence_and_nan_propagation() {
+        // -b1^2 must be -(b1^2) = -9, not (-3)^2 = +9; 2^-3 must be 0.125
+        let p = ExprProgram::compile("-b1^2").unwrap();
+        assert!((p.eval(&[3.0]) - (-9.0)).abs() < 1e-6);
+        let p2 = ExprProgram::compile("2^-3").unwrap();
+        assert!((p2.eval(&[]) - 0.125).abs() < 1e-6);
+
+        // clip with inverted bounds (lo > hi) must not panic
+        let pc = ExprProgram::compile("clip(b1, 10, 5)").unwrap();
+        assert!((pc.eval(&[7.0]) - 7.0).abs() < 1e-6);
+        assert!((pc.eval(&[2.0]) - 5.0).abs() < 1e-6);
+
+        // min/max/pow must propagate NaN instead of swallowing it
+        let pm = ExprProgram::compile("min(b1 / (b1 - b1), 5.0)").unwrap();
+        assert!(pm.eval(&[1.0]).is_nan());
+
+        // >16 distinct bands must be rejected at compile time
+        let many_bands = (1..=17).map(|i| format!("b{i}")).collect::<Vec<_>>().join("+");
+        assert!(ExprProgram::compile(&many_bands).is_err());
+
+        // Deep nesting must be rejected cleanly instead of overflowing stack / VM
+        let deep = format!("{}1{}", "(".repeat(100), ")".repeat(100));
+        assert!(ExprProgram::compile(&deep).is_err());
     }
 
     #[test]
