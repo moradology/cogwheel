@@ -251,6 +251,28 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     let not_geojson = client.post(format!("{base}/searches/{id}/feature.png?assets=visual")).body("nope").send().await.unwrap();
     assert_eq!(not_geojson.status().as_u16(), 422);
 
+    // Statistics under features: nothing to read, and the parameters are checked first.
+    let collection = json!({ "type": "FeatureCollection", "features": [triangle.clone()] });
+    for (path, body, status) in [
+        ("statistics?assets=visual", &triangle, 204),
+        ("statistics?assets=visual&max_size=64&categorical=true&c=1&p=5&histogram_bins=4&cover_scale=2", &triangle, 204),
+        ("statistics?assets=visual", &collection, 204),
+        ("statistics", &triangle, 422),
+        ("statistics?assets=visual", &triangle["geometry"], 422),
+        ("statistics?assets=visual&histogram_bins=ten", &triangle, 422),
+        ("statistics?assets=visual&cover_scale=0", &triangle, 422),
+        ("statistics?assets=visual&width=wide", &triangle, 422),
+        ("statistics?assets=visual&dst_crs=epsg:3857", &triangle, 400),
+        ("statistics?assets=visual&algorithm=hillshade", &triangle, 400),
+        ("statistics?assets=visual&pixel_selection=mean", &triangle, 400),
+        ("statistics/extra?assets=visual", &triangle, 404),
+    ] {
+        let resp = post_json(&client, format!("{base}/searches/{id}/{path}"), body).await;
+        assert_eq!(resp.status().as_u16(), status, "POST {path}");
+    }
+    let get = client.get(format!("{base}/searches/{id}/statistics?assets=visual")).send().await.unwrap();
+    assert_eq!(get.status().as_u16(), 405);
+
     // Point values: nothing is under the point, and the parameters are checked first.
     for (path, status) in [
         ("point/8.5,45.75?assets=visual", 204),

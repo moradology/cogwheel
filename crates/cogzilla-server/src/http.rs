@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 
 mod pgstac;
 mod point_expr;
+mod zonal;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
