@@ -256,7 +256,8 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("point/8.5,45.75?assets=visual", 204),
         ("point/945000,5740000?assets=visual&coord_crs=epsg:3857", 204),
         ("point/8.5,45.75", 422),
-        ("point/8.5,45.75?assets=visual&expression=visual_b1", 400),
+        ("point/8.5,45.75?assets=visual&expression=b1*2", 204),
+        ("point/8.5,45.75?assets=visual&asset_as_band=true", 400),
         ("point/8.5,45.75?assets=visual%7Cbidx%3D1", 400),
         ("point/8.5,45.75?assets=visual&coord_crs=epsg:32632", 400),
         ("point/8.5,45.75?assets=visual&items_limit=many", 422),
@@ -418,7 +419,13 @@ async fn item_routes_match_titiler_pgstac_shapes() {
         "type": "Feature", "stac_version": "1.0.0", "id": iid, "collection": cid,
         "bbox": [6.0, 44.0, 8.0, 46.0],
         "geometry": { "type": "Polygon", "coordinates": [[[6.0, 44.0], [8.0, 44.0], [8.0, 46.0], [6.0, 46.0], [6.0, 44.0]]] },
-        "properties": { "datetime": "2024-06-01T00:00:00Z" },
+        "properties": {
+            "datetime": "2024-06-01T00:00:00Z",
+            "renders": {
+                "rgb": { "title": "True colour", "assets": ["visual"] },
+                "math": { "expression": "b1*2" }
+            }
+        },
         "links": [],
         "assets": {
             "visual": { "href": "https://example.invalid/cogzilla-test/visual.tif", "type": tiff },
@@ -447,9 +454,30 @@ async fn item_routes_match_titiler_pgstac_shapes() {
     let assets = get_json(&client, format!("{it}/assets")).await;
     assert_eq!(assets, json!(["red", "visual", "red-jp2", "untyped"]));
 
+    // Renders: one that can make a tile, with its TileJSON and WMTS links, and one that cannot.
     let renders = get_json(&client, format!("{it}/renders")).await;
-    assert_eq!(renders["renders"], json!({}));
     assert_eq!(renders["links"][0]["href"], json!(format!("{it}/renders")));
+    let rgb = &renders["renders"]["rgb"];
+    assert_eq!(rgb["valid"], true);
+    assert_eq!(rgb["params"], json!({ "title": "True colour", "assets": ["visual"] }));
+    assert_eq!(rgb["links"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        rgb["links"][1]["href"],
+        json!(format!("{it}/%7BtileMatrixSetId%7D/tilejson.json?url=%3CItem+id%3D{iid}%3E&title=True+colour&assets=visual"))
+    );
+    assert_eq!(renders["renders"]["math"]["valid"], false);
+    assert_eq!(renders["renders"]["math"]["links"].as_array().unwrap().len(), 1);
+    let one = get_json(&client, format!("{it}/renders/rgb")).await;
+    assert_eq!(&one, rgb);
+    let missing = client.get(format!("{it}/renders/nope")).send().await.unwrap();
+    assert_eq!(missing.status().as_u16(), 404);
+    assert_eq!(body_json(missing).await["detail"], "Render not found");
+    // The render that can make a tile is a WMTS layer even with no `assets` in the query.
+    let wmts = client.get(format!("{it}/WMTSCapabilities.xml")).send().await.unwrap();
+    assert_eq!(wmts.status().as_u16(), 200);
+    let xml = String::from_utf8(wmts.bytes().await.unwrap().to_vec()).unwrap();
+    assert!(xml.contains("<ows:Identifier>TiTiler_WebMercatorQuad_rgb</ows:Identifier>"));
+    assert_eq!(xml.matches("<Layer>").count(), 1);
 
     // Without projection metadata the tileset covers the item's bbox at every zoom.
     let set = get_json(&client, format!("{it}/tiles/WebMercatorQuad?assets=visual")).await;
@@ -478,10 +506,10 @@ async fn item_routes_match_titiler_pgstac_shapes() {
     let xml = String::from_utf8(wmts.bytes().await.unwrap().to_vec()).unwrap();
     assert!(xml.contains("<ows:Identifier>TiTiler_WebMercatorQuad_default</ows:Identifier>"));
     assert!(xml.contains(&format!("template=\"{it}/tiles/WebMercatorQuad/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.png?assets=visual\"")));
-    assert_eq!(xml.matches("<TileMatrixLimits>").count(), 25);
+    // Two layers, the render and the one from the query, each with limits at 25 zooms.
+    assert_eq!(xml.matches("<Layer>").count(), 2);
+    assert_eq!(xml.matches("<TileMatrixLimits>").count(), 50);
     assert!(xml.contains("<ows:UpperCorner>8.0 46.0</ows:UpperCorner>"));
-    let no_layer = client.get(format!("{it}/WMTSCapabilities.xml")).send().await.unwrap();
-    assert_eq!(no_layer.status().as_u16(), 400);
 
     // Lookups.
     for (path, message) in [

@@ -204,7 +204,10 @@ class Oracle:
         elif kind == "status":
             note = f"{cz.status_code}"
         elif kind == "json":
-            diff = first_diff(normalize(cz.json(), COGZILLA), normalize(tt.json(), TITILER))
+            try:
+                diff = first_diff(normalize(cz.json(), COGZILLA), normalize(tt.json(), TITILER))
+            except ValueError:
+                diff = f"not JSON: {cz.text[:80]!r} vs {tt.text[:80]!r}"
             ok, note = diff is None, diff or f"{cz.status_code}, bodies equal"
         elif kind == "tilesets":
             # cogzilla serves these routes in Web Mercator only, so only that entry is compared.
@@ -477,6 +480,15 @@ def main() -> int:
         o.check("point with an unknown asset", "json", f"/searches/{sid}/point/{pt}?assets=nope&items_limit=1")
         o.check("point for an unknown search", "json", f"/searches/deadbeef/point/{pt}?assets=visual")
         o.check("collection point", "json", f"/collections/{collection}/point/{pt}?assets=visual&items_limit=2")
+        o.check("point, band math on one asset", "json", f"/searches/{sid}/point/{pt}?assets=visual&expression=b1*2&items_limit=1")
+        o.check("point, band math across assets", "json",
+                f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)&items_limit=2")
+        o.check("point, two expressions", "json",
+                f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=b1%2Bb2;b2-b1&items_limit=1")
+        o.check("point, expression with an asset name", "json",
+                f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=(nir-red)/(nir%2Bred)&items_limit=1")
+        o.check("collection point, band math", "json",
+                f"/collections/{collection}/point/{pt}?assets=red&assets=nir&expression=b2/b1&items_limit=1")
         o.check("collection point with a datetime", "json",
                 f"/collections/{collection}/point/{pt}?assets=red&items_limit=2&datetime=2024-06-01T00:00:00Z/2024-08-31T23:59:59Z")
 
@@ -584,6 +596,40 @@ def main() -> int:
         o.check("item wmts, jpg and EPSG codes", "wmts",
                 f"{it}/WMTSCapabilities.xml?assets=visual&tile_format=jpg&use_epsg=true&minzoom=9&maxzoom=10")
         o.check("item wmts with no layer", "wmts", f"{it}/WMTSCapabilities.xml")
+        o.check("item point, band math", "json",
+                f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)")
+        o.check("item point, two expressions", "json",
+                f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir&expression=b1%2Bb2;b2*2")
+        o.check("item point, expression with an asset name", "json",
+                f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir&expression=nir-red")
+
+        # An item that carries STAC renders, with the assets of a real one.
+        with psycopg.connect(env["DATABASE_URL"], autocommit=True) as conn:
+            src = conn.execute("SELECT pgstac.get_item(%s, %s)", [item_id, collection]).fetchone()[0]
+            conn.execute("SELECT pgstac.upsert_item(%s::jsonb)", [json.dumps({
+                "type": "Feature", "stac_version": "1.0.0", "id": "cogzilla-oracle-item",
+                "collection": renders_id, "stac_extensions": src.get("stac_extensions", []),
+                "bbox": src["bbox"], "geometry": src["geometry"], "links": [],
+                "properties": {
+                    "datetime": "2024-12-31T10:00:00Z", "proj:epsg": src["properties"].get("proj:epsg"),
+                    "renders": {
+                        "rgb": {"title": "True colour", "assets": ["visual"]},
+                        "ndvi": {"title": "NDVI", "assets": ["red", "nir"], "expression": "(nir-red)/(nir+red)",
+                                 "rescale": [[-1, 1]], "colormap_name": "viridis"},
+                        "one_band": {"assets": ["red"], "asset_bidx": ["red|1"], "rescale": [[0, 3000]],
+                                     "minmax_zoom": [8, 12]},
+                        "no_assets": {"expression": "b1*2"},
+                    },
+                },
+                "assets": {k: src["assets"][k] for k in ("visual", "red", "nir", "thumbnail")},
+            })])
+        rit = f"/collections/{renders_id}/items/cogzilla-oracle-item"
+        o.check("item renders with content", "json", f"{rit}/renders")
+        o.check("item render", "json", f"{rit}/renders/ndvi")
+        o.check("item render that cannot make a tile", "json", f"{rit}/renders/no_assets")
+        o.check("item render that does not exist", "json", f"{rit}/renders/nope")
+        o.check("item wmts from renders", "wmts", f"{rit}/WMTSCapabilities.xml")
+        o.check("item wmts from renders and the query", "wmts", f"{rit}/WMTSCapabilities.xml?assets=visual&tile_format=jpg")
         o.check("item unknown route", "status", f"{it}/nope")
     finally:
         proc.terminate()
