@@ -6,13 +6,13 @@
 
 - Tiles: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|jpg|npy|f32}]`, for `WebMercatorQuad` and `WorldCRS84Quad`. `@1x` is 256 px and `@2x` is 512 px.
 - Tile parameters: `rescale`, `colormap_name`, `colormap` (JSON discrete or interval), `expression`, `algorithm` (`terrarium`, `terrainrgb`, `hillshade`, `slope`, `aspect`, with `azimuth`, `altitude`, `z_factor`), `resampling`, `reproject`, `nodata`, `unscale`, `return_mask`, `color_formula`, `buffer`.
-- Metadata: `GET /cog/info`, `/cog/info.geojson`, `/cog/bounds`, `/cog/validate`, `/cog/{tms}/tilejson.json`, `/cog/tiles`, `/cog/tiles/{tms}`, `/cog/{tms}/map.html`.
+- Metadata: `GET /cog/info`, `/cog/info.geojson`, `/cog/bounds`, `/cog/validate`, `/cog/{tms}/tilejson.json`, `/cog/{tms}/WMTSCapabilities.xml`, `/cog/tiles`, `/cog/tiles/{tms}`, `/cog/{tms}/map.html`.
 - Point and statistics: `GET /cog/point/{lon},{lat}` (with `coord_crs`), `GET|POST /cog/statistics` (POST clips to a GeoJSON `Feature`, `FeatureCollection`, or geometry).
-- Crops: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]`.
+- Crops: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]` (also accepts `?width=`/`?height=` query params).
 
 **`/stac/*`** (TiTiler's `MultiBaseTilerFactory` with `STACReader`)
 
-- `GET /stac/assets`, `/stac/bounds`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/map.html`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
+- `GET /stac/assets`, `/stac/bounds`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/WMTSCapabilities.xml`, `/stac/{tms}/map.html`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
 - The STAC item can be a local path, an HTTP(S) URL or an `s3://` URI. Its JSON is cached, and assets named with `?assets=red&assets=green&assets=blue` are opened concurrently.
 - Expressions can use band positions, `(b1-b2)/(b1+b2)`, or asset names, `(red-green)/(red+green)` or `{asset}_b{k}`.
 - On the M5 at v0.1.0, with local fixtures, a warm cache and one request at a time, these routes ran 4–84× faster than TiTiler. The large multiples are tiles (2.1 ms against 52.3 ms, 25×), info (50×), TileJSON (70×) and three-asset point queries (84×); asset listing, statistics and previews were 4–11×.
@@ -29,7 +29,7 @@
 - `resampling` and `reproject` accept `nearest`, `bilinear` and `cubic`. `lanczos` and `cubic_spline` are served as cubic. The other GDAL methods (`average`, `mode`, `gauss`, `rms`, `max`, `min`, `med`, `q1`, `q3`, `sum`) are rejected.
 - `algorithm` accepts `hillshade`, `slope`, `aspect`, `terrarium` and `terrainrgb`. TiTiler's `contours`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale` and `bitonal` are rejected. `aspect` is a `cogzilla` addition.
 - Tile matrix sets are `WebMercatorQuad` and `WorldCRS84Quad`; TiTiler's other eleven are rejected.
-- Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, `width` and `height` as query parameters (use the `{w}x{h}` path form), `histogram_bins`, `histogram_range`, `categorical`, `c`, `p`, `cover_scale`, and `orientation` on colormap images.
+- Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, `histogram_bins`, `histogram_range`, `categorical`, `c`, `p`, and `cover_scale`.
 - Statistics always report the 2nd and 98th percentiles and a 10-bin histogram over every band; `expression`, `algorithm` and `bidx` are rejected there and on point queries. `POST /statistics` supports a single Feature, geometry, or `FeatureCollection` (up to 64 features).
 - `coord_crs` accepts `EPSG:4326` and `EPSG:3857`, on point queries and `/bbox`. `max_size` is supported on format-only `/bbox` routes (and rejected when explicit `{w}x{h}` dimensions are given).
 - `tilesize` accepts 64 to 2048.
