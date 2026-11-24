@@ -632,6 +632,7 @@ impl BandStatsAcc {
         unscale: bool,
         scale: f32,
         offset: f32,
+        description: &str,
     ) -> serde_json::Value {
         let valid_px: usize = hist.iter().map(|&c| c as usize).sum();
         let masked_px = denom_pixels.saturating_sub(valid_px);
@@ -643,10 +644,12 @@ impl BandStatsAcc {
         if valid_px == 0 {
             return serde_json::json!({
                 "min": null, "max": null, "mean": null, "count": 0, "sum": 0.0,
-                "std": null, "median": null, "valid_percent": 0.0,
+                "std": null, "median": null, "majority": null, "minority": null,
+                "unique": 0, "valid_percent": 0.0,
                 "masked_pixels": masked_px, "valid_pixels": 0,
                 "percentile_2": null, "percentile_98": null,
                 "histogram": [[], []],
+                "description": description,
             });
         }
         let reverse = unscale && scale < 0.0;
@@ -668,6 +671,11 @@ impl BandStatsAcc {
         let mut p98 = f32::NAN;
         let mut sum = 0.0f64;
         let mut cum = 0usize;
+        let mut unique = 0usize;
+        let mut maj_val = f32::NAN;
+        let mut maj_cnt = 0usize;
+        let mut min_val = f32::NAN;
+        let mut min_cnt = usize::MAX;
 
         let n = hist.len();
         for step in 0..n {
@@ -676,7 +684,16 @@ impl BandStatsAcc {
             if c == 0 {
                 continue;
             }
+            unique += 1;
             let v = to_val(k);
+            if c > maj_cnt {
+                maj_cnt = c;
+                maj_val = v;
+            }
+            if c < min_cnt {
+                min_cnt = c;
+                min_val = v;
+            }
             if min.is_nan() {
                 min = v;
             }
@@ -723,12 +740,16 @@ impl BandStatsAcc {
             "sum": sum,
             "std": std,
             "median": median,
+            "majority": maj_val,
+            "minority": min_val,
+            "unique": unique,
             "valid_percent": valid_pct,
             "masked_pixels": masked_px,
             "valid_pixels": valid_px,
             "percentile_2": p2,
             "percentile_98": p98,
             "histogram": [counts, edges],
+            "description": description,
         })
     }
 
@@ -739,6 +760,7 @@ impl BandStatsAcc {
         scale: f32,
         offset: f32,
         nodata_override: Option<f32>,
+        description: &str,
     ) -> serde_json::Value {
         match self {
             Self::HistU8(mut hist) => {
@@ -747,7 +769,7 @@ impl BandStatsAcc {
                         hist[nd as usize] = 0;
                     }
                 }
-                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset)
+                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset, description)
             }
             Self::HistU16(mut hist) => {
                 if let Some(nd) = nodata_override {
@@ -755,7 +777,7 @@ impl BandStatsAcc {
                         hist[nd as usize] = 0;
                     }
                 }
-                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset)
+                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset, description)
             }
             Self::Floats(mut vals) => {
                 let valid_px = vals.len();
@@ -768,23 +790,49 @@ impl BandStatsAcc {
                 if valid_px == 0 {
                     return serde_json::json!({
                         "min": null, "max": null, "mean": null, "count": 0, "sum": 0.0,
-                        "std": null, "median": null, "valid_percent": 0.0,
+                        "std": null, "median": null, "majority": null, "minority": null,
+                        "unique": 0, "valid_percent": 0.0,
                         "masked_pixels": masked_px, "valid_pixels": 0,
                         "percentile_2": null, "percentile_98": null,
                         "histogram": [[], []],
+                        "description": description,
                     });
                 }
-                let mut min = f32::INFINITY;
-                let mut max = f32::NEG_INFINITY;
+                vals.sort_unstable_by(|a, b| a.total_cmp(b));
+                let min = vals[0];
+                let max = vals[valid_px - 1];
                 let mut sum = 0.0f64;
+                let mut unique = 0usize;
+                let mut maj_val = min;
+                let mut maj_cnt = 0usize;
+                let mut min_val = min;
+                let mut min_cnt = usize::MAX;
+                let mut run_val = min;
+                let mut run_cnt = 0usize;
                 for &v in &vals {
-                    if v < min {
-                        min = v;
-                    }
-                    if v > max {
-                        max = v;
-                    }
                     sum += v as f64;
+                    if v == run_val {
+                        run_cnt += 1;
+                    } else {
+                        unique += 1;
+                        if run_cnt > maj_cnt {
+                            maj_cnt = run_cnt;
+                            maj_val = run_val;
+                        }
+                        if run_cnt < min_cnt {
+                            min_cnt = run_cnt;
+                            min_val = run_val;
+                        }
+                        run_val = v;
+                        run_cnt = 1;
+                    }
+                }
+                unique += 1;
+                if run_cnt > maj_cnt {
+                    maj_val = run_val;
+                }
+                if run_cnt < min_cnt {
+                    min_val = run_val;
                 }
                 let mean = sum / (valid_px as f64);
                 let min_f64 = min as f64;
@@ -801,24 +849,12 @@ impl BandStatsAcc {
                 }
                 let std = (var_sum / (valid_px as f64)).sqrt();
 
-                // O(N) Quickselect for median, p2, p98 (bit-exact match with full sort)
                 let p2_idx = ((valid_px as f64) * 0.02) as usize;
                 let med_idx = valid_px / 2;
                 let p98_idx = (((valid_px as f64) * 0.98) as usize).min(valid_px - 1);
-                let (left, med_ref, right) = vals.select_nth_unstable_by(med_idx, |a, b| a.total_cmp(b));
-                let median = *med_ref;
-                let p2 = if p2_idx < med_idx {
-                    *left.select_nth_unstable_by(p2_idx, |a, b| a.total_cmp(b)).1
-                } else {
-                    median
-                };
-                let p98 = if p98_idx > med_idx {
-                    *right
-                        .select_nth_unstable_by(p98_idx - med_idx - 1, |a, b| a.total_cmp(b))
-                        .1
-                } else {
-                    median
-                };
+                let median = vals[med_idx];
+                let p2 = vals[p2_idx];
+                let p98 = vals[p98_idx];
                 let edges: Vec<f64> = (0..=10)
                     .map(|i| min_f64 + span * (i as f64 / 10.0))
                     .collect();
@@ -830,12 +866,16 @@ impl BandStatsAcc {
                     "sum": sum,
                     "std": std,
                     "median": median,
+                    "majority": maj_val,
+                    "minority": min_val,
+                    "unique": unique,
                     "valid_percent": valid_pct,
                     "masked_pixels": masked_px,
                     "valid_pixels": valid_px,
                     "percentile_2": p2,
                     "percentile_98": p98,
                     "histogram": [counts, edges],
+                    "description": description,
                 })
             }
         }
@@ -1263,19 +1303,64 @@ fn compute_statistics_cpu(
     for (b, acc) in per_band.into_iter().enumerate() {
         let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
         let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
-        out.insert(
-            format!("b{}", b + 1),
-            acc.finalize(denom_pixels, unscale, scale, offset, nodata_override),
-        );
+        let bname = format!("b{}", b + 1);
+        let val = acc.finalize(denom_pixels, unscale, scale, offset, nodata_override, &bname);
+        out.insert(bname, val);
     }
 
     serde_json::Value::Object(out)
 }
 
-/// TiTiler-compatible `/cog/statistics` computed from the coarsest overview <= `max_size`.
+/// Project a WGS84 polygon bbox into an IFD's pixel space and return its clipped `(win_w, win_h)`.
+fn polygon_window_dims(
+    ifd: &cogzilla_tiff::IfdMeta,
+    crs: &cogzilla_proj::CrsModel,
+    bbox: [f64; 4],
+) -> (u32, u32) {
+    let [w, s, e, n] = bbox;
+    let mx = 0.5 * (w + e);
+    let my = 0.5 * (s + n);
+    let pts = [
+        (w, s),
+        (e, s),
+        (w, n),
+        (e, n),
+        (mx, s),
+        (mx, n),
+        (w, my),
+        (e, my),
+    ];
+    let mut cmin = f64::INFINITY;
+    let mut cmax = f64::NEG_INFINITY;
+    let mut rmin = f64::INFINITY;
+    let mut rmax = f64::NEG_INFINITY;
+    for (lon, lat) in pts {
+        let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+        if sx.is_finite() && sy.is_finite() {
+            let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
+            if col.is_finite() && row.is_finite() {
+                cmin = cmin.min(col);
+                cmax = cmax.max(col);
+                rmin = rmin.min(row);
+                rmax = rmax.max(row);
+            }
+        }
+    }
+    if !cmin.is_finite() {
+        return (ifd.width, ifd.height);
+    }
+    let c0 = cmin.floor().clamp(0.0, ifd.width as f64);
+    let c1 = cmax.ceil().clamp(0.0, ifd.width as f64);
+    let r0 = rmin.floor().clamp(0.0, ifd.height as f64);
+    let r1 = rmax.ceil().clamp(0.0, ifd.height as f64);
+    (((c1 - c0).max(1.0)) as u32, ((r1 - r0).max(1.0)) as u32)
+}
+
+/// TiTiler-compatible `/cog/statistics` computed from the finest overview whose target window
+/// fits within `max_size` (for `POST /statistics` with a polygon, sized to the polygon's pixel
+/// window rather than the whole raster so small polygons sample at full native resolution).
 /// When the coarsest IFD still exceeds `max_size` (e.g. an overview-less GeoTIFF), stride-decimates
-/// by `step = ceil(max_dim / max_size)` so memory and I/O stay bounded to `<= max_size^2` samples.
-/// When `poly_mask` is `Some`, clips statistics strictly to pixels inside the posted GeoJSON polygon.
+/// by `step = ceil(win_max_dim / max_size)` so memory and I/O stay bounded to `<= max_size^2` samples.
 pub async fn compute_statistics(
     engine: &TileEngine,
     cog: &Arc<OpenedCog>,
@@ -1287,15 +1372,24 @@ pub async fn compute_statistics(
     let crs = engine.get_or_build_crs(cog)?;
     let max_size = max_size.max(1);
     let mut ifd_idx = cog.index.ifds.len() - 1;
+    let mut win_max_dim = cog.index.ifds[ifd_idx].width.max(cog.index.ifds[ifd_idx].height);
     for (i, ifd) in cog.index.ifds.iter().enumerate() {
-        if ifd.width.max(ifd.height) <= max_size {
+        let dim = if let Some(pm) = poly_mask {
+            let (ww, wh) = polygon_window_dims(ifd, &crs, pm.bbox);
+            ww.max(wh)
+        } else {
+            ifd.width.max(ifd.height)
+        };
+        if dim <= max_size {
             ifd_idx = i;
+            win_max_dim = dim;
             break;
         }
+        win_max_dim = dim;
     }
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
-    let step = ifd.width.max(ifd.height).div_ceil(max_size).max(1) as usize;
+    let step = win_max_dim.div_ceil(max_size).max(1) as usize;
     let total_pixels = if step > 1 {
         (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
     } else {

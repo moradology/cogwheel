@@ -650,44 +650,54 @@ impl CrsModel {
         height: u32,
         overview_factor: f64,
     ) -> (u8, u8) {
-        let cx = (width as f64) * 0.5;
-        let cy = (height as f64) * 0.5;
-        let step_px = (width.min(height) as f64 * 0.01).clamp(1.0, 64.0);
-        let to_ll = |col: f64, row: f64| -> Option<(f64, f64)> {
-            let (sx, sy) = pixel_to_crs.forward(col, row);
-            let (lon, lat) = self.to_lonlat_deg(sx, sy);
-            if lon.is_finite() && lat.is_finite() {
-                Some((lon, lat))
-            } else {
-                None
-            }
-        };
-        let px_deg = if let (Some((lon0, lat0)), Some((lonx, latx)), Some((lony, laty))) = (
-            to_ll(cx, cy),
-            to_ll(cx + step_px, cy),
-            to_ll(cx, cy + step_px),
-        ) {
-            let wrap_dlon = |d: f64| -> f64 {
-                if d > 180.0 {
-                    d - 360.0
-                } else if d < -180.0 {
-                    d + 360.0
+        let px_deg = if matches!(self, Self::Geographic) {
+            let dx = pixel_to_crs.a.hypot(pixel_to_crs.d);
+            let dy = pixel_to_crs.b.hypot(pixel_to_crs.e);
+            dx.min(dy).max(dx.max(dy) * 0.5).max(1e-8)
+        } else {
+            let cx = (width as f64) * 0.5;
+            let cy = (height as f64) * 0.5;
+            let step_px = (width.min(height) as f64 * 0.01).clamp(1.0, 64.0);
+            let to_ll = |col: f64, row: f64| -> Option<(f64, f64)> {
+                let (sx, sy) = pixel_to_crs.forward(col, row);
+                let (lon, lat) = self.to_lonlat_deg(sx, sy);
+                if lon.is_finite() && lat.is_finite() {
+                    Some((lon, lat))
                 } else {
-                    d
+                    None
                 }
             };
-            let dx = wrap_dlon(lonx - lon0).hypot(latx - lat0) / step_px;
-            let dy = wrap_dlon(lony - lon0).hypot(laty - lat0) / step_px;
-            let local = dx.min(dy).max(dx.max(dy) * 0.5);
-            if local.is_finite() && local > 1e-8 {
-                local
+            if let (Some((lon0, lat0)), Some((lonx, latx)), Some((lony, laty))) = (
+                to_ll(cx, cy),
+                to_ll(cx + step_px, cy),
+                to_ll(cx, cy + step_px),
+            ) {
+                let wrap_dlon = |d: f64| -> f64 {
+                    if d > 180.0 {
+                        d - 360.0
+                    } else if d < -180.0 {
+                        d + 360.0
+                    } else {
+                        d
+                    }
+                };
+                // Scale longitude delta by cos(lat) to eliminate the 1/cos(lat) polar singularity
+                // on polar-centered / high-latitude rasters (EPSG:3413, EPSG:3031, etc.).
+                let cos_lat = lat0.to_radians().cos().abs();
+                let dx = (wrap_dlon(lonx - lon0) * cos_lat).hypot(latx - lat0) / step_px;
+                let dy = (wrap_dlon(lony - lon0) * cos_lat).hypot(laty - lat0) / step_px;
+                let local = dx.max(dy);
+                if local.is_finite() && local > 1e-8 {
+                    local
+                } else {
+                    let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                    (n - s).abs().max((e - w).abs() * cos_lat).max(1e-6)
+                        / (width.max(height) as f64)
+                }
             } else {
                 let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
                 (e - w).abs().max((n - s).abs()).max(1e-6) / (width.max(height) as f64)
             }
-        } else {
-            let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
-            (e - w).abs().max((n - s).abs()).max(1e-6) / (width.max(height) as f64)
         };
         let crs84_px0 = 180.0 / 256.0;
         let maxzoom = (crs84_px0 / px_deg).log2().ceil().clamp(0.0, 22.0) as u8;
@@ -1538,5 +1548,22 @@ mod tests {
         assert_eq!(b[2], 180.0);
         let (_minz, maxz) = crs.web_mercator_zoom_range(&aff, 10_000, 10_000, 16.0);
         assert!(maxz >= 13, "10m antimeridian raster should have maxzoom >= 13, got {maxz}");
+
+        // Polar-centered Polar Stereographic (EPSG:3413) 100m raster at North Pole (lat=90°):
+        // world_crs84_zoom_range must not collapse to 0 from the 1/cos(lat) longitude singularity.
+        let polar = CrsModel::from_geo_keys(&keys(|k| {
+            k.projected_cs_type = Some(3413);
+        }))
+        .unwrap();
+        let polar_aff = Affine2D {
+            a: 100.0,
+            b: 0.0,
+            c: -50_000.0,
+            d: 0.0,
+            e: -100.0,
+            f: 50_000.0,
+        };
+        let (p_minz, p_maxz) = polar.world_crs84_zoom_range(&polar_aff, 1000, 1000, 8.0);
+        assert!(p_maxz >= 9 && p_minz <= p_maxz, "100m polar raster should have CRS84 maxzoom >= 9, got ({p_minz}, {p_maxz})");
     }
 }
