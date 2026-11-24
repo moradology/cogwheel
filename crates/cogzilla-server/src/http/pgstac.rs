@@ -217,23 +217,189 @@ fn search_json(rec: &SearchRecord) -> Value {
     Value::Object(out)
 }
 
-fn register_links(host: &str, id: &str) -> Value {
-    json!([
-        { "href": format!("{host}/searches/{id}/info"), "rel": "metadata", "title": "Mosaic metadata" },
-        { "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/tilejson.json"), "rel": "tilejson", "templated": true, "title": "Link for TileJSON (Template URL)" },
-        { "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/map.html"), "rel": "map", "templated": true, "title": "Link for Map viewer (Template URL)" },
-        { "href": format!("{host}/searches/{id}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }
-    ])
+/// Python's `str()` of a JSON value, which is what `urlencode` writes into a link.
+fn py_str(v: &Value) -> String {
+    fn repr(v: &Value) -> String {
+        match v {
+            Value::String(s) => format!("'{s}'"),
+            other => py_str(other),
+        }
+    }
+    match v {
+        Value::Null => "None".into(),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(a) => format!("[{}]", a.iter().map(repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => {
+            let mut keys: Vec<String> = o.keys().cloned().collect();
+            jsonb_key_order(&mut keys);
+            let body: Vec<String> = keys.iter().map(|k| format!("'{k}': {}", repr(&o[k]))).collect();
+            format!("{{{}}}", body.join(", "))
+        }
+    }
+}
+
+/// Python's `json.dumps` with its default separators, keys in Postgres' jsonb order.
+fn py_json_dumps(v: &Value) -> String {
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(py_json_dumps).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => {
+            let mut keys: Vec<String> = o.keys().cloned().collect();
+            jsonb_key_order(&mut keys);
+            let body: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", Value::String(k.clone()), py_json_dumps(&o[k])))
+                .collect();
+            format!("{{{}}}", body.join(", "))
+        }
+        scalar => scalar.to_string(),
+    }
+}
+
+/// Python truthiness of a JSON value.
+fn py_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// The layers a mosaic's `metadata.defaults` describe, each as a name and the query string
+/// titiler-pgstac puts on the layer's links. A layer without `assets` cannot make a tile
+/// request and gets no link. `adapt` folds `asset_bidx` and `asset_expression` into the
+/// asset names (`name|bidx=1`), as the info routes do.
+fn layer_queries(metadata: &Value, adapt: bool) -> Vec<(String, String)> {
+    let Some(defaults) = metadata.get("defaults").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let as_list = |v: &Value| match v {
+        Value::Array(a) => a.clone(),
+        other => vec![other.clone()],
+    };
+    let mut names: Vec<String> = defaults.keys().cloned().collect();
+    jsonb_key_order(&mut names);
+    let mut out = Vec::new();
+    for name in names {
+        let Some(values) = defaults[&name].as_object() else {
+            continue;
+        };
+        // Python reads the keys in jsonb order, then moves the ones it rewrites to the end.
+        let mut keys: Vec<String> = values.keys().cloned().collect();
+        jsonb_key_order(&mut keys);
+        let mut params: Vec<(String, Value)> =
+            keys.into_iter().map(|k| (k.clone(), values[&k].clone())).collect();
+        for key in ["rescale", "colormap", "assets", "asset_bidx"] {
+            let Some(pos) = params.iter().position(|(k, _)| k == key) else {
+                continue;
+            };
+            let (_, value) = params.remove(pos);
+            if !py_truthy(&value) {
+                continue;
+            }
+            let value = match key {
+                "rescale" => Value::Array(
+                    as_list(&value)
+                        .iter()
+                        .map(|r| match r {
+                            Value::Array(pair) => {
+                                json!(pair.iter().map(py_str).collect::<Vec<_>>().join(","))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+                "colormap" if !value.is_string() => json!(py_json_dumps(&value)),
+                "assets" | "asset_bidx" if value.is_string() => json!([value]),
+                _ => value,
+            };
+            params.push((key.to_string(), value));
+        }
+        let assets: Vec<String> = params
+            .iter()
+            .find(|(k, _)| k == "assets")
+            .map(|(_, v)| as_list(v).iter().map(py_str).collect())
+            .unwrap_or_default();
+        if assets.is_empty() {
+            continue;
+        }
+        if adapt {
+            let mut options: Vec<Vec<String>> = vec![Vec::new(); assets.len()];
+            for (key, label) in [("asset_bidx", "bidx"), ("asset_expression", "expression")] {
+                let Some(pos) = params.iter().position(|(k, _)| k == key) else {
+                    continue;
+                };
+                let (_, value) = params.remove(pos);
+                for entry in as_list(&value) {
+                    let entry = py_str(&entry);
+                    if let Some((asset, opt)) = entry.split_once('|')
+                        && let Some(i) = assets.iter().position(|a| a == asset)
+                    {
+                        options[i].push(format!("{label}={opt}"));
+                    }
+                }
+            }
+            let merged: Vec<Value> = assets
+                .iter()
+                .zip(&options)
+                .map(|(a, o)| if o.is_empty() { json!(a) } else { json!(format!("{a}|{}", o.join("|"))) })
+                .collect();
+            if let Some(slot) = params.iter_mut().find(|(k, _)| k == "assets") {
+                slot.1 = Value::Array(merged);
+            }
+        }
+        let mut qs = Vec::new();
+        for (k, v) in &params {
+            match v {
+                Value::Array(items) => {
+                    qs.extend(items.iter().map(|i| format!("{}={}", quote_plus(k), quote_plus(&py_str(i)))));
+                }
+                other => qs.push(format!("{}={}", quote_plus(k), quote_plus(&py_str(other)))),
+            }
+        }
+        out.push((name, qs.join("&")));
+    }
+    out
+}
+
+fn register_links(host: &str, rec: &SearchRecord) -> Value {
+    let id = &rec.hash;
+    let tilejson = format!("{host}/searches/{id}/{{tileMatrixSetId}}/tilejson.json");
+    let mut links = vec![
+        json!({ "href": format!("{host}/searches/{id}/info"), "rel": "metadata", "title": "Mosaic metadata" }),
+        json!({ "href": tilejson, "rel": "tilejson", "templated": true, "title": "Link for TileJSON (Template URL)" }),
+        json!({ "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/map.html"), "rel": "map", "templated": true, "title": "Link for Map viewer (Template URL)" }),
+        json!({ "href": format!("{host}/searches/{id}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }),
+    ];
+    for (name, qs) in layer_queries(&rec.metadata, false) {
+        links.push(json!({ "href": format!("{tilejson}?{qs}"), "rel": "tilejson", "templated": true, "title": format!("TileJSON link for `{name}` layer (Template URL).") }));
+    }
+    Value::Array(links)
 }
 
 /// `base` is the mosaic's own path: `/searches/{hash}` or `/collections/{id}`.
-fn info_links(host: &str, base: &str) -> Value {
-    json!([
-        { "href": format!("{host}{base}/info"), "rel": "self", "title": "Mosaic metadata" },
-        { "href": format!("{host}{base}/{{tileMatrixSetId}}/tilejson.json"), "rel": "tilejson", "templated": true, "title": "TileJSON link (Template URL)." },
-        { "href": format!("{host}{base}/{{tileMatrixSetId}}/map.html"), "rel": "map", "templated": true, "title": "Map viewer link (Template URL)." },
-        { "href": format!("{host}{base}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }
-    ])
+fn info_links(host: &str, base: &str, rec: &SearchRecord) -> Value {
+    let layers = layer_queries(&rec.metadata, true);
+    let tilejson = format!("{host}{base}/{{tileMatrixSetId}}/tilejson.json");
+    let map = format!("{host}{base}/{{tileMatrixSetId}}/map.html");
+    let mut links = vec![
+        json!({ "href": format!("{host}{base}/info"), "rel": "self", "title": "Mosaic metadata" }),
+        json!({ "href": tilejson, "rel": "tilejson", "templated": true, "title": "TileJSON link (Template URL)." }),
+    ];
+    for (name, qs) in &layers {
+        links.push(json!({ "href": format!("{tilejson}?{qs}"), "rel": "tilejson", "templated": true, "title": format!("TileJSON link for `{name}` layer (Template URL).") }));
+    }
+    links.push(json!({ "href": map, "rel": "map", "templated": true, "title": "Map viewer link (Template URL)." }));
+    for (name, qs) in &layers {
+        links.push(json!({ "href": format!("{map}?{qs}"), "rel": "map", "templated": true, "title": format!("Map viewer link for `{name}` layer (Template URL).") }));
+    }
+    links.push(json!({ "href": format!("{host}{base}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }));
+    Value::Array(links)
 }
 
 fn list_item_links(host: &str, id: &str) -> Value {
@@ -299,7 +465,7 @@ where
     match pg.register_search(&search, &metadata).await {
         Ok(rec) => json_resp(
             StatusCode::OK,
-            &json!({ "id": rec.hash, "links": register_links(ctx.host, &rec.hash) }),
+            &json!({ "id": rec.hash, "links": register_links(ctx.host, &rec) }),
         ),
         Err(e) => db_error(&e),
     }
@@ -481,8 +647,26 @@ fn collection_search(
         jsonb_key_order(&mut keys);
         metadata.insert("assets".into(), json!(keys));
     }
-    if let Some(renders) = collection.get("renders").filter(|r| r.is_object()) {
-        metadata.insert("defaults".into(), renders.clone());
+    // The STAC render extension: each render becomes a set of default tile parameters,
+    // minus the keys titiler-pgstac does not take.
+    if let Some(renders) = collection.get("renders").and_then(Value::as_object) {
+        let mut defaults = serde_json::Map::new();
+        for (name, render) in renders {
+            let Some(render) = render.as_object() else {
+                continue;
+            };
+            let mut render = render.clone();
+            render.remove("title");
+            render.remove("tilematrixsets");
+            if let Some(zooms) = render.remove("minmax_zoom")
+                && let Some([min, max]) = zooms.as_array().map(Vec::as_slice)
+            {
+                render.insert("minzoom".into(), min.clone());
+                render.insert("maxzoom".into(), max.clone());
+            }
+            defaults.insert(name.clone(), Value::Object(render));
+        }
+        metadata.insert("defaults".into(), Value::Object(defaults));
     }
     Ok((Value::Object(search), Value::Object(metadata)))
 }
@@ -1038,7 +1222,7 @@ async fn mosaic_route(
             }
             json_resp(
                 StatusCode::OK,
-                &json!({ "search": search, "links": info_links(ctx.host, base) }),
+                &json!({ "search": search, "links": info_links(ctx.host, base, rec) }),
             )
         }
         [tms, "tilejson.json"] => tilejson(ctx, base, rec, tms, pairs),
@@ -1215,11 +1399,52 @@ mod tests {
         assert_eq!(metadata["bounds"], json!([6.0, 44.0, 8.0, 46.0]));
         assert!(metadata.get("assets").is_none());
 
+        // Renders become defaults, without the keys titiler-pgstac drops.
+        let with_renders = json!({ "renders": {
+            "rgb": { "title": "True colour", "assets": ["visual"], "minmax_zoom": [8, 14], "tilematrixsets": {} },
+            "ndvi": { "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]], "minmax_zoom": [8] },
+            "broken": "not an object"
+        }});
+        let (_, metadata) = collection_search("c", &with_renders, &[]).unwrap();
+        assert_eq!(
+            metadata["defaults"],
+            json!({
+                "rgb": { "assets": ["visual"], "minzoom": 8, "maxzoom": 14 },
+                "ndvi": { "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]] }
+            })
+        );
+
         let status = |q: &str| collection_search("c", &json!({}), &query_pairs(q)).unwrap_err().status();
         assert_eq!(status("bbox=1,2,3"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("bbox=1,2,x,4"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("query=nope"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("filter=eo:cloud_cover%3C20"), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn default_layers_become_link_query_strings() {
+        let metadata = json!({ "defaults": {
+            "rgb": { "assets": ["visual"], "minzoom": 8, "maxzoom": 14 },
+            "ndvi": { "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]], "colormap_name": "viridis" },
+            "bands": {
+                "assets": "red", "asset_bidx": ["red|1"], "rescale": [[0, 3000], "0,1"],
+                "colormap": { "1": [0, 0, 0, 255] }, "unscale": true
+            }
+        }});
+        // jsonb order of the names; `ndvi` has no assets, so it cannot be a tile request.
+        assert_eq!(
+            layer_queries(&metadata, true),
+            vec![
+                ("rgb".to_string(), "maxzoom=14&minzoom=8&assets=visual".to_string()),
+                (
+                    "bands".to_string(),
+                    "unscale=True&rescale=0%2C3000&rescale=0%2C1&colormap=%7B%221%22%3A+%5B0%2C+0%2C+0%2C+255%5D%7D&assets=red%7Cbidx%3D1".to_string()
+                ),
+            ]
+        );
+        // Registration links keep asset_bidx as its own parameter.
+        assert!(layer_queries(&metadata, false)[1].1.ends_with("&assets=red&asset_bidx=red%7C1"));
+        assert!(layer_queries(&json!({ "name": "x" }), true).is_empty());
     }
 
     #[test]

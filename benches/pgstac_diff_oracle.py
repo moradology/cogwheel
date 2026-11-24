@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 
 import httpx
+import psycopg
 import mercantile
 import numpy as np
 from PIL import Image
@@ -223,6 +224,18 @@ def main() -> int:
             "collections": [collection], "datetime": "2024-06-01T00:00:00Z/2024-08-31T23:59:59Z",
             "sortby": [{"field": "properties.eo:cloud_cover", "direction": "asc"}],
         })
+        layered = {
+            "collections": [collection],
+            "metadata": {"name": "layers", "defaults": {
+                "rgb": {"assets": ["visual"], "minzoom": 8, "maxzoom": 14},
+                "ndvi": {"expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]], "colormap_name": "viridis"},
+                "false_colour": {"assets": ["nir", "red", "green"], "rescale": [[0, 3000], [0, 2500]],
+                                 "color_formula": "gamma rgb 1.3", "resampling": "bilinear"},
+                "one_band": {"assets": "red", "asset_bidx": ["red|1"], "colormap_name": "viridis", "unscale": True},
+            }},
+        }
+        cz, _ = o.check("register with default layers", "json", "/searches/register", "POST", layered)
+        sid_layers = cz.json().get("id", "missing")
         o.check("register rejects bbox with intersects", "status", "/searches/register", "POST", {
             "collections": [collection], "bbox": [0, 0, 1, 1],
             "intersects": {"type": "Point", "coordinates": [0, 0]},
@@ -237,6 +250,7 @@ def main() -> int:
         print("metadata")
         o.check("info", "json", f"/searches/{sid}/info")
         o.check("info with metadata", "json", f"/searches/{sid_meta}/info")
+        o.check("info with default layers", "json", f"/searches/{sid_layers}/info")
         o.check("info for an unknown search", "json", "/searches/deadbeef/info")
         o.check("tilejson", "json", f"/searches/{sid}/WebMercatorQuad/tilejson.json?assets=visual")
         o.check("tilejson passes parameters through", "json",
@@ -318,6 +332,21 @@ def main() -> int:
 
         print("collection")
         col = f"/collections/{collection}"
+        # A second, empty collection that carries STAC renders, to compare the derived defaults.
+        renders_id = "cogzilla-oracle-renders"
+        with psycopg.connect(env["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute("SELECT pgstac.upsert_collection(%s::jsonb)", [json.dumps({
+                "id": renders_id, "type": "Collection", "stac_version": "1.0.0",
+                "description": "cogzilla oracle: renders", "license": "proprietary", "links": [],
+                "extent": {"spatial": {"bbox": [[w, s, e, n]]}, "temporal": {"interval": [[None, None]]}},
+                "item_assets": {"visual": {}, "red": {}, "nir": {}},
+                "renders": {
+                    "rgb": {"title": "True colour", "assets": ["visual"], "minmax_zoom": [8, 14]},
+                    "ndvi": {"title": "NDVI", "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]],
+                             "colormap_name": "viridis", "tilematrixsets": {"WebMercatorQuad": [8, 14]}},
+                },
+            })])
+        o.check("collection info with renders", "json", f"/collections/{renders_id}/info")
         o.check("collection info", "json", f"{col}/info")
         o.check("collection info for an unknown collection", "json", "/collections/nope/info")
         o.check("collection info with ids", "json", f"{col}/info?ids=a,b")
