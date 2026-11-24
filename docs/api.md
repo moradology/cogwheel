@@ -33,8 +33,8 @@
 - Statistics support `bidx`/`indexes`, custom percentiles (`p`), `histogram_bins`, `histogram_range`, `categorical`, and `c`; `expression` and `algorithm` are rejected on statistics routes. Point queries support `bidx`/`indexes` and `expression`. `POST /statistics` and `POST /feature` both support a single Feature, geometry, or `FeatureCollection` (up to 64 features).
 - `coord_crs` accepts `EPSG:4326` and `EPSG:3857`, on point queries and `/bbox`. `max_size` is supported on format-only `/bbox` routes (and rejected when explicit `{w}x{h}` dimensions are given).
 - `tilesize` accepts 64 to 2048.
-- Output formats are `png`, `jpg`, `webp`, `npy` and raw `f32`. GeoTIFF, JPEG 2000 and `pngraw` are not available.
-- `expression` supports arithmetic and functions such as `sqrt` and `log`, but not multiple `;`-separated outputs, comparisons or `where(...)`.
+- Output formats are `png`, `pngraw`, `jpg`, `webp`, `npy` and raw `f32`. GeoTIFF and JPEG 2000 are not available.
+- `expression` supports arithmetic, comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`), `where(cond, a, b)`, and functions (`sqrt`, `log10`, `ln`, `log2`, `db`, `exp`, `abs`, `ceil`, `floor`, `round`, `min`, `max`, `clip`), but not multiple `;`-separated outputs.
 - A tile outside the dataset's bounds returns a transparent tile with `200`; TiTiler returns `404`.
 - Remote sources are `http(s)://`, `/vsicurl/http(s)://`, `s3://`, `/vsis3/`, `gs://`, `/vsigs/`, `az://`, `abfs[s]://`, and `/vsiaz/`. Other GDAL virtual filesystems such as `/vsizip/` or `/vsimem/` are not recognized.
 - Mosaics: `GET /mosaicjson/{info,{tms}/tilejson.json,tiles/...}?url=...` serves quadkey-indexed MosaicJSON documents; `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b`, `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`, and `POST /mosaic/register` serve front-to-back dynamic or spatially indexed mosaics (including live STAC-API `/search`) with early exit once 100% of pixels are filled.

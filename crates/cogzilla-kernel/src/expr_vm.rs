@@ -20,6 +20,16 @@ pub enum Op {
     Min,
     Max,
     Clip,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    Where,
+    Ceil,
+    Floor,
+    Round,
 }
 
 /// Compiled flat bytecode for any TiTiler-style band-math expression (e.g. `(b1-b2)/(b1+b2)`).
@@ -79,10 +89,22 @@ impl ExprProgram {
                     depth += 1;
                     max_depth = max_depth.max(depth);
                 }
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Pow | Op::Min | Op::Max => {
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Pow
+                | Op::Min
+                | Op::Max
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::Eq
+                | Op::Ne => {
                     depth = depth.saturating_sub(1);
                 }
-                Op::Clip => {
+                Op::Clip | Op::Where => {
                     depth = depth.saturating_sub(2);
                 }
                 _ => {}
@@ -209,6 +231,64 @@ impl ExprProgram {
                         let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
                         x.clamp(a, b)
                     };
+                }
+                Op::Lt => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else if a < b { 1.0 } else { 0.0 };
+                }
+                Op::Le => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else if a <= b { 1.0 } else { 0.0 };
+                }
+                Op::Gt => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else if a > b { 1.0 } else { 0.0 };
+                }
+                Op::Ge => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else if a >= b { 1.0 } else { 0.0 };
+                }
+                Op::Eq => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else if a == b { 1.0 } else { 0.0 };
+                }
+                Op::Ne => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else if a != b { 1.0 } else { 0.0 };
+                }
+                Op::Where => {
+                    let b = stack[sp - 1];
+                    let a = stack[sp - 2];
+                    sp -= 2;
+                    let cond = stack[sp - 1];
+                    stack[sp - 1] = if cond.is_nan() {
+                        f32::NAN
+                    } else if cond != 0.0 {
+                        a
+                    } else {
+                        b
+                    };
+                }
+                Op::Ceil => {
+                    stack[sp - 1] = stack[sp - 1].ceil();
+                }
+                Op::Floor => {
+                    stack[sp - 1] = stack[sp - 1].floor();
+                }
+                Op::Round => {
+                    stack[sp - 1] = stack[sp - 1].round();
                 }
             }
         }
@@ -435,6 +515,65 @@ impl ExprProgram {
                     }
                     sp -= 2;
                 }
+                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Ne => {
+                    sp -= 1;
+                    let (lo, hi) = stack.split_at_mut(sp);
+                    let lhs = &mut lo[sp - 1];
+                    let rhs = &hi[0];
+                    for i in 0..N {
+                        let a = lhs[i];
+                        let b = rhs[i];
+                        lhs[i] = if a.is_nan() || b.is_nan() {
+                            f32::NAN
+                        } else {
+                            let ok = match op {
+                                Op::Lt => a < b,
+                                Op::Le => a <= b,
+                                Op::Gt => a > b,
+                                Op::Ge => a >= b,
+                                Op::Eq => a == b,
+                                Op::Ne => a != b,
+                                _ => unreachable!(),
+                            };
+                            if ok { 1.0 } else { 0.0 }
+                        };
+                    }
+                }
+                Op::Where => {
+                    let (lo_part, hi_part) = stack.split_at_mut(sp - 2);
+                    let cond = &mut lo_part[sp - 3];
+                    let a_v = &hi_part[0];
+                    let b_v = &hi_part[1];
+                    for i in 0..N {
+                        let c = cond[i];
+                        cond[i] = if c.is_nan() {
+                            f32::NAN
+                        } else if c != 0.0 {
+                            a_v[i]
+                        } else {
+                            b_v[i]
+                        };
+                    }
+                    sp -= 2;
+                }
+                Op::Ceil => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].ceil();
+                    }
+                }
+                Op::Floor => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].floor();
+                    }
+                }
+                Op::Round => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].round();
+                    }
+                }
             }
         }
 
@@ -458,6 +597,12 @@ enum Tok {
     LParen,
     RParen,
     Comma,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    EqEq,
+    BangEq,
 }
 
 fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
@@ -507,6 +652,40 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             ',' => {
                 out.push(Tok::Comma);
                 i += 1;
+            }
+            '<' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    out.push(Tok::Le);
+                    i += 2;
+                } else {
+                    out.push(Tok::Lt);
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    out.push(Tok::Ge);
+                    i += 2;
+                } else {
+                    out.push(Tok::Gt);
+                    i += 1;
+                }
+            }
+            '=' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    out.push(Tok::EqEq);
+                    i += 2;
+                } else {
+                    return Err("expected '==' in expression".to_string());
+                }
+            }
+            '!' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    out.push(Tok::BangEq);
+                    i += 2;
+                } else {
+                    return Err("expected '!=' in expression".to_string());
+                }
             }
             '0'..='9' | '.' => {
                 let start = i;
@@ -578,26 +757,45 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) -> Result<(), String> {
         self.enter()?;
         let res = (|| {
-            self.parse_term()?;
+            self.parse_add_sub()?;
             while let Some(tok) = self.peek().cloned() {
-                match tok {
-                    Tok::Plus => {
-                        self.pos += 1;
-                        self.parse_term()?;
-                        self.ops.push(Op::Add);
-                    }
-                    Tok::Minus => {
-                        self.pos += 1;
-                        self.parse_term()?;
-                        self.ops.push(Op::Sub);
-                    }
+                let op = match tok {
+                    Tok::Lt => Op::Lt,
+                    Tok::Le => Op::Le,
+                    Tok::Gt => Op::Gt,
+                    Tok::Ge => Op::Ge,
+                    Tok::EqEq => Op::Eq,
+                    Tok::BangEq => Op::Ne,
                     _ => break,
-                }
+                };
+                self.pos += 1;
+                self.parse_add_sub()?;
+                self.ops.push(op);
             }
             Ok(())
         })();
         self.depth -= 1;
         res
+    }
+
+    fn parse_add_sub(&mut self) -> Result<(), String> {
+        self.parse_term()?;
+        while let Some(tok) = self.peek().cloned() {
+            match tok {
+                Tok::Plus => {
+                    self.pos += 1;
+                    self.parse_term()?;
+                    self.ops.push(Op::Add);
+                }
+                Tok::Minus => {
+                    self.pos += 1;
+                    self.parse_term()?;
+                    self.ops.push(Op::Sub);
+                }
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     fn parse_term(&mut self) -> Result<(), String> {
@@ -699,9 +897,13 @@ impl<'a> Parser<'a> {
                         ("exp", 1) => Op::Exp,
                         ("sqrt", 1) => Op::Sqrt,
                         ("abs", 1) => Op::Abs,
+                        ("ceil", 1) => Op::Ceil,
+                        ("floor", 1) => Op::Floor,
+                        ("round", 1) => Op::Round,
                         ("min" | "minimum", 2) => Op::Min,
                         ("max" | "maximum", 2) => Op::Max,
                         ("clip", 3) => Op::Clip,
+                        ("where", 3) => Op::Where,
                         _ => return Err(format!("unknown function '{name}' with {argc} args")),
                     };
                     self.ops.push(op);
@@ -758,6 +960,26 @@ mod tests {
         let pc = ExprProgram::compile("clip(b1, 10, 5)").unwrap();
         assert!((pc.eval(&[7.0]) - 7.0).abs() < 1e-6);
         assert!((pc.eval(&[2.0]) - 5.0).abs() < 1e-6);
+
+        // Comparisons, where(cond, a, b), ceil/floor/round (scalar & row parity)
+        let pw = ExprProgram::compile("where(b1 > 0.2, ceil(b1 * 10), floor(b2))").unwrap();
+        assert!((pw.eval(&[0.25, 3.9]) - 3.0).abs() < 1e-6);
+        assert!((pw.eval(&[0.1, 3.9]) - 3.0).abs() < 1e-6);
+        assert!((pw.eval(&[0.1, 4.9]) - 4.0).abs() < 1e-6);
+        let row_b1 = [0.25f32, 0.1, 0.5, f32::NAN];
+        let row_b2 = [3.9f32, 4.9, 1.2, 2.0];
+        let mut out = [0.0f32; 4];
+        let mut scratch = Vec::new();
+        pw.eval_row_with_scratch(&[row_b1, row_b2], &mut scratch, &mut out);
+        assert!((out[0] - 3.0).abs() < 1e-6);
+        assert!((out[1] - 4.0).abs() < 1e-6);
+        assert!((out[2] - 5.0).abs() < 1e-6);
+        assert!(out[3].is_nan());
+
+        let pr = ExprProgram::compile("where(b1 == 2, round(b2), b1 != 3)").unwrap();
+        assert!((pr.eval(&[2.0, 2.6]) - 3.0).abs() < 1e-6);
+        assert!((pr.eval(&[3.0, 2.6]) - 0.0).abs() < 1e-6);
+        assert!((pr.eval(&[4.0, 2.6]) - 1.0).abs() < 1e-6);
 
         // min/max/pow must propagate NaN instead of swallowing it
         let pm = ExprProgram::compile("min(b1 / (b1 - b1), 5.0)").unwrap();

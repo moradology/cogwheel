@@ -59,11 +59,29 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
 
     let count = full.samples_per_pixel as usize;
-    let band_metadata: Vec<_> = (1..=count)
-        .map(|i| serde_json::json!([format!("b{i}"), {}]))
+    let band_metadata: Vec<_> = (0..count)
+        .map(|i| {
+            let mut m = serde_json::Map::new();
+            if let Some(tags) = cog.index.band_metadata.get(i) {
+                for (k, v) in tags {
+                    m.insert(k.clone(), serde_json::json!(v));
+                }
+            }
+            serde_json::json!([format!("b{}", i + 1), serde_json::Value::Object(m)])
+        })
         .collect();
-    let band_descriptions: Vec<_> = (1..=count)
-        .map(|i| serde_json::json!([format!("b{i}"), format!("b{i}")]))
+    let band_descriptions: Vec<_> = (0..count)
+        .map(|i| {
+            let bname = format!("b{}", i + 1);
+            let desc = cog
+                .index
+                .band_descriptions
+                .get(i)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| bname.clone());
+            serde_json::json!([bname, desc])
+        })
         .collect();
     let colorinterp = infer_colorinterp(full);
     let overviews: Vec<u32> = cog

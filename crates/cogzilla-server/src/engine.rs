@@ -2049,6 +2049,8 @@ mod tests {
             nodata: None,
             scales: vec![1.0; 3],
             offsets: vec![0.0; 3],
+            band_metadata: vec![Vec::new(); 3],
+            band_descriptions: vec![String::new(); 3],
             ifds: vec![ifd],
         };
         let source = cogzilla_io::CogSource::open_local(&tmp_path).unwrap();
