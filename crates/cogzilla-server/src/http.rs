@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
 use crate::stac::{
-    get_colormap_json, get_colormap_png, get_tms_json, list_colormaps_json, list_tms_json,
+    get_colormap_image, get_colormap_json, get_tms_json, list_colormaps_json, list_tms_json,
     load_stac_item, resolve_stac_assets,
 };
 use crate::titiler::{
@@ -539,9 +539,9 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
     }
-    if route("bbox") {
+    if route("bbox") && segs.len() >= 4 {
         if let Some(k) = has(&["max_size"]) {
-            return Err(format!("parameter '{k}' is not supported on bbox routes"));
+            return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
     }
     let last_seg = segs.last().copied().unwrap_or("");
@@ -673,10 +673,51 @@ fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCo
     }
 }
 
+/// Compute aspect-preserving `(width, height)` inside `max_dim` for format-only `/bbox` and
+/// `POST /feature` routes (matching TiTiler instead of stretching into a fixed square).
+fn aspect_preserving_dims(bbox: [f64; 4], max_dim: u32) -> (u32, u32) {
+    let max_d = max_dim.clamp(1, 4096) as f64;
+    let dx = (bbox[2] - bbox[0]).abs();
+    let dy = (bbox[3] - bbox[1]).abs();
+    if !dx.is_finite() || !dy.is_finite() || dx <= 0.0 || dy <= 0.0 {
+        let d = max_dim.clamp(1, 4096);
+        return (d, d);
+    }
+    if dx >= dy {
+        let w = max_d.round() as u32;
+        let h = ((max_d * (dy / dx)).round() as u32).clamp(1, max_dim.clamp(1, 4096));
+        (w.max(1), h)
+    } else {
+        let h = max_d.round() as u32;
+        let w = ((max_d * (dx / dy)).round() as u32).clamp(1, max_dim.clamp(1, 4096));
+        (w, h.max(1))
+    }
+}
+
+/// Default rescale range matching TiTiler's `dtype_ranges` when `?rescale=` is omitted.
+fn default_rescale_for_dtype(st: cogzilla_tiff::SampleType, single: bool) -> (f32, f32) {
+    use cogzilla_tiff::SampleType;
+    match st {
+        SampleType::Uint8 => (0.0, 255.0),
+        SampleType::Int8 => (-128.0, 127.0),
+        SampleType::Uint16 => (0.0, 65535.0),
+        SampleType::Int16 => (-32768.0, 32767.0),
+        SampleType::Uint32 => (0.0, 4_294_967_295.0),
+        SampleType::Int32 => (-2_147_483_648.0, 2_147_483_647.0),
+        SampleType::Float32 | SampleType::Float64 => {
+            if single {
+                (0.0, 1000.0)
+            } else {
+                (0.0, 1.0)
+            }
+        }
+    }
+}
+
 fn build_band_request(
     pq: &ParsedQuery,
     default_bands: u16,
-    is_u8: bool,
+    sample_type: cogzilla_tiff::SampleType,
 ) -> Result<BandRequest, EngineError> {
     if let Some(alg) = pq.algorithm.as_deref() {
         let band_1based = pq.bidx.first().copied().unwrap_or(1);
@@ -820,11 +861,8 @@ fn build_band_request(
             ),
             1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
             _ => {
-                if is_u8 {
-                    ([0.0; 3], [255.0; 3])
-                } else {
-                    ([0.0; 3], [1.0; 3])
-                }
+                let (lo, hi) = default_rescale_for_dtype(sample_type, false);
+                ([lo; 3], [hi; 3])
             }
         };
         Ok(BandRequest::Rgb {
@@ -834,7 +872,7 @@ fn build_band_request(
         })
     } else {
         let b = pq.bidx.first().copied().unwrap_or(1);
-        let default_range = if is_u8 { (0.0, 255.0) } else { (0.0, 1000.0) };
+        let default_range = default_rescale_for_dtype(sample_type, true);
         let rescale = pq.rescale.first().copied().unwrap_or(default_range);
         Ok(BandRequest::Single {
             band_1based: b,
@@ -869,7 +907,7 @@ fn build_tile_request(
     ext: &str,
     pq: &ParsedQuery,
     default_bands: u16,
-    is_u8: bool,
+    sample_type: cogzilla_tiff::SampleType,
     is_crs84: bool,
     source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
@@ -893,7 +931,7 @@ fn build_tile_request(
         ext
     };
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
-    let bands = build_band_request(pq, default_bands, is_u8)?;
+    let bands = build_band_request(pq, default_bands, sample_type)?;
     let tile_size = match scale_opt {
         Some(sc) if (1..=4).contains(&sc) => sc * 256,
         Some(other) => {
@@ -1514,8 +1552,16 @@ where
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
-                            let (treq, ct) =
-                                build_tile_request(tile, sc, ext, &pq, 3, true, false, None)?;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                3,
+                                cogzilla_tiff::SampleType::Uint8,
+                                false,
+                                None,
+                            )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
@@ -1528,15 +1574,14 @@ where
                         } else {
                             let first_cog = engine.store.open_uri(&urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
-                            let is_u8 = first_cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
+                            let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
                                 tile,
                                 sc,
                                 ext,
                                 &pq,
                                 db,
-                                is_u8,
+                                st,
                                 false,
                                 Some(&first_cog),
                             )?;
@@ -1593,15 +1638,14 @@ where
                         .get_or_render(cache_key, || async {
                             let first_cog = engine.store.open_uri(&pq.urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
-                            let is_u8 = first_cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
+                            let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
                                 TileCoord { z, x, y },
                                 sc,
                                 ext,
                                 &pq,
                                 db,
-                                is_u8,
+                                st,
                                 false,
                                 Some(&first_cog),
                             )?;
@@ -1647,8 +1691,16 @@ where
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
-                            let (treq, ct) =
-                                build_tile_request(tile, sc, ext, &pq, 3, true, false, None)?;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                3,
+                                cogzilla_tiff::SampleType::Uint8,
+                                false,
+                                None,
+                            )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
@@ -1661,15 +1713,14 @@ where
                         } else {
                             let first_cog = engine.store.open_uri(&urls[0]).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
-                            let is_u8 = first_cog.index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
+                            let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
                                 tile,
                                 sc,
                                 ext,
                                 &pq,
                                 db,
-                                is_u8,
+                                st,
                                 false,
                                 Some(&first_cog),
                             )?;
@@ -1722,15 +1773,14 @@ where
                             } else {
                                 cogs[0].index.full_res().samples_per_pixel
                             };
-                            let is_u8 = cogs[0].index.full_res().sample_type
-                                == cogzilla_tiff::SampleType::Uint8;
+                            let st = cogs[0].index.full_res().sample_type;
                             let (mut treq, ct) = build_tile_request(
                                 TileCoord { z, x, y },
                                 sc,
                                 ext,
                                 &pq,
                                 db,
-                                is_u8,
+                                st,
                                 false,
                                 Some(&cogs[0]),
                             )?;
@@ -1825,13 +1875,23 @@ where
                 Bytes::from(list_colormaps_json(&host).to_string()),
                 "application/json",
             )),
-            ["colorMaps", id] => {
-                if pq.format_param.as_deref() == Some("png") {
-                    get_colormap_png(id).map(|b| (b, "image/png"))
-                } else {
+            ["colorMaps", id] => match pq.format_param.as_deref() {
+                None | Some("json") => {
                     get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
                 }
-            }
+                Some("png") => get_colormap_image(id, OutputFormat::Png).map(|b| (b, "image/png")),
+                Some("jpg" | "jpeg") => {
+                    get_colormap_image(id, OutputFormat::Jpeg { quality: pq.jpeg_quality })
+                        .map(|b| (b, "image/jpeg"))
+                }
+                Some("webp") => {
+                    get_colormap_image(id, OutputFormat::Webp { quality: pq.webp_quality })
+                        .map(|b| (b, "image/webp"))
+                }
+                Some(other) => Err(EngineError::BadRequest(format!(
+                    "unsupported colormap format '{other}' (use json, png, jpg, or webp)"
+                ))),
+            },
             _ => Err(EngineError::NotFound(path.clone())),
         };
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
@@ -2152,15 +2212,14 @@ where
                         } else {
                             cogs[0].index.full_res().samples_per_pixel
                         };
-                        let is_u8 = cogs[0].index.full_res().sample_type
-                            == cogzilla_tiff::SampleType::Uint8;
+                        let st = cogs[0].index.full_res().sample_type;
                         let (mut treq, ct) = build_tile_request(
                             TileCoord { z, x, y },
                             sc,
                             ext,
                             &pq_stac,
                             db,
-                            is_u8,
+                            st,
                             tms == "WorldCRS84Quad",
                             Some(&cogs[0]),
                         )?;
@@ -2339,8 +2398,8 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2379,8 +2438,8 @@ where
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2422,8 +2481,8 @@ where
                     pq_stac.webp_quality,
                     pq_stac.jpeg_quality,
                 )?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2439,17 +2498,18 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq_stac.max_size.min(1024));
                 let data = if pq_stac.coord_crs_3857 {
                     let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, 512, 512, &bands, resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
                     let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, 512, 512, None, &bands, resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
@@ -2472,8 +2532,8 @@ where
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2530,8 +2590,8 @@ where
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2574,8 +2634,8 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq_stac, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq_stac, db, st)?;
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -2591,9 +2651,10 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, s);
                 let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2803,15 +2864,14 @@ where
                         } else {
                             cogs[0].index.full_res().samples_per_pixel
                         };
-                        let is_u8 = cogs[0].index.full_res().sample_type
-                            == cogzilla_tiff::SampleType::Uint8;
+                        let st = cogs[0].index.full_res().sample_type;
                         let (mut treq, ct) = build_tile_request(
                             TileCoord { z, x, y },
                             sc,
                             ext,
                             &pq,
                             db,
-                            is_u8,
+                            st,
                             tms == "WorldCRS84Quad",
                             Some(&cogs[0]),
                         )?;
@@ -2976,8 +3036,8 @@ where
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -3001,8 +3061,8 @@ where
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -3030,24 +3090,25 @@ where
                     pq.webp_quality,
                     pq.jpeg_quality,
                 )?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size.min(1024));
                 let data = if pq.coord_crs_3857 {
                     let resample = resolve_resample(&pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, 512, 512, &bands, resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
                     let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, 512, 512, None, &bands, resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
@@ -3066,8 +3127,8 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -3106,17 +3167,17 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let s = pq.max_size.min(1024);
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size.min(1024));
                 let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -3135,8 +3196,8 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
-                let mut bands = build_band_request(&pq, db, is_u8)?;
+                let st = cogs[0].index.full_res().sample_type;
+                let mut bands = build_band_request(&pq, db, st)?;
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -3432,7 +3493,8 @@ mod tests {
     fn colormap_param_sets_explicit_for_hillshade_and_stac_bbox_accepts_coord_crs() {
         let pq = parse_query(Some("algorithm=hillshade&colormap=terrain"));
         assert!(pq.colormap_explicit);
-        let bands = build_band_request(&pq, 1, false).expect("valid hillshade request");
+        let bands = build_band_request(&pq, 1, cogzilla_tiff::SampleType::Float32)
+            .expect("valid hillshade request");
         match bands {
             BandRequest::Dem { colormap, .. } => {
                 assert_ne!(colormap, ColormapName::Grayscale);
@@ -3452,14 +3514,15 @@ mod tests {
         let pq = parse_query(None);
         assert_eq!(pq.resample, ResampleMode::Nearest);
         assert_eq!(pq.reproject, ResampleMode::Nearest);
+        let u8t = cogzilla_tiff::SampleType::Uint8;
         // WebMercatorQuad at z=2 has 4x4 tiles (0..=3)
-        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, true, false, None).is_ok());
-        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, true, false, None).is_err());
-        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, false, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, u8t, false, None).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, u8t, false, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, u8t, false, None).is_err());
         // WorldCRS84Quad at z=2 has 8x4 tiles (x: 0..=7, y: 0..=3)
-        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, true, true, None).is_ok());
-        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, true, true, None).is_err());
-        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, true, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, u8t, true, None).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, u8t, true, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, u8t, true, None).is_err());
 
         // ?reproject= is accepted and parsed independently from ?resampling=
         let pq_rp = parse_query(Some("resampling=bilinear&reproject=cubic"));
@@ -3480,10 +3543,19 @@ mod tests {
         // ?format= applies on format-less tile routes
         let pq_fmt = parse_query(Some("format=webp"));
         let (treq, ct) =
-            build_tile_request(TileCoord { z: 2, x: 1, y: 1 }, None, "", &pq_fmt, 3, true, false, None)
+            build_tile_request(TileCoord { z: 2, x: 1, y: 1 }, None, "", &pq_fmt, 3, u8t, false, None)
                 .unwrap();
         assert_eq!(ct, "image/webp");
         assert!(matches!(treq.format, OutputFormat::Webp { .. }));
+
+        // Default dtype rescale ranges & aspect-preserving dims & hex colormaps
+        assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Uint16, false), (0.0, 65535.0));
+        assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Int16, true), (-32768.0, 32767.0));
+        assert_eq!(aspect_preserving_dims([0.0, 0.0, 2.0, 1.0], 512), (512, 256));
+        assert_eq!(aspect_preserving_dims([0.0, 0.0, 1.0, 4.0], 512), (128, 512));
+        let hex_lut = ColormapLut::from_json_str(r##"{"0":"#112233","255":"#ff000080"}"##).unwrap();
+        assert_eq!(hex_lut.rgb[0], [0x11, 0x22, 0x33]);
+        assert_eq!(hex_lut.rgba_u32[255].to_le_bytes(), [0xff, 0x00, 0x00, 0x80]);
 
         // TiTiler query param parity: nodata=nan/inf/-inf, z_exaggeration, [0,1000] rescale,
         // colormap_name precedence over inline colormap, and tilejson minzoom/maxzoom/tile_format.

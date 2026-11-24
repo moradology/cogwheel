@@ -65,7 +65,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("point coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:32610")),
         ("preview dst_crs", format!("{base}/cog/preview.png?url={sat_url}&dst_crs=epsg:4326")),
         ("preview width", format!("{base}/cog/preview.png?url={sat_url}&width=300")),
-        ("bbox max_size", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8.png?url={sat_url}&max_size=2000")),
+        ("bbox explicit dims max_size", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8/256x256.png?url={sat_url}&max_size=2000")),
         ("info.geojson crs", format!("{base}/cog/info.geojson?url={sat_url}&crs=epsg:32610")),
         ("colormap orientation", format!("{base}/colorMaps/viridis?f=png&orientation=vertical")),
     ] {
