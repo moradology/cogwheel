@@ -1582,37 +1582,60 @@ pub(crate) fn encode_rgba_output(
     format: OutputFormat,
     return_mask: bool,
 ) -> Bytes {
+    thread_local! {
+        static PNG_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    const MAX_TLS_SCRATCH: usize = 4 * 1024 * 1024;
     match format {
         OutputFormat::Png => {
-            if !return_mask {
-                let mut rgb = vec![0u8; w * h * 3];
-                for i in 0..(w * h) {
-                    if rgba[i * 4 + 3] != 0 {
-                        rgb[i * 3] = rgba[i * 4];
-                        rgb[i * 3 + 1] = rgba[i * 4 + 1];
-                        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+            PNG_SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let (ref mut filtered, ref mut rgb_row) = *guard;
+                let out = if !return_mask {
+                    let stride = 1 + w * 3;
+                    filtered.resize(h * stride, 0);
+                    rgb_row.resize(w * 3, 0);
+                    for py in 0..h {
+                        let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
+                        for (src, dst) in
+                            src_row.chunks_exact(4).zip(rgb_row.chunks_exact_mut(3))
+                        {
+                            if src[3] != 0 {
+                                dst[0] = src[0];
+                                dst[1] = src[1];
+                                dst[2] = src[2];
+                            } else {
+                                dst[0] = 0;
+                                dst[1] = 0;
+                                dst[2] = 0;
+                            }
+                        }
+                        filter_sub_rgb_row(
+                            rgb_row,
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
                     }
+                    encode_filtered_png(w as u32, h as u32, 2, filtered)
+                } else {
+                    let stride = 1 + w * 4;
+                    filtered.resize(h * stride, 0);
+                    for py in 0..h {
+                        filter_sub_rgba_row(
+                            &rgba[py * w * 4..(py + 1) * w * 4],
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
+                    }
+                    encode_filtered_png(w as u32, h as u32, 6, filtered)
+                };
+                if filtered.capacity() > MAX_TLS_SCRATCH {
+                    *filtered = Vec::new();
                 }
-                let stride = 1 + w * 3;
-                let mut filtered = vec![0u8; h * stride];
-                for py in 0..h {
-                    filter_sub_rgb_row(
-                        &rgb[py * w * 3..(py + 1) * w * 3],
-                        &mut filtered[py * stride..(py + 1) * stride],
-                    );
+                if rgb_row.capacity() > MAX_TLS_SCRATCH {
+                    *rgb_row = Vec::new();
                 }
-                encode_filtered_png(w as u32, h as u32, 2, &filtered)
-            } else {
-                let stride = 1 + w * 4;
-                let mut filtered = vec![0u8; h * stride];
-                for py in 0..h {
-                    filter_sub_rgba_row(
-                        &rgba[py * w * 4..(py + 1) * w * 4],
-                        &mut filtered[py * stride..(py + 1) * stride],
-                    );
-                }
-                encode_filtered_png(w as u32, h as u32, 6, &filtered)
-            }
+                out
+            })
         }
         OutputFormat::Webp { quality } => {
             if !return_mask {
