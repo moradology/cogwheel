@@ -583,15 +583,18 @@ impl CogStore {
                             let mask_idx = (tile_idx as usize) % per_plane.max(1);
                             match mask_tile_range(mask_ifd, mask_idx) {
                                 SidecarTileRange::Present(moff, mlen) => {
-                                    if let Some(mslice) = cog.source.local_slice(moff, mlen) {
-                                        if let Ok(mask) = decode_mask_tile_rows(
-                                            mslice,
-                                            mask_ifd,
-                                            mask_ifd.block_height(mask_idx),
-                                        ) {
-                                            apply_mask_to_tile(&mut decoded, &mask);
-                                        }
-                                    }
+                                    let Some(mslice) = cog.source.local_slice(moff, mlen) else {
+                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                            required: moff.saturating_add(mlen as u64),
+                                            available: 0,
+                                        }));
+                                    };
+                                    let mask = decode_mask_tile_rows(
+                                        mslice,
+                                        mask_ifd,
+                                        mask_ifd.block_height(mask_idx),
+                                    )?;
+                                    apply_mask_to_tile(&mut decoded, &mask);
                                 }
                                 SidecarTileRange::SparseTransparent => {
                                     mark_tile_all_nodata(&mut decoded);
@@ -603,18 +606,21 @@ impl CogStore {
                     if let Some(alpha_plane) = planar_alpha_plane(ifd) {
                         match planar_alpha_tile_range(ifd, tile_idx, alpha_plane) {
                             SidecarTileRange::Present(aoff, alen) => {
-                                if let Some(aslice) = cog.source.local_slice(aoff, alen) {
-                                    if let Ok(alpha_tile) = decode_tile_rows(
-                                        aslice,
-                                        ifd,
-                                        cog.index.byte_order,
-                                        None,
-                                        rows,
-                                    ) {
-                                        if let Some(ab) = alpha_tile.bands.first() {
-                                            apply_alpha_band_to_tile(&mut decoded, ab);
-                                        }
-                                    }
+                                let Some(aslice) = cog.source.local_slice(aoff, alen) else {
+                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                        required: aoff.saturating_add(alen as u64),
+                                        available: 0,
+                                    }));
+                                };
+                                let alpha_tile = decode_tile_rows(
+                                    aslice,
+                                    ifd,
+                                    cog.index.byte_order,
+                                    None,
+                                    rows,
+                                )?;
+                                if let Some(ab) = alpha_tile.bands.first() {
+                                    apply_alpha_band_to_tile(&mut decoded, ab);
                                 }
                             }
                             SidecarTileRange::SparseTransparent => {
@@ -1522,15 +1528,18 @@ impl CogStore {
                 }
             }
         }
-        let raw = cog
-            .source
-            .fetch_range(offset, offset + byte_len as u64)
-            .await?;
+        let end = offset.checked_add(byte_len as u64).ok_or_else(|| {
+            IoError::Tiff(TiffError::NeedMoreBytes {
+                required: u64::MAX,
+                available: 0,
+            })
+        })?;
+        let raw = cog.source.fetch_range(offset, end).await?;
         let want = byte_len as usize;
         if raw.len() < want {
             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                required: offset + byte_len as u64,
-                available: offset + raw.len() as u64,
+                required: end,
+                available: offset.saturating_add(raw.len() as u64),
             }));
         }
         let raw = if raw.len() > want {

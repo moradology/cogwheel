@@ -228,10 +228,17 @@ pub fn parse_aws_credentials_ini(text: &str, profile: &str) -> Option<AwsCredent
     })
 }
 
+enum CachedDynamicCreds {
+    Creds(AwsCredentials),
+    /// Negative-cache failed ECS/IMDSv2 probes so non-EC2 hosts reading public `s3://` buckets
+    /// don't serialize every range fetch behind a 500ms timeout.
+    Unavailable(Instant),
+}
+
 /// Dynamic credential cache supporting ECS container metadata (`AWS_CONTAINER_CREDENTIALS_*`)
 /// and EC2 IMDSv2 (`169.254.169.254`), with singleflighted TTL refresh.
 pub struct DynamicCredsCache {
-    cached: RwLock<Option<AwsCredentials>>,
+    cached: RwLock<Option<CachedDynamicCreds>>,
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -250,10 +257,16 @@ impl DynamicCredsCache {
     pub async fn resolve_dynamic(&self, client: &reqwest::Client) -> Option<AwsCredentials> {
         {
             let guard = self.cached.read();
-            if let Some(c) = guard.as_ref() {
-                if !c.is_expired_soon() {
+            match guard.as_ref() {
+                Some(CachedDynamicCreds::Creds(c)) if !c.is_expired_soon() => {
                     return Some(c.clone());
                 }
+                Some(CachedDynamicCreds::Unavailable(retry_after))
+                    if Instant::now() < *retry_after =>
+                {
+                    return None;
+                }
+                _ => {}
             }
         }
 
@@ -261,10 +274,16 @@ impl DynamicCredsCache {
         let _refresh_guard = self.refresh_lock.lock().await;
         {
             let guard = self.cached.read();
-            if let Some(c) = guard.as_ref() {
-                if !c.is_expired_soon() {
+            match guard.as_ref() {
+                Some(CachedDynamicCreds::Creds(c)) if !c.is_expired_soon() => {
                     return Some(c.clone());
                 }
+                Some(CachedDynamicCreds::Unavailable(retry_after))
+                    if Instant::now() < *retry_after =>
+                {
+                    return None;
+                }
+                _ => {}
             }
         }
 
@@ -277,7 +296,7 @@ impl DynamicCredsCache {
 
         if let Some(url) = ecs_url {
             if let Some(creds) = fetch_ecs_credentials(client, &url).await {
-                *self.cached.write() = Some(creds.clone());
+                *self.cached.write() = Some(CachedDynamicCreds::Creds(creds.clone()));
                 return Some(creds);
             }
         }
@@ -285,11 +304,14 @@ impl DynamicCredsCache {
         // 2. EC2 IMDSv2 (only when not explicitly disabled via AWS_EC2_METADATA_DISABLED=true)
         if !env_truthy("AWS_EC2_METADATA_DISABLED") {
             if let Some(creds) = fetch_imds_v2_credentials(client).await {
-                *self.cached.write() = Some(creds.clone());
+                *self.cached.write() = Some(CachedDynamicCreds::Creds(creds.clone()));
                 return Some(creds);
             }
         }
 
+        *self.cached.write() = Some(CachedDynamicCreds::Unavailable(
+            Instant::now() + Duration::from_secs(60),
+        ));
         None
     }
 }

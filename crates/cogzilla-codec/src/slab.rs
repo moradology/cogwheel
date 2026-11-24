@@ -1,4 +1,4 @@
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -65,8 +65,9 @@ impl AlignedF32Slab {
         }
         let layout = Layout::from_size_align(len * std::mem::size_of::<f32>(), 64)
             .expect("valid aligned f32 layout");
-        // SAFETY: layout size > 0 and align is power of two.
-        let raw = unsafe { alloc(layout) as *mut f32 };
+        // SAFETY: layout size > 0 and align is power of two; zero-initializing ensures
+        // subsequent `&[f32]`/`&mut [f32]` slice views are always valid initialized memory.
+        let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
         let ptr = NonNull::new(raw).expect("OOM allocating AlignedF32Slab");
         Self { ptr, len }
     }

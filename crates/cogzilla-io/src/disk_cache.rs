@@ -311,6 +311,9 @@ impl DiskBlockCache {
         }
 
         let new_sz = (HEADER_LEN + data.len()) as u64;
+        // Reserve `new_sz` before inserting into `self.entries` so concurrent eviction cannot
+        // subtract `new_sz` before `fetch_add` runs.
+        let mut now = self.current_bytes.fetch_add(new_sz, Ordering::AcqRel) + new_sz;
         let old_sz = self
             .entries
             .insert(
@@ -324,18 +327,15 @@ impl DiskBlockCache {
             .map(|e| e.bytes)
             .unwrap_or(0);
 
-        let now = if new_sz >= old_sz {
-            let delta = new_sz - old_sz;
-            self.current_bytes.fetch_add(delta, Ordering::AcqRel) + delta
-        } else {
-            let delta = old_sz - new_sz;
-            self.current_bytes
+        if old_sz > 0 {
+            now = self
+                .current_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    Some(c.saturating_sub(delta))
+                    Some(c.saturating_sub(old_sz))
                 })
                 .unwrap_or(0)
-                .saturating_sub(delta)
-        };
+                .saturating_sub(old_sz);
+        }
 
         if now > self.max_bytes {
             self.evict_if_needed();

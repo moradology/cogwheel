@@ -285,8 +285,8 @@ pub fn decode_tile_rows(
                 use zune_jpeg::zune_core::options::DecoderOptions;
 
                 let opts = DecoderOptions::default()
-                    .set_max_width(ifd.tile_width as usize)
-                    .set_max_height(tile_h as usize);
+                    .set_max_width((ifd.tile_width as usize).next_multiple_of(16))
+                    .set_max_height((ifd.tile_height as usize).next_multiple_of(16));
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(jpeg_bytes, opts);
                 dec.decode_headers()
                     .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
@@ -296,7 +296,13 @@ pub fn decode_tile_rows(
                     // APP14 transform=0 marker is present, YCbCr if stripped) so zune-jpeg performs
                     // zero colorspace conversion instead of failing on RGB->YCbCr.
                     (3, 2) => dec.get_input_colorspace().unwrap_or(ColorSpace::YCbCr),
-                    _ => ColorSpace::RGB,
+                    (3, _) => ColorSpace::RGB,
+                    (4, _) => dec.get_input_colorspace().unwrap_or(ColorSpace::RGBA),
+                    _ => {
+                        return Err(CodecError::Jpeg(format!(
+                            "unsupported JPEG band count: {bands_in_tile}"
+                        )));
+                    }
                 };
                 dec.set_options(opts.jpeg_set_out_colorspace(out_cs));
                 let out_len = dec.output_buffer_size().unwrap_or(expected_bytes);
@@ -310,10 +316,20 @@ pub fn decode_tile_rows(
                     let pixels = dec
                         .decode()
                         .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
+                    if pixels.len() < expected_bytes {
+                        return Err(CodecError::Jpeg(format!(
+                            "decoded JPEG buffer too small: {} < {expected_bytes}",
+                            pixels.len()
+                        )));
+                    }
                     raw_slice[..expected_bytes].copy_from_slice(&pixels[..expected_bytes]);
                 }
             }
             Compression::Webp => {
+                if ifd.sample_type != SampleType::Uint8 || (bands_in_tile != 3 && bands_in_tile != 4)
+                {
+                    return Err(CodecError::Webp);
+                }
                 let stride = (ifd.tile_width as i32) * (bands_in_tile as i32);
                 let ptr = unsafe {
                     if bands_in_tile == 4 {

@@ -1192,6 +1192,11 @@ where
                                 "invalid /mosaicjson/tiles coordinate path".into(),
                             ));
                         };
+                        if z > 30 {
+                            return Err(EngineError::BadRequest(format!(
+                                "invalid zoom level z={z} (expected 0..=30)"
+                            )));
+                        }
                         let tile = TileCoord { z, x, y };
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
@@ -1290,6 +1295,11 @@ where
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
+                        if z > 30 {
+                            return Err(EngineError::BadRequest(format!(
+                                "invalid zoom level z={z} (expected 0..=30)"
+                            )));
+                        }
                         let tile = TileCoord { z, x, y };
                         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);

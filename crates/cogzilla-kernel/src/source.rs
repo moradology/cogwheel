@@ -287,7 +287,7 @@ impl<'a> BandSource<'a> {
             if blk.width < 2 || blk.height < 2 {
                 return None;
             }
-            if let cogzilla_codec::BandData::U16 { data, nodata: None } = &blk.data {
+            if let cogzilla_codec::BandData::U16 { data, .. } = &blk.data {
                 return Some((
                     data.as_ref(),
                     self.tx0 * self.tile_w,
@@ -307,7 +307,7 @@ impl<'a> BandSource<'a> {
             if blk.width < 2 || blk.height < 2 {
                 return None;
             }
-            if let cogzilla_codec::BandData::U8 { data, nodata: None } = &blk.data {
+            if let cogzilla_codec::BandData::U8 { data, .. } = &blk.data {
                 return Some((
                     data.as_ref(),
                     self.tx0 * self.tile_w,
@@ -328,12 +328,7 @@ impl<'a> BandSource<'a> {
             if blk.width < 2 || blk.height < 2 {
                 return None;
             }
-            if let cogzilla_codec::BandData::RgbU8Channel {
-                rgb,
-                channel,
-                nodata: None,
-            } = &blk.data
-            {
+            if let cogzilla_codec::BandData::RgbU8Channel { rgb, channel, .. } = &blk.data {
                 return Some((
                     rgb.as_ref(),
                     *channel,
@@ -453,5 +448,25 @@ mod tests {
         let src_id = BandSource::new(2, 2, 2, 2, 0, 0, 1, 1, &blocks).with_scale_offset(1.0, 0.0);
         assert!(src_id.scale_offset.is_none());
         assert!(src_id.single_block_flat().is_some());
+
+        // Clean (`no_nodata == true`) U8/U16/RgbU8 blocks with GDAL_NODATA metadata (e.g. Some(0))
+        // must still unlock single_block_* SIMD fast paths!
+        let u16_band = DecodedBand {
+            width: 2,
+            height: 2,
+            data: BandData::U16 {
+                data: vec![10u16, 20, 30, 40].into_boxed_slice(),
+                nodata: Some(0),
+            },
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 10.0,
+                max: 40.0,
+            },
+        };
+        let u16_blocks = [Some(&u16_band)];
+        let src_u16 = BandSource::new(2, 2, 2, 2, 0, 0, 1, 1, &u16_blocks);
+        assert!(src_u16.single_block_u16().is_some());
     }
 }

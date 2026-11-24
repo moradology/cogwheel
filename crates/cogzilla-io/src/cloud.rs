@@ -92,10 +92,17 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
     })
 }
 
+enum CachedGcsToken {
+    Token(String, Instant),
+    /// Negative-cache failed GCE metadata probes so non-GCE hosts don't serialize
+    /// every public `gs://` range request behind a 2-second timeout.
+    Unavailable(Instant),
+}
+
 /// Cached GCE / GKE / Cloud Run metadata OAuth2 bearer token with singleflighted refresh.
 #[derive(Default)]
 pub struct GcsTokenCache {
-    cached: Mutex<Option<(String, Instant)>>,
+    cached: Mutex<Option<CachedGcsToken>>,
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -117,37 +124,62 @@ impl GcsTokenCache {
         }
         {
             let lock = self.cached.lock();
-            if let Some((tok, exp)) = lock.as_ref() {
-                if Instant::now() + Duration::from_secs(60) < *exp {
+            match lock.as_ref() {
+                Some(CachedGcsToken::Token(tok, exp))
+                    if Instant::now() + Duration::from_secs(60) < *exp =>
+                {
                     return Some(tok.clone());
                 }
+                Some(CachedGcsToken::Unavailable(retry_after)) if Instant::now() < *retry_after => {
+                    return None;
+                }
+                _ => {}
             }
         }
         let _refresh_guard = self.refresh_lock.lock().await;
         {
             let lock = self.cached.lock();
-            if let Some((tok, exp)) = lock.as_ref() {
-                if Instant::now() + Duration::from_secs(60) < *exp {
+            match lock.as_ref() {
+                Some(CachedGcsToken::Token(tok, exp))
+                    if Instant::now() + Duration::from_secs(60) < *exp =>
+                {
                     return Some(tok.clone());
                 }
+                Some(CachedGcsToken::Unavailable(retry_after)) if Instant::now() < *retry_after => {
+                    return None;
+                }
+                _ => {}
             }
         }
-        let resp = client
-            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-            .header("Metadata-Flavor", "Google")
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+        let fetched = async {
+            let resp = client
+                .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+                .header("Metadata-Flavor", "Google")
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let text = resp.text().await.ok()?;
+            let tok = extract_json_str(&text, "access_token")?;
+            let ttl = extract_json_u64(&text, "expires_in").unwrap_or(300);
+            Some((tok, ttl))
         }
-        let text = resp.text().await.ok()?;
-        let tok = extract_json_str(&text, "access_token")?;
-        let ttl = extract_json_u64(&text, "expires_in").unwrap_or(300);
-        let exp = Instant::now() + Duration::from_secs(ttl);
-        *self.cached.lock() = Some((tok.clone(), exp));
-        Some(tok)
+        .await;
+        match fetched {
+            Some((tok, ttl)) => {
+                let exp = Instant::now() + Duration::from_secs(ttl);
+                *self.cached.lock() = Some(CachedGcsToken::Token(tok.clone(), exp));
+                Some(tok)
+            }
+            None => {
+                *self.cached.lock() =
+                    Some(CachedGcsToken::Unavailable(Instant::now() + Duration::from_secs(60)));
+                None
+            }
+        }
     }
 }
 
@@ -496,7 +528,8 @@ async fn fetch_azure_inner(
         .endpoint_override
         .clone()
         .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", target.account));
-    let mut url = format!("{}/{}/{}", base, target.container, encode_path(&target.blob));
+    let clean_url = format!("{}/{}/{}", base, target.container, encode_path(&target.blob));
+    let mut url = clean_url.clone();
     if !cfg.no_sign {
         if let Some(sas) = &cfg.sas_token {
             url.push('?');
@@ -547,7 +580,7 @@ async fn fetch_azure_inner(
                         continue;
                     }
                 }
-                return Err(IoError::Http(e));
+                return Err(IoError::Http(e.without_url()));
             }
         };
         let status = resp.status().as_u16();
@@ -562,16 +595,25 @@ async fn fetch_azure_inner(
                 tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
                 continue;
             }
-            return Err(IoError::HttpStatus { status, url });
+            return Err(IoError::HttpStatus {
+                status,
+                url: clean_url,
+            });
         }
         if status == 200
             && let Some((start, _)) = range
             && start > 0
         {
-            return Err(IoError::HttpStatus { status: 200, url });
+            return Err(IoError::HttpStatus {
+                status: 200,
+                url: clean_url,
+            });
         }
         if status != 200 && status != 206 {
-            return Err(IoError::HttpStatus { status, url });
+            return Err(IoError::HttpStatus {
+                status,
+                url: clean_url,
+            });
         }
         let eff_cap = max_bytes.or_else(|| {
             range.map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
@@ -579,7 +621,7 @@ async fn fetch_azure_inner(
         let body_res = if let Some(cap) = eff_cap {
             read_response_capped(resp, cap).await
         } else {
-            resp.bytes().await.map_err(IoError::Http)
+            resp.bytes().await.map_err(|e| IoError::Http(e.without_url()))
         };
         match body_res {
             Ok(data) => {
@@ -597,12 +639,15 @@ async fn fetch_azure_inner(
                         continue;
                     }
                 }
-                return Err(IoError::Http(e));
+                return Err(IoError::Http(e.without_url()));
             }
             Err(e) => return Err(e),
         }
     }
-    Err(IoError::HttpStatus { status: 503, url })
+    Err(IoError::HttpStatus {
+        status: 503,
+        url: clean_url,
+    })
 }
 
 fn encode_path(path: &str) -> String {
