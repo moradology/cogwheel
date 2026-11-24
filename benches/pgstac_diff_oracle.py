@@ -480,6 +480,38 @@ def main() -> int:
         o.check("collection point with a datetime", "json",
                 f"/collections/{collection}/point/{pt}?assets=red&items_limit=2&datetime=2024-06-01T00:00:00Z/2024-08-31T23:59:59Z")
 
+        print("bbox and feature images")
+        part = f"{lon - 0.1:.4f},{lat - 0.05:.4f},{lon + 0.1:.4f},{lat + 0.05:.4f}"
+        wide = f"{lon - 0.9:.4f},{lat - 0.5:.4f},{lon + 0.9:.4f},{lat + 0.5:.4f}"
+        triangle = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
+            [lon - 0.1, lat - 0.05], [lon + 0.1, lat - 0.05], [lon, lat + 0.05], [lon - 0.1, lat - 0.05]]]}}
+        o.check("bbox, max_size", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=256")
+        o.check("bbox, exact size", "image", f"/searches/{sid}/bbox/{part}/300x200.png?assets=visual")
+        o.check("bbox, width only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&width=300")
+        o.check("bbox, height only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&height=90")
+        o.check("bbox at the data's own resolution", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual",
+                known="shared bbox renderer: a pixel with a zero in any band is nodata; TiTiler needs every band")
+        o.check("bbox, jpg", "image", f"/searches/{sid}/bbox/{part}.jpg?assets=visual&max_size=256")
+        o.check("bbox, webp", "image", f"/searches/{sid}/bbox/{part}/256x128.webp?assets=visual")
+        o.check("bbox over several items", "image", f"/searches/{sid}/bbox/{wide}.png?assets=visual&max_size=512")
+        o.check("bbox, three assets", "image",
+                f"/searches/{sid}/bbox/{part}.png?assets=red&assets=green&assets=blue&rescale=0,3000&max_size=256")
+        o.check("bbox, one band with a colormap", "image",
+                f"/searches/{sid}/bbox/{part}.png?assets=nir&rescale=0,5000&colormap_name=viridis&max_size=256")
+        o.check("bbox, filtered search", "image", f"/searches/{sid_meta}/bbox/{part}.png?assets=visual&max_size=256")
+        o.check("bbox without assets", "json", f"/searches/{sid}/bbox/{part}.png")
+        o.check("bbox without a format", "status", f"/searches/{sid}/bbox/{part}?assets=visual")
+        o.check("bbox outside the data", "status", f"/searches/{sid}/bbox/-100,10,-99,11.png?assets=visual&max_size=64")
+        o.check("bbox with an unknown asset", "json", f"/searches/{sid}/bbox/{part}.png?assets=nope&max_size=64")
+        o.check("bbox for an unknown search", "json", f"/searches/deadbeef/bbox/{part}.png?assets=visual")
+        o.check("collection bbox", "image", f"/collections/{collection}/bbox/{part}.png?assets=visual&max_size=256")
+        o.check("feature, max_size", "image", f"/searches/{sid}/feature.png?assets=visual&max_size=256", "POST", triangle)
+        o.check("feature, exact size", "image", f"/searches/{sid}/feature/200x100.png?assets=visual", "POST", triangle)
+        o.check("feature, format from the pixels", "image", f"/searches/{sid}/feature?assets=visual&max_size=128", "POST", triangle)
+        o.check("feature, format=jpg", "image", f"/searches/{sid}/feature?assets=visual&max_size=128&format=jpg", "POST", triangle)
+        o.check("feature without assets", "json", f"/searches/{sid}/feature.png", "POST", triangle)
+        o.check("collection feature", "image", f"/collections/{collection}/feature.png?assets=visual&max_size=256", "POST", triangle)
+
         print("wmts")
         o.check("search wmts", "wmts", f"/searches/{sid}/WMTSCapabilities.xml?assets=visual")
         o.check("search wmts keeps tile parameters", "wmts",
