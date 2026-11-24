@@ -92,10 +92,11 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
     })
 }
 
-/// Cached GCE / GKE / Cloud Run metadata OAuth2 bearer token.
+/// Cached GCE / GKE / Cloud Run metadata OAuth2 bearer token with singleflighted refresh.
 #[derive(Default)]
 pub struct GcsTokenCache {
     cached: Mutex<Option<(String, Instant)>>,
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl GcsTokenCache {
@@ -114,6 +115,15 @@ impl GcsTokenCache {
         {
             return None;
         }
+        {
+            let lock = self.cached.lock();
+            if let Some((tok, exp)) = lock.as_ref() {
+                if Instant::now() + Duration::from_secs(60) < *exp {
+                    return Some(tok.clone());
+                }
+            }
+        }
+        let _refresh_guard = self.refresh_lock.lock().await;
         {
             let lock = self.cached.lock();
             if let Some((tok, exp)) = lock.as_ref() {

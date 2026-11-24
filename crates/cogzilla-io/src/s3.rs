@@ -223,23 +223,36 @@ pub fn parse_aws_credentials_ini(text: &str, profile: &str) -> Option<AwsCredent
 }
 
 /// Dynamic credential cache supporting ECS container metadata (`AWS_CONTAINER_CREDENTIALS_*`)
-/// and EC2 IMDSv2 (`169.254.169.254`), with automatic TTL refresh.
+/// and EC2 IMDSv2 (`169.254.169.254`), with singleflighted TTL refresh.
 pub struct DynamicCredsCache {
     cached: RwLock<Option<AwsCredentials>>,
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl Default for DynamicCredsCache {
     fn default() -> Self {
         Self {
             cached: RwLock::new(None),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
 
 impl DynamicCredsCache {
     /// Resolve active credentials: returns cached temporary creds if still fresh, otherwise
-    /// tries ECS container credentials endpoint (if env vars are set) or EC2 IMDSv2.
+    /// singleflights an ECS container credentials or EC2 IMDSv2 refresh.
     pub async fn resolve_dynamic(&self, client: &reqwest::Client) -> Option<AwsCredentials> {
+        {
+            let guard = self.cached.read();
+            if let Some(c) = guard.as_ref() {
+                if !c.is_expired_soon() {
+                    return Some(c.clone());
+                }
+            }
+        }
+
+        // Singleflight metadata refresh so a burst of concurrent requests never hammers IMDSv2.
+        let _refresh_guard = self.refresh_lock.lock().await;
         {
             let guard = self.cached.read();
             if let Some(c) = guard.as_ref() {
@@ -607,6 +620,17 @@ pub async fn fetch_s3_object_limited(
     let mut attempt = 0u32;
 
     loop {
+        // Resolve dynamic credentials BEFORE acquiring an AimdLimiter permit so IMDSv2/ECS
+        // metadata hops never consume upstream S3 concurrency slots.
+        let resolved_dynamic = if !cfg.no_sign_request && !cfg.has_credentials() {
+            match dynamic_creds {
+                Some(dc) => dc.resolve_dynamic(client).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let permit = match limiter {
             Some(l) => Some(l.acquire().await),
             None => None,
@@ -618,7 +642,7 @@ pub async fn fetch_s3_object_limited(
             req = req.header("Range", rng);
         }
 
-        // Resolve credentials: static config -> dynamic ECS/IMDSv2 (unless no_sign_request)
+        // Sign request using static config or pre-resolved dynamic ECS/IMDSv2 creds
         if !cfg.no_sign_request {
             if cfg.has_credentials() {
                 for (k, v) in sign_s3_get(
@@ -633,22 +657,18 @@ pub async fn fetch_s3_object_limited(
                 ) {
                     req = req.header(k, v);
                 }
-            } else if let Some(dc) = dynamic_creds {
-                if let Some(creds) = dc.resolve_dynamic(client).await {
-                    for (k, v) in sign_s3_get(
-                        &creds.access_key,
-                        &creds.secret_key,
-                        creds.session_token.as_deref(),
-                        &region,
-                        &host,
-                        &canonical_uri,
-                        range_header,
-                        cfg.requester_pays,
-                    ) {
-                        req = req.header(k, v);
-                    }
-                } else if cfg.requester_pays {
-                    req = req.header("x-amz-request-payer", "requester");
+            } else if let Some(ref creds) = resolved_dynamic {
+                for (k, v) in sign_s3_get(
+                    &creds.access_key,
+                    &creds.secret_key,
+                    creds.session_token.as_deref(),
+                    &region,
+                    &host,
+                    &canonical_uri,
+                    range_header,
+                    cfg.requester_pays,
+                ) {
+                    req = req.header(k, v);
                 }
             } else if cfg.requester_pays {
                 req = req.header("x-amz-request-payer", "requester");

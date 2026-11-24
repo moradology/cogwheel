@@ -1,10 +1,13 @@
+use std::collections::VecDeque;
+
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::oneshot;
 
 struct LimiterState {
     limit: f64,
     in_flight: usize,
     throttles: u64,
+    waiters: VecDeque<oneshot::Sender<()>>,
 }
 
 /// Throttle-only AIMD (Additive Increase, Multiplicative Decrease) concurrency limiter for
@@ -16,12 +19,13 @@ struct LimiterState {
 ///   byte-range sizes (8 KiB..4 MiB) and multi-region buckets never cause false throttling.
 /// - **Additive increase (`+0.25` per clean response, i.e. `+1` every 4 successes)** back up to
 ///   `max_limit`.
-/// - RAII [`AimdPermit`] guarantees `in_flight` is always decremented on task cancellation.
+/// - Strictly FIFO waiter queue with direct permit handoff (zero thundering herd, zero spurious
+///   wakeups during throttle drain, zero barging starvation).
+/// - RAII [`AimdPermit`] and cancellation guard guarantee `in_flight` never leaks on task abort.
 pub struct AimdLimiter {
     min_limit: usize,
     max_limit: usize,
     state: Mutex<LimiterState>,
-    notify: Notify,
 }
 
 impl AimdLimiter {
@@ -35,8 +39,8 @@ impl AimdLimiter {
                 limit: max_limit as f64,
                 in_flight: 0,
                 throttles: 0,
+                waiters: VecDeque::new(),
             }),
-            notify: Notify::new(),
         }
     }
 
@@ -55,34 +59,65 @@ impl AimdLimiter {
         (raw_limit.floor() as usize).clamp(self.min_limit, self.max_limit)
     }
 
-    /// Acquire a concurrency permit, waiting asynchronously if `in_flight >= current_limit`.
-    /// Cancel-safe: dropping the returned future before completion never leaks a permit.
+    /// Hand off available capacity directly to queued FIFO waiters, skipping any whose task was
+    /// already cancelled. Caller must hold `self.state`.
+    fn wake_waiters_locked(&self, st: &mut LimiterState) {
+        let eff = self.effective_limit(st.limit);
+        while st.in_flight < eff {
+            let Some(tx) = st.waiters.pop_front() else {
+                break;
+            };
+            if tx.send(()).is_ok() {
+                st.in_flight += 1;
+            }
+        }
+    }
+
+    /// Acquire a concurrency permit, waiting asynchronously in FIFO order if
+    /// `in_flight >= current_limit`.
+    /// Cancel-safe: dropping the returned future at any point never leaks a permit.
     pub async fn acquire(&self) -> AimdPermit<'_> {
-        loop {
-            {
-                let mut st = self.state.lock();
-                if st.in_flight < self.effective_limit(st.limit) {
-                    st.in_flight += 1;
-                    return AimdPermit {
-                        limiter: self,
-                        finished: false,
-                    };
+        let rx = {
+            let mut st = self.state.lock();
+            if st.waiters.is_empty() && st.in_flight < self.effective_limit(st.limit) {
+                st.in_flight += 1;
+                return AimdPermit {
+                    limiter: self,
+                    finished: false,
+                };
+            }
+            let (tx, rx) = oneshot::channel();
+            st.waiters.push_back(tx);
+            rx
+        };
+
+        struct WaiterGuard<'a> {
+            limiter: &'a AimdLimiter,
+            rx: oneshot::Receiver<()>,
+            acquired: bool,
+        }
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                if !self.acquired {
+                    self.rx.close();
+                    // If a permit was handed to us right as we were cancelled, release it.
+                    if self.rx.try_recv().is_ok() {
+                        self.limiter.release_neutral();
+                    }
                 }
             }
-            let fut = self.notify.notified();
-            tokio::pin!(fut);
-            fut.as_mut().enable();
-            {
-                let mut st = self.state.lock();
-                if st.in_flight < self.effective_limit(st.limit) {
-                    st.in_flight += 1;
-                    return AimdPermit {
-                        limiter: self,
-                        finished: false,
-                    };
-                }
-            }
-            fut.await;
+        }
+
+        let mut guard = WaiterGuard {
+            limiter: self,
+            rx,
+            acquired: false,
+        };
+        let _ = (&mut guard.rx).await;
+        guard.acquired = true;
+        AimdPermit {
+            limiter: self,
+            finished: false,
         }
     }
 
@@ -100,46 +135,26 @@ impl AimdLimiter {
     }
 
     fn release_success(&self) {
-        let wake_all = {
-            let mut st = self.state.lock();
-            st.in_flight = st.in_flight.saturating_sub(1);
-            if st.limit < self.max_limit as f64 {
-                let prev = self.effective_limit(st.limit);
-                st.limit = (st.limit + 0.25).min(self.max_limit as f64);
-                self.effective_limit(st.limit) > prev
-            } else {
-                false
-            }
-        };
-        if wake_all {
-            self.notify.notify_waiters();
-        } else {
-            self.notify.notify_one();
+        let mut st = self.state.lock();
+        st.in_flight = st.in_flight.saturating_sub(1);
+        if st.limit < self.max_limit as f64 {
+            st.limit = (st.limit + 0.25).min(self.max_limit as f64);
         }
+        self.wake_waiters_locked(&mut st);
     }
 
     fn release_throttle(&self) {
-        let should_wake = {
-            let mut st = self.state.lock();
-            st.in_flight = st.in_flight.saturating_sub(1);
-            st.throttles += 1;
-            st.limit = (st.limit * 0.7).max(self.min_limit as f64);
-            st.in_flight < self.effective_limit(st.limit)
-        };
-        if should_wake {
-            self.notify.notify_one();
-        }
+        let mut st = self.state.lock();
+        st.in_flight = st.in_flight.saturating_sub(1);
+        st.throttles += 1;
+        st.limit = (st.limit * 0.7).max(self.min_limit as f64);
+        self.wake_waiters_locked(&mut st);
     }
 
     fn release_neutral(&self) {
-        let should_wake = {
-            let mut st = self.state.lock();
-            st.in_flight = st.in_flight.saturating_sub(1);
-            st.in_flight < self.effective_limit(st.limit)
-        };
-        if should_wake {
-            self.notify.notify_one();
-        }
+        let mut st = self.state.lock();
+        st.in_flight = st.in_flight.saturating_sub(1);
+        self.wake_waiters_locked(&mut st);
     }
 }
 
