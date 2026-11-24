@@ -27,7 +27,8 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, build_cog_info, build_cog_info_geojson, build_map_html, build_tilejson,
-    compute_statistics, encode_rgba_output, query_point, render_mercator_bbox, render_wgs84_bbox,
+    compute_statistics, encode_rgba_output, query_point, render_mercator_bbox,
+    render_native_preview, render_wgs84_bbox,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -394,7 +395,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             },
             "max_size" => {
                 if let Ok(ms) = v.parse::<u32>() {
-                    pq.max_size = ms.clamp(64, 4096);
+                    pq.max_size = ms.clamp(1, 4096);
                 } else {
                     bad("expected a number");
                 }
@@ -2036,7 +2037,7 @@ where
             (Method::GET, ["statistics"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, _) =
+                let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = cogs.len();
                 let mut set = tokio::task::JoinSet::new();
@@ -2059,11 +2060,19 @@ where
                 }
                 let mut map = serde_json::Map::new();
                 let mut band_idx = 1usize;
-                for (nb, st) in ordered.into_iter().flatten() {
+                for (name, slot) in names.iter().zip(ordered.into_iter()) {
+                    let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
                         for i in 1..=nb {
                             if let Some(v) = obj.get(&format!("b{i}")) {
-                                map.insert(format!("b{band_idx}"), v.clone());
+                                let mut band_val = v.clone();
+                                if let Some(bobj) = band_val.as_object_mut() {
+                                    bobj.insert(
+                                        "description".to_string(),
+                                        serde_json::json!(format!("{name}_b{i}")),
+                                    );
+                                }
+                                map.insert(format!("b{band_idx}"), band_val);
                                 band_idx += 1;
                             }
                         }
@@ -2083,11 +2092,12 @@ where
 
                 let compute_stac_merged_stats = |mask: Arc<PolygonMask>| {
                     let cogs_c = cogs.clone();
+                    let names_c = names.clone();
                     let eng = engine.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    let n = names.len();
+                    let n = names_c.len();
                     async move {
                         let mut set = tokio::task::JoinSet::new();
                         for (idx, cog) in cogs_c.into_iter().enumerate() {
@@ -2116,11 +2126,19 @@ where
                         // Merge bands in numeric order 1..=nb across assets to match TiTiler's POST /stac/statistics.
                         let mut merged = serde_json::Map::new();
                         let mut b_counter = 1usize;
-                        for (nb, st) in ordered.into_iter().flatten() {
+                        for (name, slot) in names_c.iter().zip(ordered.into_iter()) {
+                            let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
                                 for b in 1..=nb {
                                     if let Some(v) = obj.get(&format!("b{b}")) {
-                                        merged.insert(format!("b{b_counter}"), v.clone());
+                                        let mut band_val = v.clone();
+                                        if let Some(bobj) = band_val.as_object_mut() {
+                                            bobj.insert(
+                                                "description".to_string(),
+                                                serde_json::json!(format!("{name}_b{b}")),
+                                            );
+                                        }
+                                        merged.insert(format!("b{b_counter}"), band_val);
                                         b_counter += 1;
                                     }
                                 }
@@ -2474,9 +2492,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                let data = render_native_preview(
+                    &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2516,9 +2533,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                let data = render_native_preview(
+                    &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -3103,9 +3119,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                let data = render_native_preview(
+                    &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -3130,9 +3145,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                let data = render_native_preview(
+                    &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
