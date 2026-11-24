@@ -227,24 +227,30 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "azimuth" => {
-                if let Ok(a) = v.parse::<f32>() {
+                if let Ok(a) = v.parse::<f32>()
+                    && a.is_finite()
+                {
                     pq.azimuth = a;
                 } else {
-                    bad("expected a number");
+                    bad("expected a finite number");
                 }
             }
             "altitude" | "angle" | "angle_altitude" => {
-                if let Ok(a) = v.parse::<f32>() {
+                if let Ok(a) = v.parse::<f32>()
+                    && a.is_finite()
+                {
                     pq.altitude = a.clamp(0.0, 90.0);
                 } else {
-                    bad("expected a number");
+                    bad("expected a finite number");
                 }
             }
             "z_factor" | "zfactor" => {
-                if let Ok(z) = v.parse::<f32>() {
+                if let Ok(z) = v.parse::<f32>()
+                    && z.is_finite()
+                {
                     pq.z_factor = z.max(1e-4);
                 } else {
-                    bad("expected a number");
+                    bad("expected a finite number");
                 }
             }
             "bidx" | "indexes" => {
@@ -260,8 +266,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 let decoded = percent_decode(v);
                 for group in decoded.split(';') {
                     match group.split_once(',').map(|(a, b)| (a.parse::<f32>(), b.parse::<f32>())) {
-                        Some((Ok(mn), Ok(mx))) => pq.rescale.push((mn, mx)),
-                        _ => bad("expected min,max"),
+                        Some((Ok(mn), Ok(mx))) if mn.is_finite() && mx.is_finite() => {
+                            pq.rescale.push((mn, mx));
+                        }
+                        _ => bad("expected finite min,max"),
                     }
                 }
             }
@@ -302,10 +310,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 pq.return_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
             }
             "buffer" => {
-                if let Ok(buf) = v.parse::<f32>() {
+                if let Ok(buf) = v.parse::<f32>()
+                    && buf.is_finite()
+                {
                     pq.buffer = buf.round().clamp(0.0, 256.0) as u32;
                 } else {
-                    bad("expected a number");
+                    bad("expected a finite number");
                 }
             }
             "coord_crs" => {
@@ -332,14 +342,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     _ => bad("expected a tile size from 64 to 2048"),
                 }
             }
-            "scale" => {
-                if let Ok(sc) = v.parse::<u32>() {
-                    pq.tile_size = match sc {
-                        2 => 512,
-                        _ => 256,
-                    };
-                }
-            }
+            "scale" => match v.parse::<u32>() {
+                Ok(sc) if (1..=4).contains(&sc) => pq.tile_size = sc * 256,
+                _ => bad("expected scale in 1..=4"),
+            },
             "max_size" => {
                 if let Ok(ms) = v.parse::<u32>() {
                     pq.max_size = ms.clamp(64, 4096);
@@ -349,9 +355,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "quality" => {
                 if v != "lossless" {
-                    if let Ok(qual) = v.parse::<f32>() {
+                    if let Ok(qual) = v.parse::<f32>()
+                        && qual.is_finite()
+                    {
                         pq.webp_quality = Some(qual.clamp(1.0, 100.0));
                         pq.jpeg_quality = qual.round().clamp(1.0, 100.0) as u8;
+                    } else {
+                        bad("expected a finite quality in 1..=100 or 'lossless'");
                     }
                 }
             }
@@ -701,9 +711,13 @@ fn build_tile_request(
     let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, is_u8)?;
     let tile_size = match scale_opt {
-        Some(2) => 512,
-        Some(1) => 256,
-        _ => pq.tile_size,
+        Some(sc) if (1..=4).contains(&sc) => sc * 256,
+        Some(other) => {
+            return Err(EngineError::BadRequest(format!(
+                "invalid tile scale @{other}x (expected 1..=4)"
+            )));
+        }
+        None => pq.tile_size,
     };
     Ok((
         TileRequest {
@@ -917,7 +931,19 @@ where
         })
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("127.0.0.1:8080");
-    let host = format!("{proto}://{host_raw}");
+    let forwarded_prefix = req
+        .headers()
+        .get("x-forwarded-prefix")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| {
+            !s.is_empty()
+                && s.starts_with('/')
+                && !s.contains("..")
+                && !s.bytes().any(|b| b.is_ascii_whitespace() || b == b'?' || b == b'#')
+        })
+        .unwrap_or("");
+    let host = format!("{proto}://{host_raw}{forwarded_prefix}");
     let if_none_match = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -1369,16 +1395,22 @@ where
                             let db = scene.len() as u16;
                             let is_u8 = scene[0].index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) =
+                            let (mut treq, ct) =
                                 build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            if pq.unscale {
+                                apply_unscale_cogs(&mut treq.bands, &scene);
+                            }
                             let b = engine.render_multi_cog_tile(&scene, &treq).await?;
                             Ok((b, ct))
                         } else if let Some(cog) = engine.store.get_registered(ds) {
                             let db = cog.index.full_res().samples_per_pixel;
                             let is_u8 = cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) =
+                            let (mut treq, ct) =
                                 build_tile_request(TileCoord { z, x, y }, sc, ext, &pq, db, is_u8)?;
+                            if pq.unscale {
+                                apply_unscale_cogs(&mut treq.bands, std::slice::from_ref(&cog));
+                            }
                             let b = engine.render_tile(&cog, &treq).await?;
                             Ok((b, ct))
                         } else {
@@ -1912,14 +1944,9 @@ where
 
             // GET /stac/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]
             (Method::GET, ["bbox", bbox_seg]) => async {
-                let Some((mut bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
-                if pq.coord_crs_3857 {
-                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
-                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
-                    bbox = [w, s, e, n];
-                }
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
@@ -1945,23 +1972,26 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
-                )
-                .await?;
+                let data = if pq_stac.coord_crs_3857 {
+                    render_mercator_bbox(
+                        &engine, &cogs, bbox, 512, 512, &bands, pq_stac.resample, fmt,
+                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                    )
+                    .await?
+                } else {
+                    render_wgs84_bbox(
+                        &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
+                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                    )
+                    .await?
+                };
                 Ok((data, ct))
             }
             .await,
             (Method::GET, ["bbox", bbox_seg, dims_ext]) => async {
-                let Some((mut bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
-                if pq.coord_crs_3857 {
-                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
-                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
-                    bbox = [w, s, e, n];
-                }
                 let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
@@ -1990,11 +2020,19 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
-                )
-                .await?;
+                let data = if pq_stac.coord_crs_3857 {
+                    render_mercator_bbox(
+                        &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
+                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                    )
+                    .await?
+                } else {
+                    render_wgs84_bbox(
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                    )
+                    .await?
+                };
                 Ok((data, ct))
             }
             .await,
@@ -2421,14 +2459,9 @@ where
 
             // 12. GET /cog/bbox/{minx},{miny},{maxx},{maxy}[.{format}] & /cog/bbox/{...}/{w}x{h}.{format}
             (Method::GET, ["bbox", bbox_seg]) => async {
-                let Some((mut bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("expected /cog/bbox/{minx},{miny},{maxx},{maxy}.{ext}".into()));
                 };
-                if pq.coord_crs_3857 {
-                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
-                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
-                    bbox = [w, s, e, n];
-                }
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
@@ -2440,23 +2473,26 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, 512, 512, None, &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
-                )
-                .await?;
+                let data = if pq.coord_crs_3857 {
+                    render_mercator_bbox(
+                        &engine, &cogs, bbox, 512, 512, &bands, pq.resample, fmt,
+                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                    )
+                    .await?
+                } else {
+                    render_wgs84_bbox(
+                        &engine, &cogs, bbox, 512, 512, None, &bands, pq.resample, fmt,
+                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                    )
+                    .await?
+                };
                 Ok((data, ct))
             }
             .await,
             (Method::GET, ["bbox", bbox_seg, dims_ext]) => async {
-                let Some((mut bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox coordinates".into()));
                 };
-                if pq.coord_crs_3857 {
-                    let (w, s) = mercator_to_lonlat_deg(bbox[0], bbox[1]);
-                    let (e, n) = mercator_to_lonlat_deg(bbox[2], bbox[3]);
-                    bbox = [w, s, e, n];
-                }
                 let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
@@ -2471,11 +2507,19 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
-                )
-                .await?;
+                let data = if pq.coord_crs_3857 {
+                    render_mercator_bbox(
+                        &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                    )
+                    .await?
+                } else {
+                    render_wgs84_bbox(
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                    )
+                    .await?
+                };
                 Ok((data, ct))
             }
             .await,

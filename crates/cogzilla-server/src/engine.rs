@@ -1549,14 +1549,57 @@ impl TileEngine {
         let mut canvas = vec![0u8; total_pixels * 4];
         let mut filled = 0usize;
 
-        let mut scene_req = req.clone();
-        scene_req.format = OutputFormat::RawRgba;
+        let mut base_scene_req = req.clone();
+        base_scene_req.format = OutputFormat::RawRgba;
 
         for url in urls {
             if filled >= total_pixels {
                 break;
             }
             let cog = self.store.open_uri(url).await?;
+            // Fold each scene's own GDAL scale/offset into Single/Rgb rescale bounds when
+            // `?unscale=true` so heterogeneous mosaic scenes unscale accurately at zero per-pixel cost.
+            let scene_req = if req.unscale
+                && matches!(
+                    base_scene_req.bands,
+                    BandRequest::Single { .. } | BandRequest::Rgb { .. }
+                ) {
+                let mut sr = base_scene_req.clone();
+                let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+                    let i = b1.saturating_sub(1) as usize;
+                    let sc = cog.index.scales.get(i).copied().unwrap_or(1.0);
+                    let off = cog.index.offsets.get(i).copied().unwrap_or(0.0);
+                    if ((sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9) || sc.abs() < 1e-12 {
+                        (mn, mx)
+                    } else {
+                        ((mn - off) / sc, (mx - off) / sc)
+                    }
+                };
+                match &mut sr.bands {
+                    BandRequest::Single {
+                        band_1based,
+                        rescale,
+                        ..
+                    } => {
+                        *rescale = adj(*band_1based, rescale.0, rescale.1);
+                    }
+                    BandRequest::Rgb {
+                        bands_1based,
+                        rescale_min,
+                        rescale_max,
+                    } => {
+                        for k in 0..3 {
+                            let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                            rescale_min[k] = mn;
+                            rescale_max[k] = mx;
+                        }
+                    }
+                    _ => {}
+                }
+                sr
+            } else {
+                base_scene_req.clone()
+            };
             let src = self.render_tile(&cog, &scene_req).await?;
             if src.len() != total_pixels * 4 {
                 continue;
