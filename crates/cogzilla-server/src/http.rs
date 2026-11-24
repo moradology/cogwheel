@@ -709,6 +709,7 @@ fn build_tile_request(
             bands,
             resample: pq.resample,
             format,
+            unscale: pq.unscale,
         },
         content_type,
     ))
@@ -1468,10 +1469,27 @@ where
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                let n = names.len();
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, cog) in cogs.into_iter().enumerate() {
+                    let eng = engine.clone();
+                    let max_size = pq.max_size;
+                    let unscale = pq.unscale;
+                    set.spawn(async move {
+                        let st = compute_statistics(&eng, &cog, max_size, None, unscale).await?;
+                        Ok::<_, EngineError>((idx, st))
+                    });
+                }
+                let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
+                while let Some(res) = set.join_next().await {
+                    let (idx, st) = res.map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
+                    ordered[idx] = Some(st);
+                }
                 let mut map = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
-                    let st = compute_statistics(&engine, &cog, pq.max_size, None, pq.unscale).await?;
-                    map.insert(name, st);
+                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
+                    if let Some(st) = st {
+                        map.insert(name, st);
+                    }
                 }
                 Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"))
             }
@@ -1482,11 +1500,26 @@ where
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                let n = cogs.len();
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, cog) in cogs.into_iter().enumerate() {
+                    let eng = engine.clone();
+                    let max_size = pq.max_size;
+                    let unscale = pq.unscale;
+                    set.spawn(async move {
+                        let nb = cog.index.full_res().samples_per_pixel as usize;
+                        let st = compute_statistics(&eng, &cog, max_size, None, unscale).await?;
+                        Ok::<_, EngineError>((idx, nb, st))
+                    });
+                }
+                let mut ordered: Vec<Option<(usize, serde_json::Value)>> = vec![None; n];
+                while let Some(res) = set.join_next().await {
+                    let (idx, nb, st) = res.map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
+                    ordered[idx] = Some((nb, st));
+                }
                 let mut map = serde_json::Map::new();
                 let mut band_idx = 1usize;
-                for cog in cogs {
-                    let st = compute_statistics(&engine, &cog, pq.max_size, None, pq.unscale).await?;
-                    let nb = cog.index.full_res().samples_per_pixel as usize;
+                for (nb, st) in ordered.into_iter().flatten() {
                     if let Some(obj) = st.as_object() {
                         for i in 1..=nb {
                             if let Some(v) = obj.get(&format!("b{i}")) {
@@ -1508,12 +1541,31 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, _) = PolygonMask::from_geojson(&geojson)?;
+                let mask = Arc::new(mask);
+                let n = names.len();
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, cog) in cogs.into_iter().enumerate() {
+                    let eng = engine.clone();
+                    let mask_c = mask.clone();
+                    let max_size = pq.max_size;
+                    let unscale = pq.unscale;
+                    set.spawn(async move {
+                        let st =
+                            compute_statistics(&eng, &cog, max_size, Some(&mask_c), unscale)
+                                .await?;
+                        Ok::<_, EngineError>((idx, st))
+                    });
+                }
+                let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
+                while let Some(res) = set.join_next().await {
+                    let (idx, st) = res.map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
+                    ordered[idx] = Some(st);
+                }
                 let mut map = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
-                    let st =
-                        compute_statistics(&engine, &cog, pq.max_size, Some(&mask), pq.unscale)
-                            .await?;
-                    map.insert(name, st);
+                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
+                    if let Some(st) = st {
+                        map.insert(name, st);
+                    }
                 }
                 let feat = serde_json::json!({
                     "type": "Feature",
@@ -1637,6 +1689,7 @@ where
                                     custom_lut.as_ref(),
                                     cf.as_ref(),
                                     pq_stac.return_mask,
+                                    pq_stac.unscale,
                                 )
                                 .await?
                             } else {
@@ -1660,6 +1713,7 @@ where
                                     custom_lut.as_ref(),
                                     cf.as_ref(),
                                     pq_stac.return_mask,
+                                    pq_stac.unscale,
                                 )
                                 .await?
                             };
@@ -1711,11 +1765,25 @@ where
                 } else {
                     (x, y)
                 };
+                let n = names.len();
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, cog) in cogs.into_iter().enumerate() {
+                    let eng = engine.clone();
+                    let unscale = pq.unscale;
+                    set.spawn(async move {
+                        let pt = query_point(&eng, &cog, lon, lat, unscale).await?;
+                        Ok::<_, EngineError>((idx, pt))
+                    });
+                }
+                let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
+                while let Some(res) = set.join_next().await {
+                    let (idx, pt) = res.map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
+                    ordered[idx] = Some(pt);
+                }
                 let mut all_vals = Vec::new();
                 let mut all_names = Vec::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
-                    let pt = query_point(&engine, &cog, lon, lat).await?;
-                    if let Some(vs) = pt["values"].as_array() {
+                for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
+                    if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         for (i, v) in vs.iter().enumerate() {
                             all_vals.push(v.clone());
                             all_names.push(format!("{name}_b{}", i + 1));
@@ -1768,7 +1836,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1808,7 +1876,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1852,7 +1920,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1897,7 +1965,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1945,7 +2013,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -1985,7 +2053,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq_stac.resample, fmt,
-                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2172,6 +2240,7 @@ where
                                     custom_lut.as_ref(),
                                     cf.as_ref(),
                                     pq.return_mask,
+                                    pq.unscale,
                                 )
                                 .await?
                             } else {
@@ -2195,6 +2264,7 @@ where
                                     custom_lut.as_ref(),
                                     cf.as_ref(),
                                     pq.return_mask,
+                                    pq.unscale,
                                 )
                                 .await?
                             };
@@ -2263,7 +2333,7 @@ where
                 } else {
                     (x, y)
                 };
-                let json = query_point(&engine, &cogs[0], lon, lat).await?;
+                let json = query_point(&engine, &cogs[0], lon, lat, pq.unscale).await?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
@@ -2289,7 +2359,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2314,7 +2384,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2344,7 +2414,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, None, &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2375,7 +2445,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2402,7 +2472,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, 512, 512, Some(&mask), &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
                 Ok((data, ct))
@@ -2429,7 +2499,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq.resample, fmt,
-                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
                 Ok((data, ct))

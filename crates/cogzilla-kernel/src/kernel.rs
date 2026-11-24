@@ -319,6 +319,7 @@ fn sample_bilinear<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f
             && x0 + 1 < src.ifd_w
             && y0 + 1 < src.ifd_h
             && src.nodata_override.is_none()
+            && src.scale_offset.is_none()
         {
             src.sample_quad_inbounds(x0 as u32, y0 as u32)
         } else {
@@ -2403,15 +2404,49 @@ pub fn render_terrain_tile<const N: usize>(
                 if sc.row_buf.len() < N * 3 {
                     sc.row_buf.resize(N * 3, 0);
                 }
+                let flat_dem = if resample == ResampleMode::Bilinear {
+                    src.single_block_flat()
+                } else {
+                    None
+                };
+                if sc.f32_row.len() < N {
+                    sc.f32_row.resize(N, 0.0);
+                }
                 for py in 0..N {
                     let row_rgb = &mut sc.row_buf[..N * 3];
-                    for_each_pixel_in_row(plan, py, |px, u, v| {
-                        let [r, g, b] = encode_px(sample_px(u, v));
-                        let off = px * 3;
-                        row_rgb[off] = r;
-                        row_rgb[off + 1] = g;
-                        row_rgb[off + 2] = b;
-                    });
+                    if let (CoordPlan::Separable1D { u, v, .. }, Some((slice, bc, br, stride))) =
+                        (plan, flat_dem)
+                    {
+                        let (y0_raw, fy) = fast_floor_i32(v[py] - br as f32);
+                        let max_y = ((slice.len() / stride) as i32 - 2).max(0);
+                        let y0 = y0_raw.clamp(0, max_y) as usize;
+                        let r0_off = y0 * stride;
+                        let r1_off = r0_off + stride;
+                        let frow = &mut sc.f32_row[..N];
+                        bilinear_row_flat_dispatch::<N>(
+                            u,
+                            bc,
+                            &slice[r0_off..r0_off + stride],
+                            &slice[r1_off..r1_off + stride],
+                            fy,
+                            frow,
+                        );
+                        for px in 0..N {
+                            let [r, g, b] = encode_px(frow[px]);
+                            let off = px * 3;
+                            row_rgb[off] = r;
+                            row_rgb[off + 1] = g;
+                            row_rgb[off + 2] = b;
+                        }
+                    } else {
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let [r, g, b] = encode_px(sample_px(u, v));
+                            let off = px * 3;
+                            row_rgb[off] = r;
+                            row_rgb[off + 1] = g;
+                            row_rgb[off + 2] = b;
+                        });
+                    }
                     filter_sub_rgb_row(row_rgb, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
                 encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total])

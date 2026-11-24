@@ -290,6 +290,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::RawF32,
+                    unscale: false,
                 },
             ),
             (
@@ -305,6 +306,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::Png,
+                    unscale: false,
                 },
             ),
             (
@@ -320,6 +322,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::RawF32,
+                    unscale: false,
                 },
             ),
             (
@@ -335,6 +338,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::RawF32,
+                    unscale: false,
                 },
             ),
             (
@@ -351,6 +355,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::RawF32,
+                    unscale: false,
                 },
             ),
             (
@@ -366,6 +371,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::RawF32,
+                    unscale: false,
                 },
             ),
         ];
@@ -396,6 +402,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: fmt,
+            unscale: false,
         };
         let (med_cold, p99_cold, bytes_len) = bench_tile_sync(&engine, &cog_merc, &req, 80, true).await;
         let (med_warm, p99_warm, _) = bench_tile_sync(&engine, &cog_merc, &req, 200, false).await;
@@ -434,6 +441,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let (med_cold, p99_cold, sz) = bench_tile_sync(&engine, &cog_4326, &req, 60, true).await;
         let (med_warm, p99_warm, _) = bench_tile_sync(&engine, &cog_4326, &req, 200, false).await;
@@ -470,6 +478,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let (mc, pc, sz) = bench_tile_sync(&engine, &cog_sat, &req_sat_png, 50, true).await;
         let (mw, pw, _) = bench_tile_sync(&engine, &cog_sat, &req_sat_png, 150, false).await;
@@ -501,6 +510,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let (mc, pc, sz) = bench_tile_sync(&engine, &cog_utm_lzw, &req_utm_lzw, 50, true).await;
         let (mw, pw, _) = bench_tile_sync(&engine, &cog_utm_lzw, &req_utm_lzw, 150, false).await;
@@ -532,6 +542,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let (mc, pc, sz) = bench_tile_sync(&engine, &cog_albers, &req_alb, 50, true).await;
         let (mw, pw, _) = bench_tile_sync(&engine, &cog_albers, &req_alb, 150, false).await;
@@ -564,6 +575,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let (mc, pc, sz) = bench_tile_sync(&engine, &cog_sat, &req_ndvi, 50, true).await;
         let (mw, pw, _) = bench_tile_sync(&engine, &cog_sat, &req_ndvi, 150, false).await;
@@ -609,6 +621,7 @@ async fn main() {
                 },
                 resample: ResampleMode::Bilinear,
                 format: OutputFormat::Png,
+                unscale: false,
             };
             let _ = engine.render_tile(&cog_coast, &req).await.unwrap();
         }
@@ -626,6 +639,7 @@ async fn main() {
                     },
                     resample: ResampleMode::Bilinear,
                     format: OutputFormat::Png,
+                    unscale: false,
                 };
                 let b = engine.render_tile(&cog_coast, &req).await.unwrap();
                 std::hint::black_box(&b);
@@ -793,6 +807,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let t1 = Instant::now();
         let _ = remote_eng.render_tile(&cog, &req).await.unwrap();
@@ -864,6 +879,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         // Cold + Warm BM-09
         let mut cold_s = Vec::new();
@@ -915,6 +931,7 @@ async fn main() {
             },
             resample: ResampleMode::Bilinear,
             format: OutputFormat::Png,
+            unscale: false,
         };
         let mut cold_s = Vec::new();
         for _ in 0..30 {
@@ -976,6 +993,7 @@ async fn main() {
                 },
                 resample: ResampleMode::Bilinear,
                 format: OutputFormat::Png,
+                unscale: false,
             };
             // Warmup + measure warm
             let b0 = engine.render_multi_cog_tile(&landsat_scene, &zreq).await.unwrap();
@@ -1005,6 +1023,7 @@ async fn main() {
                     &landsat_scene,
                     &TileRequest {
                         format: OutputFormat::RawF32,
+                        unscale: false,
                         ..lsat_req.clone()
                     },
                 )
@@ -1017,6 +1036,7 @@ async fn main() {
                     &sar_scene,
                     &TileRequest {
                         format: OutputFormat::RawF32,
+                        unscale: false,
                         ..sar_req.clone()
                     },
                 )
@@ -1038,6 +1058,7 @@ async fn main() {
                             },
                             resample: ResampleMode::Bilinear,
                             format: OutputFormat::RawF32,
+                            unscale: false,
                         },
                     )
                     .await
