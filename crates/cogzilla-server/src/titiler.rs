@@ -356,7 +356,26 @@ pub fn build_cog_validate(
     }))
 }
 
-const SUPPORTED_ALGORITHMS: &[&str] = &["hillshade", "slope", "aspect", "terrarium", "terrainrgb"];
+const SUPPORTED_ALGORITHMS: &[&str] = &[
+    "hillshade",
+    "slope",
+    "aspect",
+    "terrarium",
+    "terrainrgb",
+    "normalizedIndex",
+    "cast",
+    "ceil",
+    "floor",
+    "min",
+    "max",
+    "median",
+    "mean",
+    "std",
+    "var",
+    "sum",
+    "grayscale",
+    "bitonal",
+];
 
 /// TiTiler 2.4 `AlgorithmFactory` `GET /algorithms` response.
 pub fn list_algorithms_json(host: &str) -> serde_json::Value {
@@ -437,6 +456,99 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
                 "interval": { "default": 0.1, "maximum": 1.0, "minimum": 0.0, "title": "Interval", "type": "number" },
                 "baseval": { "default": -10000.0, "maximum": 99999.0, "minimum": -99999.0, "title": "Baseval", "type": "number" },
                 "nodata_height": { "anyOf": [{ "maximum": 99999.0, "minimum": -99999.0, "type": "number" }, { "type": "null" }], "default": null, "title": "Nodata Height" }
+            }
+        }),
+        "normalizedIndex" | "normalizedindex" => serde_json::json!({
+            "title": "Normalized Index",
+            "description": "Calculate normalized difference index (b1 - b2) / (b1 + b2).",
+            "inputs": { "nbands": 2 },
+            "outputs": { "nbands": 1, "dtype": "float32", "min": [-1.0], "max": [1.0] },
+            "parameters": {}
+        }),
+        "cast" => serde_json::json!({
+            "title": "Cast",
+            "description": "Cast data to a target numeric type.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "ceil" => serde_json::json!({
+            "title": "Ceil",
+            "description": "Return the ceiling of the input, element-wise.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "floor" => serde_json::json!({
+            "title": "Floor",
+            "description": "Return the floor of the input, element-wise.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "min" => serde_json::json!({
+            "title": "Min",
+            "description": "Calculate pixel-wise minimum across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "max" => serde_json::json!({
+            "title": "Max",
+            "description": "Calculate pixel-wise maximum across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "median" => serde_json::json!({
+            "title": "Median",
+            "description": "Calculate pixel-wise median across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "mean" => serde_json::json!({
+            "title": "Mean",
+            "description": "Calculate pixel-wise mean across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "std" => serde_json::json!({
+            "title": "Std",
+            "description": "Calculate pixel-wise standard deviation across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "var" => serde_json::json!({
+            "title": "Var",
+            "description": "Calculate pixel-wise variance across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "sum" => serde_json::json!({
+            "title": "Sum",
+            "description": "Calculate pixel-wise sum across bands.",
+            "inputs": {},
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "grayscale" => serde_json::json!({
+            "title": "Grayscale",
+            "description": "Convert RGB bands to grayscale using ITU-R BT.601 luma weights.",
+            "inputs": { "nbands": 3 },
+            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "parameters": {}
+        }),
+        "bitonal" => serde_json::json!({
+            "title": "Bitonal",
+            "description": "Threshold single-band data into binary 0/1 output.",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [1] },
+            "parameters": {
+                "threshold": { "default": 128.0, "title": "Threshold", "type": "number" }
             }
         }),
         _ => {
