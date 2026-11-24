@@ -37,6 +37,8 @@ import sys
 import time
 from pathlib import Path
 
+import xml.etree.ElementTree as ET
+
 import httpx
 import psycopg
 import mercantile
@@ -134,6 +136,31 @@ def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     return mask >= 99.0 and psnr >= 25.0, f"mask {mask:.2f}%, PSNR {psnr:.1f} dB"
 
 
+def wmts_view(text: str, base: str):
+    """A WMTS capabilities document as plain lists, keeping only what concerns WebMercatorQuad:
+    cogzilla serves these routes in that one tile matrix set, TiTiler lists thirteen."""
+    wm = "{http://www.opengis.net/wmts/1.0}"
+    ows = "{http://www.opengis.net/ows/1.1}"
+
+    def plain(el):
+        attrs = {k: v.replace(base, "{base}") for k, v in sorted(el.attrib.items())}
+        text = (el.text or "").strip().replace(base, "{base}")
+        if el.tag.endswith("Corner"):
+            # Coordinates are compared as numbers: the two servers project with different code.
+            text = [float(v) for v in text.split()]
+        return [el.tag, attrs, text, [plain(c) for c in el]]
+
+    root = ET.fromstring(text)
+    contents = root.find(f"{wm}Contents")
+    layers = [l for l in contents.findall(f"{wm}Layer")
+              if l.find(f"{wm}TileMatrixSetLink/{wm}TileMatrixSet").text == "WebMercatorQuad"]
+    matrix_sets = [t for t in contents.findall(f"{wm}TileMatrixSet")
+                   if t.find(f"{ows}Identifier").text == "WebMercatorQuad"]
+    rest = [plain(c) for c in root if c.tag != f"{wm}Contents"]
+    return {"root": [root.tag, dict(sorted(root.attrib.items()))], "outside_contents": rest,
+            "layers": [plain(l) for l in layers], "tile_matrix_sets": [plain(t) for t in matrix_sets]}
+
+
 def stats_diff(a, b, path="$"):
     """Statistics come from differently resampled pixels: compare structure exactly and the
     summary numbers loosely (5% of the reference, or 2 units)."""
@@ -186,6 +213,16 @@ class Oracle:
             theirs["tilesets"] = [t for t in theirs["tilesets"] if "WebMercatorQuad TileMatrixSet" in t["title"]]
             diff = first_diff(ours, theirs)
             ok, note = diff is None, diff or "WebMercatorQuad entry equal"
+        elif kind == "wmts":
+            if cz.status_code != 200:
+                diff = first_diff(normalize(cz.json(), COGZILLA), normalize(tt.json(), TITILER))
+                ok, note = diff is None, diff or f"{cz.status_code}, bodies equal"
+            elif cz.headers.get("content-type") != tt.headers.get("content-type"):
+                ok, note = False, f"content type {cz.headers.get('content-type')} vs {tt.headers.get('content-type')}"
+            else:
+                a, b = wmts_view(cz.text, COGZILLA), wmts_view(tt.text, TITILER)
+                diff = first_diff(a, b)
+                ok, note = diff is None, diff or f"{len(a['layers'])} layer(s), WebMercatorQuad parts equal"
         elif kind == "stats":
             diff = stats_diff(cz.json(), tt.json())
             ok, note = diff is None, diff or "same bands and fields, numbers within tolerance"
@@ -424,7 +461,24 @@ def main() -> int:
                 f"{col}/tiles/Nope/12/{t12.x}/{t12.y}?assets=visual")
         o.check("collection unknown route", "status", f"{col}/nope")
 
-        print("item")
+        print("wmts")
+        o.check("search wmts", "wmts", f"/searches/{sid}/WMTSCapabilities.xml?assets=visual")
+        o.check("search wmts keeps tile parameters", "wmts",
+                f"/searches/{sid}/WMTSCapabilities.xml?assets=visual&rescale=0,255&tilesize=512&tile_scale=2&resampling=bilinear")
+        o.check("search wmts, jpg and EPSG codes", "wmts",
+                f"/searches/{sid}/WMTSCapabilities.xml?assets=visual&tile_format=jpg&use_epsg=true&minzoom=3&maxzoom=5")
+        o.check("search wmts from search metadata", "wmts", f"/searches/{sid_meta}/WMTSCapabilities.xml?assets=visual")
+        o.check("search wmts with a zoom override", "wmts",
+                f"/searches/{sid}/WMTSCapabilities.xml?assets=visual&zooms=WebMercatorQuad::4,9")
+        o.check("search wmts from default layers", "wmts", f"/searches/{sid_layers}/WMTSCapabilities.xml")
+        o.check("search wmts, default layers and the query", "wmts",
+                f"/searches/{sid_layers}/WMTSCapabilities.xml?assets=visual&tile_format=webp")
+        o.check("search wmts with no layer", "wmts", f"/searches/{sid}/WMTSCapabilities.xml")
+        o.check("search wmts with an unknown format", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=visual&tile_format=nope")
+        o.check("search wmts for an unknown search", "json", "/searches/deadbeef/WMTSCapabilities.xml?assets=visual")
+        o.check("collection wmts", "wmts", f"/collections/{collection}/WMTSCapabilities.xml?assets=visual&rescale=0,255")
+        o.check("collection wmts with a bbox", "wmts", f"/collections/{collection}/WMTSCapabilities.xml?assets=visual&bbox=6,44,8,46")
+        o.check("collection wmts with renders", "wmts", f"/collections/cogzilla-oracle-renders/WMTSCapabilities.xml")
         with psycopg.connect(env["DATABASE_URL"], autocommit=True) as conn:
             item_id, ib = conn.execute(
                 "SELECT id, content->'bbox' FROM pgstac.items WHERE collection = %s"
@@ -475,6 +529,10 @@ def main() -> int:
                 known="shared /stac statistics: the sample is smaller than max_size, and merged bands are described as b1, not visual_b1")
         o.check("item asset statistics", "stats", f"{it}/asset_statistics?assets=red&max_size=128",
                 known="shared /stac statistics: the sample is smaller than max_size, and merged bands are described as b1, not visual_b1")
+        o.check("item wmts", "wmts", f"{it}/WMTSCapabilities.xml?assets=visual")
+        o.check("item wmts, jpg and EPSG codes", "wmts",
+                f"{it}/WMTSCapabilities.xml?assets=visual&tile_format=jpg&use_epsg=true&minzoom=9&maxzoom=10")
+        o.check("item wmts with no layer", "wmts", f"{it}/WMTSCapabilities.xml")
         o.check("item unknown route", "status", f"{it}/nope")
     finally:
         proc.terminate()
