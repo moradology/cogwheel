@@ -159,8 +159,11 @@ pub fn build_tilejson(
     let coarsest = cog.index.ifds.last().unwrap();
     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
         .max(full.height as f64 / coarsest.height.max(1) as f64);
-    let (minzoom, maxzoom) =
-        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
+    let (minzoom, maxzoom) = if tms == "WorldCRS84Quad" {
+        crs.world_crs84_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+    } else {
+        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+    };
     let center = serde_json::json!([
         0.5 * (bounds[0] + bounds[2]),
         0.5 * (bounds[1] + bounds[3]),
