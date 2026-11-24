@@ -28,7 +28,7 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .map(|i| serde_json::json!([format!("b{i}"), {}]))
         .collect();
     let band_descriptions: Vec<_> = (1..=count)
-        .map(|i| serde_json::json!([format!("b{i}"), ""]))
+        .map(|i| serde_json::json!([format!("b{i}"), format!("b{i}")]))
         .collect();
     let colorinterp: Vec<&str> = match count {
         3 => vec!["red", "green", "blue"],
@@ -43,11 +43,39 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .map(|ifd| (full.width as f64 / ifd.width.max(1) as f64).round() as u32)
         .collect();
 
+    let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
     let (nodata_type, nodata_value) = match cog.index.nodata {
-        Some(v) if v.is_nan() => ("Nodata", serde_json::json!("nan")),
-        Some(v) => ("Nodata", serde_json::json!(v)),
-        None => ("None", serde_json::Value::Null),
+        Some(v) if v.is_nan() => ("Nodata", Some(serde_json::json!("nan"))),
+        Some(v) => ("Nodata", Some(serde_json::json!(v))),
+        None if has_alpha => ("Alpha", None),
+        None if full.mask_ifd.is_some() => ("Mask", None),
+        None => ("None", None),
     };
+
+    let crs_uri = if let Some(epsg) = cog
+        .index
+        .geo_keys
+        .projected_cs_type
+        .filter(|&c| c > 0 && c != 32767)
+    {
+        format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
+    } else if let Some(epsg) = cog
+        .index
+        .geo_keys
+        .geographic_type
+        .filter(|&c| c > 0 && c != 32767)
+    {
+        format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
+    } else {
+        "http://www.opengis.net/def/crs/EPSG/0/4326".to_string()
+    };
+
+    let scales: Vec<f32> = (0..count)
+        .map(|i| cog.index.scales.get(i).copied().unwrap_or(1.0))
+        .collect();
+    let offsets: Vec<f32> = (0..count)
+        .map(|i| cog.index.offsets.get(i).copied().unwrap_or(0.0))
+        .collect();
 
     let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
     let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
@@ -62,8 +90,9 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         y00.max(y10).max(y01).max(y11),
     ];
 
-    Ok(serde_json::json!({
+    let mut info = serde_json::json!({
         "bounds": native_bounds,
+        "crs": crs_uri,
         "wgs84_bounds": bounds,
         "minzoom": minzoom,
         "maxzoom": maxzoom,
@@ -71,14 +100,19 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         "band_descriptions": band_descriptions,
         "dtype": full.sample_type.gdal_name(),
         "nodata_type": nodata_type,
-        "nodata_value": nodata_value,
         "colorinterp": colorinterp,
+        "scales": scales,
+        "offsets": offsets,
         "driver": "GTiff",
         "count": count,
         "width": full.width,
         "height": full.height,
         "overviews": overviews,
-    }))
+    });
+    if let Some(nv) = nodata_value {
+        info["nodata_value"] = nv;
+    }
+    Ok(info)
 }
 
 /// TiTiler-compatible `/cog/info.geojson` Feature wrapping the raster footprint polygon.
@@ -102,6 +136,7 @@ pub fn build_cog_info_geojson(
     };
     Ok(serde_json::json!({
         "type": "Feature",
+        "bbox": [w, s, e, n],
         "geometry": {
             "type": "Polygon",
             "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]
@@ -110,7 +145,7 @@ pub fn build_cog_info_geojson(
     }))
 }
 
-/// TiTiler-compatible TileJSON 2.2.0 (`/cog/{tms}/tilejson.json`).
+/// TiTiler-compatible TileJSON 3.0.0 (`/cog/{tms}/tilejson.json`).
 pub fn build_tilejson(
     engine: &TileEngine,
     cog: &OpenedCog,
@@ -126,11 +161,11 @@ pub fn build_tilejson(
         .max(full.height as f64 / coarsest.height.max(1) as f64);
     let (minzoom, maxzoom) =
         crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
-    let center = [
+    let center = serde_json::json!([
         0.5 * (bounds[0] + bounds[2]),
         0.5 * (bounds[1] + bounds[3]),
-        minzoom as f64,
-    ];
+        minzoom,
+    ]);
     let origin = if host.starts_with("http://") || host.starts_with("https://") {
         host.to_string()
     } else {

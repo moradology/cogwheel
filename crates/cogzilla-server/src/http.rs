@@ -158,7 +158,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         assets: Vec::new(),
         bidx: Vec::new(),
         rescale: Vec::new(),
-        colormap: ColormapName::Viridis,
+        colormap: ColormapName::Grayscale,
         custom_colormap_json: None,
         color_formula: None,
         resample: ResampleMode::Nearest,
@@ -391,7 +391,27 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "expr" | "expression" | "index" => {
-                pq.expr_raw = Some(percent_decode_opts(v, false));
+                // Standard HTTP clients (httpx, requests, URLSearchParams) form-encode spaces as `+`
+                // and literal plus as `%2B`, while raw CLI/browser URLs often write `(b1+b2)` directly.
+                // Decode `+` as space when form-encoding markers are present so both work cleanly.
+                let plus_is_space = v.contains("%2B")
+                    || v.contains("%2b")
+                    || v.contains("+-")
+                    || v.contains("-+")
+                    || v.contains("+*")
+                    || v.contains("*+")
+                    || v.contains("+/")
+                    || v.contains("/+")
+                    || v.contains("++")
+                    || v.contains("+(")
+                    || v.contains(")+")
+                    || v.contains("%2F+")
+                    || v.contains("+%2F")
+                    || v.contains("%2f+")
+                    || v.contains("+%2f")
+                    || v.contains("%28+")
+                    || v.contains("+%29");
+                pq.expr_raw = Some(percent_decode_opts(v, plus_is_space));
             }
             "padding" => {
                 if v.parse::<f32>().ok() != Some(0.0) {
@@ -772,7 +792,12 @@ fn build_tile_request(
             tile.x, tile.y, tile.z
         )));
     }
-    let (format, content_type) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+    let eff_ext = if ext.is_empty() {
+        pq.format_param.as_deref().unwrap_or("png")
+    } else {
+        ext
+    };
+    let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, is_u8)?;
     let tile_size = match scale_opt {
         Some(sc) if (1..=4).contains(&sc) => sc * 256,
@@ -2144,7 +2169,7 @@ where
 
             // GET /stac/preview[/{w}x{h}][.{ext}]
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
-                let ext = p.strip_prefix("preview.").unwrap_or("png");
+                let ext_opt = p.strip_prefix("preview.");
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (_, cogs, rewritten_expr) =
@@ -2158,6 +2183,7 @@ where
                 let out_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
                 let out_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq_stac, db, is_u8)?;
@@ -2176,9 +2202,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2217,9 +2242,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2239,7 +2263,11 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq_stac.webp_quality, pq_stac.jpeg_quality)?;
+                let (fmt, ct) = parse_ext_format(
+                    ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
+                    pq_stac.webp_quality,
+                    pq_stac.jpeg_quality,
+                )?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq_stac, db, is_u8)?;
                 if pq_stac.unscale {
@@ -2374,8 +2402,10 @@ where
                 Ok((data, ct))
             }
             .await,
-            (Method::POST, [feat_ext]) if feat_ext.starts_with("feature.") => async {
-                let ext = feat_ext.strip_prefix("feature.").unwrap_or("png");
+            (Method::POST, [feat_ext])
+                if *feat_ext == "feature" || feat_ext.starts_with("feature.") =>
+            async {
+                let ext_opt = feat_ext.strip_prefix("feature.");
                 let s = pq.max_size.min(1024);
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
@@ -2388,6 +2418,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq_stac, db, is_u8)?;
@@ -2726,7 +2757,10 @@ where
 
             // 11. GET /cog/preview, /cog/preview.{format}, /cog/preview/{w}x{h}.{format}
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
-                let ext = p.strip_prefix("preview.").unwrap_or("png");
+                let ext = p
+                    .strip_prefix("preview.")
+                    .or(pq.format_param.as_deref())
+                    .unwrap_or("png");
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
@@ -2743,9 +2777,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2769,9 +2802,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2787,7 +2819,11 @@ where
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
-                let (fmt, ct) = parse_ext_format(ext_opt.unwrap_or("png"), pq.webp_quality, pq.jpeg_quality)?;
+                let (fmt, ct) = parse_ext_format(
+                    ext_opt.or(pq.format_param.as_deref()).unwrap_or("png"),
+                    pq.webp_quality,
+                    pq.jpeg_quality,
+                )?;
                 let is_u8 = cogs[0].index.full_res().sample_type == cogzilla_tiff::SampleType::Uint8;
                 let mut bands = build_band_request(&pq, db, is_u8)?;
                 if pq.unscale {
@@ -2852,7 +2888,10 @@ where
 
             // 13. POST /cog/feature, /cog/feature.{format}, /cog/feature/{w}x{h}.{format}
             (Method::POST, [f]) if *f == "feature" || f.starts_with("feature.") => async {
-                let ext = f.strip_prefix("feature.").unwrap_or("png");
+                let ext = f
+                    .strip_prefix("feature.")
+                    .or(pq.format_param.as_deref())
+                    .unwrap_or("png");
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
@@ -3222,6 +3261,23 @@ mod tests {
         assert_eq!(pq_rp.resample, ResampleMode::Bilinear);
         assert_eq!(pq_rp.reproject, ResampleMode::Cubic);
         assert!(validate_query(&["cog", "tiles", "WebMercatorQuad", "0", "0", "0.png"], &pq_rp).is_ok());
+
+        // Single-band default colormap is Grayscale (matching TiTiler)
+        assert_eq!(pq.colormap, ColormapName::Grayscale);
+
+        // Form-encoded ?expression= with spaces (`+`) and `%2B` decodes cleanly, while raw `(b1+b2)` still works
+        let pq_form = parse_query(Some("expression=%28b1+-+b2%29+%2F+%28b1+%2B+b2%29"));
+        assert_eq!(pq_form.expr_raw.as_deref(), Some("(b1 - b2) / (b1 + b2)"));
+        let pq_raw = parse_query(Some("expression=(b1-b2)/(b1+b2)"));
+        assert_eq!(pq_raw.expr_raw.as_deref(), Some("(b1-b2)/(b1+b2)"));
+
+        // ?format= applies on format-less tile routes
+        let pq_fmt = parse_query(Some("format=webp"));
+        let (treq, ct) =
+            build_tile_request(TileCoord { z: 2, x: 1, y: 1 }, None, "", &pq_fmt, 3, true, false, None)
+                .unwrap();
+        assert_eq!(ct, "image/webp");
+        assert!(matches!(treq.format, OutputFormat::Webp { .. }));
 
         // HTTP status mapping for upstream 404, local NotFound, and invalid TIFF
         let r404 = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::HttpStatus {
