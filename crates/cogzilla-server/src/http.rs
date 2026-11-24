@@ -833,6 +833,12 @@ async fn open_query_urls(
             "missing ?url=... query parameter".to_string(),
         ));
     }
+    if urls.len() > 16 {
+        return Err(EngineError::BadRequest(format!(
+            "too many ?url= parameters ({}, maximum 16)",
+            urls.len()
+        )));
+    }
     if urls.len() == 1 {
         return Ok(vec![engine.store.open_uri(&urls[0]).await?]);
     }
@@ -945,9 +951,11 @@ where
             !s.is_empty()
                 && s.starts_with('/')
                 && !s.contains("..")
-                && !s.bytes().any(|b| b.is_ascii_whitespace() || b == b'?' || b == b'#')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~'))
         })
-        .unwrap_or("");
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     let host = format!("{proto}://{host_raw}{forwarded_prefix}");
     let if_none_match = req
         .headers()
@@ -1030,13 +1038,16 @@ where
     }
 
     if method == Method::GET && path == "/docs" {
+        let spec_url_js = serde_json::to_string(&format!("{forwarded_prefix}/openapi.json"))
+            .unwrap_or_else(|_| "\"/openapi.json\"".to_string())
+            .replace("</", "<\\/");
         let html = format!(
             r#"<!DOCTYPE html>
 <html><head><title>cogzilla API Docs</title>
 <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
 </head><body><div id="swagger-ui"></div>
 <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-<script>SwaggerUIBundle({{url:'{forwarded_prefix}/openapi.json',dom_id:'#swagger-ui'}});</script>
+<script>SwaggerUIBundle({{url:{spec_url_js},dom_id:'#swagger-ui'}});</script>
 </body></html>"#
         );
         return Ok(plain_resp(
@@ -1180,7 +1191,7 @@ where
             let body = serde_json::json!({
                 "name": name,
                 "scenes": count,
-                "tiles_url": format!("/mosaic/{name}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png"),
+                "tiles_url": format!("{forwarded_prefix}/mosaic/{name}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png"),
             })
             .to_string();
             Ok((Bytes::from(body), "application/json"))
@@ -1540,8 +1551,10 @@ where
                     let eng = engine.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
+                    let nodata = pq.nodata;
                     set.spawn(async move {
-                        let st = compute_statistics(&eng, &cog, max_size, None, unscale).await?;
+                        let st =
+                            compute_statistics(&eng, &cog, max_size, None, unscale, nodata).await?;
                         Ok::<_, EngineError>((idx, st))
                     });
                 }
@@ -1571,9 +1584,11 @@ where
                     let eng = engine.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
+                    let nodata = pq.nodata;
                     set.spawn(async move {
                         let nb = cog.index.full_res().samples_per_pixel as usize;
-                        let st = compute_statistics(&eng, &cog, max_size, None, unscale).await?;
+                        let st =
+                            compute_statistics(&eng, &cog, max_size, None, unscale, nodata).await?;
                         Ok::<_, EngineError>((idx, nb, st))
                     });
                 }
@@ -1614,10 +1629,17 @@ where
                     let mask_c = mask.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
+                    let nodata = pq.nodata;
                     set.spawn(async move {
-                        let st =
-                            compute_statistics(&eng, &cog, max_size, Some(&mask_c), unscale)
-                                .await?;
+                        let st = compute_statistics(
+                            &eng,
+                            &cog,
+                            max_size,
+                            Some(&mask_c),
+                            unscale,
+                            nodata,
+                        )
+                        .await?;
                         Ok::<_, EngineError>((idx, st))
                     });
                 }
@@ -1836,8 +1858,9 @@ where
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
                     let unscale = pq.unscale;
+                    let nodata = pq.nodata;
                     set.spawn(async move {
-                        let pt = query_point(&eng, &cog, lon, lat, unscale).await?;
+                        let pt = query_point(&eng, &cog, lon, lat, unscale, nodata).await?;
                         Ok::<_, EngineError>((idx, pt))
                     });
                 }
@@ -2173,7 +2196,15 @@ where
             // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
             (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let json = compute_statistics(&engine, &cogs[0], pq.max_size, None, pq.unscale).await?;
+                let json = compute_statistics(
+                    &engine,
+                    &cogs[0],
+                    pq.max_size,
+                    None,
+                    pq.unscale,
+                    pq.nodata,
+                )
+                .await?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
@@ -2181,16 +2212,29 @@ where
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 if body_bytes.is_empty() {
-                    let json =
-                        compute_statistics(&engine, &cogs[0], pq.max_size, None, pq.unscale).await?;
+                    let json = compute_statistics(
+                        &engine,
+                        &cogs[0],
+                        pq.max_size,
+                        None,
+                        pq.unscale,
+                        pq.nodata,
+                    )
+                    .await?;
                     Ok((Bytes::from(json.to_string()), "application/json"))
                 } else {
                     let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                         .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                     let (mask, _) = PolygonMask::from_geojson(&geojson)?;
-                    let stats =
-                        compute_statistics(&engine, &cogs[0], pq.max_size, Some(&mask), pq.unscale)
-                            .await?;
+                    let stats = compute_statistics(
+                        &engine,
+                        &cogs[0],
+                        pq.max_size,
+                        Some(&mask),
+                        pq.unscale,
+                        pq.nodata,
+                    )
+                    .await?;
                     if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
                         if let Some(props) = geojson.get_mut("properties").and_then(|v| v.as_object_mut()) {
                             props.insert("statistics".into(), stats);
@@ -2406,7 +2450,7 @@ where
                 } else {
                     (x, y)
                 };
-                let json = query_point(&engine, &cogs[0], lon, lat, pq.unscale).await?;
+                let json = query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,

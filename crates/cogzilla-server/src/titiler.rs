@@ -161,6 +161,7 @@ pub async fn query_point(
     lon: f64,
     lat: f64,
     unscale: bool,
+    nodata_override: Option<f32>,
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
@@ -190,6 +191,11 @@ pub async fn query_point(
     let pidx = (ly as usize) * (ifd.tile_width as usize) + (lx as usize);
 
     let maybe_unscale = |b: usize, v: f32| -> f32 {
+        if let Some(nd) = nodata_override {
+            if !nd.is_nan() && v == nd {
+                return f32::NAN;
+            }
+        }
         if unscale && !v.is_nan() {
             let sc = cog.index.scales.get(b).copied().unwrap_or(1.0);
             let off = cog.index.offsets.get(b).copied().unwrap_or(0.0);
@@ -268,6 +274,7 @@ impl BandStatsAcc {
     }
 
     /// Accumulate an unmasked tile region `[0..x_max) x [0..y_max)` directly from `BandData`.
+    #[allow(clippy::too_many_arguments)]
     fn push_tile_unmasked(
         &mut self,
         data: &cogzilla_codec::BandData,
@@ -277,6 +284,7 @@ impl BandStatsAcc {
         unscale: bool,
         scale: f32,
         offset: f32,
+        nodata_override: Option<f32>,
     ) {
         use cogzilla_codec::BandData;
         match (self, data) {
@@ -348,11 +356,12 @@ impl BandStatsAcc {
             }
             (Self::Floats(vals), BandData::F32(slab)) => {
                 let slice = slab.as_slice();
+                let nd_ov = nodata_override.filter(|v| !v.is_nan());
                 if unscale {
                     for ly in 0..y_max {
                         let row = &slice[ly * tw..ly * tw + x_max];
                         for &v in row {
-                            if v.is_finite() {
+                            if v.is_finite() && nd_ov != Some(v) {
                                 vals.push(v * scale + offset);
                             }
                         }
@@ -361,7 +370,7 @@ impl BandStatsAcc {
                     for ly in 0..y_max {
                         let row = &slice[ly * tw..ly * tw + x_max];
                         for &v in row {
-                            if v.is_finite() {
+                            if v.is_finite() && nd_ov != Some(v) {
                                 vals.push(v);
                             }
                         }
@@ -370,11 +379,12 @@ impl BandStatsAcc {
             }
             // Fallback if tile storage variant differs from IFD sample type
             (Self::Floats(vals), other) => {
+                let nd_ov = nodata_override.filter(|v| !v.is_nan());
                 for ly in 0..y_max {
                     let base = ly * tw;
                     for lx in 0..x_max {
                         let mut v = other.get_f32(base + lx);
-                        if v.is_finite() {
+                        if v.is_finite() && nd_ov != Some(v) {
                             if unscale {
                                 v = v * scale + offset;
                             }
@@ -420,6 +430,7 @@ impl BandStatsAcc {
         unscale: bool,
         scale: f32,
         offset: f32,
+        nodata_override: Option<f32>,
     ) {
         use cogzilla_codec::BandData;
         match (self, data) {
@@ -475,13 +486,14 @@ impl BandStatsAcc {
             }
             (Self::Floats(vals), BandData::F32(slab)) => {
                 let slice = slab.as_slice();
+                let nd_ov = nodata_override.filter(|v| !v.is_nan());
                 for ly in 0..y_max {
                     let mrow = &mask_bits[ly * x_max..(ly + 1) * x_max];
                     let row = &slice[ly * tw..ly * tw + x_max];
                     for lx in 0..x_max {
                         if mrow[lx] != 0 {
                             let mut v = row[lx];
-                            if v.is_finite() {
+                            if v.is_finite() && nd_ov != Some(v) {
                                 if unscale {
                                     v = v * scale + offset;
                                 }
@@ -492,13 +504,14 @@ impl BandStatsAcc {
                 }
             }
             (acc, other) => {
+                let nd_ov = nodata_override.filter(|v| !v.is_nan());
                 for ly in 0..y_max {
                     let mrow = &mask_bits[ly * x_max..(ly + 1) * x_max];
                     let base = ly * tw;
                     for lx in 0..x_max {
                         if mrow[lx] != 0 {
                             let mut v = other.get_f32(base + lx);
-                            if v.is_finite() {
+                            if v.is_finite() && nd_ov != Some(v) {
                                 match acc {
                                     Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
                                     Self::HistU16(hist) => {
@@ -631,10 +644,25 @@ impl BandStatsAcc {
         unscale: bool,
         scale: f32,
         offset: f32,
+        nodata_override: Option<f32>,
     ) -> serde_json::Value {
         match self {
-            Self::HistU8(hist) => Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset),
-            Self::HistU16(hist) => Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset),
+            Self::HistU8(mut hist) => {
+                if let Some(nd) = nodata_override {
+                    if nd.is_finite() && nd >= 0.0 && nd <= 255.0 && nd.fract() == 0.0 {
+                        hist[nd as usize] = 0;
+                    }
+                }
+                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset)
+            }
+            Self::HistU16(mut hist) => {
+                if let Some(nd) = nodata_override {
+                    if nd.is_finite() && nd >= 0.0 && nd <= 65535.0 && nd.fract() == 0.0 {
+                        hist[nd as usize] = 0;
+                    }
+                }
+                Self::finalize_hist(&hist, denom_pixels, unscale, scale, offset)
+            }
             Self::Floats(mut vals) => {
                 let valid_px = vals.len();
                 let masked_px = denom_pixels.saturating_sub(valid_px);
@@ -879,30 +907,41 @@ enum StatsTiles {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_statistics_cpu(
     cog: &OpenedCog,
     ifd_idx: usize,
     _crs: &cogzilla_proj::CrsModel,
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
+    nodata_override: Option<f32>,
     fetched: StatsTiles,
 ) -> serde_json::Value {
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
     let total_pixels = (ifd.width as usize) * (ifd.height as usize);
-    let mask_total_pixels;
+    let mask_total_pixels = match &fetched {
+        StatsTiles::Chunky {
+            mask_total_pixels, ..
+        }
+        | StatsTiles::Planar {
+            mask_total_pixels, ..
+        } => *mask_total_pixels,
+    };
+    let capacity_hint = if poly_mask.is_some() {
+        mask_total_pixels
+    } else {
+        total_pixels
+    };
 
     let mut per_band: Vec<BandStatsAcc> = (0..count)
-        .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, total_pixels))
+        .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, capacity_hint))
         .collect();
 
     match fetched {
         StatsTiles::Chunky {
-            tiles,
-            tile_masks,
-            mask_total_pixels: mtp,
+            tiles, tile_masks, ..
         } => {
-            mask_total_pixels = mtp;
             for (ti, tile_opt) in tiles.iter().enumerate() {
                 let Some(tile) = tile_opt else { continue };
                 let tx = (ti as u32) % ifd.tiles_across;
@@ -928,6 +967,7 @@ fn compute_statistics_cpu(
                             unscale,
                             cog.index.scales[b],
                             cog.index.offsets[b],
+                            nodata_override,
                         );
                     }
                 } else {
@@ -943,6 +983,7 @@ fn compute_statistics_cpu(
                             unscale,
                             cog.index.scales[b],
                             cog.index.offsets[b],
+                            nodata_override,
                         );
                     }
                 }
@@ -951,9 +992,8 @@ fn compute_statistics_cpu(
         StatsTiles::Planar {
             band_tiles,
             tile_masks,
-            mask_total_pixels: planar_mask_px,
+            ..
         } => {
-            mask_total_pixels = planar_mask_px;
             for (b, tiles) in band_tiles.iter().enumerate() {
                 for (ti, tile_opt) in tiles.iter().enumerate() {
                     let Some(tile) = tile_opt else { continue };
@@ -977,6 +1017,7 @@ fn compute_statistics_cpu(
                                 unscale,
                                 cog.index.scales[b],
                                 cog.index.offsets[b],
+                                nodata_override,
                             );
                         }
                     } else {
@@ -988,6 +1029,7 @@ fn compute_statistics_cpu(
                             unscale,
                             cog.index.scales[b],
                             cog.index.offsets[b],
+                            nodata_override,
                         );
                     }
                 }
@@ -1005,7 +1047,13 @@ fn compute_statistics_cpu(
     for (b, acc) in per_band.into_iter().enumerate() {
         out.insert(
             format!("b{}", b + 1),
-            acc.finalize(denom_pixels, unscale, cog.index.scales[b], cog.index.offsets[b]),
+            acc.finalize(
+                denom_pixels,
+                unscale,
+                cog.index.scales[b],
+                cog.index.offsets[b],
+                nodata_override,
+            ),
         );
     }
 
@@ -1020,6 +1068,7 @@ pub async fn compute_statistics(
     max_size: u32,
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
+    nodata_override: Option<f32>,
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let mut ifd_idx = cog.index.ifds.len() - 1;
@@ -1116,6 +1165,7 @@ pub async fn compute_statistics(
                     &crs,
                     pm_owned.as_ref(),
                     unscale,
+                    nodata_override,
                     fetched,
                 )
             })
@@ -1123,7 +1173,13 @@ pub async fn compute_statistics(
         Ok(val)
     } else {
         Ok(compute_statistics_cpu(
-            cog, ifd_idx, &crs, poly_mask, unscale, fetched,
+            cog,
+            ifd_idx,
+            &crs,
+            poly_mask,
+            unscale,
+            nodata_override,
+            fetched,
         ))
     }
 }
@@ -1420,6 +1476,12 @@ async fn render_bbox_impl(
     return_mask: bool,
     unscale: bool,
 ) -> Result<Bytes, EngineError> {
+    if cogs.is_empty() || cogs.len() > 16 {
+        return Err(EngineError::BadRequest(format!(
+            "render_bbox supports 1..=16 assets, got {}",
+            cogs.len()
+        )));
+    }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
     let primary = &cogs[0];
@@ -1673,16 +1735,21 @@ async fn render_bbox_impl(
     let is_single_planar =
         cogs.len() == 1 && ifd.planar_config == cogzilla_tiff::PlanarConfig::Planar;
 
-    // Validate 1-based band indices on single-COG requests and collect unique 0-based planes
-    // needed when the COG is `PlanarConfig::Planar`.
+    // Validate 1-based band indices on both single- and multi-COG requests and collect unique
+    // 0-based planes needed when a single COG is `PlanarConfig::Planar`.
     let mut planar_bands: Vec<u16> = Vec::new();
-    if cogs.len() == 1 {
+    let max_bands = if cogs.len() == 1 {
+        ifd.samples_per_pixel
+    } else {
+        cogs.len() as u16
+    };
+    {
         let mut check_band = |b_1based: u16| -> Result<(), EngineError> {
             let b0 = b_1based.saturating_sub(1);
-            if b0 >= ifd.samples_per_pixel {
+            if b_1based == 0 || b0 >= max_bands {
                 return Err(EngineError::BadRequest(format!(
                     "band {} out of range (dataset has {} bands)",
-                    b_1based, ifd.samples_per_pixel
+                    b_1based, max_bands
                 )));
             }
             if is_single_planar && !planar_bands.contains(&b0) {

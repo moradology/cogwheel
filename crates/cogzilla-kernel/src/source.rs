@@ -123,11 +123,11 @@ impl<'a> BandSource<'a> {
         }
         let bidx = (gy * self.grid_w + gx) as usize;
         let v = match unsafe { *self.blocks.get_unchecked(bidx) } {
-            Some(blk) => {
+            Some(blk) if ly < blk.height && lx < blk.width => {
                 let pidx = (ly as usize) * (self.tile_w as usize) + (lx as usize);
                 unsafe { blk.data.get_f32_unchecked(pidx) }
             }
-            None => f32::NAN,
+            _ => f32::NAN,
         };
         if let Some(nd) = self.nodata_override {
             if v == nd {
@@ -169,7 +169,7 @@ impl<'a> BandSource<'a> {
             if gx < self.grid_w && gy < self.grid_h {
                 let bidx = (gy * self.grid_w + gx) as usize;
                 return match unsafe { *self.blocks.get_unchecked(bidx) } {
-                    Some(blk) => {
+                    Some(blk) if ly + 1 < blk.height && lx + 1 < blk.width => {
                         let tw = self.tile_w as usize;
                         let p00 = (ly as usize) * tw + (lx as usize);
                         let p01 = p00 + tw;
@@ -238,6 +238,12 @@ impl<'a> BandSource<'a> {
                         }
                     }
                     None => (f32::NAN, f32::NAN, f32::NAN, f32::NAN),
+                    Some(_) => (
+                        self.sample_inbounds(ux0, uy0),
+                        self.sample_inbounds(ux0 + 1, uy0),
+                        self.sample_inbounds(ux0, uy0 + 1),
+                        self.sample_inbounds(ux0 + 1, uy0 + 1),
+                    ),
                 };
             }
             return (f32::NAN, f32::NAN, f32::NAN, f32::NAN);
@@ -370,9 +376,13 @@ impl<'a> BandSource<'a> {
             let gy = ty.wrapping_sub(self.ty0);
             if gx < self.grid_w && gy < self.grid_h {
                 let bidx = (gy * self.grid_w + gx) as usize;
-                let tw = self.tile_w as usize;
-                let p00 = (ly as usize) * tw + (lx as usize);
-                return Some((bidx, p00, p00 + tw));
+                if let Some(blk) = unsafe { *self.blocks.get_unchecked(bidx) } {
+                    if ly + 1 < blk.height && lx + 1 < blk.width {
+                        let tw = self.tile_w as usize;
+                        let p00 = (ly as usize) * tw + (lx as usize);
+                        return Some((bidx, p00, p00 + tw));
+                    }
+                }
             }
         }
         None
@@ -401,6 +411,9 @@ impl<'a> BandSource<'a> {
             if gx < self.grid_w && gy < self.grid_h {
                 let bidx = (gy * self.grid_w + gx) as usize;
                 let blk = unsafe { *self.blocks.get_unchecked(bidx) }?;
+                if ly + 2 >= blk.height || lx + 2 >= blk.width {
+                    return None;
+                }
                 let sl = blk.data.as_f32_slice()?;
                 let tw = self.tile_w as usize;
                 let off = (ly as usize - 1) * tw + (lx as usize - 1);
