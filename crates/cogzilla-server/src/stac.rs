@@ -83,10 +83,13 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
     }
 }
 
-/// Load (or fetch from lock-free cache) a STAC Item JSON from local disk or HTTP(S).
+/// Maximum STAC Item JSON size (16 MiB) to prevent OOM on hostile/oversized metadata URLs.
+pub const MAX_STAC_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+/// Load (or fetch from lock-free cache) a STAC Item JSON from local disk, HTTP(S), S3, GCS, or Azure.
 pub async fn load_stac_item(
     cache: &DashMap<String, Arc<StacItem>, ahash::RandomState>,
-    client: &reqwest::Client,
+    store: &cogzilla_io::CogStore,
     uri: &str,
 ) -> Result<Arc<StacItem>, EngineError> {
     cogzilla_io::check_uri_allowed(uri)?;
@@ -94,33 +97,19 @@ pub async fn load_stac_item(
         return Ok(hit.clone());
     }
 
-    let raw_bytes = if let Some((bucket, key)) = cogzilla_io::parse_s3_uri(uri) {
-        let cfg = cogzilla_io::S3Config::from_env_full();
-        cogzilla_io::fetch_s3_object(client, bucket, key, &cfg, None, None)
-            .await
-            .map_err(|e| EngineError::BadRequest(format!("failed to fetch S3 STAC item: {e}")))?
-            .to_vec()
-    } else if uri.starts_with("http://") || uri.starts_with("https://") {
-        let resp = client
-            .get(uri)
-            .send()
-            .await
-            .map_err(|e| EngineError::BadRequest(format!("failed to fetch STAC item: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(EngineError::NotFound(format!(
-                "STAC item HTTP {}: {uri}",
-                resp.status().as_u16()
-            )));
-        }
-        resp.bytes()
-            .await
-            .map_err(|e| EngineError::BadRequest(format!("STAC body error: {e}")))?
-            .to_vec()
-    } else {
-        let local = uri.strip_prefix("file://").unwrap_or(uri);
-        std::fs::read(local)
-            .map_err(|e| EngineError::NotFound(format!("cannot read STAC item '{local}': {e}")))?
-    };
+    let raw_bytes = store
+        .fetch_uri_bytes(uri, MAX_STAC_JSON_BYTES)
+        .await
+        .map_err(|e| match e {
+            cogzilla_io::IoError::Forbidden(u) => EngineError::Io(cogzilla_io::IoError::Forbidden(u)),
+            cogzilla_io::IoError::HttpStatus { status: 404, url } => {
+                EngineError::NotFound(format!("STAC item HTTP 404: {url}"))
+            }
+            cogzilla_io::IoError::Fs(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => {
+                EngineError::NotFound(format!("cannot read STAC item '{uri}': {ioe}"))
+            }
+            other => EngineError::BadRequest(format!("failed to fetch STAC item '{uri}': {other}")),
+        })?;
 
     let val: serde_json::Value = serde_json::from_slice(&raw_bytes)
         .map_err(|e| EngineError::BadRequest(format!("invalid STAC JSON: {e}")))?;

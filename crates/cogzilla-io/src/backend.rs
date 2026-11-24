@@ -128,14 +128,14 @@ pub fn coalesce_ranges(
     spans
 }
 
-fn shared_dynamic_creds() -> Arc<DynamicCredsCache> {
+pub(crate) fn shared_dynamic_creds() -> Arc<DynamicCredsCache> {
     static CREDS: std::sync::OnceLock<Arc<DynamicCredsCache>> = std::sync::OnceLock::new();
     CREDS
         .get_or_init(|| Arc::new(DynamicCredsCache::default()))
         .clone()
 }
 
-fn shared_gcs_token_cache() -> Arc<GcsTokenCache> {
+pub(crate) fn shared_gcs_token_cache() -> Arc<GcsTokenCache> {
     static CACHE: std::sync::OnceLock<Arc<GcsTokenCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| Arc::new(GcsTokenCache::default())).clone()
 }

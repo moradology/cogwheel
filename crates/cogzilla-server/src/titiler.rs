@@ -1472,16 +1472,79 @@ pub async fn render_wgs84_bbox(
     let grid_w = tx1 - tx0 + 1;
     let grid_h = ty1 - ty0 + 1;
 
-    // Fetch needed bands (single COG or multi-COG)
-    let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
-    for ty in ty0..=ty1 {
-        for tx in tx0..=tx1 {
-            indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+    let grid_len = (grid_w * grid_h) as usize;
+    let is_single_planar =
+        cogs.len() == 1 && ifd.planar_config == cogzilla_tiff::PlanarConfig::Planar;
+
+    // Validate 1-based band indices on single-COG requests and collect unique 0-based planes
+    // needed when the COG is `PlanarConfig::Planar`.
+    let mut planar_bands: Vec<u16> = Vec::new();
+    if cogs.len() == 1 {
+        let mut check_band = |b_1based: u16| -> Result<(), EngineError> {
+            let b0 = b_1based.saturating_sub(1);
+            if b0 >= ifd.samples_per_pixel {
+                return Err(EngineError::BadRequest(format!(
+                    "band {} out of range (dataset has {} bands)",
+                    b_1based, ifd.samples_per_pixel
+                )));
+            }
+            if is_single_planar && !planar_bands.contains(&b0) {
+                planar_bands.push(b0);
+            }
+            Ok(())
+        };
+        match bands {
+            BandRequest::Single { band_1based, .. }
+            | BandRequest::Terrain { band_1based, .. }
+            | BandRequest::Dem { band_1based, .. }
+            | BandRequest::Spectral1 { band_1based, .. } => check_band(*band_1based)?,
+            BandRequest::SarRgb { bands_1based, .. }
+            | BandRequest::Spectral2 { bands_1based, .. } => {
+                check_band(bands_1based[0])?;
+                check_band(bands_1based[1])?;
+            }
+            BandRequest::Rgb { bands_1based, .. }
+            | BandRequest::Spectral3 { bands_1based, .. } => {
+                check_band(bands_1based[0])?;
+                check_band(bands_1based[1])?;
+                check_band(bands_1based[2])?;
+            }
+            BandRequest::CustomExpr { prog, .. } => {
+                for &b in &prog.used_bands {
+                    check_band(b)?;
+                }
+            }
         }
     }
+
+    // Fetch needed bands (single COG chunky/planar or multi-COG)
     let cog_tiles = if cogs.len() == 1 {
-        vec![engine.store.get_blocks(&cogs[0], ifd_idx, &indices).await?]
+        if is_single_planar {
+            let mut indices = Vec::with_capacity(grid_len * planar_bands.len().max(1));
+            for &band in &planar_bands {
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        indices.push(Some(ifd.tile_index(tx, ty, band) as u32));
+                    }
+                }
+            }
+            vec![engine.store.get_blocks(&cogs[0], ifd_idx, &indices).await?]
+        } else {
+            let mut indices = Vec::with_capacity(grid_len);
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                }
+            }
+            vec![engine.store.get_blocks(&cogs[0], ifd_idx, &indices).await?]
+        }
     } else {
+        let mut indices = Vec::with_capacity(grid_len);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+            }
+        }
         let indices_arc = Arc::new(indices);
         let mut js = tokio::task::JoinSet::new();
         for (slot, c) in cogs.iter().enumerate() {
@@ -1529,10 +1592,15 @@ pub async fn render_wgs84_bbox(
                 ResampleMode::Nearest => {
                     let xi = (u + 0.5).floor() as i32;
                     let yi = (v + 0.5).floor() as i32;
-                    if xi >= 0 && yi >= 0 && xi < ifd_w_i && yi < ifd_h_i {
+                    if xi >= 0
+                        && yi >= 0
+                        && xi < ifd_w_i
+                        && yi < ifd_h_i
+                        && src.nodata_override.is_none()
+                    {
                         src.sample_inbounds(xi as u32, yi as u32)
                     } else {
-                        f32::NAN
+                        src.sample_checked(xi, yi)
                     }
                 }
                 ResampleMode::Cubic => cogzilla_kernel::sample_cubic(src, u, v),
@@ -1543,17 +1611,21 @@ pub async fn render_wgs84_bbox(
                     let fy = v - y0_f;
                     let x0 = x0_f as i32;
                     let y0 = y0_f as i32;
-                    let (v00, v10, v01, v11) =
-                        if x0 >= 0 && y0 >= 0 && (x0 + 1) < ifd_w_i && (y0 + 1) < ifd_h_i {
-                            src.sample_quad_inbounds(x0 as u32, y0 as u32)
-                        } else {
-                            (
-                                src.sample_checked(x0, y0),
-                                src.sample_checked(x0 + 1, y0),
-                                src.sample_checked(x0, y0 + 1),
-                                src.sample_checked(x0 + 1, y0 + 1),
-                            )
-                        };
+                    let (v00, v10, v01, v11) = if x0 >= 0
+                        && y0 >= 0
+                        && (x0 + 1) < ifd_w_i
+                        && (y0 + 1) < ifd_h_i
+                        && src.nodata_override.is_none()
+                    {
+                        src.sample_quad_inbounds(x0 as u32, y0 as u32)
+                    } else {
+                        (
+                            src.sample_checked(x0, y0),
+                            src.sample_checked(x0 + 1, y0),
+                            src.sample_checked(x0, y0 + 1),
+                            src.sample_checked(x0 + 1, y0 + 1),
+                        )
+                    };
                     let omx = 1.0 - fx;
                     let omy = 1.0 - fy;
                     // Fast branchless path when all 4 corners are valid (99.9% of interior pixels)
@@ -1579,7 +1651,7 @@ pub async fn render_wgs84_bbox(
             }
         };
 
-        // Helper to build BandSource for 1-based band index across single or multi-COG
+        // Helper to build BandSource for 1-based band index across single (chunky/planar) or multi-COG
         let get_band_refs =
             |b_1based: u16, asset_slot: usize| -> Vec<Option<&cogzilla_codec::DecodedBand>> {
                 if num_cogs > 1 {
@@ -1588,6 +1660,18 @@ pub async fn render_wgs84_bbox(
                         .iter()
                         .map(|o| o.as_ref().and_then(|t| t.bands.first()))
                         .collect()
+                } else if is_single_planar {
+                    let b0 = b_1based.saturating_sub(1);
+                    if let Some(pos) = planar_bands.iter().position(|&b| b == b0) {
+                        let start = pos * grid_len;
+                        let end = (start + grid_len).min(cog_tiles[0].len());
+                        cog_tiles[0][start..end]
+                            .iter()
+                            .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                            .collect()
+                    } else {
+                        vec![None; grid_len]
+                    }
                 } else {
                     let b0 = b_1based.saturating_sub(1) as usize;
                     cog_tiles[0]
@@ -1751,18 +1835,18 @@ pub async fn render_wgs84_bbox(
                 colormap,
             } => {
                 let refs = get_band_refs(*band_1based, 0);
-                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let src = make_src!(&refs);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let v = sample(&src, u_map[i], v_map[i]);
                     if !v.is_nan() {
                         let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let c = lut.rgb[idx];
-                        rgba[i * 4] = c[0];
-                        rgba[i * 4 + 1] = c[1];
-                        rgba[i * 4 + 2] = c[2];
-                        rgba[i * 4 + 3] = 255;
+                        let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                        rgba[i * 4] = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = a;
                     }
                 }
             }
@@ -1771,7 +1855,7 @@ pub async fn render_wgs84_bbox(
                 encoding,
             } => {
                 let refs = get_band_refs(*band_1based, 0);
-                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let src = make_src!(&refs);
                 for i in 0..(w * h) {
                     let v = sample(&src, u_map[i], v_map[i]);
                     if !v.is_nan() {
@@ -1797,7 +1881,7 @@ pub async fn render_wgs84_bbox(
                 colormap,
             } => {
                 let refs = get_band_refs(*band_1based, 0);
-                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let src = make_src!(&refs);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let mut elev = vec![f32::NAN; w * h];
@@ -1831,11 +1915,11 @@ pub async fn render_wgs84_bbox(
                         if !v.is_nan() {
                             let i = py * w + px;
                             let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                            let c = lut.rgb[idx];
-                            rgba[i * 4] = c[0];
-                            rgba[i * 4 + 1] = c[1];
-                            rgba[i * 4 + 2] = c[2];
-                            rgba[i * 4 + 3] = 255;
+                            let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                            rgba[i * 4] = r;
+                            rgba[i * 4 + 1] = g;
+                            rgba[i * 4 + 2] = b;
+                            rgba[i * 4 + 3] = a;
                         }
                     }
                 }
@@ -1916,11 +2000,11 @@ pub async fn render_wgs84_bbox(
                     let v = prog.eval(&vals[..nb]);
                     if !v.is_nan() {
                         let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let c = lut.rgb[idx];
-                        rgba[i * 4] = c[0];
-                        rgba[i * 4 + 1] = c[1];
-                        rgba[i * 4 + 2] = c[2];
-                        rgba[i * 4 + 3] = 255;
+                        let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                        rgba[i * 4] = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = a;
                     }
                 }
             }
@@ -1931,18 +2015,18 @@ pub async fn render_wgs84_bbox(
                 colormap,
             } => {
                 let refs = get_band_refs(*band_1based, 0);
-                let src = make_src!(&refs).with_nodata_override(nodata_override);
+                let src = make_src!(&refs);
                 let lut = custom_lut.unwrap_or_else(|| colormap.lut());
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 for i in 0..(w * h) {
                     let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
                     if !v.is_nan() {
                         let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let c = lut.rgb[idx];
-                        rgba[i * 4] = c[0];
-                        rgba[i * 4 + 1] = c[1];
-                        rgba[i * 4 + 2] = c[2];
-                        rgba[i * 4 + 3] = 255;
+                        let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+                        rgba[i * 4] = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = a;
                     }
                 }
             }
@@ -1968,11 +2052,11 @@ pub async fn render_wgs84_bbox(
                     };
                     if !v.is_nan() {
                         let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let c = lut.rgb[idx];
-                        rgba[i * 4] = c[0];
-                        rgba[i * 4 + 1] = c[1];
-                        rgba[i * 4 + 2] = c[2];
-                        rgba[i * 4 + 3] = 255;
+                        let [r, g, b, al] = lut.rgba_u32[idx].to_le_bytes();
+                        rgba[i * 4] = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = al;
                     }
                 }
             }
@@ -2001,11 +2085,11 @@ pub async fn render_wgs84_bbox(
                     };
                     if !v.is_nan() {
                         let idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        let col = lut.rgb[idx];
-                        rgba[i * 4] = col[0];
-                        rgba[i * 4 + 1] = col[1];
-                        rgba[i * 4 + 2] = col[2];
-                        rgba[i * 4 + 3] = 255;
+                        let [r, g, b, al] = lut.rgba_u32[idx].to_le_bytes();
+                        rgba[i * 4] = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = al;
                     }
                 }
             }

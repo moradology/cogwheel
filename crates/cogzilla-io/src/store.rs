@@ -4,9 +4,37 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use cogzilla_codec::{DecodedTile, apply_mask_to_tile, decode_mask_tile, decode_tile};
-use cogzilla_tiff::{CogIndex, IfdMeta, TiffError, parse_cog};
+use cogzilla_codec::{
+    DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile, decode_tile,
+};
+use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog};
 use dashmap::DashMap;
+
+/// Return the 0-based alpha plane index if this IFD is a `PlanarConfig::Planar` RGBA COG
+/// (`samples_per_pixel >= 4` with `ExtraSamples` tag 338 containing 1 or 2).
+fn planar_alpha_plane(ifd: &IfdMeta) -> Option<usize> {
+    if ifd.planar_config == PlanarConfig::Planar
+        && ifd.samples_per_pixel >= 4
+        && ifd.extra_samples.iter().any(|&v| v == 1 || v == 2)
+    {
+        Some((ifd.samples_per_pixel - 1) as usize)
+    } else {
+        None
+    }
+}
+
+/// Given a planar color-plane `tile_idx`, return `(offset, len)` of its paired alpha-plane tile.
+fn planar_alpha_tile_range(ifd: &IfdMeta, tile_idx: u32, alpha_plane: usize) -> Option<(u64, u32)> {
+    let per_plane = ((ifd.tiles_across as usize) * (ifd.tiles_down as usize)).max(1);
+    let plane = (tile_idx as usize) / per_plane;
+    if plane >= alpha_plane {
+        return None;
+    }
+    let alpha_idx = alpha_plane * per_plane + (tile_idx as usize) % per_plane;
+    let offset = *ifd.tile_offsets.get(alpha_idx)?;
+    let len = *ifd.tile_byte_counts.get(alpha_idx)?;
+    if len == 0 { None } else { Some((offset, len)) }
+}
 
 /// Lightweight `'static` clone of `IfdMeta` carrying only the fields `decode_tile` reads
 /// (omitting large `tile_offsets`/`tile_byte_counts` vectors) so multi-block decodes can fan out
@@ -520,6 +548,21 @@ impl CogStore {
                             }
                         }
                     }
+                    if let Some(alpha_plane) = planar_alpha_plane(ifd) {
+                        if let Some((aoff, alen)) =
+                            planar_alpha_tile_range(ifd, tile_idx, alpha_plane)
+                        {
+                            if let Some(aslice) = cog.source.local_slice(aoff, alen) {
+                                if let Ok(alpha_tile) =
+                                    decode_tile(aslice, ifd, cog.index.byte_order, None)
+                                {
+                                    if let Some(ab) = alpha_tile.bands.first() {
+                                        apply_alpha_band_to_tile(&mut decoded, ab);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let arc = Arc::new(decoded);
                     guard.complete(arc.clone());
                     out[slot] = Some(arc);
@@ -601,8 +644,11 @@ impl CogStore {
                 && ifd.predictor == cogzilla_tiff::Predictor::None
                 && expected_bytes <= 256 * 1024;
 
+            let alpha_plane = planar_alpha_plane(ifd);
+            let no_sidecar_mask = ifd.mask_ifd.is_none() && alpha_plane.is_none();
+
             if is_local {
-                if heavy_block && ifd.mask_ifd.is_none() {
+                if heavy_block && no_sidecar_mask {
                     let decode_meta = Arc::new(clone_for_decode(ifd));
                     let byte_order = cog.index.byte_order;
                     let nodata = cog.index.nodata;
@@ -659,7 +705,7 @@ impl CogStore {
                 } else if num_workers >= 2
                     && owned.len() >= 2
                     && !trivial_block
-                    && ifd.mask_ifd.is_none()
+                    && no_sidecar_mask
                 {
                     let decode_meta = Arc::new(clone_for_decode(ifd));
                     let byte_order = cog.index.byte_order;
@@ -750,6 +796,22 @@ impl CogStore {
                                 }
                             }
                         }
+                        if let Some(ap) = alpha_plane {
+                            if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                                if let Some((aoff, alen)) = planar_alpha_tile_range(ifd, *tidx, ap) {
+                                    let Some(aslice) = cog.source.local_slice(aoff, alen) else {
+                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                            required: aoff + alen as u64,
+                                            available: 0,
+                                        }));
+                                    };
+                                    let alpha_tile = decode_tile(aslice, ifd, byte_order, None)?;
+                                    if let Some(ab) = alpha_tile.bands.first() {
+                                        apply_alpha_band_to_tile(&mut decoded, ab);
+                                    }
+                                }
+                            }
+                        }
                         let arc = Arc::new(decoded);
                         if let Some(guard) = guard_opt {
                             guard.complete(arc.clone());
@@ -760,7 +822,7 @@ impl CogStore {
             } else {
                 // Tier-2 compressed-block disk cache lookup for remote sources (RAM miss -> disk hit).
                 // Synchronously probe the in-memory index first so 100% cold misses do 0 JoinSet/spawn_blocking hops!
-                if ifd.mask_ifd.is_none() {
+                if no_sidecar_mask {
                     if let Some(dc) = &self.disk_cache {
                         let prev_owned = std::mem::take(&mut owned);
                         let mut disk_candidates = Vec::new();
@@ -894,7 +956,7 @@ impl CogStore {
                         match span_res {
                             Ok((span, data)) => {
                                 let has_more_fetches = !join_set.is_empty();
-                                let can_parallel = ifd.mask_ifd.is_none()
+                                let can_parallel = no_sidecar_mask
                                     && (heavy_block
                                         || (!trivial_block
                                             && ((num_workers >= 2 && span.items.len() >= 2)
@@ -1059,6 +1121,77 @@ impl CogStore {
                                         }
                                     }
 
+                                    // If this IFD is a planar RGBA COG, coalesce and fetch paired
+                                    // alpha-plane tiles for this span concurrently too.
+                                    let mut alpha_bytes_by_slot: Vec<Option<bytes::Bytes>> =
+                                        vec![None; span.items.len()];
+                                    if let Some(ap) = alpha_plane {
+                                        let mut areqs = Vec::new();
+                                        for (idx_in_span, item) in span.items.iter().enumerate() {
+                                            let orig_slot = owned[item.slot].0;
+                                            if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                                                if let Some((aoff, alen)) =
+                                                    planar_alpha_tile_range(ifd, *tidx, ap)
+                                                {
+                                                    areqs.push(TileByteReq {
+                                                        slot: idx_in_span,
+                                                        offset: aoff,
+                                                        len: alen,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        if !areqs.is_empty() {
+                                            let aspans = coalesce_ranges(
+                                                areqs,
+                                                RANGE_GAP_THRESHOLD,
+                                                MAX_COALESCED_SPAN,
+                                            );
+                                            let mut aset = tokio::task::JoinSet::new();
+                                            for aspan in aspans {
+                                                let src = cog.source.clone();
+                                                aset.spawn(async move {
+                                                    let b = src
+                                                        .fetch_range(aspan.start, aspan.end)
+                                                        .await?;
+                                                    Ok::<_, IoError>((aspan, b))
+                                                });
+                                            }
+                                            while let Some(ares) = aset.join_next().await {
+                                                match ares {
+                                                    Ok(Ok((aspan, ab))) => {
+                                                        for ai in aspan.items {
+                                                            let rs = (ai.offset - aspan.start)
+                                                                as usize;
+                                                            let re = rs + ai.len as usize;
+                                                            if re <= ab.len() {
+                                                                alpha_bytes_by_slot[ai.slot] =
+                                                                    Some(ab.slice(rs..re));
+                                                            } else {
+                                                                fetch_err = Some(IoError::Tiff(
+                                                                    TiffError::NeedMoreBytes {
+                                                                        required: ai.offset
+                                                                            + ai.len as u64,
+                                                                        available: aspan.start
+                                                                            + ab.len() as u64,
+                                                                    },
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(Err(e)) => fetch_err = Some(e),
+                                                    Err(e) => {
+                                                        fetch_err = Some(IoError::Fs(
+                                                            std::io::Error::other(format!(
+                                                                "planar alpha fetch task failed: {e}"
+                                                            )),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     if fetch_err.is_some() {
                                         continue;
                                     }
@@ -1075,7 +1208,7 @@ impl CogStore {
                                                 }));
                                             continue;
                                         }
-                                        if ifd.mask_ifd.is_none() {
+                                        if no_sidecar_mask {
                                             if let Some(dc) = &self.disk_cache {
                                                 if let Some(Some(tidx)) =
                                                     tile_indices.get(*orig_slot)
@@ -1103,6 +1236,27 @@ impl CogStore {
                                                     match decode_mask_tile(mbytes, mask_ifd) {
                                                         Ok(mask) => {
                                                             apply_mask_to_tile(&mut decoded, &mask);
+                                                        }
+                                                        Err(e) => {
+                                                            fetch_err = Some(IoError::Codec(e));
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(abytes) =
+                                                    alpha_bytes_by_slot[idx_in_span].as_ref()
+                                                {
+                                                    match decode_tile(abytes, ifd, byte_order, None)
+                                                    {
+                                                        Ok(alpha_tile) => {
+                                                            if let Some(ab) =
+                                                                alpha_tile.bands.first()
+                                                            {
+                                                                apply_alpha_band_to_tile(
+                                                                    &mut decoded,
+                                                                    ab,
+                                                                );
+                                                            }
                                                         }
                                                         Err(e) => {
                                                             fetch_err = Some(IoError::Codec(e));
@@ -1237,5 +1391,155 @@ impl CogStore {
             }
         }
         Ok(raw)
+    }
+
+    /// Fetch a full metadata object (STAC Item JSON, MosaicJSON, etc.) from any supported URI
+    /// (`s3://`, `/vsis3/`, `gs://`, `/vsigs/`, `az://`, `abfs(s)://`, `/vsiaz/`, `http(s)://`,
+    /// `file://`, or local path) with allowlist checks, dynamic cloud auth (IAM/IRSA/ECS/IMDSv2,
+    /// GCS ADC/GCE metadata, Azure SharedKey/SAS/Bearer), AIMD concurrency limiting, transient
+    /// retries, and a hard streaming byte cap (`max_bytes`) to prevent OOM.
+    pub async fn fetch_uri_bytes(
+        &self,
+        uri: &str,
+        max_bytes: usize,
+    ) -> Result<bytes::Bytes, IoError> {
+        crate::allowlist::check_uri_allowed(uri)?;
+
+        if let Some((bucket, key)) = crate::s3::parse_s3_uri(uri) {
+            let cfg = self
+                .s3_cfg
+                .clone()
+                .unwrap_or_else(crate::s3::S3Config::from_env_full);
+            let dyn_creds = crate::backend::shared_dynamic_creds();
+            return crate::s3::fetch_s3_object_capped(
+                &self.client,
+                bucket,
+                key,
+                &cfg,
+                Some(&dyn_creds),
+                None,
+                max_bytes,
+                Some(&self.upstream_limiter),
+            )
+            .await;
+        }
+
+        if let Some((bucket, key)) = crate::cloud::parse_gcs_uri(uri) {
+            let cfg = crate::cloud::GcsConfig::from_env();
+            let tc = crate::backend::shared_gcs_token_cache();
+            return crate::cloud::fetch_gcs_object_capped(
+                &self.client,
+                bucket,
+                key,
+                &cfg,
+                &tc,
+                max_bytes,
+                &self.metrics,
+                &self.upstream_limiter,
+            )
+            .await;
+        }
+
+        if let Some(target) = crate::cloud::parse_azure_uri(uri, None) {
+            let az_cfg = crate::cloud::AzureConfig::from_env();
+            return crate::cloud::fetch_azure_object_capped(
+                &self.client,
+                &target,
+                &az_cfg,
+                max_bytes,
+                &self.metrics,
+                &self.upstream_limiter,
+            )
+            .await;
+        }
+
+        if uri.starts_with("http://") || uri.starts_with("https://") {
+            let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(4);
+            for attempt in 0..=max_retries {
+                let permit = self.upstream_limiter.acquire().await;
+                let send_res = self.client.get(uri).send().await;
+                let resp = match send_res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if crate::s3::is_retryable_transport_error(&e) {
+                            permit.on_throttle();
+                            if attempt < max_retries {
+                                tokio::time::sleep(crate::s3::retry_backoff_duration(
+                                    attempt, None,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        }
+                        return Err(IoError::Http(e));
+                    }
+                };
+                let status = resp.status().as_u16();
+                if crate::s3::is_retryable_status(status) {
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u64>().ok());
+                    permit.on_throttle();
+                    if attempt < max_retries {
+                        tokio::time::sleep(crate::s3::retry_backoff_duration(
+                            attempt,
+                            retry_after,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    return Err(IoError::HttpStatus {
+                        status,
+                        url: uri.to_string(),
+                    });
+                }
+                if !resp.status().is_success() {
+                    return Err(IoError::HttpStatus {
+                        status,
+                        url: uri.to_string(),
+                    });
+                }
+                match crate::cloud::read_response_capped(resp, max_bytes).await {
+                    Ok(data) => {
+                        permit.on_success();
+                        return Ok(data);
+                    }
+                    Err(IoError::Http(e)) => {
+                        if crate::s3::is_retryable_transport_error(&e) {
+                            permit.on_throttle();
+                            if attempt < max_retries {
+                                tokio::time::sleep(crate::s3::retry_backoff_duration(
+                                    attempt, None,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        }
+                        return Err(IoError::Http(e));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(IoError::HttpStatus {
+                status: 503,
+                url: uri.to_string(),
+            });
+        }
+
+        let local = uri.strip_prefix("file://").unwrap_or(uri);
+        let meta = std::fs::metadata(local)?;
+        if meta.len() > max_bytes as u64 {
+            return Err(IoError::Fs(std::io::Error::other(format!(
+                "local file '{local}' size {} exceeds limit of {max_bytes} bytes",
+                meta.len()
+            ))));
+        }
+        let bytes = std::fs::read(local)?;
+        Ok(bytes::Bytes::from(bytes))
     }
 }

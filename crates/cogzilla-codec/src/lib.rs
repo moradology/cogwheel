@@ -448,22 +448,40 @@ fn apply_rgba_alpha_if_present(bands: &mut [DecodedBand], ifd: &IfdMeta) {
         return;
     }
     for b in &mut bands[..alpha_idx] {
-        let slice = b.data.make_f32_mut();
-        let mut all_nd = true;
-        let mut no_nd = true;
-        for i in 0..n.min(slice.len()) {
-            if alpha[i] == 0.0 || alpha[i].is_nan() {
-                slice[i] = f32::NAN;
-                no_nd = false;
-            } else if slice[i].is_nan() {
-                no_nd = false;
-            } else {
-                all_nd = false;
-            }
-        }
-        b.stats.all_nodata = all_nd;
-        b.stats.no_nodata = no_nd;
+        apply_alpha_slice_to_band(b, &alpha);
     }
+}
+
+/// Mask transparent pixels (`alpha == 0` or `NaN`) to `f32::NAN` in a single-band decoded tile
+/// (used for `PlanarConfig::Planar` 4-band RGBA COGs where the alpha channel lives in a separate plane).
+pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
+    let n = alpha.data.len();
+    let alpha_vals: Vec<f32> = (0..n).map(|i| alpha.data.get_f32(i)).collect();
+    if alpha_vals.iter().all(|&a| a > 0.0) {
+        return;
+    }
+    for b in &mut tile.bands {
+        apply_alpha_slice_to_band(b, &alpha_vals);
+    }
+}
+
+fn apply_alpha_slice_to_band(b: &mut DecodedBand, alpha: &[f32]) {
+    let n = alpha.len();
+    let slice = b.data.make_f32_mut();
+    let mut all_nd = true;
+    let mut no_nd = true;
+    for i in 0..n.min(slice.len()) {
+        if alpha[i] == 0.0 || alpha[i].is_nan() {
+            slice[i] = f32::NAN;
+            no_nd = false;
+        } else if slice[i].is_nan() {
+            no_nd = false;
+        } else {
+            all_nd = false;
+        }
+    }
+    b.stats.all_nodata = all_nd;
+    b.stats.no_nodata = no_nd;
 }
 
 /// Decompress a 1-bit (packed MSB-first per row) or 8-bit internal transparency mask tile
@@ -610,5 +628,47 @@ mod tests {
             decode_tile(&[0u8; 4], &ifd, ByteOrder::Little, None),
             Err(CodecError::SizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn apply_alpha_band_to_tile_masks_zero_alpha_and_updates_stats() {
+        let mut tile = DecodedTile {
+            bands: vec![DecodedBand {
+                width: 2,
+                height: 2,
+                data: BandData::U8 {
+                    data: vec![10u8, 20, 30, 40].into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 10.0,
+                    max: 40.0,
+                },
+            }],
+        };
+        let alpha = DecodedBand {
+            width: 2,
+            height: 2,
+            data: BandData::U8 {
+                data: vec![255u8, 0, 255, 0].into_boxed_slice(),
+                nodata: None,
+            },
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 0.0,
+                max: 255.0,
+            },
+        };
+        apply_alpha_band_to_tile(&mut tile, &alpha);
+        let b = &tile.bands[0];
+        assert!(!b.stats.all_nodata);
+        assert!(!b.stats.no_nodata);
+        assert_eq!(b.data.get_f32(0), 10.0);
+        assert!(b.data.get_f32(1).is_nan());
+        assert_eq!(b.data.get_f32(2), 30.0);
+        assert!(b.data.get_f32(3).is_nan());
     }
 }
