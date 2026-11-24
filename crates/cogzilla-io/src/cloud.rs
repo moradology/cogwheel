@@ -393,10 +393,19 @@ async fn fetch_gcs_inner(
             }
             return Err(IoError::HttpStatus { status, url });
         }
+        if status == 200
+            && let Some((start, _)) = range
+            && start > 0
+        {
+            return Err(IoError::HttpStatus { status: 200, url });
+        }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus { status, url });
         }
-        let body_res = if let Some(cap) = max_bytes {
+        let eff_cap = max_bytes.or_else(|| {
+            range.map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
+        });
+        let body_res = if let Some(cap) = eff_cap {
             read_response_capped(resp, cap).await
         } else {
             resp.bytes().await.map_err(IoError::Http)
@@ -555,10 +564,19 @@ async fn fetch_azure_inner(
             }
             return Err(IoError::HttpStatus { status, url });
         }
+        if status == 200
+            && let Some((start, _)) = range
+            && start > 0
+        {
+            return Err(IoError::HttpStatus { status: 200, url });
+        }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus { status, url });
         }
-        let body_res = if let Some(cap) = max_bytes {
+        let eff_cap = max_bytes.or_else(|| {
+            range.map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
+        });
+        let body_res = if let Some(cap) = eff_cap {
             read_response_capped(resp, cap).await
         } else {
             resp.bytes().await.map_err(IoError::Http)

@@ -13,8 +13,8 @@ use crate::cloud::{
 };
 use crate::limiter::AimdLimiter;
 use crate::s3::{
-    DynamicCredsCache, S3Config, fetch_s3_object_limited, is_retryable_status,
-    is_retryable_transport_error, parse_s3_uri, retry_backoff_duration,
+    DynamicCredsCache, S3Config, is_retryable_status, is_retryable_transport_error, parse_s3_uri,
+    retry_backoff_duration,
 };
 
 #[derive(Debug, Error)]
@@ -242,14 +242,16 @@ impl CogSource {
                 limiter,
             } => {
                 let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
+                let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
                 metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-                let data = fetch_s3_object_limited(
+                let data = crate::s3::fetch_s3_object_capped(
                     client,
                     bucket,
                     key,
                     s3_cfg,
                     Some(dynamic_creds),
                     Some(&range_hdr),
+                    expected_len,
                     Some(limiter),
                 )
                 .await?;

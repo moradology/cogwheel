@@ -1615,8 +1615,12 @@ async fn render_bbox_impl(
                 encode_jpeg_rgb(w as u32, h as u32, &vec![0u8; w * h * 3], quality)
             }
             OutputFormat::RawF32 => {
-                let mut b = BytesMut::with_capacity(w * h * 4);
-                for _ in 0..(w * h) {
+                let nb: usize = match bands {
+                    BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                    _ => 1,
+                };
+                let mut b = BytesMut::with_capacity(nb * w * h * 4);
+                for _ in 0..(nb * w * h) {
                     b.put_slice(&f32::NAN.to_le_bytes());
                 }
                 b.freeze()
@@ -1877,10 +1881,15 @@ async fn render_bbox_impl(
                     for i in 0..(w * h) {
                         elev[i] = sample(&src, u_map[i], v_map[i]);
                     }
-                    let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                    let px_m = ((dlx * 111_320.0 * lat_rad.cos()).abs()
-                        .max((dly * 111_320.0).abs()))
-                        .max(1e-3) as f32;
+                    let px_m = if bbox_is_3857 {
+                        let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
+                        (dlx.abs().max(dly.abs()) * center_lat.to_radians().cos()).max(1e-3) as f32
+                    } else {
+                        let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                        ((dlx * 111_320.0 * lat_rad.cos()).abs()
+                            .max((dly * 111_320.0).abs()))
+                            .max(1e-3) as f32
+                    };
                     let inv_8dx = 1.0 / (8.0 * px_m);
                     for py in 0..h {
                         let ym = py.saturating_sub(1);
@@ -1975,17 +1984,33 @@ async fn render_bbox_impl(
                 }
                 BandRequest::Rgb { bands_1based, .. } => {
                     let r0 = get_band_refs(bands_1based[0], 0);
-                    let s0 = make_src!(&r0);
-                    for i in 0..(w * h) {
-                        out.put_slice(&sample(&s0, u_map[i], v_map[i]).to_le_bytes());
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let r2 = get_band_refs(bands_1based[2], 2);
+                    let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                    out.reserve(w * h * 8);
+                    for s in &srcs {
+                        for i in 0..(w * h) {
+                            out.put_slice(&sample(s, u_map[i], v_map[i]).to_le_bytes());
+                        }
                     }
                 }
                 BandRequest::SarRgb { bands_1based, .. } => {
                     let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
                     let s0 = make_src!(&r0);
+                    let s1 = make_src!(&r1);
+                    let mut vh_plane = Vec::with_capacity(w * h * 4);
+                    let mut diff_plane = Vec::with_capacity(w * h * 4);
+                    out.reserve(w * h * 8);
                     for i in 0..(w * h) {
-                        out.put_slice(&fast_db_from_power(sample(&s0, u_map[i], v_map[i])).to_le_bytes());
+                        let vv = fast_db_from_power(sample(&s0, u_map[i], v_map[i]));
+                        let vh = fast_db_from_power(sample(&s1, u_map[i], v_map[i]));
+                        out.put_slice(&vv.to_le_bytes());
+                        vh_plane.extend_from_slice(&vh.to_le_bytes());
+                        diff_plane.extend_from_slice(&(vv - vh).to_le_bytes());
                     }
+                    out.put_slice(&vh_plane);
+                    out.put_slice(&diff_plane);
                 }
             }
             return out.freeze();

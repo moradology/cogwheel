@@ -163,6 +163,10 @@ pub struct GeoKeys {
     pub scale_at_nat_origin: Option<f64>,
     /// GeogGeodeticDatumGeoKey (2050).
     pub geodetic_datum: Option<u16>,
+    /// GeogPrimeMeridianGeoKey (2051); 8901 is Greenwich.
+    pub prime_meridian: Option<u16>,
+    /// GeogPrimeMeridianLongGeoKey (2061); 0.0 is Greenwich.
+    pub prime_meridian_long: Option<f64>,
     /// GeogAngularUnitsGeoKey (2054); 9102 is degrees.
     pub geog_angular_units: Option<u16>,
     /// GeogEllipsoidGeoKey (2056); 7019 is GRS80, 7030 is WGS84.
@@ -173,6 +177,9 @@ pub struct GeoKeys {
     /// ProjFalseOriginEastingGeoKey (3086) and ProjFalseOriginNorthingGeoKey (3087).
     pub false_origin_easting: Option<f64>,
     pub false_origin_northing: Option<f64>,
+    /// ProjCenterEastingGeoKey (3090) and ProjCenterNorthingGeoKey (3091).
+    pub center_easting: Option<f64>,
+    pub center_northing: Option<f64>,
     /// ProjStraightVertPoleLongGeoKey (3095): the central meridian of a polar stereographic.
     pub straight_vert_pole_long: Option<f64>,
 }

@@ -2859,6 +2859,12 @@ pub fn render_dem_algorithm<const N: usize>(
         let mut u_row = [0.0f32; N];
         let mut v_row = [0.0f32; N];
 
+        let flat_dem = if style.resample == ResampleMode::Bilinear && clean {
+            src.single_block_flat()
+        } else {
+            None
+        };
+
         for py in 0..N {
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
             if py == 0 {
@@ -2869,8 +2875,26 @@ pub fn render_dem_algorithm<const N: usize>(
                 v_second = v_row;
             }
             let row_off = (py + 1) * pad;
-            for px in 0..N {
-                elev[row_off + px + 1] = sample_px(u_row[px], v_row[px]);
+            if let (CoordPlan::Separable1D { u, v, .. }, Some((slice, bc, br, stride))) =
+                (plan, flat_dem)
+            {
+                let (y0_raw, fy) = fast_floor_i32(v[py] - br as f32);
+                let max_y = ((slice.len() / stride) as i32 - 2).max(0);
+                let y0 = y0_raw.clamp(0, max_y) as usize;
+                let r0_off = y0 * stride;
+                let r1_off = r0_off + stride;
+                bilinear_row_flat_dispatch::<N>(
+                    u,
+                    bc,
+                    &slice[r0_off..r0_off + stride],
+                    &slice[r1_off..r1_off + stride],
+                    fy,
+                    &mut elev[row_off + 1..row_off + 1 + N],
+                );
+            } else {
+                for px in 0..N {
+                    elev[row_off + px + 1] = sample_px(u_row[px], v_row[px]);
+                }
             }
             // Left/right 1-px extrapolated border using the exact same sub-pixel interpolation
             let du_l = u_row[1] - u_row[0];

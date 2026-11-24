@@ -53,18 +53,41 @@ impl CrsModel {
         if matches!(gk.geog_angular_units, Some(u) if u != 9102) {
             return Err(unsupported("angular units other than degrees"));
         }
+        if !matches!(gk.prime_meridian, None | Some(8901 | 32767))
+            || matches!(gk.prime_meridian_long, Some(lon) if !lon.is_finite() || lon.abs() > 1e-9)
+        {
+            return Err(unsupported("prime meridian other than Greenwich"));
+        }
 
         // 1. ProjectedCSTypeGeoKey EPSG codes. A code fixes the datum, projection
-        //    and units by definition, so no other key is consulted. The table is
-        //    generated from PROJ's database and holds only codes whose datum is
-        //    within about 2 m of WGS84.
+        //    and units by definition, unless ProjLinearUnitsGeoKey (3076) explicitly
+        //    overrides the linear unit with a conflicting code.
         match gk.projected_cs_type {
-            Some(3857 | 3785) => return Ok(Self::Epsg3857),
+            Some(3857 | 3785) => {
+                if matches!(gk.proj_linear_units, Some(u) if u != 9001 && u != 32767) {
+                    return Err(unsupported("EPSG:3857 with non-metre linear units override"));
+                }
+                return Ok(Self::Epsg3857);
+            }
             // User-defined: described by the parameter keys below.
             Some(32767) | None => {}
             Some(code) => {
                 return match crate::epsg::lookup(code) {
-                    Some(def) => Ok(def.to_model()),
+                    Some(def) => {
+                        let expected_unit = match def.unit {
+                            0 => 9001,
+                            1 => 9002,
+                            2 => 9003,
+                            _ => 0,
+                        };
+                        if matches!(gk.proj_linear_units, Some(u) if u != expected_unit && u != 32767)
+                        {
+                            return Err(unsupported(
+                                "projected CRS linear units override conflicts with EPSG definition",
+                            ));
+                        }
+                        Ok(def.to_model())
+                    }
                     // Parameter keys beside an unknown code cannot vouch for its datum.
                     None => Err(unsupported("projected CRS code is not in the supported list")),
                 };
@@ -85,8 +108,16 @@ impl CrsModel {
             let missing = |what: &str| unsupported(&format!("{what} is missing"));
             let lon0 = gk.false_origin_long.or(gk.nat_origin_long).or(gk.center_long);
             let lat0 = gk.false_origin_lat.or(gk.nat_origin_lat).or(gk.center_lat);
-            let fe = gk.false_origin_easting.or(gk.false_easting).unwrap_or(0.0);
-            let fn_m = gk.false_origin_northing.or(gk.false_northing).unwrap_or(0.0);
+            let fe = gk
+                .false_origin_easting
+                .or(gk.false_easting)
+                .or(gk.center_easting)
+                .unwrap_or(0.0);
+            let fn_m = gk
+                .false_origin_northing
+                .or(gk.false_northing)
+                .or(gk.center_northing)
+                .unwrap_or(0.0);
             return match ct {
                 // CT_TransverseMercator
                 1 => {
@@ -1132,6 +1163,30 @@ mod tests {
                     k.nat_origin_long = Some(0.0);
                     k.semi_major_axis = Some(6_371_007.181);
                     k.semi_minor_axis = Some(6_371_007.181);
+                }),
+            ),
+            (
+                "non-Greenwich prime meridian code (Rome)",
+                keys(|k| {
+                    k.model_type = Some(2);
+                    k.geographic_type = Some(4326);
+                    k.prime_meridian = Some(8906);
+                }),
+            ),
+            (
+                "non-Greenwich prime meridian longitude",
+                keys(|k| {
+                    k.model_type = Some(2);
+                    k.geographic_type = Some(4326);
+                    k.prime_meridian = Some(32767);
+                    k.prime_meridian_long = Some(12.452333);
+                }),
+            ),
+            (
+                "EPSG:32610 with conflicting foot linear unit override",
+                keys(|k| {
+                    k.projected_cs_type = Some(32610);
+                    k.proj_linear_units = Some(9002);
                 }),
             ),
             ("no CRS keys at all", GeoKeys::default()),
