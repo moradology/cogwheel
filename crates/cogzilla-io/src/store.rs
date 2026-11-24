@@ -658,12 +658,41 @@ impl CogStore {
         ifd_idx: usize,
         tile_indices: &[Option<u32>],
     ) -> Result<Vec<Option<Arc<DecodedTile>>>, IoError> {
+        // Bound per-request block fan-out and cumulative decoded bytes so a hostile overview-less
+        // TIFF cannot force tens of thousands of simultaneous block decodes into RAM.
+        const MAX_BLOCKS_PER_REQUEST: usize = 512;
+        const MAX_DECODED_BYTES_PER_REQUEST: usize = 256 * 1024 * 1024;
+        let ifd = &cog.index.ifds[ifd_idx];
+        let active_blocks = tile_indices.iter().filter(|o| o.is_some()).count();
+        if active_blocks > MAX_BLOCKS_PER_REQUEST {
+            return Err(IoError::Tiff(TiffError::Corrupt(
+                "request exceeds maximum 512 source blocks per operation",
+            )));
+        }
+        let bands_per_block = match ifd.planar_config {
+            cogzilla_tiff::PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
+            cogzilla_tiff::PlanarConfig::Planar => 1,
+        };
+        let bytes_per_sample = match ifd.sample_type {
+            cogzilla_tiff::SampleType::Uint8 => 1usize,
+            cogzilla_tiff::SampleType::Uint16 => 2usize,
+            _ => 4usize,
+        };
+        let per_block_bytes = (ifd.tile_width as usize)
+            .saturating_mul(ifd.tile_height as usize)
+            .saturating_mul(bands_per_block)
+            .saturating_mul(bytes_per_sample);
+        if active_blocks.saturating_mul(per_block_bytes) > MAX_DECODED_BYTES_PER_REQUEST {
+            return Err(IoError::Tiff(TiffError::Corrupt(
+                "request exceeds maximum 256 MiB decoded blocks per operation",
+            )));
+        }
+
         // Fast path: if local or already warm in cache, zero async overhead!
         if let Some(fast) = self.try_get_blocks_sync(cog, ifd_idx, tile_indices)? {
             return Ok(fast);
         }
 
-        let ifd = &cog.index.ifds[ifd_idx];
         let mut results: Vec<Option<Arc<DecodedTile>>> = vec![None; tile_indices.len()];
         // Each owned slot holds an Option<InFlightGuard> so cancellation/panic auto-aborts!
         let mut owned: Vec<(usize, Option<InFlightGuard>, u64, u32)> = Vec::new();
@@ -1551,10 +1580,15 @@ impl CogStore {
         byte_len: u32,
     ) -> Result<bytes::Bytes, IoError> {
         let is_local = matches!(cog.source, CogSource::LocalMmap { .. });
+        let want = byte_len as usize;
         if !is_local {
             if let Some(dc) = &self.disk_cache {
                 if let Some(cached) = dc.get(&cog.uri, ifd_idx as u16, tile_idx).await {
-                    return Ok(cached);
+                    if cached.len() == want {
+                        return Ok(cached);
+                    }
+                    let key = DiskBlockCache::key_bytes(&cog.uri, ifd_idx as u16, tile_idx);
+                    dc.invalidate(key);
                 }
             }
         }
@@ -1565,7 +1599,6 @@ impl CogStore {
             })
         })?;
         let raw = cog.source.fetch_range(offset, end).await?;
-        let want = byte_len as usize;
         if raw.len() < want {
             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
                 required: end,
@@ -1579,7 +1612,11 @@ impl CogStore {
         };
         if !is_local {
             if let Some(dc) = &self.disk_cache {
-                dc.put_async(&cog.uri, ifd_idx as u16, tile_idx, raw.clone());
+                let valid_passthrough_magic = (raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8)
+                    || (raw.len() >= 12 && &raw[0..4] == b"RIFF" && &raw[8..12] == b"WEBP");
+                if valid_passthrough_magic {
+                    dc.put_async(&cog.uri, ifd_idx as u16, tile_idx, raw.clone());
+                }
             }
         }
         Ok(raw)
@@ -1680,7 +1717,7 @@ impl CogStore {
                                 continue;
                             }
                         }
-                        return Err(IoError::Http(e));
+                        return Err(IoError::Http(e.without_url()));
                     }
                 };
                 let status = resp.status().as_u16();
@@ -1701,13 +1738,13 @@ impl CogStore {
                     }
                     return Err(IoError::HttpStatus {
                         status,
-                        url: uri.to_string(),
+                        url: crate::backend::redact_http_url(uri),
                     });
                 }
                 if !resp.status().is_success() {
                     return Err(IoError::HttpStatus {
                         status,
-                        url: uri.to_string(),
+                        url: crate::backend::redact_http_url(uri),
                     });
                 }
                 match crate::cloud::read_response_capped(resp, max_bytes).await {
@@ -1726,14 +1763,14 @@ impl CogStore {
                                 continue;
                             }
                         }
-                        return Err(IoError::Http(e));
+                        return Err(IoError::Http(e.without_url()));
                     }
                     Err(e) => return Err(e),
                 }
             }
             return Err(IoError::HttpStatus {
                 status: 503,
-                url: uri.to_string(),
+                url: crate::backend::redact_http_url(uri),
             });
         }
 

@@ -358,7 +358,7 @@ pub async fn read_response_capped(
         .map(|n| (n as usize).min(max_bytes).min(1024 * 1024))
         .unwrap_or(0);
     let mut out = bytes::BytesMut::with_capacity(init);
-    while let Some(chunk) = resp.chunk().await.map_err(IoError::Http)? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| IoError::Http(e.without_url()))? {
         if out.len().saturating_add(chunk.len()) > max_bytes {
             return Err(IoError::Fs(std::io::Error::other(format!(
                 "remote response exceeded limit of {max_bytes} bytes"

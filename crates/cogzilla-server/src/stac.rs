@@ -119,9 +119,13 @@ pub async fn load_stac_item(
                 EngineError::NotFound(format!("STAC item HTTP 404: {url}"))
             }
             cogzilla_io::IoError::Fs(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => {
-                EngineError::NotFound(format!("cannot read STAC item '{uri}': {ioe}"))
+                let safe_uri = cogzilla_io::redact_http_url(uri);
+                EngineError::NotFound(format!("cannot read STAC item '{safe_uri}': {ioe}"))
             }
-            other => EngineError::BadRequest(format!("failed to fetch STAC item '{uri}': {other}")),
+            other => {
+                let safe_uri = cogzilla_io::redact_http_url(uri);
+                EngineError::BadRequest(format!("failed to fetch STAC item '{safe_uri}': {other}"))
+            }
         })?;
 
     let val: serde_json::Value = serde_json::from_slice(&raw_bytes)

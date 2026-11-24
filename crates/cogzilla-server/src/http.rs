@@ -1184,7 +1184,10 @@ where
                     .send()
                     .await
                     .map_err(|e| {
-                        EngineError::BadRequest(format!("STAC API search failed: {e}"))
+                        EngineError::BadRequest(format!(
+                            "STAC API search failed: {}",
+                            e.without_url()
+                        ))
                     })?;
                 if !resp.status().is_success() {
                     return Err(EngineError::BadRequest(format!(
