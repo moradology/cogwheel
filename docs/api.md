@@ -26,7 +26,7 @@
 
 ## pgSTAC
 
-With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 271 requests to both servers on one database and compares status codes, JSON bodies, item lists, WMTS documents, statistics and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 264 agreed and 7 were known differences, listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; the 29 agreeing pairs had a median of 37.5 dB (25.8 to 52.1).
+With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 275 requests to both servers on one database and compares status codes, JSON bodies, item lists, WMTS documents, statistics and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 268 agreed and 7 were known differences, listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; the 29 agreeing pairs had a median of 37.5 dB (25.8 to 52.1).
 
 - `POST /searches/register` with a STAC search body (`collections`, `ids`, `bbox`, `intersects`, `datetime`, `query`, `filter`, `sortby`) and optional `metadata`. The returned `id` is pgSTAC's hash, the same one titiler-pgstac returns for the same body.
 - `GET /searches/` and `/searches/list` (with `limit`, `offset`, and `sortby` on `lastused` or `usecount`), `GET /searches/{id}/info`.
@@ -44,6 +44,8 @@ With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla
 - Tile parameters: `assets` (required, one to three per item), `expression`, `rescale`, `colormap_name`, `resampling`, `reproject`, `color_formula`, `return_mask`, `unscale` (single asset), `tilesize` (256 or 512), and the search limits `scan_limit`, `items_limit`, `time_limit`, `exitwhenfull` and `skipcovered`.
 
 Responses follow titiler-pgstac: errors are JSON `{"detail": ...}`, a missing `assets` is a `422`, a tile no item covers is a `204`, and a tile with no extension is a JPEG when every pixel is valid and a PNG otherwise. Resampling follows TiTiler on these routes: nearest neighbour by default, with `resampling` applied to sources already in Web Mercator and `reproject` to sources that have to be reprojected.
+
+`/openapi.json` lists all 63 operations titiler-pgstac 3.2 has under `/searches` and `/collections`. Of the routes titiler-pgstac serves outside those two prefixes, `/algorithms`, `/algorithms/{algorithmId}` and `/conformance` are not on this branch.
 
 ### Item routes
 

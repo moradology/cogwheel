@@ -546,7 +546,23 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 }
 
 /// The pgSTAC routes: path, method and summary.
-const OPENAPI_ROUTES: [(&str, &str, &str); 47] = [
+const OPENAPI_ROUTES: [(&str, &str, &str); 63] = [
+    ("/searches/list", "get", "List registered pgSTAC searches"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get", "Render pgSTAC search mosaic tile, format from the pixels"),
+    ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get", "Image of a pgSTAC search mosaic over a bounding box, at a size"),
+    ("/searches/{search_id}/feature", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature, format from the pixels"),
+    ("/searches/{search_id}/feature/{width}x{height}.{format}", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature, at a size"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get", "Render pgSTAC collection mosaic tile, format from the pixels"),
+    ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get", "Image of a pgSTAC collection mosaic over a bounding box, at a size"),
+    ("/collections/{collection_id}/feature", "post", "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature, format from the pixels"),
+    ("/collections/{collection_id}/feature/{width}x{height}.{format}", "post", "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature, at a size"),
+    ("/collections/{collection_id}/items/{item_id}/statistics", "post", "pgSTAC item statistics under GeoJSON features"),
+    ("/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get", "Render pgSTAC item tile, format from the pixels"),
+    ("/collections/{collection_id}/items/{item_id}/preview", "get", "pgSTAC item preview, format from the pixels"),
+    ("/collections/{collection_id}/items/{item_id}/preview/{width}x{height}.{format}", "get", "pgSTAC item preview, at a size"),
+    ("/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get", "pgSTAC item image for a bounding box, at a size"),
+    ("/collections/{collection_id}/items/{item_id}/feature", "post", "pgSTAC item image for a GeoJSON feature, format from the pixels"),
+    ("/collections/{collection_id}/items/{item_id}/feature/{width}x{height}.{format}", "post", "pgSTAC item image for a GeoJSON feature, at a size"),
     ("/searches/{search_id}/statistics", "post", "Statistics of a pgSTAC search mosaic under GeoJSON features"),
     ("/collections/{collection_id}/statistics", "post", "Statistics of a pgSTAC collection mosaic under GeoJSON features"),
     ("/collections/{collection_id}/items/{item_id}/renders/{render_id}", "get", "One of a pgSTAC item's renders"),
@@ -600,7 +616,9 @@ const OPENAPI_ROUTES: [(&str, &str, &str); 47] = [
 pub(super) fn openapi_paths() -> Value {
     let mut paths = serde_json::Map::new();
     for (path, method, summary) in OPENAPI_ROUTES {
-        paths.insert(path.to_string(), json!({ method: { "summary": summary } }));
+        // A path may take more than one method.
+        let entry = paths.entry(path.to_string()).or_insert_with(|| json!({}));
+        entry[method] = json!({ "summary": summary });
     }
     Value::Object(paths)
 }
@@ -1777,9 +1795,14 @@ async fn feature_image(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let not_a_feature = || invalid_param("body", "body", "Input should be a valid GeoJSON Feature");
     let Some(geojson) = body.and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
-        return invalid_param("body", "body", "Input should be a valid GeoJSON Feature");
+        return not_a_feature();
     };
+    // As in TiTiler the body is a Feature; a bare geometry is not taken.
+    if geojson.get("type").and_then(Value::as_str) != Some("Feature") || !geojson["geometry"].is_object() {
+        return not_a_feature();
+    }
     let (mask, bbox) = match PolygonMask::from_geojson(&geojson) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
