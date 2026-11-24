@@ -976,7 +976,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
         let mut out_r = [0u32; 4];
         let mut out_g = [0u32; 4];
         let max_x = (stride as i32 - 2).max(0);
-        let max_y = ((r_slice.len() / stride) as i32 - 2).max(0);
+        let max_y = ((r_slice.len().min(g_slice.len()).min(b_slice.len()) / stride) as i32 - 2).max(0);
         let v_zero_i = vdupq_n_s32(0);
         let v_max_x = vdupq_n_s32(max_x);
         let v_max_y = vdupq_n_s32(max_y);
@@ -1058,9 +1058,12 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            let max_y =
+                ((r_slice.len().min(g_slice.len()).min(b_slice.len()) / stride) as i32 - 2).max(0);
             unsafe {
                 bilinear_rgb_single_block_row_avx2::<N, T, F>(
-                    u_row, v_row, r_ptr, g_ptr, b_ptr, bc, br, stride, inv, mins, row_rgb, &to_f32,
+                    u_row, v_row, r_ptr, g_ptr, b_ptr, bc, br, stride, max_y, inv, mins, row_rgb,
+                    &to_f32,
                 );
             }
             return;
@@ -1070,7 +1073,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     #[allow(unreachable_code)]
     {
         let max_x = (stride as i32 - 2).max(0);
-        let max_y = ((r_slice.len() / stride) as i32 - 2).max(0);
+        let max_y = ((r_slice.len().min(g_slice.len()).min(b_slice.len()) / stride) as i32 - 2).max(0);
         for px in 0..N {
         let (x0_raw, fx) = fast_floor_i32(u_row[px] - bc);
         let (y0_raw, fy) = fast_floor_i32(v_row[px] - br);
@@ -1123,6 +1126,7 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
     bc: f32,
     br: f32,
     stride: usize,
+    max_y: i32,
     inv: [f32; 3],
     mins: [f32; 3],
     row_rgb: &mut [u8],
@@ -1146,7 +1150,6 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
     let mut out_r = [0i32; 8];
     let mut out_g = [0i32; 8];
     let max_x = (stride as i32 - 2).max(0);
-    let max_y = ((r_slice.len() / stride) as i32 - 2).max(0);
     let v_zero_i = _mm256_setzero_si256();
     let v_max_x = _mm256_set1_epi32(max_x);
     let v_max_y = _mm256_set1_epi32(max_y);
