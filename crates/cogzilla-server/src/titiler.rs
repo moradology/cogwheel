@@ -532,6 +532,61 @@ impl BandStatsAcc {
         }
     }
 
+    /// Accumulate strided pixels (`lx0, lx0+step, ...` × `ly0, ly0+step, ...`) when an overview-less
+    /// IFD exceeds `max_size`. `mask_bits`, when present, is compact (`nx * ny` bytes matching the
+    /// strided grid).
+    #[allow(clippy::too_many_arguments)]
+    fn push_tile_strided(
+        &mut self,
+        data: &cogzilla_codec::BandData,
+        tw: usize,
+        x_max: usize,
+        y_max: usize,
+        lx0: usize,
+        ly0: usize,
+        step: usize,
+        mask_bits: Option<&[u8]>,
+        unscale: bool,
+        scale: f32,
+        offset: f32,
+        nodata_override: Option<f32>,
+    ) {
+        let nd_ov = nodata_override.filter(|v| !v.is_nan());
+        let mut mi = 0usize;
+        let mut ly = ly0;
+        while ly < y_max {
+            let base = ly * tw;
+            let mut lx = lx0;
+            while lx < x_max {
+                let keep = match mask_bits {
+                    Some(bits) => {
+                        let k = bits.get(mi).copied().unwrap_or(0) != 0;
+                        mi += 1;
+                        k
+                    }
+                    None => true,
+                };
+                if keep {
+                    let mut v = data.get_f32(base + lx);
+                    if v.is_finite() && nd_ov != Some(v) {
+                        match self {
+                            Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
+                            Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
+                            Self::Floats(vals) => {
+                                if unscale {
+                                    v = v * scale + offset;
+                                }
+                                vals.push(v);
+                            }
+                        }
+                    }
+                }
+                lx += step;
+            }
+            ly += step;
+        }
+    }
+
     fn finalize_hist(
         hist: &[u64],
         denom_pixels: usize,
@@ -894,6 +949,52 @@ fn build_tile_polygon_mask(
     }
 }
 
+/// Build a compact polygon mask on the strided sample grid `(lx0..x_max).step_by(step)` ×
+/// `(ly0..y_max).step_by(step)` for overview-less IFDs exceeding `max_size`.
+#[allow(clippy::too_many_arguments)]
+fn build_tile_polygon_mask_strided(
+    ifd: &cogzilla_tiff::IfdMeta,
+    crs: &cogzilla_proj::CrsModel,
+    pm: &PolygonMask,
+    tx: u32,
+    ty: u32,
+    x_max: usize,
+    y_max: usize,
+    lx0: usize,
+    ly0: usize,
+    step: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let nx = (x_max - lx0).div_ceil(step);
+    let ny = (y_max - ly0).div_ceil(step);
+    let base_x = (tx * ifd.tile_width) as f64;
+    let base_y = (ty * ifd.tile_height) as f64;
+    let mut bits = vec![0u8; nx * ny];
+    let mut inside_count = 0usize;
+    let mut idx = 0usize;
+    let mut ly = ly0;
+    while ly < y_max {
+        let py = base_y + ly as f64 + 0.5;
+        let mut lx = lx0;
+        while lx < x_max {
+            let px = base_x + lx as f64 + 0.5;
+            let (sx, sy) = ifd.pixel_to_crs.forward(px, py);
+            let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+            if lon.is_finite() && lat.is_finite() && pm.contains(lon, lat) {
+                bits[idx] = 1;
+                inside_count += 1;
+            }
+            idx += 1;
+            lx += step;
+        }
+        ly += step;
+    }
+    if inside_count == 0 {
+        None
+    } else {
+        Some((bits, inside_count))
+    }
+}
+
 enum StatsTiles {
     Chunky {
         tiles: Vec<Option<Arc<cogzilla_codec::DecodedTile>>>,
@@ -915,11 +1016,16 @@ fn compute_statistics_cpu(
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
     nodata_override: Option<f32>,
+    step: usize,
     fetched: StatsTiles,
 ) -> serde_json::Value {
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
-    let total_pixels = (ifd.width as usize) * (ifd.height as usize);
+    let total_pixels = if step > 1 {
+        (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
+    } else {
+        (ifd.width as usize) * (ifd.height as usize)
+    };
     let mask_total_pixels = match &fetched {
         StatsTiles::Chunky {
             mask_total_pixels, ..
@@ -950,14 +1056,52 @@ fn compute_statistics_cpu(
                 let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                 let tw = ifd.tile_width as usize;
 
-                if let Some(ref masks) = tile_masks {
-                    let Some(ref mask_bits) = masks[ti] else {
+                if step > 1 {
+                    let x0_tile = (tx * ifd.tile_width) as usize;
+                    let y0_tile = (ty * ifd.tile_height) as usize;
+                    let lx0 = (step - (x0_tile % step)) % step;
+                    let ly0 = (step - (y0_tile % step)) % step;
+                    if lx0 >= x_max || ly0 >= y_max {
                         continue;
+                    }
+                    let mask_bits = match tile_masks {
+                        Some(ref masks) => match masks[ti] {
+                            Some(ref bits) => Some(bits.as_slice()),
+                            None => continue,
+                        },
+                        None => None,
                     };
-                    for b in 0..count {
+                    for b in 0..count.min(tile.bands.len()) {
                         if tile.bands[b].stats.all_nodata {
                             continue;
                         }
+                        let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
+                        let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
+                        per_band[b].push_tile_strided(
+                            &tile.bands[b].data,
+                            tw,
+                            x_max,
+                            y_max,
+                            lx0,
+                            ly0,
+                            step,
+                            mask_bits,
+                            unscale,
+                            scale,
+                            offset,
+                            nodata_override,
+                        );
+                    }
+                } else if let Some(ref masks) = tile_masks {
+                    let Some(ref mask_bits) = masks[ti] else {
+                        continue;
+                    };
+                    for b in 0..count.min(tile.bands.len()) {
+                        if tile.bands[b].stats.all_nodata {
+                            continue;
+                        }
+                        let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
+                        let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
                         per_band[b].push_tile_masked(
                             &tile.bands[b].data,
                             tw,
@@ -965,24 +1109,26 @@ fn compute_statistics_cpu(
                             y_max,
                             mask_bits,
                             unscale,
-                            cog.index.scales[b],
-                            cog.index.offsets[b],
+                            scale,
+                            offset,
                             nodata_override,
                         );
                     }
                 } else {
-                    for b in 0..count {
+                    for b in 0..count.min(tile.bands.len()) {
                         if tile.bands[b].stats.all_nodata {
                             continue;
                         }
+                        let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
+                        let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
                         per_band[b].push_tile_unmasked(
                             &tile.bands[b].data,
                             tw,
                             x_max,
                             y_max,
                             unscale,
-                            cog.index.scales[b],
-                            cog.index.offsets[b],
+                            scale,
+                            offset,
                             nodata_override,
                         );
                     }
@@ -995,6 +1141,8 @@ fn compute_statistics_cpu(
             ..
         } => {
             for (b, tiles) in band_tiles.iter().enumerate() {
+                let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
+                let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
                 for (ti, tile_opt) in tiles.iter().enumerate() {
                     let Some(tile) = tile_opt else { continue };
                     let band = &tile.bands[0];
@@ -1006,7 +1154,36 @@ fn compute_statistics_cpu(
                     let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
                     let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                     let tw = ifd.tile_width as usize;
-                    if let Some(ref masks) = tile_masks {
+                    if step > 1 {
+                        let x0_tile = (tx * ifd.tile_width) as usize;
+                        let y0_tile = (ty * ifd.tile_height) as usize;
+                        let lx0 = (step - (x0_tile % step)) % step;
+                        let ly0 = (step - (y0_tile % step)) % step;
+                        if lx0 >= x_max || ly0 >= y_max {
+                            continue;
+                        }
+                        let mask_bits = match tile_masks {
+                            Some(ref masks) => match masks[ti] {
+                                Some(ref bits) => Some(bits.as_slice()),
+                                None => continue,
+                            },
+                            None => None,
+                        };
+                        per_band[b].push_tile_strided(
+                            &band.data,
+                            tw,
+                            x_max,
+                            y_max,
+                            lx0,
+                            ly0,
+                            step,
+                            mask_bits,
+                            unscale,
+                            scale,
+                            offset,
+                            nodata_override,
+                        );
+                    } else if let Some(ref masks) = tile_masks {
                         if let Some(ref mask_bits) = masks[ti] {
                             per_band[b].push_tile_masked(
                                 &band.data,
@@ -1015,8 +1192,8 @@ fn compute_statistics_cpu(
                                 y_max,
                                 mask_bits,
                                 unscale,
-                                cog.index.scales[b],
-                                cog.index.offsets[b],
+                                scale,
+                                offset,
                                 nodata_override,
                             );
                         }
@@ -1027,8 +1204,8 @@ fn compute_statistics_cpu(
                             x_max,
                             y_max,
                             unscale,
-                            cog.index.scales[b],
-                            cog.index.offsets[b],
+                            scale,
+                            offset,
                             nodata_override,
                         );
                     }
@@ -1045,15 +1222,11 @@ fn compute_statistics_cpu(
 
     let mut out = serde_json::Map::new();
     for (b, acc) in per_band.into_iter().enumerate() {
+        let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
+        let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
         out.insert(
             format!("b{}", b + 1),
-            acc.finalize(
-                denom_pixels,
-                unscale,
-                cog.index.scales[b],
-                cog.index.offsets[b],
-                nodata_override,
-            ),
+            acc.finalize(denom_pixels, unscale, scale, offset, nodata_override),
         );
     }
 
@@ -1061,6 +1234,8 @@ fn compute_statistics_cpu(
 }
 
 /// TiTiler-compatible `/cog/statistics` computed from the coarsest overview <= `max_size`.
+/// When the coarsest IFD still exceeds `max_size` (e.g. an overview-less GeoTIFF), stride-decimates
+/// by `step = ceil(max_dim / max_size)` so memory and I/O stay bounded to `<= max_size^2` samples.
 /// When `poly_mask` is `Some`, clips statistics strictly to pixels inside the posted GeoJSON polygon.
 pub async fn compute_statistics(
     engine: &TileEngine,
@@ -1071,6 +1246,7 @@ pub async fn compute_statistics(
     nodata_override: Option<f32>,
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
+    let max_size = max_size.max(1);
     let mut ifd_idx = cog.index.ifds.len() - 1;
     for (i, ifd) in cog.index.ifds.iter().enumerate() {
         if ifd.width.max(ifd.height) <= max_size {
@@ -1080,9 +1256,25 @@ pub async fn compute_statistics(
     }
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
-    let total_pixels = (ifd.width as usize) * (ifd.height as usize);
+    let step = ifd.width.max(ifd.height).div_ceil(max_size).max(1) as usize;
+    let total_pixels = if step > 1 {
+        (ifd.width as usize).div_ceil(step) * (ifd.height as usize).div_ceil(step)
+    } else {
+        (ifd.width as usize) * (ifd.height as usize)
+    };
 
     let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+    let tile_has_strided_sample = |tx: u32, ty: u32, x_max: usize, y_max: usize| -> bool {
+        if step == 1 {
+            return true;
+        }
+        let x0_tile = (tx * ifd.tile_width) as usize;
+        let y0_tile = (ty * ifd.tile_height) as usize;
+        let lx0 = (step - (x0_tile % step)) % step;
+        let ly0 = (step - (y0_tile % step)) % step;
+        lx0 < x_max && ly0 < y_max
+    };
+
     let mut mask_total_pixels = 0usize;
     let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
         let mut masks = Vec::with_capacity(n_tiles);
@@ -1090,9 +1282,22 @@ pub async fn compute_statistics(
             for tx in 0..ifd.tiles_across {
                 let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
                 let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
-                if let Some((bits, inside)) =
+                if !tile_has_strided_sample(tx, ty, x_max, y_max) {
+                    masks.push(None);
+                    continue;
+                }
+                let built = if step > 1 {
+                    let x0_tile = (tx * ifd.tile_width) as usize;
+                    let y0_tile = (ty * ifd.tile_height) as usize;
+                    let lx0 = (step - (x0_tile % step)) % step;
+                    let ly0 = (step - (y0_tile % step)) % step;
+                    build_tile_polygon_mask_strided(
+                        ifd, &crs, pm, tx, ty, x_max, y_max, lx0, ly0, step,
+                    )
+                } else {
                     build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
-                {
+                };
+                if let Some((bits, inside)) = built {
                     mask_total_pixels += inside;
                     masks.push(Some(bits));
                 } else {
@@ -1109,6 +1314,12 @@ pub async fn compute_statistics(
             for ty in 0..ifd.tiles_down {
                 for tx in 0..ifd.tiles_across {
                     let ti = (ty * ifd.tiles_across + tx) as usize;
+                    let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+                    let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+                    if !tile_has_strided_sample(tx, ty, x_max, y_max) {
+                        indices.push(None);
+                        continue;
+                    }
                     if let Some(ref masks) = tile_masks {
                         if masks[ti].is_none() {
                             indices.push(None);
@@ -1126,22 +1337,36 @@ pub async fn compute_statistics(
             }
         }
         PlanarConfig::Planar => {
-            let mut band_tiles = Vec::with_capacity(count);
+            // Coalesce all `count * n_tiles` band-plane block indices into one concurrent
+            // `get_blocks` batch instead of `count` sequential remote round trips.
+            let mut all_indices = Vec::with_capacity(count * n_tiles);
             for b in 0..count {
-                let mut indices = Vec::with_capacity(n_tiles);
                 for ty in 0..ifd.tiles_down {
                     for tx in 0..ifd.tiles_across {
                         let ti = (ty * ifd.tiles_across + tx) as usize;
+                        let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+                        let y_max =
+                            (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+                        if !tile_has_strided_sample(tx, ty, x_max, y_max) {
+                            all_indices.push(None);
+                            continue;
+                        }
                         if let Some(ref masks) = tile_masks {
                             if masks[ti].is_none() {
-                                indices.push(None);
+                                all_indices.push(None);
                                 continue;
                             }
                         }
-                        indices.push(Some(ifd.tile_index(tx, ty, b as u16) as u32));
+                        all_indices.push(Some(ifd.tile_index(tx, ty, b as u16) as u32));
                     }
                 }
-                band_tiles.push(engine.store.get_blocks(cog, ifd_idx, &indices).await?);
+            }
+            let mut flat = engine.store.get_blocks(cog, ifd_idx, &all_indices).await?;
+            let mut band_tiles = Vec::with_capacity(count);
+            for _ in 0..count {
+                let tail = flat.split_off(n_tiles);
+                band_tiles.push(flat);
+                flat = tail;
             }
             StatsTiles::Planar {
                 band_tiles,
@@ -1166,6 +1391,7 @@ pub async fn compute_statistics(
                     pm_owned.as_ref(),
                     unscale,
                     nodata_override,
+                    step,
                     fetched,
                 )
             })
@@ -1179,6 +1405,7 @@ pub async fn compute_statistics(
             poly_mask,
             unscale,
             nodata_override,
+            step,
             fetched,
         ))
     }

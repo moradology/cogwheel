@@ -458,14 +458,21 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         let mut raw_geo_keys: Option<Vec<u16>> = None;
         let mut double_params: Vec<f64> = Vec::new();
 
+        let to_u32 = |v: u64| -> Result<u32, TiffError> {
+            u32::try_from(v).map_err(|_| TiffError::Corrupt("IFD integer tag exceeds u32::MAX"))
+        };
+        let to_u16 = |v: u64| -> Result<u16, TiffError> {
+            u16::try_from(v).map_err(|_| TiffError::Corrupt("IFD integer tag exceeds u16::MAX"))
+        };
+
         for entry in &entries {
             match entry.tag {
-                TAG_NEW_SUBFILE_TYPE => subfile_type = entry.read_u64_scalar(&r)? as u32,
-                TAG_IMAGE_WIDTH => width = entry.read_u64_scalar(&r)? as u32,
-                TAG_IMAGE_LENGTH => height = entry.read_u64_scalar(&r)? as u32,
+                TAG_NEW_SUBFILE_TYPE => subfile_type = to_u32(entry.read_u64_scalar(&r)?)?,
+                TAG_IMAGE_WIDTH => width = to_u32(entry.read_u64_scalar(&r)?)?,
+                TAG_IMAGE_LENGTH => height = to_u32(entry.read_u64_scalar(&r)?)?,
                 TAG_BITS_PER_SAMPLE => bits_per_sample = Some(entry.read_u16_vec(&r)?),
                 TAG_COMPRESSION => {
-                    let code = entry.read_u64_scalar(&r)? as u16;
+                    let code = to_u16(entry.read_u64_scalar(&r)?)?;
                     compression = match code {
                         1 => Compression::None,
                         5 => Compression::Lzw,
@@ -476,10 +483,10 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                         other => return Err(TiffError::UnsupportedCompression(other)),
                     };
                 }
-                TAG_PHOTOMETRIC => photometric = entry.read_u64_scalar(&r)? as u16,
+                TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
                 TAG_STRIP_OFFSETS => strip_offsets = Some(entry.read_u64_vec(&r)?),
-                TAG_SAMPLES_PER_PIXEL => samples_per_pixel = entry.read_u64_scalar(&r)? as u16,
-                TAG_ROWS_PER_STRIP => rows_per_strip = entry.read_u64_scalar(&r)? as u32,
+                TAG_SAMPLES_PER_PIXEL => samples_per_pixel = to_u16(entry.read_u64_scalar(&r)?)?,
+                TAG_ROWS_PER_STRIP => rows_per_strip = to_u32(entry.read_u64_scalar(&r)?)?,
                 TAG_STRIP_BYTE_COUNTS => strip_byte_counts = Some(entry.read_u32_vec(&r)?),
                 TAG_PLANAR_CONFIG => {
                     planar_config = match entry.read_u64_scalar(&r)? {
@@ -489,7 +496,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     };
                 }
                 TAG_PREDICTOR => {
-                    let code = entry.read_u64_scalar(&r)? as u16;
+                    let code = to_u16(entry.read_u64_scalar(&r)?)?;
                     predictor = match code {
                         1 => Predictor::None,
                         2 => Predictor::HorizontalInt,
@@ -497,8 +504,8 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                         other => return Err(TiffError::UnsupportedPredictor(other)),
                     };
                 }
-                TAG_TILE_WIDTH => tile_width = entry.read_u64_scalar(&r)? as u32,
-                TAG_TILE_LENGTH => tile_height = entry.read_u64_scalar(&r)? as u32,
+                TAG_TILE_WIDTH => tile_width = to_u32(entry.read_u64_scalar(&r)?)?,
+                TAG_TILE_LENGTH => tile_height = to_u32(entry.read_u64_scalar(&r)?)?,
                 TAG_TILE_OFFSETS => tile_offsets = Some(entry.read_u64_vec(&r)?),
                 TAG_TILE_BYTE_COUNTS => tile_byte_counts = Some(entry.read_u32_vec(&r)?),
                 TAG_EXTRA_SAMPLES => extra_samples = entry.read_u16_vec(&r)?,
@@ -613,8 +620,15 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             }
         };
 
-        if width == 0 || height == 0 || samples_per_pixel == 0 {
-            return Err(TiffError::Corrupt("IFD has zero width, height, or samples_per_pixel"));
+        if width == 0
+            || height == 0
+            || samples_per_pixel == 0
+            || width > i32::MAX as u32
+            || height > i32::MAX as u32
+        {
+            return Err(TiffError::Corrupt(
+                "IFD has invalid width, height, or samples_per_pixel",
+            ));
         }
 
         let (tile_width, tile_height, tile_offsets, tile_byte_counts, is_stripped) =

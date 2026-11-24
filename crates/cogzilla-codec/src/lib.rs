@@ -310,25 +310,57 @@ pub fn decode_tile_rows(
                         )));
                     }
                 };
+                if out_cs.num_components() != bands_in_tile {
+                    return Err(CodecError::Jpeg(format!(
+                        "JPEG colorspace {out_cs:?} has {} components, expected {bands_in_tile}",
+                        out_cs.num_components()
+                    )));
+                }
+                let (jw, jh) = dec.dimensions().ok_or_else(|| {
+                    CodecError::Jpeg("JPEG header missing dimensions".into())
+                })?;
                 dec.set_options(opts.jpeg_set_out_colorspace(out_cs));
-                let out_len = dec.output_buffer_size().unwrap_or(expected_bytes);
-                if out_len <= expected_bytes {
-                    dec.decode_into(&mut raw_slice[..out_len])
-                        .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
-                    if out_len < expected_bytes {
-                        raw_slice[out_len..expected_bytes].fill(0);
+                let tile_w = ifd.tile_width as usize;
+                let tile_h = actual_rows as usize;
+                if jw == tile_w {
+                    let out_len = dec.output_buffer_size().unwrap_or(expected_bytes);
+                    if out_len <= expected_bytes {
+                        dec.decode_into(&mut raw_slice[..out_len])
+                            .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
+                        if out_len < expected_bytes {
+                            raw_slice[out_len..expected_bytes].fill(0);
+                        }
+                    } else {
+                        let pixels = dec
+                            .decode()
+                            .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
+                        if pixels.len() < expected_bytes {
+                            return Err(CodecError::Jpeg(format!(
+                                "decoded JPEG buffer too small: {} < {expected_bytes}",
+                                pixels.len()
+                            )));
+                        }
+                        raw_slice[..expected_bytes].copy_from_slice(&pixels[..expected_bytes]);
                     }
                 } else {
+                    // MCU-padded or narrower JPEG stream: copy row-by-row so rows don't shear.
                     let pixels = dec
                         .decode()
                         .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
-                    if pixels.len() < expected_bytes {
-                        return Err(CodecError::Jpeg(format!(
-                            "decoded JPEG buffer too small: {} < {expected_bytes}",
-                            pixels.len()
-                        )));
+                    let src_stride = jw * bands_in_tile;
+                    let dst_stride = tile_w * bands_in_tile;
+                    let copy_bytes = jw.min(tile_w) * bands_in_tile;
+                    let copy_rows = jh.min(tile_h);
+                    raw_slice[..expected_bytes].fill(0);
+                    for y in 0..copy_rows {
+                        let src_off = y * src_stride;
+                        if src_off + copy_bytes > pixels.len() {
+                            break;
+                        }
+                        let dst_off = y * dst_stride;
+                        raw_slice[dst_off..dst_off + copy_bytes]
+                            .copy_from_slice(&pixels[src_off..src_off + copy_bytes]);
                     }
-                    raw_slice[..expected_bytes].copy_from_slice(&pixels[..expected_bytes]);
                 }
             }
             Compression::Webp => {
@@ -526,14 +558,13 @@ fn apply_rgba_alpha_if_present(bands: &mut [DecodedBand], ifd: &IfdMeta) {
         return;
     }
     let n = bands[alpha_idx].data.len();
-    let alpha: Vec<f32> = (0..n).map(|i| bands[alpha_idx].data.get_f32(i)).collect();
-    if alpha.iter().all(|&a| a > 0.0) {
+    if (0..n).all(|i| bands[alpha_idx].data.get_f32(i) > 0.0) {
         return;
     }
-    for (idx, b) in bands.iter_mut().enumerate() {
-        if idx != alpha_idx {
-            apply_alpha_slice_to_band(b, &alpha);
-        }
+    let (before, rest) = bands.split_at_mut(alpha_idx);
+    let (alpha_band, after) = rest.split_first_mut().unwrap();
+    for b in before.iter_mut().chain(after.iter_mut()) {
+        apply_alpha_data_to_band(b, &alpha_band.data);
     }
 }
 
@@ -544,32 +575,50 @@ pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
         return;
     }
     let n = alpha.data.len();
-    let alpha_vals: Vec<f32> = (0..n).map(|i| alpha.data.get_f32(i)).collect();
-    if alpha_vals.iter().all(|&a| a > 0.0) {
+    if (0..n).all(|i| alpha.data.get_f32(i) > 0.0) {
         return;
     }
     for b in &mut tile.bands {
-        apply_alpha_slice_to_band(b, &alpha_vals);
+        apply_alpha_data_to_band(b, &alpha.data);
     }
 }
 
-fn apply_alpha_slice_to_band(b: &mut DecodedBand, alpha: &[f32]) {
+fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
     let n = alpha.len();
     let slice = b.data.make_f32_mut();
     let mut all_nd = true;
     let mut no_nd = true;
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
     for i in 0..n.min(slice.len()) {
-        if alpha[i] == 0.0 || alpha[i].is_nan() {
+        let a = alpha.get_f32(i);
+        if a == 0.0 || a.is_nan() {
             slice[i] = f32::NAN;
             no_nd = false;
-        } else if slice[i].is_nan() {
-            no_nd = false;
         } else {
-            all_nd = false;
+            let v = slice[i];
+            if v.is_nan() {
+                no_nd = false;
+            } else {
+                all_nd = false;
+                if v < mn {
+                    mn = v;
+                }
+                if v > mx {
+                    mx = v;
+                }
+            }
         }
     }
     b.stats.all_nodata = all_nd;
     b.stats.no_nodata = no_nd;
+    if all_nd {
+        b.stats.min = f32::NAN;
+        b.stats.max = f32::NAN;
+    } else {
+        b.stats.min = mn;
+        b.stats.max = mx;
+    }
 }
 
 /// Decompress a 1-bit (packed MSB-first per row) or 8-bit internal transparency mask tile
@@ -587,6 +636,15 @@ pub fn decode_mask_tile_rows(
 ) -> Result<Vec<u8>, CodecError> {
     let w = mask.tile_width as usize;
     let h = actual_rows.min(mask.tile_height).max(1) as usize;
+    // Enforce MAX_DECODED_TILE_BYTES on the unpacked output pixel count (1 byte/px),
+    // not just packed 1-bit row_bytes (which would allow 8x larger 1 GiB allocations).
+    let unpacked_bytes = w
+        .checked_mul(h)
+        .filter(|&px| px > 0 && px <= MAX_DECODED_TILE_BYTES)
+        .ok_or(CodecError::SizeMismatch {
+            expected: MAX_DECODED_TILE_BYTES,
+            got: compressed.len(),
+        })?;
     let row_bytes = if mask.bits_per_sample == 1 {
         w.div_ceil(8)
     } else {
@@ -594,7 +652,7 @@ pub fn decode_mask_tile_rows(
     };
     let expected = row_bytes
         .checked_mul(h)
-        .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+        .filter(|&b| b > 0 && b <= unpacked_bytes)
         .ok_or(CodecError::SizeMismatch {
             expected: MAX_DECODED_TILE_BYTES,
             got: compressed.len(),
@@ -683,18 +741,36 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
         let n = slice.len().min(mask.len());
         let mut all_nd = true;
         let mut no_nd = true;
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
         for i in 0..n {
             if mask[i] == 0 {
                 slice[i] = f32::NAN;
                 no_nd = false;
-            } else if slice[i].is_nan() {
-                no_nd = false;
             } else {
-                all_nd = false;
+                let v = slice[i];
+                if v.is_nan() {
+                    no_nd = false;
+                } else {
+                    all_nd = false;
+                    if v < mn {
+                        mn = v;
+                    }
+                    if v > mx {
+                        mx = v;
+                    }
+                }
             }
         }
         b.stats.all_nodata = all_nd;
         b.stats.no_nodata = no_nd;
+        if all_nd {
+            b.stats.min = f32::NAN;
+            b.stats.max = f32::NAN;
+        } else {
+            b.stats.min = mn;
+            b.stats.max = mx;
+        }
     }
 }
 
@@ -870,5 +946,53 @@ mod tests {
         assert_eq!(tile.bands[0].stats.min, 100.0);
         assert_eq!(tile.bands[0].stats.max, 200.0);
         assert_eq!(tile.bands[3].stats.min, 255.0);
+    }
+
+    #[test]
+    fn one_bit_mask_enforces_unpacked_byte_limit_and_recomputes_stats() {
+        let huge_mask = MaskIfdMeta {
+            width: 32768,
+            height: 32768,
+            tile_width: 32768,
+            tile_height: 32768,
+            tiles_across: 1,
+            tiles_down: 1,
+            bits_per_sample: 1,
+            compression: Compression::None,
+            predictor: Predictor::None,
+            is_stripped: false,
+            tile_offsets: Box::new([0]),
+            tile_byte_counts: Box::new([1]),
+        };
+        assert!(
+            matches!(decode_mask_tile(&[0u8], &huge_mask), Err(CodecError::SizeMismatch { .. })),
+            "32768x32768 1-bit mask unpacks to 1 GiB and must be rejected"
+        );
+
+        let mut slab = AlignedF32Slab::new_uninit(4);
+        slab.as_mut_slice().copy_from_slice(&[1.0, 10.0, 20.0, 999.0]);
+        let mut tile = DecodedTile {
+            bands: vec![DecodedBand {
+                width: 2,
+                height: 2,
+                data: BandData::F32(slab),
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 1.0,
+                    max: 999.0,
+                },
+            }],
+        };
+        apply_mask_to_tile(&mut tile, &[0, 255, 255, 0]);
+        assert!(!tile.bands[0].stats.all_nodata);
+        assert!(!tile.bands[0].stats.no_nodata);
+        assert_eq!(tile.bands[0].stats.min, 10.0);
+        assert_eq!(tile.bands[0].stats.max, 20.0);
+
+        apply_mask_to_tile(&mut tile, &[0, 0, 0, 0]);
+        assert!(tile.bands[0].stats.all_nodata);
+        assert!(tile.bands[0].stats.min.is_nan());
+        assert!(tile.bands[0].stats.max.is_nan());
     }
 }
