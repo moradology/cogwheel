@@ -132,6 +132,9 @@ struct TagEntry {
 
 impl TagEntry {
     fn read_u64_scalar(&self, r: &Reader<'_>) -> Result<u64, TiffError> {
+        if self.count == 0 {
+            return Err(TiffError::Corrupt("empty scalar integer tag"));
+        }
         match self.ty {
             TYPE_SHORT => Ok(r.u16_at(self.value_offset)? as u64),
             TYPE_LONG | TYPE_IFD => Ok(r.u32_at(self.value_offset)? as u64),
@@ -424,10 +427,16 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     let mut base_affine: Option<Affine2D> = None;
     let mut base_dims: Option<(u32, u32)> = None;
 
-    // Guard against cyclic IFD chains
-    let mut ifd_count = 0usize;
-    while next_ifd != 0 && ifd_count < 64 {
-        ifd_count += 1;
+    // Guard against cyclic IFD chains and runaway IFD counts (prevents 64x heap amplification DoS)
+    let mut visited_ifds: Vec<u64> = Vec::with_capacity(16);
+    while next_ifd != 0 {
+        if visited_ifds.contains(&next_ifd) {
+            return Err(TiffError::Corrupt("cyclic IFD chain"));
+        }
+        if visited_ifds.len() >= 64 {
+            return Err(TiffError::Corrupt("IFD chain exceeds 64 entries"));
+        }
+        visited_ifds.push(next_ifd);
         let (entries, following) = parse_ifd_entries(&r, next_ifd, is_bigtiff)?;
         next_ifd = following;
 
@@ -595,14 +604,28 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         }
 
         // Accept all 8 standard GDAL numeric sample types (widened to f32 at block decode)
-        let bps = bits_per_sample
-            .as_deref()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0);
-        let fmt = sample_format
-            .as_deref()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(1);
+        let bps = match bits_per_sample.as_deref() {
+            Some(v) if !v.is_empty() => {
+                if v.iter().any(|&x| x != v[0]) {
+                    return Err(TiffError::Corrupt(
+                        "heterogeneous BitsPerSample across bands is not supported",
+                    ));
+                }
+                v[0]
+            }
+            _ => 0,
+        };
+        let fmt = match sample_format.as_deref() {
+            Some(v) if !v.is_empty() => {
+                if v.iter().any(|&x| x != v[0]) {
+                    return Err(TiffError::Corrupt(
+                        "heterogeneous SampleFormat across bands is not supported",
+                    ));
+                }
+                v[0]
+            }
+            _ => 1,
+        };
         let sample_type = match (fmt, bps) {
             (1, 8) => SampleType::Uint8,
             (2, 8) => SampleType::Int8,

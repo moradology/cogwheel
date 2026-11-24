@@ -80,6 +80,26 @@ pub enum CogSource {
     },
 }
 
+/// Strip `?query`, `#fragment`, and `user:pass@` userinfo from an HTTP(S) URL before surfacing it
+/// in `IoError::HttpStatus` so presigned S3 / Azure SAS / basic-auth credentials never leak.
+fn redact_http_url(url: &str) -> String {
+    let no_query = url.split(['?', '#']).next().unwrap_or(url);
+    if let Some(scheme_end) = no_query.find("://") {
+        let after_scheme = &no_query[scheme_end + 3..];
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            return format!(
+                "{}{}{}",
+                &no_query[..scheme_end + 3],
+                &authority[at + 1..],
+                &after_scheme[authority_end..]
+            );
+        }
+    }
+    no_query.to_string()
+}
+
 /// A requested tile byte range `(slot_idx, file_offset, byte_len)`.
 #[derive(Debug, Clone, Copy)]
 pub struct TileByteReq {
@@ -289,7 +309,7 @@ impl CogSource {
                             if is_retryable_transport_error(&e) {
                                 permit.on_throttle();
                             }
-                            return Err(IoError::Http(e));
+                            return Err(IoError::Http(e.without_url()));
                         }
                     };
                     let status = resp.status().as_u16();
@@ -298,7 +318,7 @@ impl CogSource {
                         // returning those bytes would silently corrupt tile/IFD data!
                         return Err(IoError::HttpStatus {
                             status: 200,
-                            url: url.clone(),
+                            url: redact_http_url(url),
                         });
                     }
                     if status == 200 || status == 206 {
@@ -318,7 +338,7 @@ impl CogSource {
                                 if is_retryable_transport_error(&e) {
                                     permit.on_throttle();
                                 }
-                                return Err(IoError::Http(e));
+                                return Err(IoError::Http(e.without_url()));
                             }
                             Err(e) => return Err(e),
                         };
@@ -344,7 +364,7 @@ impl CogSource {
                     }
                     return Err(IoError::HttpStatus {
                         status,
-                        url: url.clone(),
+                        url: redact_http_url(url),
                     });
                 }
             }

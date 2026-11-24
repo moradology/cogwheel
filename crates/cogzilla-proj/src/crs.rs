@@ -492,27 +492,51 @@ impl CrsModel {
         let mut min_lat = f64::INFINITY;
         let mut max_lon = f64::NEG_INFINITY;
         let mut max_lat = f64::NEG_INFINITY;
+        let mut crosses_antimeridian = false;
         let w = width as f64;
         let h = height as f64;
         let steps = 8;
 
-        let mut visit = |col: f64, row: f64| {
+        let sample_pt = |col: f64, row: f64| -> Option<(f64, f64)> {
             let (sx, sy) = pixel_to_crs.forward(col, row);
             let (lon, lat) = self.to_lonlat_deg(sx, sy);
             if lon.is_finite() && lat.is_finite() {
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
+                Some((lon, lat))
+            } else {
+                None
             }
         };
 
-        for i in 0..=steps {
-            let t = (i as f64) / (steps as f64);
-            visit(t * w, 0.0);
-            visit(t * w, h);
-            visit(0.0, t * h);
-            visit(w, t * h);
+        let mut visit_edge = |pts: &[(f64, f64)]| {
+            let mut prev_lon: Option<f64> = None;
+            for &(col, row) in pts {
+                if let Some((lon, lat)) = sample_pt(col, row) {
+                    if let Some(pl) = prev_lon {
+                        if (lon - pl).abs() > 180.0 {
+                            crosses_antimeridian = true;
+                        }
+                    }
+                    prev_lon = Some(lon);
+                    min_lon = min_lon.min(lon);
+                    max_lon = max_lon.max(lon);
+                    min_lat = min_lat.min(lat);
+                    max_lat = max_lat.max(lat);
+                }
+            }
+        };
+
+        let top: Vec<(f64, f64)> = (0..=steps).map(|i| (i as f64 / steps as f64 * w, 0.0)).collect();
+        let bot: Vec<(f64, f64)> = (0..=steps).map(|i| (i as f64 / steps as f64 * w, h)).collect();
+        let left: Vec<(f64, f64)> = (0..=steps).map(|i| (0.0, i as f64 / steps as f64 * h)).collect();
+        let right: Vec<(f64, f64)> = (0..=steps).map(|i| (w, i as f64 / steps as f64 * h)).collect();
+        visit_edge(&top);
+        visit_edge(&bot);
+        visit_edge(&left);
+        visit_edge(&right);
+
+        if crosses_antimeridian {
+            min_lon = -180.0;
+            max_lon = 180.0;
         }
 
         // Check whether North or South Pole lies inside the raster footprint (polar CRSes).
@@ -537,6 +561,23 @@ impl CrsModel {
             }
         }
 
+        // Fallback if all border samples fell outside a lobe-bounded projection (e.g. Sinusoidal)
+        if !min_lon.is_finite() || !min_lat.is_finite() {
+            for iy in 1..=3 {
+                for ix in 1..=3 {
+                    if let Some((lon, lat)) = sample_pt(w * ix as f64 / 4.0, h * iy as f64 / 4.0) {
+                        min_lon = min_lon.min(lon);
+                        max_lon = max_lon.max(lon);
+                        min_lat = min_lat.min(lat);
+                        max_lat = max_lat.max(lat);
+                    }
+                }
+            }
+        }
+        if !min_lon.is_finite() || !min_lat.is_finite() {
+            return [-180.0, -85.05112878, 180.0, 85.05112878];
+        }
+
         [min_lon, min_lat, max_lon, max_lat]
     }
 
@@ -548,11 +589,51 @@ impl CrsModel {
         height: u32,
         overview_factor: f64,
     ) -> (u8, u8) {
-        let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
-        let (mx0, my0) = lonlat_deg_to_mercator(w, s);
-        let (mx1, my1) = lonlat_deg_to_mercator(e, n);
-        let span_m = (mx1 - mx0).abs().max((my1 - my0).abs()).max(1.0);
-        let px_m = span_m / (width.max(height) as f64);
+        // Compute local Web Mercator pixel size via a 1-pixel Jacobian at the raster center
+        // (immune to [-180, 180] longitude expansion on polar and antimeridian-crossing rasters).
+        let cx = (width as f64) * 0.5;
+        let cy = (height as f64) * 0.5;
+        let step_px = (width.min(height) as f64 * 0.01).clamp(1.0, 64.0);
+        let to_merc = |col: f64, row: f64| -> Option<(f64, f64)> {
+            let (sx, sy) = pixel_to_crs.forward(col, row);
+            let (lon, lat) = self.to_lonlat_deg(sx, sy);
+            if lon.is_finite() && lat.is_finite() {
+                Some(lonlat_deg_to_mercator(lon, lat))
+            } else {
+                None
+            }
+        };
+        let px_m = if let (Some((mx0, my0)), Some((mxx, myx)), Some((mxy, myy))) = (
+            to_merc(cx, cy),
+            to_merc(cx + step_px, cy),
+            to_merc(cx, cy + step_px),
+        ) {
+            let wrap_dx = |dx: f64| -> f64 {
+                if dx > ORIGIN_SHIFT {
+                    dx - 2.0 * ORIGIN_SHIFT
+                } else if dx < -ORIGIN_SHIFT {
+                    dx + 2.0 * ORIGIN_SHIFT
+                } else {
+                    dx
+                }
+            };
+            let dx_m = wrap_dx(mxx - mx0).hypot(myx - my0) / step_px;
+            let dy_m = wrap_dx(mxy - mx0).hypot(myy - my0) / step_px;
+            let local = dx_m.min(dy_m).max(dx_m.max(dy_m) * 0.5);
+            if local.is_finite() && local > 1e-3 {
+                local
+            } else {
+                let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                let (a0, b0) = lonlat_deg_to_mercator(w, s);
+                let (a1, b1) = lonlat_deg_to_mercator(e, n);
+                (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / (width.max(height) as f64)
+            }
+        } else {
+            let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+            let (a0, b0) = lonlat_deg_to_mercator(w, s);
+            let (a1, b1) = lonlat_deg_to_mercator(e, n);
+            (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / (width.max(height) as f64)
+        };
         let world_px0 = (2.0 * ORIGIN_SHIFT) / 256.0;
         let maxzoom = (world_px0 / px_m).log2().ceil().clamp(0.0, 22.0) as u8;
         let minzoom_f = (world_px0 / (px_m * overview_factor.max(1.0))).log2().floor();
@@ -1379,5 +1460,28 @@ mod tests {
         for (what, gk) in cases {
             assert!(CrsModel::from_geo_keys(&gk).is_err(), "{what} should be refused");
         }
+    }
+
+    #[test]
+    fn antimeridian_utm_bounds_and_zoom_range_are_accurate() {
+        // UTM Zone 60N (EPSG:32660, central meridian 177°E) 10m raster spanning ~179.5°E to ~179.5°W
+        let crs = CrsModel::from_geo_keys(&keys(|k| {
+            k.projected_cs_type = Some(32660);
+        }))
+        .unwrap();
+        let (cx, cy) = crs.from_lonlat_deg(180.0, 0.0);
+        let aff = Affine2D {
+            a: 10.0,
+            b: 0.0,
+            c: cx - 50_000.0,
+            d: 0.0,
+            e: -10.0,
+            f: cy + 50_000.0,
+        };
+        let b = crs.wgs84_bounds(&aff, 10_000, 10_000);
+        assert_eq!(b[0], -180.0);
+        assert_eq!(b[2], 180.0);
+        let (_minz, maxz) = crs.web_mercator_zoom_range(&aff, 10_000, 10_000, 16.0);
+        assert!(maxz >= 13, "10m antimeridian raster should have maxzoom >= 13, got {maxz}");
     }
 }
