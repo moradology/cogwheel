@@ -184,6 +184,63 @@ async fn s3_auto_discovers_and_caches_bucket_region_on_301() {
 }
 
 #[tokio::test]
+async fn s3_auto_discovers_and_caches_bucket_region_on_307() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_cl = calls.clone();
+
+    let endpoint = spawn_mock_s3(move |req| {
+        calls_cl.fetch_add(1, Ordering::SeqCst);
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if auth.contains("/us-east-1/s3/aws4_request") {
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header("location", "https://region-307-test-bucket.s3.ap-northeast-1.amazonaws.com/scene.tif")
+                .header("x-amz-bucket-region", "ap-northeast-1")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
+        assert!(
+            auth.contains("/ap-northeast-1/s3/aws4_request"),
+            "expected re-signed ap-northeast-1, got {auth}"
+        );
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .body(Full::new(Bytes::from_static(b"AP_DATA")))
+            .unwrap()
+    })
+    .await;
+
+    let cfg = S3Config {
+        access_key: "AKIA_TEST".to_string(),
+        secret_key: "SECRET_TEST".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint),
+        force_path_style: true,
+        ..Default::default()
+    };
+
+    let no_redirect_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let src = CogSource::open_remote(
+        "s3://region-307-test-bucket/scene.tif",
+        no_redirect_client,
+        Some(cfg),
+        Arc::new(IoMetrics::default()),
+    )
+    .unwrap();
+
+    let d1 = src.fetch_range(0, 7).await.unwrap();
+    assert_eq!(&d1[..], b"AP_DATA");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn s3_retries_transient_503_slowdown_and_supports_no_sign_request() {
     let calls = Arc::new(AtomicUsize::new(0));
     let saw_auth = Arc::new(AtomicUsize::new(0));

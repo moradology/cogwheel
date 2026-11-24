@@ -141,6 +141,9 @@ pub struct CogStore {
     /// to `num_cpus` so pathological workloads never oversubscribe OS threads or starve Tokio I/O.
     pub heavy_cpu_sem: Arc<tokio::sync::Semaphore>,
     pub client: reqwest::Client,
+    /// Separate client with redirects disabled for S3/GCS/Azure so 307 region redirects are
+    /// handled explicitly (with SigV4 re-signing) instead of failing the HTTP allowlist redirect hook.
+    pub cloud_client: reqwest::Client,
     pub s3_cfg: Option<S3Config>,
     pub metrics: Arc<IoMetrics>,
 }
@@ -169,11 +172,13 @@ impl CogStore {
                 .filter(|&s| s > 0)
                 .unwrap_or(default)
         };
+        let connect_timeout = Duration::from_secs(env_secs("GDAL_HTTP_CONNECTTIMEOUT", 10));
+        let read_timeout = Duration::from_secs(env_secs("GDAL_HTTP_TIMEOUT", 30));
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
-            .connect_timeout(Duration::from_secs(env_secs("GDAL_HTTP_CONNECTTIMEOUT", 10)))
-            .read_timeout(Duration::from_secs(env_secs("GDAL_HTTP_TIMEOUT", 30)))
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 10 {
                     return attempt.error("too many HTTP redirects");
@@ -185,6 +190,14 @@ impl CogStore {
             }))
             .build()
             .expect("reqwest client");
+        let cloud_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(64)
+            .tcp_nodelay(true)
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest cloud client");
         let heavy_permits = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -201,6 +214,7 @@ impl CogStore {
             upstream_limiter,
             heavy_cpu_sem: Arc::new(tokio::sync::Semaphore::new(heavy_permits)),
             client,
+            cloud_client,
             s3_cfg: S3Config::from_env(),
             metrics: Arc::new(IoMetrics::default()),
         }
@@ -437,9 +451,21 @@ impl CogStore {
                 done: false,
             };
 
+            let is_cloud_scheme = uri.starts_with("s3://")
+                || uri.starts_with("/vsis3/")
+                || uri.starts_with("gs://")
+                || uri.starts_with("/vsigs/")
+                || uri.starts_with("az://")
+                || uri.starts_with("abfs://")
+                || uri.starts_with("abfss://")
+                || uri.starts_with("/vsiaz/");
             let source = CogSource::open_remote_limited(
                 uri,
-                self.client.clone(),
+                if is_cloud_scheme {
+                    self.cloud_client.clone()
+                } else {
+                    self.client.clone()
+                },
                 self.s3_cfg.clone(),
                 self.metrics.clone(),
                 self.upstream_limiter.clone(),
@@ -976,23 +1002,39 @@ impl CogStore {
                             let meta = Arc::new(clone_for_decode(ifd));
                             let byte_order = cog.index.byte_order;
                             let nodata = cog.index.nodata;
+                            let max_disk_conc = std::thread::available_parallelism()
+                                .map(|n| n.get())
+                                .unwrap_or(4)
+                                .clamp(1, 16);
                             let mut disk_set = tokio::task::JoinSet::new();
-                            for (item, key, path) in disk_candidates {
+                            let mut iter = disk_candidates.into_iter();
+                            let spawn_one = |disk_set: &mut tokio::task::JoinSet<_>,
+                                             (item, key, path): (
+                                                 (usize, Option<InFlightGuard>, u64, u32),
+                                                 [u8; 16],
+                                                 std::path::PathBuf,
+                                             )| {
                                 let (orig_slot, guard_opt, offset, count) = item;
                                 let rows = tile_indices[orig_slot]
                                     .map(|tidx| ifd.block_height(tidx))
                                     .unwrap_or(ifd.tile_height);
                                 let dc_c = dc.clone();
                                 let m = meta.clone();
+                                let sem = if heavy_block {
+                                    Some(self.heavy_cpu_sem.clone())
+                                } else {
+                                    None
+                                };
                                 disk_set.spawn(async move {
-                                    let dc_inv = dc_c.clone();
-                                    let read_res = tokio::task::spawn_blocking(move || {
-                                        dc_c.read_verified_sync(key, &path)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten();
-                                    if let Some(compressed) = read_res {
+                                    let _permit = match &sem {
+                                        Some(s) => s.acquire().await.ok(),
+                                        None => None,
+                                    };
+                                    let decoded_opt = tokio::task::spawn_blocking(move || {
+                                        let Some(compressed) = dc_c.read_verified_sync(key, &path)
+                                        else {
+                                            return None;
+                                        };
                                         if compressed.len() == count as usize {
                                             if let Ok(decoded) = decode_tile_rows(
                                                 &compressed,
@@ -1001,25 +1043,32 @@ impl CogStore {
                                                 nodata,
                                                 rows,
                                             ) {
-                                                let arc = Arc::new(decoded);
-                                                if let Some(guard) = guard_opt {
-                                                    guard.complete(arc.clone());
-                                                }
-                                                return Ok::<
-                                                    _,
-                                                    (usize, Option<InFlightGuard>, u64, u32),
-                                                >(
-                                                    (orig_slot, arc)
-                                                );
+                                                return Some(Arc::new(decoded));
                                             }
                                         }
                                         // Stale length or undecodable payload: evict from disk cache
                                         // so the remote refetch can persist the fresh block.
-                                        dc_inv.invalidate(key);
+                                        dc_c.invalidate(key);
+                                        None
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                    if let Some(arc) = decoded_opt {
+                                        if let Some(guard) = guard_opt {
+                                            guard.complete(arc.clone());
+                                        }
+                                        return Ok::<
+                                            _,
+                                            (usize, Option<InFlightGuard>, u64, u32),
+                                        >((orig_slot, arc));
                                     }
                                     // Corrupt/evicted disk entry: fail-open and refetch from remote!
                                     Err((orig_slot, guard_opt, offset, count))
                                 });
+                            };
+                            for cand in iter.by_ref().take(max_disk_conc) {
+                                spawn_one(&mut disk_set, cand);
                             }
                             while let Some(res) = disk_set.join_next().await {
                                 match res {
@@ -1034,6 +1083,9 @@ impl CogStore {
                                             "disk cache decode task failed: {e}"
                                         ))));
                                     }
+                                }
+                                if let Some(next_cand) = iter.next() {
+                                    spawn_one(&mut disk_set, next_cand);
                                 }
                             }
                         }
@@ -1641,7 +1693,7 @@ impl CogStore {
                 .unwrap_or_else(crate::s3::S3Config::from_env_full);
             let dyn_creds = crate::backend::shared_dynamic_creds();
             return crate::s3::fetch_s3_object_capped(
-                &self.client,
+                &self.cloud_client,
                 bucket,
                 key,
                 &cfg,
@@ -1660,7 +1712,7 @@ impl CogStore {
             let cfg = crate::cloud::GcsConfig::from_env();
             let tc = crate::backend::shared_gcs_token_cache();
             return crate::cloud::fetch_gcs_object_capped(
-                &self.client,
+                &self.cloud_client,
                 bucket,
                 key,
                 &cfg,
@@ -1678,7 +1730,7 @@ impl CogStore {
         if let Some(target) = crate::cloud::parse_azure_uri(uri, None) {
             let az_cfg = crate::cloud::AzureConfig::from_env();
             return crate::cloud::fetch_azure_object_capped(
-                &self.client,
+                &self.cloud_client,
                 &target,
                 &az_cfg,
                 max_bytes,
