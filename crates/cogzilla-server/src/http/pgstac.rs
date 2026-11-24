@@ -31,7 +31,7 @@ use super::{
 use super::point_expr::Program;
 use super::zonal::{self, Bins, StatsOptions};
 use crate::engine::{BandRequest, EngineError, TileEngine};
-use crate::stac::{StacItem, rewrite_stac_expr, stac_item_from_json};
+use crate::stac::{StacItem, stac_item_from_json};
 use crate::titiler::{
     PolygonMask, build_map_html, encode_rgba_output, query_point, render_wgs84_bbox,
 };
@@ -1197,7 +1197,141 @@ fn tilejson(
 }
 
 /// What a tile request asks of the items, beyond the search itself.
+/// One entry of `assets`: a name and, after a `|`, TiTiler's options for that asset.
+#[derive(Debug, Clone, PartialEq)]
+struct AssetSpec {
+    name: String,
+    /// `bidx=1,2`: the bands to take, counted from one.
+    indexes: Option<Vec<u16>>,
+    /// `expression=b1*2`: band math over this asset's own bands. It wins over `bidx`.
+    expression: Option<String>,
+}
+
+/// `assets=red`, `assets=visual|bidx=3,2,1`, `assets=red|expression=b1*2`, each `assets`
+/// parameter being one asset. As in TiTiler an option is `key=value`, and the keys it does
+/// not know are passed over. An entry without options may still list several names with
+/// commas, which the other routes of this server take.
+fn parse_assets(pairs: &[(String, String)]) -> Result<Vec<AssetSpec>, Resp> {
+    let bad = |msg: &str| invalid_param("query", "assets", format!("Value error, {msg}"));
+    pairs
+        .iter()
+        .filter(|(k, _)| k == "assets")
+        .flat_map(|(_, v)| {
+            let whole = v.contains('|');
+            v.split(move |c| c == ',' && !whole).filter(|part| !part.is_empty())
+        })
+        .map(|entry| {
+            let (name, options) = entry.split_once('|').map_or((entry, None), |(n, o)| (n, Some(o)));
+            if name.is_empty() {
+                return Err(detail(StatusCode::BAD_REQUEST, "an asset has no name"));
+            }
+            let mut spec = AssetSpec { name: name.to_string(), indexes: None, expression: None };
+            for option in options.into_iter().flat_map(|o| o.split('|')) {
+                let (key, value) = option
+                    .split_once('=')
+                    .ok_or_else(|| bad("not enough values to unpack (expected 2, got 1)"))?;
+                match key {
+                    "bidx" => {
+                        let indexes: Option<Vec<u16>> = value.split(',').map(|i| i.parse().ok()).collect();
+                        spec.indexes = Some(indexes.ok_or_else(|| {
+                            bad(&format!("invalid literal for int() with base 10: '{value}'"))
+                        })?);
+                    }
+                    "expression" => spec.expression = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            Ok(spec)
+        })
+        .collect()
+}
+
+/// What an asset gives to the stacked bands of an item.
+enum AssetBands {
+    /// These of its bands, counted from zero.
+    Pick(Vec<usize>),
+    /// The results of band math over its own bands.
+    Math(Program),
+}
+
+/// The bands an asset with `bands` bands contributes, and how TiTiler describes them:
+/// `visual_b3` for a band, the expression after the asset's name for band math, and the
+/// bare name with `asset_as_band`, which only single-band assets can be used with.
+fn asset_bands(spec: &AssetSpec, bands: usize, as_band: bool) -> Result<(AssetBands, Vec<String>), String> {
+    let (out, mut descriptions) = if let Some(expression) = &spec.expression {
+        let program = Program::parse(expression, bands)?;
+        let descriptions: Vec<String> =
+            program.sources().map(|part| format!("{}_{part}", spec.name)).collect();
+        (AssetBands::Math(program), descriptions)
+    } else {
+        let picked: Vec<usize> = match &spec.indexes {
+            None => (0..bands).collect(),
+            Some(indexes) => indexes
+                .iter()
+                .map(|&i| {
+                    usize::from(i).checked_sub(1).filter(|i| *i < bands).ok_or_else(|| {
+                        let known: Vec<String> = (1..=bands).map(|b| b.to_string()).collect();
+                        let tail = if bands == 1 { "," } else { "" };
+                        format!("band index {i} out of range (not in ({}{tail}))", known.join(", "))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        let descriptions = picked.iter().map(|i| format!("{}_b{}", spec.name, i + 1)).collect();
+        (AssetBands::Pick(picked), descriptions)
+    };
+    if as_band {
+        if descriptions.len() != 1 {
+            return Err("Can't use `asset_as_band` for multibands asset".into());
+        }
+        descriptions = vec![spec.name.clone()];
+    }
+    Ok((out, descriptions))
+}
+
+impl AssetBands {
+    /// The contribution for whole planes, one per band of the asset.
+    fn planes(&self, bands: &[Vec<f32>]) -> Vec<Vec<f64>> {
+        match self {
+            AssetBands::Pick(picked) => {
+                picked.iter().map(|&i| bands[i].iter().map(|v| f64::from(*v)).collect()).collect()
+            }
+            AssetBands::Math(program) => {
+                let len = bands.first().map_or(0, Vec::len);
+                let mut out = vec![Vec::with_capacity(len); program.len()];
+                let mut pixel = vec![0f64; bands.len()];
+                for i in 0..len {
+                    for (value, band) in pixel.iter_mut().zip(bands) {
+                        *value = f64::from(band[i]);
+                    }
+                    for (part, plane) in out.iter_mut().enumerate() {
+                        let v = program.eval(part, &pixel);
+                        plane.push(if v.is_finite() { v } else { f64::NAN });
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// The contribution for one pixel, given every band of the asset there. A band with
+    /// no value is NaN, and so is band math that does not come out finite.
+    fn pixel(&self, bands: &[f64], out: &mut Vec<f64>) {
+        match self {
+            AssetBands::Pick(picked) => out.extend(picked.iter().map(|&i| bands[i])),
+            AssetBands::Math(program) => out.extend((0..program.len()).map(|part| {
+                let v = program.eval(part, bands);
+                if v.is_finite() { v } else { f64::NAN }
+            })),
+        }
+    }
+}
+
 struct MosaicQuery {
+    /// The assets asked for, with their options.
+    assets: Vec<AssetSpec>,
+    /// `asset_as_band`: bands are named after their assets.
+    asset_as_band: bool,
     limits: SearchLimits,
     /// Method for a source already in the tile's projection (`resampling`).
     resampling: ResampleMode,
@@ -1226,16 +1360,19 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if let Some(e) = pq.errors.iter().find(|e| !e.contains("'reproject'")) {
         return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
     }
-    if pq.assets.iter().any(|a| a.contains('|')) {
-        return Err(detail(
-            StatusCode::BAD_REQUEST,
-            "per-asset options (assets=name|bidx=...|expression=...) are not supported yet",
-        ));
+    let assets = parse_assets(pairs)?;
+    if assets.is_empty() {
+        return Err(missing_query_param("assets"));
     }
-    if pq.assets.len() > MAX_ASSETS_PER_SCENE {
+    let asset_as_band = match query_value(pairs, "asset_as_band") {
+        None => false,
+        Some(v) => parse_bool(v)
+            .ok_or_else(|| invalid_param("query", "asset_as_band", "Input should be a valid boolean"))?,
+    };
+    if assets.len() > MAX_ASSETS_PER_SCENE {
         return Err(detail(
             StatusCode::BAD_REQUEST,
-            format!("at most {MAX_ASSETS_PER_SCENE} assets per item are supported, got {}", pq.assets.len()),
+            format!("at most {MAX_ASSETS_PER_SCENE} assets per item are supported, got {}", assets.len()),
         ));
     }
     match query_value(pairs, "pixel_selection") {
@@ -1247,13 +1384,8 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
             ));
         }
     }
-    for unsupported in ["asset_as_band", "algorithm_params"] {
-        if query_value(pairs, unsupported).is_some() {
-            return Err(detail(
-                StatusCode::BAD_REQUEST,
-                format!("parameter '{unsupported}' is not supported yet"),
-            ));
-        }
+    if query_value(pairs, "algorithm_params").is_some() {
+        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
     }
     // The mosaic engine renders whole tiles at the two native sizes without these.
     if pq.buffer > 0 {
@@ -1265,17 +1397,68 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.custom_colormap_json.is_some() {
         return Err(detail(StatusCode::BAD_REQUEST, "a JSON 'colormap' is not supported on mosaic routes yet"));
     }
-    if pq.unscale && pq.assets.len() > 1 {
+    if pq.unscale && assets.len() > 1 {
         return Err(detail(
             StatusCode::BAD_REQUEST,
             "parameter 'unscale' is not supported with more than one asset yet",
         ));
     }
     Ok(MosaicQuery {
+        assets,
+        asset_as_band,
         limits: parse_limits(pairs)?,
         resampling: parse_resample(pairs, "resampling")?,
         reproject: parse_resample(pairs, "reproject")?,
     })
+}
+
+/// Bring the assets and their options to what the tile and image renderer takes, and
+/// give back the asset names. The renderer reads either the bands of one raster or the
+/// first band of several, so it can honour `bidx` and band math on a single asset, and
+/// `bidx=1` on each of several; anything else is refused rather than drawn differently.
+fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>, Resp> {
+    let unsupported = |what: &str| {
+        detail(StatusCode::BAD_REQUEST, format!("{what} is not supported on tile and image routes yet"))
+    };
+    // TiTiler 2 takes band indexes per asset only; a bare `bidx` is passed over.
+    pq.bidx.clear();
+    let names: Vec<String> = query.assets.iter().map(|a| a.name.clone()).collect();
+    pq.assets = names.clone();
+    // Band math is over `b1..bn`, never over asset names.
+    if let Some(expression) = &pq.expr_raw {
+        let words = expression.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        if let Some(name) = words.filter(|w| !w.is_empty()).find(|w| names.iter().any(|n| n == w)) {
+            return Err(detail(StatusCode::BAD_REQUEST, format!("Invalid band/asset name '{name}'")));
+        }
+    }
+    match query.assets.as_slice() {
+        [one] => {
+            if let Some(expression) = &one.expression {
+                if pq.expr_raw.is_some() {
+                    return Err(unsupported("an `expression` on top of an asset's own expression"));
+                }
+                if expression.contains(';') {
+                    return Err(unsupported("an asset expression with several results"));
+                }
+                pq.expr_raw = Some(expression.clone());
+            } else if let Some(indexes) = &one.indexes {
+                if pq.expr_raw.is_some() {
+                    return Err(unsupported("an `expression` over bands chosen with `bidx`"));
+                }
+                if !matches!(indexes.len(), 1 | 3) {
+                    return Err(unsupported("`bidx` with a number of bands other than one or three"));
+                }
+                pq.bidx = indexes.clone();
+            }
+        }
+        several => {
+            let plain = |a: &AssetSpec| a.expression.is_none() && a.indexes.as_ref().is_none_or(|i| i == &[1]);
+            if !several.iter().all(plain) {
+                return Err(unsupported("options other than `bidx=1` when several assets are given"));
+            }
+        }
+    }
+    Ok(names)
 }
 
 async fn tile_items(
@@ -1415,6 +1598,10 @@ async fn part_image(
         Ok(q) => q,
         Err(r) => return r,
     };
+    let names = match renderer_assets(&mut pq, &query) {
+        Ok(names) => names,
+        Err(r) => return r,
+    };
     if let Err(r) = check_coord_crs(pairs) {
         return r;
     }
@@ -1448,17 +1635,14 @@ async fn part_image(
     }
     let mut scenes: Vec<Vec<String>> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
     for item in items.iter().take(MAX_SCENES_PER_TILE) {
-        let mut hrefs = Vec::with_capacity(pq.assets.len());
-        for asset in &pq.assets {
+        let mut hrefs = Vec::with_capacity(names.len());
+        for asset in &names {
             match item.asset_href(asset) {
                 Some(href) => hrefs.push(href.to_string()),
                 None => return unknown_asset(asset, item),
             }
         }
         scenes.push(hrefs);
-    }
-    if let Some(expr) = pq.expr_raw.take() {
-        pq.expr_raw = Some(rewrite_stac_expr(&expr, &pq.assets));
     }
 
     let engine = ctx.engine;
@@ -1478,6 +1662,9 @@ async fn part_image(
             }
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
+            if query.asset_as_band && full.samples_per_pixel > 1 {
+                return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
+            }
             if n == 0 {
                 // The first item sets the size; the others are drawn onto its grid.
                 let res = wgs84_resolution(&crs, &cogs[0]).ok_or_else(|| {
@@ -1700,10 +1887,22 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)])
     }
 }
 
+/// How GDAL goes about a warped read, which decides the pixels it takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WarpPath {
+    /// Every band of the raster is asked for: one warp straight onto the output grid,
+    /// from the source overview that suits it.
+    Direct,
+    /// Only some bands are: the warped raster is read block by block, 512 pixels wide,
+    /// through its own overview when the output is smaller, and that is then resized.
+    Blocks,
+}
+
 /// Every band of one raster on a WGS84 grid, read the way GDAL's nearest-neighbour warp
 /// reads it: from the overview GDAL would pick, each output pixel taking the source pixel
 /// its centre falls in. A pixel outside the raster, or without data, is NaN. `native` is
 /// the size of the grid at the raster's own resolution.
+#[allow(clippy::too_many_arguments)]
 async fn warp_nearest(
     engine: &TileEngine,
     cog: &Arc<cogzilla_io::OpenedCog>,
@@ -1711,31 +1910,62 @@ async fn warp_nearest(
     bounds: [f64; 4],
     (width, height): (usize, usize),
     native: (u64, u64),
+    path: WarpPath,
     unscale: bool,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
-    let level = gdal_overview_level(&sizes, native, (width, height));
+    // The grid the warp is worked out on, and how wide a stretch of a row GDAL
+    // approximates in one go.
+    let (level, (grid_w, grid_h), block) = match path {
+        WarpPath::Direct => (gdal_overview_level(&sizes, native, (width, height)), (width, height), width),
+        WarpPath::Blocks => {
+            // The warped raster has one overview per source overview, reduced as much.
+            let (full_w, full_h) = sizes.first().copied().unwrap_or((1, 1));
+            let reduced: Vec<(u32, u32)> = sizes
+                .iter()
+                .map(|&(w, h)| {
+                    let across = native.0 as f64 / (f64::from(full_w) / f64::from(w.max(1)));
+                    let down = native.1 as f64 / (f64::from(full_h) / f64::from(h.max(1)));
+                    (((across + 0.5) as u32).max(1), ((down + 0.5) as u32).max(1))
+                })
+                .collect();
+            let level = gdal_overview_level(&reduced, native, (width, height));
+            let grid = if level == 0 { (native.0 as usize, native.1 as usize) } else { (reduced[level].0 as usize, reduced[level].1 as usize) };
+            (level, grid, grid.0.min(512))
+        }
+    };
     let ifd = &cog.index.ifds[level];
     let bands = ifd.samples_per_pixel as usize;
-    let (dx, dy) = ((bounds[2] - bounds[0]) / width as f64, (bounds[3] - bounds[1]) / height as f64);
+    let (dx, dy) = ((bounds[2] - bounds[0]) / grid_w as f64, (bounds[3] - bounds[1]) / grid_h as f64);
 
     // Where each output pixel reads from, as (column, row) of the level.
     let mut cells: Vec<(i32, i32)> = Vec::with_capacity(width * height);
-    let mut row_positions = vec![(0f64, 0f64); width];
+    let mut row_positions = vec![(0f64, 0f64); grid_w];
     let (mut c0, mut c1, mut r0, mut r1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    let (w, h) = (f64::from(ifd.width), f64::from(ifd.height));
+    let inside = |u: f64, v: f64| u >= 0.0 && v >= 0.0 && u + 1e-10 <= w && v + 1e-10 <= h;
+    let mut worked_row = usize::MAX;
     for j in 0..height {
-        let lat = bounds[3] - (j as f64 + 0.5) * dy;
+        // The row and columns of the grid an output pixel takes: its own, or when the
+        // grid is being resized the one its centre falls in.
+        let grid_row = if grid_h == height { j } else { ((2 * j + 1) * grid_h / (2 * height)).min(grid_h - 1) };
+        let lat = bounds[3] - (grid_row as f64 + 0.5) * dy;
         let exact = |i: usize| {
             let (x, y) = crs.from_lonlat_deg(bounds[0] + (i as f64 + 0.5) * dx, lat);
             ifd.crs_to_pixel.forward(x, y)
         };
-        approx_scanline(&exact, &mut row_positions);
-        let (w, h) = (f64::from(ifd.width), f64::from(ifd.height));
-        let inside = |u: f64, v: f64| u >= 0.0 && v >= 0.0 && u + 1e-10 <= w && v + 1e-10 <= h;
-        for (i, &(mut u, mut v)) in row_positions.iter().enumerate() {
+        if grid_row != worked_row {
+            for (n, stretch) in row_positions.chunks_mut(block.max(1)).enumerate() {
+                approx_scanline(&|i| exact(n * block + i), stretch);
+            }
+            worked_row = grid_row;
+        }
+        for i in 0..width {
+            let grid_col = if grid_w == width { i } else { ((2 * i + 1) * grid_w / (2 * width)).min(grid_w - 1) };
+            let (mut u, mut v) = row_positions[grid_col];
             // A position less than a pixel outside the raster is worked out again exactly.
             if !inside(u, v) && u > -1.0 && v > -1.0 && u < w + 1.0 && v < h + 1.0 {
-                (u, v) = exact(i);
+                (u, v) = exact(grid_col);
             }
             if u.is_finite() && v.is_finite() && inside(u, v) {
                 let col = ((u + 1e-10).floor() as i32).min(ifd.width as i32 - 1);
@@ -1916,7 +2146,6 @@ struct StatsRequest<'a> {
     size: PartSize,
     opts: StatsOptions,
     cover_scale: usize,
-    assets: &'a [String],
     expression: Option<&'a str>,
     unscale: bool,
 }
@@ -1940,12 +2169,13 @@ async fn feature_statistics(
         return Ok(None);
     }
     let mut scenes: Vec<(String, Vec<String>)> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
+    let assets = &req.query.assets;
     for item in items.iter().take(MAX_SCENES_PER_TILE) {
-        let mut hrefs = Vec::with_capacity(req.assets.len());
-        for asset in req.assets {
-            match item.asset_href(asset) {
+        let mut hrefs = Vec::with_capacity(assets.len());
+        for asset in assets {
+            match item.asset_href(&asset.name) {
                 Some(href) => hrefs.push(href.to_string()),
-                None => return Err(unknown_asset(asset, item)),
+                None => return Err(unknown_asset(&asset.name, item)),
             }
         }
         let name = match &item.collection {
@@ -1968,16 +2198,16 @@ async fn feature_statistics(
             for href in &hrefs {
                 cogs.push(engine.store.open_uri(href).await?);
             }
-            let mut planes: Vec<Vec<f32>> = Vec::new();
+            let mut planes: Vec<Vec<f64>> = Vec::new();
             let mut names: Vec<String> = Vec::new();
             let mut missing = false;
-            'assets: for (asset, cog) in req.assets.iter().zip(&cogs) {
+            'assets: for (asset, cog) in assets.iter().zip(&cogs) {
                 // As rio-tiler does, every raster is read on its own grid: the feature's box
                 // grown to whole pixels of the raster as GDAL would warp it to WGS84. The
                 // first one read sets the size of the result.
                 let crs = engine.get_or_build_crs(cog)?;
                 let grid = wgs84_grid(&crs, cog).ok_or_else(|| {
-                    EngineError::BadRequest(format!("cannot place asset '{asset}' in WGS84"))
+                    EngineError::BadRequest(format!("cannot place asset '{}' in WGS84", asset.name))
                 })?;
                 let own_bounds = grid.align(bbox);
                 let own = PartSize::Query { max_size: None, width: None, height: None };
@@ -1999,15 +2229,25 @@ async fn feature_statistics(
                     CrsModel::Geographic => req.query.resampling,
                     _ => req.query.reproject,
                 };
+                // GDAL takes another road when only some of a raster's bands are read.
+                let all = usize::from(cog.index.full_res().samples_per_pixel);
+                let path = match &asset.indexes {
+                    Some(indexes) if asset.expression.is_none() && indexes.len() != all => WarpPath::Blocks,
+                    _ => WarpPath::Direct,
+                };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, size, native, req.unscale).await
+                    warp_nearest(engine, cog, &crs, own_bounds, size, native, path, req.unscale).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
                 match read {
                     Ok(read) => {
-                        names.extend((1..=read.len()).map(|band| format!("{asset}_b{band}")));
-                        planes.extend(read.into_iter().map(|p| resize_nearest(p, size, (width, height))));
+                        let (plan, described) = asset_bands(asset, read.len(), req.query.asset_as_band)
+                            .map_err(EngineError::BadRequest)?;
+                        let read: Vec<Vec<f32>> =
+                            read.into_iter().map(|p| resize_nearest(p, size, (width, height))).collect();
+                        planes.extend(plan.planes(&read));
+                        names.extend(described);
                     }
                     // The item's footprint meets the box but this raster does not.
                     Err(EngineError::NotFound(_)) => {
@@ -2038,7 +2278,7 @@ async fn feature_statistics(
                             continue;
                         }
                         for (value, plane) in pixel.iter_mut().zip(&planes) {
-                            *value = f64::from(plane[i]);
+                            *value = plane[i];
                         }
                         for (part, band) in canvas.iter_mut().enumerate() {
                             if band[i].is_nan() {
@@ -2059,7 +2299,7 @@ async fn feature_statistics(
                     for (band, plane) in canvas.iter_mut().zip(&planes) {
                         for (dst, src) in band.iter_mut().zip(plane) {
                             if dst.is_nan() && src.is_finite() {
-                                *dst = f64::from(*src);
+                                *dst = *src;
                             }
                         }
                     }
@@ -2170,7 +2410,6 @@ async fn mosaic_statistics(
         size,
         opts,
         cover_scale,
-        assets: &pq.assets,
         expression: query_value(pairs, "expression"),
         unscale: pq.unscale,
     };
@@ -2252,18 +2491,16 @@ async fn point_values(
     if let Some(e) = pq.errors.iter().find(|e| !e.contains("'reproject'")) {
         return detail(StatusCode::BAD_REQUEST, e.clone());
     }
-    if pq.assets.iter().any(|a| a.contains('|')) {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "per-asset options (assets=name|bidx=...|expression=...) are not supported yet",
-        );
-    }
-    if query_value(pairs, "asset_as_band").is_some() {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "parameter 'asset_as_band' is not supported on pgSTAC point routes yet",
-        );
-    }
+    let specs = match parse_assets(pairs) {
+        Ok(specs) if specs.is_empty() => return missing_query_param("assets"),
+        Ok(specs) => specs,
+        Err(r) => return r,
+    };
+    let as_band = match query_value(pairs, "asset_as_band").map(parse_bool) {
+        None => false,
+        Some(Some(flag)) => flag,
+        Some(None) => return invalid_param("query", "asset_as_band", "Input should be a valid boolean"),
+    };
     let expression = query_value(pairs, "expression").map(str::to_string);
     let (lon, lat) = if pq.coord_crs_3857 {
         mercator_to_lonlat_deg(x, y)
@@ -2290,13 +2527,13 @@ async fn point_values(
     }
 
     // Resolve every asset before reading anything, so a bad name fails the request at once.
-    let mut jobs: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(items.len());
+    let mut jobs: Vec<(String, Vec<(AssetSpec, String)>)> = Vec::with_capacity(items.len());
     for item in items.iter() {
-        let mut hrefs = Vec::with_capacity(pq.assets.len());
-        for asset in &pq.assets {
-            match item.asset_href(asset) {
-                Some(href) => hrefs.push((asset.clone(), href.to_string())),
-                None => return unknown_asset(asset, item),
+        let mut hrefs = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            match item.asset_href(&spec.name) {
+                Some(href) => hrefs.push((spec.clone(), href.to_string())),
+                None => return unknown_asset(&spec.name, item),
             }
         }
         let name = match &item.collection {
@@ -2317,7 +2554,7 @@ async fn point_values(
             let _permit = gate.acquire_owned().await;
             let mut values = Vec::new();
             let mut descriptions = Vec::new();
-            for (asset, href) in &hrefs {
+            for (spec, href) in &hrefs {
                 let cog = engine.store.open_uri(href).await?;
                 let pt = match query_point(&engine, &cog, lon, lat, unscale, nodata).await {
                     Ok(pt) => pt,
@@ -2325,10 +2562,20 @@ async fn point_values(
                     Err(EngineError::NotFound(_)) => return Ok((idx, None)),
                     Err(e) => return Err(e),
                 };
-                for (i, v) in pt["values"].as_array().into_iter().flatten().enumerate() {
-                    values.push(v.clone());
-                    descriptions.push(format!("{asset}_b{}", i + 1));
-                }
+                // Every band of the asset under the point, then what the asset's options
+                // make of them.
+                let bands: Vec<f64> = pt["values"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_f64().unwrap_or(f64::NAN))
+                    .collect();
+                let (plan, described) =
+                    asset_bands(spec, bands.len(), as_band).map_err(EngineError::BadRequest)?;
+                let mut out = Vec::new();
+                plan.pixel(&bands, &mut out);
+                values.extend(out.into_iter().map(|v| if v.is_nan() { Value::Null } else { json!(v) }));
+                descriptions.extend(described);
             }
             let mut band_names: Vec<String> = (1..=values.len()).map(|i| format!("b{i}")).collect();
             if let Some(expression) = &expression {
@@ -2378,6 +2625,10 @@ async fn tile(
         Ok(q) => q,
         Err(r) => return r,
     };
+    let names = match renderer_assets(&mut pq, &query) {
+        Ok(names) => names,
+        Err(r) => return r,
+    };
     let items = match tile_items(pg, id, tile, query.limits).await {
         Ok(items) => items,
         Err(r) => return r,
@@ -2388,8 +2639,8 @@ async fn tile(
 
     let mut scenes: Vec<Vec<String>> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
     for item in items.iter().take(MAX_SCENES_PER_TILE) {
-        let mut hrefs = Vec::with_capacity(pq.assets.len());
-        for asset in &pq.assets {
+        let mut hrefs = Vec::with_capacity(names.len());
+        for asset in &names {
             match item.asset_href(asset) {
                 Some(href) => hrefs.push(href.to_string()),
                 None => return unknown_asset(asset, item),
@@ -2406,10 +2657,8 @@ async fn tile(
         ext.to_string()
     };
     let auto_format = explicit.is_empty();
-    if let Some(expr) = pq.expr_raw.take() {
-        pq.expr_raw = Some(rewrite_stac_expr(&expr, &pq.assets));
-    }
     let (resampling, reproject) = (query.resampling, query.reproject);
+    let asset_as_band = query.asset_as_band;
     let return_mask = pq.return_mask;
     let jpeg_quality = pq.jpeg_quality;
     let engine = ctx.engine;
@@ -2419,6 +2668,9 @@ async fn tile(
         .get_or_render(cache_key, || async {
             let first = engine.store.open_uri(&scenes[0][0]).await?;
             let full = first.index.full_res();
+            if asset_as_band && full.samples_per_pixel > 1 {
+                return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
+            }
             let default_bands = if scenes[0].len() > 1 {
                 scenes[0].len() as u16
             } else {
@@ -3808,6 +4060,90 @@ mod tests {
         approx_scanline(&broken, &mut out);
         assert!(out[10].0.is_nan());
         assert_eq!(out[60], (60.0, 1.0));
+    }
+
+    #[test]
+    fn assets_take_titilers_options() {
+        let parse = |q: &str| parse_assets(&query_pairs(q));
+        let spec = |name: &str, indexes: Option<Vec<u16>>, expression: Option<&str>| AssetSpec {
+            name: name.into(),
+            indexes,
+            expression: expression.map(str::to_string),
+        };
+        assert_eq!(parse("assets=red&assets=nir").unwrap(), [spec("red", None, None), spec("nir", None, None)]);
+        // Options keep their commas; a plain entry may still list names with them.
+        assert_eq!(
+            parse("assets=visual%7Cbidx%3D3,2,1&assets=red,nir").unwrap(),
+            [spec("visual", Some(vec![3, 2, 1]), None), spec("red", None, None), spec("nir", None, None)]
+        );
+        assert_eq!(
+            parse("assets=red%7Cexpression%3Db1*2%7Cnope%3D1%7Cbands%3Dx").unwrap(),
+            [spec("red", None, Some("b1*2"))]
+        );
+        for bad in ["assets=visual%7Cbidx", "assets=visual%7Cbidx%3Dx", "assets=visual%7Cbidx%3D1,"] {
+            assert_eq!(parse(bad).unwrap_err().status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        }
+        assert_eq!(parse("assets=%7Cbidx%3D1").unwrap_err().status(), StatusCode::BAD_REQUEST);
+
+        // What an asset gives, and how it is described.
+        let pixel = |spec: &AssetSpec, as_band: bool| {
+            let (plan, described) = asset_bands(spec, 3, as_band)?;
+            let mut out = Vec::new();
+            plan.pixel(&[109.0, 79.0, 46.0], &mut out);
+            Ok::<_, String>((out, described))
+        };
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(pixel(&spec("visual", None, None), false).unwrap(), (vec![109.0, 79.0, 46.0], names(&["visual_b1", "visual_b2", "visual_b3"])));
+        assert_eq!(pixel(&spec("visual", Some(vec![3, 1]), None), false).unwrap(), (vec![46.0, 109.0], names(&["visual_b3", "visual_b1"])));
+        assert_eq!(pixel(&spec("visual", None, Some("b1+b2;b3")), false).unwrap(), (vec![188.0, 46.0], names(&["visual_b1+b2", "visual_b3"])));
+        // Band math wins over band indexes, and sees the asset's own bands.
+        assert_eq!(pixel(&spec("visual", Some(vec![3]), Some("b1*2")), false).unwrap().0, [218.0]);
+        assert_eq!(pixel(&spec("visual", Some(vec![2]), None), true).unwrap(), (vec![79.0], names(&["visual"])));
+        assert_eq!(pixel(&spec("visual", None, None), true).unwrap_err(), "Can't use `asset_as_band` for multibands asset");
+        assert_eq!(pixel(&spec("visual", Some(vec![9]), None), false).unwrap_err(), "band index 9 out of range (not in (1, 2, 3))");
+        assert_eq!(asset_bands(&spec("red", Some(vec![0]), None), 1, false).err().unwrap(), "band index 0 out of range (not in (1,))");
+        // Whole planes go the same way.
+        let (plan, _) = asset_bands(&spec("v", None, Some("b2/b1")), 2, false).unwrap();
+        let planes = plan.planes(&[vec![2.0, 0.0], vec![1.0, 1.0]]);
+        assert_eq!(planes[0][0], 0.5);
+        assert!(planes[0][1].is_nan());
+    }
+
+    #[test]
+    fn the_renderer_gets_what_it_can_draw() {
+        let run = |q: &str| {
+            let mut pq = super::super::parse_query(Some(q));
+            let pairs = query_pairs(q);
+            let query = check_mosaic_query(&pq, &pairs).map_err(|r| r.status())?;
+            let names = renderer_assets(&mut pq, &query).map_err(|r| r.status())?;
+            Ok::<_, StatusCode>((names, pq.bidx, pq.expr_raw, query.asset_as_band))
+        };
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(run("assets=visual").unwrap(), (names(&["visual"]), vec![], None, false));
+        // A bare `bidx` is passed over, as in TiTiler 2; an asset's own is used.
+        assert_eq!(run("assets=visual&bidx=2").unwrap().1, Vec::<u16>::new());
+        assert_eq!(run("assets=visual%7Cbidx%3D3,2,1").unwrap(), (names(&["visual"]), vec![3, 2, 1], None, false));
+        assert_eq!(run("assets=red%7Cexpression%3Db1*2").unwrap().2.as_deref(), Some("b1*2"));
+        assert_eq!(
+            run("assets=red%7Cbidx%3D1&assets=nir&asset_as_band=true&expression=b2-b1").unwrap(),
+            (names(&["red", "nir"]), vec![], Some("b2-b1".to_string()), true)
+        );
+        // Band math is over b1..bn; asset names are refused as TiTiler refuses them.
+        assert_eq!(run("assets=red&assets=nir&expression=nir-red").unwrap_err(), StatusCode::BAD_REQUEST);
+        // What the renderer cannot draw yet is refused, not drawn differently.
+        for q in [
+            "assets=visual%7Cbidx%3D2&assets=nir",
+            "assets=visual%7Cbidx%3D1,2",
+            "assets=visual%7Cbidx%3D1&expression=b1*2",
+            "assets=visual%7Cexpression%3Db1;b2",
+            "assets=red%7Cexpression%3Db1*2&assets=nir",
+            "assets=red%7Cexpression%3Db1*2&expression=b1%2B1",
+        ] {
+            assert_eq!(run(q).unwrap_err(), StatusCode::BAD_REQUEST, "{q}");
+        }
+        assert_eq!(run("assets=red&asset_as_band=perhaps").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
+        // An `assets` that names nothing is a missing parameter.
+        assert_eq!(run("assets=,").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
