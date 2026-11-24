@@ -590,6 +590,11 @@ def main() -> int:
         o.check("feature, format=jpg", "image", f"/searches/{sid}/feature?assets=visual&max_size=128&format=jpg", "POST", triangle)
         o.check("feature without assets", "json", f"/searches/{sid}/feature.png", "POST", triangle)
         o.check("collection feature", "image", f"/collections/{collection}/feature.png?assets=visual&max_size=256", "POST", triangle)
+        o.check("feature, a bare geometry", "status", f"/searches/{sid}/feature.png?assets=visual&max_size=64", "POST", triangle["geometry"])
+        o.check("feature, an empty object", "status", f"/searches/{sid}/feature/64x64.png?assets=visual", "POST", {})
+        o.check("feature, a feature collection", "status", f"/searches/{sid}/feature?assets=visual&max_size=64", "POST",
+                {"type": "FeatureCollection", "features": [triangle]})
+        o.check("collection feature, an empty object", "status", f"/collections/{collection}/feature.png?assets=visual&max_size=64", "POST", {})
 
         print("statistics under features")
         five = {"type": "Feature", "properties": {"name": "five sides"}, "geometry": {"type": "Polygon", "coordinates": [[
