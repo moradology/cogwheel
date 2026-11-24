@@ -624,19 +624,24 @@ async fn lean_lookup_lists_the_items_a_picture_samples() {
         eprintln!("COGZILLA_TEST_DATABASE_URL not set; skipping lean lookup test");
         return;
     };
+    // The same items twice: in a collection with a partition per month, so the walk crosses
+    // chunks, and in one left as pgSTAC makes it, a single partition whose chunk runs
+    // from minus infinity to infinity.
     let cid = "cogzilla-test-lean";
+    let flat = "cogzilla-test-lean-flat";
     let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
     tokio::spawn(conn);
-    let collection = json!({
-        "id": cid, "type": "Collection", "stac_version": "1.0.0",
-        "description": "cogzilla lean lookup test", "license": "proprietary", "links": [],
-        "extent": { "spatial": { "bbox": [[-1.0, -1.0, 11.0, 11.0]] }, "temporal": { "interval": [[null, null]] } }
-    });
-    db.execute("SELECT pgstac.delete_collection($1)", &[&cid]).await.ok();
-    db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()]).await.unwrap();
-    // A partition per month, so the walk crosses chunks.
+    for id in [cid, flat] {
+        let collection = json!({
+            "id": id, "type": "Collection", "stac_version": "1.0.0",
+            "description": "cogzilla lean lookup test", "license": "proprietary", "links": [],
+            "extent": { "spatial": { "bbox": [[-1.0, -1.0, 11.0, 11.0]] }, "temporal": { "interval": [[null, null]] } }
+        });
+        db.execute("SELECT pgstac.delete_collection($1)", &[&id]).await.ok();
+        db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()]).await.unwrap();
+    }
     db.execute("UPDATE pgstac.collections SET partition_trunc = 'month' WHERE id = $1", &[&cid]).await.unwrap();
-    let item = |id: &str, day: &str, [w, s, e, n]: [f64; 4], assets: Value| {
+    let item = |cid: &str, id: &str, day: &str, [w, s, e, n]: [f64; 4], assets: Value| {
         json!({
             "type": "Feature", "stac_version": "1.0.0", "id": id, "collection": cid,
             "bbox": [w, s, e, n],
@@ -646,15 +651,17 @@ async fn lean_lookup_lists_the_items_a_picture_samples() {
         })
     };
     let visual = |name: &str| json!({ "visual": { "href": format!("https://example.invalid/lean/{name}.tif") } });
-    for doc in [
-        item("lean-a", "2024-06-05", [-1.0, -1.0, 5.0, 11.0], visual("a")),
-        // With 50 sample columns over ten degrees the samples sit at 0.1, 0.3, ...: this strip
-        // holds none of them, and pgSTAC keeps it for its area.
-        item("lean-b", "2024-06-04", [5.12, 0.0, 5.28, 10.0], visual("b")),
-        item("lean-c", "2024-05-20", [5.0, -1.0, 11.0, 11.0], visual("c")),
-        item("lean-d", "2024-04-01", [-1.0, -1.0, 11.0, 11.0], json!({ "other": { "href": "https://example.invalid/lean/d.tif" } })),
-    ] {
-        db.execute("SELECT pgstac.upsert_item($1::text::jsonb)", &[&doc.to_string()]).await.unwrap();
+    for id in [cid, flat] {
+        for doc in [
+            item(id, "lean-a", "2024-06-05", [-1.0, -1.0, 5.0, 11.0], visual("a")),
+            // With 50 sample columns over ten degrees the samples sit at 0.1, 0.3, ...: this
+            // strip holds none of them, and pgSTAC keeps it for its area.
+            item(id, "lean-b", "2024-06-04", [5.12, 0.0, 5.28, 10.0], visual("b")),
+            item(id, "lean-c", "2024-05-20", [5.0, -1.0, 11.0, 11.0], visual("c")),
+            item(id, "lean-d", "2024-04-01", [-1.0, -1.0, 11.0, 11.0], json!({ "other": { "href": "https://example.invalid/lean/d.tif" } })),
+        ] {
+            db.execute("SELECT pgstac.upsert_item($1::text::jsonb)", &[&doc.to_string()]).await.unwrap();
+        }
     }
 
     let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
@@ -694,6 +701,23 @@ async fn lean_lookup_lists_the_items_a_picture_samples() {
     assert_eq!(ids(&aside), ["lean-a", "lean-b", "lean-c"]);
     assert!(aside[0]["bbox"].is_array());
 
+    // The collection in one partition answers the same.
+    let flat_box = format!("{base}/collections/{flat}/bbox/0,0,10,10/assets");
+    assert_eq!(ids(&get_json(&client, flat_box.clone()).await), ["lean-a", "lean-b", "lean-c"]);
+    let flat_lean = get_json(&client, format!("{flat_box}?item_lookup=lean&width=10&height=10&assets=visual")).await;
+    assert_eq!(ids(&flat_lean), ["lean-a", "lean-c"]);
+    assert_eq!(flat_lean[0]["assets"]["visual"]["href"], "https://example.invalid/lean/a.tif");
+    let flat_point = get_json(&client, format!("{base}/collections/{flat}/point/2,2/assets?item_lookup=lean")).await;
+    assert_eq!(ids(&flat_point), ["lean-a", "lean-d"]);
+    // An odd number of rows puts samples on the line through the middle of the box, and
+    // footprints that meet there still fill it: two halves, top and bottom.
+    for (name, day, bounds) in [("lean-n", "2024-07-02", [-1.0, 5.0, 11.0, 11.0]), ("lean-s", "2024-07-01", [-1.0, -1.0, 11.0, 5.0])] {
+        let doc = item(flat, name, day, bounds, visual(name));
+        db.execute("SELECT pgstac.upsert_item($1::text::jsonb)", &[&doc.to_string()]).await.unwrap();
+    }
+    let halves = get_json(&client, format!("{flat_box}?item_lookup=lean&width=9&height=9")).await;
+    assert_eq!(ids(&halves), ["lean-n", "lean-s"]);
+
     // A point has no area to cover: every item under it, newest first.
     let point = get_json(&client, format!("{base}/collections/{cid}/point/2,2/assets?item_lookup=lean")).await;
     assert_eq!(ids(&point), ["lean-a", "lean-d"]);
@@ -725,5 +749,7 @@ async fn lean_lookup_lists_the_items_a_picture_samples() {
         assert_eq!(resp.status().as_u16(), 400, "{path}");
     }
 
-    db.execute("SELECT pgstac.delete_collection($1)", &[&cid]).await.unwrap();
+    for id in [cid, flat] {
+        db.execute("SELECT pgstac.delete_collection($1)", &[&id]).await.unwrap();
+    }
 }

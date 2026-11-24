@@ -265,9 +265,11 @@ impl Coverage {
             if top.is_nan() || bottom.is_nan() || top < bottom || left.is_nan() || right.is_nan() {
                 continue;
             }
-            // Rows run north to south: the first at or below `top`, up to the last above `bottom`.
-            let first = self.row_lat.partition_point(|lat| *lat > top);
-            let end = self.row_lat.partition_point(|lat| *lat > bottom);
+            // Rows run north to south. A sample is inside from the bottom edge up to, but not
+            // on, the top one, the same half-open rule the crossings below follow: a row on
+            // the edge two footprints share belongs to the upper one and to no other.
+            let first = self.row_lat.partition_point(|lat| *lat >= top);
+            let end = self.row_lat.partition_point(|lat| *lat >= bottom);
             // The words the polygon's extent reaches into.
             let column = |x: f64| ((x - self.west) / self.dx - 0.5).ceil().clamp(0.0, self.cols as f64) as usize;
             let (from, to) = (column(left), column(right));
@@ -337,6 +339,7 @@ fn is_box(area: &[Polygon], [west, south, east, north]: [f64; 4]) -> bool {
     let corners = if closed { &ring[..4] } else { ring.as_slice() };
     corners.len() == 4
         && corners.iter().all(|p| (p.0 == west || p.0 == east) && (p.1 == south || p.1 == north))
+        && (0..4).all(|i| (0..i).all(|j| corners[i] != corners[j]))
         // Neighbours share exactly one coordinate, which rules out a bow-tie through the corners.
         && (0..4).all(|i| {
             let (a, b) = (corners[i], corners[(i + 1) % 4]);
@@ -377,6 +380,35 @@ mod tests {
         // The other half shares the edge at x = 5: no sample is counted twice or missed.
         assert_eq!(cover.add(&[square(5.0, -5.0, 15.0, 15.0)]), 50);
         assert!(cover.is_full());
+    }
+
+    #[test]
+    fn a_row_of_samples_on_a_shared_edge_belongs_to_one_side() {
+        // Ten rows put samples at 9.5, 8.5, ...: two footprints that meet at 4.5 meet on a row.
+        let mut cover = Coverage::new(&[square(0.0, 0.0, 10.0, 10.0)], grid(10)).unwrap();
+        assert_eq!(cover.add(&[square(0.0, 4.5, 10.0, 15.0)]), 60);
+        assert_eq!(cover.add(&[square(0.0, -5.0, 10.0, 4.5)]), 40);
+        assert!(cover.is_full());
+        // An odd number of rows puts one on the middle of the box.
+        let mut cover = Coverage::new(&[square(0.0, 0.0, 10.0, 10.0)], grid(3)).unwrap();
+        assert_eq!(cover.add(&[square(0.0, -5.0, 10.0, 5.0)]), 3);
+        assert_eq!(cover.add(&[square(0.0, 5.0, 10.0, 15.0)]), 6);
+        assert!(cover.is_full());
+        // And the same for columns.
+        let mut cover = Coverage::new(&[square(0.0, 0.0, 10.0, 10.0)], grid(3)).unwrap();
+        assert_eq!(cover.add(&[square(-5.0, 0.0, 5.0, 10.0)]) + cover.add(&[square(5.0, 0.0, 15.0, 10.0)]), 9);
+        assert!(cover.is_full());
+    }
+
+    #[test]
+    fn a_ring_through_the_corners_is_not_always_the_box() {
+        let bounds = [0.0, 0.0, 10.0, 10.0];
+        assert!(is_box(&[square(0.0, 0.0, 10.0, 10.0)], bounds));
+        // Out along one side and back: the same extent, no area.
+        let folded: Polygon = vec![vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (10.0, 0.0), (0.0, 0.0)]];
+        assert!(!is_box(&[folded], bounds));
+        let bow_tie: Polygon = vec![vec![(0.0, 0.0), (10.0, 10.0), (10.0, 0.0), (0.0, 10.0), (0.0, 0.0)]];
+        assert!(!is_box(&[bow_tie], bounds));
     }
 
     #[test]

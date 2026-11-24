@@ -556,36 +556,12 @@ impl PgStac {
             Lookup::Configured => match self.lean_mode {
                 LeanMode::On => true,
                 LeanMode::Off => false,
-                LeanMode::Auto => *self
-                    .lean_checked
-                    .get_or_try_init(|| async { self.version().await.map(|v| lean_checked_version(&v)) })
-                    .await?,
+                LeanMode::Auto => self.lean_checked().await,
             },
         };
-        if lean {
-            match self.lean_items(geometry, search_hash, limits, assets, grid).await {
-                Ok(Some(items)) => return Ok(items),
-                Ok(None) => {}
-                Err(e) => {
-                    use std::sync::atomic::Ordering;
-                    if !self.lean_warned.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(error = %e, "lean pgSTAC lookup failed; answering with geojsonsearch");
-                    }
-                }
-            }
+        if !lean {
+            return self.items_for_geometry(geometry, search_hash, limits).await;
         }
-        self.items_for_geometry(geometry, search_hash, limits).await
-    }
-
-    /// `None` when the lean lookup stands aside.
-    async fn lean_items(
-        &self,
-        geometry: &Value,
-        search_hash: &str,
-        limits: SearchLimits,
-        assets: &[String],
-        grid: Option<SampleGrid>,
-    ) -> Result<Option<Arc<Vec<MosaicItem>>>, PgStacError> {
         let key = self.items.as_ref().map(|_| {
             format!(
                 "lean|{search_hash}|{}|{}|{}|{}|{}|{grid:?}|{assets:?}|{geometry}",
@@ -599,13 +575,68 @@ impl PgStac {
         if let (Some(cache), Some(key)) = (&self.items, &key)
             && let Some(hit) = cache.get(key)
         {
-            return Ok(Some(hit));
+            return Ok(hit);
         }
+        let items = match self.lean_items(geometry, search_hash, limits, assets, grid).await {
+            Ok(Some(items)) => Arc::new(items),
+            Ok(None) => self.items_for_geometry(geometry, search_hash, limits).await?,
+            // No connection to be had: the reference path would only wait for one again.
+            Err(e @ PgStacError::Unavailable(_)) => return Err(e),
+            Err(e) => {
+                use std::sync::atomic::Ordering;
+                if self.lean_warned.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(error = %e, "lean pgSTAC lookup failed; answering with geojsonsearch");
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        "lean pgSTAC lookup failed; answering with geojsonsearch (later failures are logged at debug)"
+                    );
+                }
+                self.items_for_geometry(geometry, search_hash, limits).await?
+            }
+        };
+        // Whichever path answered, the answer is kept under this request's key, so one the
+        // lean lookup cannot answer does not walk again on every repeat.
+        if let (Some(cache), Some(key)) = (&self.items, key) {
+            cache.put(key, items.clone());
+        }
+        Ok(items)
+    }
+
+    /// Whether the installed pgSTAC is a version the lean lookup was checked against. A
+    /// version that cannot be read is not one, and the reference path serves the request.
+    async fn lean_checked(&self) -> bool {
+        if let Some(known) = self.lean_checked.get() {
+            return *known;
+        }
+        let (checked, settled) = match self.version().await {
+            Ok(version) => (lean_checked_version(&version), true),
+            // The database answered and there is no version to read: that will not change.
+            Err(PgStacError::Shape(_)) => (false, true),
+            Err(PgStacError::Db(e)) if e.as_db_error().is_some() => (false, true),
+            // The database could not be reached: ask again next time.
+            Err(_) => (false, false),
+        };
+        if settled {
+            let _ = self.lean_checked.set(checked);
+        }
+        checked
+    }
+
+    /// `None` when the lean lookup stands aside.
+    async fn lean_items(
+        &self,
+        geometry: &Value,
+        search_hash: &str,
+        limits: SearchLimits,
+        assets: &[String],
+        grid: Option<SampleGrid>,
+    ) -> Result<Option<Vec<MosaicItem>>, PgStacError> {
         // An unknown search is the reference path's error to raise.
         let Some(search) = self.get_search_cached(search_hash).await? else {
             return Ok(None);
         };
-        let client = self.client().await?;
+        let mut client = self.client().await?;
         let plan = match self.plans.as_ref().and_then(|c| c.get(search_hash)) {
             Some(plan) => plan,
             None => {
@@ -616,14 +647,8 @@ impl PgStac {
                 plan
             }
         };
-        match plan.items(&client, geometry, limits, assets, grid).await? {
-            lean::Outcome::Items(items) => {
-                let items = Arc::new(items);
-                if let (Some(cache), Some(key)) = (&self.items, key) {
-                    cache.put(key, items.clone());
-                }
-                Ok(Some(items))
-            }
+        match plan.items(&mut client, geometry, limits, assets, grid).await? {
+            lean::Outcome::Items(items) => Ok(Some(items)),
             lean::Outcome::Aside(why) => {
                 tracing::debug!(?why, "lean pgSTAC lookup stood aside");
                 Ok(None)
