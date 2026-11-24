@@ -111,12 +111,15 @@ unsafe fn bilinear_row_flat_neon<const N: usize>(
     base_col: u32,
     row0_ptr: *const f32,
     row1_ptr: *const f32,
+    max_x: i32,
     fy: f32,
     out_row: &mut [f32],
 ) {
     use std::arch::aarch64::*;
     let v_fy = unsafe { vdupq_n_f32(fy) };
     let v_base = unsafe { vdupq_n_f32(base_col as f32) };
+    let v_zero = unsafe { vdupq_n_s32(0) };
+    let v_max_x = unsafe { vdupq_n_s32(max_x) };
     let mut px = 0usize;
 
     while px + 4 <= N {
@@ -124,7 +127,7 @@ unsafe fn bilinear_row_flat_neon<const N: usize>(
             let u = vsubq_f32(vld1q_f32(u_coords.as_ptr().add(px)), v_base);
             let x0_f = vrndmq_f32(u);
             let fx = vsubq_f32(u, x0_f);
-            let x0_i = vcvtq_s32_f32(x0_f);
+            let x0_i = vminq_s32(vmaxq_s32(vcvtq_s32_f32(x0_f), v_zero), v_max_x);
 
             let c0 = vgetq_lane_s32::<0>(x0_i) as usize;
             let c1 = vgetq_lane_s32::<1>(x0_i) as usize;
@@ -158,6 +161,21 @@ unsafe fn bilinear_row_flat_neon<const N: usize>(
         }
         px += 4;
     }
+    let bc_f = base_col as f32;
+    while px < N {
+        let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc_f);
+        let c = x0_raw.clamp(0, max_x) as usize;
+        unsafe {
+            let v00 = *row0_ptr.add(c);
+            let v10 = *row0_ptr.add(c + 1);
+            let v01 = *row1_ptr.add(c);
+            let v11 = *row1_ptr.add(c + 1);
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        }
+        px += 1;
+    }
 }
 
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for flat single-block `Separable1D + CleanFastPath`.
@@ -170,12 +188,15 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
     base_col: u32,
     row0_ptr: *const f32,
     row1_ptr: *const f32,
+    max_x: i32,
     fy: f32,
     out_row: &mut [f32],
 ) {
     use std::arch::x86_64::*;
     let v_fy = _mm256_set1_ps(fy);
     let v_base = _mm256_set1_ps(base_col as f32);
+    let v_zero = _mm256_setzero_si256();
+    let v_max_x = _mm256_set1_epi32(max_x);
     let mut idxs = [0i32; 8];
     let mut px = 0usize;
 
@@ -222,7 +243,7 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
         let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_base);
         let x0_f = _mm256_floor_ps(u);
         let fx = _mm256_sub_ps(u, x0_f);
-        let idx = _mm256_cvtps_epi32(x0_f);
+        let idx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero), v_max_x);
         _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
 
         let (v00, v10) = load_8_pairs!(row0_ptr);
@@ -235,6 +256,19 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
         _mm256_storeu_ps(out_row.as_mut_ptr().add(px), res);
         px += 8;
     }
+    let bc_f = base_col as f32;
+    while px < N {
+        let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc_f);
+        let c = x0_raw.clamp(0, max_x) as usize;
+        let v00 = *row0_ptr.add(c);
+        let v10 = *row0_ptr.add(c + 1);
+        let v01 = *row1_ptr.add(c);
+        let v11 = *row1_ptr.add(c + 1);
+        let top = v00 + (v10 - v00) * fx;
+        let bot = v01 + (v11 - v01) * fx;
+        *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        px += 1;
+    }
 }
 
 #[inline(always)]
@@ -246,10 +280,23 @@ fn bilinear_row_flat_dispatch<const N: usize>(
     fy: f32,
     out_row: &mut [f32],
 ) {
+    let row_len = row0.len().min(row1.len());
+    if row_len < 2 || out_row.len() < N {
+        return;
+    }
+    let max_x = (row_len as i32) - 2;
     #[cfg(target_arch = "aarch64")]
     {
         unsafe {
-            bilinear_row_flat_neon::<N>(u_coords, base_col, row0.as_ptr(), row1.as_ptr(), fy, out_row);
+            bilinear_row_flat_neon::<N>(
+                u_coords,
+                base_col,
+                row0.as_ptr(),
+                row1.as_ptr(),
+                max_x,
+                fy,
+                out_row,
+            );
         }
         return;
     }
@@ -257,7 +304,15 @@ fn bilinear_row_flat_dispatch<const N: usize>(
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             unsafe {
-                bilinear_row_flat_avx2::<N>(u_coords, base_col, row0.as_ptr(), row1.as_ptr(), fy, out_row);
+                bilinear_row_flat_avx2::<N>(
+                    u_coords,
+                    base_col,
+                    row0.as_ptr(),
+                    row1.as_ptr(),
+                    max_x,
+                    fy,
+                    out_row,
+                );
             }
             return;
         }
@@ -572,18 +627,32 @@ pub fn wrap_raw_f32_as_npy(raw: Bytes, bands: usize, height: u32, width: u32) ->
 }
 
 pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) -> Bytes {
+    use std::sync::OnceLock;
     match format {
         OutputFormat::Png => empty_transparent_png(tile_size),
         OutputFormat::Webp { .. } => empty_transparent_webp(tile_size),
         OutputFormat::Jpeg { .. } => empty_black_jpeg(tile_size),
         OutputFormat::RawF32 => {
-            let count = (tile_size as usize) * (tile_size as usize) * num_bands;
-            let mut buf = BytesMut::with_capacity(count * 4);
-            let nan_bytes = f32::NAN.to_le_bytes();
-            for _ in 0..count {
-                buf.put_slice(&nan_bytes);
+            let build = |sz: u32, nb: usize| -> Bytes {
+                let count = (sz as usize) * (sz as usize) * nb;
+                let mut buf = BytesMut::with_capacity(count * 4);
+                let nan_bytes = f32::NAN.to_le_bytes();
+                for _ in 0..count {
+                    buf.put_slice(&nan_bytes);
+                }
+                buf.freeze()
+            };
+            static F32_256_1: OnceLock<Bytes> = OnceLock::new();
+            static F32_256_3: OnceLock<Bytes> = OnceLock::new();
+            static F32_512_1: OnceLock<Bytes> = OnceLock::new();
+            static F32_512_3: OnceLock<Bytes> = OnceLock::new();
+            match (tile_size, num_bands) {
+                (256, 1) => F32_256_1.get_or_init(|| build(256, 1)).clone(),
+                (256, 3) => F32_256_3.get_or_init(|| build(256, 3)).clone(),
+                (512, 1) => F32_512_1.get_or_init(|| build(512, 1)).clone(),
+                (512, 3) => F32_512_3.get_or_init(|| build(512, 3)).clone(),
+                _ => build(tile_size, num_bands),
             }
-            buf.freeze()
         }
         OutputFormat::Npy => {
             let hdr = encode_npy_f32_header(num_bands, tile_size, tile_size);
@@ -596,7 +665,15 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
             }
             buf.freeze()
         }
-        OutputFormat::RawRgba => Bytes::from(vec![0u8; (tile_size as usize) * (tile_size as usize) * 4]),
+        OutputFormat::RawRgba => {
+            static RGBA_256: OnceLock<Bytes> = OnceLock::new();
+            static RGBA_512: OnceLock<Bytes> = OnceLock::new();
+            match tile_size {
+                256 => RGBA_256.get_or_init(|| Bytes::from(vec![0u8; 256 * 256 * 4])).clone(),
+                512 => RGBA_512.get_or_init(|| Bytes::from(vec![0u8; 512 * 512 * 4])).clone(),
+                _ => Bytes::from(vec![0u8; (tile_size as usize) * (tile_size as usize) * 4]),
+            }
+        }
     }
 }
 
@@ -2589,6 +2666,7 @@ pub fn render_expr_vm<const N: usize>(
     };
 
     let mut band_rows = vec![[0.0f32; N]; nb];
+    let mut expr_scratch: Vec<[f32; N]> = Vec::new();
     let mut out_row = [0.0f32; N];
 
     match style.format {
@@ -2596,7 +2674,7 @@ pub fn render_expr_vm<const N: usize>(
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 sample_row(py, &mut band_rows);
-                prog.eval_row::<N>(&band_rows, &mut out_row);
+                prog.eval_row_with_scratch::<N>(&band_rows, &mut expr_scratch, &mut out_row);
                 for &v in &out_row {
                     out.put_slice(&v.to_le_bytes());
                 }
@@ -2619,7 +2697,7 @@ pub fn render_expr_vm<const N: usize>(
                 }
                 for py in 0..N {
                     sample_row(py, &mut band_rows);
-                    prog.eval_row::<N>(&band_rows, &mut out_row);
+                    prog.eval_row_with_scratch::<N>(&band_rows, &mut expr_scratch, &mut out_row);
                     let row_idx = &mut sc.row_buf[..N];
                     for px in 0..N {
                         let val = out_row[px];
@@ -2653,7 +2731,7 @@ pub fn render_expr_vm<const N: usize>(
                 let buf = &mut sc.img_buf[..total];
                 for py in 0..N {
                     sample_row(py, &mut band_rows);
-                    prog.eval_row::<N>(&band_rows, &mut out_row);
+                    prog.eval_row_with_scratch::<N>(&band_rows, &mut expr_scratch, &mut out_row);
                     let row_off = py * N * 4;
                     for px in 0..N {
                         let val = out_row[px];
@@ -2721,7 +2799,11 @@ pub fn render_terrain_tile<const N: usize>(
     format: OutputFormat,
 ) -> Bytes {
     if src.all_nodata {
-        let nb = if format == OutputFormat::RawF32 { 1 } else { 3 };
+        let nb = if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
+            1
+        } else {
+            3
+        };
         return empty_tile_bytes(N as u32, format, nb);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();

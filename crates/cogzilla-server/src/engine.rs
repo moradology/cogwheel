@@ -1540,6 +1540,60 @@ impl TileEngine {
             _ => 1,
         };
 
+        // Helper to fold a scene's GDAL scale/offset into Single/Rgb rescale bounds when `?unscale=true`.
+        let fold_scene_unscale = |cog: &OpenedCog, base: &TileRequest| -> TileRequest {
+            if base.unscale
+                && matches!(
+                    base.bands,
+                    BandRequest::Single { .. } | BandRequest::Rgb { .. }
+                )
+            {
+                let mut sr = base.clone();
+                let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+                    let i = b1.saturating_sub(1) as usize;
+                    let sc = cog.index.scales.get(i).copied().unwrap_or(1.0);
+                    let off = cog.index.offsets.get(i).copied().unwrap_or(0.0);
+                    if ((sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9) || sc.abs() < 1e-12 {
+                        (mn, mx)
+                    } else {
+                        ((mn - off) / sc, (mx - off) / sc)
+                    }
+                };
+                match &mut sr.bands {
+                    BandRequest::Single {
+                        band_1based,
+                        rescale,
+                        ..
+                    } => {
+                        *rescale = adj(*band_1based, rescale.0, rescale.1);
+                    }
+                    BandRequest::Rgb {
+                        bands_1based,
+                        rescale_min,
+                        rescale_max,
+                    } => {
+                        for k in 0..3 {
+                            let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                            rescale_min[k] = mn;
+                            rescale_max[k] = mx;
+                        }
+                    }
+                    _ => {}
+                }
+                sr
+            } else {
+                base.clone()
+            }
+        };
+
+        // 1-scene fast path: skip canvas allocation, pixel compositing, and re-encoding so single-scene
+        // mosaic tiles keep zero-decode JPEG/WebP passthrough and 8-bit indexed PLTE PNG encoding!
+        if urls.len() == 1 {
+            let cog = self.store.open_uri(&urls[0]).await?;
+            let scene_req = fold_scene_unscale(&cog, req);
+            return self.render_tile(&cog, &scene_req).await;
+        }
+
         // RawF32 / Npy mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
         // and early exit once every pixel has valid data.
         if matches!(req.format, OutputFormat::RawF32 | OutputFormat::Npy) {
@@ -1547,14 +1601,20 @@ impl TileEngine {
             let mut filled = 0usize;
             let mut scene_req = req.clone();
             scene_req.format = OutputFormat::RawF32;
+            let empty_f32_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
 
-            for url in urls {
+            for (scene_i, url) in urls.iter().enumerate() {
                 if filled >= total_pixels {
                     break;
                 }
+                if scene_i > 0 {
+                    tokio::task::consume_budget().await;
+                }
                 let cog = self.store.open_uri(url).await?;
                 let src = self.render_tile(&cog, &scene_req).await?;
-                if src.len() != f32_bands * total_pixels * 4 {
+                if src.len() != f32_bands * total_pixels * 4
+                    || src.as_ptr() == empty_f32_sentinel.as_ptr()
+                {
                     continue;
                 }
                 for i in 0..total_pixels {
@@ -1614,57 +1674,19 @@ impl TileEngine {
 
         let mut base_scene_req = req.clone();
         base_scene_req.format = OutputFormat::RawRgba;
+        let empty_rgba_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawRgba, 1);
 
-        for url in urls {
+        for (scene_i, url) in urls.iter().enumerate() {
             if filled >= total_pixels {
                 break;
             }
+            if scene_i > 0 {
+                tokio::task::consume_budget().await;
+            }
             let cog = self.store.open_uri(url).await?;
-            // Fold each scene's own GDAL scale/offset into Single/Rgb rescale bounds when
-            // `?unscale=true` so heterogeneous mosaic scenes unscale accurately at zero per-pixel cost.
-            let scene_req = if req.unscale
-                && matches!(
-                    base_scene_req.bands,
-                    BandRequest::Single { .. } | BandRequest::Rgb { .. }
-                ) {
-                let mut sr = base_scene_req.clone();
-                let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
-                    let i = b1.saturating_sub(1) as usize;
-                    let sc = cog.index.scales.get(i).copied().unwrap_or(1.0);
-                    let off = cog.index.offsets.get(i).copied().unwrap_or(0.0);
-                    if ((sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9) || sc.abs() < 1e-12 {
-                        (mn, mx)
-                    } else {
-                        ((mn - off) / sc, (mx - off) / sc)
-                    }
-                };
-                match &mut sr.bands {
-                    BandRequest::Single {
-                        band_1based,
-                        rescale,
-                        ..
-                    } => {
-                        *rescale = adj(*band_1based, rescale.0, rescale.1);
-                    }
-                    BandRequest::Rgb {
-                        bands_1based,
-                        rescale_min,
-                        rescale_max,
-                    } => {
-                        for k in 0..3 {
-                            let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
-                            rescale_min[k] = mn;
-                            rescale_max[k] = mx;
-                        }
-                    }
-                    _ => {}
-                }
-                sr
-            } else {
-                base_scene_req.clone()
-            };
+            let scene_req = fold_scene_unscale(&cog, &base_scene_req);
             let src = self.render_tile(&cog, &scene_req).await?;
-            if src.len() != total_pixels * 4 {
+            if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
                 continue;
             }
             for i in 0..total_pixels {

@@ -764,7 +764,7 @@ impl CogStore {
                 .max(1);
             let expected_bytes = (ifd.tile_width as usize)
                 .saturating_mul(ifd.tile_height as usize)
-                .saturating_mul(ifd.samples_per_pixel as usize)
+                .saturating_mul(bands_per_block)
                 .saturating_mul(ifd.sample_type.bytes_per_sample());
             const HEAVY_DECODE_BYTES: usize = 2 * 1024 * 1024;
             let heavy_block = expected_bytes > HEAVY_DECODE_BYTES;
