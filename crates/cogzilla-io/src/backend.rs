@@ -33,6 +33,19 @@ pub enum IoError {
     InvalidUri(String),
     #[error("location is not in COGZILLA_ALLOWED_URL_PREFIXES: {0}")]
     Forbidden(String),
+    #[error("{0}")]
+    Shared(Arc<IoError>),
+}
+
+impl IoError {
+    /// Unwrap any [`IoError::Shared`] singleflight wrapper to inspect the underlying cause.
+    pub fn root(&self) -> &IoError {
+        let mut cur = self;
+        while let IoError::Shared(inner) = cur {
+            cur = inner;
+        }
+        cur
+    }
 }
 
 #[derive(Default)]

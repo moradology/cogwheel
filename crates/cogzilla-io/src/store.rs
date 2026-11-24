@@ -117,12 +117,37 @@ pub struct OpenedCog {
     pub source: CogSource,
 }
 
+struct OpenFlight {
+    notify: tokio::sync::Notify,
+    outcome: std::sync::Mutex<Option<Result<Arc<OpenedCog>, Arc<IoError>>>>,
+}
+
+impl OpenFlight {
+    fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            outcome: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn take_outcome(&self) -> Option<Result<Arc<OpenedCog>, Arc<IoError>>> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_outcome(&self, res: Result<Arc<OpenedCog>, Arc<IoError>>) {
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+    }
+}
+
 enum OpenSlot {
     Ready {
         cog: Arc<OpenedCog>,
         last_used: AtomicU64,
     },
-    InFlight(Arc<tokio::sync::Notify>),
+    InFlight(Arc<OpenFlight>),
 }
 
 /// Manages opened COGs (local mmap + remote HTTP/S3) and the shared singleflight block cache.
@@ -214,7 +239,7 @@ impl CogStore {
             heavy_cpu_sem: Arc::new(tokio::sync::Semaphore::new(heavy_permits)),
             client,
             cloud_client,
-            s3_cfg: S3Config::from_env(),
+            s3_cfg: Some(S3Config::from_env_full()),
             metrics: Arc::new(IoMetrics::default()),
         }
     }
@@ -390,7 +415,7 @@ impl CogStore {
                 }
             }
 
-            let wait_notify = {
+            let wait_flight = {
                 use dashmap::mapref::entry::Entry;
                 match self.datasets_by_uri.entry(uri.to_string()) {
                     Entry::Occupied(occ) => match occ.get() {
@@ -398,35 +423,47 @@ impl CogStore {
                             last_used.store(self.uri_tick(), Ordering::Relaxed);
                             return Ok(cog.clone());
                         }
-                        OpenSlot::InFlight(n) => Some(n.clone()),
+                        OpenSlot::InFlight(f) => Some(f.clone()),
                     },
                     Entry::Vacant(vac) => {
-                        vac.insert(OpenSlot::InFlight(Arc::new(tokio::sync::Notify::new())));
+                        vac.insert(OpenSlot::InFlight(Arc::new(OpenFlight::new())));
                         None
                     }
                 }
             };
 
-            if let Some(notify) = wait_notify {
-                let fut = notify.notified();
+            if let Some(flight) = wait_flight {
+                let fut = flight.notify.notified();
                 tokio::pin!(fut);
                 fut.as_mut().enable();
+                if let Some(outcome) = flight.take_outcome() {
+                    return outcome.map_err(IoError::Shared);
+                }
                 match self.datasets_by_uri.get(uri) {
                     Some(existing) => match existing.value() {
                         OpenSlot::Ready { cog, last_used } => {
                             last_used.store(self.uri_tick(), Ordering::Relaxed);
                             return Ok(cog.clone());
                         }
-                        OpenSlot::InFlight(cur_n) if !Arc::ptr_eq(cur_n, &notify) => continue,
+                        OpenSlot::InFlight(cur_f) if !Arc::ptr_eq(cur_f, &flight) => continue,
                         OpenSlot::InFlight(_) => {}
                     },
-                    None => continue,
+                    None => {
+                        if let Some(outcome) = flight.take_outcome() {
+                            return outcome.map_err(IoError::Shared);
+                        }
+                        continue;
+                    }
                 }
                 fut.await;
+                if let Some(outcome) = flight.take_outcome() {
+                    return outcome.map_err(IoError::Shared);
+                }
                 continue;
             }
 
-            // We own the cold open; ensure abort on error or cancellation
+            // We own the cold open; ensure abort on cancellation (leaving outcome == None so a
+            // waiter takes over), while explicit open errors broadcast Err(Arc<IoError>) in 1 RTT.
             struct OpenAbortGuard<'a> {
                 map: &'a DashMap<String, OpenSlot, ahash::RandomState>,
                 uri: String,
@@ -435,11 +472,11 @@ impl CogStore {
             impl Drop for OpenAbortGuard<'_> {
                 fn drop(&mut self) {
                     if !self.done {
-                        if let Some((_, OpenSlot::InFlight(n))) = self
+                        if let Some((_, OpenSlot::InFlight(f))) = self
                             .map
                             .remove_if(&self.uri, |_, v| matches!(v, OpenSlot::InFlight(_)))
                         {
-                            n.notify_waiters();
+                            f.notify.notify_waiters();
                         }
                     }
                 }
@@ -450,100 +487,123 @@ impl CogStore {
                 done: false,
             };
 
-            let is_cloud_scheme = uri.starts_with("s3://")
-                || uri.starts_with("/vsis3/")
-                || uri.starts_with("gs://")
-                || uri.starts_with("/vsigs/")
-                || uri.starts_with("az://")
-                || uri.starts_with("abfs://")
-                || uri.starts_with("abfss://")
-                || uri.starts_with("/vsiaz/");
-            let source = CogSource::open_remote_limited(
-                uri,
-                if is_cloud_scheme {
-                    self.cloud_client.clone()
-                } else {
-                    self.client.clone()
-                },
-                self.s3_cfg.clone(),
-                self.metrics.clone(),
-                self.upstream_limiter.clone(),
-            )?;
+            let open_res: Result<Arc<OpenedCog>, IoError> = async {
+                let is_cloud_scheme = uri.starts_with("s3://")
+                    || uri.starts_with("/vsis3/")
+                    || uri.starts_with("gs://")
+                    || uri.starts_with("/vsigs/")
+                    || uri.starts_with("az://")
+                    || uri.starts_with("abfs://")
+                    || uri.starts_with("abfss://")
+                    || uri.starts_with("/vsiaz/");
+                let source = CogSource::open_remote_limited(
+                    uri,
+                    if is_cloud_scheme {
+                        self.cloud_client.clone()
+                    } else {
+                        self.client.clone()
+                    },
+                    self.s3_cfg.clone(),
+                    self.metrics.clone(),
+                    self.upstream_limiter.clone(),
+                )?;
 
-            let index = match &source {
-                CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
-                CogSource::RemoteS3 { .. }
-                | CogSource::RemoteHttp { .. }
-                | CogSource::RemoteGcs { .. }
-                | CogSource::RemoteAzure { .. } => {
-                    // Speculative 128 KiB single-RTT header read; bounded at 32 MiB to prevent
-                    // crafted non-COG / BigTIFF offsets from causing OOM or u64 overflow.
-                    const MAX_HEADER_FETCH_BYTES: u64 = 32 * 1024 * 1024;
-                    const MAX_HEADER_FETCH_ITERS: u32 = 16;
-                    let mut hdr = source.fetch_range(0, INITIAL_HEADER_FETCH_BYTES).await?.to_vec();
-                    let mut header_fetches = 0u32;
-                    loop {
-                        match parse_cog(&hdr) {
-                            Ok(idx) => break idx,
-                            Err(TiffError::NeedMoreBytes { required, .. }) => {
-                                let cur_len = hdr.len() as u64;
-                                if required > MAX_HEADER_FETCH_BYTES {
-                                    return Err(IoError::Tiff(TiffError::Corrupt(
-                                        "TIFF header/IFD exceeds 32 MiB limit",
-                                    )));
+                let index = match &source {
+                    CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
+                    CogSource::RemoteS3 { .. }
+                    | CogSource::RemoteHttp { .. }
+                    | CogSource::RemoteGcs { .. }
+                    | CogSource::RemoteAzure { .. } => {
+                        // Speculative 128 KiB single-RTT header read; bounded at 32 MiB to prevent
+                        // crafted non-COG / BigTIFF offsets from causing OOM or u64 overflow.
+                        const MAX_HEADER_FETCH_BYTES: u64 = 32 * 1024 * 1024;
+                        const MAX_HEADER_FETCH_ITERS: u32 = 16;
+                        let mut hdr = source
+                            .fetch_range(0, INITIAL_HEADER_FETCH_BYTES)
+                            .await?
+                            .to_vec();
+                        let mut header_fetches = 0u32;
+                        loop {
+                            match parse_cog(&hdr) {
+                                Ok(idx) => break idx,
+                                Err(TiffError::NeedMoreBytes { required, .. }) => {
+                                    let cur_len = hdr.len() as u64;
+                                    if required > MAX_HEADER_FETCH_BYTES {
+                                        return Err(IoError::Tiff(TiffError::Corrupt(
+                                            "TIFF header/IFD exceeds 32 MiB limit",
+                                        )));
+                                    }
+                                    header_fetches += 1;
+                                    if header_fetches > MAX_HEADER_FETCH_ITERS {
+                                        return Err(IoError::Tiff(TiffError::Corrupt(
+                                            "TIFF header required too many incremental range fetches",
+                                        )));
+                                    }
+                                    let target = required
+                                        .checked_add(65535)
+                                        .map(|v| (v / 65536) * 65536)
+                                        .unwrap_or(MAX_HEADER_FETCH_BYTES)
+                                        .min(MAX_HEADER_FETCH_BYTES);
+                                    if target <= cur_len {
+                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                            required,
+                                            available: cur_len,
+                                        }));
+                                    }
+                                    let more = source.fetch_range(cur_len, target).await?;
+                                    if more.is_empty() {
+                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                            required,
+                                            available: cur_len,
+                                        }));
+                                    }
+                                    hdr.extend_from_slice(&more);
                                 }
-                                header_fetches += 1;
-                                if header_fetches > MAX_HEADER_FETCH_ITERS {
-                                    return Err(IoError::Tiff(TiffError::Corrupt(
-                                        "TIFF header required too many incremental range fetches",
-                                    )));
-                                }
-                                let target = required
-                                    .checked_add(65535)
-                                    .map(|v| (v / 65536) * 65536)
-                                    .unwrap_or(MAX_HEADER_FETCH_BYTES)
-                                    .min(MAX_HEADER_FETCH_BYTES);
-                                if target <= cur_len {
-                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                        required,
-                                        available: cur_len,
-                                    }));
-                                }
-                                let more = source.fetch_range(cur_len, target).await?;
-                                if more.is_empty() {
-                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                        required,
-                                        available: cur_len,
-                                    }));
-                                }
-                                hdr.extend_from_slice(&more);
+                                Err(e) => return Err(IoError::Tiff(e)),
                             }
-                            Err(e) => return Err(IoError::Tiff(e)),
                         }
                     }
-                }
-            };
+                };
 
-            let cog = Arc::new(OpenedCog {
-                id: self.next_id.fetch_add(1, Ordering::Relaxed),
-                uri: uri.to_string(),
-                index,
-                source,
-            });
+                Ok(Arc::new(OpenedCog {
+                    id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                    uri: uri.to_string(),
+                    index,
+                    source,
+                }))
+            }
+            .await;
+
             open_guard.done = true;
-            if let Some(OpenSlot::InFlight(n)) = self.datasets_by_uri.insert(
-                uri.to_string(),
-                OpenSlot::Ready {
-                    cog: cog.clone(),
-                    last_used: AtomicU64::new(self.uri_tick()),
-                },
-            ) {
-                n.notify_waiters();
+            match open_res {
+                Ok(cog) => {
+                    if let Some(OpenSlot::InFlight(f)) = self.datasets_by_uri.insert(
+                        uri.to_string(),
+                        OpenSlot::Ready {
+                            cog: cog.clone(),
+                            last_used: AtomicU64::new(self.uri_tick()),
+                        },
+                    ) {
+                        f.set_outcome(Ok(cog.clone()));
+                        f.notify.notify_waiters();
+                    }
+                    if self.datasets_by_uri.len() > self.max_open_uris {
+                        self.evict_uris_if_needed();
+                    }
+                    return Ok(cog);
+                }
+                Err(err) => {
+                    let shared = Arc::new(err);
+                    if let Some((_, OpenSlot::InFlight(f))) = self
+                        .datasets_by_uri
+                        .remove_if(uri, |_, v| matches!(v, OpenSlot::InFlight(_)))
+                    {
+                        f.set_outcome(Err(shared.clone()));
+                        f.notify.notify_waiters();
+                    }
+                    return Err(IoError::Shared(shared));
+                }
             }
-            if self.datasets_by_uri.len() > self.max_open_uris {
-                self.evict_uris_if_needed();
-            }
-            return Ok(cog);
         }
     }
 
@@ -721,7 +781,7 @@ impl CogStore {
         let mut results: Vec<Option<Arc<DecodedTile>>> = vec![None; tile_indices.len()];
         // Each owned slot holds an Option<InFlightGuard> so cancellation/panic auto-aborts!
         let mut owned: Vec<(usize, Option<InFlightGuard>, u64, u32)> = Vec::new();
-        let mut waiters: Vec<(usize, BlockKey, Arc<tokio::sync::Notify>)> = Vec::new();
+        let mut waiters: Vec<(usize, BlockKey, Arc<crate::cache::InFlightBlock>)> = Vec::new();
 
         // Deduplicate identical tile_indices within the same call (e.g. chunky multi-band requests)
         let mut seen_owned: HashMap<u32, usize> = HashMap::new();
@@ -1565,43 +1625,79 @@ impl CogStore {
                     }
 
                     if let Some(e) = fetch_err {
-                        // Any uncompleted guards in `owned` auto-abort cleanly on Drop!
-                        return Err(e);
+                        let shared = Arc::new(e);
+                        // Broadcast the explicit upstream/decode error to all parked waiters for
+                        // any still-owned guards so they fail in 1 RTT instead of retrying serially.
+                        for (_, guard_opt, _, _) in owned.drain(..) {
+                            if let Some(guard) = guard_opt {
+                                guard.fail(shared.clone());
+                            }
+                        }
+                        return Err(IoError::Shared(shared));
                     }
                 }
             }
         }
 
-        // Resolve any singleflight waiters; if an owner was cancelled/aborted mid-flight,
-        // seamlessly take over and fetch those orphaned slots instead of deadlocking!
+        // Resolve any singleflight waiters; read the leader's shared outcome directly so:
+        // - `Some(Ok(tile))` succeeds even if the cache evicted the block before wakeup,
+        // - `Some(Err(err))` fails immediately in 1 RTT (preventing K× retry storms & AIMD collapse),
+        // - `None` (true leader cancellation) seamlessly takes over via `retry_slots`.
         let mut retry_slots: Vec<(usize, u32)> = Vec::new();
-        for (slot, key, mut notify) in waiters {
+        for (slot, key, mut flight) in waiters {
             loop {
+                if let Some(outcome) = flight.take_outcome() {
+                    match outcome {
+                        Ok(hit) => {
+                            results[slot] = Some(hit);
+                            break;
+                        }
+                        Err(err) => return Err(IoError::Shared(err)),
+                    }
+                }
                 let switch_to = {
-                    let fut = notify.notified();
+                    let fut = flight.notify.notified();
                     tokio::pin!(fut);
                     fut.as_mut().enable();
+                    if let Some(outcome) = flight.take_outcome() {
+                        match outcome {
+                            Ok(hit) => {
+                                results[slot] = Some(hit);
+                                break;
+                            }
+                            Err(err) => return Err(IoError::Shared(err)),
+                        }
+                    }
                     match self.cache.peek_state(&key) {
                         Some(Ok(hit)) => {
                             results[slot] = Some(hit);
                             break;
                         }
-                        Some(Err(live_notify)) => {
-                            if !Arc::ptr_eq(&notify, &live_notify) {
-                                Some(live_notify)
+                        Some(Err(live_flight)) => {
+                            if !Arc::ptr_eq(&flight, &live_flight) {
+                                Some(live_flight)
                             } else {
                                 fut.await;
                                 None
                             }
                         }
                         None => {
+                            if let Some(outcome) = flight.take_outcome() {
+                                match outcome {
+                                    Ok(hit) => {
+                                        results[slot] = Some(hit);
+                                        break;
+                                    }
+                                    Err(err) => return Err(IoError::Shared(err)),
+                                }
+                            }
                             retry_slots.push((slot, key.tile_idx));
                             break;
                         }
                     }
                 };
-                if let Some(new_notify) = switch_to {
-                    notify = new_notify;
+                if let Some(new_flight) = switch_to {
+                    flight = new_flight;
                 }
             }
         }
