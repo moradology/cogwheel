@@ -409,7 +409,9 @@ async fn collection_routes_match_titiler_pgstac_shapes() {
     for (path, status) in [
         ("info?bbox=6,44,8", 422),
         ("info?query=not-json", 422),
-        ("info?filter=eo:cloud_cover%3C20", 400),
+        ("info?filter=eo:cloud_cover%3C", 422),
+        ("info?filter=eo:cloud_cover", 422),
+        ("info?filter=a%3D1&filter-lang=cql2-nope", 422),
         ("tiles/Nope/8/133/91?assets=visual", 422),
         ("items/some-item/info", 404),
         ("nope", 404),
