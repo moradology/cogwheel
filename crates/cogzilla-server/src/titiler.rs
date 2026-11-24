@@ -171,7 +171,13 @@ pub async fn query_point(
     let count = ifd.samples_per_pixel as usize;
     let band_names: Vec<String> = (1..=count).map(|i| format!("b{i}")).collect();
 
-    if col < 0 || row < 0 || col >= ifd.width as i64 || row >= ifd.height as i64 {
+    if !col_f.is_finite()
+        || !row_f.is_finite()
+        || col < 0
+        || row < 0
+        || col >= ifd.width as i64
+        || row >= ifd.height as i64
+    {
         return Err(EngineError::NotFound(format!(
             "point ({lon}, {lat}) is outside dataset bounds"
         )));
@@ -762,11 +768,39 @@ fn build_tile_polygon_mask(
             let la01 = grid_lat[i00 + gw];
             let la11 = grid_lat[i00 + gw + 1];
 
-            // Cell-level reject against polygon bbox
+            let all_finite = lo00.is_finite()
+                && lo10.is_finite()
+                && lo01.is_finite()
+                && lo11.is_finite()
+                && la00.is_finite()
+                && la10.is_finite()
+                && la01.is_finite()
+                && la11.is_finite();
             let c_min_lo = lo00.min(lo10).min(lo01).min(lo11);
             let c_max_lo = lo00.max(lo10).max(lo01).max(lo11);
             let c_min_la = la00.min(la10).min(la01).min(la11);
             let c_max_la = la00.max(la10).max(la01).max(la11);
+            // Fall back to exact per-pixel projection on Sinusoidal/LAEA boundary cells (non-finite
+            // corners) or antimeridian/polar cells where linear longitude interpolation wraps across 0°.
+            if !all_finite || (c_max_lo - c_min_lo) > 180.0 {
+                let base_x = (tx * ifd.tile_width) as f64;
+                let base_y = (ty * ifd.tile_height) as f64;
+                for ly in y0..y1 {
+                    let row_off = ly * x_max;
+                    let py = base_y + ly as f64 + 0.5;
+                    for lx in x0..x1 {
+                        let px = base_x + lx as f64 + 0.5;
+                        let (sx, sy) = ifd.pixel_to_crs.forward(px, py);
+                        let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+                        if lon.is_finite() && lat.is_finite() && pm.contains(lon, lat) {
+                            bits[row_off + lx] = 1;
+                            inside_count += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            // Cell-level reject against polygon bbox
             if c_max_lo < pm.bbox[0]
                 || c_min_lo > pm.bbox[2]
                 || c_max_la < pm.bbox[1]
@@ -807,7 +841,11 @@ fn build_tile_polygon_mask(
 }
 
 enum StatsTiles {
-    Chunky(Vec<Option<Arc<cogzilla_codec::DecodedTile>>>),
+    Chunky {
+        tiles: Vec<Option<Arc<cogzilla_codec::DecodedTile>>>,
+        tile_masks: Option<Vec<Option<Vec<u8>>>>,
+        mask_total_pixels: usize,
+    },
     Planar {
         band_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
         tile_masks: Option<Vec<Option<Vec<u8>>>>,
@@ -818,7 +856,7 @@ enum StatsTiles {
 fn compute_statistics_cpu(
     cog: &OpenedCog,
     ifd_idx: usize,
-    crs: &cogzilla_proj::CrsModel,
+    _crs: &cogzilla_proj::CrsModel,
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
     fetched: StatsTiles,
@@ -826,14 +864,19 @@ fn compute_statistics_cpu(
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
     let total_pixels = (ifd.width as usize) * (ifd.height as usize);
-    let mut mask_total_pixels = 0usize;
+    let mask_total_pixels;
 
     let mut per_band: Vec<BandStatsAcc> = (0..count)
         .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, total_pixels))
         .collect();
 
     match fetched {
-        StatsTiles::Chunky(tiles) => {
+        StatsTiles::Chunky {
+            tiles,
+            tile_masks,
+            mask_total_pixels: mtp,
+        } => {
+            mask_total_pixels = mtp;
             for (ti, tile_opt) in tiles.iter().enumerate() {
                 let Some(tile) = tile_opt else { continue };
                 let tx = (ti as u32) % ifd.tiles_across;
@@ -842,13 +885,10 @@ fn compute_statistics_cpu(
                 let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
                 let tw = ifd.tile_width as usize;
 
-                if let Some(pm) = poly_mask {
-                    let Some((mask_bits, inside)) =
-                        build_tile_polygon_mask(ifd, crs, pm, tx, ty, x_max, y_max)
-                    else {
+                if let Some(ref masks) = tile_masks {
+                    let Some(ref mask_bits) = masks[ti] else {
                         continue;
                     };
-                    mask_total_pixels += inside;
                     for b in 0..count {
                         if tile.bands[b].stats.all_nodata {
                             continue;
@@ -858,7 +898,7 @@ fn compute_statistics_cpu(
                             tw,
                             x_max,
                             y_max,
-                            &mask_bits,
+                            mask_bits,
                             unscale,
                             cog.index.scales[b],
                             cog.index.offsets[b],
@@ -967,40 +1007,50 @@ pub async fn compute_statistics(
     let count = ifd.samples_per_pixel as usize;
     let total_pixels = (ifd.width as usize) * (ifd.height as usize);
 
+    let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+    let mut mask_total_pixels = 0usize;
+    let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
+        let mut masks = Vec::with_capacity(n_tiles);
+        for ty in 0..ifd.tiles_down {
+            for tx in 0..ifd.tiles_across {
+                let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+                let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+                if let Some((bits, inside)) =
+                    build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
+                {
+                    mask_total_pixels += inside;
+                    masks.push(Some(bits));
+                } else {
+                    masks.push(None);
+                }
+            }
+        }
+        masks
+    });
+
     let fetched = match ifd.planar_config {
         PlanarConfig::Chunky => {
-            let mut indices = Vec::new();
+            let mut indices = Vec::with_capacity(n_tiles);
             for ty in 0..ifd.tiles_down {
                 for tx in 0..ifd.tiles_across {
+                    let ti = (ty * ifd.tiles_across + tx) as usize;
+                    if let Some(ref masks) = tile_masks {
+                        if masks[ti].is_none() {
+                            indices.push(None);
+                            continue;
+                        }
+                    }
                     indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
                 }
             }
             let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
-            StatsTiles::Chunky(tiles)
+            StatsTiles::Chunky {
+                tiles,
+                tile_masks,
+                mask_total_pixels,
+            }
         }
         PlanarConfig::Planar => {
-            let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
-            let mut mask_total_pixels = 0usize;
-            let tile_masks: Option<Vec<Option<Vec<u8>>>> = poly_mask.map(|pm| {
-                let mut masks = Vec::with_capacity(n_tiles);
-                for ty in 0..ifd.tiles_down {
-                    for tx in 0..ifd.tiles_across {
-                        let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
-                        let y_max =
-                            (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
-                        if let Some((bits, inside)) =
-                            build_tile_polygon_mask(ifd, &crs, pm, tx, ty, x_max, y_max)
-                        {
-                            mask_total_pixels += inside;
-                            masks.push(Some(bits));
-                        } else {
-                            masks.push(None);
-                        }
-                    }
-                }
-                masks
-            });
-
             let mut band_tiles = Vec::with_capacity(count);
             for b in 0..count {
                 let mut indices = Vec::with_capacity(n_tiles);
@@ -1273,16 +1323,43 @@ pub async fn render_wgs84_bbox(
     let primary = &cogs[0];
     let crs = engine.get_or_build_crs(primary)?;
 
-    // Estimate target CRS resolution at bbox center to pick optimal overview IFD
+    // Estimate target CRS resolution to pick optimal overview IFD.
+    // Probe bbox center first; if out of CRS domain (e.g. WorldCRS84Quad z=0/1 on a UTM COG >75°
+    // from center), fall back to the raster's own center clamped into bbox, then 4 quadrant probes.
     let cx = 0.5 * (bbox[0] + bbox[2]);
     let cy = 0.5 * (bbox[1] + bbox[3]);
     let dlx = (bbox[2] - bbox[0]) / (w as f64);
     let dly = (bbox[3] - bbox[1]) / (h as f64);
-    let (s0x, s0y) = crs.from_lonlat_deg(cx, cy);
-    let (s1x, s1y) = crs.from_lonlat_deg(cx + dlx, cy);
-    let (s2x, s2y) = crs.from_lonlat_deg(cx, cy + dly);
-    let target_rx = ((s1x - s0x).powi(2) + (s1y - s0y).powi(2)).sqrt();
-    let target_ry = ((s2x - s0x).powi(2) + (s2y - s0y).powi(2)).sqrt();
+    let probe_res = |px: f64, py: f64| -> (f64, f64) {
+        let (s0x, s0y) = crs.from_lonlat_deg(px, py);
+        let (s1x, s1y) = crs.from_lonlat_deg(px + dlx, py);
+        let (s2x, s2y) = crs.from_lonlat_deg(px, py + dly);
+        let rx = ((s1x - s0x).powi(2) + (s1y - s0y).powi(2)).sqrt();
+        let ry = ((s2x - s0x).powi(2) + (s2y - s0y).powi(2)).sqrt();
+        (rx, ry)
+    };
+    let (mut target_rx, mut target_ry) = probe_res(cx, cy);
+    if !target_rx.is_finite() || !target_ry.is_finite() {
+        let full = primary.index.full_res();
+        let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+        let rcx = (0.5 * (rb[0] + rb[2])).clamp(bbox[0], bbox[2]);
+        let rcy = (0.5 * (rb[1] + rb[3])).clamp(bbox[1], bbox[3]);
+        let probes = [
+            (rcx, rcy),
+            (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
+            (bbox[0] + 0.75 * (bbox[2] - bbox[0]), bbox[1] + 0.25 * (bbox[3] - bbox[1])),
+            (bbox[0] + 0.25 * (bbox[2] - bbox[0]), bbox[1] + 0.75 * (bbox[3] - bbox[1])),
+            (bbox[0] + 0.75 * (bbox[2] - bbox[0]), bbox[1] + 0.75 * (bbox[3] - bbox[1])),
+        ];
+        for (px, py) in probes {
+            let (rx, ry) = probe_res(px, py);
+            if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+                target_rx = rx;
+                target_ry = ry;
+                break;
+            }
+        }
+    }
     let ifd_idx = primary.index.select_ifd(target_rx, target_ry);
     crate::engine::validate_multi_cog_grid(cogs, ifd_idx)?;
     let ifd = &primary.index.ifds[ifd_idx];

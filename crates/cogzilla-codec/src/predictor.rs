@@ -2176,17 +2176,19 @@ pub fn reconstruct_u8(
     let pixels = w * h;
 
     // Zero-deinterleave fast path for chunky 3-band uint8 COGs (Sentinel-2 TCI, NAIP, JPEG/WebP RGB):
-    // keep pixels interleaved in one shared Arc<[u8]> instead of allocating and scattering into 3 slabs.
+    // allocate a single shared Arc<[u8]> directly (undoing horizontal differencing in-place via
+    // Arc::get_mut when enabled), eliminating a redundant 768 KiB Vec<u8> -> Arc<[u8]> copy!
     if bands_in_tile == 3 {
-        let mut buf = raw[..pixels * 3].to_vec();
+        let mut rgb: std::sync::Arc<[u8]> = std::sync::Arc::from(&raw[..pixels * 3]);
         let mut any_valid = [false; 3];
         let mut any_nodata = [false; 3];
         let mut min_u8 = [255u8; 3];
         let mut max_u8 = [0u8; 3];
 
         if horizontal_diff {
+            let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
             for y in 0..h {
-                let row = &mut buf[y * w * 3..(y + 1) * w * 3];
+                let row = &mut slice[y * w * 3..(y + 1) * w * 3];
                 let mut acc = [0u8; 3];
                 for px in row.chunks_exact_mut(3) {
                     acc[0] = acc[0].wrapping_add(px[0]);
@@ -2200,7 +2202,7 @@ pub fn reconstruct_u8(
         }
 
         if let Some(nd) = nd_u8 {
-            for px in buf.chunks_exact(3) {
+            for px in rgb.chunks_exact(3) {
                 for b in 0..3 {
                     let v = px[b];
                     if v == nd {
@@ -2214,7 +2216,7 @@ pub fn reconstruct_u8(
             }
         } else {
             any_valid = [pixels > 0; 3];
-            for px in buf.chunks_exact(3) {
+            for px in rgb.chunks_exact(3) {
                 if px[0] < min_u8[0] { min_u8[0] = px[0]; }
                 if px[0] > max_u8[0] { max_u8[0] = px[0]; }
                 if px[1] < min_u8[1] { min_u8[1] = px[1]; }
@@ -2223,8 +2225,6 @@ pub fn reconstruct_u8(
                 if px[2] > max_u8[2] { max_u8[2] = px[2]; }
             }
         }
-
-        let rgb: std::sync::Arc<[u8]> = buf.into_boxed_slice().into();
         return (0..3u8)
             .map(|b| {
                 let bi = b as usize;

@@ -268,24 +268,33 @@ pub fn decode_tile(
                 use zune_jpeg::zune_core::colorspace::ColorSpace;
                 use zune_jpeg::zune_core::options::DecoderOptions;
 
-                let out_cs = match (bands_in_tile, ifd.photometric) {
-                    (1, _) => ColorSpace::Luma,
-                    // Photometric=2 (RGB) stored without YCbCr transform: skip YCbCr->RGB in decoder
-                    (3, 2) => ColorSpace::YCbCr,
-                    _ => ColorSpace::RGB,
-                };
                 let opts = DecoderOptions::default()
-                    .jpeg_set_out_colorspace(out_cs)
                     .set_max_width(ifd.tile_width as usize)
                     .set_max_height(ifd.tile_height as usize);
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(jpeg_bytes, opts);
-                let pixels = dec
-                    .decode()
+                dec.decode_headers()
                     .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
-                let copy_len = pixels.len().min(expected_bytes);
-                raw_slice[..copy_len].copy_from_slice(&pixels[..copy_len]);
-                if copy_len < expected_bytes {
-                    raw_slice[copy_len..expected_bytes].fill(0);
+                let out_cs = match (bands_in_tile, ifd.photometric) {
+                    (1, _) => ColorSpace::Luma,
+                    // Photometric=2 (RGB): match the stream's own input colorspace (RGB if an Adobe
+                    // APP14 transform=0 marker is present, YCbCr if stripped) so zune-jpeg performs
+                    // zero colorspace conversion instead of failing on RGB->YCbCr.
+                    (3, 2) => dec.get_input_colorspace().unwrap_or(ColorSpace::YCbCr),
+                    _ => ColorSpace::RGB,
+                };
+                dec.set_options(opts.jpeg_set_out_colorspace(out_cs));
+                let out_len = dec.output_buffer_size().unwrap_or(expected_bytes);
+                if out_len <= expected_bytes {
+                    dec.decode_into(&mut raw_slice[..out_len])
+                        .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
+                    if out_len < expected_bytes {
+                        raw_slice[out_len..expected_bytes].fill(0);
+                    }
+                } else {
+                    let pixels = dec
+                        .decode()
+                        .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
+                    raw_slice[..expected_bytes].copy_from_slice(&pixels[..expected_bytes]);
                 }
             }
             Compression::Webp => {
@@ -427,34 +436,52 @@ pub fn decode_tile(
     })
 }
 
-/// If a chunky multi-band tile carries an alpha channel via `ExtraSamples` (tag 338 = 1 or 2,
-/// e.g. 4-band RGBA), mask transparent pixels (`alpha == 0`) to `f32::NAN` in the color bands
-/// and recompute their `BlockStats` so every downstream kernel renders alpha identically to TiTiler.
-fn apply_rgba_alpha_if_present(bands: &mut [DecodedBand], ifd: &IfdMeta) {
-    if ifd.planar_config != PlanarConfig::Chunky
-        || bands.len() < 4
-        || ifd.extra_samples.is_empty()
+/// Return the 0-based alpha channel index from `ExtraSamples` (tag 338 = 1 or 2), supporting
+/// both 2-band Gray+Alpha (`samples_per_pixel == 2`) and 4-band RGBA (`samples_per_pixel >= 4`).
+pub fn alpha_channel_index(samples_per_pixel: usize, extra_samples: &[u16]) -> Option<usize> {
+    if samples_per_pixel < 2 || extra_samples.is_empty() || extra_samples.len() >= samples_per_pixel
     {
+        return None;
+    }
+    let pos = extra_samples.iter().position(|&v| v == 1 || v == 2)?;
+    let base_samples = samples_per_pixel - extra_samples.len();
+    Some(base_samples + pos)
+}
+
+/// If a chunky multi-band tile carries an alpha channel via `ExtraSamples` (tag 338 = 1 or 2,
+/// e.g. 2-band Gray+Alpha or 4-band RGBA), mask transparent pixels (`alpha == 0`) to `f32::NAN`
+/// in the color bands and recompute their `BlockStats` so every downstream kernel renders alpha
+/// identically to TiTiler.
+fn apply_rgba_alpha_if_present(bands: &mut [DecodedBand], ifd: &IfdMeta) {
+    if ifd.planar_config != PlanarConfig::Chunky {
         return;
     }
-    let has_alpha = ifd.extra_samples.iter().any(|&v| v == 1 || v == 2);
-    if !has_alpha {
+    let Some(alpha_idx) = alpha_channel_index(bands.len(), &ifd.extra_samples) else {
+        return;
+    };
+    // O(1) fast-path: if the alpha band has no nodata and min > 0, every pixel is opaque!
+    let alpha_stats = bands[alpha_idx].stats;
+    if alpha_stats.no_nodata && alpha_stats.min > 0.0 {
         return;
     }
-    let alpha_idx = bands.len() - 1;
     let n = bands[alpha_idx].data.len();
     let alpha: Vec<f32> = (0..n).map(|i| bands[alpha_idx].data.get_f32(i)).collect();
     if alpha.iter().all(|&a| a > 0.0) {
         return;
     }
-    for b in &mut bands[..alpha_idx] {
-        apply_alpha_slice_to_band(b, &alpha);
+    for (idx, b) in bands.iter_mut().enumerate() {
+        if idx != alpha_idx {
+            apply_alpha_slice_to_band(b, &alpha);
+        }
     }
 }
 
 /// Mask transparent pixels (`alpha == 0` or `NaN`) to `f32::NAN` in a single-band decoded tile
-/// (used for `PlanarConfig::Planar` 4-band RGBA COGs where the alpha channel lives in a separate plane).
+/// (used for `PlanarConfig::Planar` Gray+Alpha / RGBA COGs where the alpha channel lives in a separate plane).
 pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
+    if alpha.stats.no_nodata && alpha.stats.min > 0.0 {
+        return;
+    }
     let n = alpha.data.len();
     let alpha_vals: Vec<f32> = (0..n).map(|i| alpha.data.get_f32(i)).collect();
     if alpha_vals.iter().all(|&a| a > 0.0) {
@@ -556,7 +583,18 @@ pub fn decode_mask_tile(compressed: &[u8], mask: &MaskIfdMeta) -> Result<Vec<u8>
         }
         Ok(out)
     } else {
-        Ok(raw)
+        let mut out = raw;
+        if mask.predictor == Predictor::HorizontalInt {
+            for r in 0..h {
+                let row = &mut out[r * w..(r + 1) * w];
+                let mut acc = 0u8;
+                for px in row.iter_mut() {
+                    acc = acc.wrapping_add(*px);
+                    *px = acc;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -670,5 +708,31 @@ mod tests {
         assert!(b.data.get_f32(1).is_nan());
         assert_eq!(b.data.get_f32(2), 30.0);
         assert!(b.data.get_f32(3).is_nan());
+    }
+
+    #[test]
+    fn decode_mask_tile_undoes_horizontal_predictor_on_8bit_mask_and_gray_alpha_index() {
+        // Horizontal-differenced opaque 4x2 8-bit mask: [255, 0, 0, 0] per row -> [255, 255, 255, 255]
+        let mask_meta = MaskIfdMeta {
+            width: 4,
+            height: 2,
+            tile_width: 4,
+            tile_height: 2,
+            tiles_across: 1,
+            tiles_down: 1,
+            bits_per_sample: 8,
+            compression: Compression::None,
+            predictor: Predictor::HorizontalInt,
+            tile_offsets: Box::new([0]),
+            tile_byte_counts: Box::new([8]),
+        };
+        let raw_diff = [255u8, 0, 0, 0, 0, 255, 0, 1];
+        let decoded = decode_mask_tile(&raw_diff, &mask_meta).unwrap();
+        assert_eq!(decoded, vec![255, 255, 255, 255, 0, 255, 255, 0]);
+
+        // 2-band Gray+Alpha and 4-band RGBA ExtraSamples index detection
+        assert_eq!(alpha_channel_index(2, &[2]), Some(1));
+        assert_eq!(alpha_channel_index(4, &[1]), Some(3));
+        assert_eq!(alpha_channel_index(4, &[0]), None);
     }
 }

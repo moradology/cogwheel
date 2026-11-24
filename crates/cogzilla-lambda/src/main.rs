@@ -4,7 +4,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cogzilla_io::{CogStore, DiskBlockCache};
 use cogzilla_server::{TileEngine, handle_bytes_request, load_catalog_json_file};
-use lambda_http::{Body, Error, Request, Response, run, service_fn};
+use lambda_http::{
+    Body, Error, Request, RequestExt, Response, request::RequestContext, run, service_fn,
+};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -73,11 +75,50 @@ fn is_binary_content_type(ct: &str) -> bool {
         || ct.starts_with("application/x-npy")
 }
 
+/// Strip a leading `/{stage}` prefix added by API Gateway v1 (REST) or API Gateway v2 named stages
+/// (anything other than `$default`), preserving any query string and mapping `/{stage}` -> `/`.
+fn strip_stage_prefix(uri: &lambda_http::http::Uri, stage: Option<&str>) -> lambda_http::http::Uri {
+    let Some(s) = stage.filter(|s| !s.is_empty() && *s != "$default") else {
+        return uri.clone();
+    };
+    let path = uri.path();
+    let prefix = format!("/{s}");
+    let stripped = if let Some(rest) = path.strip_prefix(&prefix) {
+        if rest.is_empty() {
+            "/"
+        } else if rest.starts_with('/') {
+            rest
+        } else {
+            return uri.clone();
+        }
+    } else {
+        return uri.clone();
+    };
+    let new_pq = match uri.query() {
+        Some(q) => format!("{stripped}?{q}"),
+        None => stripped.to_string(),
+    };
+    let mut parts = uri.clone().into_parts();
+    if let Ok(pq) = new_pq.parse() {
+        parts.path_and_query = Some(pq);
+        if let Ok(u) = lambda_http::http::Uri::from_parts(parts) {
+            return u;
+        }
+    }
+    uri.clone()
+}
+
 /// Core AWS Lambda HTTP handler: translates `lambda_http::Request` into `cogzilla-server`'s
 /// shared `handle_bytes_request` and encodes binary image/raster payloads as `Body::Binary`
 /// (automatic `isBase64Encoded: true` for Function URLs, API Gateway v1/v2, and ALB).
 async fn lambda_handler(engine: Arc<TileEngine>, event: Request) -> Result<Response<Body>, Error> {
-    let (parts, body) = event.into_parts();
+    let stage = event.request_context_ref().and_then(|ctx| match ctx {
+        RequestContext::ApiGatewayV1(c) => c.stage.clone(),
+        RequestContext::ApiGatewayV2(c) => c.stage.clone(),
+        _ => None,
+    });
+    let (mut parts, body) = event.into_parts();
+    parts.uri = strip_stage_prefix(&parts.uri, stage.as_deref());
     let req_bytes = match body {
         Body::Empty => Bytes::new(),
         Body::Text(s) => Bytes::from(s),
@@ -210,5 +251,28 @@ mod tests {
         let resp304 = lambda_handler(engine, req304).await.unwrap();
         assert_eq!(resp304.status(), 304);
         assert_eq!(resp304.body(), &Body::Empty);
+    }
+
+    #[test]
+    fn strip_stage_prefix_handles_apigw_named_stages_and_default() {
+        let u1: lambda_http::http::Uri = "/prod/cog/info?url=s3://b/k.tif".parse().unwrap();
+        assert_eq!(
+            strip_stage_prefix(&u1, Some("prod")).to_string(),
+            "/cog/info?url=s3://b/k.tif"
+        );
+        // $default stage must NOT strip
+        assert_eq!(
+            strip_stage_prefix(&u1, Some("$default")).to_string(),
+            "/prod/cog/info?url=s3://b/k.tif"
+        );
+        // Exact /{stage} maps to /
+        let u2: lambda_http::http::Uri = "/v1".parse().unwrap();
+        assert_eq!(strip_stage_prefix(&u2, Some("v1")).to_string(), "/");
+        // Partial prefix match (/v10 vs stage v1) must NOT strip
+        let u3: lambda_http::http::Uri = "/v10/healthz".parse().unwrap();
+        assert_eq!(
+            strip_stage_prefix(&u3, Some("v1")).to_string(),
+            "/v10/healthz"
+        );
     }
 }

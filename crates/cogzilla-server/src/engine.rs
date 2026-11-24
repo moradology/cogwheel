@@ -1272,6 +1272,67 @@ impl TileEngine {
         }
         let n = req.tile_size as usize;
         let total_pixels = n * n;
+        let f32_bands: usize = match req.bands {
+            BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+            _ => 1,
+        };
+
+        // RawF32 mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
+        // and early exit once every pixel has valid data.
+        if req.format == OutputFormat::RawF32 {
+            let mut canvas = vec![f32::NAN; f32_bands * total_pixels];
+            let mut filled = 0usize;
+            let mut scene_req = req.clone();
+            scene_req.format = OutputFormat::RawF32;
+
+            for url in urls {
+                if filled >= total_pixels {
+                    break;
+                }
+                let cog = self.store.open_uri(url).await?;
+                let src = self.render_tile(&cog, &scene_req).await?;
+                if src.len() != f32_bands * total_pixels * 4 {
+                    continue;
+                }
+                for i in 0..total_pixels {
+                    if !canvas[i].is_nan() {
+                        continue;
+                    }
+                    let mut all_valid = true;
+                    let mut vals = [f32::NAN; 3];
+                    for b in 0..f32_bands {
+                        let byte_off = (b * total_pixels + i) * 4;
+                        let v = f32::from_le_bytes([
+                            src[byte_off],
+                            src[byte_off + 1],
+                            src[byte_off + 2],
+                            src[byte_off + 3],
+                        ]);
+                        if v.is_nan() {
+                            all_valid = false;
+                            break;
+                        }
+                        vals[b] = v;
+                    }
+                    if all_valid {
+                        for b in 0..f32_bands {
+                            canvas[b * total_pixels + i] = vals[b];
+                        }
+                        filled += 1;
+                    }
+                }
+            }
+
+            if filled == 0 {
+                return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
+            }
+            let mut out = bytes::BytesMut::with_capacity(f32_bands * total_pixels * 4);
+            for v in canvas {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            return Ok(out.freeze());
+        }
+
         let mut canvas = vec![0u8; total_pixels * 4];
         let mut filled = 0usize;
 
@@ -1302,7 +1363,7 @@ impl TileEngine {
         }
 
         if filled == 0 && canvas.chunks_exact(4).all(|p| p[3] == 0) {
-            return Ok(empty_tile_bytes(req.tile_size, req.format, 3));
+            return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
         Ok(encode_rgba_tile(
             &canvas,
@@ -1325,7 +1386,11 @@ impl TileEngine {
             self.stats
                 .empty_short_circuits
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(empty_tile_bytes(req.tile_size, req.format, 3));
+            let f32_bands = match req.bands {
+                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                _ => 1,
+            };
+            return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
         self.render_mosaic_tile(&urls, req).await
     }
