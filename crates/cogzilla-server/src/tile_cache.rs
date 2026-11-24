@@ -114,8 +114,18 @@ impl TileCache {
     }
 
     pub fn clear(&self) {
-        self.ready.clear();
-        self.current_bytes.store(0, Ordering::Release);
+        let mut removed = 0usize;
+        self.ready.retain(|_, entry| {
+            removed += entry.byte_len;
+            false
+        });
+        if removed > 0 {
+            let _ = self
+                .current_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                    Some(c.saturating_sub(removed))
+                });
+        }
     }
 
     #[inline]
@@ -132,6 +142,8 @@ impl TileCache {
             return;
         }
         let stamp = self.tick();
+        // Reserve `byte_len` before inserting so concurrent eviction/clear cannot subtract first.
+        let mut now = self.current_bytes.fetch_add(byte_len, Ordering::AcqRel) + byte_len;
         let old_len = self
             .ready
             .insert(
@@ -145,18 +157,15 @@ impl TileCache {
             .map(|old| old.byte_len)
             .unwrap_or(0);
 
-        let now = if byte_len >= old_len {
-            let delta = byte_len - old_len;
-            self.current_bytes.fetch_add(delta, Ordering::AcqRel) + delta
-        } else {
-            let delta = old_len - byte_len;
-            self.current_bytes
+        if old_len > 0 {
+            now = self
+                .current_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    Some(c.saturating_sub(delta))
+                    Some(c.saturating_sub(old_len))
                 })
                 .unwrap_or(0)
-                .saturating_sub(delta)
-        };
+                .saturating_sub(old_len);
+        }
         if now > self.max_bytes {
             self.evict_some();
         }

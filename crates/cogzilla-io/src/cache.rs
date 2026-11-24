@@ -127,6 +127,10 @@ impl SingleflightBlockCache {
     /// Complete an in-flight fetch, storing the decoded tile and waking all singleflight waiters.
     pub fn complete(&self, key: BlockKey, tile: Arc<DecodedTile>) {
         let new_bytes = tile_bytes(&tile);
+        // Account for `new_bytes` *before* making the entry visible in `self.map` so a concurrent
+        // eviction or `clear()` can never subtract `new_bytes` before we add it (which would clamp
+        // `saturating_sub` to 0 and permanently leak `new_bytes` into `current_bytes`).
+        let mut now_bytes = self.current_bytes.fetch_add(new_bytes, Ordering::AcqRel) + new_bytes;
         let entry = CacheEntry::Ready {
             tile,
             last_used: AtomicU64::new(self.tick()),
@@ -139,18 +143,15 @@ impl SingleflightBlockCache {
         if let Some(n) = notify {
             n.notify_waiters();
         }
-        let now_bytes = if new_bytes >= old_bytes {
-            let delta = new_bytes - old_bytes;
-            self.current_bytes.fetch_add(delta, Ordering::AcqRel) + delta
-        } else {
-            let delta = old_bytes - new_bytes;
-            self.current_bytes
+        if old_bytes > 0 {
+            now_bytes = self
+                .current_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                    Some(cur.saturating_sub(delta))
+                    Some(cur.saturating_sub(old_bytes))
                 })
                 .unwrap_or(0)
-                .saturating_sub(delta)
-        };
+                .saturating_sub(old_bytes);
+        }
         if now_bytes > self.max_bytes {
             self.evict_some();
         }

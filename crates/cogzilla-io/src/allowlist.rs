@@ -66,14 +66,16 @@ fn decode_percent_once(s: &str) -> String {
 /// encoded path separators (`%2f`, `%5c`) never match, since they can climb
 /// out of an allowed prefix on downstream HTTP servers/proxies.
 pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
-    let mut cur = uri.to_string();
+    // Only inspect the path component (before `?query` / `#fragment`) for traversal and
+    // percent-encoded path separators so valid AWS SigV4 presigned URLs (`%2F` in
+    // `X-Amz-Credential`) and Azure SAS URLs (`%2F` in base64 `sig=`) are allowed.
+    let mut cur = uri.split(['?', '#']).next().unwrap_or(uri).to_string();
     for _ in 0..3 {
         let lower = cur.to_ascii_lowercase();
         if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
             return false;
         }
-        let path_part = cur.split(['?', '#']).next().unwrap_or(&cur);
-        if path_part.split(['/', '\\']).any(|seg| seg == "..") {
+        if cur.split(['/', '\\']).any(|seg| seg == "..") {
             return false;
         }
         let next = decode_percent_once(&cur);
@@ -145,5 +147,15 @@ mod tests {
         assert!(!matches_any_prefix(&p, "https://bucket.example.com/public/..?x=1"));
         assert!(!matches_any_prefix(&p, "https://bucket.example.com/public/..#frag"));
         assert!(matches_any_prefix(&p, "https://bucket.example.com/a..b.tif"));
+        // Presigned S3 URLs (`%2F` in X-Amz-Credential) and Azure SAS URLs (`%2F` in base64 sig)
+        // must be allowed while `%2F` in the path remains rejected.
+        assert!(matches_any_prefix(
+            &p,
+            "https://bucket.example.com/scene.tif?X-Amz-Credential=AKIA%2F20261124%2Fus-west-2%2Fs3%2Faws4_request"
+        ));
+        assert!(matches_any_prefix(
+            &p,
+            "https://bucket.example.com/scene.tif?sig=abc%2Fdef%2B123%3D"
+        ));
     }
 }

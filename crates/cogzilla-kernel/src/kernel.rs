@@ -295,14 +295,21 @@ fn fast_floor_i32(x: f32) -> (i32, f32) {
     #[cfg(not(any(target_arch = "aarch64", target_feature = "sse4.1")))]
     {
         let i = x as i32;
-        let adj = i - ((i as f32 > x) as i32);
+        let adj = i.saturating_sub((i as f32 > x) as i32);
         (adj, x - (adj as f32))
     }
 }
 
 #[inline(always)]
 fn sample_bilinear<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
-    if !CLEAN && (!u.is_finite() || !v.is_finite()) {
+    if !CLEAN
+        && (!u.is_finite()
+            || !v.is_finite()
+            || u < -1.0
+            || v < -1.0
+            || u > src.ifd_w as f32
+            || v > src.ifd_h as f32)
+    {
         return f32::NAN;
     }
     let (x0, fx) = fast_floor_i32(u);
@@ -392,7 +399,13 @@ fn cubic_weights(t: f32) -> [f32; 4] {
 
 #[inline(always)]
 pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
-    if !u.is_finite() || !v.is_finite() {
+    if !u.is_finite()
+        || !v.is_finite()
+        || u < -2.0
+        || v < -2.0
+        || u > src.ifd_w as f32 + 1.0
+        || v > src.ifd_h as f32 + 1.0
+    {
         return f32::NAN;
     }
     let (x0, fx) = fast_floor_i32(u);

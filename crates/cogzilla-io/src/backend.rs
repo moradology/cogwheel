@@ -110,10 +110,12 @@ pub fn coalesce_ranges(
 
     let mut spans: Vec<CoalescedSpan> = Vec::with_capacity(reqs.len());
     for r in reqs {
-        let r_end = r.offset + r.len as u64;
+        let r_end = r.offset.saturating_add(r.len as u64);
         if let Some(last) = spans.last_mut() {
             let new_end = last.end.max(r_end);
-            if r.offset <= last.end + gap_threshold && (new_end - last.start) <= max_span_bytes {
+            if r.offset <= last.end.saturating_add(gap_threshold)
+                && new_end.saturating_sub(last.start) <= max_span_bytes
+            {
                 last.end = new_end;
                 last.items.push(r);
                 continue;
@@ -228,8 +230,11 @@ impl CogSource {
     pub async fn fetch_range(&self, start: u64, end: u64) -> Result<Bytes, IoError> {
         match self {
             Self::LocalMmap { mmap } => {
-                let s = (start as usize).min(mmap.len());
-                let e = (end as usize).min(mmap.len());
+                if start >= end {
+                    return Ok(Bytes::new());
+                }
+                let s = usize::try_from(start).unwrap_or(usize::MAX).min(mmap.len());
+                let e = usize::try_from(end).unwrap_or(usize::MAX).min(mmap.len());
                 Ok(Bytes::copy_from_slice(&mmap[s..e]))
             }
             Self::RemoteS3 {
@@ -380,8 +385,8 @@ impl CogSource {
     pub fn local_slice(&self, offset: u64, len: u32) -> Option<&[u8]> {
         match self {
             Self::LocalMmap { mmap } => {
-                let start = offset as usize;
-                let end = start + len as usize;
+                let start = usize::try_from(offset).ok()?;
+                let end = start.checked_add(len as usize)?;
                 mmap.get(start..end)
             }
             Self::RemoteS3 { .. }
