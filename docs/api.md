@@ -1,6 +1,6 @@
 # API
 
-`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet.
+`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet. The first of titiler-pgstac's routes, which do need Postgres, are described under [pgSTAC](#pgstac).
 
 **`/cog/*`** (TiTiler's `TilerFactory`)
 
@@ -21,6 +21,24 @@
 
 - `GET /colorMaps`, `GET /colorMaps/{colorMapId}`: the lookup tables match `rio-tiler`'s exactly, and `?f=png` returns a 256×20 colorbar.
 - `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}`: `WebMercatorQuad` (25 levels) and `WorldCRS84Quad` as OGC TileMatrixSet 2.0 JSON.
+
+## pgSTAC
+
+With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 51 requests to both servers on one database and compares status codes, JSON bodies, item lists and rendered tiles; all 51 agreed when last run, at v0.5.19 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2. Agreement on tiles means the same valid pixels and a PSNR of at least 25 dB; the 16 tile pairs had a median of 37.5 dB (30.1 to 43.4).
+
+- `POST /searches/register` with a STAC search body (`collections`, `ids`, `bbox`, `intersects`, `datetime`, `query`, `filter`, `sortby`) and optional `metadata`. The returned `id` is pgSTAC's hash, the same one titiler-pgstac returns for the same body.
+- `GET /searches/` and `/searches/list` (with `limit`, `offset`, and `sortby` on `lastused` or `usecount`), `GET /searches/{id}/info`.
+- `GET /searches/{id}/{tms}/tilejson.json` and `/searches/{id}/{tms}/map.html`.
+- `GET /searches/{id}/tiles/{tms}/{z}/{x}/{y}[.{png|jpg|webp|npy}]` and `GET /searches/{id}/tiles/{tms}/{z}/{x}/{y}/assets`.
+- Tile parameters: `assets` (required, one to three per item), `expression`, `rescale`, `colormap_name`, `resampling`, `reproject`, `color_formula`, `return_mask`, `unscale` (single asset), `tilesize` (256 or 512), and the search limits `scan_limit`, `items_limit`, `time_limit`, `exitwhenfull` and `skipcovered`.
+
+Responses follow titiler-pgstac: errors are JSON `{"detail": ...}`, a missing `assets` is a `422`, a tile no item covers is a `204`, and a tile with no extension is a JPEG when every pixel is valid and a PNG otherwise. Resampling follows TiTiler on these routes: nearest neighbour by default, with `resampling` applied to sources already in Web Mercator and `reproject` to sources that have to be reprojected.
+
+Not there yet, each answered with a `400` or `404` rather than a different picture:
+
+- The rest of the search routes (`point`, `bbox`, `feature`, `statistics`, WMTS, `/tiles` listings) and the `/collections/{id}` and `/collections/{id}/items/{id}` families.
+- `pixel_selection` other than `first`, per-asset options (`assets=name|bidx=...`), `asset_as_band`, `buffer`, `nodata`, a JSON `colormap`, more than three assets, and assets of one item on different grids.
+- Tile matrix sets other than `WebMercatorQuad`.
 
 ## Differences from TiTiler
 

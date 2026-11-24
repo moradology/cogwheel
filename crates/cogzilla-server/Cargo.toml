@@ -9,6 +9,7 @@ cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-proj = { path = "../cogzilla-proj" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
 cogzilla-io = { path = "../cogzilla-io" }
+cogzilla-pgstac = { path = "../cogzilla-pgstac" }
 thiserror.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
