@@ -288,6 +288,7 @@ pub async fn query_point(
         "coordinates": [lon, lat],
         "values": values,
         "band_names": band_names,
+        "band_descriptions": band_names,
     }))
 }
 
