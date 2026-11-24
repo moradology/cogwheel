@@ -2474,8 +2474,9 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2515,8 +2516,9 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -3101,8 +3103,9 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -3127,8 +3130,9 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;

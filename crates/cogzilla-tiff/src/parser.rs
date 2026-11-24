@@ -162,12 +162,23 @@ impl TagEntry {
     }
 
     fn read_u64_vec(&self, r: &Reader<'_>) -> Result<Box<[u64]>, TiffError> {
-        let elem_sz = type_size(self.ty).ok_or(TiffError::Corrupt("unknown tag type"))?;
+        let elem_sz = match self.ty {
+            TYPE_SHORT => 2u64,
+            TYPE_LONG | TYPE_IFD => 4u64,
+            TYPE_LONG8 | TYPE_IFD8 => 8u64,
+            _ => return Err(TiffError::Corrupt("unexpected integer array type")),
+        };
         let total = self
             .count
             .checked_mul(elem_sz)
             .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
             .ok_or(TiffError::Corrupt("integer array size overflow"))?;
+        let out_bytes = self
+            .count
+            .checked_mul(8)
+            .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
+            .ok_or(TiffError::Corrupt("integer array output size overflow"))?;
+        let _ = out_bytes;
         let n = self.count as usize;
         let _ = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
@@ -187,18 +198,29 @@ impl TagEntry {
                     out.push(r.u64_at(self.value_offset + (i as u64) * 8)?);
                 }
             }
-            _ => return Err(TiffError::Corrupt("unexpected integer array type")),
+            _ => unreachable!(),
         }
         Ok(out.into_boxed_slice())
     }
 
     fn read_u32_vec(&self, r: &Reader<'_>) -> Result<Box<[u32]>, TiffError> {
-        let elem_sz = type_size(self.ty).ok_or(TiffError::Corrupt("unknown tag type"))?;
+        let elem_sz = match self.ty {
+            TYPE_SHORT => 2u64,
+            TYPE_LONG | TYPE_IFD => 4u64,
+            TYPE_LONG8 | TYPE_IFD8 => 8u64,
+            _ => return Err(TiffError::Corrupt("unexpected byte count array type")),
+        };
         let total = self
             .count
             .checked_mul(elem_sz)
             .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
             .ok_or(TiffError::Corrupt("byte count array size overflow"))?;
+        let out_bytes = self
+            .count
+            .checked_mul(4)
+            .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
+            .ok_or(TiffError::Corrupt("byte count array output size overflow"))?;
+        let _ = out_bytes;
         let n = self.count as usize;
         let _ = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
@@ -222,7 +244,7 @@ impl TagEntry {
                     );
                 }
             }
-            _ => return Err(TiffError::Corrupt("unexpected byte count array type")),
+            _ => unreachable!(),
         }
         Ok(out.into_boxed_slice())
     }
@@ -427,7 +449,10 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     let mut base_affine: Option<Affine2D> = None;
     let mut base_dims: Option<(u32, u32)> = None;
 
-    // Guard against cyclic IFD chains and runaway IFD counts (prevents 64x heap amplification DoS)
+    // Guard against cyclic IFD chains, runaway IFD counts, and cumulative heap amplification DoS.
+    const MAX_COG_METADATA_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_JPEG_TABLES_BYTES: usize = 64 * 1024;
+    let mut total_meta_bytes: usize = 0;
     let mut visited_ifds: Vec<u64> = Vec::with_capacity(16);
     while next_ifd != 0 {
         if visited_ifds.contains(&next_ifd) {
@@ -562,13 +587,26 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             if mask_bps == 1 || mask_bps == 8 {
                 if tile_width > 0 && tile_height > 0 {
                     if let (Some(offs), Some(cnts)) = (tile_offsets, tile_byte_counts) {
+                        let ta = width.div_ceil(tile_width);
+                        let td = height.div_ceil(tile_height);
+                        let exp = (ta as usize).saturating_mul(td as usize);
+                        let offs: Box<[u64]> = if offs.len() > exp { offs[..exp].into() } else { offs };
+                        let cnts: Box<[u32]> = if cnts.len() > exp { cnts[..exp].into() } else { cnts };
+                        total_meta_bytes = total_meta_bytes
+                            .saturating_add(offs.len().saturating_mul(8))
+                            .saturating_add(cnts.len().saturating_mul(4));
+                        if total_meta_bytes > MAX_COG_METADATA_BYTES {
+                            return Err(TiffError::Corrupt(
+                                "cumulative TIFF IFD metadata exceeds 64 MiB limit",
+                            ));
+                        }
                         mask_ifds.push(MaskIfdMeta {
                             width,
                             height,
                             tile_width,
                             tile_height,
-                            tiles_across: width.div_ceil(tile_width),
-                            tiles_down: height.div_ceil(tile_height),
+                            tiles_across: ta,
+                            tiles_down: td,
                             bits_per_sample: mask_bps,
                             compression,
                             predictor,
@@ -585,13 +623,25 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     }
                     .clamp(1, height.max(1));
                     if width > 0 && height > 0 {
+                        let td = height.div_ceil(rps);
+                        let exp = td as usize;
+                        let offs: Box<[u64]> = if offs.len() > exp { offs[..exp].into() } else { offs };
+                        let cnts: Box<[u32]> = if cnts.len() > exp { cnts[..exp].into() } else { cnts };
+                        total_meta_bytes = total_meta_bytes
+                            .saturating_add(offs.len().saturating_mul(8))
+                            .saturating_add(cnts.len().saturating_mul(4));
+                        if total_meta_bytes > MAX_COG_METADATA_BYTES {
+                            return Err(TiffError::Corrupt(
+                                "cumulative TIFF IFD metadata exceeds 64 MiB limit",
+                            ));
+                        }
                         mask_ifds.push(MaskIfdMeta {
                             width,
                             height,
                             tile_width: width,
                             tile_height: rps,
                             tiles_across: 1,
-                            tiles_down: height.div_ceil(rps),
+                            tiles_down: td,
                             bits_per_sample: mask_bps,
                             compression,
                             predictor,
@@ -686,6 +736,40 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             || (tile_byte_counts.len() as u64) < expected_tiles
         {
             return Err(TiffError::Corrupt("truncated tile/strip offset or byte-count table"));
+        }
+        let expected_usize = expected_tiles as usize;
+        let tile_offsets: Box<[u64]> = if tile_offsets.len() > expected_usize {
+            tile_offsets[..expected_usize].into()
+        } else {
+            tile_offsets
+        };
+        let tile_byte_counts: Box<[u32]> = if tile_byte_counts.len() > expected_usize {
+            tile_byte_counts[..expected_usize].into()
+        } else {
+            tile_byte_counts
+        };
+        if extra_samples.len() > samples_per_pixel as usize {
+            return Err(TiffError::Corrupt("ExtraSamples exceeds SamplesPerPixel"));
+        }
+        let jpeg_tables = if compression == Compression::Jpeg {
+            if let Some(ref jt) = jpeg_tables {
+                if jt.len() > MAX_JPEG_TABLES_BYTES {
+                    return Err(TiffError::Corrupt("JPEGTables exceeds 64 KiB limit"));
+                }
+            }
+            jpeg_tables
+        } else {
+            None
+        };
+        let ifd_meta_bytes = tile_offsets
+            .len()
+            .saturating_mul(std::mem::size_of::<u64>())
+            .saturating_add(tile_byte_counts.len().saturating_mul(std::mem::size_of::<u32>()))
+            .saturating_add(extra_samples.len().saturating_mul(std::mem::size_of::<u16>()))
+            .saturating_add(jpeg_tables.as_ref().map_or(0, |b| b.len()));
+        total_meta_bytes = total_meta_bytes.saturating_add(ifd_meta_bytes);
+        if total_meta_bytes > MAX_COG_METADATA_BYTES {
+            return Err(TiffError::Corrupt("cumulative TIFF IFD metadata exceeds 64 MiB limit"));
         }
 
         let pixel_to_crs = if ifds.is_empty() {
@@ -910,5 +994,30 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes()); // next IFD
         let err = parse_cog(&buf).unwrap_err();
         assert!(matches!(err, TiffError::Corrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn hostile_integer_array_type_and_amplification_are_rejected_before_alloc() {
+        // Classic TIFF with a single IFD entry: TAG_TILE_OFFSETS (324) with ty=TYPE_BYTE (1)
+        // and count=33_554_432 (formerly allocated 256 MiB before rejecting TYPE_BYTE).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+        buf.extend_from_slice(&TAG_TILE_OFFSETS.to_le_bytes());
+        buf.extend_from_slice(&TYPE_BYTE.to_le_bytes());
+        buf.extend_from_slice(&33_554_432u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(matches!(err, TiffError::Corrupt(_)), "got {err:?}");
+
+        // Same header with ty=TYPE_SHORT (3) and count=8_000_000: wire=16 MiB, output u64=64 MiB
+        // (> 32 MiB cap), must be rejected before reading or allocating.
+        buf[12..14].copy_from_slice(&TYPE_SHORT.to_le_bytes());
+        buf[14..18].copy_from_slice(&8_000_000u32.to_le_bytes());
+        let err2 = parse_cog(&buf).unwrap_err();
+        assert!(matches!(err2, TiffError::Corrupt(_)), "got {err2:?}");
     }
 }

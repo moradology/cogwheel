@@ -33,8 +33,7 @@ enum SidecarTileRange {
 fn mark_tile_all_nodata(tile: &mut DecodedTile) {
     for b in &mut tile.bands {
         b.data.make_f32_mut().fill(f32::NAN);
-        b.stats.all_nodata = true;
-        b.stats.no_nodata = false;
+        b.stats = cogzilla_codec::BlockStats::ALL_NODATA;
     }
 }
 
@@ -800,7 +799,7 @@ impl CogStore {
                             let decoded = tokio::task::spawn_blocking(move || {
                                 let Some(slice) = src.local_slice(offset, count) else {
                                     return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                        required: offset + count as u64,
+                                        required: offset.saturating_add(count as u64),
                                         available: 0,
                                     }));
                                 };
@@ -869,7 +868,7 @@ impl CogStore {
                         decode_set.spawn(async move {
                             let Some(slice) = src.local_slice(offset, count) else {
                                 return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                    required: offset + count as u64,
+                                    required: offset.saturating_add(count as u64),
                                     available: 0,
                                 }));
                             };
@@ -907,7 +906,7 @@ impl CogStore {
                     for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
                         let Some(slice) = cog.source.local_slice(offset, count) else {
                             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                required: offset + count as u64,
+                                required: offset.saturating_add(count as u64),
                                 available: 0,
                             }));
                         };
@@ -929,7 +928,7 @@ impl CogStore {
                                             else {
                                                 return Err(IoError::Tiff(
                                                     TiffError::NeedMoreBytes {
-                                                        required: moff + mlen as u64,
+                                                        required: moff.saturating_add(mlen as u64),
                                                         available: 0,
                                                     },
                                                 ));
@@ -956,7 +955,7 @@ impl CogStore {
                                         let Some(aslice) = cog.source.local_slice(aoff, alen)
                                         else {
                                             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                                required: aoff + alen as u64,
+                                                required: aoff.saturating_add(alen as u64),
                                                 available: 0,
                                             }));
                                         };
@@ -1324,10 +1323,16 @@ impl CogStore {
                                                                 } else {
                                                                     fetch_err = Some(IoError::Tiff(
                                                                         TiffError::NeedMoreBytes {
-                                                                            required: mi.offset
-                                                                                + mi.len as u64,
-                                                                            available: ms.start
-                                                                                + mb.len() as u64,
+                                                                            required: mi
+                                                                                .offset
+                                                                                .saturating_add(
+                                                                                    mi.len as u64,
+                                                                                ),
+                                                                            available: ms
+                                                                                .start
+                                                                                .saturating_add(
+                                                                                    mb.len() as u64,
+                                                                                ),
                                                                         },
                                                                     ));
                                                                 }
@@ -1401,10 +1406,16 @@ impl CogStore {
                                                             } else {
                                                                 fetch_err = Some(IoError::Tiff(
                                                                     TiffError::NeedMoreBytes {
-                                                                        required: ai.offset
-                                                                            + ai.len as u64,
-                                                                        available: aspan.start
-                                                                            + ab.len() as u64,
+                                                                        required: ai
+                                                                            .offset
+                                                                            .saturating_add(
+                                                                                ai.len as u64,
+                                                                            ),
+                                                                        available: aspan
+                                                                            .start
+                                                                            .saturating_add(
+                                                                                ab.len() as u64,
+                                                                            ),
                                                                     },
                                                                 ));
                                                             }
