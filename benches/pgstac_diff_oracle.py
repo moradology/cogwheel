@@ -634,6 +634,49 @@ def main() -> int:
         o.check("statistics for an unknown search", "json", "/searches/deadbeef/statistics?assets=red", "POST", five)
         o.check("statistics for an unknown collection", "json", "/collections/nope/statistics?assets=red", "POST", five)
 
+        print("per-asset options and asset_as_band")
+        opt = lambda v: quote(v, safe="")
+        ndvi = opt("(b2-b1)/(b2+b1)")
+        for label, q in [
+            ("one band of three", f"assets={opt('visual|bidx=1')}"),
+            ("bands in another order", f"assets={opt('visual|bidx=3,1')}"),
+            ("band math on one asset", f"assets={opt('red|expression=b1*2')}"),
+            ("band math with two results", f"assets={opt('visual|expression=b1+b2;b3')}"),
+            ("band math on two assets", f"assets={opt('red|expression=b1*2')}&assets={opt('nir|expression=b1/2')}"),
+            ("an option on one of two assets", f"assets={opt('visual|bidx=2')}&assets=nir"),
+            ("options and an expression over the result", f"assets={opt('visual|bidx=1,2')}&expression={opt('b1+b2')}"),
+            ("an option TiTiler does not know", f"assets={opt('visual|nope=1')}"),
+            ("the same asset twice", "assets=red&assets=red"),
+            ("asset_as_band", "assets=red&assets=nir&asset_as_band=true"),
+            ("asset_as_band and an expression", f"assets=red&assets=nir&asset_as_band=true&expression={ndvi}"),
+            ("asset_as_band=false", "assets=red&asset_as_band=false"),
+            ("asset names in an expression with asset_as_band", f"assets=red&assets=nir&asset_as_band=true&expression={opt('(nir-red)/(nir+red)')}"),
+            ("a bare bidx is passed over", "assets=visual&bidx=1"),
+        ]:
+            o.check(f"point, {label}", "json", f"/searches/{sid}/point/{pt}?{q}&items_limit=1")
+        o.check("point, an option without a value", "status", f"/searches/{sid}/point/{pt}?assets={opt('visual|bidx')}&items_limit=1")
+        o.check("point, a band index that is not a number", "status", f"/searches/{sid}/point/{pt}?assets={opt('visual|bidx=x')}&items_limit=1")
+        o.check("collection point, options", "json", f"/collections/{collection}/point/{pt}?assets={opt('visual|bidx=3,1')}&items_limit=1")
+        o.check("tile, bidx=1 on a one-band asset", "image", f"{base12}.png?assets={opt('red|bidx=1')}&rescale=0,3000")
+        o.check("tile, band math on one asset", "image", f"{base12}.png?assets={opt('red|expression=b1*2')}&rescale=0,6000")
+        o.check("tile, three bands in another order", "image", f"{base12}.png?assets={opt('visual|bidx=3,2,1')}")
+        o.check("tile, asset_as_band", "image", f"{base12}.png?assets=red&assets=green&assets=blue&rescale=0,3000&asset_as_band=true")
+        o.check("tile, asset_as_band and an expression", "image", f"{base12}.png?assets=red&assets=nir&expression={ndvi}&rescale=-1,1&asset_as_band=true")
+        o.check("tile, a bare bidx is passed over", "image", f"{base12}.png?assets=visual&bidx=1")
+        o.check("tile, asset names in an expression", "json", f"{base12}.png?assets=red&assets=nir&expression={opt('(nir-red)/(nir+red)')}&rescale=-1,1")
+        o.check("tile, one band of three", "image", f"{base12}.png?assets={opt('visual|bidx=1')}",
+                known="GDAL reads a subset of an RGB raster's bands from other pixels than all of them (rio-tiler tile(indexes=(1,)) differs from tile(indexes=(1,2,3))[0] in 43% of pixels); cogzilla reads the same pixels either way")
+        o.check("bbox, bidx=1 on a one-band asset", "image", f"/searches/{sid}/bbox/{part}.png?assets={opt('red|bidx=1')}&rescale=0,3000&max_size=256")
+        o.check("bbox, asset_as_band", "image", f"/searches/{sid}/bbox/{part}.png?assets=red&assets=green&assets=blue&rescale=0,3000&asset_as_band=true&max_size=256")
+        o.check("statistics, one band of three", "zonal", f"{st}?assets={opt('visual|bidx=2')}&max_size=64", "POST", five)
+        o.check("statistics, bands in another order", "zonal", f"{st}?assets={opt('visual|bidx=3,1')}", "POST", five)
+        o.check("statistics, band math on one asset", "zonal", f"{st}?assets={opt('red|expression=b1*2')}&max_size=64", "POST", five)
+        o.check("statistics, asset_as_band", "zonal", f"{st}?assets=red&assets=nir&asset_as_band=true&max_size=64", "POST", five)
+        o.check("statistics, asset_as_band and an expression", "zonal",
+                f"{st}?assets=red&assets=nir&asset_as_band=true&expression={ndvi}&max_size=64", "POST", five)
+        o.check("statistics, options and an expression over the result", "zonal",
+                f"{st}?assets={opt('visual|bidx=1,2')}&assets=nir&expression={opt('b1+b2;b3/2')}&max_size=64", "POST", five)
+
         print("wmts")
         o.check("search wmts", "wmts", f"/searches/{sid}/WMTSCapabilities.xml?assets=visual")
         o.check("search wmts keeps tile parameters", "wmts",

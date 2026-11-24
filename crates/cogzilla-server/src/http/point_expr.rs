@@ -69,6 +69,11 @@ impl Program {
         self.parts[part].0.eval(bands)
     }
 
+    /// The text of each part, as it was written.
+    pub(super) fn sources(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().map(|(_, text)| text.as_str())
+    }
+
     /// Each part with every `bN` replaced by that band's description.
     pub(super) fn describe(&self, descriptions: &[String]) -> Vec<String> {
         self.parts.iter().map(|(_, text)| describe(text, descriptions)).collect()
