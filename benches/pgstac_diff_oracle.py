@@ -182,6 +182,34 @@ def stats_diff(a, b, path="$"):
     return None if a == b else f"{path}: {a!r} vs {b!r}"
 
 
+def zonal_diff(a, b, path="$", key=""):
+    """Mosaic statistics are read from the same pixels on both sides, so everything has to
+    be equal. TiTiler sums coverage-weighted values in single precision: `mean`, `count`,
+    `sum` and `std` are compared to one part in a million, other numbers to one in 1e9."""
+    if isinstance(b, dict):
+        if not isinstance(a, dict) or set(a) != set(b):
+            return f"{path}: keys differ: {sorted(set(a) ^ set(b)) if isinstance(a, dict) else type(a).__name__}"
+        for k in b:
+            d = zonal_diff(a[k], b[k], f"{path}.{k}", k)
+            if d:
+                return d
+        return None
+    if isinstance(b, list):
+        if not isinstance(a, list) or len(a) != len(b):
+            return f"{path}: lists differ"
+        for i, (x, y) in enumerate(zip(a, b)):
+            d = zonal_diff(x, y, f"{path}[{i}]", key)
+            if d:
+                return d
+        return None
+    if isinstance(b, (int, float)) and not isinstance(b, bool):
+        tol = 1e-6 if key in ("mean", "count", "sum", "std") else 1e-9
+        if not isinstance(a, (int, float)) or abs(a - b) > tol * max(1.0, abs(b)):
+            return f"{path}: {a!r} vs {b!r}"
+        return None
+    return None if a == b else f"{path}: {a!r} vs {b!r}"
+
+
 class Oracle:
     def __init__(self, timeout: float):
         self.client = httpx.Client(timeout=timeout)
@@ -229,6 +257,14 @@ class Oracle:
         elif kind == "stats":
             diff = stats_diff(cz.json(), tt.json())
             ok, note = diff is None, diff or "same bands and fields, numbers within tolerance"
+        elif kind == "zonal":
+            if cz.status_code != 200:
+                note = f"{cz.status_code}"
+            elif cz.headers.get("content-type") != tt.headers.get("content-type"):
+                ok, note = False, f"content type {cz.headers.get('content-type')} vs {tt.headers.get('content-type')}"
+            else:
+                diff = zonal_diff(cz.json(), tt.json())
+                ok, note = diff is None, diff or "same features, items and statistics"
         elif kind == "ids":
             a, b = [i["id"] for i in cz.json()], [i["id"] for i in tt.json()]
             ok = a == b
@@ -523,6 +559,49 @@ def main() -> int:
         o.check("feature, format=jpg", "image", f"/searches/{sid}/feature?assets=visual&max_size=128&format=jpg", "POST", triangle)
         o.check("feature without assets", "json", f"/searches/{sid}/feature.png", "POST", triangle)
         o.check("collection feature", "image", f"/collections/{collection}/feature.png?assets=visual&max_size=256", "POST", triangle)
+
+        print("statistics under features")
+        five = {"type": "Feature", "properties": {"name": "five sides"}, "geometry": {"type": "Polygon", "coordinates": [[
+            [lon - 0.03, lat - 0.03], [lon + 0.03, lat - 0.03], [lon + 0.03, lat + 0.01], [lon, lat + 0.03],
+            [lon - 0.03, lat + 0.01], [lon - 0.03, lat - 0.03]]]}}
+        holed = {"type": "Feature", "id": "holed", "properties": None, "geometry": {"type": "MultiPolygon", "coordinates": [
+            [[[lon - 0.03, lat - 0.03], [lon + 0.03, lat - 0.03], [lon + 0.03, lat + 0.03], [lon - 0.03, lat + 0.03], [lon - 0.03, lat - 0.03]],
+             [[lon - 0.01, lat - 0.01], [lon + 0.01, lat - 0.01], [lon + 0.01, lat + 0.01], [lon - 0.01, lat + 0.01], [lon - 0.01, lat - 0.01]]],
+            [[[lon + 0.07, lat - 0.03], [lon + 0.09, lat - 0.03], [lon + 0.08, lat - 0.01], [lon + 0.07, lat - 0.03]]]]}}
+        large = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
+            [lon - 0.6, lat - 0.4], [lon + 0.6, lat - 0.35], [lon + 0.5, lat + 0.4], [lon - 0.2, lat + 0.3], [lon - 0.6, lat - 0.4]]]}}
+        far = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
+            [-150.4, 10.0], [-150.3, 10.0], [-150.3, 10.1], [-150.4, 10.0]]]}}
+        st = f"/searches/{sid}/statistics"
+        o.check("statistics at the data's own resolution", "zonal", f"{st}?assets=red", "POST", five)
+        o.check("statistics, max_size", "zonal", f"{st}?assets=red&max_size=64", "POST", five)
+        o.check("statistics, width and height", "zonal", f"{st}?assets=red&width=48&height=32", "POST", five)
+        o.check("statistics, height only", "zonal", f"{st}?assets=nir&height=100", "POST", five)
+        o.check("statistics, band math over two assets", "zonal",
+                f"{st}?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)", "POST", five)
+        o.check("statistics, two expressions", "zonal",
+                f"{st}?assets=red&assets=nir&expression=b1%2Bb2;b2/b1&max_size=128", "POST", five)
+        o.check("statistics, three bands, bin edges, a range and cover_scale", "zonal",
+                f"{st}?assets=visual&height=100&histogram_bins=0,100,200,255&histogram_range=0,300&cover_scale=4", "POST", holed)
+        o.check("statistics, categories and percentiles", "zonal",
+                f"{st}?assets=scl&max_size=128&categorical=true&c=4&c=5&c=6&c=99&p=5&p=50&p=95", "POST", five)
+        o.check("statistics, categorical without categories", "zonal", f"{st}?assets=scl&max_size=64&categorical=true", "POST", five)
+        o.check("statistics, bin count and range", "zonal",
+                f"{st}?assets=red&max_size=64&histogram_bins=4&histogram_range=0,2000", "POST", five)
+        o.check("statistics over several items", "zonal", f"{st}?assets=red&max_size=512", "POST", large)
+        o.check("statistics, filtered search", "zonal", f"/searches/{sid_meta}/statistics?assets=red&max_size=64", "POST", five)
+        o.check("statistics of a feature collection", "zonal", f"{st}?assets=red&max_size=64", "POST",
+                {"type": "FeatureCollection", "features": [five, holed]})
+        o.check("collection statistics", "zonal", f"/collections/{collection}/statistics?assets=red&max_size=64", "POST", five)
+        o.check("collection statistics, filtered", "zonal",
+                f"/collections/{collection}/statistics?assets=red&max_size=64&datetime=2024-12-01T00:00:00Z/..", "POST", five)
+        o.check("statistics without assets", "json", st, "POST", five)
+        o.check("statistics of a bare geometry", "status", f"{st}?assets=red", "POST", five["geometry"])
+        o.check("statistics outside the data", "status", f"{st}?assets=red&max_size=64", "POST", far)
+        o.check("statistics with an unknown asset", "json", f"{st}?assets=nope&max_size=64", "POST", five)
+        o.check("statistics with GET", "status", f"{st}?assets=red")
+        o.check("statistics for an unknown search", "json", "/searches/deadbeef/statistics?assets=red", "POST", five)
+        o.check("statistics for an unknown collection", "json", "/collections/nope/statistics?assets=red", "POST", five)
 
         print("wmts")
         o.check("search wmts", "wmts", f"/searches/{sid}/WMTSCapabilities.xml?assets=visual")

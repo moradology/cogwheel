@@ -1,8 +1,79 @@
-//! TiTiler's band math on point values: expressions over `b1..bn`, the stacked bands of the
+//! TiTiler's band math on pixel values: expressions over `b1..bn`, the stacked bands of the
 //! assets that were asked for, evaluated in double precision as numexpr does.
 //!
 //! `b1+b2;b2-b1` gives two values. Each result is described by the expression with every
 //! `bN` replaced by that band's description (`red_b1+nir_b1`).
+
+/// A parsed expression: one tree per `;`-separated part.
+pub(super) struct Program {
+    parts: Vec<(Node, String)>,
+}
+
+#[derive(Debug, Clone)]
+enum Node {
+    Num(f64),
+    Band(usize),
+    Neg(Box<Node>),
+    Bin(u8, Box<Node>, Box<Node>),
+    Call(fn(f64) -> f64, Box<Node>),
+}
+
+impl Node {
+    fn eval(&self, bands: &[f64]) -> f64 {
+        match self {
+            Node::Num(v) => *v,
+            Node::Band(i) => bands[*i],
+            Node::Neg(a) => -a.eval(bands),
+            Node::Bin(op, a, b) => {
+                let (a, b) = (a.eval(bands), b.eval(bands));
+                match op {
+                    b'+' => a + b,
+                    b'-' => a - b,
+                    b'*' => a * b,
+                    b'/' => a / b,
+                    b'%' => a % b,
+                    _ => a.powf(b),
+                }
+            }
+            Node::Call(f, a) => f(a.eval(bands)),
+        }
+    }
+}
+
+impl Program {
+    /// Parse `expression` for a pixel of `bands` stacked bands.
+    pub(super) fn parse(expression: &str, bands: usize) -> Result<Self, String> {
+        let mut parts = Vec::new();
+        for part in expression.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands };
+            let node = parser.sum()?;
+            parser.skip_space();
+            if parser.pos != parser.src.len() {
+                return Err(format!("Invalid expression '{part}'"));
+            }
+            parts.push((node, part.to_string()));
+        }
+        if parts.is_empty() {
+            return Err("Invalid expression ''".into());
+        }
+        Ok(Self { parts })
+    }
+
+    /// How many values the expression gives.
+    pub(super) fn len(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Result `part` for one pixel; a band with no value is NaN, and so is what uses it.
+    pub(super) fn eval(&self, part: usize, bands: &[f64]) -> f64 {
+        self.parts[part].0.eval(bands)
+    }
+
+    /// Each part with every `bN` replaced by that band's description.
+    pub(super) fn describe(&self, descriptions: &[String]) -> Vec<String> {
+        self.parts.iter().map(|(_, text)| describe(text, descriptions)).collect()
+    }
+}
 
 /// Evaluate `expression` over one pixel. A band with no value makes every result that
 /// touches it empty.
@@ -11,22 +82,12 @@ pub(super) fn apply(
     values: &[Option<f64>],
     descriptions: &[String],
 ) -> Result<(Vec<Option<f64>>, Vec<String>), String> {
-    let mut out = Vec::new();
-    let mut described = Vec::new();
-    for part in expression.split(';').map(str::trim).filter(|p| !p.is_empty()) {
-        let mut parser = Parser { src: part.as_bytes(), pos: 0, values };
-        let v = parser.sum()?;
-        parser.skip_space();
-        if parser.pos != parser.src.len() {
-            return Err(format!("Invalid expression '{part}'"));
-        }
-        out.push(v.is_finite().then_some(v));
-        described.push(describe(part, descriptions));
-    }
-    if out.is_empty() {
-        return Err("Invalid expression ''".into());
-    }
-    Ok((out, described))
+    let program = Program::parse(expression, values.len())?;
+    let bands: Vec<f64> = values.iter().map(|v| v.unwrap_or(f64::NAN)).collect();
+    let out = (0..program.len())
+        .map(|i| Some(program.eval(i, &bands)).filter(|v| v.is_finite()))
+        .collect();
+    Ok((out, program.describe(descriptions)))
 }
 
 /// `b3` -> `Some(2)`.
@@ -63,7 +124,7 @@ fn describe(part: &str, descriptions: &[String]) -> String {
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
-    values: &'a [Option<f64>],
+    bands: usize,
 }
 
 impl Parser<'_> {
@@ -83,20 +144,20 @@ impl Parser<'_> {
         }
     }
 
-    fn sum(&mut self) -> Result<f64, String> {
+    fn sum(&mut self) -> Result<Node, String> {
         let mut v = self.product()?;
         loop {
             if self.eat("+") {
-                v += self.product()?;
+                v = Node::Bin(b'+', Box::new(v), Box::new(self.product()?));
             } else if self.eat("-") {
-                v -= self.product()?;
+                v = Node::Bin(b'-', Box::new(v), Box::new(self.product()?));
             } else {
                 return Ok(v);
             }
         }
     }
 
-    fn product(&mut self) -> Result<f64, String> {
+    fn product(&mut self) -> Result<Node, String> {
         let mut v = self.unary()?;
         loop {
             self.skip_space();
@@ -105,20 +166,20 @@ impl Parser<'_> {
                 return Ok(v);
             }
             if self.eat("*") {
-                v *= self.unary()?;
+                v = Node::Bin(b'*', Box::new(v), Box::new(self.unary()?));
             } else if self.eat("/") {
-                v /= self.unary()?;
+                v = Node::Bin(b'/', Box::new(v), Box::new(self.unary()?));
             } else if self.eat("%") {
-                v %= self.unary()?;
+                v = Node::Bin(b'%', Box::new(v), Box::new(self.unary()?));
             } else {
                 return Ok(v);
             }
         }
     }
 
-    fn unary(&mut self) -> Result<f64, String> {
+    fn unary(&mut self) -> Result<Node, String> {
         if self.eat("-") {
-            return Ok(-self.unary()?);
+            return Ok(Node::Neg(Box::new(self.unary()?)));
         }
         if self.eat("+") {
             return self.unary();
@@ -126,12 +187,12 @@ impl Parser<'_> {
         let base = self.primary()?;
         if self.eat("**") {
             // Right-associative, and binds tighter than a leading minus on its right.
-            return Ok(base.powf(self.unary()?));
+            return Ok(Node::Bin(b'^', Box::new(base), Box::new(self.unary()?)));
         }
         Ok(base)
     }
 
-    fn primary(&mut self) -> Result<f64, String> {
+    fn primary(&mut self) -> Result<Node, String> {
         self.skip_space();
         let start = self.pos;
         let Some(&c) = self.src.get(self.pos) else {
@@ -165,7 +226,7 @@ impl Parser<'_> {
                 }
             }
             let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
-            return text.parse::<f64>().map_err(|_| format!("Invalid number '{text}'"));
+            return text.parse::<f64>().map(Node::Num).map_err(|_| format!("Invalid number '{text}'"));
         }
         if c.is_ascii_alphabetic() || c == b'_' {
             while self.src.get(self.pos).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
@@ -177,25 +238,26 @@ impl Parser<'_> {
                 if !self.eat(")") {
                     return Err("Invalid expression: missing ')'".into());
                 }
-                return match ident {
-                    "sqrt" => Ok(arg.sqrt()),
-                    "abs" => Ok(arg.abs()),
-                    "exp" => Ok(arg.exp()),
-                    "log" => Ok(arg.ln()),
-                    "log10" => Ok(arg.log10()),
-                    "sin" => Ok(arg.sin()),
-                    "cos" => Ok(arg.cos()),
-                    "tan" => Ok(arg.tan()),
-                    "arcsin" => Ok(arg.asin()),
-                    "arccos" => Ok(arg.acos()),
-                    "arctan" => Ok(arg.atan()),
-                    "floor" => Ok(arg.floor()),
-                    "ceil" => Ok(arg.ceil()),
-                    other => Err(format!("function '{other}' is not supported in point expressions")),
+                let function: fn(f64) -> f64 = match ident {
+                    "sqrt" => f64::sqrt,
+                    "abs" => f64::abs,
+                    "exp" => f64::exp,
+                    "log" => f64::ln,
+                    "log10" => f64::log10,
+                    "sin" => f64::sin,
+                    "cos" => f64::cos,
+                    "tan" => f64::tan,
+                    "arcsin" => f64::asin,
+                    "arccos" => f64::acos,
+                    "arctan" => f64::atan,
+                    "floor" => f64::floor,
+                    "ceil" => f64::ceil,
+                    other => return Err(format!("function '{other}' is not supported in expressions")),
                 };
+                return Ok(Node::Call(function, Box::new(arg)));
             }
-            return match band_index(ident).and_then(|n| self.values.get(n)) {
-                Some(v) => Ok(v.unwrap_or(f64::NAN)),
+            return match band_index(ident).filter(|n| *n < self.bands) {
+                Some(n) => Ok(Node::Band(n)),
                 None => Err(format!("Invalid band/asset name '{ident}'")),
             };
         }
