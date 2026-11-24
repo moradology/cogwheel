@@ -1436,10 +1436,27 @@ impl PolygonMask {
             .get("coordinates")
             .ok_or_else(|| EngineError::BadRequest("GeoJSON missing coordinates".into()))?;
 
-        let parse_ring = |arr: &serde_json::Value| -> Result<Vec<(f64, f64)>, EngineError> {
+        const MAX_GEOJSON_VERTICES: usize = 65_536;
+        const MAX_GEOJSON_RINGS: usize = 4_096;
+        let mut total_vertices = 0usize;
+        let mut total_rings = 0usize;
+
+        let mut parse_ring = |arr: &serde_json::Value| -> Result<Vec<(f64, f64)>, EngineError> {
             let list = arr
                 .as_array()
                 .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON ring".into()))?;
+            total_rings += 1;
+            if total_rings > MAX_GEOJSON_RINGS {
+                return Err(EngineError::BadRequest(format!(
+                    "GeoJSON polygon exceeds max {MAX_GEOJSON_RINGS} rings"
+                )));
+            }
+            total_vertices = total_vertices.saturating_add(list.len());
+            if total_vertices > MAX_GEOJSON_VERTICES {
+                return Err(EngineError::BadRequest(format!(
+                    "GeoJSON polygon exceeds max {MAX_GEOJSON_VERTICES} vertices"
+                )));
+            }
             let mut ring = Vec::with_capacity(list.len());
             for pt in list {
                 let p = pt
@@ -1448,10 +1465,17 @@ impl PolygonMask {
                 if p.len() < 2 {
                     return Err(EngineError::BadRequest("coord needs [lon, lat]".into()));
                 }
-                ring.push((
-                    p[0].as_f64().unwrap_or(0.0),
-                    p[1].as_f64().unwrap_or(0.0),
-                ));
+                let (Some(lon), Some(lat)) = (p[0].as_f64(), p[1].as_f64()) else {
+                    return Err(EngineError::BadRequest(
+                        "GeoJSON coordinates must be numeric".into(),
+                    ));
+                };
+                if !lon.is_finite() || !lat.is_finite() {
+                    return Err(EngineError::BadRequest(
+                        "GeoJSON coordinates must be finite".into(),
+                    ));
+                }
+                ring.push((lon, lat));
             }
             Ok(ring)
         };
@@ -1504,8 +1528,10 @@ impl PolygonMask {
                 }
             }
         }
-        if !min_x.is_finite() {
-            return Err(EngineError::BadRequest("empty GeoJSON polygon".into()));
+        if !min_x.is_finite() || !min_y.is_finite() || min_x >= max_x || min_y >= max_y {
+            return Err(EngineError::BadRequest(
+                "empty or degenerate GeoJSON polygon".into(),
+            ));
         }
         let bbox = [min_x, min_y, max_x, max_y];
         Ok((Self { polygons, bbox }, bbox))

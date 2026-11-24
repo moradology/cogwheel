@@ -263,6 +263,18 @@ impl<'a> BandSource<'a> {
         self.no_nodata && c0 >= 0 && r0 >= 0 && c1 < self.ifd_w && r1 < self.ifd_h
     }
 
+    #[inline(always)]
+    fn single_block_base_exact(&self) -> Option<(u32, u32)> {
+        let base_col = self.tx0.checked_mul(self.tile_w)?;
+        let base_row = self.ty0.checked_mul(self.tile_h)?;
+        // Reject bases > 2^24 that cannot be represented exactly in f32 so
+        // `u_coords[px] - (base_col as f32)` can never round down and over-read past row_stride.
+        if ((base_col as f32) as u32) != base_col || ((base_row as f32) as u32) != base_row {
+            return None;
+        }
+        Some((base_col, base_row))
+    }
+
     /// If the tile intersects a single decoded `f32` block (`grid_w == 1 && grid_h == 1`), return
     /// `(flat_slice, base_col, base_row, row_stride)` so hot scanline loops can hoist pointers
     /// and bypass per-pixel tile-grid indexing completely!
@@ -273,17 +285,13 @@ impl<'a> BandSource<'a> {
             && self.scale_offset.is_none()
             && self.nodata_override.is_none()
         {
+            let (base_col, base_row) = self.single_block_base_exact()?;
             let blk = self.blocks[0]?;
             if blk.width < 2 || blk.height < 2 {
                 return None;
             }
             let slice = blk.data.as_f32_slice()?;
-            Some((
-                slice,
-                self.tx0 * self.tile_w,
-                self.ty0 * self.tile_h,
-                self.tile_w as usize,
-            ))
+            Some((slice, base_col, base_row, self.tile_w as usize))
         } else {
             None
         }
@@ -293,17 +301,13 @@ impl<'a> BandSource<'a> {
     #[inline(always)]
     pub fn single_block_u16(&self) -> Option<(&'a [u16], u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
+            let (base_col, base_row) = self.single_block_base_exact()?;
             let blk = self.blocks[0]?;
             if blk.width < 2 || blk.height < 2 {
                 return None;
             }
             if let cogzilla_codec::BandData::U16 { data, .. } = &blk.data {
-                return Some((
-                    data.as_ref(),
-                    self.tx0 * self.tile_w,
-                    self.ty0 * self.tile_h,
-                    self.tile_w as usize,
-                ));
+                return Some((data.as_ref(), base_col, base_row, self.tile_w as usize));
             }
         }
         None
@@ -313,17 +317,13 @@ impl<'a> BandSource<'a> {
     #[inline(always)]
     pub fn single_block_u8(&self) -> Option<(&'a [u8], u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
+            let (base_col, base_row) = self.single_block_base_exact()?;
             let blk = self.blocks[0]?;
             if blk.width < 2 || blk.height < 2 {
                 return None;
             }
             if let cogzilla_codec::BandData::U8 { data, .. } = &blk.data {
-                return Some((
-                    data.as_ref(),
-                    self.tx0 * self.tile_w,
-                    self.ty0 * self.tile_h,
-                    self.tile_w as usize,
-                ));
+                return Some((data.as_ref(), base_col, base_row, self.tile_w as usize));
             }
         }
         None
@@ -334,6 +334,7 @@ impl<'a> BandSource<'a> {
     #[inline(always)]
     pub fn single_block_rgb_u8(&self) -> Option<(&'a [u8], u8, u32, u32, usize)> {
         if self.grid_w == 1 && self.grid_h == 1 && self.no_nodata {
+            let (base_col, base_row) = self.single_block_base_exact()?;
             let blk = self.blocks[0]?;
             if blk.width < 2 || blk.height < 2 {
                 return None;
@@ -342,8 +343,8 @@ impl<'a> BandSource<'a> {
                 return Some((
                     rgb.as_ref(),
                     *channel,
-                    self.tx0 * self.tile_w,
-                    self.ty0 * self.tile_h,
+                    base_col,
+                    base_row,
                     self.tile_w as usize,
                 ));
             }
@@ -494,5 +495,50 @@ mod tests {
         assert!(b.is_nan());
         assert!(c.is_nan());
         assert_eq!(d, 400.0);
+    }
+
+    #[test]
+    fn single_block_fast_paths_reject_f32_inexact_base_coords() {
+        let mut slab = AlignedF32Slab::new_uninit(4);
+        slab.as_mut_slice().copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let band = DecodedBand {
+            width: 2,
+            height: 2,
+            data: BandData::F32(slab),
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 1.0,
+                max: 4.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        // base_col = 263_173 * 255 = 67_109_115 > 2^24, not exactly representable in f32.
+        let src_inexact = BandSource::new(
+            70_000_000,
+            255,
+            255,
+            255,
+            263_173,
+            0,
+            1,
+            1,
+            &blocks,
+        );
+        assert!(src_inexact.single_block_flat().is_none());
+
+        // Power-of-two aligned base_col (262_144 * 256 = 67_108_864 = 2^26) IS exact in f32.
+        let src_exact = BandSource::new(
+            70_000_000,
+            256,
+            256,
+            256,
+            262_144,
+            0,
+            1,
+            1,
+            &blocks,
+        );
+        assert!(src_exact.single_block_flat().is_some());
     }
 }
