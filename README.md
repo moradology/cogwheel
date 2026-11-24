@@ -33,7 +33,7 @@ Mt. Rainier from the public Copernicus 30 m DEM on S3, four ways from one file. 
 One command, no data to download and no account:
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.5.16
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.5.17
 ```
 
 Then open <http://localhost:8080>.
@@ -42,7 +42,7 @@ Then open <http://localhost:8080>.
   <img src="assets/demo-page.jpg" alt="The cogzilla demo page: Mt. Rainier in 3D with a sidebar of demos and a tile-time readout" width="100%" />
 </p>
 
-The server's own front page is the demo. It has one-click maps of public data (Mt. Rainier as hillshade, slope, aspect and 3D terrain; Sentinel-2 true colour and NDVI), a box for your own COG URL, and a readout of how long each tile took. The first view of an area waits on S3; after that, tiles like the ones above render in a few milliseconds from cached blocks.
+The server's own front page is the demo. It has one-click maps of public data (Mt. Rainier as hillshade, slope, aspect, 3D terrain, and a custom JSON colormap; Sentinel-2 true colour, NDVI, 3-file algebraic EVI, and live `/stac` false-color IR + `color_formula` & NDWI expression demos), click-to-inspect `/cog/point` & `/stac/point` sampling, a box for your own COG URL, and a readout of how long each tile took. The first view of an area waits on S3; after that, tiles like the ones above render in a few milliseconds from cached blocks.
 
 ## Use it
 
