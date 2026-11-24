@@ -53,7 +53,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("unknown algorithm", format!("{tile}&algorithm=contours")),
         ("unsupported resampling", format!("{tile}&resampling=average")),
         ("padding", format!("{tile}&padding=4")),
-        ("reproject", format!("{tile}&reproject=bilinear")),
+        ("unsupported reproject", format!("{tile}&reproject=average")),
         ("bad rescale", format!("{tile}&rescale=abc")),
         ("unknown colormap", format!("{tile}&bidx=1&colormap_name=nope")),
         ("bad tilesize", format!("{tile}&tilesize=7")),
@@ -76,6 +76,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     for (what, url) in [
         ("tilesize alias", format!("{tile}&tilesize=512&rescale=0,1")),
         ("cubic_spline", format!("{tile}&resampling=cubic_spline&rescale=0,1")),
+        ("reproject=bilinear", format!("{tile}&reproject=bilinear&rescale=0,1")),
         ("padding=0", format!("{tile}&padding=0&rescale=0,1")),
         ("unrelated parameter", format!("{tile}&rescale=0,1&_cachebust=1&access_token=x")),
         ("hillshade", format!("{tile}&bidx=1&algorithm=hillshade")),
