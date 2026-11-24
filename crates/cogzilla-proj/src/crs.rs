@@ -640,6 +640,61 @@ impl CrsModel {
         let minzoom = minzoom_f.clamp(0.0, maxzoom as f64) as u8;
         (minzoom, maxzoom)
     }
+
+    /// Estimate `(minzoom, maxzoom)` for OGC `WorldCRS84Quad` (`cellSize(z=0) = 180° / 256`,
+    /// covering `±90°` without Mercator clamping).
+    pub fn world_crs84_zoom_range(
+        &self,
+        pixel_to_crs: &Affine2D,
+        width: u32,
+        height: u32,
+        overview_factor: f64,
+    ) -> (u8, u8) {
+        let cx = (width as f64) * 0.5;
+        let cy = (height as f64) * 0.5;
+        let step_px = (width.min(height) as f64 * 0.01).clamp(1.0, 64.0);
+        let to_ll = |col: f64, row: f64| -> Option<(f64, f64)> {
+            let (sx, sy) = pixel_to_crs.forward(col, row);
+            let (lon, lat) = self.to_lonlat_deg(sx, sy);
+            if lon.is_finite() && lat.is_finite() {
+                Some((lon, lat))
+            } else {
+                None
+            }
+        };
+        let px_deg = if let (Some((lon0, lat0)), Some((lonx, latx)), Some((lony, laty))) = (
+            to_ll(cx, cy),
+            to_ll(cx + step_px, cy),
+            to_ll(cx, cy + step_px),
+        ) {
+            let wrap_dlon = |d: f64| -> f64 {
+                if d > 180.0 {
+                    d - 360.0
+                } else if d < -180.0 {
+                    d + 360.0
+                } else {
+                    d
+                }
+            };
+            let dx = wrap_dlon(lonx - lon0).hypot(latx - lat0) / step_px;
+            let dy = wrap_dlon(lony - lon0).hypot(laty - lat0) / step_px;
+            let local = dx.min(dy).max(dx.max(dy) * 0.5);
+            if local.is_finite() && local > 1e-8 {
+                local
+            } else {
+                let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                (e - w).abs().max((n - s).abs()).max(1e-6) / (width.max(height) as f64)
+            }
+        } else {
+            let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+            (e - w).abs().max((n - s).abs()).max(1e-6) / (width.max(height) as f64)
+        };
+        let crs84_px0 = 180.0 / 256.0;
+        let maxzoom = (crs84_px0 / px_deg).log2().ceil().clamp(0.0, 22.0) as u8;
+        let minzoom_f = (crs84_px0 / (px_deg * overview_factor.max(1.0))).log2().floor();
+        let minzoom = minzoom_f.clamp(0.0, maxzoom as f64) as u8;
+        (minzoom, maxzoom)
+    }
 }
 
 /// Control grid dimension: `17x17` points = `16x16` bilinear cells across any tile.

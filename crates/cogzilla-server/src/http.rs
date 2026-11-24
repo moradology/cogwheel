@@ -58,11 +58,11 @@ fn percent_decode_opts(input: &str, plus_as_space: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parse TiTiler's `{y}[@{scale}x][.{ext}]` segment into `(y, scale_opt, ext_str)`.
-fn parse_y_scale_ext(seg: &str) -> Option<(u32, Option<u32>, &str)> {
+/// Parse TiTiler's `{y}[@{scale}x][.{ext}]` segment into `(y, scale_opt, ext_opt)`.
+fn parse_y_scale_ext(seg: &str) -> Option<(u32, Option<u32>, Option<&str>)> {
     let (left, ext) = match seg.split_once('.') {
-        Some((l, e)) => (l, e),
-        None => (seg, "png"),
+        Some((l, e)) => (l, Some(e)),
+        None => (seg, None),
     };
     let (y_str, scale) = match left.split_once('@') {
         Some((ys, sc)) => {
@@ -75,10 +75,10 @@ fn parse_y_scale_ext(seg: &str) -> Option<(u32, Option<u32>, &str)> {
     Some((y, scale, ext))
 }
 
-fn parse_wxh_ext(seg: &str) -> Option<(u32, u32, &str)> {
+fn parse_wxh_ext(seg: &str) -> Option<(u32, u32, Option<&str>)> {
     let (dims, ext) = match seg.split_once('.') {
-        Some((d, e)) => (d, e),
-        None => (seg, "png"),
+        Some((d, e)) => (d, Some(e)),
+        None => (seg, None),
     };
     let (ws, hs) = dims.split_once('x')?;
     let w = ws.parse::<u32>().ok()?;
@@ -415,23 +415,31 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 // Standard HTTP clients (httpx, requests, URLSearchParams) form-encode spaces as `+`
                 // and literal plus as `%2B`, while raw CLI/browser URLs often write `(b1+b2)` directly.
                 // Decode `+` as space when form-encoding markers are present so both work cleanly.
-                let plus_is_space = v.contains("%2B")
-                    || v.contains("%2b")
-                    || v.contains("+-")
-                    || v.contains("-+")
-                    || v.contains("+*")
-                    || v.contains("*+")
-                    || v.contains("+/")
-                    || v.contains("/+")
-                    || v.contains("++")
-                    || v.contains("+(")
-                    || v.contains(")+")
-                    || v.contains("%2F+")
-                    || v.contains("+%2F")
-                    || v.contains("%2f+")
-                    || v.contains("+%2f")
-                    || v.contains("%28+")
-                    || v.contains("+%29");
+                let lower = v.to_ascii_lowercase();
+                let plus_is_space = lower.contains("%2b")
+                    || lower.contains("+-")
+                    || lower.contains("-+")
+                    || lower.contains("+*")
+                    || lower.contains("*+")
+                    || lower.contains("+/")
+                    || lower.contains("/+")
+                    || lower.contains("+^")
+                    || lower.contains("^+")
+                    || lower.contains("++")
+                    || lower.contains("+(")
+                    || lower.contains(")+")
+                    || lower.contains(",+")
+                    || lower.contains("+%2f")
+                    || lower.contains("%2f+")
+                    || lower.contains("+%2a")
+                    || lower.contains("%2a+")
+                    || lower.contains("+%5e")
+                    || lower.contains("%5e+")
+                    || lower.contains("+%28")
+                    || lower.contains("%28+")
+                    || lower.contains("+%29")
+                    || lower.contains("%29+")
+                    || lower.contains("%2c+");
                 pq.expr_raw = Some(percent_decode_opts(v, plus_is_space));
             }
             "padding" => {
@@ -551,6 +559,10 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
                 "parameter '{k}' is only supported on tilejson.json and map.html routes"
             ));
         }
+    } else if let (Some(minz), Some(maxz)) = (pq.minzoom, pq.maxzoom)
+        && minz > maxz
+    {
+        return Err(format!("minzoom ({minz}) must be <= maxzoom ({maxz})"));
     }
     Ok(())
 }
@@ -589,16 +601,20 @@ fn apply_tilejson_overrides(
         format!("{origin}/{route_prefix}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext_suffix}?{filtered_query}")
     };
     tj["tiles"] = serde_json::json!([tile_url]);
-    if let Some(minz) = pq.minzoom {
-        tj["minzoom"] = serde_json::json!(minz);
-        if let Some(center) = tj.get_mut("center").and_then(|v| v.as_array_mut())
-            && center.len() >= 3
-        {
-            center[2] = serde_json::json!(minz);
-        }
-    }
-    if let Some(maxz) = pq.maxzoom {
-        tj["maxzoom"] = serde_json::json!(maxz);
+    let cur_min = tj.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let cur_max = tj.get("maxzoom").and_then(|v| v.as_u64()).unwrap_or(22) as u8;
+    let (new_min, new_max) = match (pq.minzoom, pq.maxzoom) {
+        (Some(mn), Some(mx)) => (mn, mx.max(mn)),
+        (Some(mn), None) => (mn, cur_max.max(mn)),
+        (None, Some(mx)) => (cur_min.min(mx), mx),
+        (None, None) => (cur_min, cur_max),
+    };
+    tj["minzoom"] = serde_json::json!(new_min);
+    tj["maxzoom"] = serde_json::json!(new_max);
+    if let Some(center) = tj.get_mut("center").and_then(|v| v.as_array_mut())
+        && center.len() >= 3
+    {
+        center[2] = serde_json::json!(new_min);
     }
 }
 
@@ -884,8 +900,9 @@ fn build_band_request(
 
 /// Match TiTiler / rio-tiler resampling semantics: when the source CRS matches the target CRS,
 /// `resampling` applies; when reprojecting across CRSes, `reproject` applies (both default to
-/// `Nearest`).
+/// `Nearest`). Uses `engine.get_or_build_crs` (cached) to avoid rebuilding `CrsModel` per tile.
 fn resolve_resample(
+    engine: Option<&TileEngine>,
     pq: &ParsedQuery,
     source_cog: Option<&cogzilla_io::OpenedCog>,
     target_is_4326: bool,
@@ -893,18 +910,24 @@ fn resolve_resample(
     let Some(cog) = source_cog else {
         return pq.resample;
     };
-    let same_crs = match cogzilla_proj::CrsModel::from_geo_keys(&cog.index.geo_keys) {
-        Ok(cogzilla_proj::CrsModel::Epsg3857) => !target_is_4326,
-        Ok(cogzilla_proj::CrsModel::Geographic) => target_is_4326,
+    let crs_res = if let Some(eng) = engine {
+        eng.get_or_build_crs(cog).ok()
+    } else {
+        cogzilla_proj::CrsModel::from_geo_keys(&cog.index.geo_keys).ok()
+    };
+    let same_crs = match crs_res {
+        Some(cogzilla_proj::CrsModel::Epsg3857) => !target_is_4326,
+        Some(cogzilla_proj::CrsModel::Geographic) => target_is_4326,
         _ => false,
     };
     if same_crs { pq.resample } else { pq.reproject }
 }
 
 fn build_tile_request(
+    engine: Option<&TileEngine>,
     tile: TileCoord,
     scale_opt: Option<u32>,
-    ext: &str,
+    ext_opt: Option<&str>,
     pq: &ParsedQuery,
     default_bands: u16,
     sample_type: cogzilla_tiff::SampleType,
@@ -925,11 +948,7 @@ fn build_tile_request(
             tile.x, tile.y, tile.z
         )));
     }
-    let eff_ext = if ext.is_empty() {
-        pq.format_param.as_deref().unwrap_or("png")
-    } else {
-        ext
-    };
+    let eff_ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, sample_type)?;
     let tile_size = match scale_opt {
@@ -946,7 +965,7 @@ fn build_tile_request(
             tile,
             tile_size,
             bands,
-            resample: resolve_resample(pq, source_cog, is_crs84),
+            resample: resolve_resample(engine, pq, source_cog, is_crs84),
             format,
             unscale: pq.unscale,
         },
@@ -1510,19 +1529,23 @@ where
             ["mosaicjson", tms, "tilejson.json"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let tile_url =
-                    format!("{host}/mosaicjson/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}");
-                let tj = serde_json::json!({
+                let center = serde_json::json!([
+                    0.5 * (mj.bounds[0] + mj.bounds[2]),
+                    0.5 * (mj.bounds[1] + mj.bounds[3]),
+                    mj.minzoom,
+                ]);
+                let mut tj = serde_json::json!({
                     "tilejson": "3.0.0",
                     "version": mj.version,
                     "scheme": "xyz",
-                    "tiles": [tile_url],
+                    "tiles": [],
                     "minzoom": mj.minzoom,
                     "maxzoom": mj.maxzoom,
                     "bounds": mj.bounds,
-                })
-                .to_string();
-                Ok((Bytes::from(tj), "application/json"))
+                    "center": center,
+                });
+                apply_tilejson_overrides(&mut tj, &pq, &host, "mosaicjson", tms, &raw_query);
+                Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
             ["mosaicjson", "tiles", "WebMercatorQuad", zs, xs, ys]
@@ -1553,6 +1576,7 @@ where
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
                             let (treq, ct) = build_tile_request(
+                                Some(&engine),
                                 tile,
                                 sc,
                                 ext,
@@ -1576,6 +1600,7 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
+                                Some(&engine),
                                 tile,
                                 sc,
                                 ext,
@@ -1640,6 +1665,7 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
+                                Some(&engine),
                                 TileCoord { z, x, y },
                                 sc,
                                 ext,
@@ -1692,6 +1718,7 @@ where
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
                             let (treq, ct) = build_tile_request(
+                                Some(&engine),
                                 tile,
                                 sc,
                                 ext,
@@ -1715,6 +1742,7 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
+                                Some(&engine),
                                 tile,
                                 sc,
                                 ext,
@@ -1775,6 +1803,7 @@ where
                             };
                             let st = cogs[0].index.full_res().sample_type;
                             let (mut treq, ct) = build_tile_request(
+                                Some(&engine),
                                 TileCoord { z, x, y },
                                 sc,
                                 ext,
@@ -2064,6 +2093,7 @@ where
                         for (idx, cog) in cogs_c.into_iter().enumerate() {
                             let eng_c = eng.clone();
                             let mask_c = mask.clone();
+                            let nb = cog.index.full_res().samples_per_pixel as usize;
                             set.spawn(async move {
                                 let st = compute_statistics(
                                     &eng_c,
@@ -2074,23 +2104,25 @@ where
                                     nodata,
                                 )
                                 .await?;
-                                Ok::<_, EngineError>((idx, st))
+                                Ok::<_, EngineError>((idx, nb, st))
                             });
                         }
-                        let mut ordered: Vec<Option<serde_json::Value>> = vec![None; n];
+                        let mut ordered: Vec<Option<(usize, serde_json::Value)>> = vec![None; n];
                         while let Some(res) = set.join_next().await {
-                            let (idx, st) = res
+                            let (idx, nb, st) = res
                                 .map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
-                            ordered[idx] = Some(st);
+                            ordered[idx] = Some((nb, st));
                         }
-                        // Merge bands across assets into b1..bN to match TiTiler's POST /stac/statistics.
+                        // Merge bands in numeric order 1..=nb across assets to match TiTiler's POST /stac/statistics.
                         let mut merged = serde_json::Map::new();
                         let mut b_counter = 1usize;
-                        for st in ordered.into_iter().flatten() {
+                        for (nb, st) in ordered.into_iter().flatten() {
                             if let Some(obj) = st.as_object() {
-                                for (_k, v) in obj {
-                                    merged.insert(format!("b{b_counter}"), v.clone());
-                                    b_counter += 1;
+                                for b in 1..=nb {
+                                    if let Some(v) = obj.get(&format!("b{b}")) {
+                                        merged.insert(format!("b{b_counter}"), v.clone());
+                                        b_counter += 1;
+                                    }
                                 }
                             }
                         }
@@ -2214,6 +2246,7 @@ where
                         };
                         let st = cogs[0].index.full_res().sample_type;
                         let (mut treq, ct) = build_tile_request(
+                            Some(&engine),
                             TileCoord { z, x, y },
                             sc,
                             ext,
@@ -2424,7 +2457,7 @@ where
             }
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
-                let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected /stac/preview/{w}x{h}.{ext}".into()));
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -2437,6 +2470,7 @@ where
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
@@ -2498,16 +2532,16 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, pq_stac.max_size.min(1024));
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq_stac.max_size);
                 let data = if pq_stac.coord_crs_3857 {
-                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
-                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -2521,7 +2555,7 @@ where
                 let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
-                let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -2531,6 +2565,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
@@ -2550,14 +2585,14 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let data = if pq_stac.coord_crs_3857 {
-                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
-                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -2568,16 +2603,11 @@ where
             }
             .await,
 
-            // POST /stac/feature[.{ext}] and POST /stac/feature/{w}x{h}.{ext}
-            (Method::POST, ["feature"]) | (Method::POST, ["feature", _]) => async {
-                let (out_w, out_h, ext) = if sub.len() == 2 {
-                    parse_wxh_ext(sub[1]).ok_or_else(|| {
-                        EngineError::BadRequest("expected /stac/feature/{w}x{h}.{ext}".into())
-                    })?
-                } else {
-                    let s = pq.max_size.min(1024);
-                    (s, s, "png")
-                };
+            // POST /stac/feature/{w}x{h}[.{ext}] and POST /stac/feature[.{ext}]
+            (Method::POST, ["feature", dims_ext]) => async {
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).ok_or_else(|| {
+                    EngineError::BadRequest("expected /stac/feature/{w}x{h}.{ext}".into())
+                })?;
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -2589,6 +2619,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
@@ -2607,7 +2638,7 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -2620,7 +2651,7 @@ where
                 if *feat_ext == "feature" || feat_ext.starts_with("feature.") =>
             async {
                 let ext_opt = feat_ext.strip_prefix("feature.");
-                let s = pq.max_size.min(1024);
+                let s = pq.max_size;
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -2652,7 +2683,7 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let (out_w, out_h) = aspect_preserving_dims(bbox, s);
-                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -2866,6 +2897,7 @@ where
                         };
                         let st = cogs[0].index.full_res().sample_type;
                         let (mut treq, ct) = build_tile_request(
+                            Some(&engine),
                             TileCoord { z, x, y },
                             sc,
                             ext,
@@ -3052,7 +3084,7 @@ where
             }
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
-                let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected /cog/preview/{w}x{h}.{ext}".into()));
                 };
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
@@ -3060,6 +3092,7 @@ where
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
@@ -3097,16 +3130,16 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size.min(1024));
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let data = if pq.coord_crs_3857 {
-                    let resample = resolve_resample(&pq, Some(&cogs[0]), false);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
-                    let resample = resolve_resample(&pq, Some(&cogs[0]), true);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -3120,12 +3153,13 @@ where
                 let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox coordinates".into()));
                 };
-                let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
                 };
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
@@ -3135,14 +3169,14 @@ where
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = if pq.coord_crs_3857 {
-                    let resample = resolve_resample(&pq, Some(&cogs[0]), false);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
-                    let resample = resolve_resample(&pq, Some(&cogs[0]), true);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -3174,8 +3208,8 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size.min(1024));
-                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
+                let (out_w, out_h) = aspect_preserving_dims(bbox, pq.max_size);
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -3185,7 +3219,7 @@ where
             }
             .await,
             (Method::POST, ["feature", dims_ext]) => async {
-                let Some((out_w, out_h, ext)) = parse_wxh_ext(dims_ext) else {
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
                     return Err(EngineError::BadRequest("expected /cog/feature/{w}x{h}.{ext}".into()));
                 };
                 let body_bytes = read_limited_body(req.into_body()).await?;
@@ -3195,6 +3229,7 @@ where
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
@@ -3203,7 +3238,7 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
                     &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -3516,13 +3551,13 @@ mod tests {
         assert_eq!(pq.reproject, ResampleMode::Nearest);
         let u8t = cogzilla_tiff::SampleType::Uint8;
         // WebMercatorQuad at z=2 has 4x4 tiles (0..=3)
-        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, u8t, false, None).is_ok());
-        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, u8t, false, None).is_err());
-        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, u8t, false, None).is_err());
+        assert!(build_tile_request(None, TileCoord { z: 2, x: 3, y: 3 }, None, Some("png"), &pq, 3, u8t, false, None).is_ok());
+        assert!(build_tile_request(None, TileCoord { z: 2, x: 4, y: 0 }, None, Some("png"), &pq, 3, u8t, false, None).is_err());
+        assert!(build_tile_request(None, TileCoord { z: 2, x: 0, y: 4 }, None, Some("png"), &pq, 3, u8t, false, None).is_err());
         // WorldCRS84Quad at z=2 has 8x4 tiles (x: 0..=7, y: 0..=3)
-        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, u8t, true, None).is_ok());
-        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, u8t, true, None).is_err());
-        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, u8t, true, None).is_err());
+        assert!(build_tile_request(None, TileCoord { z: 2, x: 7, y: 3 }, None, Some("png"), &pq, 3, u8t, true, None).is_ok());
+        assert!(build_tile_request(None, TileCoord { z: 2, x: 8, y: 0 }, None, Some("png"), &pq, 3, u8t, true, None).is_err());
+        assert!(build_tile_request(None, TileCoord { z: 2, x: 0, y: 4 }, None, Some("png"), &pq, 3, u8t, true, None).is_err());
 
         // ?reproject= is accepted and parsed independently from ?resampling=
         let pq_rp = parse_query(Some("resampling=bilinear&reproject=cubic"));
@@ -3534,19 +3569,27 @@ mod tests {
         // Single-band default colormap is Grayscale (matching TiTiler)
         assert_eq!(pq.colormap, ColormapName::Grayscale);
 
-        // Form-encoded ?expression= with spaces (`+`) and `%2B` decodes cleanly, while raw `(b1+b2)` still works
+        // Form-encoded ?expression= with spaces (`+`), `%2B`, `%2A`, `%5E`, `%28`/`%29` decodes cleanly, while raw `(b1+b2)` still works
         let pq_form = parse_query(Some("expression=%28b1+-+b2%29+%2F+%28b1+%2B+b2%29"));
         assert_eq!(pq_form.expr_raw.as_deref(), Some("(b1 - b2) / (b1 + b2)"));
+        let pq_mul = parse_query(Some("expression=10+%2A+log10%28b1%29"));
+        assert_eq!(pq_mul.expr_raw.as_deref(), Some("10 * log10(b1)"));
         let pq_raw = parse_query(Some("expression=(b1-b2)/(b1+b2)"));
         assert_eq!(pq_raw.expr_raw.as_deref(), Some("(b1-b2)/(b1+b2)"));
 
-        // ?format= applies on format-less tile routes
+        // ?format= applies on format-less tile routes parsed via parse_y_scale_ext
+        let (y_parsed, sc_parsed, ext_opt) = parse_y_scale_ext("1@2x").unwrap();
+        assert_eq!((y_parsed, sc_parsed, ext_opt), (1, Some(2), None));
         let pq_fmt = parse_query(Some("format=webp"));
         let (treq, ct) =
-            build_tile_request(TileCoord { z: 2, x: 1, y: 1 }, None, "", &pq_fmt, 3, u8t, false, None)
+            build_tile_request(None, TileCoord { z: 2, x: 1, y: y_parsed }, sc_parsed, ext_opt, &pq_fmt, 3, u8t, false, None)
                 .unwrap();
         assert_eq!(ct, "image/webp");
         assert!(matches!(treq.format, OutputFormat::Webp { .. }));
+
+        // Invalid minzoom > maxzoom rejected on tilejson.json
+        let pq_bad_z = parse_query(Some("minzoom=14&maxzoom=8"));
+        assert!(validate_query(&["cog", "WebMercatorQuad", "tilejson.json"], &pq_bad_z).is_err());
 
         // Default dtype rescale ranges & aspect-preserving dims & hex colormaps
         assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Uint16, false), (0.0, 65535.0));
