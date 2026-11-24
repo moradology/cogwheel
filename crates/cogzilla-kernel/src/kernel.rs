@@ -78,6 +78,7 @@ struct KernelScratch {
     img_buf: Vec<u8>,
     row_buf: Vec<u8>,
     f32_row: Vec<f32>,
+    dem_elev: Vec<f32>,
 }
 
 impl KernelScratch {
@@ -86,6 +87,7 @@ impl KernelScratch {
             img_buf: Vec::with_capacity(512 * (1 + 512 * 4)),
             row_buf: vec![0u8; 512 * 4],
             f32_row: vec![0.0f32; 512],
+            dem_elev: Vec::new(),
         }
     }
 }
@@ -2399,208 +2401,207 @@ pub fn render_dem_algorithm<const N: usize>(
         }
     };
 
-    // Sample interior N×N elevation grid + 1-pixel extrapolated border -> (N+2)×(N+2)
+    // Reuse thread-local scratch for the (N+2)×(N+2) elevation buffer + PNG/RGBA output buffers
+    // (eliminates up to 1.05 MiB heap alloc+zero per @2x DEM tile).
     let pad = N + 2;
-    let mut elev = vec![f32::NAN; pad * pad];
-    let mut u_first = [0.0f32; N];
-    let mut v_first = [0.0f32; N];
-    let mut u_second = [0.0f32; N];
-    let mut v_second = [0.0f32; N];
-    let mut u_prev = [0.0f32; N];
-    let mut v_prev = [0.0f32; N];
-    let mut u_row = [0.0f32; N];
-    let mut v_row = [0.0f32; N];
-
-    for py in 0..N {
-        fill_uv_row(plan, py, &mut u_row, &mut v_row);
-        if py == 0 {
-            u_first = u_row;
-            v_first = v_row;
-        } else if py == 1 {
-            u_second = u_row;
-            v_second = v_row;
+    SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let sc = &mut *guard;
+        if sc.dem_elev.len() < pad * pad {
+            sc.dem_elev.resize(pad * pad, 0.0);
         }
-        let row_off = (py + 1) * pad;
+        let elev = &mut sc.dem_elev[..pad * pad];
+        let mut u_first = [0.0f32; N];
+        let mut v_first = [0.0f32; N];
+        let mut u_second = [0.0f32; N];
+        let mut v_second = [0.0f32; N];
+        let mut u_prev = [0.0f32; N];
+        let mut v_prev = [0.0f32; N];
+        let mut u_row = [0.0f32; N];
+        let mut v_row = [0.0f32; N];
+
+        for py in 0..N {
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
+            if py == 0 {
+                u_first = u_row;
+                v_first = v_row;
+            } else if py == 1 {
+                u_second = u_row;
+                v_second = v_row;
+            }
+            let row_off = (py + 1) * pad;
+            for px in 0..N {
+                elev[row_off + px + 1] = sample_px(u_row[px], v_row[px]);
+            }
+            // Left/right 1-px extrapolated border using the exact same sub-pixel interpolation
+            let du_l = u_row[1] - u_row[0];
+            let dv_l = v_row[1] - v_row[0];
+            elev[row_off] = sample_border(u_row[0] - du_l, v_row[0] - dv_l);
+            let du_r = u_row[N - 1] - u_row[N - 2];
+            let dv_r = v_row[N - 1] - v_row[N - 2];
+            elev[row_off + N + 1] = sample_border(u_row[N - 1] + du_r, v_row[N - 1] + dv_r);
+            if py + 1 < N {
+                u_prev = u_row;
+                v_prev = v_row;
+            }
+        }
+        // Top/bottom 1-px extrapolated border using the exact same sub-pixel interpolation
         for px in 0..N {
-            elev[row_off + px + 1] = sample_px(u_row[px], v_row[px]);
+            let u_top = 2.0 * u_first[px] - u_second[px];
+            let v_top = 2.0 * v_first[px] - v_second[px];
+            elev[px + 1] = sample_border(u_top, v_top);
+            let u_bot = 2.0 * u_row[px] - u_prev[px];
+            let v_bot = 2.0 * v_row[px] - v_prev[px];
+            elev[(N + 1) * pad + px + 1] = sample_border(u_bot, v_bot);
         }
-        // Left/right 1-px extrapolated border using the exact same sub-pixel interpolation
-        let du_l = u_row[1] - u_row[0];
-        let dv_l = v_row[1] - v_row[0];
-        elev[row_off] = sample_border(u_row[0] - du_l, v_row[0] - dv_l);
-        let du_r = u_row[N - 1] - u_row[N - 2];
-        let dv_r = v_row[N - 1] - v_row[N - 2];
-        elev[row_off + N + 1] = sample_border(u_row[N - 1] + du_r, v_row[N - 1] + dv_r);
-        if py + 1 < N {
-            u_prev = u_row;
-            v_prev = v_row;
-        }
-    }
-    // Top/bottom 1-px extrapolated border using the exact same sub-pixel interpolation
-    for px in 0..N {
-        let u_top = 2.0 * u_first[px] - u_second[px];
-        let v_top = 2.0 * v_first[px] - v_second[px];
-        elev[px + 1] = sample_border(u_top, v_top);
-        let u_bot = 2.0 * u_row[px] - u_prev[px];
-        let v_bot = 2.0 * v_row[px] - v_prev[px];
-        elev[(N + 1) * pad + px + 1] = sample_border(u_bot, v_bot);
-    }
-    // 4 extrapolated corners for seamless corner stencils
-    elev[0] = sample_border(
-        (2.0 * u_first[0] - u_second[0]) - (u_first[1] - u_first[0]),
-        (2.0 * v_first[0] - v_second[0]) - (v_first[1] - v_first[0]),
-    );
-    elev[pad - 1] = sample_border(
-        (2.0 * u_first[N - 1] - u_second[N - 1]) + (u_first[N - 1] - u_first[N - 2]),
-        (2.0 * v_first[N - 1] - v_second[N - 1]) + (v_first[N - 1] - v_first[N - 2]),
-    );
-    elev[(N + 1) * pad] = sample_border(
-        (2.0 * u_row[0] - u_prev[0]) - (u_row[1] - u_row[0]),
-        (2.0 * v_row[0] - v_prev[0]) - (v_row[1] - v_row[0]),
-    );
-    elev[(N + 1) * pad + pad - 1] = sample_border(
-        (2.0 * u_row[N - 1] - u_prev[N - 1]) + (u_row[N - 1] - u_row[N - 2]),
-        (2.0 * v_row[N - 1] - v_prev[N - 1]) + (v_row[N - 1] - v_row[N - 2]),
-    );
+        // 4 extrapolated corners for seamless corner stencils
+        elev[0] = sample_border(
+            (2.0 * u_first[0] - u_second[0]) - (u_first[1] - u_first[0]),
+            (2.0 * v_first[0] - v_second[0]) - (v_first[1] - v_first[0]),
+        );
+        elev[pad - 1] = sample_border(
+            (2.0 * u_first[N - 1] - u_second[N - 1]) + (u_first[N - 1] - u_first[N - 2]),
+            (2.0 * v_first[N - 1] - v_second[N - 1]) + (v_first[N - 1] - v_first[N - 2]),
+        );
+        elev[(N + 1) * pad] = sample_border(
+            (2.0 * u_row[0] - u_prev[0]) - (u_row[1] - u_row[0]),
+            (2.0 * v_row[0] - v_prev[0]) - (v_row[1] - v_row[0]),
+        );
+        elev[(N + 1) * pad + pad - 1] = sample_border(
+            (2.0 * u_row[N - 1] - u_prev[N - 1]) + (u_row[N - 1] - u_row[N - 2]),
+            (2.0 * v_row[N - 1] - v_prev[N - 1]) + (v_row[N - 1] - v_row[N - 2]),
+        );
 
-    let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
-    let inv_range = 255.0 / (style.rescale_max - style.rescale_min).max(1e-12);
-    let min_val = style.rescale_min;
-    let lut = style.colormap.lut();
+        let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
+        let inv_range = 255.0 / (style.rescale_max - style.rescale_min).max(1e-12);
+        let min_val = style.rescale_min;
+        let lut = style.colormap.lut();
 
-    match style.format {
-        OutputFormat::RawF32 => {
-            let mut out = BytesMut::with_capacity(N * N * 4);
-            for py in 0..N {
-                let r0 = py * pad;
-                let r1 = (py + 1) * pad;
-                let r2 = (py + 2) * pad;
-                for px in 0..N {
-                    let c = px + 1;
-                    let val = eval_horn_3x3(
-                        elev[r0 + c - 1],
-                        elev[r0 + c],
-                        elev[r0 + c + 1],
-                        elev[r1 + c - 1],
-                        elev[r1 + c],
-                        elev[r1 + c + 1],
-                        elev[r2 + c - 1],
-                        elev[r2 + c],
-                        elev[r2 + c + 1],
-                        inv_8dx,
-                        alg,
-                    );
-                    out.put_slice(&val.to_le_bytes());
+        match style.format {
+            OutputFormat::RawF32 => {
+                let mut out = BytesMut::with_capacity(N * N * 4);
+                for py in 0..N {
+                    let r0 = py * pad;
+                    let r1 = (py + 1) * pad;
+                    let r2 = (py + 2) * pad;
+                    for px in 0..N {
+                        let c = px + 1;
+                        let val = eval_horn_3x3(
+                            elev[r0 + c - 1],
+                            elev[r0 + c],
+                            elev[r0 + c + 1],
+                            elev[r1 + c - 1],
+                            elev[r1 + c],
+                            elev[r1 + c + 1],
+                            elev[r2 + c - 1],
+                            elev[r2 + c],
+                            elev[r2 + c + 1],
+                            inv_8dx,
+                            alg,
+                        );
+                        out.put_slice(&val.to_le_bytes());
+                    }
                 }
+                out.freeze()
             }
-            out.freeze()
-        }
-        OutputFormat::Png => SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let sc = &mut *guard;
-            let stride = 1 + N;
-            let total = N * stride;
-            if sc.img_buf.len() < total {
-                sc.img_buf.resize(total, 0);
-            }
-            if sc.row_buf.len() < N {
-                sc.row_buf.resize(N, 0);
-            }
-            let mut has_nodata = false;
-            for py in 0..N {
-                let r0 = py * pad;
-                let r1 = (py + 1) * pad;
-                let r2 = (py + 2) * pad;
-                let row_idx = &mut sc.row_buf[..N];
-                for px in 0..N {
-                    let c = px + 1;
-                    let val = eval_horn_3x3(
-                        elev[r0 + c - 1],
-                        elev[r0 + c],
-                        elev[r0 + c + 1],
-                        elev[r1 + c - 1],
-                        elev[r1 + c],
-                        elev[r1 + c + 1],
-                        elev[r2 + c - 1],
-                        elev[r2 + c],
-                        elev[r2 + c + 1],
-                        inv_8dx,
-                        alg,
-                    );
-                    if val.is_nan() {
-                        has_nodata = true;
-                        row_idx[px] = 0;
-                    } else {
-                        let idx = rescale_u8(val, inv_range, min_val);
-                        row_idx[px] = if clean && !matches!(alg, DemAlgorithm::Aspect) {
-                            idx
+            OutputFormat::Png => {
+                let stride = 1 + N;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N {
+                    sc.row_buf.resize(N, 0);
+                }
+                let mut has_nodata = false;
+                for py in 0..N {
+                    let r0 = py * pad;
+                    let r1 = (py + 1) * pad;
+                    let r2 = (py + 2) * pad;
+                    let row_idx = &mut sc.row_buf[..N];
+                    for px in 0..N {
+                        let c = px + 1;
+                        let val = eval_horn_3x3(
+                            elev[r0 + c - 1],
+                            elev[r0 + c],
+                            elev[r0 + c + 1],
+                            elev[r1 + c - 1],
+                            elev[r1 + c],
+                            elev[r1 + c + 1],
+                            elev[r2 + c - 1],
+                            elev[r2 + c],
+                            elev[r2 + c + 1],
+                            inv_8dx,
+                            alg,
+                        );
+                        if val.is_nan() {
+                            has_nodata = true;
+                            row_idx[px] = 0;
                         } else {
-                            // Reserve index 0 for transparent nodata when needed
-                            idx.max(1)
-                        };
+                            let idx = rescale_u8(val, inv_range, min_val);
+                            row_idx[px] = if clean && !matches!(alg, DemAlgorithm::Aspect) {
+                                idx
+                            } else {
+                                idx.max(1)
+                            };
+                        }
+                    }
+                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                }
+                if !has_nodata && clean && !matches!(alg, DemAlgorithm::Aspect) {
+                    let plte = build_plte_opaque(lut);
+                    encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                } else {
+                    let plte = build_plte_nodata(lut);
+                    let trns = has_nodata.then_some(&[0u8][..]);
+                    encode_indexed_png(N as u32, N as u32, &plte, trns, &sc.img_buf[..total])
+                }
+            }
+            OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+                let total = N * N * 4;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                let rgba = &mut sc.img_buf[..total];
+                rgba.fill(0);
+                let mut all_opaque = true;
+                for py in 0..N {
+                    let r0 = py * pad;
+                    let r1 = (py + 1) * pad;
+                    let r2 = (py + 2) * pad;
+                    let row_off = py * N * 4;
+                    for px in 0..N {
+                        let c = px + 1;
+                        let val = eval_horn_3x3(
+                            elev[r0 + c - 1],
+                            elev[r0 + c],
+                            elev[r0 + c + 1],
+                            elev[r1 + c - 1],
+                            elev[r1 + c],
+                            elev[r1 + c + 1],
+                            elev[r2 + c - 1],
+                            elev[r2 + c],
+                            elev[r2 + c + 1],
+                            inv_8dx,
+                            alg,
+                        );
+                        let off = row_off + px * 4;
+                        if val.is_nan() {
+                            all_opaque = false;
+                        } else {
+                            let idx = rescale_u8(val, inv_range, min_val) as usize;
+                            let rgb = lut.rgb[idx];
+                            rgba[off] = rgb[0];
+                            rgba[off + 1] = rgb[1];
+                            rgba[off + 2] = rgb[2];
+                            rgba[off + 3] = 255;
+                        }
                     }
                 }
-                filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                encode_rgba_tile(rgba, N as u32, all_opaque, style.format)
             }
-            if !has_nodata && clean && !matches!(alg, DemAlgorithm::Aspect) {
-                let mut plte = [0u8; 768];
-                for i in 0..256 {
-                    plte[i * 3] = lut.rgb[i][0];
-                    plte[i * 3 + 1] = lut.rgb[i][1];
-                    plte[i * 3 + 2] = lut.rgb[i][2];
-                }
-                encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
-            } else {
-                let mut plte = [0u8; 768];
-                for i in 1..256 {
-                    let src_i = ((i - 1) * 255) / 254;
-                    plte[i * 3] = lut.rgb[src_i][0];
-                    plte[i * 3 + 1] = lut.rgb[src_i][1];
-                    plte[i * 3 + 2] = lut.rgb[src_i][2];
-                }
-                let trns = has_nodata.then_some(&[0u8][..]);
-                encode_indexed_png(N as u32, N as u32, &plte, trns, &sc.img_buf[..total])
-            }
-        }),
-        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
-            let mut rgba = vec![0u8; N * N * 4];
-            let mut all_opaque = true;
-            for py in 0..N {
-                let r0 = py * pad;
-                let r1 = (py + 1) * pad;
-                let r2 = (py + 2) * pad;
-                let row_off = py * N * 4;
-                for px in 0..N {
-                    let c = px + 1;
-                    let val = eval_horn_3x3(
-                        elev[r0 + c - 1],
-                        elev[r0 + c],
-                        elev[r0 + c + 1],
-                        elev[r1 + c - 1],
-                        elev[r1 + c],
-                        elev[r1 + c + 1],
-                        elev[r2 + c - 1],
-                        elev[r2 + c],
-                        elev[r2 + c + 1],
-                        inv_8dx,
-                        alg,
-                    );
-                    let off = row_off + px * 4;
-                    if val.is_nan() {
-                        all_opaque = false;
-                    } else {
-                        let idx = rescale_u8(val, inv_range, min_val) as usize;
-                        let rgb = lut.rgb[idx];
-                        rgba[off] = rgb[0];
-                        rgba[off + 1] = rgb[1];
-                        rgba[off + 2] = rgb[2];
-                        rgba[off + 3] = 255;
-                    }
-                }
-            }
-            encode_rgba_tile(&rgba, N as u32, all_opaque, style.format)
         }
-    }
+    })
 }
 
 #[cfg(test)]
