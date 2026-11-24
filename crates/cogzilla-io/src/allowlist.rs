@@ -66,18 +66,28 @@ fn decode_percent_once(s: &str) -> String {
 /// encoded path separators (`%2f`, `%5c`) never match, since they can climb
 /// out of an allowed prefix on downstream HTTP servers/proxies.
 pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
+    // Reject ASCII control characters (including `\t`, `\r`, `\n`), which WHATWG URL parsers
+    // (`url` / `reqwest`) silently strip before dot-segment resolution, enabling `.%09./` bypasses.
+    if uri.bytes().any(|b| b <= 0x1f || b == 0x7f) {
+        return false;
+    }
+
     // For HTTP(S) URLs, inspect only the path component (before `?query` / `#fragment`) so valid
     // AWS SigV4 presigned URLs (`%2F` in `X-Amz-Credential`) and Azure SAS URLs (`%2F` in base64
     // `sig=`) are allowed. For cloud object URIs (`s3://`, `gs://`, `az://`, `abfs(s)://`, `/vsi*`)
     // and local paths, `?` and `#` are literal path/key bytes — inspect the entire URI so
     // `gs://allowed/public/?/../../../secret/key.tif` cannot bypass traversal checks.
-    let inspect = if uri.starts_with("http://") || uri.starts_with("https://") {
+    let is_http = uri.starts_with("http://") || uri.starts_with("https://");
+    let inspect = if is_http {
         uri.split(['?', '#']).next().unwrap_or(uri)
     } else {
         uri
     };
     let mut cur = inspect.to_string();
     for _ in 0..3 {
+        if cur.bytes().any(|b| b <= 0x1f || b == 0x7f) {
+            return false;
+        }
         let lower = cur.to_ascii_lowercase();
         if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
             return false;
@@ -91,10 +101,33 @@ pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
         }
         cur = next;
     }
-    prefixes.iter().any(|p| match uri.strip_prefix(p.as_str()) {
-        Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
-        None => false,
-    })
+
+    let matches_boundary = |candidate: &str| -> bool {
+        prefixes.iter().any(|p| match candidate.strip_prefix(p.as_str()) {
+            Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
+            None => false,
+        })
+    };
+
+    if !matches_boundary(uri) {
+        return false;
+    }
+
+    // For HTTP(S) URLs, also canonicalize with `reqwest::Url::parse` (the exact parser used by
+    // outbound requests) so WHATWG normalization cannot escape the allowed prefix.
+    if is_http {
+        let Ok(parsed) = reqwest::Url::parse(uri) else {
+            return false;
+        };
+        if parsed.path().split('/').any(|seg| seg == "..") {
+            return false;
+        }
+        if !matches_boundary(parsed.as_str()) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Reject `uri` with [`IoError::Forbidden`] when an allowlist is configured
@@ -170,5 +203,33 @@ mod tests {
         assert!(!matches_any_prefix(&cloud_p, "az://acct/public/?/../../../private/blob.tif"));
         assert!(!matches_any_prefix(&cloud_p, "s3://allowed/public/#/../../secret/key.tif"));
         assert!(matches_any_prefix(&cloud_p, "gs://allowed/public/scene.tif"));
+
+        // WHATWG URL parser strips ASCII `\t`/`\r`/`\n` before dot-segment resolution:
+        // both raw control chars and percent-encoded `%09`/`%0a`/`%0d` must be rejected.
+        let gcs_http = list(&["https://storage.googleapis.com/public-bucket/"]);
+        assert!(!matches_any_prefix(
+            &gcs_http,
+            "https://storage.googleapis.com/public-bucket/.\t./private-bucket/secret.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &gcs_http,
+            "https://storage.googleapis.com/public-bucket/.\r./private-bucket/secret.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &gcs_http,
+            "https://storage.googleapis.com/public-bucket/.\n./private-bucket/secret.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &gcs_http,
+            "https://storage.googleapis.com/public-bucket/.%09./private-bucket/secret.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &gcs_http,
+            "https://storage.googleapis.com/public-bucket/%2%09e%2%09e/private-bucket/secret.tif"
+        ));
+        assert!(matches_any_prefix(
+            &gcs_http,
+            "https://storage.googleapis.com/public-bucket/scene.tif"
+        ));
     }
 }

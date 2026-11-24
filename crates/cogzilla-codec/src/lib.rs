@@ -610,6 +610,24 @@ fn apply_rgba_alpha_if_present(
                 max: if data.is_empty() { f32::NAN } else { mx as f32 },
             };
         }
+        BandData::RgbU8Channel { rgb, channel, nodata } if nodata.is_some() => {
+            *nodata = None;
+            let ch = *channel as usize;
+            let n = rgb.len() / 3;
+            let mut mn = u8::MAX;
+            let mut mx = u8::MIN;
+            for i in 0..n {
+                let v = rgb[i * 3 + ch];
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            bands[alpha_idx].stats = BlockStats {
+                all_nodata: n == 0,
+                no_nodata: true,
+                min: if n == 0 { f32::NAN } else { mn as f32 },
+                max: if n == 0 { f32::NAN } else { mx as f32 },
+            };
+        }
         _ => {}
     }
 
