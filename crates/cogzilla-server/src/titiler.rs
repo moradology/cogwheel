@@ -1278,6 +1278,7 @@ pub struct StatsOptions {
     pub categorical: bool,
     pub categories: Option<Vec<f64>>,
     pub bidx: Option<Vec<u16>>,
+    pub expressions: Option<Vec<(String, cogzilla_kernel::ExprProgram)>>,
 }
 
 impl Default for StatsOptions {
@@ -1289,6 +1290,7 @@ impl Default for StatsOptions {
             categorical: false,
             categories: None,
             bidx: None,
+            expressions: None,
         }
     }
 }
@@ -1914,6 +1916,26 @@ fn compute_statistics_cpu(
             (None, None)
         };
 
+    if let Some(ref exprs) = opts.expressions
+        && !exprs.is_empty()
+    {
+        return compute_expression_statistics_cpu(
+            cog,
+            ifd,
+            poly_mask,
+            unscale,
+            nodata_override,
+            step,
+            &tile_xs,
+            &tile_ys,
+            total_pixels,
+            mask_total_pixels,
+            fetched,
+            opts,
+            exprs,
+        );
+    }
+
     let mut per_band: Vec<BandStatsAcc> = (0..count)
         .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, capacity_hint))
         .collect();
@@ -2160,6 +2182,291 @@ fn compute_statistics_cpu(
     serde_json::Value::Object(out)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn compute_expression_statistics_cpu(
+    cog: &OpenedCog,
+    ifd: &cogzilla_tiff::IfdMeta,
+    poly_mask: Option<&PolygonMask>,
+    unscale: bool,
+    nodata_override: Option<f32>,
+    step: usize,
+    tile_xs: &Option<Vec<Vec<usize>>>,
+    tile_ys: &Option<Vec<Vec<usize>>>,
+    total_pixels: usize,
+    mask_total_pixels: usize,
+    fetched: StatsTiles,
+    opts: &StatsOptions,
+    exprs: &[(String, cogzilla_kernel::ExprProgram)],
+) -> serde_json::Value {
+    let denom_pixels = if poly_mask.is_some() {
+        mask_total_pixels
+    } else {
+        total_pixels
+    };
+    let mut accs: Vec<Vec<f32>> = (0..exprs.len())
+        .map(|_| Vec::with_capacity(denom_pixels.min(1 << 20)))
+        .collect();
+    let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+    let count = ifd.samples_per_pixel as usize;
+    let tw = ifd.tile_width as usize;
+
+    let tile_masks = match &fetched {
+        StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
+    };
+
+    let mut eval_px = |bands: &[Option<&cogzilla_codec::BandData>], idx: usize| {
+        let mut slot_vals = [0.0f32; 16];
+        for (ei, (_, prog)) in exprs.iter().enumerate() {
+            let mut valid = true;
+            for (si, &b1) in prog.used_bands.iter().enumerate() {
+                let bi = (b1.saturating_sub(1)) as usize;
+                let Some(Some(bd)) = bands.get(bi) else {
+                    valid = false;
+                    break;
+                };
+                let raw = bd.get_f32(idx);
+                if !raw.is_finite() {
+                    valid = false;
+                    break;
+                }
+                if let Some(nd) = nodata_override
+                    && raw == nd
+                {
+                    valid = false;
+                    break;
+                }
+                let v = if unscale {
+                    let sc = cog.index.scales.get(bi).copied().unwrap_or(1.0);
+                    let off = cog.index.offsets.get(bi).copied().unwrap_or(0.0);
+                    raw * sc + off
+                } else {
+                    raw
+                };
+                slot_vals[si] = v;
+            }
+            if valid {
+                let r = prog.eval(&slot_vals[..prog.used_bands.len()]);
+                if r.is_finite() {
+                    accs[ei].push(r);
+                }
+            }
+        }
+    };
+
+    let mut band_ptrs: Vec<Option<&cogzilla_codec::BandData>> = vec![None; count];
+    for ti in 0..n_tiles {
+        let mut any_band = false;
+        match &fetched {
+            StatsTiles::Chunky { tiles, .. } => {
+                let Some(tile) = &tiles[ti] else { continue };
+                for (b, slot) in band_ptrs.iter_mut().enumerate().take(count) {
+                    *slot = tile.bands.get(b).filter(|tb| !tb.stats.all_nodata).map(|tb| &tb.data);
+                    any_band |= slot.is_some();
+                }
+            }
+            StatsTiles::Planar { band_tiles, .. } => {
+                for (b, slot) in band_ptrs.iter_mut().enumerate().take(count) {
+                    *slot = band_tiles
+                        .get(b)
+                        .and_then(|bt| bt[ti].as_ref())
+                        .and_then(|t| t.bands.first())
+                        .filter(|tb| !tb.stats.all_nodata)
+                        .map(|tb| &tb.data);
+                    any_band |= slot.is_some();
+                }
+            }
+        }
+        if !any_band {
+            continue;
+        }
+        let tx = (ti as u32) % ifd.tiles_across;
+        let ty = (ti as u32) / ifd.tiles_across;
+        let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
+        let y_max = (ifd.height - ty * ifd.tile_height).min(ifd.tile_height) as usize;
+
+        if let (Some(xs_all), Some(ys_all)) = (tile_xs, tile_ys) {
+            let xs = &xs_all[tx as usize];
+            let ys = &ys_all[ty as usize];
+            for &ly in ys {
+                let row = ly * tw;
+                for &lx in xs {
+                    eval_px(&band_ptrs, row + lx);
+                }
+            }
+        } else if step > 1 {
+            let x0_tile = (tx * ifd.tile_width) as usize;
+            let y0_tile = (ty * ifd.tile_height) as usize;
+            let lx0 = (step - (x0_tile % step)) % step;
+            let ly0 = (step - (y0_tile % step)) % step;
+            let mask_bits = match tile_masks {
+                Some(masks) => match &masks[ti] {
+                    Some(bits) => Some(bits.as_slice()),
+                    None => continue,
+                },
+                None => None,
+            };
+            let mut ly = ly0;
+            let mut m_idx = 0usize;
+            while ly < y_max {
+                let row = ly * tw;
+                let mut lx = lx0;
+                while lx < x_max {
+                    if mask_bits.is_none_or(|m| m.get(m_idx).copied().unwrap_or(0) != 0) {
+                        eval_px(&band_ptrs, row + lx);
+                    }
+                    m_idx += 1;
+                    lx += step;
+                }
+                ly += step;
+            }
+        } else if let Some(masks) = tile_masks {
+            let Some(ref mask_bits) = masks[ti] else {
+                continue;
+            };
+            for ly in 0..y_max {
+                let row = ly * tw;
+                let mrow = ly * x_max;
+                for lx in 0..x_max {
+                    if mask_bits[mrow + lx] != 0 {
+                        eval_px(&band_ptrs, row + lx);
+                    }
+                }
+            }
+        } else {
+            for ly in 0..y_max {
+                let row = ly * tw;
+                for lx in 0..x_max {
+                    eval_px(&band_ptrs, row + lx);
+                }
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    for ((expr_str, _), vals) in exprs.iter().zip(accs.into_iter()) {
+        let acc = BandStatsAcc::Floats(vals);
+        let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts);
+        out.insert(expr_str.clone(), val);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Encode an RGBA buffer as a spec-compliant uncompressed Classic GeoTIFF (`EPSG:3857` or `EPSG:4326`).
+pub fn encode_geotiff_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    bbox: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> Bytes {
+    let spp: u16 = if return_mask { 4 } else { 3 };
+    let n_px = (width as usize) * (height as usize);
+    let pixel_bytes = n_px * (spp as usize);
+    let n_entries: u16 = if return_mask { 14 } else { 13 };
+
+    // Layout:
+    // 0..8                     : TIFF header ("II", 42, ifd_offset=8)
+    // 8..8+2+12*n_entries+4    : IFD
+    // out_off..                : BitsPerSample (spp*2), ModelPixelScale (24), ModelTiepoint (48), GeoKeyDir (32)
+    // pixel_off..              : Raw strip pixel data
+    let ifd_size = 2 + 12 * (n_entries as usize) + 4;
+    let bps_off = (8 + ifd_size) as u32;
+    let scale_off = bps_off + (spp as u32) * 2;
+    let tie_off = scale_off + 24;
+    let gkd_off = tie_off + 48;
+    let pixel_off = gkd_off + 32;
+
+    let mut buf = BytesMut::with_capacity((pixel_off as usize) + pixel_bytes);
+    // TIFF little-endian header
+    buf.put_slice(b"II");
+    buf.put_u16_le(42);
+    buf.put_u32_le(8);
+
+    // IFD entry count
+    buf.put_u16_le(n_entries);
+    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
+        buf.put_u16_le(tag);
+        buf.put_u16_le(ty);
+        buf.put_u32_le(count);
+        buf.put_u32_le(val);
+    };
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    const DOUBLE: u16 = 12;
+
+    put_entry(256, LONG, 1, width);
+    put_entry(257, LONG, 1, height);
+    put_entry(258, SHORT, spp as u32, bps_off);
+    put_entry(259, SHORT, 1, 1); // Compression = None
+    put_entry(262, SHORT, 1, 2); // Photometric = RGB
+    put_entry(273, LONG, 1, pixel_off); // StripOffsets
+    put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
+    put_entry(278, LONG, 1, height); // RowsPerStrip
+    put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
+    put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
+    if return_mask {
+        put_entry(338, SHORT, 1, 2); // ExtraSamples = UnassociatedAlpha
+    }
+    put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
+    put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
+    put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
+    buf.put_u32_le(0); // Next IFD = 0
+
+    // BitsPerSample
+    for _ in 0..spp {
+        buf.put_u16_le(8);
+    }
+    // ModelPixelScaleTag: [dx, dy, 0.0]
+    let dx = ((bbox[2] - bbox[0]).abs() / (width.max(1) as f64)).max(1e-12);
+    let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
+    buf.put_f64_le(dx);
+    buf.put_f64_le(dy);
+    buf.put_f64_le(0.0);
+    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(bbox[0]);
+    buf.put_f64_le(bbox[3]);
+    buf.put_f64_le(0.0);
+    // GeoKeyDirectoryTag (16 u16s = 32 bytes)
+    let (model_type, crs_key): (u16, u16) = if epsg == 4326 {
+        (2, 2048) // ModelTypeGeographic, GeographicTypeGeoKey
+    } else {
+        (1, 3072) // ModelTypeProjected, ProjectedCSTypeGeoKey
+    };
+    let gkd: [u16; 16] = [
+        1, 1, 0, 3, // version 1.1.0, 3 keys
+        1024, 0, 1, model_type, // GTModelTypeGeoKey
+        1025, 0, 1, 1, // GTRasterTypeGeoKey = PixelIsArea
+        crs_key, 0, 1, epsg, // EPSG code
+    ];
+    for &k in &gkd {
+        buf.put_u16_le(k);
+    }
+
+    // Pixel data
+    if return_mask {
+        let take = pixel_bytes.min(rgba.len());
+        buf.put_slice(&rgba[..take]);
+        if take < pixel_bytes {
+            buf.resize((pixel_off as usize) + pixel_bytes, 0);
+        }
+    } else {
+        for px in rgba.chunks_exact(4).take(n_px) {
+            buf.put_u8(px[0]);
+            buf.put_u8(px[1]);
+            buf.put_u8(px[2]);
+        }
+        let target_len = (pixel_off as usize) + pixel_bytes;
+        if buf.len() < target_len {
+            buf.resize(target_len, 0);
+        }
+    }
+    buf.freeze()
+}
+
 /// Project a WGS84 polygon bbox into an IFD's pixel space and return its clipped `(win_w, win_h)`.
 fn polygon_window_dims(
     ifd: &cogzilla_tiff::IfdMeta,
@@ -2246,6 +2553,18 @@ pub async fn compute_statistics_with_options(
                 return Err(EngineError::BadRequest(format!(
                     "band {b} out of range (dataset has {count} bands)"
                 )));
+            }
+        }
+    }
+    if let Some(ref exprs) = opts.expressions {
+        let count = cog.index.full_res().samples_per_pixel;
+        for (_, prog) in exprs {
+            for &b in &prog.used_bands {
+                if b == 0 || b > count {
+                    return Err(EngineError::BadRequest(format!(
+                        "expression references band {b} out of range (dataset has {count} bands)"
+                    )));
+                }
             }
         }
     }

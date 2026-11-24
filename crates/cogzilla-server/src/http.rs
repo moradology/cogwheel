@@ -29,7 +29,7 @@ use crate::stac::{
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, compute_statistics_with_options,
-    encode_rgba_output, get_algorithm_json, list_algorithms_json, query_point,
+    encode_geotiff_rgba, encode_rgba_output, get_algorithm_json, list_algorithms_json, query_point,
     render_mercator_bbox, render_native_preview, render_wgs84_bbox,
 };
 
@@ -712,8 +712,15 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         }
     }
     if route("statistics") || route("asset_statistics") {
-        if let Some(k) = has(&["expression", "expr", "index", "algorithm"]) {
+        if let Some(k) = has(&["algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on statistics routes"));
+        }
+        if segs[0] != "cog" || route("asset_statistics") {
+            if let Some(k) = has(&["expression", "expr", "index"]) {
+                return Err(format!(
+                    "parameter '{k}' is only supported on /cog/statistics routes"
+                ));
+            }
         }
     } else if let Some(k) = has(&["p", "histogram_bins", "histogram_range", "categorical", "c"]) {
         return Err(format!("parameter '{k}' is only supported on statistics routes"));
@@ -845,6 +852,24 @@ fn apply_tilejson_overrides(
     }
 }
 
+const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
+
+fn wrap_geotiff(
+    data: Bytes,
+    ct: &'static str,
+    w: u32,
+    h: u32,
+    bbox: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> Bytes {
+    if ct == GEOTIFF_CONTENT_TYPE {
+        encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
+    } else {
+        data
+    }
+}
+
 fn parse_ext_format(
     ext: &str,
     webp_quality: Option<f32>,
@@ -852,6 +877,7 @@ fn parse_ext_format(
 ) -> Result<(OutputFormat, &'static str), EngineError> {
     match ext {
         "png" | "pngraw" | "" => Ok((OutputFormat::Png, "image/png")),
+        "tif" | "tiff" => Ok((OutputFormat::RawRgba, GEOTIFF_CONTENT_TYPE)),
         "webp" => Ok((
             OutputFormat::Webp {
                 quality: webp_quality,
@@ -1361,7 +1387,7 @@ fn build_tile_request(
     ))
 }
 
-fn build_stats_options(pq: &ParsedQuery) -> StatsOptions {
+fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
     let mut opts = StatsOptions::default();
     if !pq.percentiles.is_empty() {
         opts.percentiles = pq.percentiles.clone();
@@ -1377,10 +1403,28 @@ fn build_stats_options(pq: &ParsedQuery) -> StatsOptions {
     if !pq.bidx.is_empty() {
         opts.bidx = Some(pq.bidx.clone());
     }
-    opts
+    if allow_expr
+        && let Some(raw) = pq.expr_raw.as_deref()
+    {
+        let mut compiled = Vec::new();
+        for part in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let prog = ExprProgram::compile(part).map_err(EngineError::BadRequest)?;
+            compiled.push((part.to_string(), prog));
+            if compiled.len() > 16 {
+                return Err(EngineError::BadRequest(
+                    "expression exceeds max 16 semicolon-separated outputs".into(),
+                ));
+            }
+        }
+        if !compiled.is_empty() {
+            opts.expressions = Some(compiled);
+        }
+    }
+    Ok(opts)
 }
 
-/// Apply optional `?expression=` or `?bidx=` filtering to a TiTiler `/point` JSON payload.
+/// Apply optional `?expression=` (supporting `;`-separated multi-band outputs) or `?bidx=`
+/// filtering to a TiTiler `/point` JSON payload.
 fn apply_point_filters(
     pt: &mut serde_json::Value,
     expr_raw: Option<&str>,
@@ -1400,31 +1444,49 @@ fn apply_point_filters(
         .cloned()
         .unwrap_or_else(|| names.clone());
 
-    if let Some(expr) = expr_raw {
-        let prog = ExprProgram::compile(expr).map_err(EngineError::BadRequest)?;
-        let n_bands = vals.len();
-        let mut slot_vals = Vec::with_capacity(prog.used_bands.len());
-        for &b in &prog.used_bands {
-            if b == 0 || (b as usize) > n_bands {
-                return Err(EngineError::BadRequest(format!(
-                    "expression references b{b} but point query only has {n_bands} bands"
-                )));
-            }
-            let f = vals[(b - 1) as usize]
-                .as_f64()
-                .map(|x| x as f32)
-                .unwrap_or(f32::NAN);
-            slot_vals.push(f);
+    if let Some(raw_expr) = expr_raw {
+        let parts: Vec<&str> = raw_expr
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err(EngineError::BadRequest("empty expression".into()));
         }
-        let res = prog.eval(&slot_vals);
-        let out_val = if res.is_finite() {
-            serde_json::json!(res)
-        } else {
-            serde_json::Value::Null
-        };
-        pt["values"] = serde_json::json!([out_val]);
-        pt["band_names"] = serde_json::json!([expr]);
-        pt["band_descriptions"] = serde_json::json!([expr]);
+        if parts.len() > 16 {
+            return Err(EngineError::BadRequest(
+                "expression exceeds max 16 semicolon-separated outputs".into(),
+            ));
+        }
+        let n_bands = vals.len();
+        let mut out_vals = Vec::with_capacity(parts.len());
+        let mut out_names = Vec::with_capacity(parts.len());
+        for expr in parts {
+            let prog = ExprProgram::compile(expr).map_err(EngineError::BadRequest)?;
+            let mut slot_vals = Vec::with_capacity(prog.used_bands.len());
+            for &b in &prog.used_bands {
+                if b == 0 || (b as usize) > n_bands {
+                    return Err(EngineError::BadRequest(format!(
+                        "expression references b{b} but point query only has {n_bands} bands"
+                    )));
+                }
+                let f = vals[(b - 1) as usize]
+                    .as_f64()
+                    .map(|x| x as f32)
+                    .unwrap_or(f32::NAN);
+                slot_vals.push(f);
+            }
+            let res = prog.eval(&slot_vals);
+            out_vals.push(if res.is_finite() {
+                serde_json::json!(res)
+            } else {
+                serde_json::Value::Null
+            });
+            out_names.push(serde_json::json!(expr));
+        }
+        pt["values"] = serde_json::Value::Array(out_vals);
+        pt["band_names"] = serde_json::Value::Array(out_names.clone());
+        pt["band_descriptions"] = serde_json::Value::Array(out_names);
         return Ok(());
     }
 
@@ -2739,7 +2801,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = names.len();
-                let stats_opts = build_stats_options(&pq);
+                let stats_opts = build_stats_options(&pq, false)?;
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
@@ -2776,7 +2838,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = cogs.len();
-                let stats_opts = build_stats_options(&pq);
+                let stats_opts = build_stats_options(&pq, false)?;
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
@@ -2830,6 +2892,7 @@ where
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
 
+                let stats_opts_post = build_stats_options(&pq, false)?;
                 let compute_stac_merged_stats = |mask: Arc<PolygonMask>| {
                     let cogs_c = cogs.clone();
                     let names_c = names.clone();
@@ -2837,7 +2900,7 @@ where
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    let stats_opts = build_stats_options(&pq);
+                    let stats_opts = stats_opts_post.clone();
                     let n = names_c.len();
                     async move {
                         let mut set = tokio::task::JoinSet::new();
@@ -3161,6 +3224,13 @@ where
                                 )
                                 .await?
                             };
+                            let out_dim = treq.tile_size + 2 * pq_stac.buffer;
+                            let (bbox, epsg) = if tms == "WorldCRS84Quad" {
+                                (world_crs84_tile_bbox(z, x, y, pq_stac.buffer, treq.tile_size), 4326)
+                            } else {
+                                (web_mercator_buffered_3857_bbox(z, x, y, pq_stac.buffer, treq.tile_size), 3857)
+                            };
+                            let data = wrap_geotiff(data, ct, out_dim, out_dim, bbox, epsg, pq_stac.return_mask);
                             Ok((data, ct))
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -3182,9 +3252,13 @@ where
                             } else {
                                 encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
                             };
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                             Ok((data, ct))
                         }
                     })
@@ -3579,7 +3653,7 @@ where
             // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
             (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let stats_opts = build_stats_options(&pq);
+                let stats_opts = build_stats_options(&pq, true)?;
                 let json = compute_statistics_with_options(
                     &engine,
                     &cogs[0],
@@ -3596,7 +3670,7 @@ where
             (Method::POST, ["statistics"]) => async {
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let stats_opts = build_stats_options(&pq);
+                let stats_opts = build_stats_options(&pq, true)?;
                 if body_bytes.is_empty() {
                     let json = compute_statistics_with_options(
                         &engine,
@@ -3827,6 +3901,13 @@ where
                                 )
                                 .await?
                             };
+                            let out_dim = treq.tile_size + 2 * pq.buffer;
+                            let (bbox, epsg) = if tms == "WorldCRS84Quad" {
+                                (world_crs84_tile_bbox(z, x, y, pq.buffer, treq.tile_size), 4326)
+                            } else {
+                                (web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, treq.tile_size), 3857)
+                            };
+                            let data = wrap_geotiff(data, ct, out_dim, out_dim, bbox, epsg, pq.return_mask);
                             Ok((data, ct))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -3848,9 +3929,13 @@ where
                             } else {
                                 encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
                             };
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                             Ok((data, ct))
                         }
                     })
@@ -3972,6 +4057,7 @@ where
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -3998,6 +4084,7 @@ where
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4039,6 +4126,8 @@ where
                     )
                     .await?
                 };
+                let epsg = if pq.coord_crs_3857 { 3857 } else { 4326 };
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4076,6 +4165,8 @@ where
                     )
                     .await?
                 };
+                let epsg = if pq.coord_crs_3857 { 3857 } else { 4326 };
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4109,6 +4200,7 @@ where
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4138,6 +4230,7 @@ where
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, bbox, 4326, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
