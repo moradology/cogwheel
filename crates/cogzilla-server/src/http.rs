@@ -20,6 +20,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+mod pgstac;
+
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
 use crate::stac::{
@@ -2719,6 +2721,13 @@ where
                 "/stac/statistics": { "get": { "summary": "Merged STAC statistics" }, "post": { "summary": "Polygon-clipped STAC statistics" } },
                 "/stac/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render STAC multi-asset tile" } },
                 "/stac/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "STAC TileJSON 3.0" } },
+                "/searches/register": { "post": { "summary": "Register a pgSTAC search" } },
+                "/searches/": { "get": { "summary": "List registered pgSTAC searches" } },
+                "/searches/{search_id}/info": { "get": { "summary": "pgSTAC search metadata" } },
+                "/searches/{search_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC search TileJSON 3.0" } },
+                "/searches/{search_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC search map viewer" } },
+                "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC search mosaic tile" } },
+                "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets": { "get": { "summary": "Items covering a tile" } },
                 "/stac/point/{lon},{lat}": { "get": { "summary": "Sample STAC asset values at point" } },
                 "/stac/preview/{width}x{height}.{format}": { "get": { "summary": "Render STAC preview" } },
                 "/algorithms": { "get": { "summary": "List available raster algorithms" } },
@@ -2829,6 +2838,19 @@ where
             Bytes::from(body),
             "application/json",
         ));
+    }
+
+    // titiler-pgstac's routes: /searches/...
+    if segs.first() == Some(&"searches") {
+        let ctx = pgstac::Ctx {
+            engine: &engine,
+            host: &host,
+            forwarded_prefix: &forwarded_prefix,
+            path: &path,
+            raw_query: &raw_query,
+            if_none_match: if_none_match.as_deref(),
+        };
+        return Ok(pgstac::handle(ctx, &method, &segs, pq, req).await);
     }
 
     // ------------------------------------------------------------------------

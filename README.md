@@ -67,7 +67,7 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda
 
 Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes pass 39 of 39 differential checks against a live TiTiler 2.4; the mosaic routes and terrain algorithms are newer and not yet in that set. Outputs are the same picture but not the same bytes.
 
-`cogzilla` is not a general replacement. It has no pgSTAC and no custom Python algorithms or readers, and it only reads GeoTIFFs in the [coordinate systems it can place exactly](docs/api.md#coordinate-systems). For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` rather than being ignored; the full list is in [docs/api.md](docs/api.md#differences-from-titiler).
+`cogzilla` is not a general replacement. Its [pgSTAC support](docs/api.md#pgstac) covers the search tile routes only, it has no custom Python algorithms or readers, and it only reads GeoTIFFs in the [coordinate systems it can place exactly](docs/api.md#coordinate-systems). For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` rather than being ignored; the full list is in [docs/api.md](docs/api.md#differences-from-titiler).
 
 **Running it on the public internet?** Set `COGZILLA_ALLOWED_URL_PREFIXES`. By default the server opens any `url=` it is given, including local paths.
 

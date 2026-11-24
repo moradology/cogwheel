@@ -127,6 +127,7 @@ pub struct TileEngine {
     pub mosaicjson_cache: DashMap<String, Arc<MosaicJsonCatalog>, ahash::RandomState>,
     pub tile_cache: Arc<TileCache>,
     pub stats: Arc<EngineStats>,
+    pgstac: std::sync::OnceLock<Arc<cogzilla_pgstac::PgStac>>,
 }
 
 fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
@@ -262,7 +263,29 @@ impl TileEngine {
             mosaicjson_cache: DashMap::with_hasher(ahash::RandomState::new()),
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             stats: Arc::new(EngineStats::default()),
+            pgstac: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the pgSTAC database behind the `/searches` routes. The first call wins.
+    pub fn set_pgstac(&self, pgstac: Arc<cogzilla_pgstac::PgStac>) -> bool {
+        self.pgstac.set(pgstac).is_ok()
+    }
+
+    /// The pgSTAC database, when one is configured.
+    pub fn pgstac(&self) -> Option<&Arc<cogzilla_pgstac::PgStac>> {
+        self.pgstac.get()
+    }
+
+    /// Attach the pgSTAC database named by `DATABASE_URL` or the `PG*` variables, if any.
+    /// `Ok(false)` means none is configured. No connection is opened here.
+    pub fn attach_pgstac_from_env(&self) -> Result<bool, String> {
+        let Some(config) = cogzilla_pgstac::PgStacConfig::from_env().map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let pgstac = cogzilla_pgstac::PgStac::new(config).map_err(|e| e.to_string())?;
+        Ok(self.set_pgstac(Arc::new(pgstac)))
     }
 
     /// Register a pluggable spatial catalog (`SceneCatalog`) for `/mosaic/{name}/tiles`.
@@ -1637,7 +1660,47 @@ impl TileEngine {
         // Bound per-tile scene fan-out so a huge MosaicJSON/catalog of transparent or OOB COGs
         // cannot trigger thousands of sequential open_uri + render_tile calls on a single GET.
         const MAX_MOSAIC_SCENES_PER_TILE: usize = 64;
-        let urls = &urls[..urls.len().min(MAX_MOSAIC_SCENES_PER_TILE)];
+        let scenes: Vec<Vec<String>> = urls
+            .iter()
+            .take(MAX_MOSAIC_SCENES_PER_TILE)
+            .map(|u| vec![u.clone()])
+            .collect();
+        self.render_mosaic_scenes(&scenes, req).await
+    }
+
+    /// Open every asset of one mosaic scene, concurrently when there is more than one.
+    async fn open_scene(&self, scene: &[String]) -> Result<Vec<Arc<OpenedCog>>, EngineError> {
+        if let [only] = scene {
+            return Ok(vec![self.store.open_uri(only).await?]);
+        }
+        let mut js = tokio::task::JoinSet::new();
+        for (idx, uri) in scene.iter().enumerate() {
+            let store = self.store.clone();
+            let uri = uri.clone();
+            js.spawn(async move { Ok::<_, IoError>((idx, store.open_uri(&uri).await?)) });
+        }
+        let mut slots: Vec<Option<Arc<OpenedCog>>> = vec![None; scene.len()];
+        while let Some(res) = js.join_next().await {
+            let (idx, cog) = res
+                .map_err(|e| EngineError::BadRequest(format!("open task failed: {e}")))??;
+            slots[idx] = Some(cog);
+        }
+        Ok(slots.into_iter().flatten().collect())
+    }
+
+    /// The mosaic behind [`Self::render_mosaic_tile`], over scenes that are each one asset or
+    /// two to three co-registered single-band assets (rendered as one multi-asset composite).
+    /// The caller bounds how many scenes it passes.
+    pub async fn render_mosaic_scenes(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+    ) -> Result<Bytes, EngineError> {
+        if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one asset per scene".into(),
+            ));
+        }
         let n = req.tile_size as usize;
         let total_pixels = n * n;
         let f32_bands: usize = match req.bands {
