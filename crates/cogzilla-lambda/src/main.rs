@@ -77,9 +77,14 @@ fn is_binary_content_type(ct: &str) -> bool {
 
 /// Strip a leading `/{stage}` prefix added by API Gateway v1 (REST) or API Gateway v2 named stages
 /// (anything other than `$default`), preserving any query string and mapping `/{stage}` -> `/`.
-fn strip_stage_prefix(uri: &lambda_http::http::Uri, stage: Option<&str>) -> lambda_http::http::Uri {
+/// Returns `(rewritten_uri, Some("/{stage}"))` when a stage prefix was stripped so downstream
+/// URL builders (TileJSON, `/docs`, `/colorMaps`, etc.) preserve the public stage prefix.
+fn strip_stage_prefix(
+    uri: &lambda_http::http::Uri,
+    stage: Option<&str>,
+) -> (lambda_http::http::Uri, Option<String>) {
     let Some(s) = stage.filter(|s| !s.is_empty() && *s != "$default") else {
-        return uri.clone();
+        return (uri.clone(), None);
     };
     let path = uri.path();
     let prefix = format!("/{s}");
@@ -89,10 +94,10 @@ fn strip_stage_prefix(uri: &lambda_http::http::Uri, stage: Option<&str>) -> lamb
         } else if rest.starts_with('/') {
             rest
         } else {
-            return uri.clone();
+            return (uri.clone(), None);
         }
     } else {
-        return uri.clone();
+        return (uri.clone(), None);
     };
     let new_pq = match uri.query() {
         Some(q) => format!("{stripped}?{q}"),
@@ -102,10 +107,10 @@ fn strip_stage_prefix(uri: &lambda_http::http::Uri, stage: Option<&str>) -> lamb
     if let Ok(pq) = new_pq.parse() {
         parts.path_and_query = Some(pq);
         if let Ok(u) = lambda_http::http::Uri::from_parts(parts) {
-            return u;
+            return (u, Some(prefix));
         }
     }
-    uri.clone()
+    (uri.clone(), None)
 }
 
 /// Core AWS Lambda HTTP handler: translates `lambda_http::Request` into `cogzilla-server`'s
@@ -118,7 +123,15 @@ async fn lambda_handler(engine: Arc<TileEngine>, event: Request) -> Result<Respo
         _ => None,
     });
     let (mut parts, body) = event.into_parts();
-    parts.uri = strip_stage_prefix(&parts.uri, stage.as_deref());
+    let (new_uri, stage_prefix) = strip_stage_prefix(&parts.uri, stage.as_deref());
+    parts.uri = new_uri;
+    if let Some(prefix) = stage_prefix {
+        if !parts.headers.contains_key("x-forwarded-prefix") {
+            if let Ok(hv) = lambda_http::http::HeaderValue::from_str(&prefix) {
+                parts.headers.insert("x-forwarded-prefix", hv);
+            }
+        }
+    }
     let req_bytes = match body {
         Body::Empty => Bytes::new(),
         Body::Text(s) => Bytes::from(s),
@@ -256,23 +269,22 @@ mod tests {
     #[test]
     fn strip_stage_prefix_handles_apigw_named_stages_and_default() {
         let u1: lambda_http::http::Uri = "/prod/cog/info?url=s3://b/k.tif".parse().unwrap();
-        assert_eq!(
-            strip_stage_prefix(&u1, Some("prod")).to_string(),
-            "/cog/info?url=s3://b/k.tif"
-        );
+        let (r1, p1) = strip_stage_prefix(&u1, Some("prod"));
+        assert_eq!(r1.to_string(), "/cog/info?url=s3://b/k.tif");
+        assert_eq!(p1.as_deref(), Some("/prod"));
         // $default stage must NOT strip
-        assert_eq!(
-            strip_stage_prefix(&u1, Some("$default")).to_string(),
-            "/prod/cog/info?url=s3://b/k.tif"
-        );
+        let (r2, p2) = strip_stage_prefix(&u1, Some("$default"));
+        assert_eq!(r2.to_string(), "/prod/cog/info?url=s3://b/k.tif");
+        assert_eq!(p2, None);
         // Exact /{stage} maps to /
         let u2: lambda_http::http::Uri = "/v1".parse().unwrap();
-        assert_eq!(strip_stage_prefix(&u2, Some("v1")).to_string(), "/");
+        let (r3, p3) = strip_stage_prefix(&u2, Some("v1"));
+        assert_eq!(r3.to_string(), "/");
+        assert_eq!(p3.as_deref(), Some("/v1"));
         // Partial prefix match (/v10 vs stage v1) must NOT strip
         let u3: lambda_http::http::Uri = "/v10/healthz".parse().unwrap();
-        assert_eq!(
-            strip_stage_prefix(&u3, Some("v1")).to_string(),
-            "/v10/healthz"
-        );
+        let (r4, p4) = strip_stage_prefix(&u3, Some("v1"));
+        assert_eq!(r4.to_string(), "/v10/healthz");
+        assert_eq!(p4, None);
     }
 }

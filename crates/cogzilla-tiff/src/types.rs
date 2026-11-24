@@ -119,8 +119,17 @@ impl Affine2D {
     }
 
     pub fn invert(&self) -> Option<Self> {
+        if !self.a.is_finite()
+            || !self.b.is_finite()
+            || !self.c.is_finite()
+            || !self.d.is_finite()
+            || !self.e.is_finite()
+            || !self.f.is_finite()
+        {
+            return None;
+        }
         let det = self.a * self.e - self.b * self.d;
-        if det.abs() < 1e-30 {
+        if !det.is_finite() || det.abs() < 1e-30 {
             return None;
         }
         let inv = 1.0 / det;
@@ -130,6 +139,15 @@ impl Affine2D {
         let e = self.a * inv;
         let c = -(a * self.c + b * self.f);
         let f = -(d * self.c + e * self.f);
+        if !a.is_finite()
+            || !b.is_finite()
+            || !c.is_finite()
+            || !d.is_finite()
+            || !e.is_finite()
+            || !f.is_finite()
+        {
+            return None;
+        }
         Some(Self { a, b, c, d, e, f })
     }
 

@@ -149,6 +149,10 @@ impl LzwDecoder {
             }
 
             if code == EOI_CODE {
+                // Scrub up to 8 bytes past `out_pos` that the previous 8-byte `write_unaligned`
+                // fast-path entry may have written (bits 48..64 carry entry length).
+                let clear_end = (out_pos + 8).min(out_len);
+                out[out_pos..clear_end].fill(0);
                 return Ok(out_pos);
             }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use cogzilla_io::OpenedCog;
-use cogzilla_kernel::jpeg_fast::{encode_jpeg_rgb, encode_jpeg_rgba};
+use cogzilla_kernel::jpeg_fast::encode_jpeg_rgba;
 use cogzilla_kernel::png_fast::{encode_filtered_png, filter_sub_rgb_row, filter_sub_rgba_row};
 use cogzilla_kernel::webp_fast::{encode_webp_rgb, encode_webp_rgba};
 use cogzilla_kernel::{
@@ -589,21 +589,25 @@ impl BandStatsAcc {
         }
 
         let mean = sum / (valid_px as f64);
-        let span = (max - min).max(1e-12);
+        let min_f64 = min as f64;
+        let max_f64 = max as f64;
+        let span = (max_f64 - min_f64).max(1e-12);
         let mut var_sum = 0.0f64;
         let mut counts = [0u64; 10];
         for (k, &c) in hist.iter().enumerate() {
             if c == 0 {
                 continue;
             }
-            let v = to_val(k);
-            let d = (v as f64) - mean;
+            let v = to_val(k) as f64;
+            let d = v - mean;
             var_sum += d * d * (c as f64);
-            let bin = (((v - min) / span) * 10.0).floor().clamp(0.0, 9.0) as usize;
+            let bin = (((v - min_f64) / span) * 10.0).floor().clamp(0.0, 9.0) as usize;
             counts[bin] += c;
         }
         let std = (var_sum / (valid_px as f64)).sqrt();
-        let edges: Vec<f32> = (0..=10).map(|i| min + span * (i as f32 / 10.0)).collect();
+        let edges: Vec<f64> = (0..=10)
+            .map(|i| min_f64 + span * (i as f64 / 10.0))
+            .collect();
         serde_json::json!({
             "min": min,
             "max": max,
@@ -661,13 +665,16 @@ impl BandStatsAcc {
                     sum += v as f64;
                 }
                 let mean = sum / (valid_px as f64);
-                let span = (max - min).max(1e-12);
+                let min_f64 = min as f64;
+                let max_f64 = max as f64;
+                let span = (max_f64 - min_f64).max(1e-12);
                 let mut var_sum = 0.0f64;
                 let mut counts = [0u64; 10];
                 for &v in &vals {
-                    let d = (v as f64) - mean;
+                    let vf = v as f64;
+                    let d = vf - mean;
                     var_sum += d * d;
-                    let bin = (((v - min) / span) * 10.0).floor().clamp(0.0, 9.0) as usize;
+                    let bin = (((vf - min_f64) / span) * 10.0).floor().clamp(0.0, 9.0) as usize;
                     counts[bin] += 1;
                 }
                 let std = (var_sum / (valid_px as f64)).sqrt();
@@ -690,7 +697,9 @@ impl BandStatsAcc {
                 } else {
                     median
                 };
-                let edges: Vec<f32> = (0..=10).map(|i| min + span * (i as f32 / 10.0)).collect();
+                let edges: Vec<f64> = (0..=10)
+                    .map(|i| min_f64 + span * (i as f64 / 10.0))
+                    .collect();
                 serde_json::json!({
                     "min": min,
                     "max": max,
@@ -987,7 +996,7 @@ fn compute_statistics_cpu(
     }
 
     let denom_pixels = if poly_mask.is_some() {
-        mask_total_pixels.max(1)
+        mask_total_pixels
     } else {
         total_pixels
     };
@@ -1538,7 +1547,9 @@ async fn render_bbox_impl(
                 && v01.is_finite()
                 && v11.is_finite();
 
-            // Skip entire cell if all 4 corners are strictly outside the source image bounds
+            // Skip entire cell if all 4 corners are strictly outside the source image bounds,
+            // and fall back to exact per-pixel projection if the cell wraps across the antimeridian.
+            let mut use_bilinear = all_finite;
             if all_finite {
                 let cu_min = u00.min(u10).min(u01).min(u11) as f32;
                 let cu_max = u00.max(u10).max(u01).max(u11) as f32;
@@ -1547,13 +1558,16 @@ async fn render_bbox_impl(
                 if cu_max < -1.0 || cu_min > ifd_w_f || cv_max < -1.0 || cv_min > ifd_h_f {
                     continue;
                 }
+                if ifd.width >= 64 && w > STEP * 2 && (cu_max - cu_min) > 0.5 * ifd_w_f {
+                    use_bilinear = false;
+                }
             }
 
             for py in y0..y1 {
                 let row_off = py * w;
                 let ty = (py as f64 + 0.5 - y0 as f64) * inv_dy;
                 let lat = bbox[3] - (py as f64 + 0.5) * dly;
-                if all_finite {
+                if use_bilinear {
                     let ul = u00 + (u01 - u00) * ty;
                     let ur = u10 + (u11 - u10) * ty;
                     let vl = v00 + (v01 - v00) * ty;
@@ -1627,15 +1641,7 @@ async fn render_bbox_impl(
 
     // Empty check
     if !min_u.is_finite() {
-        let raw = vec![0u8; h * (1 + w * 4)];
         return Ok(match format {
-            OutputFormat::Png => encode_filtered_png(w as u32, h as u32, 6, &raw),
-            OutputFormat::Webp { quality } => {
-                encode_webp_rgba(w as u32, h as u32, &vec![0u8; w * h * 4], quality)
-            }
-            OutputFormat::Jpeg { quality } => {
-                encode_jpeg_rgb(w as u32, h as u32, &vec![0u8; w * h * 3], quality)
-            }
             OutputFormat::RawF32 => {
                 let nb: usize = match bands {
                     BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
@@ -1648,6 +1654,7 @@ async fn render_bbox_impl(
                 b.freeze()
             }
             OutputFormat::RawRgba => Bytes::from(vec![0u8; w * h * 4]),
+            _ => encode_rgba_output(w, h, &vec![0u8; w * h * 4], format, return_mask),
         });
     }
 

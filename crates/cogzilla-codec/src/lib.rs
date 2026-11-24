@@ -258,6 +258,12 @@ pub fn decode_tile_rows(
                 }
             }
             Compression::Jpeg => {
+                if ifd.sample_type != SampleType::Uint8 {
+                    return Err(CodecError::Jpeg(format!(
+                        "JPEG compression requires uint8 samples, got {:?}",
+                        ifd.sample_type
+                    )));
+                }
                 // Merge shared TIFF JPEGTables (tag 347) with abbreviated tile bitstream if present
                 let merged_buf: Vec<u8>;
                 let jpeg_bytes: &[u8] = if let Some(tables) = ifd.jpeg_tables.as_deref() {
@@ -329,6 +335,29 @@ pub fn decode_tile_rows(
                 if ifd.sample_type != SampleType::Uint8 || (bands_in_tile != 3 && bands_in_tile != 4)
                 {
                     return Err(CodecError::Webp);
+                }
+                let mut webp_w: std::ffi::c_int = 0;
+                let mut webp_h: std::ffi::c_int = 0;
+                let info_ok = unsafe {
+                    libwebp_sys::WebPGetInfo(
+                        compressed.as_ptr(),
+                        compressed.len(),
+                        &mut webp_w,
+                        &mut webp_h,
+                    )
+                };
+                if info_ok == 0
+                    || webp_w <= 0
+                    || webp_h <= 0
+                    || webp_w as u32 > ifd.tile_width
+                    || webp_h as u32 > tile_h
+                {
+                    return Err(CodecError::Webp);
+                }
+                // Zero thread-local scratch if WebP dimensions are smaller than the tile/strip so
+                // unwritten rows/columns never leak bytes from prior tiles on this thread.
+                if webp_w as u32 != ifd.tile_width || webp_h as u32 != tile_h {
+                    raw_slice.fill(0);
                 }
                 let stride = (ifd.tile_width as i32) * (bands_in_tile as i32);
                 let ptr = unsafe {
@@ -602,7 +631,10 @@ pub fn decode_mask_tile_rows(
                 }
             }
             Compression::Lzw => {
-                st.lzw.decode(compressed, &mut buf)?;
+                let written = st.lzw.decode(compressed, &mut buf)?;
+                if written < expected {
+                    buf[written..].fill(0);
+                }
             }
             _ => {
                 return Err(CodecError::Deflate(
