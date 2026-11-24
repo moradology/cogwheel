@@ -166,7 +166,9 @@ async fn search_routes_match_titiler_pgstac_shapes() {
 
     for (what, query) in [
         ("pixel selection", "assets=visual&pixel_selection=mean"),
-        ("asset options", "assets=visual%7Cbidx%3D1"),
+        ("an asset option without a value", "assets=visual%7Cbidx"),
+        ("options on several assets", "assets=visual%7Cbidx%3D2&assets=nir"),
+        ("asset names in an expression", "assets=red&assets=nir&expression=nir-red"),
         ("too many assets", "assets=a&assets=b&assets=c&assets=d"),
         ("buffer", "assets=visual&buffer=2"),
         ("bad limit", "assets=visual&items_limit=many"),
@@ -279,8 +281,10 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("point/945000,5740000?assets=visual&coord_crs=epsg:3857", 204),
         ("point/8.5,45.75", 422),
         ("point/8.5,45.75?assets=visual&expression=b1*2", 204),
-        ("point/8.5,45.75?assets=visual&asset_as_band=true", 400),
-        ("point/8.5,45.75?assets=visual%7Cbidx%3D1", 400),
+        ("point/8.5,45.75?assets=visual&asset_as_band=true", 204),
+        ("point/8.5,45.75?assets=visual%7Cbidx%3D3,1", 204),
+        ("point/8.5,45.75?assets=visual%7Cbidx%3Dx", 422),
+        ("point/8.5,45.75?assets=visual&asset_as_band=perhaps", 422),
         ("point/8.5,45.75?assets=visual&coord_crs=epsg:32632", 400),
         ("point/8.5,45.75?assets=visual&items_limit=many", 422),
         ("point/8.5?assets=visual", 404),
