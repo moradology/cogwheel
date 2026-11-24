@@ -68,9 +68,10 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
         || item_uri.starts_with("abfs://")
         || item_uri.starts_with("abfss://")
     {
-        let base = match item_uri.rfind('/') {
-            Some(idx) => &item_uri[..=idx],
-            None => item_uri,
+        let path_only = item_uri.split(['?', '#']).next().unwrap_or(item_uri);
+        let base = match path_only.rfind('/') {
+            Some(idx) => &path_only[..=idx],
+            None => path_only,
         };
         format!("{base}{}", href.trim_start_matches("./"))
     } else {
@@ -168,13 +169,30 @@ pub async fn resolve_stac_assets(
 ) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
     let mut names: Vec<String> = requested_assets.to_vec();
 
-    // If no explicit `?assets=` given, try extracting asset names referenced in `?expression=`,
+    // If no explicit `?assets=` given, extract exact identifier tokens referenced in `?expression=`,
     // otherwise default to all raster assets (up to 3).
     if names.is_empty() {
         if let Some(expr) = expr_raw {
-            for k in item.assets.keys() {
-                if expr.contains(k.as_str()) {
-                    names.push(k.clone());
+            let mut seen = std::collections::HashSet::new();
+            let bytes = expr.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_alphanumeric()
+                            || bytes[i] == b'_'
+                            || bytes[i] == b'-')
+                    {
+                        i += 1;
+                    }
+                    let tok = &expr[start..i];
+                    if item.assets.contains_key(tok) && seen.insert(tok) {
+                        names.push(tok.to_string());
+                    }
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -444,6 +462,15 @@ mod tests {
         assert_eq!(
             rewrite_stac_expr("sqrt(abs(r - b)) + g", &rgb),
             "sqrt(abs(b1 - b3)) + b2"
+        );
+
+        // resolve_href must ignore slashes inside signed query strings
+        assert_eq!(
+            resolve_href(
+                "https://host.example/items/scene.json?sig=a/b/c",
+                "./B10.tif"
+            ),
+            "https://host.example/items/B10.tif"
         );
     }
 }

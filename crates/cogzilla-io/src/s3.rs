@@ -787,6 +787,14 @@ async fn fetch_s3_inner(
         };
 
         let status = resp.status().as_u16();
+        // Reject HTTP 200 when a non-zero start range was requested: the upstream ignored Range
+        // and sent bytes from offset 0, which would silently corrupt tile/IFD parsing.
+        if status == 200
+            && let Some(rng) = range_header
+            && !rng.starts_with("bytes=0-")
+        {
+            return Err(IoError::HttpStatus { status: 200, url });
+        }
         if status == 200 || status == 206 {
             // The body can still fail after a good status line (connection reset mid-transfer).
             let body_res = if let Some(cap) = max_bytes {

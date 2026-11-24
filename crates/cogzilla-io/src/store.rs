@@ -19,17 +19,56 @@ fn planar_alpha_plane(ifd: &IfdMeta) -> Option<usize> {
     cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples)
 }
 
-/// Given a planar color-plane `tile_idx`, return `(offset, len)` of its paired alpha-plane tile.
-fn planar_alpha_tile_range(ifd: &IfdMeta, tile_idx: u32, alpha_plane: usize) -> Option<(u64, u32)> {
+/// Lookup result for a paired planar alpha-plane tile or internal mask tile.
+enum SidecarTileRange {
+    /// Non-empty tile at `(offset, byte_len)`.
+    Present(u64, u32),
+    /// Sparse (`byte_count == 0`) mask/alpha tile — 100% transparent, zero I/O needed!
+    SparseTransparent,
+    /// Not applicable (e.g. querying the alpha plane itself) or out of bounds.
+    NotApplicable,
+}
+
+fn mark_tile_all_nodata(tile: &mut DecodedTile) {
+    for b in &mut tile.bands {
+        b.data.make_f32_mut().fill(f32::NAN);
+        b.stats.all_nodata = true;
+        b.stats.no_nodata = false;
+    }
+}
+
+/// Given a planar color-plane `tile_idx`, return its paired alpha-plane tile range status.
+fn planar_alpha_tile_range(ifd: &IfdMeta, tile_idx: u32, alpha_plane: usize) -> SidecarTileRange {
     let per_plane = ((ifd.tiles_across as usize) * (ifd.tiles_down as usize)).max(1);
     let plane = (tile_idx as usize) / per_plane;
-    if plane >= alpha_plane {
-        return None;
+    if plane == alpha_plane {
+        return SidecarTileRange::NotApplicable;
     }
     let alpha_idx = alpha_plane * per_plane + (tile_idx as usize) % per_plane;
-    let offset = *ifd.tile_offsets.get(alpha_idx)?;
-    let len = *ifd.tile_byte_counts.get(alpha_idx)?;
-    if len == 0 { None } else { Some((offset, len)) }
+    let Some(&offset) = ifd.tile_offsets.get(alpha_idx) else {
+        return SidecarTileRange::NotApplicable;
+    };
+    let Some(&len) = ifd.tile_byte_counts.get(alpha_idx) else {
+        return SidecarTileRange::NotApplicable;
+    };
+    if len == 0 {
+        SidecarTileRange::SparseTransparent
+    } else {
+        SidecarTileRange::Present(offset, len)
+    }
+}
+
+fn mask_tile_range(mask_ifd: &cogzilla_tiff::MaskIfdMeta, mask_idx: usize) -> SidecarTileRange {
+    let Some(&len) = mask_ifd.tile_byte_counts.get(mask_idx) else {
+        return SidecarTileRange::NotApplicable;
+    };
+    if len == 0 {
+        return SidecarTileRange::SparseTransparent;
+    }
+    match mask_ifd.tile_offsets.get(mask_idx) {
+        Some(&off) => SidecarTileRange::Present(off, len),
+        None => SidecarTileRange::NotApplicable,
+    }
 }
 
 /// Lightweight `'static` clone of `IfdMeta` carrying only the fields `decode_tile` reads
@@ -535,28 +574,38 @@ impl CogStore {
                             let per_plane =
                                 (ifd.tiles_across as usize) * (ifd.tiles_down as usize);
                             let mask_idx = (tile_idx as usize) % per_plane.max(1);
-                            if let Some((moff, mlen)) = mask_ifd.tile_byte_range(mask_idx) {
-                                if let Some(mslice) = cog.source.local_slice(moff, mlen) {
-                                    if let Ok(mask) = decode_mask_tile(mslice, mask_ifd) {
-                                        apply_mask_to_tile(&mut decoded, &mask);
+                            match mask_tile_range(mask_ifd, mask_idx) {
+                                SidecarTileRange::Present(moff, mlen) => {
+                                    if let Some(mslice) = cog.source.local_slice(moff, mlen) {
+                                        if let Ok(mask) = decode_mask_tile(mslice, mask_ifd) {
+                                            apply_mask_to_tile(&mut decoded, &mask);
+                                        }
                                     }
                                 }
+                                SidecarTileRange::SparseTransparent => {
+                                    mark_tile_all_nodata(&mut decoded);
+                                }
+                                SidecarTileRange::NotApplicable => {}
                             }
                         }
                     }
                     if let Some(alpha_plane) = planar_alpha_plane(ifd) {
-                        if let Some((aoff, alen)) =
-                            planar_alpha_tile_range(ifd, tile_idx, alpha_plane)
-                        {
-                            if let Some(aslice) = cog.source.local_slice(aoff, alen) {
-                                if let Ok(alpha_tile) =
-                                    decode_tile(aslice, ifd, cog.index.byte_order, None)
-                                {
-                                    if let Some(ab) = alpha_tile.bands.first() {
-                                        apply_alpha_band_to_tile(&mut decoded, ab);
+                        match planar_alpha_tile_range(ifd, tile_idx, alpha_plane) {
+                            SidecarTileRange::Present(aoff, alen) => {
+                                if let Some(aslice) = cog.source.local_slice(aoff, alen) {
+                                    if let Ok(alpha_tile) =
+                                        decode_tile(aslice, ifd, cog.index.byte_order, None)
+                                    {
+                                        if let Some(ab) = alpha_tile.bands.first() {
+                                            apply_alpha_band_to_tile(&mut decoded, ab);
+                                        }
                                     }
                                 }
                             }
+                            SidecarTileRange::SparseTransparent => {
+                                mark_tile_all_nodata(&mut decoded);
+                            }
+                            SidecarTileRange::NotApplicable => {}
                         }
                     }
                     let arc = Arc::new(decoded);
@@ -778,33 +827,49 @@ impl CogStore {
                                     let per_plane = (ifd.tiles_across as usize)
                                         * (ifd.tiles_down as usize);
                                     let mask_idx = (*tidx as usize) % per_plane.max(1);
-                                    if let Some((moff, mlen)) = mask_ifd.tile_byte_range(mask_idx) {
-                                        let Some(mslice) = cog.source.local_slice(moff, mlen)
-                                        else {
-                                            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                                required: moff + mlen as u64,
-                                                available: 0,
-                                            }));
-                                        };
-                                        let mask = decode_mask_tile(mslice, mask_ifd)?;
-                                        apply_mask_to_tile(&mut decoded, &mask);
+                                    match mask_tile_range(mask_ifd, mask_idx) {
+                                        SidecarTileRange::Present(moff, mlen) => {
+                                            let Some(mslice) = cog.source.local_slice(moff, mlen)
+                                            else {
+                                                return Err(IoError::Tiff(
+                                                    TiffError::NeedMoreBytes {
+                                                        required: moff + mlen as u64,
+                                                        available: 0,
+                                                    },
+                                                ));
+                                            };
+                                            let mask = decode_mask_tile(mslice, mask_ifd)?;
+                                            apply_mask_to_tile(&mut decoded, &mask);
+                                        }
+                                        SidecarTileRange::SparseTransparent => {
+                                            mark_tile_all_nodata(&mut decoded);
+                                        }
+                                        SidecarTileRange::NotApplicable => {}
                                     }
                                 }
                             }
                         }
                         if let Some(ap) = alpha_plane {
                             if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
-                                if let Some((aoff, alen)) = planar_alpha_tile_range(ifd, *tidx, ap) {
-                                    let Some(aslice) = cog.source.local_slice(aoff, alen) else {
-                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                            required: aoff + alen as u64,
-                                            available: 0,
-                                        }));
-                                    };
-                                    let alpha_tile = decode_tile(aslice, ifd, byte_order, None)?;
-                                    if let Some(ab) = alpha_tile.bands.first() {
-                                        apply_alpha_band_to_tile(&mut decoded, ab);
+                                match planar_alpha_tile_range(ifd, *tidx, ap) {
+                                    SidecarTileRange::Present(aoff, alen) => {
+                                        let Some(aslice) = cog.source.local_slice(aoff, alen)
+                                        else {
+                                            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                                required: aoff + alen as u64,
+                                                available: 0,
+                                            }));
+                                        };
+                                        let alpha_tile =
+                                            decode_tile(aslice, ifd, byte_order, None)?;
+                                        if let Some(ab) = alpha_tile.bands.first() {
+                                            apply_alpha_band_to_tile(&mut decoded, ab);
+                                        }
                                     }
+                                    SidecarTileRange::SparseTransparent => {
+                                        mark_tile_all_nodata(&mut decoded);
+                                    }
+                                    SidecarTileRange::NotApplicable => {}
                                 }
                             }
                         }
@@ -1039,6 +1104,8 @@ impl CogStore {
                                     // and fetch all needed mask ranges for this span concurrently first.
                                     let mut mask_bytes_by_slot: Vec<Option<bytes::Bytes>> =
                                         vec![None; span.items.len()];
+                                    let mut sparse_transparent_by_slot: Vec<bool> =
+                                        vec![false; span.items.len()];
                                     if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
                                         if mask_ifd.tile_width == ifd.tile_width
                                             && mask_ifd.tile_height == ifd.tile_height
@@ -1054,14 +1121,19 @@ impl CogStore {
                                                 {
                                                     let mask_idx =
                                                         (*tidx as usize) % per_plane.max(1);
-                                                    if let Some((moff, mlen)) =
-                                                        mask_ifd.tile_byte_range(mask_idx)
-                                                    {
-                                                        mreqs.push(TileByteReq {
-                                                            slot: idx_in_span,
-                                                            offset: moff,
-                                                            len: mlen,
-                                                        });
+                                                    match mask_tile_range(mask_ifd, mask_idx) {
+                                                        SidecarTileRange::Present(moff, mlen) => {
+                                                            mreqs.push(TileByteReq {
+                                                                slot: idx_in_span,
+                                                                offset: moff,
+                                                                len: mlen,
+                                                            });
+                                                        }
+                                                        SidecarTileRange::SparseTransparent => {
+                                                            sparse_transparent_by_slot[idx_in_span] =
+                                                                true;
+                                                        }
+                                                        SidecarTileRange::NotApplicable => {}
                                                     }
                                                 }
                                             }
@@ -1126,14 +1198,19 @@ impl CogStore {
                                         for (idx_in_span, item) in span.items.iter().enumerate() {
                                             let orig_slot = owned[item.slot].0;
                                             if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
-                                                if let Some((aoff, alen)) =
-                                                    planar_alpha_tile_range(ifd, *tidx, ap)
-                                                {
-                                                    areqs.push(TileByteReq {
-                                                        slot: idx_in_span,
-                                                        offset: aoff,
-                                                        len: alen,
-                                                    });
+                                                match planar_alpha_tile_range(ifd, *tidx, ap) {
+                                                    SidecarTileRange::Present(aoff, alen) => {
+                                                        areqs.push(TileByteReq {
+                                                            slot: idx_in_span,
+                                                            offset: aoff,
+                                                            len: alen,
+                                                        });
+                                                    }
+                                                    SidecarTileRange::SparseTransparent => {
+                                                        sparse_transparent_by_slot[idx_in_span] =
+                                                            true;
+                                                    }
+                                                    SidecarTileRange::NotApplicable => {}
                                                 }
                                             }
                                         }
@@ -1225,7 +1302,9 @@ impl CogStore {
                                             nodata,
                                         ) {
                                             Ok(mut decoded) => {
-                                                if let (Some(mask_ifd), Some(mbytes)) = (
+                                                if sparse_transparent_by_slot[idx_in_span] {
+                                                    mark_tile_all_nodata(&mut decoded);
+                                                } else if let (Some(mask_ifd), Some(mbytes)) = (
                                                     ifd.mask_ifd.as_deref(),
                                                     mask_bytes_by_slot[idx_in_span].as_ref(),
                                                 ) {

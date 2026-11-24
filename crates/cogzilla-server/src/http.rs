@@ -1486,10 +1486,13 @@ where
                 let mut band_idx = 1usize;
                 for cog in cogs {
                     let st = compute_statistics(&engine, &cog, pq.max_size, None, pq.unscale).await?;
+                    let nb = cog.index.full_res().samples_per_pixel as usize;
                     if let Some(obj) = st.as_object() {
-                        for (_, v) in obj {
-                            map.insert(format!("b{band_idx}"), v.clone());
-                            band_idx += 1;
+                        for i in 1..=nb {
+                            if let Some(v) = obj.get(&format!("b{i}")) {
+                                map.insert(format!("b{band_idx}"), v.clone());
+                                band_idx += 1;
+                            }
                         }
                     }
                 }
