@@ -221,6 +221,36 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         let items = get_json(&client, format!("{base}/searches/{id}/{path}")).await;
         assert_eq!(items, json!([]), "{path}");
     }
+    // bbox and feature images: nothing to draw, and the parameters are checked first.
+    for (path, status) in [
+        ("bbox/6,44,8,46.png?assets=visual&max_size=64", 204),
+        ("bbox/6,44,8,46/64x64.png?assets=visual", 204),
+        ("bbox/6,44,8,46.png", 422),
+        ("bbox/6,44,8,46?assets=visual", 422),
+        ("bbox/6,44,8,46.png?assets=visual&width=wide", 422),
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:3857", 400),
+        ("bbox/6,44,8,46.npy?assets=visual", 400),
+        ("bbox/6,44,8.png?assets=visual", 404),
+        ("feature.png?assets=visual", 405),
+    ] {
+        let resp = client.get(format!("{base}/searches/{id}/{path}")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{path}");
+    }
+    let triangle = json!({ "type": "Feature", "properties": {}, "geometry": {
+        "type": "Polygon", "coordinates": [[[6.0, 44.0], [8.0, 44.0], [7.0, 46.0], [6.0, 44.0]]] } });
+    for (path, status) in [
+        ("feature.png?assets=visual&max_size=64", 204),
+        ("feature?assets=visual", 204),
+        ("feature/64x32.png?assets=visual", 204),
+        ("feature.png", 422),
+        ("info", 404),
+    ] {
+        let resp = post_json(&client, format!("{base}/searches/{id}/{path}"), &triangle).await;
+        assert_eq!(resp.status().as_u16(), status, "POST {path}");
+    }
+    let not_geojson = client.post(format!("{base}/searches/{id}/feature.png?assets=visual")).body("nope").send().await.unwrap();
+    assert_eq!(not_geojson.status().as_u16(), 422);
+
     // Point values: nothing is under the point, and the parameters are checked first.
     for (path, status) in [
         ("point/8.5,45.75?assets=visual", 204),

@@ -24,12 +24,15 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
 use super::{
-    ParsedQuery, build_tile_request, parse_bbox4, parse_ext_format, parse_y_scale_ext,
-    percent_decode, read_limited_body, to_http_response_cached,
+    ParsedQuery, apply_unscale_cogs, build_band_request, build_tile_request, parse_bbox4,
+    parse_ext_format, parse_wxh_ext, parse_y_scale_ext, percent_decode, read_limited_body,
+    to_http_response_cached,
 };
 use crate::engine::{EngineError, TileEngine};
 use crate::stac::{StacItem, rewrite_stac_expr, stac_item_from_json};
-use crate::titiler::{build_map_html, encode_rgba_output, query_point};
+use crate::titiler::{
+    PolygonMask, build_map_html, encode_rgba_output, query_point, render_wgs84_bbox,
+};
 
 /// Most scenes one tile may read. titiler-pgstac's default `items_limit` is 100.
 const MAX_SCENES_PER_TILE: usize = 256;
@@ -536,7 +539,11 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 }
 
 /// The pgSTAC routes: path, method and summary.
-const OPENAPI_ROUTES: [(&str, &str, &str); 40] = [
+const OPENAPI_ROUTES: [(&str, &str, &str); 44] = [
+    ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC search mosaic over a bounding box"),
+    ("/searches/{search_id}/feature.{format}", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature"),
+    ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC collection mosaic over a bounding box"),
+    ("/collections/{collection_id}/feature.{format}", "post", "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature"),
     ("/searches/{search_id}/point/{lon},{lat}", "get", "Values of the items under a point"),
     ("/collections/{collection_id}/point/{lon},{lat}", "get", "Values of the items under a point"),
     ("/searches/{search_id}/WMTSCapabilities.xml", "get", "pgSTAC search WMTS capabilities"),
@@ -1294,6 +1301,289 @@ fn unknown_asset(asset: &str, item: &MosaicItem) -> Resp {
     )
 }
 
+/// The largest side of a `bbox` or `feature` image.
+const MAX_PART_SIDE: u32 = 4096;
+
+/// The size asked for a `bbox` or `feature` image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PartSize {
+    /// `{width}x{height}` in the path.
+    Exact(u32, u32),
+    /// From the query string; whatever is missing follows the data's own resolution.
+    Query { max_size: Option<u32>, width: Option<u32>, height: Option<u32> },
+}
+
+fn part_size_from_query(pairs: &[(String, String)]) -> Result<PartSize, Resp> {
+    let int = |name: &str| -> Result<Option<u32>, Resp> {
+        match query_value(pairs, name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Some)
+                .ok_or_else(|| invalid_param("query", name, "Input should be a valid integer")),
+        }
+    };
+    let (width, height) = (int("width")?, int("height")?);
+    // As in rio-tiler, `max_size` is ignored once a width or a height is given.
+    let max_size = if width.is_some() || height.is_some() { None } else { int("max_size")? };
+    Ok(PartSize::Query { max_size, width, height })
+}
+
+/// Output size of a part of a raster, by rio-tiler's rules. `res` is the raster's
+/// resolution in the output coordinate system.
+fn part_dims(size: PartSize, bbox: [f64; 4], res: f64) -> (u64, u64) {
+    let native_w = ((bbox[2] - bbox[0]) / res).round().max(1.0);
+    let native_h = ((bbox[3] - bbox[1]) / res).round().max(1.0);
+    let ratio = native_h / native_w;
+    let (w, h) = match size {
+        PartSize::Exact(w, h) => (f64::from(w), f64::from(h)),
+        PartSize::Query { width: Some(w), height: Some(h), .. } => (f64::from(w), f64::from(h)),
+        PartSize::Query { width: Some(w), .. } => (f64::from(w), (f64::from(w) * ratio).ceil()),
+        PartSize::Query { height: Some(h), .. } => ((f64::from(h) / ratio).ceil(), f64::from(h)),
+        PartSize::Query { max_size: Some(m), .. } if native_w.max(native_h) >= f64::from(m) => {
+            if ratio > 1.0 {
+                ((f64::from(m) / ratio).ceil(), f64::from(m))
+            } else {
+                (f64::from(m), (f64::from(m) * ratio).ceil())
+            }
+        }
+        PartSize::Query { .. } => (native_w, native_h),
+    };
+    (w.max(1.0) as u64, h.max(1.0) as u64)
+}
+
+/// The resolution, in degrees, GDAL would give a raster warped to WGS84: the length of
+/// its warped diagonal over the length of its diagonal in pixels.
+fn wgs84_resolution(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<f64> {
+    let full = cog.index.full_res();
+    let (w, h) = (f64::from(full.width), f64::from(full.height));
+    let corner = |col: f64, row: f64| {
+        let (x, y) = full.pixel_to_crs.forward(col, row);
+        crs.to_lonlat_deg(x, y)
+    };
+    let (ul, lr) = (corner(0.0, 0.0), corner(w, h));
+    let res = (lr.0 - ul.0).hypot(lr.1 - ul.1) / w.hypot(h);
+    (res.is_finite() && res > 0.0).then_some(res)
+}
+
+/// `GET {base}/bbox/...` and `POST {base}/feature...`: one image of the mosaic over a box
+/// in WGS84, optionally clipped to a polygon. Items are drawn in the search's order, each
+/// filling the pixels the ones before it left empty.
+#[allow(clippy::too_many_arguments)]
+async fn part_image(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    hash: &str,
+    geometry: &Value,
+    bbox: [f64; 4],
+    mask: Option<&PolygonMask>,
+    size: PartSize,
+    ext: Option<&str>,
+    mut pq: ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    // `width` and `height` are read here; the shared parser does not know them.
+    pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'"));
+    let query = match check_mosaic_query(&pq, pairs) {
+        Ok(q) => q,
+        Err(r) => return r,
+    };
+    if let Err(r) = check_coord_crs(pairs) {
+        return r;
+    }
+    if let Some(dst) = query_value(pairs, "dst_crs")
+        && !matches!(dst.to_ascii_lowercase().as_str(), "epsg:4326" | "ogc:crs84")
+    {
+        return detail(
+            StatusCode::BAD_REQUEST,
+            format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
+        );
+    }
+    // The extension in the path, then `format=`; with neither, the pixels decide.
+    let explicit = ext.map(str::to_string).or_else(|| pq.format_param.clone());
+    let format = match explicit.as_deref() {
+        None => None,
+        Some(e) => match parse_ext_format(e, pq.webp_quality, pq.jpeg_quality) {
+            Ok(f) => Some(f),
+            Err(e) => return engine_error(&e),
+        },
+    };
+    if matches!(format, Some((OutputFormat::RawF32 | OutputFormat::Npy, _))) {
+        return detail(
+            StatusCode::BAD_REQUEST,
+            "raw array formats are not supported on pgSTAC bbox and feature routes yet",
+        );
+    }
+    // A JPEG has no mask to carry the polygon, and TiTiler then writes the whole box.
+    let mask = if matches!(format, Some((OutputFormat::Jpeg { .. }, _))) { None } else { mask };
+
+    let items = match pg.items_for_geometry(geometry, hash, query.limits).await {
+        Ok(items) => items,
+        Err(e) => return db_error(&e),
+    };
+    if items.is_empty() {
+        return no_content();
+    }
+    let mut scenes: Vec<Vec<String>> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
+    for item in items.iter().take(MAX_SCENES_PER_TILE) {
+        let mut hrefs = Vec::with_capacity(pq.assets.len());
+        for asset in &pq.assets {
+            match item.asset_href(asset) {
+                Some(href) => hrefs.push(href.to_string()),
+                None => return unknown_asset(asset, item),
+            }
+        }
+        scenes.push(hrefs);
+    }
+    if let Some(expr) = pq.expr_raw.take() {
+        pq.expr_raw = Some(rewrite_stac_expr(&expr, &pq.assets));
+    }
+
+    let engine = ctx.engine;
+    let rendered: Result<(Bytes, &'static str), EngineError> = async {
+        let formula = pq
+            .color_formula
+            .as_deref()
+            .map(cogzilla_kernel::ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let mut canvas: Vec<u8> = Vec::new();
+        let (mut width, mut height) = (0usize, 0usize);
+        for (n, scene) in scenes.iter().enumerate() {
+            let mut cogs = Vec::with_capacity(scene.len());
+            for href in scene {
+                cogs.push(engine.store.open_uri(href).await?);
+            }
+            let crs = engine.get_or_build_crs(&cogs[0])?;
+            let full = cogs[0].index.full_res();
+            if n == 0 {
+                // The first item sets the size; the others are drawn onto its grid.
+                let res = wgs84_resolution(&crs, &cogs[0]).ok_or_else(|| {
+                    EngineError::BadRequest("cannot place the first item in WGS84".into())
+                })?;
+                let (w, h) = part_dims(size, bbox, res);
+                if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) {
+                    return Err(EngineError::BadRequest(format!(
+                        "the image would be {w}x{h} pixels; the limit is {MAX_PART_SIDE} per side (pass max_size, or width and height)"
+                    )));
+                }
+                (width, height) = (w as usize, h as usize);
+                canvas = vec![0u8; width * height * 4];
+            }
+            let default_bands =
+                if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+            let mut bands = build_band_request(&pq, default_bands, full.sample_type)?;
+            if pq.unscale {
+                apply_unscale_cogs(&mut bands, &cogs);
+            }
+            // As on tiles: `resampling` for a source already in the output's projection,
+            // `reproject` for one that has to be warped into it.
+            let resample = match crs {
+                CrsModel::Geographic => query.resampling,
+                _ => query.reproject,
+            };
+            let rgba = render_wgs84_bbox(
+                engine,
+                &cogs,
+                bbox,
+                width as u32,
+                height as u32,
+                mask,
+                &bands,
+                resample,
+                OutputFormat::RawRgba,
+                None,
+                None,
+                None,
+                true,
+                pq.unscale,
+            )
+            .await?;
+            if rgba.len() != canvas.len() {
+                return Err(EngineError::BadRequest("unexpected image size from the renderer".into()));
+            }
+            let mut empty = 0usize;
+            for (dst, src) in canvas.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+                if dst[3] == 0 {
+                    if src[3] != 0 {
+                        dst.copy_from_slice(src);
+                    } else {
+                        empty += 1;
+                    }
+                }
+            }
+            if empty == 0 {
+                break;
+            }
+        }
+        if let Some(formula) = formula {
+            formula.apply_buffer_in_place(&mut canvas, 4);
+        }
+        let (format, content_type) = match format {
+            Some((f, ct)) => (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }),
+            None => {
+                let opaque = canvas.chunks_exact(4).all(|p| p[3] == 255);
+                parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?
+            }
+        };
+        Ok((encode_rgba_output(width, height, &canvas, format, pq.return_mask), content_type))
+    }
+    .await;
+    match rendered {
+        Ok((body, content_type)) => {
+            let mut resp = Response::new(Full::new(body));
+            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            resp
+        }
+        Err(e) => engine_error(&e),
+    }
+}
+
+fn bbox_polygon([w, s, e, n]: [f64; 4]) -> Value {
+    json!({ "type": "Polygon", "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]] })
+}
+
+/// `POST {base}/feature[.{format}]` and `POST {base}/feature/{width}x{height}.{format}`.
+#[allow(clippy::too_many_arguments)]
+async fn feature_image(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    hash: &str,
+    rest: &[&str],
+    body: Option<&Bytes>,
+    pq: ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    let (size, ext) = match rest {
+        ["feature"] => (part_size_from_query(pairs), None),
+        [one] => (part_size_from_query(pairs), one.strip_prefix("feature.")),
+        ["feature", dims] => match parse_wxh_ext(dims) {
+            Some((w, h, ext)) if w > 0 && h > 0 => (Ok(PartSize::Exact(w, h)), ext),
+            _ => return detail(StatusCode::NOT_FOUND, "Not Found"),
+        },
+        _ => return detail(StatusCode::NOT_FOUND, "Not Found"),
+    };
+    let size = match size {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Some(geojson) = body.and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return invalid_param("body", "body", "Input should be a valid GeoJSON Feature");
+    };
+    let geometry = match geojson.get("type").and_then(Value::as_str) {
+        Some("Feature") => geojson.get("geometry").cloned().unwrap_or(Value::Null),
+        _ => geojson.clone(),
+    };
+    let (mask, bbox) = match PolygonMask::from_geojson(&geojson) {
+        Ok(m) => m,
+        Err(e) => return engine_error(&e),
+    };
+    part_image(ctx, pg, hash, &geometry, bbox, Some(&mask), size, ext, pq, pairs).await
+}
+
 /// How many items of a point query are read at once.
 const POINT_ITEMS_IN_FLIGHT: usize = 8;
 
@@ -2021,7 +2311,9 @@ where
         ["searches"] | ["searches", ""] | ["searches", "list"] if get => list(&ctx, pg, &pairs).await,
         // Item routes with a path are answered before this is reached.
         ["collections", _, "items", ..] => not_found(),
-        [family @ ("searches" | "collections"), id, rest @ ..] if get && !rest.is_empty() => {
+        [family @ ("searches" | "collections"), id, rest @ ..]
+            if (get || *method == Method::POST) && !rest.is_empty() =>
+        {
             // A tile matrix set in the path is validated before anything is looked up.
             let tms = match rest {
                 [tms, "tilejson.json" | "map.html"] => Some(*tms),
@@ -2041,23 +2333,44 @@ where
                 Err(r) => return r,
             };
             let base = format!("/{family}/{id}");
-            mosaic_route(&ctx, pg, &base, &rec, rest, pq, &pairs).await
+            let body = if get {
+                None
+            } else {
+                match read_limited_body(req.into_body()).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => return engine_error(&e),
+                }
+            };
+            mosaic_route(&ctx, pg, &base, &rec, rest, body.as_ref(), pq, &pairs).await
         }
         _ => not_found(),
     }
 }
 
 /// The routes shared by a registered search and a collection's mosaic.
+#[allow(clippy::too_many_arguments)]
 async fn mosaic_route(
     ctx: &Ctx<'_>,
     pg: &PgStac,
     base: &str,
     rec: &SearchRecord,
     rest: &[&str],
+    body: Option<&Bytes>,
     pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
     let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
+    // The only route that takes a body.
+    let is_feature = |rest: &[&str]| {
+        rest.first().is_some_and(|f| *f == "feature" || f.starts_with("feature."))
+    };
+    if body.is_some() != is_feature(rest) {
+        return if body.is_some() {
+            not_found()
+        } else {
+            detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+        };
+    }
     match rest {
         ["info"] => {
             let mut search = search_json(rec);
@@ -2126,6 +2439,28 @@ async fn mosaic_route(
                 Ok(Some(coord)) => tile(ctx, pg, &rec.hash, coord, scale, ext, pq, pairs).await,
             }
         }
+        [first, ..] if *first == "feature" || first.starts_with("feature.") => {
+            feature_image(ctx, pg, &rec.hash, rest, body, pq, pairs).await
+        }
+        ["bbox", seg] => {
+            // The format is part of the path here: `{minx},{miny},{maxx},{maxy}.{format}`.
+            let Some((bbox, ext)) = parse_bbox4(seg) else {
+                return not_found();
+            };
+            let Some(ext) = ext else {
+                return invalid_param(
+                    "path",
+                    "format",
+                    "Input should be 'png', 'npy', 'tif', 'tiff', 'jpeg', 'jpg', 'jp2', 'webp' or 'pngraw'",
+                );
+            };
+            let size = match part_size_from_query(pairs) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            let polygon = bbox_polygon(bbox);
+            part_image(ctx, pg, &rec.hash, &polygon, bbox, None, size, Some(ext), pq, pairs).await
+        }
         ["bbox", bbox, "assets"] => {
             let Some(([w, s, e, n], None)) = parse_bbox4(bbox) else {
                 return not_found();
@@ -2139,6 +2474,18 @@ async fn mosaic_route(
                 "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]]
             });
             geometry_assets(pg, &rec.hash, polygon, limits).await
+        }
+        ["bbox", seg, dims] => {
+            let (Some((bbox, None)), Some((w, h, ext))) = (parse_bbox4(seg), parse_wxh_ext(dims))
+            else {
+                return not_found();
+            };
+            if w == 0 || h == 0 {
+                return not_found();
+            }
+            let polygon = bbox_polygon(bbox);
+            part_image(ctx, pg, &rec.hash, &polygon, bbox, None, PartSize::Exact(w, h), ext, pq, pairs)
+                .await
         }
         ["point", lonlat] => point_values(ctx, pg, &rec.hash, lonlat, &pq, pairs).await,
         ["point", lonlat, "assets"] => {
@@ -2508,6 +2855,31 @@ mod tests {
         assert_eq!(status("use_epsg=maybe"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("zooms=WebMercatorQuad"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status(""), StatusCode::OK);
+    }
+
+    #[test]
+    fn part_sizes_follow_rio_tiler() {
+        // A 0.2 by 0.1 degree box over data whose resolution makes it 1802 by 901 pixels.
+        let bbox = [8.4, 45.7, 8.6, 45.8];
+        let res = 0.2 / 1802.0;
+        let query = |max_size, width, height| PartSize::Query { max_size, width, height };
+        assert_eq!(part_dims(query(None, None, None), bbox, res), (1802, 901));
+        assert_eq!(part_dims(query(Some(256), None, None), bbox, res), (256, 128));
+        assert_eq!(part_dims(query(None, Some(300), None), bbox, res), (300, 150));
+        assert_eq!(part_dims(query(None, None, Some(90)), bbox, res), (180, 90));
+        assert_eq!(part_dims(query(None, Some(300), Some(200)), bbox, res), (300, 200));
+        assert_eq!(part_dims(PartSize::Exact(64, 48), bbox, res), (64, 48));
+        // `max_size` only shrinks: a box smaller than it keeps the data's resolution.
+        assert_eq!(part_dims(query(Some(4096), None, None), bbox, res), (1802, 901));
+        // A tall box is limited by its height.
+        assert_eq!(part_dims(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2], res), (50, 100));
+
+        // `max_size` is dropped once a width or a height is given, as in rio-tiler.
+        let pairs = query_pairs("max_size=64&width=300");
+        assert_eq!(part_size_from_query(&pairs).unwrap(), query(None, Some(300), None));
+        assert_eq!(part_size_from_query(&query_pairs("max_size=64")).unwrap(), query(Some(64), None, None));
+        assert!(part_size_from_query(&query_pairs("width=wide")).is_err());
+        assert!(part_size_from_query(&query_pairs("height=0")).is_err());
     }
 
     #[test]
