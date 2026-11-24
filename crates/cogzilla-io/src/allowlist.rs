@@ -66,10 +66,17 @@ fn decode_percent_once(s: &str) -> String {
 /// encoded path separators (`%2f`, `%5c`) never match, since they can climb
 /// out of an allowed prefix on downstream HTTP servers/proxies.
 pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
-    // Only inspect the path component (before `?query` / `#fragment`) for traversal and
-    // percent-encoded path separators so valid AWS SigV4 presigned URLs (`%2F` in
-    // `X-Amz-Credential`) and Azure SAS URLs (`%2F` in base64 `sig=`) are allowed.
-    let mut cur = uri.split(['?', '#']).next().unwrap_or(uri).to_string();
+    // For HTTP(S) URLs, inspect only the path component (before `?query` / `#fragment`) so valid
+    // AWS SigV4 presigned URLs (`%2F` in `X-Amz-Credential`) and Azure SAS URLs (`%2F` in base64
+    // `sig=`) are allowed. For cloud object URIs (`s3://`, `gs://`, `az://`, `abfs(s)://`, `/vsi*`)
+    // and local paths, `?` and `#` are literal path/key bytes — inspect the entire URI so
+    // `gs://allowed/public/?/../../../secret/key.tif` cannot bypass traversal checks.
+    let inspect = if uri.starts_with("http://") || uri.starts_with("https://") {
+        uri.split(['?', '#']).next().unwrap_or(uri)
+    } else {
+        uri
+    };
+    let mut cur = inspect.to_string();
     for _ in 0..3 {
         let lower = cur.to_ascii_lowercase();
         if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
@@ -157,5 +164,11 @@ mod tests {
             &p,
             "https://bucket.example.com/scene.tif?sig=abc%2Fdef%2B123%3D"
         ));
+        // Cloud object URIs treat `?`/`#` as literal key bytes, so `?/../..` must be rejected!
+        let cloud_p = list(&["gs://allowed/public/", "az://acct/public/", "s3://allowed/public/"]);
+        assert!(!matches_any_prefix(&cloud_p, "gs://allowed/public/?/../../../secret-bucket/key.tif"));
+        assert!(!matches_any_prefix(&cloud_p, "az://acct/public/?/../../../private/blob.tif"));
+        assert!(!matches_any_prefix(&cloud_p, "s3://allowed/public/#/../../secret/key.tif"));
+        assert!(matches_any_prefix(&cloud_p, "gs://allowed/public/scene.tif"));
     }
 }

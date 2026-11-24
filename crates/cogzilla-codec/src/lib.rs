@@ -288,7 +288,7 @@ pub fn decode_tile_rows(
 
                 let opts = DecoderOptions::default()
                     .set_max_width((ifd.tile_width as usize).next_multiple_of(16))
-                    .set_max_height((ifd.tile_height as usize).next_multiple_of(16));
+                    .set_max_height((tile_h as usize).next_multiple_of(16));
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(jpeg_bytes, opts);
                 dec.decode_headers()
                     .map_err(|e| CodecError::Jpeg(format!("{e:?}")))?;
@@ -315,9 +315,19 @@ pub fn decode_tile_rows(
                 let (jw, jh) = dec.dimensions().ok_or_else(|| {
                     CodecError::Jpeg("JPEG header missing dimensions".into())
                 })?;
+                let decoded_jpeg_bytes = jw
+                    .checked_mul(jh)
+                    .and_then(|px| px.checked_mul(bands_in_tile))
+                    .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+                    .ok_or_else(|| {
+                        CodecError::Jpeg(format!(
+                            "JPEG dimensions {jw}x{jh}x{bands_in_tile} exceed max decoded tile size"
+                        ))
+                    })?;
+                let _ = decoded_jpeg_bytes;
                 dec.set_options(opts.jpeg_set_out_colorspace(out_cs));
                 let tile_w = ifd.tile_width as usize;
-                let tile_h = actual_rows as usize;
+                let tile_h_usize = tile_h as usize;
                 if jw == tile_w {
                     let out_len = dec.output_buffer_size().unwrap_or(expected_bytes);
                     if out_len <= expected_bytes {
@@ -346,7 +356,7 @@ pub fn decode_tile_rows(
                     let src_stride = jw * bands_in_tile;
                     let dst_stride = tile_w * bands_in_tile;
                     let copy_bytes = jw.min(tile_w) * bands_in_tile;
-                    let copy_rows = jh.min(tile_h);
+                    let copy_rows = jh.min(tile_h_usize);
                     raw_slice[..expected_bytes].fill(0);
                     for y in 0..copy_rows {
                         let src_off = y * src_stride;

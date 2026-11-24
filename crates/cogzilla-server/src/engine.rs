@@ -401,11 +401,11 @@ impl TileEngine {
                 // Pad source block range by 2 source pixels so the 1-px DEM border stencil never
                 // misses an adjacent COG internal block at tile boundaries.
                 let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-                let d_tx0 = ((c0 - 2).max(0) as u32) / ifd.tile_width;
-                let d_tx1 = (((c1 + 2).max(0) as u32) / ifd.tile_width)
+                let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
+                let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
                     .min(ifd.tiles_across.saturating_sub(1));
-                let d_ty0 = ((r0 - 2).max(0) as u32) / ifd.tile_height;
-                let d_ty1 = (((r1 + 2).max(0) as u32) / ifd.tile_height)
+                let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
+                let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
                     .min(ifd.tiles_down.saturating_sub(1));
                 let d_gw = d_tx1 - d_tx0 + 1;
                 let d_gh = d_ty1 - d_ty0 + 1;
@@ -472,11 +472,11 @@ impl TileEngine {
                 // Pad source block range by 2 source pixels so the 1-px DEM border stencil never
                 // misses an adjacent COG internal block at tile boundaries.
                 let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-                let d_tx0 = ((c0 - 2).max(0) as u32) / ifd.tile_width;
-                let d_tx1 = (((c1 + 2).max(0) as u32) / ifd.tile_width)
+                let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
+                let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
                     .min(ifd.tiles_across.saturating_sub(1));
-                let d_ty0 = ((r0 - 2).max(0) as u32) / ifd.tile_height;
-                let d_ty1 = (((r1 + 2).max(0) as u32) / ifd.tile_height)
+                let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
+                let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
                     .min(ifd.tiles_down.saturating_sub(1));
                 let d_gw = d_tx1 - d_tx0 + 1;
                 let d_gh = d_ty1 - d_ty0 + 1;
@@ -1529,6 +1529,10 @@ impl TileEngine {
                 "mosaic requires at least one ?url= parameter".into(),
             ));
         }
+        // Bound per-tile scene fan-out so a huge MosaicJSON/catalog of transparent or OOB COGs
+        // cannot trigger thousands of sequential open_uri + render_tile calls on a single GET.
+        const MAX_MOSAIC_SCENES_PER_TILE: usize = 64;
+        let urls = &urls[..urls.len().min(MAX_MOSAIC_SCENES_PER_TILE)];
         let n = req.tile_size as usize;
         let total_pixels = n * n;
         let f32_bands: usize = match req.bands {

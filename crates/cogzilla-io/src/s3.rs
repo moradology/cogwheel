@@ -522,7 +522,10 @@ pub fn parse_s3_uri(uri: &str) -> Option<(&str, &str)> {
         .strip_prefix("s3://")
         .or_else(|| uri.strip_prefix("/vsis3/"))?;
     let (bucket, key) = rest.split_once('/')?;
-    if !is_valid_s3_bucket(bucket) || key.is_empty() {
+    if !is_valid_s3_bucket(bucket)
+        || key.is_empty()
+        || key.split(['/', '\\']).any(|seg| seg == "..")
+    {
         return None;
     }
     Some((bucket, key))

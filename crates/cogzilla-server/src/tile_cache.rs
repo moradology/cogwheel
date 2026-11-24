@@ -287,7 +287,8 @@ impl TileCache {
                         return match f().await {
                             Ok((bytes, content_type)) => {
                                 let is_binary = content_type.starts_with("image/")
-                                    || content_type == "application/octet-stream";
+                                    || content_type == "application/octet-stream"
+                                    || content_type == "application/x-npy";
                                 let etag = is_binary.then(|| compute_tile_etag(&bytes));
                                 let tile = CachedTile {
                                     bytes,
