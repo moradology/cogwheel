@@ -129,6 +129,7 @@ struct ParsedQuery {
     custom_colormap_json: Option<String>,
     color_formula: Option<String>,
     resample: ResampleMode,
+    reproject: ResampleMode,
     tile_size: u32,
     max_size: u32,
     webp_quality: Option<f32>,
@@ -160,7 +161,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         colormap: ColormapName::Viridis,
         custom_colormap_json: None,
         color_formula: None,
-        resample: ResampleMode::Bilinear,
+        resample: ResampleMode::Nearest,
+        reproject: ResampleMode::Nearest,
         tile_size: 256,
         max_size: 1024,
         webp_quality: None,
@@ -344,7 +346,18 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     "bilinear" => ResampleMode::Bilinear,
                     _ => {
                         bad("use nearest, bilinear or cubic");
-                        ResampleMode::Bilinear
+                        ResampleMode::Nearest
+                    }
+                };
+            }
+            "reproject" => {
+                pq.reproject = match v {
+                    "nearest" => ResampleMode::Nearest,
+                    "cubic" | "cubicspline" | "cubic_spline" | "lanczos" => ResampleMode::Cubic,
+                    "bilinear" => ResampleMode::Bilinear,
+                    _ => {
+                        bad("use nearest, bilinear or cubic");
+                        ResampleMode::Nearest
                     }
                 };
             }
@@ -385,9 +398,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("padding is not supported");
                 }
             }
-            "reproject" | "dst_crs" | "crs" | "histogram_bins" | "histogram_range"
-            | "categorical" | "c" | "p" | "cover_scale" | "height" | "width" | "minzoom"
-            | "maxzoom" | "tile_format" | "orientation" => {
+            "dst_crs" | "crs" | "histogram_bins" | "histogram_range" | "categorical" | "c"
+            | "p" | "cover_scale" | "height" | "width" | "minzoom" | "maxzoom" | "tile_format"
+            | "orientation" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
@@ -716,6 +729,25 @@ fn build_band_request(
     }
 }
 
+/// Match TiTiler / rio-tiler resampling semantics: when the source CRS matches the target CRS,
+/// `resampling` applies; when reprojecting across CRSes, `reproject` applies (both default to
+/// `Nearest`).
+fn resolve_resample(
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    target_is_4326: bool,
+) -> ResampleMode {
+    let Some(cog) = source_cog else {
+        return pq.resample;
+    };
+    let same_crs = match cogzilla_proj::CrsModel::from_geo_keys(&cog.index.geo_keys) {
+        Ok(cogzilla_proj::CrsModel::Epsg3857) => !target_is_4326,
+        Ok(cogzilla_proj::CrsModel::Geographic) => target_is_4326,
+        _ => false,
+    };
+    if same_crs { pq.resample } else { pq.reproject }
+}
+
 fn build_tile_request(
     tile: TileCoord,
     scale_opt: Option<u32>,
@@ -724,6 +756,7 @@ fn build_tile_request(
     default_bands: u16,
     is_u8: bool,
     is_crs84: bool,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
     if tile.z > 30 {
         return Err(EngineError::BadRequest(format!(
@@ -755,7 +788,7 @@ fn build_tile_request(
             tile,
             tile_size,
             bands,
-            resample: pq.resample,
+            resample: resolve_resample(pq, source_cog, is_crs84),
             format,
             unscale: pq.unscale,
         },
@@ -1362,7 +1395,7 @@ where
                         let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
                             let (treq, ct) =
-                                build_tile_request(tile, sc, ext, &pq, 3, true, false)?;
+                                build_tile_request(tile, sc, ext, &pq, 3, true, false, None)?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
@@ -1377,8 +1410,16 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) =
-                                build_tile_request(tile, sc, ext, &pq, db, is_u8, false)?;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                is_u8,
+                                false,
+                                Some(&first_cog),
+                            )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             Ok((b, ct))
@@ -1442,6 +1483,7 @@ where
                                 db,
                                 is_u8,
                                 false,
+                                Some(&first_cog),
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let b = render_mosaic_tile_styled(&engine, &pq.urls, treq, &pq).await?;
@@ -1486,7 +1528,7 @@ where
                         let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
                         if urls.is_empty() {
                             let (treq, ct) =
-                                build_tile_request(tile, sc, ext, &pq, 3, true, false)?;
+                                build_tile_request(tile, sc, ext, &pq, 3, true, false, None)?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
@@ -1501,8 +1543,16 @@ where
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let is_u8 = first_cog.index.full_res().sample_type
                                 == cogzilla_tiff::SampleType::Uint8;
-                            let (treq, ct) =
-                                build_tile_request(tile, sc, ext, &pq, db, is_u8, false)?;
+                            let (treq, ct) = build_tile_request(
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                db,
+                                is_u8,
+                                false,
+                                Some(&first_cog),
+                            )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             Ok((b, ct))
@@ -1562,6 +1612,7 @@ where
                                 db,
                                 is_u8,
                                 false,
+                                Some(&cogs[0]),
                             )?;
                             if pq.unscale {
                                 apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -1933,6 +1984,7 @@ where
                             db,
                             is_u8,
                             tms == "WorldCRS84Quad",
+                            Some(&cogs[0]),
                         )?;
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -2124,8 +2176,9 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2164,8 +2217,9 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2204,14 +2258,16 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let data = if pq_stac.coord_crs_3857 {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, 512, 512, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, 512, 512, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, 512, 512, None, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, 512, 512, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
@@ -2252,14 +2308,16 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let data = if pq_stac.coord_crs_3857 {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, pq_stac.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?
@@ -2307,8 +2365,9 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2347,8 +2406,9 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq_stac, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq_stac.resample, fmt,
+                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
@@ -2523,6 +2583,7 @@ where
                             db,
                             is_u8,
                             tms == "WorldCRS84Quad",
+                            Some(&cogs[0]),
                         )?;
                         if pq.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -2682,8 +2743,9 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2707,8 +2769,9 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2733,14 +2796,16 @@ where
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = if pq.coord_crs_3857 {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, 512, 512, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, 512, 512, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, 512, 512, None, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, 512, 512, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
@@ -2767,14 +2832,16 @@ where
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let data = if pq.coord_crs_3857 {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), false);
                     render_mercator_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
                 } else {
+                    let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                     render_wgs84_bbox(
-                        &engine, &cogs, bbox, out_w, out_h, None, &bands, pq.resample, fmt,
+                        &engine, &cogs, bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?
@@ -2802,8 +2869,9 @@ where
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let s = pq.max_size.min(1024);
+                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, s, s, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -2829,8 +2897,9 @@ where
                 }
                 let custom_lut = pq.custom_colormap_json.as_deref().map(ColormapLut::from_json_str).transpose().map_err(EngineError::BadRequest)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(&pq, Some(&cogs[0]), true);
                 let data = render_wgs84_bbox(
-                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, pq.resample, fmt,
+                    &engine, &cogs, bbox, out_w, out_h, Some(&mask), &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
@@ -3136,14 +3205,23 @@ mod tests {
     #[test]
     fn xyz_bounds_and_http_error_status_mapping() {
         let pq = parse_query(None);
+        assert_eq!(pq.resample, ResampleMode::Nearest);
+        assert_eq!(pq.reproject, ResampleMode::Nearest);
         // WebMercatorQuad at z=2 has 4x4 tiles (0..=3)
-        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, true, false).is_ok());
-        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, true, false).is_err());
-        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, false).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 3, y: 3 }, None, "png", &pq, 3, true, false, None).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 4, y: 0 }, None, "png", &pq, 3, true, false, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, false, None).is_err());
         // WorldCRS84Quad at z=2 has 8x4 tiles (x: 0..=7, y: 0..=3)
-        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, true, true).is_ok());
-        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, true, true).is_err());
-        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, true).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 7, y: 3 }, None, "png", &pq, 3, true, true, None).is_ok());
+        assert!(build_tile_request(TileCoord { z: 2, x: 8, y: 0 }, None, "png", &pq, 3, true, true, None).is_err());
+        assert!(build_tile_request(TileCoord { z: 2, x: 0, y: 4 }, None, "png", &pq, 3, true, true, None).is_err());
+
+        // ?reproject= is accepted and parsed independently from ?resampling=
+        let pq_rp = parse_query(Some("resampling=bilinear&reproject=cubic"));
+        assert!(pq_rp.errors.is_empty());
+        assert_eq!(pq_rp.resample, ResampleMode::Bilinear);
+        assert_eq!(pq_rp.reproject, ResampleMode::Cubic);
+        assert!(validate_query(&["cog", "tiles", "WebMercatorQuad", "0", "0", "0.png"], &pq_rp).is_ok());
 
         // HTTP status mapping for upstream 404, local NotFound, and invalid TIFF
         let r404 = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::HttpStatus {
