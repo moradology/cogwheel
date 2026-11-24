@@ -18,6 +18,19 @@ pub struct PgStacConfig {
     pub max_connections: usize,
     /// How long a request waits for a free connection before failing.
     pub acquire_timeout: Duration,
+    /// Whether pictures list their items with the lean lookup (`COGZILLA_PGSTAC_LEAN`).
+    pub lean: LeanMode,
+}
+
+/// When the lean item lookup is used in place of pgSTAC's `geojsonsearch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeanMode {
+    /// On the pgSTAC versions it was checked against.
+    #[default]
+    Auto,
+    /// On every version. A request it cannot answer still goes to `geojsonsearch`.
+    On,
+    Off,
 }
 
 impl std::fmt::Debug for PgStacConfig {
@@ -96,7 +109,12 @@ impl PgStacConfig {
         {
             return Err(PgStacError::Config("invalid PGSTAC_SEARCH_PATH".into()));
         }
-        pg.options(format!("-c search_path={}", schemas.replace(' ', "")));
+        // No parallel workers: every query here is an index lookup of a few rows to a few
+        // thousand, and starting workers costs more than such a query takes.
+        pg.options(format!(
+            "-c search_path={} -c max_parallel_workers_per_gather=0",
+            schemas.replace(' ', "")
+        ));
         if pg.get_application_name().is_none() {
             pg.application_name("cogzilla");
         }
@@ -112,6 +130,12 @@ impl PgStacConfig {
             verify,
             max_connections,
             acquire_timeout: Duration::from_secs(10),
+            lean: match env_nonempty(get, "COGZILLA_PGSTAC_LEAN").map(|v| v.to_ascii_lowercase()).as_deref() {
+                None | Some("auto") => LeanMode::Auto,
+                Some("on" | "1" | "true" | "yes") => LeanMode::On,
+                Some("off" | "0" | "false" | "no") => LeanMode::Off,
+                Some(_) => return Err(PgStacError::Config("COGZILLA_PGSTAC_LEAN should be auto, on or off".into())),
+            },
         })
     }
 
@@ -180,7 +204,10 @@ mod tests {
         assert_eq!(cfg.pg.get_ports(), &[5439]);
         assert_eq!(cfg.pg.get_user(), Some("reader"));
         assert_eq!(cfg.pg.get_dbname(), Some("postgis"));
-        assert_eq!(cfg.pg.get_options(), Some("-c search_path=pgstac,public"));
+        assert_eq!(
+            cfg.pg.get_options(),
+            Some("-c search_path=pgstac,public -c max_parallel_workers_per_gather=0")
+        );
         assert_eq!(cfg.max_connections, 4);
         assert_eq!(cfg.verify, TlsVerify::None);
     }

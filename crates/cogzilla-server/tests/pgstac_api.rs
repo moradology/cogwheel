@@ -11,11 +11,11 @@
 //!
 //! They read no rasters. They leave two collections (`cogzilla-test-collection`, empty, and
 //! `cogzilla-test-items`, with one item whose assets do not exist) and a few rows in
-//! `pgstac.searches`.
+//! `pgstac.searches`. The lean lookup's test makes and removes a collection of its own.
 
 use std::sync::Arc;
 
-use cogzilla_pgstac::{PgStac, PgStacConfig};
+use cogzilla_pgstac::{LeanMode, PgStac, PgStacConfig};
 use cogzilla_server::{TileEngine, serve_listener};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -614,4 +614,142 @@ async fn item_routes_match_titiler_pgstac_shapes() {
     assert!(body_json(nope).await["detail"].is_string());
     let bare = client.get(format!("{base}/collections/{cid}/items/{iid}")).send().await.unwrap();
     assert_eq!(bare.status().as_u16(), 404);
+}
+
+/// The lean lookup against `geojsonsearch` on four items made for the purpose: two halves
+/// of a box, a sliver between sample points, and one item under everything.
+#[tokio::test]
+async fn lean_lookup_lists_the_items_a_picture_samples() {
+    let Ok(url) = std::env::var("COGZILLA_TEST_DATABASE_URL") else {
+        eprintln!("COGZILLA_TEST_DATABASE_URL not set; skipping lean lookup test");
+        return;
+    };
+    // The same items twice: in a collection with a partition per month, so the walk crosses
+    // chunks, and in one left as pgSTAC makes it, a single partition whose chunk runs
+    // from minus infinity to infinity.
+    let cid = "cogzilla-test-lean";
+    let flat = "cogzilla-test-lean-flat";
+    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    for id in [cid, flat] {
+        let collection = json!({
+            "id": id, "type": "Collection", "stac_version": "1.0.0",
+            "description": "cogzilla lean lookup test", "license": "proprietary", "links": [],
+            "extent": { "spatial": { "bbox": [[-1.0, -1.0, 11.0, 11.0]] }, "temporal": { "interval": [[null, null]] } }
+        });
+        db.execute("SELECT pgstac.delete_collection($1)", &[&id]).await.ok();
+        db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()]).await.unwrap();
+    }
+    db.execute("UPDATE pgstac.collections SET partition_trunc = 'month' WHERE id = $1", &[&cid]).await.unwrap();
+    let item = |cid: &str, id: &str, day: &str, [w, s, e, n]: [f64; 4], assets: Value| {
+        json!({
+            "type": "Feature", "stac_version": "1.0.0", "id": id, "collection": cid,
+            "bbox": [w, s, e, n],
+            "geometry": { "type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]] },
+            "properties": { "datetime": format!("{day}T00:00:00Z") },
+            "links": [], "assets": assets
+        })
+    };
+    let visual = |name: &str| json!({ "visual": { "href": format!("https://example.invalid/lean/{name}.tif") } });
+    for id in [cid, flat] {
+        for doc in [
+            item(id, "lean-a", "2024-06-05", [-1.0, -1.0, 5.0, 11.0], visual("a")),
+            // With 50 sample columns over ten degrees the samples sit at 0.1, 0.3, ...: this
+            // strip holds none of them, and pgSTAC keeps it for its area.
+            item(id, "lean-b", "2024-06-04", [5.12, 0.0, 5.28, 10.0], visual("b")),
+            item(id, "lean-c", "2024-05-20", [5.0, -1.0, 11.0, 11.0], visual("c")),
+            item(id, "lean-d", "2024-04-01", [-1.0, -1.0, 11.0, 11.0], json!({ "other": { "href": "https://example.invalid/lean/d.tif" } })),
+        ] {
+            db.execute("SELECT pgstac.upsert_item($1::text::jsonb)", &[&doc.to_string()]).await.unwrap();
+        }
+    }
+
+    let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+    let mut config = PgStacConfig::from_connection_string(&url).unwrap();
+    config.lean = LeanMode::On;
+    assert!(engine.set_pgstac(Arc::new(PgStac::new(config).unwrap())));
+    let base = start(engine).await;
+    let client = reqwest::Client::new();
+    let ids = |v: &Value| -> Vec<String> {
+        v.as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
+    };
+    let boxed = format!("{base}/collections/{cid}/bbox/0,0,10,10/assets");
+
+    // pgSTAC's own list keeps the sliver; the lean list for a 10 by 10 picture does not.
+    let reference = get_json(&client, boxed.clone()).await;
+    assert_eq!(ids(&reference), ["lean-a", "lean-b", "lean-c"]);
+    assert!(reference[0]["bbox"].is_array());
+    let lean = get_json(&client, format!("{boxed}?item_lookup=lean&width=10&height=10&assets=visual")).await;
+    assert_eq!(ids(&lean), ["lean-a", "lean-c"]);
+    assert_eq!(
+        lean[1],
+        json!({ "id": "lean-c", "collection": cid, "assets": { "visual": { "href": "https://example.invalid/lean/c.tif" } } })
+    );
+    // A picture with samples close enough together to land in the sliver keeps it.
+    let fine = get_json(&client, format!("{boxed}?item_lookup=lean&width=100&height=100")).await;
+    assert_eq!(ids(&fine), ["lean-a", "lean-b", "lean-c"]);
+    // Without skipping, everything under the box is listed until it is full.
+    let all = get_json(&client, format!("{boxed}?item_lookup=lean&width=10&height=10&skipcovered=false")).await;
+    assert_eq!(ids(&all), ["lean-a", "lean-b", "lean-c"]);
+    let every = get_json(&client, format!("{boxed}?item_lookup=lean&width=10&height=10&skipcovered=false&exitwhenfull=false")).await;
+    assert_eq!(ids(&every), ["lean-a", "lean-b", "lean-c", "lean-d"]);
+    let one = get_json(&client, format!("{boxed}?item_lookup=lean&width=10&height=10&items_limit=1")).await;
+    assert_eq!(ids(&one), ["lean-a"]);
+    // An item kept that lacks an asset asked for: the lean lookup stands aside, and the
+    // answer is pgSTAC's, whole items and all.
+    let aside = get_json(&client, format!("{boxed}?item_lookup=lean&width=10&height=10&assets=other")).await;
+    assert_eq!(ids(&aside), ["lean-a", "lean-b", "lean-c"]);
+    assert!(aside[0]["bbox"].is_array());
+
+    // The collection in one partition answers the same.
+    let flat_box = format!("{base}/collections/{flat}/bbox/0,0,10,10/assets");
+    assert_eq!(ids(&get_json(&client, flat_box.clone()).await), ["lean-a", "lean-b", "lean-c"]);
+    let flat_lean = get_json(&client, format!("{flat_box}?item_lookup=lean&width=10&height=10&assets=visual")).await;
+    assert_eq!(ids(&flat_lean), ["lean-a", "lean-c"]);
+    assert_eq!(flat_lean[0]["assets"]["visual"]["href"], "https://example.invalid/lean/a.tif");
+    let flat_point = get_json(&client, format!("{base}/collections/{flat}/point/2,2/assets?item_lookup=lean")).await;
+    assert_eq!(ids(&flat_point), ["lean-a", "lean-d"]);
+    // An odd number of rows puts samples on the line through the middle of the box, and
+    // footprints that meet there still fill it: two halves, top and bottom.
+    for (name, day, bounds) in [("lean-n", "2024-07-02", [-1.0, 5.0, 11.0, 11.0]), ("lean-s", "2024-07-01", [-1.0, -1.0, 11.0, 5.0])] {
+        let doc = item(flat, name, day, bounds, visual(name));
+        db.execute("SELECT pgstac.upsert_item($1::text::jsonb)", &[&doc.to_string()]).await.unwrap();
+    }
+    let halves = get_json(&client, format!("{flat_box}?item_lookup=lean&width=9&height=9")).await;
+    assert_eq!(ids(&halves), ["lean-n", "lean-s"]);
+
+    // A point has no area to cover: every item under it, newest first.
+    let point = get_json(&client, format!("{base}/collections/{cid}/point/2,2/assets?item_lookup=lean")).await;
+    assert_eq!(ids(&point), ["lean-a", "lean-d"]);
+    let reference_point = get_json(&client, format!("{base}/collections/{cid}/point/2,2/assets")).await;
+    assert_eq!(ids(&reference_point), ["lean-a", "lean-d"]);
+
+    // A search that does not sort by time is one query with no chunks.
+    for (direction, expect) in [("asc", vec!["lean-a", "lean-c"]), ("desc", vec!["lean-d"])] {
+        let body = json!({ "collections": [cid], "sortby": [{ "field": "id", "direction": direction }] });
+        let registered = body_json(post_json(&client, format!("{base}/searches/register"), &body).await).await;
+        let sid = registered["id"].as_str().unwrap();
+        let url = format!("{base}/searches/{sid}/bbox/0,0,10,10/assets");
+        assert_eq!(ids(&get_json(&client, format!("{url}?item_lookup=lean&width=10&height=10")).await), expect, "{direction}");
+        // pgSTAC agrees, but for the sliver.
+        let theirs = ids(&get_json(&client, url).await);
+        assert_eq!(theirs.iter().filter(|i| *i != "lean-b").collect::<Vec<_>>(), expect, "{direction}");
+    }
+
+    // A tile, sampled on the tile's own rows.
+    let tile = get_json(&client, format!("{base}/collections/{cid}/tiles/WebMercatorQuad/6/32/31/assets?item_lookup=lean")).await;
+    let theirs = get_json(&client, format!("{base}/collections/{cid}/tiles/WebMercatorQuad/6/32/31/assets")).await;
+    assert!(!ids(&tile).is_empty());
+    assert!(ids(&tile).iter().all(|i| ids(&theirs).contains(i)), "{tile} {theirs}");
+
+    let unknown = client.get(format!("{boxed}?item_lookup=nope")).send().await.unwrap();
+    assert_eq!(unknown.status().as_u16(), 400);
+    for path in ["tiles/WebMercatorQuad/6/32/31.png", "bbox/0,0,10,10.png", "point/2,2"] {
+        let resp = client.get(format!("{base}/collections/{cid}/{path}?assets=visual&item_lookup=nope")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+    }
+
+    for id in [cid, flat] {
+        db.execute("SELECT pgstac.delete_collection($1)", &[&id]).await.unwrap();
+    }
 }

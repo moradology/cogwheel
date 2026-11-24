@@ -270,6 +270,14 @@ class Oracle:
             a, b = [i["id"] for i in cz.json()], [i["id"] for i in tt.json()]
             ok = a == b
             note = f"{len(a)} items, same order" if ok else f"item lists differ: {len(a)} vs {len(b)}"
+        elif kind == "part":
+            # The lean lookup's list: titiler-pgstac's, in its order, less what falls between
+            # sample points. It may not be empty where theirs is not, nor hold anything theirs lacks.
+            a, b = [i["id"] for i in cz.json()], [i["id"] for i in tt.json()]
+            rest = iter(b)
+            ok = all(i in rest for i in a) and bool(a) == bool(b)
+            note = (f"{len(a)} of their {len(b)} items, same order" if ok
+                    else f"not a part of their list: {len(a)} vs {len(b)}")
         elif kind == "image":
             ct_cz = cz.headers.get("content-type", "")
             ct_tt = tt.headers.get("content-type", "")
@@ -386,6 +394,17 @@ def main() -> int:
         o.check("items with limits", "ids",
                 f"/searches/{sid}/tiles/WebMercatorQuad/8/{tiles[8].x}/{tiles[8].y}/assets"
                 "?items_limit=3&exitwhenfull=false&skipcovered=false")
+        # The lean lookup, which titiler-pgstac does not have: it ignores the parameter and
+        # answers with geojsonsearch's list, which the lean list has to be a part of.
+        for z, t in tiles.items():
+            o.check(f"lean items for a z{z} tile", "part",
+                    f"/searches/{sid}/tiles/WebMercatorQuad/{z}/{t.x}/{t.y}/assets?item_lookup=lean&assets=visual")
+        o.check("lean items with a filter", "part",
+                f"/searches/{sid_meta}/tiles/WebMercatorQuad/10/{tiles[10].x}/{tiles[10].y}/assets?item_lookup=lean")
+        o.check("lean items with limits", "ids",
+                f"/searches/{sid}/tiles/WebMercatorQuad/8/{tiles[8].x}/{tiles[8].y}/assets"
+                "?items_limit=3&exitwhenfull=false&skipcovered=false&item_lookup=lean")
+        o.check("lean items outside the data", "json", f"/searches/{sid}/tiles/WebMercatorQuad/10/100/100/assets?item_lookup=lean")
         o.check("items outside the data", "json", f"/searches/{sid}/tiles/WebMercatorQuad/10/100/100/assets")
         o.check("items for an unknown search", "json", "/searches/deadbeef/tiles/WebMercatorQuad/10/100/100/assets")
 
@@ -436,6 +455,12 @@ def main() -> int:
         o.check("items at a point", "ids", f"/searches/{sid}/point/{lon:.4f},{lat:.4f}/assets")
         o.check("items at a point with a limit", "ids", f"/searches/{sid}/point/{lon:.4f},{lat:.4f}/assets?items_limit=5")
         o.check("items at a point outside the data", "json", f"/searches/{sid}/point/-100,10/assets")
+        o.check("lean items in a bbox", "part", f"/searches/{sid}/bbox/{box}/assets?item_lookup=lean&max_size=256")
+        o.check("lean items in a bbox, every one", "ids",
+                f"/searches/{sid}/bbox/{box}/assets?items_limit=7&skipcovered=false&exitwhenfull=false&item_lookup=lean")
+        o.check("lean items at a point", "ids", f"/searches/{sid}/point/{lon:.4f},{lat:.4f}/assets?item_lookup=lean")
+        o.check("lean items at a point with a limit", "ids",
+                f"/searches/{sid}/point/{lon:.4f},{lat:.4f}/assets?items_limit=5&item_lookup=lean")
         o.check("items at a point for an unknown search", "json", "/searches/deadbeef/point/1,2/assets")
 
         print("collection")
