@@ -393,6 +393,33 @@ impl<'a> BandSource<'a> {
         None
     }
 
+    /// Locate a single in-bounds pixel `(col, row)` in the block grid, returning `(bidx, pidx)`.
+    /// Used by aligned multi-band nearest-neighbor fast paths to compute the tile lookup once for
+    /// all 3 RGB bands.
+    #[inline(always)]
+    pub fn pixel_loc(&self, col: u32, row: u32) -> Option<(usize, usize)> {
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (col >> s, col & self.mask_x),
+            None => (col / self.tile_w, col % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (row >> s, row & self.mask_y),
+            None => (row / self.tile_h, row % self.tile_h),
+        };
+        let gx = tx.wrapping_sub(self.tx0);
+        let gy = ty.wrapping_sub(self.ty0);
+        if gx < self.grid_w && gy < self.grid_h {
+            let bidx = (gy * self.grid_w + gx) as usize;
+            if let Some(blk) = unsafe { *self.blocks.get_unchecked(bidx) } {
+                if ly < blk.height && lx < blk.width {
+                    let pidx = (ly as usize) * (self.tile_w as usize) + (lx as usize);
+                    return Some((bidx, pidx));
+                }
+            }
+        }
+        None
+    }
+
     /// Fast pointer to the top-left `(x0 - 1, y0 - 1)` of a 4×4 Catmull-Rom cubic neighborhood
     /// when all 16 pixels live strictly inside a single clean (`no_nodata`) `f32` block.
     #[inline(always)]
