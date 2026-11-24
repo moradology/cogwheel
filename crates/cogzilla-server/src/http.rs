@@ -1155,7 +1155,8 @@ where
                 Ok((Bytes::from(tj), "application/json"))
             }
             .await,
-            ["mosaicjson", "tiles", _, zs, xs, ys] | ["mosaicjson", "tiles", zs, xs, ys] => {
+            ["mosaicjson", "tiles", "WebMercatorQuad", zs, xs, ys]
+            | ["mosaicjson", "tiles", zs, xs, ys] => {
                 let cache_key = format!("{path}?{raw_query}");
                 engine
                     .tile_cache
@@ -1209,7 +1210,8 @@ where
     // ------------------------------------------------------------------------
     if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(1) == Some(&"tiles") {
         let coords = match segs.as_slice() {
-            ["mosaic", "tiles", _, zs, xs, ys] | ["mosaic", "tiles", zs, xs, ys] => (
+            ["mosaic", "tiles", "WebMercatorQuad", zs, xs, ys]
+            | ["mosaic", "tiles", zs, xs, ys] => (
                 zs.parse::<u8>().ok(),
                 xs.parse::<u32>().ok(),
                 parse_y_scale_ext(ys),
@@ -1250,7 +1252,8 @@ where
     if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(2) == Some(&"tiles") {
         let cat_name = segs[1];
         let coords = match segs.as_slice() {
-            ["mosaic", _, "tiles", _, zs, xs, ys] | ["mosaic", _, "tiles", zs, xs, ys] => (
+            ["mosaic", _, "tiles", "WebMercatorQuad", zs, xs, ys]
+            | ["mosaic", _, "tiles", zs, xs, ys] => (
                 zs.parse::<u8>().ok(),
                 xs.parse::<u32>().ok(),
                 parse_y_scale_ext(ys),

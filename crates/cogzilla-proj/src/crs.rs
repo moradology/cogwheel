@@ -294,20 +294,34 @@ impl CrsModel {
     }
 
     /// Estimate the target pixel resolution `(rx, ry)` in source CRS units at the center of an XYZ tile,
-    /// used to select the optimal COG overview IFD.
+    /// used to select the optimal COG overview IFD. Falls back to interior quadrant probes if the
+    /// tile center falls outside the projection domain (e.g. UTM at low zoom).
     pub fn target_resolution_for_tile(&self, tile: TileCoord, tile_size: u32) -> (f64, f64) {
         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
-        let cx = 0.5 * (min_x + max_x);
-        let cy = 0.5 * (min_y + max_y);
         let dx = (max_x - min_x) / (tile_size as f64);
         let dy = (max_y - min_y) / (tile_size as f64);
 
-        let (x0, y0) = self.from_3857(cx, cy);
-        let (xx, yx) = self.from_3857(cx + dx, cy);
-        let (xy, yy) = self.from_3857(cx, cy - dy);
+        let probe = |fx: f64, fy: f64| -> (f64, f64) {
+            let cx = min_x + fx * (max_x - min_x);
+            let cy = min_y + fy * (max_y - min_y);
+            let (x0, y0) = self.from_3857(cx, cy);
+            let (xx, yx) = self.from_3857(cx + dx, cy);
+            let (xy, yy) = self.from_3857(cx, cy - dy);
+            let rx = ((xx - x0).powi(2) + (yx - y0).powi(2)).sqrt();
+            let ry = ((xy - x0).powi(2) + (yy - y0).powi(2)).sqrt();
+            (rx, ry)
+        };
 
-        let rx = ((xx - x0).powi(2) + (yx - y0).powi(2)).sqrt();
-        let ry = ((xy - x0).powi(2) + (yy - y0).powi(2)).sqrt();
+        let (rx, ry) = probe(0.5, 0.5);
+        if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+            return (rx, ry);
+        }
+        for &(fx, fy) in &[(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            let (rx, ry) = probe(fx, fy);
+            if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+                return (rx, ry);
+            }
+        }
         (rx, ry)
     }
 
@@ -328,9 +342,10 @@ impl CrsModel {
         }
     }
 
-    /// Inverse map a point `(x, y)` in this CRS back to WGS84 `(lon_deg, lat_deg)`.
+    /// Inverse map a point `(x, y)` in this CRS back to WGS84 `(lon_deg, lat_deg)`,
+    /// normalizing longitude into `[-180, 180]`.
     pub fn to_lonlat_deg(&self, x: f64, y: f64) -> (f64, f64) {
-        match self {
+        let (lon, lat) = match self {
             Self::Epsg3857 => mercator_to_lonlat_deg(x, y),
             Self::Geographic => (x, y),
             Self::TransverseMercator(tm) => {
@@ -357,11 +372,17 @@ impl CrsModel {
                 let (lon, lat) = p.inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
-        }
+        };
+        let norm_lon = if lon.is_finite() && (lon < -180.0 || lon > 180.0) {
+            ((lon + 180.0).rem_euclid(360.0)) - 180.0
+        } else {
+            lon
+        };
+        (norm_lon, lat)
     }
 
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
-    /// 32 points along the 4 edges of the raster.
+    /// 32 points along the 4 edges of the raster plus checking whether either pole lies inside.
     pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
         let mut min_lon = f64::INFINITY;
         let mut min_lat = f64::INFINITY;
@@ -389,6 +410,26 @@ impl CrsModel {
             visit(0.0, t * h);
             visit(w, t * h);
         }
+
+        // Check whether North or South Pole lies inside the raster footprint (polar CRSes)
+        if let Some(crs_to_pixel) = pixel_to_crs.invert() {
+            for &pole_lat in &[90.0_f64, -90.0_f64] {
+                let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
+                if px_crs.is_finite() && py_crs.is_finite() {
+                    let (col, row) = crs_to_pixel.forward(px_crs, py_crs);
+                    if col >= 0.0 && col <= w && row >= 0.0 && row <= h {
+                        min_lon = -180.0;
+                        max_lon = 180.0;
+                        if pole_lat > 0.0 {
+                            max_lat = 90.0;
+                        } else {
+                            min_lat = -90.0;
+                        }
+                    }
+                }
+            }
+        }
+
         [min_lon, min_lat, max_lon, max_lat]
     }
 

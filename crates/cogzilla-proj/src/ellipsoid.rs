@@ -221,6 +221,9 @@ pub struct AlbersEqualArea {
 impl AlbersEqualArea {
     #[inline(always)]
     fn q_fn(e: f64, e2: f64, sin_lat: f64) -> f64 {
+        if e < 1e-12 {
+            return 2.0 * sin_lat;
+        }
         let es = e * sin_lat;
         (1.0 - e2) * (sin_lat / (1.0 - es * es) - (1.0 / (2.0 * e)) * ((1.0 - es) / (1.0 + es)).ln())
     }
@@ -251,11 +254,12 @@ impl AlbersEqualArea {
         let q2 = Self::q_fn(ellip.e, ellip.e2, lat2.sin());
         let q0 = Self::q_fn(ellip.e, ellip.e2, lat0.sin());
 
-        let n = if (lat1 - lat2).abs() < 1e-10 {
+        let raw_n = if (lat1 - lat2).abs() < 1e-10 {
             lat1.sin()
         } else {
             (m1 * m1 - m2 * m2) / (q2 - q1)
         };
+        let n = if raw_n.abs() < 1e-10 { 1e-10 } else { raw_n };
         let c = m1 * m1 + n * q1;
         let rho0 = ellip.a * (c - n * q0).max(0.0).sqrt() / n;
 
