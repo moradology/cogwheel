@@ -1,6 +1,6 @@
 # API
 
-`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet. The first of titiler-pgstac's routes, which do need Postgres, are described under [pgSTAC](#pgstac).
+`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet. titiler-pgstac's search and collection mosaic routes, which do need Postgres, are described under [pgSTAC](#pgstac).
 
 **`/cog/*`** (TiTiler's `TilerFactory`)
 
@@ -24,19 +24,26 @@
 
 ## pgSTAC
 
-With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 51 requests to both servers on one database and compares status codes, JSON bodies, item lists and rendered tiles; all 51 agreed when last run, at v0.5.19 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2. Agreement on tiles means the same valid pixels and a PSNR of at least 25 dB; the 16 tile pairs had a median of 37.5 dB (30.1 to 43.4).
+With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search and collection mosaic routes of titiler-pgstac 3.2. The items behind each tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, so both servers build a tile from the same items in the same order. `benches/pgstac_diff_oracle.py` sends 101 requests to both servers on one database and compares status codes, JSON bodies, item lists and rendered tiles; all 101 agreed when last run, at v0.5.19 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2. Agreement on tiles means the same valid pixels and a PSNR of at least 25 dB; the 20 tile pairs had a median of 37.5 dB (30.1 to 43.4).
 
 - `POST /searches/register` with a STAC search body (`collections`, `ids`, `bbox`, `intersects`, `datetime`, `query`, `filter`, `sortby`) and optional `metadata`. The returned `id` is pgSTAC's hash, the same one titiler-pgstac returns for the same body.
 - `GET /searches/` and `/searches/list` (with `limit`, `offset`, and `sortby` on `lastused` or `usecount`), `GET /searches/{id}/info`.
 - `GET /searches/{id}/{tms}/tilejson.json` and `/searches/{id}/{tms}/map.html`.
 - `GET /searches/{id}/tiles/{tms}/{z}/{x}/{y}[.{png|jpg|webp|npy}]` and `GET /searches/{id}/tiles/{tms}/{z}/{x}/{y}/assets`.
+- `GET /searches/{id}/tiles` and `/searches/{id}/tiles/{tms}`: the OGC tileset list and tileset description, with tile limits per zoom computed from the mosaic's bounds.
+- `GET /searches/{id}/bbox/{minx},{miny},{maxx},{maxy}/assets` and `GET /searches/{id}/point/{lon},{lat}/assets`: the items that intersect a box or cover a point, in WGS84, with the same search limits as a tile.
+- `GET /collections/{collection_id}/...`: every search route above except `register` and the listing, for the mosaic of one collection. The search is the collection, narrowed by `ids`, `bbox`, `datetime`, `sortby`, `query` and `filter` (CQL2 JSON, with `filter-lang=cql2-json`) from the query string. It is registered in pgSTAC under the hash titiler-pgstac derives for the same request, with the same metadata: bounds from the `bbox` parameter or the collection's extent, the asset names from `item_assets`, and the collection's [renders](https://github.com/stac-extensions/render) as `defaults`.
+- A mosaic whose metadata has `defaults` gets one extra TileJSON and map link per layer in `info` (and one TileJSON link per layer in the `register` response), with the layer's parameters as the query string. A layer without `assets` gets no link.
 - Tile parameters: `assets` (required, one to three per item), `expression`, `rescale`, `colormap_name`, `resampling`, `reproject`, `color_formula`, `return_mask`, `unscale` (single asset), `tilesize` (256 or 512), and the search limits `scan_limit`, `items_limit`, `time_limit`, `exitwhenfull` and `skipcovered`.
 
 Responses follow titiler-pgstac: errors are JSON `{"detail": ...}`, a missing `assets` is a `422`, a tile no item covers is a `204`, and a tile with no extension is a JPEG when every pixel is valid and a PNG otherwise. Resampling follows TiTiler on these routes: nearest neighbour by default, with `resampling` applied to sources already in Web Mercator and `reproject` to sources that have to be reprojected.
 
 Not there yet, each answered with a `400` or `404` rather than a different picture:
 
-- The rest of the search routes (`point`, `bbox`, `feature`, `statistics`, WMTS, `/tiles` listings) and the `/collections/{id}` and `/collections/{id}/items/{id}` families.
+- Point values, `bbox` and `feature` images, `statistics` and WMTS on the search and collection routes, and the `/collections/{id}/items/{id}` family.
+- On collection routes, a `filter` in CQL2 text (titiler-pgstac's default `filter-lang`): pass CQL2 JSON.
+- `coord_crs` other than `epsg:4326` on the `bbox` and `point` routes, and `f=html` on the tileset routes.
+- In the tileset list, the twelve tile matrix sets other than `WebMercatorQuad` that titiler-pgstac also lists.
 - `pixel_selection` other than `first`, per-asset options (`assets=name|bidx=...`), `asset_as_band`, `buffer`, `nodata`, a JSON `colormap`, more than three assets, and assets of one item on different grids.
 - Tile matrix sets other than `WebMercatorQuad`.
 

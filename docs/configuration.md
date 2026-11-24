@@ -51,7 +51,7 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 
 ### pgSTAC database
 
-The `/searches` routes need a [pgSTAC](https://github.com/stac-utils/pgstac) database. They are off, and answer `503`, until one is configured with the same variables titiler-pgstac 2 and later read. No connection is opened until the first request that needs one, so a database that is down does not stop the server from starting or from serving `/cog` and `/stac`.
+The `/searches` and `/collections` routes need a [pgSTAC](https://github.com/stac-utils/pgstac) database. They are off, and answer `503`, until one is configured with the same variables titiler-pgstac 2 and later read. No connection is opened until the first request that needs one, so a database that is down does not stop the server from starting or from serving `/cog` and `/stac`.
 
 | Variable | Purpose |
 | :--- | :--- |
@@ -63,6 +63,6 @@ The `/searches` routes need a [pgSTAC](https://github.com/stac-utils/pgstac) dat
 | `PGSTAC_SEARCH_PATH` | Schemas searched for pgSTAC's functions and tables. Default `pgstac,public`. |
 | `TITILER_PGSTAC_CACHE_TTL`, `TITILER_PGSTAC_CACHE_MAXSIZE`, `TITILER_PGSTAC_CACHE_DISABLE` | The per-process cache of item lists and search lookups, with titiler-pgstac's names and defaults (300 seconds, 512 entries, enabled). |
 
-The database role needs to read the `pgstac` schema and execute its functions. `POST /searches/register` stores a row in `pgstac.searches`, and pgSTAC's own search function updates that table's use counters on every tile, so a role without write access to it needs pgSTAC's read-only mode switched on.
+The database role needs to read the `pgstac` schema and execute its functions. `POST /searches/register` and the `/collections` routes store a row in `pgstac.searches`, and pgSTAC's own search function updates that table's use counters on every tile, so a role without write access to it needs pgSTAC's read-only mode switched on.
 
 Operational endpoints: `GET /` for the landing page with demo maps, `GET /healthz` for liveness, `GET /stats` for JSON counters, `GET /metrics` for Prometheus exposition, `POST /mosaic/register` for dynamic catalog / STAC-API search registration, and `GET /docs` with `GET /openapi.json` for the route list.

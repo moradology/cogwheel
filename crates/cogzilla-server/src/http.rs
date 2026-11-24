@@ -1014,7 +1014,7 @@ where
     }
 
     if method == Method::GET && path == "/openapi.json" {
-        let spec = serde_json::json!({
+        let mut spec = serde_json::json!({
             "openapi": "3.1.0",
             "info": {
                 "title": "cogzilla",
@@ -1044,13 +1044,6 @@ where
                 "/stac/statistics": { "get": { "summary": "Merged STAC statistics" }, "post": { "summary": "Polygon-clipped STAC statistics" } },
                 "/stac/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render STAC multi-asset tile" } },
                 "/stac/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "STAC TileJSON 3.0" } },
-                "/searches/register": { "post": { "summary": "Register a pgSTAC search" } },
-                "/searches/": { "get": { "summary": "List registered pgSTAC searches" } },
-                "/searches/{search_id}/info": { "get": { "summary": "pgSTAC search metadata" } },
-                "/searches/{search_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC search TileJSON 3.0" } },
-                "/searches/{search_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC search map viewer" } },
-                "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC search mosaic tile" } },
-                "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets": { "get": { "summary": "Items covering a tile" } },
                 "/stac/point/{lon},{lat}": { "get": { "summary": "Sample STAC asset values at point" } },
                 "/stac/preview/{width}x{height}.{format}": { "get": { "summary": "Render STAC preview" } },
                 "/colorMaps": { "get": { "summary": "List all 211 rio-tiler colormaps" } },
@@ -1058,9 +1051,13 @@ where
                 "/tileMatrixSets": { "get": { "summary": "List OGC TileMatrixSets" } },
                 "/tileMatrixSets/{tileMatrixSetId}": { "get": { "summary": "Get OGC TileMatrixSet 2.0 definition" } }
             }
-        })
-        .to_string();
-        return Ok(plain_resp(StatusCode::OK, Bytes::from(spec), "application/json"));
+        });
+        if let (Some(paths), serde_json::Value::Object(extra)) =
+            (spec["paths"].as_object_mut(), pgstac::openapi_paths())
+        {
+            paths.extend(extra);
+        }
+        return Ok(plain_resp(StatusCode::OK, Bytes::from(spec.to_string()), "application/json"));
     }
 
     if method == Method::GET && path == "/docs" {
@@ -1147,8 +1144,8 @@ where
         return Ok(plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg), "text/plain"));
     }
 
-    // titiler-pgstac's routes: /searches/...
-    if segs.first() == Some(&"searches") {
+    // titiler-pgstac's routes: /searches/... and /collections/...
+    if matches!(segs.first(), Some(&("searches" | "collections"))) {
         let ctx = pgstac::Ctx {
             engine: &engine,
             host: &host,

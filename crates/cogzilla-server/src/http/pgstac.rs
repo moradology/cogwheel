@@ -1,4 +1,4 @@
-//! titiler-pgstac's `/searches` routes, on the compatibility path.
+//! titiler-pgstac's `/searches` and `/collections/{id}` mosaic routes, on the compatibility path.
 //!
 //! The items behind a tile come from pgSTAC's own `geojsonsearch`, called with the
 //! arguments titiler-pgstac passes, and are rendered by the existing mosaic engine.
@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use cogzilla_kernel::{OutputFormat, ResampleMode};
-use cogzilla_pgstac::{MosaicItem, PgStac, PgStacError, SearchLimits, SearchOrder, SearchRecord};
+use cogzilla_pgstac::{
+    MosaicItem, PgStac, PgStacError, SearchLimits, SearchOrder, SearchRecord, jsonb_key_order,
+};
 use cogzilla_proj::{CrsModel, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::Full;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
@@ -20,8 +22,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
 use super::{
-    ParsedQuery, build_tile_request, parse_ext_format, parse_y_scale_ext, percent_decode,
-    read_limited_body, to_http_response_cached,
+    ParsedQuery, build_tile_request, parse_bbox4, parse_ext_format, parse_y_scale_ext,
+    percent_decode, read_limited_body, to_http_response_cached,
 };
 use crate::engine::{EngineError, TileEngine};
 use crate::stac::rewrite_stac_expr;
@@ -215,22 +217,189 @@ fn search_json(rec: &SearchRecord) -> Value {
     Value::Object(out)
 }
 
-fn register_links(host: &str, id: &str) -> Value {
-    json!([
-        { "href": format!("{host}/searches/{id}/info"), "rel": "metadata", "title": "Mosaic metadata" },
-        { "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/tilejson.json"), "rel": "tilejson", "templated": true, "title": "Link for TileJSON (Template URL)" },
-        { "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/map.html"), "rel": "map", "templated": true, "title": "Link for Map viewer (Template URL)" },
-        { "href": format!("{host}/searches/{id}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }
-    ])
+/// Python's `str()` of a JSON value, which is what `urlencode` writes into a link.
+fn py_str(v: &Value) -> String {
+    fn repr(v: &Value) -> String {
+        match v {
+            Value::String(s) => format!("'{s}'"),
+            other => py_str(other),
+        }
+    }
+    match v {
+        Value::Null => "None".into(),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(a) => format!("[{}]", a.iter().map(repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => {
+            let mut keys: Vec<String> = o.keys().cloned().collect();
+            jsonb_key_order(&mut keys);
+            let body: Vec<String> = keys.iter().map(|k| format!("'{k}': {}", repr(&o[k]))).collect();
+            format!("{{{}}}", body.join(", "))
+        }
+    }
 }
 
-fn info_links(host: &str, id: &str) -> Value {
-    json!([
-        { "href": format!("{host}/searches/{id}/info"), "rel": "self", "title": "Mosaic metadata" },
-        { "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/tilejson.json"), "rel": "tilejson", "templated": true, "title": "TileJSON link (Template URL)." },
-        { "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/map.html"), "rel": "map", "templated": true, "title": "Map viewer link (Template URL)." },
-        { "href": format!("{host}/searches/{id}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }
-    ])
+/// Python's `json.dumps` with its default separators, keys in Postgres' jsonb order.
+fn py_json_dumps(v: &Value) -> String {
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(py_json_dumps).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => {
+            let mut keys: Vec<String> = o.keys().cloned().collect();
+            jsonb_key_order(&mut keys);
+            let body: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", Value::String(k.clone()), py_json_dumps(&o[k])))
+                .collect();
+            format!("{{{}}}", body.join(", "))
+        }
+        scalar => scalar.to_string(),
+    }
+}
+
+/// Python truthiness of a JSON value.
+fn py_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// The layers a mosaic's `metadata.defaults` describe, each as a name and the query string
+/// titiler-pgstac puts on the layer's links. A layer without `assets` cannot make a tile
+/// request and gets no link. `adapt` folds `asset_bidx` and `asset_expression` into the
+/// asset names (`name|bidx=1`), as the info routes do.
+fn layer_queries(metadata: &Value, adapt: bool) -> Vec<(String, String)> {
+    let Some(defaults) = metadata.get("defaults").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let as_list = |v: &Value| match v {
+        Value::Array(a) => a.clone(),
+        other => vec![other.clone()],
+    };
+    let mut names: Vec<String> = defaults.keys().cloned().collect();
+    jsonb_key_order(&mut names);
+    let mut out = Vec::new();
+    for name in names {
+        let Some(values) = defaults[&name].as_object() else {
+            continue;
+        };
+        // Python reads the keys in jsonb order, then moves the ones it rewrites to the end.
+        let mut keys: Vec<String> = values.keys().cloned().collect();
+        jsonb_key_order(&mut keys);
+        let mut params: Vec<(String, Value)> =
+            keys.into_iter().map(|k| (k.clone(), values[&k].clone())).collect();
+        for key in ["rescale", "colormap", "assets", "asset_bidx"] {
+            let Some(pos) = params.iter().position(|(k, _)| k == key) else {
+                continue;
+            };
+            let (_, value) = params.remove(pos);
+            if !py_truthy(&value) {
+                continue;
+            }
+            let value = match key {
+                "rescale" => Value::Array(
+                    as_list(&value)
+                        .iter()
+                        .map(|r| match r {
+                            Value::Array(pair) => {
+                                json!(pair.iter().map(py_str).collect::<Vec<_>>().join(","))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+                "colormap" if !value.is_string() => json!(py_json_dumps(&value)),
+                "assets" | "asset_bidx" if value.is_string() => json!([value]),
+                _ => value,
+            };
+            params.push((key.to_string(), value));
+        }
+        let assets: Vec<String> = params
+            .iter()
+            .find(|(k, _)| k == "assets")
+            .map(|(_, v)| as_list(v).iter().map(py_str).collect())
+            .unwrap_or_default();
+        if assets.is_empty() {
+            continue;
+        }
+        if adapt {
+            let mut options: Vec<Vec<String>> = vec![Vec::new(); assets.len()];
+            for (key, label) in [("asset_bidx", "bidx"), ("asset_expression", "expression")] {
+                let Some(pos) = params.iter().position(|(k, _)| k == key) else {
+                    continue;
+                };
+                let (_, value) = params.remove(pos);
+                for entry in as_list(&value) {
+                    let entry = py_str(&entry);
+                    if let Some((asset, opt)) = entry.split_once('|')
+                        && let Some(i) = assets.iter().position(|a| a == asset)
+                    {
+                        options[i].push(format!("{label}={opt}"));
+                    }
+                }
+            }
+            let merged: Vec<Value> = assets
+                .iter()
+                .zip(&options)
+                .map(|(a, o)| if o.is_empty() { json!(a) } else { json!(format!("{a}|{}", o.join("|"))) })
+                .collect();
+            if let Some(slot) = params.iter_mut().find(|(k, _)| k == "assets") {
+                slot.1 = Value::Array(merged);
+            }
+        }
+        let mut qs = Vec::new();
+        for (k, v) in &params {
+            match v {
+                Value::Array(items) => {
+                    qs.extend(items.iter().map(|i| format!("{}={}", quote_plus(k), quote_plus(&py_str(i)))));
+                }
+                other => qs.push(format!("{}={}", quote_plus(k), quote_plus(&py_str(other)))),
+            }
+        }
+        out.push((name, qs.join("&")));
+    }
+    out
+}
+
+fn register_links(host: &str, rec: &SearchRecord) -> Value {
+    let id = &rec.hash;
+    let tilejson = format!("{host}/searches/{id}/{{tileMatrixSetId}}/tilejson.json");
+    let mut links = vec![
+        json!({ "href": format!("{host}/searches/{id}/info"), "rel": "metadata", "title": "Mosaic metadata" }),
+        json!({ "href": tilejson, "rel": "tilejson", "templated": true, "title": "Link for TileJSON (Template URL)" }),
+        json!({ "href": format!("{host}/searches/{id}/{{tileMatrixSetId}}/map.html"), "rel": "map", "templated": true, "title": "Link for Map viewer (Template URL)" }),
+        json!({ "href": format!("{host}/searches/{id}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }),
+    ];
+    for (name, qs) in layer_queries(&rec.metadata, false) {
+        links.push(json!({ "href": format!("{tilejson}?{qs}"), "rel": "tilejson", "templated": true, "title": format!("TileJSON link for `{name}` layer (Template URL).") }));
+    }
+    Value::Array(links)
+}
+
+/// `base` is the mosaic's own path: `/searches/{hash}` or `/collections/{id}`.
+fn info_links(host: &str, base: &str, rec: &SearchRecord) -> Value {
+    let layers = layer_queries(&rec.metadata, true);
+    let tilejson = format!("{host}{base}/{{tileMatrixSetId}}/tilejson.json");
+    let map = format!("{host}{base}/{{tileMatrixSetId}}/map.html");
+    let mut links = vec![
+        json!({ "href": format!("{host}{base}/info"), "rel": "self", "title": "Mosaic metadata" }),
+        json!({ "href": tilejson, "rel": "tilejson", "templated": true, "title": "TileJSON link (Template URL)." }),
+    ];
+    for (name, qs) in &layers {
+        links.push(json!({ "href": format!("{tilejson}?{qs}"), "rel": "tilejson", "templated": true, "title": format!("TileJSON link for `{name}` layer (Template URL).") }));
+    }
+    links.push(json!({ "href": map, "rel": "map", "templated": true, "title": "Map viewer link (Template URL)." }));
+    for (name, qs) in &layers {
+        links.push(json!({ "href": format!("{map}?{qs}"), "rel": "map", "templated": true, "title": format!("Map viewer link for `{name}` layer (Template URL).") }));
+    }
+    links.push(json!({ "href": format!("{host}{base}/WMTSCapabilities.xml"), "rel": "wmts", "title": "WMTS Capabilities link." }));
+    Value::Array(links)
 }
 
 fn list_item_links(host: &str, id: &str) -> Value {
@@ -296,7 +465,7 @@ where
     match pg.register_search(&search, &metadata).await {
         Ok(rec) => json_resp(
             StatusCode::OK,
-            &json!({ "id": rec.hash, "links": register_links(ctx.host, &rec.hash) }),
+            &json!({ "id": rec.hash, "links": register_links(ctx.host, &rec) }),
         ),
         Err(e) => db_error(&e),
     }
@@ -364,6 +533,312 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
     }
 }
 
+/// The pgSTAC routes, as entries for the OpenAPI document's `paths`.
+pub(super) fn openapi_paths() -> Value {
+    json!({
+        "/searches/register": { "post": { "summary": "Register a pgSTAC search" } },
+        "/searches/": { "get": { "summary": "List registered pgSTAC searches" } },
+        "/searches/{search_id}/info": { "get": { "summary": "pgSTAC search metadata" } },
+        "/searches/{search_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC search TileJSON 3.0" } },
+        "/searches/{search_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC search map viewer" } },
+        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC search mosaic tile" } },
+        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets": { "get": { "summary": "Items covering a tile" } },
+        "/searches/{search_id}/tiles": { "get": { "summary": "pgSTAC search tilesets" } },
+        "/searches/{search_id}/tiles/{tileMatrixSetId}": { "get": { "summary": "pgSTAC search tileset description" } },
+        "/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/assets": { "get": { "summary": "Items intersecting a bounding box" } },
+        "/searches/{search_id}/point/{lon},{lat}/assets": { "get": { "summary": "Items covering a point" } },
+        "/collections/{collection_id}/info": { "get": { "summary": "pgSTAC collection mosaic metadata" } },
+        "/collections/{collection_id}/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "pgSTAC collection TileJSON 3.0" } },
+        "/collections/{collection_id}/{tileMatrixSetId}/map.html": { "get": { "summary": "pgSTAC collection map viewer" } },
+        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render pgSTAC collection mosaic tile" } },
+        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets": { "get": { "summary": "Items covering a tile" } },
+        "/collections/{collection_id}/tiles": { "get": { "summary": "pgSTAC collection tilesets" } },
+        "/collections/{collection_id}/tiles/{tileMatrixSetId}": { "get": { "summary": "pgSTAC collection tileset description" } },
+        "/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/assets": { "get": { "summary": "Items intersecting a bounding box" } },
+        "/collections/{collection_id}/point/{lon},{lat}/assets": { "get": { "summary": "Items covering a point" } }
+    })
+}
+
+/// The request's query string, re-encoded the way TiTiler writes it into links.
+fn encoded_query(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// The search behind `/collections/{id}`: the collection, narrowed by the STAC search
+/// parameters in the query string, exactly as titiler-pgstac builds it.
+fn collection_search(
+    id: &str,
+    collection: &Value,
+    pairs: &[(String, String)],
+) -> Result<(Value, Value), Resp> {
+    let mut search = serde_json::Map::new();
+    search.insert("collections".into(), json!([id]));
+    search.insert("filter-lang".into(), json!("cql2-json"));
+    let mut bbox: Option<Vec<f64>> = None;
+    if let Some(v) = query_value(pairs, "ids") {
+        search.insert("ids".into(), json!(v.split(',').collect::<Vec<_>>()));
+    }
+    if let Some(v) = query_value(pairs, "bbox") {
+        let nums: Option<Vec<f64>> = v.split(',').map(|n| n.trim().parse::<f64>().ok()).collect();
+        match nums {
+            Some(n) if n.len() == 4 || n.len() == 6 => {
+                search.insert("bbox".into(), json!(n));
+                bbox = Some(n);
+            }
+            _ => {
+                return Err(invalid_param(
+                    "query",
+                    "bbox",
+                    "Value error, Bounding box must have 4 or 6 numbers",
+                ));
+            }
+        }
+    }
+    if let Some(v) = query_value(pairs, "datetime") {
+        search.insert("datetime".into(), json!(v));
+    }
+    if let Some(v) = query_value(pairs, "sortby") {
+        let fields: Vec<Value> = v
+            .split(',')
+            .filter(|f| !f.is_empty())
+            .map(|f| match f.as_bytes()[0] {
+                b'-' => json!({ "field": &f[1..], "direction": "desc" }),
+                b'+' => json!({ "field": &f[1..], "direction": "asc" }),
+                _ => json!({ "field": f, "direction": "asc" }),
+            })
+            .collect();
+        search.insert("sortby".into(), json!(fields));
+    }
+    if let Some(v) = query_value(pairs, "query") {
+        let parsed: Value = serde_json::from_str(v)
+            .map_err(|_| invalid_param("query", "query", "Input should be valid JSON"))?;
+        search.insert("query".into(), parsed);
+    }
+    if let Some(v) = query_value(pairs, "filter") {
+        // titiler-pgstac defaults to CQL2 text here and converts it; only JSON is taken yet.
+        if query_value(pairs, "filter-lang") != Some("cql2-json") {
+            return Err(detail(
+                StatusCode::BAD_REQUEST,
+                "cql2-text filters are not supported yet: pass the filter as CQL2 JSON with filter-lang=cql2-json",
+            ));
+        }
+        let parsed: Value = serde_json::from_str(v)
+            .map_err(|_| invalid_param("query", "filter", "Input should be valid JSON"))?;
+        search.insert("filter".into(), parsed);
+    }
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("type".into(), json!("mosaic"));
+    metadata.insert("name".into(), json!(format!("Mosaic for '{id}' Collection")));
+    let extent = collection
+        .pointer("/extent/spatial/bbox/0")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>());
+    if let Some(bounds) = bbox.or(extent) {
+        metadata.insert("bounds".into(), json!(bounds));
+    }
+    if let Some(item_assets) = collection.get("item_assets").and_then(Value::as_object) {
+        // The list is hashed with the search, so it has to come out in Postgres' key order.
+        let mut keys: Vec<String> = item_assets.keys().cloned().collect();
+        jsonb_key_order(&mut keys);
+        metadata.insert("assets".into(), json!(keys));
+    }
+    // The STAC render extension: each render becomes a set of default tile parameters,
+    // minus the keys titiler-pgstac does not take.
+    if let Some(renders) = collection.get("renders").and_then(Value::as_object) {
+        let mut defaults = serde_json::Map::new();
+        for (name, render) in renders {
+            let Some(render) = render.as_object() else {
+                continue;
+            };
+            let mut render = render.clone();
+            render.remove("title");
+            render.remove("tilematrixsets");
+            if let Some(zooms) = render.remove("minmax_zoom")
+                && let Some([min, max]) = zooms.as_array().map(Vec::as_slice)
+            {
+                render.insert("minzoom".into(), min.clone());
+                render.insert("maxzoom".into(), max.clone());
+            }
+            defaults.insert(name.clone(), Value::Object(render));
+        }
+        metadata.insert("defaults".into(), Value::Object(defaults));
+    }
+    Ok((Value::Object(search), Value::Object(metadata)))
+}
+
+async fn collection_mosaic(
+    pg: &PgStac,
+    id: &str,
+    pairs: &[(String, String)],
+) -> Result<Arc<SearchRecord>, Resp> {
+    // One request always derives the same search, so its registration is remembered under
+    // the parameters that shape it.
+    let narrowing: Vec<String> = ["ids", "bbox", "datetime", "sortby", "query", "filter", "filter-lang"]
+        .iter()
+        .filter_map(|k| query_value(pairs, k).map(|v| format!("{k}={v}")))
+        .collect();
+    let key = format!("collection|{id}|{}", narrowing.join("&"));
+    let collection = match pg.get_collection_cached(id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Err(detail(StatusCode::NOT_FOUND, format!("CollectionId `{id}` not found")));
+        }
+        Err(e) => return Err(db_error(&e)),
+    };
+    let (search, metadata) = collection_search(id, &collection, pairs)?;
+    pg.register_search_cached(&key, &search, &metadata)
+        .await
+        .map_err(|e| db_error(&e))
+}
+
+/// Zoom range and bounds of a mosaic: the query string, then the search metadata, then
+/// the whole tile matrix set.
+fn mosaic_extent(
+    rec: &SearchRecord,
+    pairs: &[(String, String)],
+) -> Result<(i64, i64, [f64; 4]), Resp> {
+    let zoom = |name: &str| -> Result<Option<i64>, Resp> {
+        match query_value(pairs, name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| invalid_param("query", name, "Input should be a valid integer")),
+        }
+    };
+    let meta_i64 = |k: &str| rec.metadata.get(k).and_then(Value::as_i64);
+    let minzoom = zoom("minzoom")?.or_else(|| meta_i64("minzoom")).unwrap_or(0);
+    let maxzoom = zoom("maxzoom")?.or_else(|| meta_i64("maxzoom")).unwrap_or(24);
+    let bounds: [f64; 4] = rec
+        .metadata
+        .get("bounds")
+        .and_then(Value::as_array)
+        .filter(|a| a.len() == 4)
+        .and_then(|a| Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?, a[3].as_f64()?]))
+        .unwrap_or([-180.0, -85.0511287798066, 180.0, 85.0511287798066]);
+    Ok((minzoom, maxzoom, bounds))
+}
+
+/// Rows and columns of Web Mercator tiles that touch `bounds` at zoom `z`.
+fn tile_limits(z: i64, bounds: [f64; 4]) -> Value {
+    const EPS: f64 = 1e-11;
+    const MAX_LAT: f64 = 85.0511287798066;
+    let n = (1u64 << z) as f64;
+    let last = (1u64 << z) - 1;
+    let col = |lon: f64| (((lon + 180.0) / 360.0 * n).floor().max(0.0) as u64).min(last);
+    let row = |lat: f64| {
+        let lat = lat.clamp(-MAX_LAT, MAX_LAT).to_radians();
+        let y = (1.0 - lat.tan().asinh() / std::f64::consts::PI) / 2.0 * n;
+        (y.floor().max(0.0) as u64).min(last)
+    };
+    json!({
+        "tileMatrix": z.to_string(),
+        "minTileRow": row(bounds[3]),
+        "maxTileRow": row(bounds[1] + EPS),
+        "minTileCol": col(bounds[0]),
+        "maxTileCol": col(bounds[2] - EPS),
+    })
+}
+
+fn bounding_box(bounds: [f64; 4]) -> Value {
+    json!({
+        "lowerLeft": [bounds[0], bounds[1]],
+        "upperRight": [bounds[2], bounds[3]],
+        "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"
+    })
+}
+
+/// `GET {base}/tiles/{tms}`: the OGC tileset description for one tile matrix set.
+fn tileset(ctx: &Ctx<'_>, base: &str, rec: &SearchRecord, tms: &str, pairs: &[(String, String)]) -> Resp {
+    let (minzoom, maxzoom, bounds) = match mosaic_extent(rec, pairs) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let host = ctx.host;
+    let qs = encoded_query(pairs);
+    let with_qs = |url: String| if qs.is_empty() { url } else { format!("{url}?{qs}") };
+    let limits: Vec<Value> = (minzoom.clamp(0, 30)..=maxzoom.clamp(0, 30))
+        .map(|z| tile_limits(z, bounds))
+        .collect();
+    json_resp(
+        StatusCode::OK,
+        &json!({
+            "title": format!("tileset tiled using {tms} TileMatrixSet"),
+            "dataType": "map",
+            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857",
+            "links": [
+                { "href": format!("{host}{base}/tiles/{tms}"), "rel": "self", "type": "application/json", "title": format!("Tileset tiled using {tms} TileMatrixSet") },
+                { "href": with_qs(format!("{host}{base}/tiles/{tms}/%7Bz%7D/%7Bx%7D/%7By%7D")), "rel": "tile", "templated": true, "title": "Templated link for retrieving Raster tiles" },
+                { "href": format!("{host}/tileMatrixSets/{tms}"), "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme", "type": "application/json", "title": format!("Definition of '{tms}' tileMatrixSet") },
+                { "href": with_qs(format!("{host}{base}/{tms}/map.html")), "rel": "data", "type": "text/html", "title": format!("Map viewer for '{tms}' tileMatrixSet") }
+            ],
+            "tileMatrixSetLimits": limits,
+            "boundingBox": bounding_box(bounds),
+            "accessConstraints": "unclassified"
+        }),
+    )
+}
+
+/// `GET {base}/tiles`: the tilesets on offer. TiTiler lists thirteen tile matrix sets;
+/// these routes serve Web Mercator only, so that is the one listed.
+fn tilesets(ctx: &Ctx<'_>, base: &str, rec: &SearchRecord, pairs: &[(String, String)]) -> Resp {
+    let (_, _, bounds) = match mosaic_extent(rec, pairs) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let host = ctx.host;
+    let tms = "WebMercatorQuad";
+    let qs = encoded_query(pairs);
+    let with_qs = |url: String| if qs.is_empty() { url } else { format!("{url}?{qs}") };
+    json_resp(
+        StatusCode::OK,
+        &json!({ "tilesets": [{
+            "title": format!("tileset tiled using {tms} TileMatrixSet"),
+            "dataType": "map",
+            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857",
+            "links": [
+                { "href": with_qs(format!("{host}{base}/tiles/{tms}")), "rel": "self", "type": "application/json", "title": format!("Tileset tiled using {tms} TileMatrixSet") },
+                { "href": with_qs(format!("{host}{base}/tiles/{tms}/%7Bz%7D/%7Bx%7D/%7By%7D")), "rel": "tile", "title": "Templated link for retrieving Raster tiles" },
+                { "href": format!("{host}/tileMatrixSets/{tms}"), "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme", "type": "application/json", "title": format!("Definition of '{tms}' tileMatrixSet") }
+            ],
+            "boundingBox": bounding_box(bounds),
+            "accessConstraints": "unclassified"
+        }]}),
+    )
+}
+
+/// Only WGS84 coordinates are taken on the bbox and point routes for now.
+fn check_coord_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
+    match query_value(pairs, "coord_crs").map(str::to_ascii_lowercase).as_deref() {
+        None | Some("epsg:4326" | "ogc:crs84") => Ok(()),
+        Some(other) => Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("coord_crs '{other}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
+        )),
+    }
+}
+
+/// `GET {base}/bbox/{minx},{miny},{maxx},{maxy}/assets` and `GET {base}/point/{lon},{lat}/assets`.
+async fn geometry_assets(
+    pg: &PgStac,
+    hash: &str,
+    geometry: Value,
+    limits: SearchLimits,
+) -> Resp {
+    match pg.items_for_geometry(&geometry, hash, limits).await {
+        Ok(items) => json_resp(
+            StatusCode::OK,
+            &Value::Array(items.iter().map(MosaicItem::to_json).collect()),
+        ),
+        Err(e) => db_error(&e),
+    }
+}
+
 /// The tile matrix sets TiTiler registers by default.
 const TITILER_TMS: &[&str] = &[
     "CDB1GlobalGrid",
@@ -397,33 +872,20 @@ fn check_tms(tms: &str) -> Result<(), Resp> {
     }
 }
 
-fn tilejson(ctx: &Ctx<'_>, rec: &SearchRecord, tms: &str, pairs: &[(String, String)]) -> Resp {
+fn tilejson(
+    ctx: &Ctx<'_>,
+    base: &str,
+    rec: &SearchRecord,
+    tms: &str,
+    pairs: &[(String, String)],
+) -> Resp {
     if !pairs.iter().any(|(k, _)| k == "assets") {
         return missing_query_param("assets");
     }
-    let zoom = |name: &str| -> Result<Option<i64>, Resp> {
-        match query_value(pairs, name) {
-            None => Ok(None),
-            Some(v) => v
-                .parse::<i64>()
-                .map(Some)
-                .map_err(|_| invalid_param("query", name, "Input should be a valid integer")),
-        }
+    let (minzoom, maxzoom, bounds) = match mosaic_extent(rec, pairs) {
+        Ok(e) => e,
+        Err(r) => return r,
     };
-    let (minzoom_q, maxzoom_q) = match (zoom("minzoom"), zoom("maxzoom")) {
-        (Ok(a), Ok(b)) => (a, b),
-        (Err(r), _) | (_, Err(r)) => return r,
-    };
-    let meta_i64 = |k: &str| rec.metadata.get(k).and_then(Value::as_i64);
-    let minzoom = minzoom_q.or_else(|| meta_i64("minzoom")).unwrap_or(0);
-    let maxzoom = maxzoom_q.or_else(|| meta_i64("maxzoom")).unwrap_or(24);
-    let bounds: [f64; 4] = rec
-        .metadata
-        .get("bounds")
-        .and_then(Value::as_array)
-        .filter(|a| a.len() == 4)
-        .and_then(|a| Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?, a[3].as_f64()?]))
-        .unwrap_or([-180.0, -85.0511287798066, 180.0, 85.0511287798066]);
 
     // TiTiler drops the parameters that shape the TileJSON itself and pins the tile size.
     let dropped = ["tilematrixsetid", "tile_format", "tile_scale", "minzoom", "maxzoom"];
@@ -440,9 +902,8 @@ fn tilejson(ctx: &Ctx<'_>, rec: &SearchRecord, tms: &str, pairs: &[(String, Stri
         _ => String::new(),
     };
     let tiles = format!(
-        "{}/searches/{}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext}?{}",
+        "{}{base}/tiles/{tms}/{{z}}/{{x}}/{{y}}{ext}?{}",
         ctx.host,
-        rec.hash,
         qs.join("&")
     );
     let mut out = serde_json::Map::new();
@@ -712,31 +1173,62 @@ where
     match segs {
         ["searches", "register"] if *method == Method::POST => register(&ctx, pg, req).await,
         ["searches"] | ["searches", ""] | ["searches", "list"] if get => list(&ctx, pg, &pairs).await,
-        ["searches", id, "info"] if get => match find_search(pg, id).await {
-            Ok(rec) => json_resp(
-                StatusCode::OK,
-                &json!({ "search": search_json(&rec), "links": info_links(ctx.host, &rec.hash) }),
-            ),
-            Err(r) => r,
-        },
-        ["searches", id, tms, "tilejson.json"] if get => {
-            if let Err(r) = check_tms(tms) {
+        // The item routes are not served yet.
+        ["collections", _, "items", ..] => not_found(),
+        [family @ ("searches" | "collections"), id, rest @ ..] if get && !rest.is_empty() => {
+            // A tile matrix set in the path is validated before anything is looked up.
+            let tms = match rest {
+                [tms, "tilejson.json" | "map.html"] => Some(*tms),
+                ["tiles", tms, ..] => Some(*tms),
+                _ => None,
+            };
+            if let Some(Err(r)) = tms.map(check_tms) {
                 return r;
             }
-            match find_search(pg, id).await {
-                Ok(rec) => tilejson(&ctx, &rec, tms, &pairs),
-                Err(r) => r,
-            }
+            let found = if *family == "searches" {
+                find_search(pg, id).await
+            } else {
+                collection_mosaic(pg, id, &pairs).await
+            };
+            let rec = match found {
+                Ok(rec) => rec,
+                Err(r) => return r,
+            };
+            let base = format!("/{family}/{id}");
+            mosaic_route(&ctx, pg, &base, &rec, rest, pq, &pairs).await
         }
-        ["searches", id, tms, "map.html"] if get => {
-            if let Err(r) = check_tms(tms) {
-                return r;
+        _ => not_found(),
+    }
+}
+
+/// The routes shared by a registered search and a collection's mosaic.
+async fn mosaic_route(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    base: &str,
+    rec: &SearchRecord,
+    rest: &[&str],
+    pq: ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
+    match rest {
+        ["info"] => {
+            let mut search = search_json(rec);
+            // titiler-pgstac leaves the compiled SQL out of a collection's description.
+            if let (true, Some(obj)) = (base.starts_with("/collections/"), search.as_object_mut()) {
+                obj.remove("_where");
+                obj.remove("orderby");
             }
-            if let Err(r) = find_search(pg, id).await {
-                return r;
-            }
+            json_resp(
+                StatusCode::OK,
+                &json!({ "search": search, "links": info_links(ctx.host, base, rec) }),
+            )
+        }
+        [tms, "tilejson.json"] => tilejson(ctx, base, rec, tms, pairs),
+        [tms, "map.html"] => {
             let tilejson_url = format!(
-                "{}/searches/{id}/{tms}/tilejson.json?{}",
+                "{}{base}/{tms}/tilejson.json?{}",
                 ctx.forwarded_prefix, ctx.raw_query
             );
             let mut resp = Response::new(Full::new(Bytes::from(build_map_html(&tilejson_url))));
@@ -744,38 +1236,67 @@ where
                 .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
             resp
         }
-        ["searches", id, "tiles", tms, zs, xs, ys, "assets"] if get => {
-            if let Err(r) = check_tms(tms) {
-                return r;
-            }
+        ["tiles"] | ["tiles", _] if query_value(pairs, "f") == Some("html") => detail(
+            StatusCode::BAD_REQUEST,
+            "f=html is not supported on tileset routes (use f=json)",
+        ),
+        ["tiles"] => tilesets(ctx, base, rec, pairs),
+        ["tiles", tms] => tileset(ctx, base, rec, tms, pairs),
+        ["tiles", _, zs, xs, ys, "assets"] => {
             let coord = match ys.parse::<u32>() {
                 Ok(y) => parse_zxy(zs, xs, y),
                 Err(_) => Err(detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate")),
             };
-            match (find_search(pg, id).await, coord) {
-                (Err(r), _) | (_, Err(r)) => r,
-                (Ok(_), Ok(None)) => json_resp(StatusCode::OK, &json!([])),
-                (Ok(_), Ok(Some(t))) => tile_assets(pg, id, t, &pairs).await,
+            match coord {
+                Err(r) => r,
+                Ok(None) => json_resp(StatusCode::OK, &json!([])),
+                Ok(Some(t)) => tile_assets(pg, &rec.hash, t, pairs).await,
             }
         }
-        ["searches", id, "tiles", tms, zs, xs, ys] if get => {
-            if let Err(r) = check_tms(tms) {
-                return r;
-            }
+        ["tiles", _, zs, xs, ys] => {
             let Some((y, scale, ext)) = parse_y_scale_ext(ys) else {
                 return detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
             };
             // Without an extension the format is chosen from the rendered pixels.
             let ext = if ys.contains('.') { ext } else { "" };
-            if let Err(r) = find_search(pg, id).await {
-                return r;
-            }
             match parse_zxy(zs, xs, y) {
                 Err(r) => r,
                 Ok(None) if pq.assets.is_empty() => missing_query_param("assets"),
                 Ok(None) => no_content(),
-                Ok(Some(coord)) => tile(&ctx, pg, id, coord, scale, ext, pq, &pairs).await,
+                Ok(Some(coord)) => tile(ctx, pg, &rec.hash, coord, scale, ext, pq, pairs).await,
             }
+        }
+        ["bbox", bbox, "assets"] => {
+            let Some(([w, s, e, n], None)) = parse_bbox4(bbox) else {
+                return not_found();
+            };
+            let limits = match (check_coord_crs(pairs), parse_limits(pairs)) {
+                (Err(r), _) | (_, Err(r)) => return r,
+                (Ok(()), Ok(l)) => l,
+            };
+            let polygon = json!({
+                "type": "Polygon",
+                "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]]
+            });
+            geometry_assets(pg, &rec.hash, polygon, limits).await
+        }
+        ["point", lonlat, "assets"] => {
+            let coords = lonlat
+                .split_once(',')
+                .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)))
+                .filter(|(x, y)| x.is_finite() && y.is_finite());
+            let Some((lon, lat)) = coords else {
+                return not_found();
+            };
+            let mut limits = match (check_coord_crs(pairs), parse_limits(pairs)) {
+                (Err(r), _) | (_, Err(r)) => return r,
+                (Ok(()), Ok(l)) => l,
+            };
+            // A point is never "covered", so every item under it is wanted.
+            limits.exitwhenfull = false;
+            limits.skipcovered = false;
+            let point = json!({ "type": "Point", "coordinates": [lon, lat] });
+            geometry_assets(pg, &rec.hash, point, limits).await
         }
         _ => not_found(),
     }
@@ -831,6 +1352,121 @@ mod tests {
         assert!((west + 180.0).abs() < 1e-9);
         assert!((north - 85.0511287798066).abs() < 1e-6);
         assert!(ring[2][0].as_f64().unwrap().abs() < 1e-9);
+    }
+
+    #[test]
+    fn collection_search_is_built_like_titiler_pgstac() {
+        let collection = json!({
+            "extent": { "spatial": { "bbox": [[-180.0, -90.0, 180.0, 90.0], [1.0, 2.0, 3.0, 4.0]] } },
+            "item_assets": { "visual": {}, "aot": {}, "red-jp2": {}, "nir": {}, "blue": {} }
+        });
+        let (search, metadata) = collection_search("c", &collection, &[]).unwrap();
+        assert_eq!(search, json!({ "collections": ["c"], "filter-lang": "cql2-json" }));
+        assert_eq!(
+            metadata,
+            json!({
+                "type": "mosaic",
+                "name": "Mosaic for 'c' Collection",
+                "bounds": [-180.0, -90.0, 180.0, 90.0],
+                "assets": ["aot", "nir", "blue", "visual", "red-jp2"]
+            })
+        );
+
+        let pairs = query_pairs(
+            "ids=a,b&bbox=6,44,8,46&datetime=2024-01-01T00:00:00Z/..&sortby=%2Bproperties.eo:cloud_cover,-datetime,id\
+             &query=%7B%22eo%3Acloud_cover%22%3A%7B%22lt%22%3A20%7D%7D\
+             &filter=%7B%22op%22%3A%22%3D%22%2C%22args%22%3A%5B1%2C1%5D%7D&filter-lang=cql2-json",
+        );
+        let (search, metadata) = collection_search("c", &json!({}), &pairs).unwrap();
+        assert_eq!(
+            search,
+            json!({
+                "collections": ["c"],
+                "filter-lang": "cql2-json",
+                "ids": ["a", "b"],
+                "bbox": [6.0, 44.0, 8.0, 46.0],
+                "datetime": "2024-01-01T00:00:00Z/..",
+                "sortby": [
+                    { "field": "properties.eo:cloud_cover", "direction": "asc" },
+                    { "field": "datetime", "direction": "desc" },
+                    { "field": "id", "direction": "asc" }
+                ],
+                "query": { "eo:cloud_cover": { "lt": 20 } },
+                "filter": { "op": "=", "args": [1, 1] }
+            })
+        );
+        // The bbox parameter, not the collection's extent, bounds the mosaic.
+        assert_eq!(metadata["bounds"], json!([6.0, 44.0, 8.0, 46.0]));
+        assert!(metadata.get("assets").is_none());
+
+        // Renders become defaults, without the keys titiler-pgstac drops.
+        let with_renders = json!({ "renders": {
+            "rgb": { "title": "True colour", "assets": ["visual"], "minmax_zoom": [8, 14], "tilematrixsets": {} },
+            "ndvi": { "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]], "minmax_zoom": [8] },
+            "broken": "not an object"
+        }});
+        let (_, metadata) = collection_search("c", &with_renders, &[]).unwrap();
+        assert_eq!(
+            metadata["defaults"],
+            json!({
+                "rgb": { "assets": ["visual"], "minzoom": 8, "maxzoom": 14 },
+                "ndvi": { "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]] }
+            })
+        );
+
+        let status = |q: &str| collection_search("c", &json!({}), &query_pairs(q)).unwrap_err().status();
+        assert_eq!(status("bbox=1,2,3"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("bbox=1,2,x,4"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("query=nope"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=eo:cloud_cover%3C20"), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn default_layers_become_link_query_strings() {
+        let metadata = json!({ "defaults": {
+            "rgb": { "assets": ["visual"], "minzoom": 8, "maxzoom": 14 },
+            "ndvi": { "expression": "(nir-red)/(nir+red)", "rescale": [[-1, 1]], "colormap_name": "viridis" },
+            "bands": {
+                "assets": "red", "asset_bidx": ["red|1"], "rescale": [[0, 3000], "0,1"],
+                "colormap": { "1": [0, 0, 0, 255] }, "unscale": true
+            }
+        }});
+        // jsonb order of the names; `ndvi` has no assets, so it cannot be a tile request.
+        assert_eq!(
+            layer_queries(&metadata, true),
+            vec![
+                ("rgb".to_string(), "maxzoom=14&minzoom=8&assets=visual".to_string()),
+                (
+                    "bands".to_string(),
+                    "unscale=True&rescale=0%2C3000&rescale=0%2C1&colormap=%7B%221%22%3A+%5B0%2C+0%2C+0%2C+255%5D%7D&assets=red%7Cbidx%3D1".to_string()
+                ),
+            ]
+        );
+        // Registration links keep asset_bidx as its own parameter.
+        assert!(layer_queries(&metadata, false)[1].1.ends_with("&assets=red&asset_bidx=red%7C1"));
+        assert!(layer_queries(&json!({ "name": "x" }), true).is_empty());
+    }
+
+    #[test]
+    fn tile_limits_cover_the_bounds() {
+        let limits = |z, b| tile_limits(z, b);
+        assert_eq!(
+            limits(8, [5.0, 43.5, 12.0, 48.0]),
+            json!({ "tileMatrix": "8", "minTileRow": 88, "maxTileRow": 93, "minTileCol": 131, "maxTileCol": 136 })
+        );
+        assert_eq!(
+            limits(7, [6.0, 44.0, 8.0, 46.0]),
+            json!({ "tileMatrix": "7", "minTileRow": 45, "maxTileRow": 46, "minTileCol": 66, "maxTileCol": 66 })
+        );
+        // The whole world, including latitudes past the Web Mercator limit, stays on the grid.
+        assert_eq!(
+            limits(0, [-180.0, -90.0, 180.0, 90.0]),
+            json!({ "tileMatrix": "0", "minTileRow": 0, "maxTileRow": 0, "minTileCol": 0, "maxTileCol": 0 })
+        );
+        assert_eq!(
+            limits(3, [-180.0, -90.0, 180.0, 90.0]),
+            json!({ "tileMatrix": "3", "minTileRow": 0, "maxTileRow": 7, "minTileCol": 0, "maxTileCol": 7 })
+        );
     }
 
     #[test]
