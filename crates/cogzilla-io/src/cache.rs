@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use cogzilla_codec::DecodedTile;
 use dashmap::DashMap;
 use tokio::sync::Notify;
+
+use crate::backend::IoError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockKey {
@@ -12,13 +14,49 @@ pub struct BlockKey {
     pub tile_idx: u32,
 }
 
+/// Shared singleflight slot for an in-flight block fetch/decode.
+///
+/// Carries the leader's terminal `Ok(tile)` or `Err(Arc<IoError>)` directly to parked waiters:
+/// - `Some(Ok(tile))`: leader succeeded (waiters get the tile even if the cache evicts it before wakeup).
+/// - `Some(Err(err))`: leader failed with an explicit upstream/decode error (waiters fail immediately
+///   in 1 RTT instead of triggering `K` serialized retry storms).
+/// - `None`: leader was cancelled/dropped before completing (waiters retry and elect a new leader).
+pub struct InFlightBlock {
+    pub notify: Notify,
+    outcome: Mutex<Option<Result<Arc<DecodedTile>, Arc<IoError>>>>,
+}
+
+impl InFlightBlock {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            outcome: Mutex::new(None),
+        }
+    }
+
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    pub fn take_outcome(&self) -> Option<Result<Arc<DecodedTile>, Arc<IoError>>> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_outcome(&self, res: Result<Arc<DecodedTile>, Arc<IoError>>) {
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+    }
+}
+
 enum CacheEntry {
     Ready {
         tile: Arc<DecodedTile>,
         /// Value of the cache clock when this block was last inserted or read.
         last_used: AtomicU64,
     },
-    InFlight(Arc<Notify>),
+    InFlight(Arc<InFlightBlock>),
 }
 
 #[inline(always)]
@@ -46,10 +84,10 @@ pub struct SingleflightBlockCache {
 
 pub enum LookupResult {
     Hit(Arc<DecodedTile>),
-    /// Caller owns the miss and MUST call `complete(key, tile)` or `abort(key)` when done!
+    /// Caller owns the miss and MUST call `complete(key, tile)`, `fail(key, err)`, or `abort(key)`!
     Owner,
-    /// Another worker is currently fetching/decoding this block; await this Notify and retry.
-    Wait(Arc<Notify>),
+    /// Another worker is currently fetching/decoding this block; await this flight and check its outcome.
+    Wait(Arc<InFlightBlock>),
 }
 
 impl SingleflightBlockCache {
@@ -71,17 +109,17 @@ impl SingleflightBlockCache {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Check current state of `key`: `Some(Ok(tile))` if ready, `Some(Err(current_notify))` if
-    /// in-flight (returning the live owner's `Notify`), or `None` if removed/aborted.
+    /// Check current state of `key`: `Some(Ok(tile))` if ready, `Some(Err(current_flight))` if
+    /// in-flight (returning the live owner's `InFlightBlock`), or `None` if removed/aborted.
     #[inline(always)]
-    pub fn peek_state(&self, key: &BlockKey) -> Option<Result<Arc<DecodedTile>, Arc<Notify>>> {
+    pub fn peek_state(&self, key: &BlockKey) -> Option<Result<Arc<DecodedTile>, Arc<InFlightBlock>>> {
         self.map.get(key).map(|entry| match entry.value() {
             CacheEntry::Ready { tile, last_used } => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 last_used.store(self.tick(), Ordering::Relaxed);
                 Ok(tile.clone())
             }
-            CacheEntry::InFlight(n) => Err(n.clone()),
+            CacheEntry::InFlight(f) => Err(f.clone()),
         })
     }
 
@@ -111,14 +149,14 @@ impl SingleflightBlockCache {
                     last_used.store(self.tick(), Ordering::Relaxed);
                     LookupResult::Hit(tile.clone())
                 }
-                CacheEntry::InFlight(notify) => {
+                CacheEntry::InFlight(flight) => {
                     self.coalesced_waiters.fetch_add(1, Ordering::Relaxed);
-                    LookupResult::Wait(notify.clone())
+                    LookupResult::Wait(flight.clone())
                 }
             },
             Entry::Vacant(vac) => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
-                vac.insert(CacheEntry::InFlight(Arc::new(Notify::new())));
+                vac.insert(CacheEntry::InFlight(Arc::new(InFlightBlock::new())));
                 LookupResult::Owner
             }
         }
@@ -132,16 +170,17 @@ impl SingleflightBlockCache {
         // `saturating_sub` to 0 and permanently leak `new_bytes` into `current_bytes`).
         let mut now_bytes = self.current_bytes.fetch_add(new_bytes, Ordering::AcqRel) + new_bytes;
         let entry = CacheEntry::Ready {
-            tile,
+            tile: tile.clone(),
             last_used: AtomicU64::new(self.tick()),
         };
-        let (notify, old_bytes) = match self.map.insert(key, entry) {
-            Some(CacheEntry::InFlight(n)) => (Some(n), 0),
+        let (flight, old_bytes) = match self.map.insert(key, entry) {
+            Some(CacheEntry::InFlight(f)) => (Some(f), 0),
             Some(CacheEntry::Ready { tile: old, .. }) => (None, tile_bytes(&old)),
             None => (None, 0),
         };
-        if let Some(n) = notify {
-            n.notify_waiters();
+        if let Some(f) = flight {
+            f.set_outcome(Ok(tile));
+            f.notify.notify_waiters();
         }
         if old_bytes > 0 {
             now_bytes = self
@@ -157,12 +196,23 @@ impl SingleflightBlockCache {
         }
     }
 
-    /// Abort an in-flight fetch on error or cancellation so waiters can retry cleanly.
-    pub fn abort(&self, key: &BlockKey) {
-        if let Some((_, CacheEntry::InFlight(n))) =
+    /// Fail an in-flight fetch with an explicit upstream/decode error, broadcasting the shared
+    /// error to all parked waiters so they fail in 1 RTT instead of retrying serially.
+    pub fn fail(&self, key: &BlockKey, err: Arc<IoError>) {
+        if let Some((_, CacheEntry::InFlight(f))) =
             self.map.remove_if(key, |_, v| matches!(v, CacheEntry::InFlight(_)))
         {
-            n.notify_waiters();
+            f.set_outcome(Err(err));
+            f.notify.notify_waiters();
+        }
+    }
+
+    /// Abort an in-flight fetch on leader cancellation so parked waiters can take over cleanly.
+    pub fn abort(&self, key: &BlockKey) {
+        if let Some((_, CacheEntry::InFlight(f))) =
+            self.map.remove_if(key, |_, v| matches!(v, CacheEntry::InFlight(_)))
+        {
+            f.notify.notify_waiters();
         }
     }
 
@@ -345,6 +395,11 @@ impl InFlightGuard {
         self.cache.complete(self.key, tile);
     }
 
+    pub fn fail(mut self, err: Arc<IoError>) {
+        self.done = true;
+        self.cache.fail(&self.key, err);
+    }
+
     pub fn key(&self) -> BlockKey {
         self.key
     }
@@ -479,5 +534,35 @@ mod tests {
             matches!(cache.acquire(key(99)), LookupResult::Wait(_)),
             "clear() must never delete InFlight singleflight entries"
         );
+    }
+
+    #[test]
+    fn singleflight_fail_broadcasts_error_while_drop_signals_cancellation() {
+        let cache = Arc::new(SingleflightBlockCache::new(8 * BLOCK_BYTES));
+        // 1. Explicit fail() delivers Err(Arc<IoError>) directly to parked waiters.
+        assert!(matches!(cache.acquire(key(1)), LookupResult::Owner));
+        let guard = cache.guard(key(1));
+        let LookupResult::Wait(flight) = cache.acquire(key(1)) else {
+            panic!("expected Wait");
+        };
+        guard.fail(Arc::new(IoError::HttpStatus {
+            status: 503,
+            url: "https://example.com/a.tif".into(),
+        }));
+        match flight.take_outcome() {
+            Some(Err(err)) => assert!(matches!(err.root(), IoError::HttpStatus { status: 503, .. })),
+            _ => panic!("expected shared 503 error"),
+        }
+        assert!(cache.peek_state(&key(1)).is_none());
+
+        // 2. Dropping guard (cancellation) leaves outcome == None so waiters take over.
+        assert!(matches!(cache.acquire(key(2)), LookupResult::Owner));
+        let guard2 = cache.guard(key(2));
+        let LookupResult::Wait(flight2) = cache.acquire(key(2)) else {
+            panic!("expected Wait");
+        };
+        drop(guard2);
+        assert!(flight2.take_outcome().is_none());
+        assert!(cache.peek_state(&key(2)).is_none());
     }
 }

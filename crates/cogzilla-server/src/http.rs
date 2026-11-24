@@ -3474,31 +3474,33 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
         EngineError::Proj(e) => {
             plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
         }
-        EngineError::Io(e @ cogzilla_io::IoError::InvalidUri(_)) => {
-            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
-        }
-        EngineError::Io(e @ cogzilla_io::IoError::Tiff(_)) => {
-            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
-        }
-        EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_)) => {
-            plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
-        }
-        EngineError::Io(e @ cogzilla_io::IoError::HttpStatus { status: 404, .. }) => {
-            plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
-        }
-        EngineError::Io(e @ cogzilla_io::IoError::Fs(io_err))
-            if io_err.kind() == std::io::ErrorKind::NotFound =>
-        {
-            plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
-        }
-        e => {
-            tracing::warn!(error = %e, "request failed with 500");
-            plain_resp(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Bytes::from(e.to_string()),
-                "text/plain",
-            )
-        }
+        EngineError::Io(io_e) => match io_e.root() {
+            e @ cogzilla_io::IoError::InvalidUri(_) => {
+                plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+            }
+            e @ cogzilla_io::IoError::Tiff(_) => {
+                plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+            }
+            e @ cogzilla_io::IoError::Forbidden(_) => {
+                plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
+            }
+            e @ cogzilla_io::IoError::HttpStatus { status: 404, .. } => {
+                plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
+            }
+            e @ cogzilla_io::IoError::Fs(io_err)
+                if io_err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
+            }
+            e => {
+                tracing::warn!(error = %e, "request failed with 500");
+                plain_resp(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from(e.to_string()),
+                    "text/plain",
+                )
+            }
+        },
     }
 }
 

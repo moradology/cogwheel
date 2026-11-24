@@ -113,8 +113,10 @@ pub async fn load_stac_item(
     let raw_bytes = store
         .fetch_uri_bytes(uri, MAX_STAC_JSON_BYTES)
         .await
-        .map_err(|e| match e {
-            cogzilla_io::IoError::Forbidden(u) => EngineError::Io(cogzilla_io::IoError::Forbidden(u)),
+        .map_err(|e| match e.root() {
+            cogzilla_io::IoError::Forbidden(u) => {
+                EngineError::Io(cogzilla_io::IoError::Forbidden(u.clone()))
+            }
             cogzilla_io::IoError::HttpStatus { status: 404, url } => {
                 EngineError::NotFound(format!("STAC item HTTP 404: {url}"))
             }
