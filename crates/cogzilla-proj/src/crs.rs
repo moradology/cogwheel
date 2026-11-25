@@ -1132,9 +1132,17 @@ impl<const N: usize> CoordPlan<N> {
                 let wrap = |d: f64| (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
                 wrap(lon_w - lon0) > 0.0 && wrap(lon_e - lon0) < 0.0
             });
+            let near_laea_antipode = matches!(crs, CrsModel::Laea(p) if p.pole == 0 && {
+                let (lon_c, lat_c) =
+                    mercator_to_lonlat_rad(0.5 * (min_x + max_x), 0.5 * (min_y + max_y));
+                let cos_dist = p.lat0.sin() * lat_c.sin()
+                    + p.lat0.cos() * lat_c.cos() * (lon_c - p.lon0).cos();
+                1.0 + cos_dist < 0.02
+            });
             let try_grid_2d = tile.z > 8
                 && ((tile.x as u64) + 1 < (1u64 << tile.z.min(30)))
-                && !straddles_branch_cut;
+                && !straddles_branch_cut
+                && !near_laea_antipode;
             if try_grid_2d {
                 let mut grid_u = [0.0f32; GRID_DIM * GRID_DIM];
                 let mut grid_v = [0.0f32; GRID_DIM * GRID_DIM];
@@ -1995,6 +2003,32 @@ mod tests {
             assert!(
                 (rlon - lon).abs() < 1e-9 && (rlat - lat).abs() < 1e-9,
                 "EPSG:3395 round-trip failed for ({lon}, {lat}) -> ({rlon}, {rlat})"
+            );
+        }
+    }
+
+    #[test]
+    fn laea_antipode_tile_does_not_interpolate_ghost_pixels() {
+        // EPSG:3035 (Europe LAEA: lat0=52°N, lon0=10°E, FE=4321000, FN=3210000)
+        // Antipode is (-170°W, -52°S), inside WebMercator tile z=9/14/342 and z=12/113/2743.
+        let crs = CrsModel::from_epsg(3035).unwrap();
+        let p2c = Affine2D {
+            a: 1000.0,
+            b: 0.0,
+            c: 2_321_000.0,
+            d: 0.0,
+            e: -1000.0,
+            f: 5_210_000.0,
+        };
+        let c2p = p2c.invert().unwrap();
+        for tile in [
+            TileCoord { z: 9, x: 14, y: 342 },
+            TileCoord { z: 12, x: 113, y: 2743 },
+        ] {
+            let plan = CoordPlan::<256>::build(&crs, &c2p, 4000, 4000, tile);
+            assert!(
+                plan.is_none(),
+                "antipode tile {tile:?} in South Pacific must not intersect Europe EPSG:3035 COG"
             );
         }
     }
