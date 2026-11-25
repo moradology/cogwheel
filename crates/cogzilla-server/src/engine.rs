@@ -139,39 +139,65 @@ fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bo
         && close(a.f, b.f)
 }
 
+/// Check whether two `GeoKeys` describe the same CRS (falling back to full equality for
+/// user-defined GeoTIFF codes `32767`).
+fn geo_keys_match(a: &cogzilla_tiff::GeoKeys, b: &cogzilla_tiff::GeoKeys) -> bool {
+    if a.model_type != b.model_type
+        || a.projected_cs_type != b.projected_cs_type
+        || a.geographic_type != b.geographic_type
+    {
+        return false;
+    }
+    if a.projected_cs_type == Some(32767) || a.geographic_type == Some(32767) {
+        return a == b;
+    }
+    true
+}
+
+/// Resampling kernel support margin `(lo, hi)` in source pixels needed around `[floor(min), ceil(max)]`.
+pub(crate) fn resample_fetch_margin(resample: ResampleMode, is_dem: bool) -> (i32, i32) {
+    let (lo, hi) = match resample {
+        ResampleMode::Cubic | ResampleMode::CubicSpline => (1, 2),
+        ResampleMode::Lanczos => (2, 3),
+        _ => (1, 1),
+    };
+    if is_dem {
+        (lo + 2, hi + 2)
+    } else {
+        (lo, hi)
+    }
+}
+
 /// Fast check whether all COGs in a multi-COG / STAC composite share the exact same base
-/// dimensions, tile grid, overview count, CRS, and geotransform (allowing the single-grid fast path).
+/// dimensions, tile grid, overview count, CRS, and geotransform across all IFDs (allowing the
+/// single-grid fast path).
 pub(crate) fn cogs_share_base_grid(cogs: &[Arc<OpenedCog>]) -> bool {
     if cogs.len() <= 1 {
         return true;
     }
-    let p = cogs[0].index.full_res();
     let p_gk = &cogs[0].index.geo_keys;
     let n_ifds = cogs[0].index.ifds.len();
     cogs.iter().skip(1).all(|c| {
-        if c.index.ifds.len() != n_ifds {
+        if c.index.ifds.len() != n_ifds || !geo_keys_match(&c.index.geo_keys, p_gk) {
             return false;
         }
-        let o_gk = &c.index.geo_keys;
-        if o_gk.projected_cs_type != p_gk.projected_cs_type
-            || o_gk.geographic_type != p_gk.geographic_type
-            || o_gk.model_type != p_gk.model_type
-        {
-            return false;
-        }
-        let o = c.index.full_res();
-        o.width == p.width
-            && o.height == p.height
-            && o.tile_width == p.tile_width
-            && o.tile_height == p.tile_height
-            && o.tiles_across == p.tiles_across
-            && o.tiles_down == p.tiles_down
-            && affines_match(&o.pixel_to_crs, &p.pixel_to_crs)
+        (0..n_ifds).all(|idx| {
+            let p = &cogs[0].index.ifds[idx];
+            let o = &c.index.ifds[idx];
+            o.width == p.width
+                && o.height == p.height
+                && o.tile_width == p.tile_width
+                && o.tile_height == p.tile_height
+                && o.tiles_across == p.tiles_across
+                && o.tiles_down == p.tiles_down
+                && affines_match(&o.pixel_to_crs, &p.pixel_to_crs)
+        })
     })
 }
 
 /// Verify that all secondary COGs in a multi-COG / STAC composite share the exact same overview
-/// index, image dimensions, and internal tile grid as `cogs[0]` so `BandSource` never reads OOB.
+/// index, image dimensions, internal tile grid, CRS, and geotransform as `cogs[0]` so `BandSource`
+/// never reads OOB or misregisters pixels.
 pub(crate) fn validate_multi_cog_grid(
     cogs: &[Arc<OpenedCog>],
     ifd_idx: usize,
@@ -180,7 +206,13 @@ pub(crate) fn validate_multi_cog_grid(
         return Ok(());
     }
     let primary_ifd = &cogs[0].index.ifds[ifd_idx];
+    let primary_gk = &cogs[0].index.geo_keys;
     for (k, c) in cogs.iter().enumerate().skip(1) {
+        if !geo_keys_match(&c.index.geo_keys, primary_gk) {
+            return Err(EngineError::BadRequest(format!(
+                "multi-COG asset #{k} CRS does not match primary asset"
+            )));
+        }
         let Some(other) = c.index.ifds.get(ifd_idx) else {
             return Err(EngineError::BadRequest(format!(
                 "multi-COG asset #{k} has {} overviews, fewer than primary asset (need IFD {ifd_idx})",
@@ -193,6 +225,7 @@ pub(crate) fn validate_multi_cog_grid(
             || other.tile_height != primary_ifd.tile_height
             || other.tiles_across != primary_ifd.tiles_across
             || other.tiles_down != primary_ifd.tiles_down
+            || !affines_match(&other.pixel_to_crs, &primary_ifd.pixel_to_crs)
         {
             return Err(EngineError::BadRequest(format!(
                 "multi-COG asset #{k} grid ({}x{}, tile {}x{}) does not match primary ({}x{}, tile {}x{})",
@@ -352,19 +385,25 @@ impl TileEngine {
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. } => 3,
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
         };
 
-        let (tx0, tx1, ty0, ty1) = if matches!(req.bands, BandRequest::Dem { .. }) {
+        let (pad_lo, pad_hi) =
+            resample_fetch_margin(req.resample, matches!(req.bands, BandRequest::Dem { .. }));
+        let (tx0, tx1, ty0, ty1) = if pad_lo > 1 || pad_hi > 1 {
+            // CoordPlan::src_pixel_bounds() already includes ±1 px padding.
+            let extra_lo = pad_lo - 1;
+            let extra_hi = pad_hi - 1;
             let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-            let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
-            let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
+            let d_tx0 = (c0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_width;
+            let d_tx1 = ((c1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_width)
                 .min(ifd.tiles_across.saturating_sub(1));
-            let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
-            let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
+            let d_ty0 = (r0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_height;
+            let d_ty1 = ((r1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_height)
                 .min(ifd.tiles_down.saturating_sub(1));
             (d_tx0, d_tx1, d_ty0, d_ty1)
         } else {
@@ -1321,19 +1360,25 @@ impl TileEngine {
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. } => 3,
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
         };
 
-        let (tx0, tx1, ty0, ty1) = if matches!(req.bands, BandRequest::Dem { .. }) {
+        let (pad_lo, pad_hi) =
+            resample_fetch_margin(req.resample, matches!(req.bands, BandRequest::Dem { .. }));
+        let (tx0, tx1, ty0, ty1) = if pad_lo > 1 || pad_hi > 1 {
+            // CoordPlan::src_pixel_bounds() already includes ±1 px padding.
+            let extra_lo = pad_lo - 1;
+            let extra_hi = pad_hi - 1;
             let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-            let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
-            let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
+            let d_tx0 = (c0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_width;
+            let d_tx1 = ((c1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_width)
                 .min(ifd.tiles_across.saturating_sub(1));
-            let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
-            let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
+            let d_ty0 = (r0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_height;
+            let d_ty1 = ((r1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_height)
                 .min(ifd.tiles_down.saturating_sub(1));
             (d_tx0, d_tx1, d_ty0, d_ty1)
         } else {
@@ -1791,7 +1836,10 @@ impl TileEngine {
                 .empty_short_circuits
                 .fetch_add(1, Ordering::Relaxed);
             let f32_bands = match req.bands {
-                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                BandRequest::Rgb { .. }
+                | BandRequest::SarRgb { .. }
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));

@@ -158,7 +158,7 @@ impl Affine2D {
 }
 
 /// Raw GeoTIFF GeoKeys extracted from IFD 0 for closed-form CRS construction.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GeoKeys {
     pub model_type: Option<u16>,
     pub raster_type: Option<u16>,

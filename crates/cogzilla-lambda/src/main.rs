@@ -72,6 +72,7 @@ fn build_engine_from_env() -> Arc<TileEngine> {
 fn is_binary_content_type(ct: &str) -> bool {
     ct.starts_with("image/")
         || ct.starts_with("application/octet-stream")
+        || ct.starts_with("application/x-binary")
         || ct.starts_with("application/x-npy")
 }
 

@@ -86,7 +86,7 @@ fn parse_wxh_ext(seg: &str) -> Option<(u32, u32, Option<&str>)> {
     let (ws, hs) = dims.split_once('x')?;
     let w = ws.parse::<u32>().ok()?;
     let h = hs.parse::<u32>().ok()?;
-    if w == 0 || h == 0 {
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
         return None;
     }
     Some((w, h, ext))
@@ -156,6 +156,7 @@ struct ParsedQuery {
     buffer: f32,
     coord_crs_3857: bool,
     coord_crs: Option<cogzilla_proj::CrsModel>,
+    coord_crs_epsg: Option<u16>,
     dst_crs: Option<(cogzilla_proj::CrsModel, u16)>,
     bounds_crs: Option<(cogzilla_proj::CrsModel, u16)>,
     bbox_param: Option<[f64; 4]>,
@@ -216,6 +217,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         buffer: 0.0,
         coord_crs_3857: false,
         coord_crs: None,
+        coord_crs_epsg: None,
         dst_crs: None,
         bounds_crs: None,
         bbox_param: None,
@@ -300,7 +302,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             pq.assets.push(name.to_string());
                         }
                         if !parsed.is_empty() {
-                            pq.asset_bidx.push((name.to_string(), parsed));
+                            if let Some((_, existing)) =
+                                pq.asset_bidx.iter_mut().find(|(n, _)| n == name)
+                            {
+                                existing.extend(parsed);
+                            } else {
+                                pq.asset_bidx.push((name.to_string(), parsed));
+                            }
                         }
                     }
                 } else {
@@ -506,10 +514,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "coord_crs" => {
                 let dec = percent_decode(v);
-                match parse_coord_crs(&dec) {
-                    Ok(crs) => {
+                match parse_coord_crs_with_epsg(&dec) {
+                    Ok((crs, epsg)) => {
                         pq.coord_crs_3857 = matches!(crs, cogzilla_proj::CrsModel::Epsg3857);
                         pq.coord_crs = Some(crs);
+                        pq.coord_crs_epsg = Some(epsg);
                     }
                     Err(msg) => bad(&msg),
                 }
@@ -987,10 +996,6 @@ fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16)
     let model = cogzilla_proj::CrsModel::from_epsg(code)
         .map_err(|e| format!("unsupported CRS '{raw}': {e}"))?;
     Ok((model, code))
-}
-
-fn parse_coord_crs(raw: &str) -> Result<cogzilla_proj::CrsModel, String> {
-    parse_coord_crs_with_epsg(raw).map(|(m, _)| m)
 }
 
 /// Transform a WGS84 `[min_lon, min_lat, max_lon, max_lat]` bbox into `dst` CRS by densifying
@@ -1707,19 +1712,26 @@ fn resolve_resample(
     engine: Option<&TileEngine>,
     pq: &ParsedQuery,
     source_cog: Option<&cogzilla_io::OpenedCog>,
-    target_is_4326: bool,
+    target_epsg: u16,
 ) -> ResampleMode {
     let Some(cog) = source_cog else {
         return pq.resample;
     };
+    let gk = &cog.index.geo_keys;
+    if gk.projected_cs_type == Some(target_epsg) || gk.geographic_type == Some(target_epsg) {
+        return pq.resample;
+    }
     let crs_res = if let Some(eng) = engine {
         eng.get_or_build_crs(cog).ok()
     } else {
-        cogzilla_proj::CrsModel::from_geo_keys(&cog.index.geo_keys).ok()
+        cogzilla_proj::CrsModel::from_geo_keys(gk).ok()
     };
     let same_crs = match crs_res {
-        Some(cogzilla_proj::CrsModel::Epsg3857) => !target_is_4326,
-        Some(cogzilla_proj::CrsModel::Geographic) => target_is_4326,
+        Some(cogzilla_proj::CrsModel::Epsg3857) => target_epsg == 3857,
+        Some(cogzilla_proj::CrsModel::Geographic) => matches!(
+            cogzilla_proj::CrsModel::from_epsg(target_epsg),
+            Ok(cogzilla_proj::CrsModel::Geographic)
+        ),
         _ => false,
     };
     if same_crs { pq.resample } else { pq.reproject }
@@ -1766,14 +1778,14 @@ fn build_tile_request_for_tms(
     tms_id: &str,
     source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
-    let (cols, rows, target_is_4326) = if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
+    let (cols, rows, target_epsg) = if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
         let Some(m) = tms_def.matrix(tile.z) else {
             return Err(EngineError::BadRequest(format!(
                 "zoom level z={} is not defined for tile matrix set '{}'",
                 tile.z, tms_id
             )));
         };
-        (m.matrix_width, m.matrix_height, tms_def.epsg == 4326)
+        (m.matrix_width, m.matrix_height, tms_def.epsg)
     } else {
         if tile.z > 30 {
             return Err(EngineError::BadRequest(format!(
@@ -1782,7 +1794,7 @@ fn build_tile_request_for_tms(
             )));
         }
         let rows = 1u64 << (tile.z as u32);
-        (rows, rows, false)
+        (rows, rows, 3857u16)
     };
     if (tile.x as u64) >= cols || (tile.y as u64) >= rows {
         return Err(EngineError::BadRequest(format!(
@@ -1807,7 +1819,7 @@ fn build_tile_request_for_tms(
             tile,
             tile_size,
             bands,
-            resample: resolve_resample(engine, pq, source_cog, target_is_4326),
+            resample: resolve_resample(engine, pq, source_cog, target_epsg),
             format,
             unscale: pq.unscale,
         },
@@ -1956,19 +1968,22 @@ async fn render_mosaic_tile_styled(
     mut treq: TileRequest,
     pq: &ParsedQuery,
 ) -> Result<Bytes, EngineError> {
-    let needs_bbox_mosaic = pq.nodata.is_some()
+    let mut needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0.0
         || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
+    if !needs_bbox_mosaic
+        && !pq.colormap_explicit
+        && pq.custom_colormap_json.is_none()
+        && let Some(u0) = urls.first()
+        && let Ok(c0) = engine.store.open_uri(u0).await
+        && c0.index.color_map.is_some()
+    {
+        needs_bbox_mosaic = true;
+    }
 
     if needs_bbox_mosaic && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
-        let custom_lut = pq
-            .custom_colormap_json
-            .as_deref()
-            .map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty()))
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
         let cf = pq
             .color_formula
             .as_deref()
@@ -1988,13 +2003,16 @@ async fn render_mosaic_tile_styled(
         let mut filled = 0usize;
 
         for url in urls {
-            let cog = engine.store.open_uri(url).await?;
+            let Ok(cog) = engine.store.open_uri(url).await else {
+                continue;
+            };
             let cogs = vec![cog];
             let mut scene_bands = treq.bands.clone();
             if pq.unscale {
                 apply_unscale_cogs(&mut scene_bands, &cogs);
             }
-            let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), false);
+            let scene_lut = resolve_custom_lut(pq, &cogs[0], &scene_bands)?;
+            let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
             let scene_rgba = render_mercator_bbox(
                 engine,
                 &cogs,
@@ -2005,7 +2023,7 @@ async fn render_mosaic_tile_styled(
                 resample,
                 OutputFormat::RawRgba,
                 pq.nodata,
-                custom_lut.as_ref(),
+                scene_lut.as_ref(),
                 None,
                 true,
                 pq.unscale,
@@ -2071,8 +2089,15 @@ fn apply_stac_asset_bidx(pq: &mut ParsedQuery, names: &[String]) {
     }
 }
 
+fn stac_asset_selected_bands<'a>(pq: &'a ParsedQuery, asset_name: &str) -> Option<&'a [u16]> {
+    pq.asset_bidx
+        .iter()
+        .find(|(n, _)| n == asset_name)
+        .map(|(_, bands)| bands.as_slice())
+}
+
 /// Composite up to 16 intersecting MosaicJSON scenes for `/mosaicjson/bbox` and `/mosaicjson/feature`
-/// using first-non-transparent alpha-over blending in target CRS.
+/// using first-non-transparent alpha-over (or first-non-NaN for f32/npy) blending in target CRS.
 #[allow(clippy::too_many_arguments)]
 async fn render_mosaic_bbox_composite(
     engine: &TileEngine,
@@ -2090,13 +2115,25 @@ async fn render_mosaic_bbox_composite(
     if urls.is_empty() {
         return Err(EngineError::NotFound("no mosaic scenes intersect requested bounds".into()));
     }
+    let out_w = out_w.clamp(1, 4096);
+    let out_h = out_h.clamp(1, 4096);
     let urls = &urls[..urls.len().min(16)];
+    let is_f32_out = matches!(fmt, OutputFormat::RawF32 | OutputFormat::Npy);
     let mut acc_rgba: Option<Vec<u8>> = None;
+    let mut acc_f32: Option<(usize, Vec<f32>)> = None;
     let total_px = (out_w as usize).saturating_mul(out_h as usize);
     let mut opaque_count = 0usize;
+    let mut any_ok = false;
+    let mut last_err: Option<EngineError> = None;
 
     for u in urls {
-        let cog = engine.store.open_uri(u).await?;
+        let cog = match engine.store.open_uri(u).await {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
         let cogs = [cog];
         let full = cogs[0].index.full_res();
         let mut bands = build_band_request(pq, full.samples_per_pixel, full.sample_type)?;
@@ -2110,8 +2147,8 @@ async fn render_mosaic_bbox_composite(
             .map(ColorFormula::parse)
             .transpose()
             .map_err(EngineError::BadRequest)?;
-        let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), matches!(dst_crs, cogzilla_proj::CrsModel::Geographic));
-        if urls.len() == 1 || matches!(fmt, OutputFormat::RawF32 | OutputFormat::Npy) {
+        let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), epsg);
+        if urls.len() == 1 {
             let d = render_crs_bbox(
                 engine,
                 &cogs,
@@ -2132,6 +2169,66 @@ async fn render_mosaic_bbox_composite(
             .await?;
             return Ok(wrap_geotiff(d, ct, out_w, out_h, bbox, epsg, pq.return_mask));
         }
+        if is_f32_out {
+            let raw = render_crs_bbox(
+                engine,
+                &cogs,
+                bbox,
+                dst_crs,
+                out_w,
+                out_h,
+                poly_mask,
+                &bands,
+                resample,
+                OutputFormat::RawF32,
+                pq.nodata,
+                custom_lut.as_ref(),
+                cf.as_ref(),
+                pq.return_mask,
+                pq.unscale,
+            )
+            .await?;
+            any_ok = true;
+            if total_px == 0 || raw.len() % (total_px * 4) != 0 {
+                continue;
+            }
+            let nb = raw.len() / (total_px * 4);
+            if nb == 0 {
+                continue;
+            }
+            let (acc_nb, acc) = acc_f32.get_or_insert_with(|| (nb, vec![f32::NAN; nb * total_px]));
+            if *acc_nb != nb {
+                continue;
+            }
+            for i in 0..total_px {
+                if acc[i].is_nan() {
+                    let b0_off = i * 4;
+                    let v0 = f32::from_le_bytes([
+                        raw[b0_off],
+                        raw[b0_off + 1],
+                        raw[b0_off + 2],
+                        raw[b0_off + 3],
+                    ]);
+                    if !v0.is_nan() {
+                        acc[i] = v0;
+                        for b in 1..nb {
+                            let boff = (b * total_px + i) * 4;
+                            acc[b * total_px + i] = f32::from_le_bytes([
+                                raw[boff],
+                                raw[boff + 1],
+                                raw[boff + 2],
+                                raw[boff + 3],
+                            ]);
+                        }
+                        opaque_count += 1;
+                    }
+                }
+            }
+            if opaque_count >= total_px {
+                break;
+            }
+            continue;
+        }
         let raw = render_crs_bbox(
             engine,
             &cogs,
@@ -2150,17 +2247,39 @@ async fn render_mosaic_bbox_composite(
             pq.unscale,
         )
         .await?;
+        any_ok = true;
+        if raw.len() != total_px * 4 {
+            continue;
+        }
         let acc = acc_rgba.get_or_insert_with(|| vec![0u8; total_px * 4]);
         for i in 0..total_px {
             let off = i * 4;
             if acc[off + 3] == 0 && raw[off + 3] > 0 {
                 acc[off..off + 4].copy_from_slice(&raw[off..off + 4]);
-                opaque_count += 1;
+                if raw[off + 3] == 255 {
+                    opaque_count += 1;
+                }
             }
         }
         if opaque_count >= total_px {
             break;
         }
+    }
+    if !any_ok {
+        return Err(last_err.unwrap_or_else(|| {
+            EngineError::NotFound("no readable mosaic scenes intersect requested bounds".into())
+        }));
+    }
+    if is_f32_out {
+        let (nb, acc) = acc_f32.unwrap_or_else(|| (1, vec![f32::NAN; total_px]));
+        let mut out = bytes::BytesMut::with_capacity(128 + acc.len() * 4);
+        if matches!(fmt, OutputFormat::Npy) {
+            out.extend_from_slice(&cogzilla_kernel::encode_npy_f32_header(nb, out_h, out_w));
+        }
+        for v in acc {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        return Ok(out.freeze());
     }
     let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
     let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, fmt, pq.return_mask);
@@ -2750,32 +2869,100 @@ where
                 let stats_opts = build_stats_options(&pq, false)?;
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
-                let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
-                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
-                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
-                let first_u = urls.first().ok_or_else(|| {
-                    EngineError::NotFound("no mosaic scenes intersect requested geometry".into())
-                })?;
-                let cog = engine.store.open_uri(first_u).await?;
-                let stats = compute_statistics_with_options(
-                    &engine, &cog, pq.max_size, Some(&mask), pq.unscale, pq.nodata, &stats_opts,
-                )
-                .await?;
-                if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
-                    if let Some(props) = geojson.get_mut("properties").and_then(|v| v.as_object_mut()) {
-                        props.insert("statistics".into(), stats);
-                    } else if let Some(obj) = geojson.as_object_mut() {
-                        obj.insert("properties".into(), serde_json::json!({"statistics": stats}));
+                let compute_for_geom = |geom: &serde_json::Value| {
+                    let eng = engine.clone();
+                    let mj_c = mj.clone();
+                    let opts = stats_opts.clone();
+                    let max_size = pq.max_size;
+                    let unscale = pq.unscale;
+                    let nodata = pq.nodata;
+                    let geom_owned = geom.clone();
+                    async move {
+                        let (mask, bbox) = PolygonMask::from_geojson(&geom_owned)?;
+                        let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
+                        let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
+                        let urls = mj_c.query_bbox_3857(
+                            mx0.min(mx1),
+                            my0.min(my1),
+                            mx0.max(mx1),
+                            my0.max(my1),
+                        );
+                        let mut last_err: Option<EngineError> = None;
+                        for cand in urls.iter().take(16) {
+                            match eng.store.open_uri(cand).await {
+                                Ok(cog) => {
+                                    return compute_statistics_with_options(
+                                        &eng,
+                                        &cog,
+                                        max_size,
+                                        Some(&mask),
+                                        unscale,
+                                        nodata,
+                                        &opts,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => last_err = Some(e.into()),
+                            }
+                        }
+                        Err(last_err.unwrap_or_else(|| {
+                            EngineError::NotFound(
+                                "no mosaic scenes intersect requested geometry".into(),
+                            )
+                        }))
+                    }
+                };
+                if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                    let features = geojson
+                        .get_mut("features")
+                        .and_then(|v| v.as_array_mut())
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(
+                                "FeatureCollection missing 'features' array".into(),
+                            )
+                        })?;
+                    if features.len() > 64 {
+                        return Err(EngineError::BadRequest(format!(
+                            "FeatureCollection exceeds max 64 features (got {})",
+                            features.len()
+                        )));
+                    }
+                    for feat in features.iter_mut() {
+                        let stats = compute_for_geom(feat).await?;
+                        if let Some(props) =
+                            feat.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = feat.as_object_mut() {
+                            obj.insert(
+                                "properties".into(),
+                                serde_json::json!({"statistics": stats}),
+                            );
+                        }
                     }
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                 } else {
-                    let feat = serde_json::json!({
-                        "type": "Feature",
-                        "geometry": geojson,
-                        "properties": { "statistics": stats },
-                    });
-                    Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                    let stats = compute_for_geom(&geojson).await?;
+                    if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                        if let Some(props) =
+                            geojson.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
+                            props.insert("statistics".into(), stats);
+                        } else if let Some(obj) = geojson.as_object_mut() {
+                            obj.insert(
+                                "properties".into(),
+                                serde_json::json!({"statistics": stats}),
+                            );
+                        }
+                        Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                    } else {
+                        let feat = serde_json::json!({
+                            "type": "Feature",
+                            "geometry": geojson,
+                            "properties": { "statistics": stats },
+                        });
+                        Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                    }
                 }
             }
             .await,
@@ -2904,16 +3091,23 @@ where
                 let (mx0, my0) = lonlat_deg_to_mercator(w, s);
                 let (mx1, my1) = lonlat_deg_to_mercator(e, n);
                 let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
-                let first_u = urls.first().ok_or_else(|| {
-                    EngineError::NotFound("mosaicjson contains no raster scenes".into())
-                })?;
-                let cog = engine.store.open_uri(first_u).await?;
                 let stats_opts = build_stats_options(&pq, false)?;
-                let json = compute_statistics_with_options(
-                    &engine, &cog, pq.max_size, None, pq.unscale, pq.nodata, &stats_opts,
-                )
-                .await?;
-                Ok((Bytes::from(json.to_string()), "application/json"))
+                let mut last_err: Option<EngineError> = None;
+                for cand in urls.iter().take(16) {
+                    match engine.store.open_uri(cand).await {
+                        Ok(cog) => {
+                            let json = compute_statistics_with_options(
+                                &engine, &cog, pq.max_size, None, pq.unscale, pq.nodata, &stats_opts,
+                            )
+                            .await?;
+                            return Ok((Bytes::from(json.to_string()), "application/json"));
+                        }
+                        Err(e) => last_err = Some(e.into()),
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| {
+                    EngineError::NotFound("mosaicjson contains no readable raster scenes".into())
+                }))
             }
             .await,
             ["mosaicjson", "bbox", bbox_seg] => async {
@@ -2928,11 +3122,18 @@ where
                 let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = pq
-                    .dst_crs
-                    .clone()
-                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
-                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let (dst_crs, dst_epsg) = pq.dst_crs.clone().unwrap_or_else(|| {
+                    if pq.coord_crs_3857 {
+                        (cogzilla_proj::CrsModel::Epsg3857, 3857)
+                    } else {
+                        (cogzilla_proj::CrsModel::Geographic, 4326)
+                    }
+                });
+                let out_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                    bbox
+                } else {
+                    reproject_wgs84_bounds(wgs_bbox, &dst_crs)?
+                };
                 let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let data = render_mosaic_bbox_composite(
@@ -2957,11 +3158,18 @@ where
                 let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = pq
-                    .dst_crs
-                    .clone()
-                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
-                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let (dst_crs, dst_epsg) = pq.dst_crs.clone().unwrap_or_else(|| {
+                    if pq.coord_crs_3857 {
+                        (cogzilla_proj::CrsModel::Epsg3857, 3857)
+                    } else {
+                        (cogzilla_proj::CrsModel::Geographic, 4326)
+                    }
+                });
+                let out_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                    bbox
+                } else {
+                    reproject_wgs84_bounds(wgs_bbox, &dst_crs)?
+                };
                 let data = render_mosaic_bbox_composite(
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
                 )
@@ -3135,7 +3343,10 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
-                                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                                BandRequest::Rgb { .. }
+                                | BandRequest::SarRgb { .. }
+                                | BandRequest::Terrain { .. }
+                                | BandRequest::CustomExprRgb { .. } => 3,
                                 _ => 1,
                             };
                             let b = cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb);
@@ -3308,7 +3519,10 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let nb = match treq.bands {
-                                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                                BandRequest::Rgb { .. }
+                                | BandRequest::SarRgb { .. }
+                                | BandRequest::Terrain { .. }
+                                | BandRequest::CustomExprRgb { .. } => 3,
                                 _ => 1,
                             };
                             let b = cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb);
@@ -3711,7 +3925,19 @@ where
                 }
                 let mut map = serde_json::Map::new();
                 for (name, st) in names.into_iter().zip(ordered.into_iter()) {
-                    if let Some(st) = st {
+                    if let Some(mut st) = st {
+                        if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
+                            if let Some(obj) = st.as_object() {
+                                let mut filtered = serde_json::Map::new();
+                                for &b in sel {
+                                    let k = format!("b{b}");
+                                    if let Some(v) = obj.get(&k) {
+                                        filtered.insert(k, v.clone());
+                                    }
+                                }
+                                st = serde_json::Value::Object(filtered);
+                            }
+                        }
                         map.insert(name, st);
                     }
                 }
@@ -3752,7 +3978,11 @@ where
                 for (name, slot) in names.iter().zip(ordered.into_iter()) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
-                        for i in 1..=nb {
+                        let bands_iter: Vec<usize> = match stac_asset_selected_bands(&pq, name) {
+                            Some(sel) => sel.iter().map(|&b| b as usize).collect(),
+                            None => (1..=nb).collect(),
+                        };
+                        for i in bands_iter {
                             if let Some(v) = obj.get(&format!("b{i}")) {
                                 let mut band_val = v.clone();
                                 if let Some(bobj) = band_val.as_object_mut() {
@@ -3788,6 +4018,7 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let stats_opts = stats_opts_post.clone();
+                    let asset_bidx_c = pq.asset_bidx.clone();
                     let n = names_c.len();
                     async move {
                         let mut set = tokio::task::JoinSet::new();
@@ -3822,7 +4053,14 @@ where
                         for (name, slot) in names_c.iter().zip(ordered.into_iter()) {
                             let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
-                                for b in 1..=nb {
+                                let bands_iter: Vec<usize> = match asset_bidx_c
+                                    .iter()
+                                    .find(|(n, _)| n == name)
+                                {
+                                    Some((_, sel)) => sel.iter().map(|&b| b as usize).collect(),
+                                    None => (1..=nb).collect(),
+                                };
+                                for b in bands_iter {
                                     if let Some(v) = obj.get(&format!("b{b}")) {
                                         let mut band_val = v.clone();
                                         if let Some(bobj) = band_val.as_object_mut() {
@@ -3974,7 +4212,7 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                 let data = render_crs_bbox(
                     &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -4078,7 +4316,11 @@ where
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
-                        if !tile_intersects_cog(&engine, &cogs[0], tms, TileCoord { z, x, y }, pq_stac.buffer, treq.tile_size)? {
+                        let any_intersects = cogs.iter().any(|c| {
+                            tile_intersects_cog(&engine, c, tms, TileCoord { z, x, y }, pq_stac.buffer, treq.tile_size)
+                                .unwrap_or(false)
+                        });
+                        if !any_intersects {
                             return Err(EngineError::NotFound(format!(
                                 "Tile {z}/{x}/{y} is outside image bounds"
                             )));
@@ -4226,9 +4468,18 @@ where
                 let mut all_names = Vec::new();
                 for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
-                        for (i, v) in vs.iter().enumerate() {
-                            all_vals.push(v.clone());
-                            all_names.push(format!("{name}_b{}", i + 1));
+                        if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
+                            for &b in sel {
+                                if let Some(v) = vs.get((b as usize).saturating_sub(1)) {
+                                    all_vals.push(v.clone());
+                                    all_names.push(format!("{name}_b{b}"));
+                                }
+                            }
+                        } else {
+                            for (i, v) in vs.iter().enumerate() {
+                                all_vals.push(v.clone());
+                                all_names.push(format!("{name}_b{}", i + 1));
+                            }
                         }
                     }
                 }
@@ -4379,35 +4630,43 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (def_w, def_h) = aspect_preserving_dims(bbox, pq_stac.max_size);
-                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
-                let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
-                    let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
-                    let dst_bbox = reproject_wgs84_bounds(wgs_bbox, dst_crs)?;
-                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let (data, out_bbox, out_w, out_h, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
+                    let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, dst_crs)?
+                    };
+                    let (def_w, def_h) = aspect_preserving_dims(dst_bbox, pq_stac.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
-                    (d, dst_bbox, dst_epsg)
+                    (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else if pq_stac.coord_crs_3857 {
-                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
+                    let (def_w, def_h) = aspect_preserving_dims(bbox, pq_stac.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 3857);
                     let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
-                    (d, bbox, 3857u16)
+                    (d, bbox, out_w, out_h, 3857u16)
                 } else {
                     let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
-                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                    let (def_w, def_h) = aspect_preserving_dims(wgs_bbox, pq_stac.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
-                    (d, wgs_bbox, 4326u16)
+                    (d, wgs_bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
                 Ok((data, ct))
@@ -4443,9 +4702,13 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
-                    let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
-                    let dst_bbox = reproject_wgs84_bounds(wgs_bbox, dst_crs)?;
-                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                    let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, dst_crs)?
+                    };
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -4453,7 +4716,7 @@ where
                     .await?;
                     (d, dst_bbox, dst_epsg)
                 } else if pq_stac.coord_crs_3857 {
-                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), false);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 3857);
                     let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -4462,7 +4725,7 @@ where
                     (d, bbox, 3857u16)
                 } else {
                     let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
-                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
@@ -4506,7 +4769,8 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let target_epsg = pq_stac.dst_crs.as_ref().map(|(_, e)| *e).unwrap_or(4326);
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq_stac.shape_mask.then_some(&mask);
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
@@ -4561,7 +4825,8 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let (def_w, def_h) = aspect_preserving_dims(bbox, s);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
-                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let target_epsg = pq_stac.dst_crs.as_ref().map(|(_, e)| *e).unwrap_or(4326);
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq_stac.shape_mask.then_some(&mask);
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
@@ -4832,7 +5097,11 @@ where
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
 
-                        if !tile_intersects_cog(&engine, &cogs[0], tms, TileCoord { z, x, y }, pq.buffer, treq.tile_size)? {
+                        let any_intersects = cogs.iter().any(|c| {
+                            tile_intersects_cog(&engine, c, tms, TileCoord { z, x, y }, pq.buffer, treq.tile_size)
+                                .unwrap_or(false)
+                        });
+                        if !any_intersects {
                             return Err(EngineError::NotFound(format!(
                                 "Tile {z}/{x}/{y} is outside image bounds"
                             )));
@@ -4996,7 +5265,7 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                 let data = render_crs_bbox(
                     &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -5171,35 +5440,43 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
-                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
-                let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
-                    let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
-                    let dst_bbox = reproject_wgs84_bounds(wgs_bbox, dst_crs)?;
-                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let (data, out_bbox, out_w, out_h, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
+                    let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, dst_crs)?
+                    };
+                    let (def_w, def_h) = aspect_preserving_dims(dst_bbox, pq.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?;
-                    (d, dst_bbox, dst_epsg)
+                    (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else if pq.coord_crs_3857 {
-                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
+                    let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 3857);
                     let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?;
-                    (d, bbox, 3857u16)
+                    (d, bbox, out_w, out_h, 3857u16)
                 } else {
                     let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
-                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                    let (def_w, def_h) = aspect_preserving_dims(wgs_bbox, pq.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?;
-                    (d, wgs_bbox, 4326u16)
+                    (d, wgs_bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq.return_mask);
                 Ok((data, ct))
@@ -5225,9 +5502,13 @@ where
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
-                    let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
-                    let dst_bbox = reproject_wgs84_bounds(wgs_bbox, dst_crs)?;
-                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                    let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, dst_crs)?
+                    };
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -5235,7 +5516,7 @@ where
                     .await?;
                     (d, dst_bbox, dst_epsg)
                 } else if pq.coord_crs_3857 {
-                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), false);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 3857);
                     let d = render_mercator_bbox(
                         &engine, &cogs, bbox, out_w, out_h, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -5244,7 +5525,7 @@ where
                     (d, bbox, 3857u16)
                 } else {
                     let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
-                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, wgs_bbox, out_w, out_h, None, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -5280,7 +5561,8 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
-                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let target_epsg = pq.dst_crs.as_ref().map(|(_, e)| *e).unwrap_or(4326);
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq.shape_mask.then_some(&mask);
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
@@ -5322,7 +5604,8 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let target_epsg = pq.dst_crs.as_ref().map(|(_, e)| *e).unwrap_or(4326);
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq.shape_mask.then_some(&mask);
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
