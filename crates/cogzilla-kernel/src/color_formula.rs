@@ -216,6 +216,21 @@ impl ColorFormula {
         if stride < 3 {
             return;
         }
+        // Fast hoisted single-LUT path (the common Gamma / Sigmoidal case with no Saturation).
+        if let [ColorStage::Lut { r: lr, g: lg, b: lb }] = self.stages.as_slice() {
+            let mut i = 0;
+            while i + stride <= buf.len() {
+                if stride == 4 && buf[i + 3] == 0 {
+                    i += 4;
+                    continue;
+                }
+                buf[i] = lr[buf[i] as usize];
+                buf[i + 1] = lg[buf[i + 1] as usize];
+                buf[i + 2] = lb[buf[i + 2] as usize];
+                i += stride;
+            }
+            return;
+        }
         let mut i = 0;
         while i + stride <= buf.len() {
             if stride == 4 && buf[i + 3] == 0 {
@@ -231,20 +246,31 @@ impl ColorFormula {
     }
 }
 
+/// Bit-exact 256-entry sRGB u8 -> linear f32 LUT (avoids 3x `powf(2.4)` per pixel in LCH Saturation).
+#[inline(always)]
+fn srgb_to_lin_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let u = (i as f32) * (1.0 / 255.0);
+            *slot = if u <= 0.04045 {
+                u * (1.0 / 12.92)
+            } else {
+                ((u + 0.055) * (1.0 / 1.055)).powf(2.4)
+            };
+        }
+        t
+    })
+}
+
 /// CIE LCH (D65) saturation matching `rio-color`'s `Saturation` operation.
 /// Scaling chroma `C *= sat` at constant hue `H` is mathematically identical to scaling
 /// CIE Lab `(a, b)` by `sat` directly without trigonometric round-trips.
 #[inline(always)]
 fn apply_lch_saturation(r: u8, g: u8, b: u8, sat: f32) -> (u8, u8, u8) {
-    #[inline(always)]
-    fn srgb_to_lin(c: u8) -> f32 {
-        let u = (c as f32) * (1.0 / 255.0);
-        if u <= 0.04045 {
-            u * (1.0 / 12.92)
-        } else {
-            ((u + 0.055) * (1.0 / 1.055)).powf(2.4)
-        }
-    }
+    let lin_lut = srgb_to_lin_lut();
+    let srgb_to_lin = |c: u8| -> f32 { lin_lut[c as usize] };
     #[inline(always)]
     fn lin_to_srgb(u: f32) -> u8 {
         let c = u.clamp(0.0, 1.0);

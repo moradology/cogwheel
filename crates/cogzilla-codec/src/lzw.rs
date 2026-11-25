@@ -36,6 +36,9 @@ impl LzwDecoder {
         let src_bits = src_len * 8;
 
         let out_len = out.len();
+        if out_len > u32::MAX as usize {
+            return Err(CodecError::Lzw("LZW output buffer exceeds 4 GiB limit"));
+        }
         let out_ptr = out.as_mut_ptr();
 
         let mut bit_pos: usize = 0;
@@ -344,6 +347,8 @@ impl LzwDecoder {
             }
         }
 
+        let clear_end = (out_pos + 8).min(out_len);
+        out[out_pos..clear_end].fill(0);
         Ok(out_pos)
     }
 }
