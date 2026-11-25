@@ -898,6 +898,21 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
             assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
+            // Empty buffered /mosaicjson/tiles must honor ?buffer=8 -> 272x272 PNG
+            let mj_empty_buf = client
+                .get(format!(
+                    "{base}/mosaicjson/tiles/WebMercatorQuad/12/0/0.png?url={mj_url}&buffer=8"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_empty_buf.status(), 200);
+            let mj_eb_bytes = mj_empty_buf.bytes().await.unwrap();
+            assert_eq!(&mj_eb_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            let eb_w = u32::from_be_bytes([mj_eb_bytes[16], mj_eb_bytes[17], mj_eb_bytes[18], mj_eb_bytes[19]]);
+            let eb_h = u32::from_be_bytes([mj_eb_bytes[20], mj_eb_bytes[21], mj_eb_bytes[22], mj_eb_bytes[23]]);
+            assert_eq!((eb_w, eb_h), (272, 272));
+
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
                 .post(format!("{base}/mosaic/register"))

@@ -754,34 +754,62 @@ impl CogStore {
                 LookupResult::Owner => {
                     let guard = self.cache.guard(key);
                     let rows = ifd.block_height(tile_idx);
-                    let mut decoded = decode_tile_rows(
-                        slice,
-                        ifd,
-                        cog.index.byte_order,
-                        cog.index.nodata,
-                        rows,
-                    )?;
-                    if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                        if mask_ifd.tile_width == ifd.tile_width
-                            && mask_ifd.tile_height == ifd.tile_height
-                        {
-                            let per_plane =
-                                (ifd.tiles_across as usize) * (ifd.tiles_down as usize);
-                            let mask_idx = (tile_idx as usize) % per_plane.max(1);
-                            match mask_tile_range(mask_ifd, mask_idx) {
-                                SidecarTileRange::Present(moff, mlen) => {
-                                    let Some(mslice) = cog.source.local_slice(moff, mlen) else {
+                    let decode_res: Result<DecodedTile, IoError> = (|| {
+                        let mut decoded = decode_tile_rows(
+                            slice,
+                            ifd,
+                            cog.index.byte_order,
+                            cog.index.nodata,
+                            rows,
+                        )?;
+                        if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                            if mask_ifd.tile_width == ifd.tile_width
+                                && mask_ifd.tile_height == ifd.tile_height
+                            {
+                                let per_plane =
+                                    (ifd.tiles_across as usize) * (ifd.tiles_down as usize);
+                                let mask_idx = (tile_idx as usize) % per_plane.max(1);
+                                match mask_tile_range(mask_ifd, mask_idx) {
+                                    SidecarTileRange::Present(moff, mlen) => {
+                                        let Some(mslice) = cog.source.local_slice(moff, mlen) else {
+                                            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                                required: moff.saturating_add(mlen as u64),
+                                                available: 0,
+                                            }));
+                                        };
+                                        let mask = decode_mask_tile_rows(
+                                            mslice,
+                                            mask_ifd,
+                                            mask_ifd.block_height(mask_idx),
+                                        )?;
+                                        apply_mask_to_tile(&mut decoded, &mask);
+                                    }
+                                    SidecarTileRange::SparseTransparent => {
+                                        mark_tile_all_nodata(&mut decoded);
+                                    }
+                                    SidecarTileRange::NotApplicable => {}
+                                }
+                            }
+                        }
+                        if let Some(alpha_plane) = planar_alpha_plane(ifd) {
+                            match planar_alpha_tile_range(ifd, tile_idx, alpha_plane) {
+                                SidecarTileRange::Present(aoff, alen) => {
+                                    let Some(aslice) = cog.source.local_slice(aoff, alen) else {
                                         return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                            required: moff.saturating_add(mlen as u64),
+                                            required: aoff.saturating_add(alen as u64),
                                             available: 0,
                                         }));
                                     };
-                                    let mask = decode_mask_tile_rows(
-                                        mslice,
-                                        mask_ifd,
-                                        mask_ifd.block_height(mask_idx),
+                                    let alpha_tile = decode_tile_rows(
+                                        aslice,
+                                        ifd,
+                                        cog.index.byte_order,
+                                        None,
+                                        rows,
                                     )?;
-                                    apply_mask_to_tile(&mut decoded, &mask);
+                                    if let Some(ab) = alpha_tile.bands.first() {
+                                        apply_alpha_band_to_tile(&mut decoded, ab);
+                                    }
                                 }
                                 SidecarTileRange::SparseTransparent => {
                                     mark_tile_all_nodata(&mut decoded);
@@ -789,33 +817,16 @@ impl CogStore {
                                 SidecarTileRange::NotApplicable => {}
                             }
                         }
-                    }
-                    if let Some(alpha_plane) = planar_alpha_plane(ifd) {
-                        match planar_alpha_tile_range(ifd, tile_idx, alpha_plane) {
-                            SidecarTileRange::Present(aoff, alen) => {
-                                let Some(aslice) = cog.source.local_slice(aoff, alen) else {
-                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                        required: aoff.saturating_add(alen as u64),
-                                        available: 0,
-                                    }));
-                                };
-                                let alpha_tile = decode_tile_rows(
-                                    aslice,
-                                    ifd,
-                                    cog.index.byte_order,
-                                    None,
-                                    rows,
-                                )?;
-                                if let Some(ab) = alpha_tile.bands.first() {
-                                    apply_alpha_band_to_tile(&mut decoded, ab);
-                                }
-                            }
-                            SidecarTileRange::SparseTransparent => {
-                                mark_tile_all_nodata(&mut decoded);
-                            }
-                            SidecarTileRange::NotApplicable => {}
+                        Ok(decoded)
+                    })();
+                    let decoded = match decode_res {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let shared = Arc::new(e);
+                            guard.fail(shared.clone());
+                            return Err(IoError::Shared(shared));
                         }
-                    }
+                    };
                     let arc = Arc::new(decoded);
                     guard.complete(arc.clone());
                     out[slot] = Some(arc);
@@ -870,6 +881,7 @@ impl CogStore {
         // and huge/duplicate compressed tile_byte_counts cannot trigger multi-GiB transfers.
         const MAX_COMPRESSED_TILE_BYTES: u32 = 64 * 1024 * 1024;
         const MAX_COMPRESSED_BYTES_PER_REQUEST: u64 = 256 * 1024 * 1024;
+        let alpha_plane_cap = planar_alpha_plane(ifd);
         let mut total_compressed: u64 = 0;
         for tidx in tile_indices.iter().flatten() {
             let bc = ifd.tile_byte_counts.get(*tidx as usize).copied().unwrap_or(0);
@@ -888,6 +900,16 @@ impl CogStore {
                     )));
                 }
                 total_compressed = total_compressed.saturating_add(mbc as u64);
+            }
+            if let Some(ap) = alpha_plane_cap
+                && let SidecarTileRange::Present(_, abc) = planar_alpha_tile_range(ifd, *tidx, ap)
+            {
+                if abc > MAX_COMPRESSED_TILE_BYTES {
+                    return Err(IoError::Tiff(TiffError::Corrupt(
+                        "compressed alpha tile exceeds 64 MiB limit",
+                    )));
+                }
+                total_compressed = total_compressed.saturating_add(abc as u64);
             }
             if total_compressed > MAX_COMPRESSED_BYTES_PER_REQUEST {
                 return Err(IoError::Tiff(TiffError::Corrupt(
@@ -974,33 +996,47 @@ impl CogStore {
                         let src = cog.source.clone();
                         let meta = decode_meta.clone();
                         decode_set.spawn(async move {
-                            let _permit = sem.acquire_owned().await.map_err(|e| {
-                                IoError::Fs(std::io::Error::other(format!(
-                                    "heavy CPU semaphore closed: {e}"
-                                )))
-                            })?;
-                            let decoded = tokio::task::spawn_blocking(move || {
-                                let Some(slice) = src.local_slice(offset, count) else {
-                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                        required: offset.saturating_add(count as u64),
-                                        available: 0,
-                                    }));
-                                };
-                                Ok::<_, IoError>(decode_tile_rows(
-                                    slice, &meta, byte_order, nodata, rows,
-                                )?)
-                            })
-                            .await
-                            .map_err(|e| {
-                                IoError::Fs(std::io::Error::other(format!(
-                                    "heavy local decode task failed: {e}"
-                                )))
-                            })??;
-                            let arc = Arc::new(decoded);
-                            if let Some(guard) = guard_opt {
-                                guard.complete(arc.clone());
+                            let res: Result<DecodedTile, IoError> = async {
+                                let _permit = sem.acquire_owned().await.map_err(|e| {
+                                    IoError::Fs(std::io::Error::other(format!(
+                                        "heavy CPU semaphore closed: {e}"
+                                    )))
+                                })?;
+                                tokio::task::spawn_blocking(move || {
+                                    let Some(slice) = src.local_slice(offset, count) else {
+                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                            required: offset.saturating_add(count as u64),
+                                            available: 0,
+                                        }));
+                                    };
+                                    Ok::<_, IoError>(decode_tile_rows(
+                                        slice, &meta, byte_order, nodata, rows,
+                                    )?)
+                                })
+                                .await
+                                .map_err(|e| {
+                                    IoError::Fs(std::io::Error::other(format!(
+                                        "heavy local decode task failed: {e}"
+                                    )))
+                                })?
                             }
-                            Ok::<_, IoError>((orig_slot, arc))
+                            .await;
+                            match res {
+                                Ok(decoded) => {
+                                    let arc = Arc::new(decoded);
+                                    if let Some(guard) = guard_opt {
+                                        guard.complete(arc.clone());
+                                    }
+                                    Ok::<_, IoError>((orig_slot, arc))
+                                }
+                                Err(e) => {
+                                    let shared = Arc::new(e);
+                                    if let Some(guard) = guard_opt {
+                                        guard.fail(shared.clone());
+                                    }
+                                    Err(IoError::Shared(shared))
+                                }
+                            }
                         });
                     }
 
@@ -1049,19 +1085,31 @@ impl CogStore {
                         let src = cog.source.clone();
                         let meta = decode_meta.clone();
                         decode_set.spawn(async move {
-                            let Some(slice) = src.local_slice(offset, count) else {
-                                return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                    required: offset.saturating_add(count as u64),
-                                    available: 0,
-                                }));
-                            };
-                            let decoded =
-                                decode_tile_rows(slice, &meta, byte_order, nodata, rows)?;
-                            let arc = Arc::new(decoded);
-                            if let Some(guard) = guard_opt {
-                                guard.complete(arc.clone());
+                            let res: Result<DecodedTile, IoError> = (|| {
+                                let Some(slice) = src.local_slice(offset, count) else {
+                                    return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                        required: offset.saturating_add(count as u64),
+                                        available: 0,
+                                    }));
+                                };
+                                Ok(decode_tile_rows(slice, &meta, byte_order, nodata, rows)?)
+                            })();
+                            match res {
+                                Ok(decoded) => {
+                                    let arc = Arc::new(decoded);
+                                    if let Some(guard) = guard_opt {
+                                        guard.complete(arc.clone());
+                                    }
+                                    Ok::<_, IoError>((orig_slot, arc))
+                                }
+                                Err(e) => {
+                                    let shared = Arc::new(e);
+                                    if let Some(guard) = guard_opt {
+                                        guard.fail(shared.clone());
+                                    }
+                                    Err(IoError::Shared(shared))
+                                }
                             }
-                            Ok::<_, IoError>((orig_slot, arc))
                         });
                     }
 
@@ -1087,41 +1135,74 @@ impl CogStore {
                     let byte_order = cog.index.byte_order;
                     let nodata = cog.index.nodata;
                     for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
-                        let Some(slice) = cog.source.local_slice(offset, count) else {
-                            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                required: offset.saturating_add(count as u64),
-                                available: 0,
-                            }));
-                        };
-                        let rows = tile_indices[orig_slot]
-                            .map(|tidx| ifd.block_height(tidx))
-                            .unwrap_or(ifd.tile_height);
-                        let mut decoded = decode_tile_rows(slice, ifd, byte_order, nodata, rows)?;
-                        if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                            if mask_ifd.tile_width == ifd.tile_width
-                                && mask_ifd.tile_height == ifd.tile_height
-                            {
+                        let decode_res: Result<DecodedTile, IoError> = (|| {
+                            let Some(slice) = cog.source.local_slice(offset, count) else {
+                                return Err(IoError::Tiff(TiffError::NeedMoreBytes {
+                                    required: offset.saturating_add(count as u64),
+                                    available: 0,
+                                }));
+                            };
+                            let rows = tile_indices[orig_slot]
+                                .map(|tidx| ifd.block_height(tidx))
+                                .unwrap_or(ifd.tile_height);
+                            let mut decoded =
+                                decode_tile_rows(slice, ifd, byte_order, nodata, rows)?;
+                            if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
+                                if mask_ifd.tile_width == ifd.tile_width
+                                    && mask_ifd.tile_height == ifd.tile_height
+                                {
+                                    if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                                        let per_plane = (ifd.tiles_across as usize)
+                                            * (ifd.tiles_down as usize);
+                                        let mask_idx = (*tidx as usize) % per_plane.max(1);
+                                        match mask_tile_range(mask_ifd, mask_idx) {
+                                            SidecarTileRange::Present(moff, mlen) => {
+                                                let Some(mslice) =
+                                                    cog.source.local_slice(moff, mlen)
+                                                else {
+                                                    return Err(IoError::Tiff(
+                                                        TiffError::NeedMoreBytes {
+                                                            required: moff
+                                                                .saturating_add(mlen as u64),
+                                                            available: 0,
+                                                        },
+                                                    ));
+                                                };
+                                                let mask = decode_mask_tile_rows(
+                                                    mslice,
+                                                    mask_ifd,
+                                                    mask_ifd.block_height(mask_idx),
+                                                )?;
+                                                apply_mask_to_tile(&mut decoded, &mask);
+                                            }
+                                            SidecarTileRange::SparseTransparent => {
+                                                mark_tile_all_nodata(&mut decoded);
+                                            }
+                                            SidecarTileRange::NotApplicable => {}
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(ap) = alpha_plane {
                                 if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
-                                    let per_plane = (ifd.tiles_across as usize)
-                                        * (ifd.tiles_down as usize);
-                                    let mask_idx = (*tidx as usize) % per_plane.max(1);
-                                    match mask_tile_range(mask_ifd, mask_idx) {
-                                        SidecarTileRange::Present(moff, mlen) => {
-                                            let Some(mslice) = cog.source.local_slice(moff, mlen)
+                                    match planar_alpha_tile_range(ifd, *tidx, ap) {
+                                        SidecarTileRange::Present(aoff, alen) => {
+                                            let Some(aslice) = cog.source.local_slice(aoff, alen)
                                             else {
                                                 return Err(IoError::Tiff(
                                                     TiffError::NeedMoreBytes {
-                                                        required: moff.saturating_add(mlen as u64),
+                                                        required: aoff
+                                                            .saturating_add(alen as u64),
                                                         available: 0,
                                                     },
                                                 ));
                                             };
-                                            let mask = decode_mask_tile_rows(
-                                                mslice,
-                                                mask_ifd,
-                                                mask_ifd.block_height(mask_idx),
+                                            let alpha_tile = decode_tile_rows(
+                                                aslice, ifd, byte_order, None, rows,
                                             )?;
-                                            apply_mask_to_tile(&mut decoded, &mask);
+                                            if let Some(ab) = alpha_tile.bands.first() {
+                                                apply_alpha_band_to_tile(&mut decoded, ab);
+                                            }
                                         }
                                         SidecarTileRange::SparseTransparent => {
                                             mark_tile_all_nodata(&mut decoded);
@@ -1130,31 +1211,18 @@ impl CogStore {
                                     }
                                 }
                             }
-                        }
-                        if let Some(ap) = alpha_plane {
-                            if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
-                                match planar_alpha_tile_range(ifd, *tidx, ap) {
-                                    SidecarTileRange::Present(aoff, alen) => {
-                                        let Some(aslice) = cog.source.local_slice(aoff, alen)
-                                        else {
-                                            return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                                required: aoff.saturating_add(alen as u64),
-                                                available: 0,
-                                            }));
-                                        };
-                                        let alpha_tile =
-                                            decode_tile_rows(aslice, ifd, byte_order, None, rows)?;
-                                        if let Some(ab) = alpha_tile.bands.first() {
-                                            apply_alpha_band_to_tile(&mut decoded, ab);
-                                        }
-                                    }
-                                    SidecarTileRange::SparseTransparent => {
-                                        mark_tile_all_nodata(&mut decoded);
-                                    }
-                                    SidecarTileRange::NotApplicable => {}
+                            Ok(decoded)
+                        })();
+                        let decoded = match decode_res {
+                            Ok(d) => d,
+                            Err(e) => {
+                                let shared = Arc::new(e);
+                                if let Some(guard) = guard_opt {
+                                    guard.fail(shared.clone());
                                 }
+                                return Err(IoError::Shared(shared));
                             }
-                        }
+                        };
                         let arc = Arc::new(decoded);
                         if let Some(guard) = guard_opt {
                             guard.complete(arc.clone());
