@@ -2219,6 +2219,8 @@ struct Look<'a> {
     asked: Option<(OutputFormat, &'static str)>,
     jpeg_quality: u8,
     return_mask: bool,
+    /// Whether a colour map was named: one band is then a picture in colour, not a grey one.
+    mapped: bool,
 }
 
 impl PlanesTile {
@@ -2282,7 +2284,8 @@ impl PlanesTile {
                 "Could not encode array of shape (2,{height},{width}) and of datatype `uint8` using JPEG driver"
             )));
         }
-        encode_picture(rgba, width, height, look.formula, Some(asked), look.jpeg_quality, look.return_mask)
+        let grey = bands == 1 && !look.mapped && look.custom.is_none();
+        encode_picture(rgba, width, height, look.formula, Some(asked), look.jpeg_quality, look.return_mask, grey)
     }
 }
 
@@ -2752,6 +2755,7 @@ async fn part_image(
             let look = Look {
                 rescale: &pq.rescale,
                 colormap: pq.colormap,
+                mapped: pq.colormap_explicit,
                 custom: custom.as_ref(),
                 formula: formula.as_ref(),
                 asked: format.map(|(f, ct)| (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct })),
@@ -4271,6 +4275,7 @@ async fn tile(
                 let look = Look {
                     rescale: &pq.rescale,
                     colormap: pq.colormap,
+                    mapped: pq.colormap_explicit,
                     custom: custom.as_ref(),
                     formula: formula.as_ref(),
                     asked,
@@ -4360,7 +4365,8 @@ async fn tile(
                 engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?.to_vec()
             };
             let asked = (!auto_format).then_some((asked, content_type));
-            encode_picture(rgba, dim, dim, formula.as_ref(), asked, jpeg_quality, return_mask)
+            let grey = selection.is_some() && !pq.colormap_explicit && TileEngine::value_bands(&treq.bands) == 1;
+            encode_picture(rgba, dim, dim, formula.as_ref(), asked, jpeg_quality, return_mask, grey)
                 .map(|made| as_geotiff(made, dim, dim, lies, 3857, return_mask))
         })
         .await;
@@ -4445,9 +4451,14 @@ fn encode_picture(
     asked: Option<(OutputFormat, &'static str)>,
     jpeg_quality: u8,
     return_mask: bool,
+    grey: bool,
 ) -> Result<(Bytes, &'static str), EngineError> {
     if let Some(formula) = formula {
         formula.apply_buffer_in_place(&mut rgba, 4);
+        // One band is the formula's red, and the picture is of that band alone.
+        if grey {
+            rgba.chunks_exact_mut(4).for_each(|p| (p[1], p[2]) = (p[0], p[0]));
+        }
     }
     let (format, content_type) = match asked {
         Some(asked) => asked,
@@ -4460,7 +4471,40 @@ fn encode_picture(
     // quicker to write, which is what the renderer does for its own tiles.
     let alpha = return_mask
         && !(matches!(format, OutputFormat::Png) && rgba.chunks_exact(4).all(|p| p[3] == 255));
+    // One band is a grey picture, as TiTiler writes it: a PNG of one channel, or two
+    // with the mask, and a JPEG of one component. WebP has no such picture.
+    if grey && rgba.len() == width * height * 4 {
+        match format {
+            OutputFormat::Png => return Ok((grey_png(&rgba, width, height, alpha), content_type)),
+            OutputFormat::Jpeg { quality } => {
+                let luma: Vec<u8> = rgba.chunks_exact(4).map(|p| if p[3] == 0 { 0 } else { p[0] }).collect();
+                return Ok((cogzilla_kernel::jpeg_fast::encode_jpeg_luma(width as u32, height as u32, &luma, quality), content_type));
+            }
+            _ => {}
+        }
+    }
     Ok((encode_rgba_output(width, height, &rgba, format, alpha), content_type))
+}
+
+/// A grey PNG of an RGBA picture whose red is the grey: one channel, or two with `alpha`.
+/// Without it a pixel that is not there is black, as it is in the RGB the renderer writes.
+fn grey_png(rgba: &[u8], width: usize, height: usize, alpha: bool) -> Bytes {
+    let channels = if alpha { 2 } else { 1 };
+    let stride = 1 + width * channels;
+    let mut filtered = vec![0u8; height * stride];
+    for (row, out) in rgba.chunks_exact(width * 4).zip(filtered.chunks_exact_mut(stride)) {
+        // PNG's Sub filter: each byte less the same channel of the pixel before.
+        out[0] = 1;
+        let mut before = [0u8; 2];
+        for (p, o) in row.chunks_exact(4).zip(out[1..].chunks_exact_mut(channels)) {
+            let now = [if p[3] == 0 && !alpha { 0 } else { p[0] }, p[3]];
+            for c in 0..channels {
+                o[c] = now[c].wrapping_sub(before[c]);
+            }
+            before = now;
+        }
+    }
+    cogzilla_kernel::png_fast::encode_filtered_png(width as u32, height as u32, if alpha { 4 } else { 0 }, &filtered)
 }
 
 /// What the router does with `/collections/{c}/items/{i}/...`.
