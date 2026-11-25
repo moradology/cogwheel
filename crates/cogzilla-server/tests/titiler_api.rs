@@ -145,14 +145,21 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     }
     let st_custom = get_json(
         &client,
-        format!("{base}/cog/statistics?url={sat_url}&bidx=1&p=5&p=95&histogram_bins=20&categorical=true"),
+        format!("{base}/cog/statistics?url={sat_url}&bidx=1&p=5&p=95&histogram_bins=20"),
     )
     .await;
     assert_eq!(st_custom.as_object().unwrap().len(), 1);
     assert!(st_custom["b1"]["percentile_5"].is_number());
     assert!(st_custom["b1"]["percentile_95"].is_number());
     assert_eq!(st_custom["b1"]["histogram"][0].as_array().unwrap().len(), 20);
-    assert!(st_custom["b1"]["categories"].is_object());
+    let st_cat = get_json(
+        &client,
+        format!("{base}/cog/statistics?url={sat_url}&bidx=1&max_size=64&categorical=true&c=0&c=1"),
+    )
+    .await;
+    assert_eq!(st_cat["b1"]["histogram"][0].as_array().unwrap().len(), 2);
+    assert_eq!(st_cat["b1"]["histogram"][1], serde_json::json!([0, 1]));
+    assert!(st_cat["b1"]["categories"].is_object());
 
     let pt_expr = get_json(
         &client,
@@ -176,8 +183,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         format!("{base}/cog/statistics?url={sat_url}&expression=b1-b2;b2-b3"),
     )
     .await;
-    assert!(st_expr["b1-b2"]["mean"].is_number());
-    assert!(st_expr["b2-b3"]["mean"].is_number());
+    assert!(st_expr["b1"]["mean"].is_number());
+    assert_eq!(st_expr["b1"]["description"], "b1-b2");
+    assert!(st_expr["b2"]["mean"].is_number());
+    assert_eq!(st_expr["b2"]["description"], "b2-b3");
 
     let pt_multi = get_json(
         &client,
@@ -1130,7 +1139,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 format!("{base}/cog/statistics?url={merc_url}&expression=42&max_size=64"),
             )
             .await;
-            assert!((const_stats["42"]["mean"].as_f64().unwrap() - 42.0).abs() < 1e-4);
+            assert!((const_stats["b1"]["mean"].as_f64().unwrap() - 42.0).abs() < 1e-4);
+            assert_eq!(const_stats["b1"]["description"], "42");
 
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];

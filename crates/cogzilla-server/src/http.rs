@@ -29,7 +29,8 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
-    build_map_html, build_tilejson, build_wmts_capabilities, compute_statistics_with_options,
+    build_map_html, build_tilejson, build_wmts_capabilities, compute_f32_band_stats,
+    compute_statistics_with_options,
     encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output, get_algorithm_json,
     list_algorithms_json, query_point,
     render_crs_bbox, render_mercator_bbox, render_native_preview, render_wgs84_bbox,
@@ -852,8 +853,15 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
     }
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics") || family == "colorMaps") {
+        if let Some(k) = has(&["width", "height"]) {
+            return Err(format!(
+                "parameter '{k}' is only supported on preview, bbox, feature, map, statistics, and colorMaps routes"
+            ));
+        }
+    }
     if !(route("preview") || route("bbox") || route("feature") || is_ogc_map) {
-        if let Some(k) = has(&["width", "height", "dst_crs"]) {
+        if let Some(k) = has(&["dst_crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, and map routes"
             ));
@@ -868,12 +876,25 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     }
     if route("statistics") || route("asset_statistics") {
         if let Some(k) = has(&["algorithm"]) {
-            return Err(format!("parameter '{k}' is not supported on statistics routes"));
+            if segs[0] != "cog" || route("asset_statistics") {
+                return Err(format!("parameter '{k}' is only supported on /cog/statistics routes"));
+            }
+            if let Some(alg) = pq.algorithm.as_deref() {
+                let low = alg.to_ascii_lowercase();
+                if matches!(
+                    low.as_str(),
+                    "hillshade" | "slope" | "aspect" | "contours" | "terrarium" | "terrainrgb"
+                ) {
+                    return Err(format!(
+                        "algorithm '{alg}' is not supported on statistics routes"
+                    ));
+                }
+            }
         }
-        if segs[0] != "cog" || route("asset_statistics") {
+        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
             if let Some(k) = has(&["expression", "expr", "index"]) {
                 return Err(format!(
-                    "parameter '{k}' is only supported on /cog/statistics routes"
+                    "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
         }
@@ -2173,6 +2194,14 @@ fn build_tile_request_for_tms(
 }
 
 fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
+    build_stats_options_with_bands(pq, allow_expr, 0)
+}
+
+fn build_stats_options_with_bands(
+    pq: &ParsedQuery,
+    allow_expr: bool,
+    default_bands: u16,
+) -> Result<StatsOptions, EngineError> {
     let mut opts = StatsOptions::default();
     if !pq.percentiles.is_empty() {
         opts.percentiles = pq.percentiles.clone();
@@ -2188,6 +2217,8 @@ fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOption
     if !pq.bidx.is_empty() {
         opts.bidx = Some(pq.bidx.clone());
     }
+    opts.width = pq.width;
+    opts.height = pq.height;
     if allow_expr
         && let Some(raw) = pq.expr_raw.as_deref()
     {
@@ -2204,6 +2235,65 @@ fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOption
         if !compiled.is_empty() {
             opts.expressions = Some(compiled);
         }
+    } else if allow_expr
+        && let Some(alg_raw) = pq.algorithm.as_deref()
+    {
+        let bands: Vec<u16> = if !pq.bidx.is_empty() {
+            pq.bidx.clone()
+        } else {
+            (1..=default_bands.clamp(1, 16)).collect()
+        };
+        let alg = alg_raw.to_ascii_lowercase();
+        let expr_str = match alg.as_str() {
+            "normalizedindex" => {
+                if bands.len() < 2 {
+                    return Err(EngineError::BadRequest(
+                        "algorithm 'normalizedIndex' requires at least 2 bands".into(),
+                    ));
+                }
+                format!("(b{} - b{}) / (b{} + b{})", bands[1], bands[0], bands[1], bands[0])
+            }
+            "min" | "max" => {
+                let mut acc = format!("b{}", bands[0]);
+                for &b in &bands[1..] {
+                    acc = format!("{alg}({acc}, b{b})");
+                }
+                acc
+            }
+            "sum" => bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(" + "),
+            "mean" => {
+                let s = bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(" + ");
+                format!("({s}) / {}", bands.len())
+            }
+            "var" | "std" | "median" => {
+                let args = bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(", ");
+                format!("{alg}({args})")
+            }
+            "grayscale" => {
+                if bands.len() >= 3 {
+                    format!("0.299 * b{} + 0.587 * b{} + 0.114 * b{}", bands[0], bands[1], bands[2])
+                } else {
+                    format!("b{}", bands[0])
+                }
+            }
+            "bitonal" => {
+                let src = if bands.len() >= 3 {
+                    format!("(0.299 * b{} + 0.587 * b{} + 0.114 * b{})", bands[0], bands[1], bands[2])
+                } else {
+                    format!("b{}", bands[0])
+                };
+                format!("where({src} > {}, 255, 0)", pq.threshold)
+            }
+            "cast" => format!("clip(floor(b{}), 0, 255)", bands[0]),
+            "ceil" | "floor" => format!("{alg}(b{})", bands[0]),
+            _ => {
+                return Err(EngineError::BadRequest(format!(
+                    "algorithm '{alg_raw}' is not supported on statistics routes"
+                )));
+            }
+        };
+        let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
+        opts.expressions = Some(vec![(alg_raw.to_string(), prog)]);
     }
     Ok(opts)
 }
@@ -4628,8 +4718,61 @@ where
             (Method::GET, ["statistics"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (names, cogs, _) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                let (names, cogs, rewritten_expr) =
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                if let Some(ref expr_str) = rewritten_expr {
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let full = cogs[0].index.full_res();
+                    let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                    let stats_opts = build_stats_options(&pq, false)?;
+                    let parts: Vec<&str> = expr_str
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let mut map = serde_json::Map::new();
+                    for (idx, part) in parts.iter().enumerate() {
+                        let prog = ExprProgram::compile(part).map_err(EngineError::BadRequest)?;
+                        let mut bands = BandRequest::CustomExpr {
+                            prog,
+                            rescale: (0.0, 1.0),
+                            colormap: ColormapName::Grayscale,
+                        };
+                        if pq.unscale {
+                            apply_unscale_cogs(&mut bands, &cogs);
+                        }
+                        let raw = render_native_preview(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            OutputFormat::RawF32,
+                            pq.nodata,
+                            None,
+                            None,
+                            true,
+                            pq.unscale,
+                        )
+                        .await?;
+                        let pixels: Vec<f32> = raw
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let desc = pq.expr_raw.as_deref().unwrap_or(part);
+                        map.insert(
+                            format!("b{}", idx + 1),
+                            compute_f32_band_stats(&pixels, desc, &stats_opts),
+                        );
+                    }
+                    return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
+                }
                 let n = cogs.len();
                 let stats_opts = build_stats_options(&pq, false)?;
                 let mut set = tokio::task::JoinSet::new();
@@ -5756,7 +5899,8 @@ where
             // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
             (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let stats_opts = build_stats_options(&pq, true)?;
+                let db = cogs[0].index.full_res().samples_per_pixel;
+                let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
                 let json = compute_statistics_with_options(
                     &engine,
                     &cogs[0],
@@ -5773,7 +5917,8 @@ where
             (Method::POST, ["statistics"]) => async {
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let stats_opts = build_stats_options(&pq, true)?;
+                let db = cogs[0].index.full_res().samples_per_pixel;
+                let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
                 if body_bytes.is_empty() {
                     let json = compute_statistics_with_options(
                         &engine,

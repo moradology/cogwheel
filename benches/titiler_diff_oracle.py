@@ -362,9 +362,15 @@ def main():
             ("GET /cog/point (coord_crs=epsg:900913)", "GET", f"/cog/point/-13653336.0,4547451.0?url={sat}&coord_crs=epsg:900913", None, "json_point"),
             ("GET /cog/point?bidx=3&bidx=1", "GET", f"/cog/point/-122.65,37.773?url={sat}&bidx=3&bidx=1", None, "json_point"),
             ("GET /cog/point?expression=(b1-b2)/(b1+b2)", "GET", f"/cog/point/-122.65,37.773?url={sat}&expression=(b1-b2)/(b1%2Bb2)", None, "json_point"),
+            ("GET /cog/point?expression=where(b1>b2,1,0)", "GET", f"/cog/point/-122.65,37.773?url={sat}&expression=where(b1>b2,1,0)", None, "json_point"),
             ("GET /cog/statistics?max_size=512", "GET", f"/cog/statistics?url={sat}&max_size=512", None, "json_stats"),
             ("GET /cog/statistics?p=10&p=90&histogram_bins=10", "GET", f"/cog/statistics?url={sat}&max_size=256&p=10&p=90&histogram_bins=10", None, "json_stats_ext"),
             ("GET /cog/statistics?bidx=3&bidx=1", "GET", f"/cog/statistics?url={sat}&max_size=256&bidx=3&bidx=1", None, "json_stats_keys"),
+            ("GET /cog/statistics?categorical=true (uint8)", "GET", f"/cog/statistics?url={u8_path}&max_size=64&categorical=true", None, "json_stats_cat"),
+            ("GET /cog/statistics?categorical=true&c=10&c=20", "GET", f"/cog/statistics?url={u8_path}&max_size=64&categorical=true&c=10&c=20", None, "json_stats_cat"),
+            ("GET /cog/statistics?expression=(b1-b2)/(b1+b2)", "GET", f"/cog/statistics?url={sat}&max_size=128&expression=(b1-b2)/(b1%2Bb2)", None, "json_stats"),
+            ("GET /cog/statistics?algorithm=normalizedIndex", "GET", f"/cog/statistics?url={sat}&max_size=128&bidx=1&bidx=2&algorithm=normalizedIndex", None, "json_stats"),
+            ("GET /cog/statistics?width=64&height=64", "GET", f"/cog/statistics?url={sat}&width=64&height=64", None, "json_stats"),
             ("POST /cog/statistics (GeoJSON Polygon clip)", "POST", f"/cog/statistics?url={sat}&max_size=512", poly_feature, "json_post_stats"),
             ("POST /cog/statistics (Triangle clip)", "POST", f"/cog/statistics?url={sat}&max_size=256", tri_feature, "json_post_stats"),
             ("POST /cog/statistics (GeometryCollection overlap)", "POST", f"/cog/statistics?url={sat}&max_size=256", gc_overlap, "json_post_stats"),
@@ -428,6 +434,7 @@ def main():
             ("GET /stac/point/-122.65,37.773 (3-asset)", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_point"),
             ("GET /stac/asset_statistics?assets=red&assets=green", "GET", f"/stac/asset_statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stac_asset_stats"),
             ("GET /stac/statistics?assets=red&assets=green", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stats"),
+            ("GET /stac/statistics?expression=(b1-b2)/(b1+b2)", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=128&expression=(b1-b2)/(b1%2Bb2)", None, "json_stats"),
             ("POST /stac/statistics (Polygon)", "POST", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", poly_feature, "json_post_stats"),
             ("GET /stac/preview/256x256.png (3-asset RGB)", "GET", f"/stac/preview/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
             ("GET /stac/bbox/.../256x256.png (3-asset RGB)", "GET", f"/stac/bbox/-122.8,37.6,-122.5,37.9/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
@@ -529,6 +536,12 @@ def main():
                         j_cw, j_tt = r_cw.json(), r_tt.json()
                         ok = set(j_cw.keys()) == set(j_tt.keys())
                         parity = f"keys cw={sorted(j_cw.keys())} vs tt={sorted(j_tt.keys())}"
+                    elif kind == "json_stats_cat":
+                        h_cw, h_tt = r_cw.json()["b1"]["histogram"], r_tt.json()["b1"]["histogram"]
+                        ok = len(h_cw) == 2 and len(h_tt) == 2 and h_cw[1] == h_tt[1] and len(h_cw[0]) == len(h_tt[0])
+                        max_cnt_diff = max((abs(a - b) for a, b in zip(h_cw[0], h_tt[0])), default=0) if ok else -1
+                        ok = ok and max_cnt_diff <= 2
+                        parity = f"cats={len(h_cw[1])}=={len(h_tt[1])} max_cnt_diff={max_cnt_diff}"
                     elif kind == "json_post_stats":
                         j_cw = r_cw.json()["properties"]["statistics"]
                         j_tt = r_tt.json()["properties"]["statistics"]

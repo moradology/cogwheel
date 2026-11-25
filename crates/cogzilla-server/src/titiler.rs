@@ -1314,6 +1314,8 @@ pub struct StatsOptions {
     pub categories: Option<Vec<f64>>,
     pub bidx: Option<Vec<u16>>,
     pub expressions: Option<Vec<(String, cogzilla_kernel::ExprProgram)>>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 impl Default for StatsOptions {
@@ -1326,8 +1328,52 @@ impl Default for StatsOptions {
             categories: None,
             bidx: None,
             expressions: None,
+            width: None,
+            height: None,
         }
     }
+}
+
+fn build_categorical_histogram(
+    observed: &[(f64, u64)],
+    req_cats: &Option<Vec<f64>>,
+) -> serde_json::Value {
+    let val_json = |v: f64| -> serde_json::Value {
+        if v.fract() == 0.0 && v >= (i64::MIN as f64) && v <= (i64::MAX as f64) {
+            serde_json::json!(v as i64)
+        } else {
+            serde_json::json!(v)
+        }
+    };
+    if let Some(req) = req_cats {
+        let mut counts = Vec::with_capacity(req.len());
+        let mut vals = Vec::with_capacity(req.len());
+        for &c in req {
+            let cnt = observed
+                .iter()
+                .find(|(v, _)| (v - c).abs() <= 1e-6)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            counts.push(cnt);
+            vals.push(val_json(c));
+        }
+        serde_json::json!([counts, vals])
+    } else {
+        let counts: Vec<u64> = observed.iter().map(|(_, n)| *n).collect();
+        let vals: Vec<serde_json::Value> = observed.iter().map(|(v, _)| val_json(*v)).collect();
+        serde_json::json!([counts, vals])
+    }
+}
+
+/// Compute TiTiler-compatible band statistics from a dense `f32` slice where `NaN` marks masked pixels.
+pub fn compute_f32_band_stats(
+    pixels: &[f32],
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let denom = pixels.len();
+    let valid: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
+    BandStatsAcc::Floats(valid).finalize(denom, false, 1.0, 0.0, None, description, opts)
 }
 
 fn percentile_key(p: f64) -> String {
@@ -1434,6 +1480,7 @@ impl BandStatsAcc {
         } else {
             None
         };
+        let mut cat_observed: Vec<(f64, u64)> = Vec::new();
 
         let n = hist.len();
         for step in 0..n {
@@ -1446,6 +1493,7 @@ impl BandStatsAcc {
             let v = to_val(k);
             if let Some(ref mut cats) = categories {
                 let vf = v as f64;
+                cat_observed.push((vf, c as u64));
                 if matches_category_filter(vf, &opts.categories) {
                     cats.insert(format_category_key(vf), serde_json::json!(c));
                 }
@@ -1516,9 +1564,14 @@ impl BandStatsAcc {
         for (&p, &pv) in opts.percentiles.iter().zip(p_vals.iter()) {
             obj.insert(percentile_key(p), serde_json::json!(pv));
         }
-        obj.insert("histogram".into(), serde_json::json!([counts, edges]));
         if let Some(cats) = categories {
+            obj.insert(
+                "histogram".into(),
+                build_categorical_histogram(&cat_observed, &opts.categories),
+            );
             obj.insert("categories".into(), serde_json::Value::Object(cats));
+        } else {
+            obj.insert("histogram".into(), serde_json::json!([counts, edges]));
         }
         obj.insert("description".into(), serde_json::json!(description));
         serde_json::Value::Object(obj)
@@ -1594,6 +1647,7 @@ impl BandStatsAcc {
                 } else {
                     None
                 };
+                let mut cat_observed: Vec<(f64, u64)> = Vec::new();
                 for &v in &vals {
                     sum += v as f64;
                     if v == run_val {
@@ -1602,6 +1656,7 @@ impl BandStatsAcc {
                         unique += 1;
                         if let Some(ref mut cats) = categories {
                             let vf = run_val as f64;
+                            cat_observed.push((vf, run_cnt as u64));
                             if matches_category_filter(vf, &opts.categories) {
                                 cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
                             }
@@ -1621,6 +1676,7 @@ impl BandStatsAcc {
                 unique += 1;
                 if let Some(ref mut cats) = categories {
                     let vf = run_val as f64;
+                    cat_observed.push((vf, run_cnt as u64));
                     if matches_category_filter(vf, &opts.categories) {
                         cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
                     }
@@ -1674,9 +1730,14 @@ impl BandStatsAcc {
                         .min(valid_px - 1);
                     obj.insert(percentile_key(p), serde_json::json!(vals[idx]));
                 }
-                obj.insert("histogram".into(), serde_json::json!([counts, edges]));
                 if let Some(cats) = categories {
+                    obj.insert(
+                        "histogram".into(),
+                        build_categorical_histogram(&cat_observed, &opts.categories),
+                    );
                     obj.insert("categories".into(), serde_json::Value::Object(cats));
+                } else {
+                    obj.insert("histogram".into(), serde_json::json!([counts, edges]));
                 }
                 obj.insert("description".into(), serde_json::json!(description));
                 serde_json::Value::Object(obj)
@@ -2502,10 +2563,10 @@ fn compute_expression_statistics_cpu(
     }
 
     let mut out = serde_json::Map::new();
-    for ((expr_str, _), vals) in exprs.iter().zip(accs.into_iter()) {
+    for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs.into_iter()).enumerate() {
         let acc = BandStatsAcc::Floats(vals);
         let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts);
-        out.insert(expr_str.clone(), val);
+        out.insert(format!("b{}", i + 1), val);
     }
     serde_json::Value::Object(out)
 }
@@ -2947,18 +3008,37 @@ pub async fn compute_statistics_with_options(
         // Unmasked full-image statistics: match rio-tiler's exact `max_size` target dimensions
         // and select the coarsest IFD that is >= target dimensions (falling back to IFD 0).
         let full = cog.index.full_res();
-        let (out_w, out_h) = if full.width.max(full.height) <= max_size {
-            (full.width as usize, full.height as usize)
-        } else if full.width >= full.height {
-            let h = ((full.height as f64 / full.width as f64) * max_size as f64)
-                .round()
-                .max(1.0) as usize;
-            (max_size as usize, h)
-        } else {
-            let w = ((full.width as f64 / full.height as f64) * max_size as f64)
-                .round()
-                .max(1.0) as usize;
-            (w, max_size as usize)
+        let (out_w, out_h) = match (opts.width, opts.height) {
+            (Some(w), Some(h)) => (w.clamp(1, 4096) as usize, h.clamp(1, 4096) as usize),
+            (Some(w), None) => {
+                let w = w.clamp(1, 4096) as usize;
+                let h = ((full.height as f64 / full.width.max(1) as f64) * w as f64)
+                    .round()
+                    .clamp(1.0, 4096.0) as usize;
+                (w, h)
+            }
+            (None, Some(h)) => {
+                let h = h.clamp(1, 4096) as usize;
+                let w = ((full.width as f64 / full.height.max(1) as f64) * h as f64)
+                    .round()
+                    .clamp(1.0, 4096.0) as usize;
+                (w, h)
+            }
+            (None, None) => {
+                if full.width.max(full.height) <= max_size {
+                    (full.width as usize, full.height as usize)
+                } else if full.width >= full.height {
+                    let h = ((full.height as f64 / full.width as f64) * max_size as f64)
+                        .round()
+                        .max(1.0) as usize;
+                    (max_size as usize, h)
+                } else {
+                    let w = ((full.width as f64 / full.height as f64) * max_size as f64)
+                        .round()
+                        .max(1.0) as usize;
+                    (w, max_size as usize)
+                }
+            }
         };
         let mut idx = 0usize;
         for (i, ifd) in cog.index.ifds.iter().enumerate() {
