@@ -1712,12 +1712,15 @@ impl TileEngine {
         }) && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
     }
 
-    /// The bands to read of a raster that has `count`: those asked for, counted from one,
-    /// or all of them when none is. Refuses a band the raster has not, and more than
+    /// The bands to read of a raster that has `count`, `extra` of them extra samples: those
+    /// asked for, counted from one, or all of its own when none is. Refuses a band the raster has not, and more than
     /// [`Self::MAX_PLANES_PER_RASTER`].
-    pub fn wanted_bands(count: u16, bands_1based: &[u16]) -> Result<Vec<u16>, EngineError> {
+    pub fn wanted_bands(count: u16, extra: usize, bands_1based: &[u16]) -> Result<Vec<u16>, EngineError> {
+        // With none asked for: every band that is not an extra sample (alpha), as rio-tiler
+        // leaves those out. They come last.
+        let own = count.saturating_sub(extra.min(usize::from(u16::MAX)) as u16).max(1).min(count);
         let wanted: Vec<u16> =
-            if bands_1based.is_empty() { (1..=count).collect() } else { bands_1based.to_vec() };
+            if bands_1based.is_empty() { (1..=own).collect() } else { bands_1based.to_vec() };
         if let Some(bad) = wanted.iter().find(|b| **b == 0 || **b > count) {
             let known: Vec<String> = (1..=count).map(|b| b.to_string()).collect();
             let tail = if count == 1 { "," } else { "" };
@@ -1755,7 +1758,7 @@ impl TileEngine {
         let cog = self.store.open_uri(uri).await?;
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
-        let wanted = Self::wanted_bands(full.samples_per_pixel, bands_1based)?;
+        let wanted = Self::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
         let mut one = req.clone();
         one.format = OutputFormat::RawF32;
         one.resample = match self.get_or_build_crs(&cog)? {

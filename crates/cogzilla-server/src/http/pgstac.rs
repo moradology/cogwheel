@@ -1647,13 +1647,17 @@ struct PlanesTile {
     window: Window,
 }
 
+/// A polygon an image is cut to, and which of the picture's pixels are inside it once
+/// that has been worked out.
+type PartMask = (Arc<PolygonMask>, tokio::sync::OnceCell<Vec<bool>>);
+
 /// What a mosaic of planes is read over.
 enum Window {
     /// A map tile: the tile, its size and `unscale`; the rest is set for each read.
     Tile(crate::engine::TileRequest),
     /// A box in WGS84 at a size in pixels, optionally cut to a polygon. `size` is what was
     /// asked for, from which each raster's own size follows.
-    Part { bbox: [f64; 4], width: u32, height: u32, size: PartSize, mask: Option<PolygonMask>, unscale: bool },
+    Part { bbox: [f64; 4], width: u32, height: u32, size: PartSize, mask: Option<PartMask>, unscale: bool },
 }
 
 impl Window {
@@ -1691,7 +1695,7 @@ impl Window {
         let cog = engine.store.open_uri(href).await?;
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
-        let wanted = TileEngine::wanted_bands(full.samples_per_pixel, bands_1based)?;
+        let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
         let pixels = self.pixels();
         // Known from the header alone, so nothing is read of an image too large to hold.
         if wanted.len() * pixels > max_values {
@@ -1716,12 +1720,19 @@ impl Window {
             let native = part_dims(PartSize::Query { max_size: None, width: None, height: None }, bbox, res);
             let (w, h) = part_dims(size, bbox, res);
             let all = usize::from(full.samples_per_pixel);
-            if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) || all * (w * h) as usize > max_values {
+            // A raster finer than the first item's, which set the picture's size, would be
+            // read larger than an image may be: it is read at the picture's size instead.
+            let own = if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) || all as u64 * w * h > max_values as u64 {
+                (width as usize, height as usize)
+            } else {
+                (w as usize, h as usize)
+            };
+            if all * own.0 * own.1 > max_values {
                 return Err(EngineError::BadRequest(format!(
-                    "{all} bands of an asset at {w}x{h} pixels are too many to hold; pass max_size, or width and height"
+                    "{all} bands of an asset at {}x{} pixels are too many to hold; pass max_size, or width and height",
+                    own.0, own.1
                 )));
             }
-            let own = (w as usize, h as usize);
             // GDAL takes another road when only some of a raster's bands are read.
             let path = if wanted.len() == all { WarpPath::Direct } else { WarpPath::Blocks };
             let read = match warp_nearest(engine, &cog, &crs, bbox, own, native, path, unscale).await {
@@ -1738,16 +1749,31 @@ impl Window {
                 })?;
                 planes.push(resize_nearest(plane, own, out));
             }
-            if let Some(mask) = mask {
-                // A pixel is inside the polygon when its centre is.
-                let (dx, dy) = ((bbox[2] - bbox[0]) / f64::from(width), (bbox[3] - bbox[1]) / f64::from(height));
-                for row in 0..out.1 {
-                    let lat = bbox[3] - (row as f64 + 0.5) * dy;
-                    for col in 0..out.0 {
-                        if !mask.contains(bbox[0] + (col as f64 + 0.5) * dx, lat) {
-                            for plane in &mut planes {
-                                plane[row * out.0 + col] = f32::NAN;
-                            }
+            if let Some((mask, inside)) = mask {
+                // Worked out once for the picture, and not on the workers that serve requests.
+                let inside = inside
+                    .get_or_try_init(|| async {
+                        let mask = mask.clone();
+                        engine
+                            .store
+                            .run_heavy_cpu(move || {
+                                // A pixel is inside the polygon when its centre is.
+                                let (dx, dy) =
+                                    ((bbox[2] - bbox[0]) / f64::from(width), (bbox[3] - bbox[1]) / f64::from(height));
+                                let mut inside = Vec::with_capacity(out.0 * out.1);
+                                for row in 0..out.1 {
+                                    let lat = bbox[3] - (row as f64 + 0.5) * dy;
+                                    inside.extend((0..out.0).map(|col| mask.contains(bbox[0] + (col as f64 + 0.5) * dx, lat)));
+                                }
+                                inside
+                            })
+                            .await
+                    })
+                    .await?;
+                for plane in &mut planes {
+                    for (v, inside) in plane.iter_mut().zip(inside) {
+                        if !inside {
+                            *v = f32::NAN;
                         }
                     }
                 }
@@ -1764,7 +1790,7 @@ impl Window {
                 bbox,
                 width,
                 height,
-                mask.as_ref(),
+                mask.as_ref().map(|(mask, _)| mask.as_ref()),
                 &bands,
                 resample,
                 OutputFormat::RawF32,
@@ -2245,8 +2271,16 @@ async fn part_image(
     // reads it, which is what TiTiler's pixels are. The shared renderer draws the rest:
     // the other resampling methods and the algorithms, where it can.
     let nearest = query.resampling == ResampleMode::Nearest && query.reproject == ResampleMode::Nearest;
-    let planes_wanted = wants_planes(&pq, &query) || (nearest && pq.algorithm.is_none());
-    let names = if planes_wanted { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
+    // The renderer's band math knows names and functions that band math over planes does
+    // not (`ndvi`, `^`, `max(a, b)`); what only it can read, it draws.
+    let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok();
+    let planes_can = pq.expr_raw.as_ref().is_none_or(reads)
+        && query.assets.iter().all(|a| a.expression.as_ref().is_none_or(reads));
+    let planes_needed = wants_planes(&pq, &query);
+    let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
+    // The request's own band math, before an asset's is put in its place for the renderer.
+    let expression = pq.expr_raw.clone();
+    let names = if planes_needed { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
     let names = match names {
         Ok(names) => names,
         Err(r) => return r,
@@ -2310,7 +2344,9 @@ async fn part_image(
         for href in &scenes[0] {
             first.push(engine.store.open_uri(href).await?);
         }
-        if planes_wanted || !TileEngine::on_one_grid(&first) {
+        // A raster with an alpha band is the renderer's too: it reads the alpha as the mask.
+        let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty());
+        if planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
             if pq.algorithm.is_some() {
                 return Err(EngineError::BadRequest(
                     "`algorithm` is not supported with these assets and options yet".into(),
@@ -2334,11 +2370,11 @@ async fn part_image(
             let job = PlanesTile {
                 assets: query.assets.clone(),
                 as_band: query.asset_as_band,
-                expression: pq.expr_raw.clone(),
+                expression: expression.clone(),
                 selection: query.selection.unwrap_or(Selection::First),
                 resampling: query.resampling,
                 reproject: query.reproject,
-                window: Window::Part { bbox, width: w as u32, height: h as u32, size, mask: mask.cloned(), unscale: pq.unscale },
+                window: Window::Part { bbox, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
             };
             let look = Look {
                 rescale: &pq.rescale,
@@ -2681,7 +2717,14 @@ async fn warp_nearest(
                 .collect();
             let level = gdal_overview_level(&reduced, native, (width, height));
             let grid = if level == 0 { (native.0 as usize, native.1 as usize) } else { (reduced[level].0 as usize, reduced[level].1 as usize) };
-            (level, grid, grid.0.min(512))
+            // Each output row is worked out along a whole row of that grid. A box far
+            // larger than what is asked of it makes the grid enormous; past what a
+            // picture's own rows cost many times over, the direct road is taken.
+            if grid.0 > 16 * width.max(MAX_PART_SIDE as usize) {
+                (gdal_overview_level(&sizes, native, (width, height)), (width, height), width)
+            } else {
+                (level, grid, grid.0.min(512))
+            }
         }
     };
     let ifd = &cog.index.ifds[level];
