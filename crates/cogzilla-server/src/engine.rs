@@ -89,6 +89,10 @@ pub enum BandRequest {
         rescale: (f32, f32),
         colormap: ColormapName,
     },
+    /// Arbitrary N-band selection (e.g. 2-band or 4..=15-band) for scientific `.tif`/`.npy`/`.f32` output.
+    MultiBand {
+        bands_1based: Vec<u16>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +343,7 @@ impl TileEngine {
                 | BandRequest::SarRgb { .. }
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
+                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
@@ -392,6 +397,7 @@ impl TileEngine {
                 | BandRequest::SarRgb { .. }
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
+                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
@@ -1155,7 +1161,7 @@ impl TileEngine {
                     }
                 }
             }
-            BandRequest::CustomExprRgb { .. } => Err(EngineError::BadRequest(
+            BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
                 "3-band custom expressions are rendered via bbox pipeline".into(),
             )),
             BandRequest::CustomExpr {
@@ -1306,6 +1312,7 @@ impl TileEngine {
                 | BandRequest::SarRgb { .. }
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
+                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
@@ -1356,6 +1363,7 @@ impl TileEngine {
                 | BandRequest::SarRgb { .. }
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
+                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
@@ -1590,7 +1598,7 @@ impl TileEngine {
                 };
                 Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
             }
-            BandRequest::CustomExprRgb { .. } => Err(EngineError::BadRequest(
+            BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
                 "3-band custom expressions are rendered via bbox pipeline".into(),
             )),
             BandRequest::CustomExpr {
@@ -1639,6 +1647,7 @@ impl TileEngine {
             | BandRequest::SarRgb { .. }
             | BandRequest::Terrain { .. }
             | BandRequest::CustomExprRgb { .. } => 3,
+            BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
             _ => 1,
         };
 
@@ -1866,6 +1875,7 @@ impl TileEngine {
                 | BandRequest::SarRgb { .. }
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
+                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
                 _ => 1,
             };
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
