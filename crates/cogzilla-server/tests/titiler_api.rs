@@ -1417,19 +1417,27 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(hi_v >= lo_v, "highest ({hi_v}) must be >= lowest ({lo_v})");
             assert!((cnt_v - 2.0).abs() < 1e-4, "count on 2 identical scenes must be 2.0, got {cnt_v}");
 
-            // Sweep #1 C1, C2, C3, C4, D2(validate), D3 regression checks
+            // Sweep #1 & #7 C1-C4, D2(validate), G1-G3 regression checks
             let cog_stac = get_json(
                 &client,
-                format!("{base}/cog/stac?url={sat_url}&id=my-sat&collection=c1&asset_name=rgb"),
+                format!("{base}/cog/stac?url={sat_url}&id=my-sat&collection=c1&collection_url=https://example.com/c1&asset_name=rgb&asset_href=https://example.com/sat.tif&asset_roles=visual&extensions=https://example.com/ext.json"),
             )
             .await;
             assert_eq!(cog_stac["type"], "Feature");
-            assert_eq!(cog_stac["stac_version"], "1.0.0");
+            assert_eq!(cog_stac["stac_version"], "1.1.0");
             assert_eq!(cog_stac["id"], "my-sat");
             assert_eq!(cog_stac["collection"], "c1");
             assert_eq!(cog_stac["properties"]["proj:epsg"], 32610);
-            assert!(cog_stac["assets"]["rgb"]["raster:bands"].is_array());
+            assert!(cog_stac["properties"]["proj:geometry"].is_object());
+            assert_eq!(cog_stac["assets"]["rgb"]["href"], "https://example.com/sat.tif");
+            assert_eq!(cog_stac["assets"]["rgb"]["roles"], serde_json::json!(["visual"]));
+            assert_eq!(cog_stac["assets"]["rgb"]["type"], "image/tiff; application=geotiff");
+            assert!(cog_stac["assets"]["rgb"]["raster:bands"][0]["statistics"].is_object());
+            assert!(cog_stac["assets"]["rgb"]["raster:bands"][0]["histogram"].is_object());
+            assert_eq!(cog_stac["assets"]["rgb"]["raster:bands"][0]["sampling"], "area");
             assert!(cog_stac["assets"]["rgb"]["eo:bands"].is_array());
+            assert_eq!(cog_stac["links"][0]["rel"], "collection");
+            assert!(cog_stac["stac_extensions"].as_array().unwrap().iter().any(|v| v == "https://example.com/ext.json"));
 
             let viewer_cog = client
                 .get(format!("{base}/cog/viewer?url={sat_url}"))
@@ -1463,9 +1471,13 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(viewer_stac.status(), 200);
 
             let renders_json = get_json(&client, format!("{base}/stac/renders?url={stac_item_url}")).await;
-            assert!(renders_json["visual"].is_object());
+            assert!(renders_json["renders"]["visual"]["valid"] == true);
+            assert!(renders_json["renders"]["visual"]["params"]["assets"][0] == "red");
+            assert!(renders_json["links"].is_array());
             let visual_render = get_json(&client, format!("{base}/stac/renders/visual?url={stac_item_url}")).await;
-            assert_eq!(visual_render["assets"][0], "red");
+            assert_eq!(visual_render["valid"], true);
+            assert_eq!(visual_render["params"]["assets"][0], "red");
+            assert_eq!(visual_render["links"].as_array().unwrap().len(), 3);
             let missing_render = client
                 .get(format!("{base}/stac/renders/nonexistent?url={stac_item_url}"))
                 .send().await.unwrap();
@@ -1478,6 +1490,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 "maxzoom": 12,
                 "quadkey_zoom": 10,
                 "bounds": [-123.0, 37.0, -122.0, 38.0],
+                "name": null,
+                "attribution": null,
                 "tiles": { "0230102033": [merc_url.clone()] }
             });
             let mj_val = client
@@ -1489,6 +1503,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_val_json: serde_json::Value =
                 serde_json::from_slice(&mj_val.bytes().await.unwrap()).unwrap();
             assert_eq!(mj_val_json["mosaicjson"], "0.0.3");
+            assert!(mj_val_json.get("name").is_none(), "null optional fields must be omitted");
             assert!(mj_val_json["tiles"].is_object());
 
             let mj_root_path = std::env::temp_dir().join(format!(
@@ -1502,6 +1517,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             )
             .await;
             assert_eq!(mj_root["mosaicjson"], "0.0.3");
+            assert!(mj_root.get("name").is_none());
+            assert!(mj_root.get("attribution").is_none());
             assert!(mj_root["tiles"].is_object());
             let _ = std::fs::remove_file(&mj_root_path);
         }
