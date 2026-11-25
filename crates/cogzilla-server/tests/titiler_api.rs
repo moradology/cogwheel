@@ -1437,19 +1437,40 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(viewer_cog.status(), 200);
             assert!(viewer_cog.text().await.unwrap().contains("tilejson.json"));
 
-            let stac_path = sat_path.parent().unwrap().join("landsat_c2_stac.json");
-            let stac_item_url = stac_path.to_str().unwrap();
+            let stac_renders_path = std::env::temp_dir().join(format!(
+                "cogzilla_test_stac_renders_{}.json",
+                std::process::id()
+            ));
+            let stac_renders_doc = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "renders-test",
+                "bbox": [-122.9, 37.5, -122.4, 38.0],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "red": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                },
+                "renders": {
+                    "visual": { "assets": ["red"], "rescale": [[0, 1]] }
+                }
+            });
+            std::fs::write(&stac_renders_path, stac_renders_doc.to_string()).unwrap();
+            let stac_item_url = stac_renders_path.to_str().unwrap();
             let viewer_stac = client
                 .get(format!("{base}/stac/viewer?url={stac_item_url}&assets=red"))
                 .send().await.unwrap();
             assert_eq!(viewer_stac.status(), 200);
 
             let renders_json = get_json(&client, format!("{base}/stac/renders?url={stac_item_url}")).await;
-            assert!(renders_json.is_object());
+            assert!(renders_json["visual"].is_object());
+            let visual_render = get_json(&client, format!("{base}/stac/renders/visual?url={stac_item_url}")).await;
+            assert_eq!(visual_render["assets"][0], "red");
             let missing_render = client
                 .get(format!("{base}/stac/renders/nonexistent?url={stac_item_url}"))
                 .send().await.unwrap();
             assert_eq!(missing_render.status(), 404);
+            let _ = std::fs::remove_file(&stac_renders_path);
 
             let mj_doc = serde_json::json!({
                 "mosaicjson": "0.0.3",
