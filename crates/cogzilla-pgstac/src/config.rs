@@ -271,6 +271,13 @@ fn tls_plan(
         return Err(PgStacError::Config("sslrootcert=system needs sslmode=verify-full".into()));
     }
     let root_cert = root_cert.filter(|_| !system);
+    // Without the host name checked, the public web roots vouch for anyone who holds a
+    // certificate for any name at all. libpq refuses this too, for want of a root file.
+    if mode == "verify-ca" && root_cert.is_none() {
+        return Err(PgStacError::Config(
+            "sslmode=verify-ca needs a root certificate: set sslrootcert or PGSSLROOTCERT, or use verify-full".into(),
+        ));
+    }
     let (ssl_mode, verify) = match mode {
         "disable" => (SslMode::Disable, TlsVerify::None),
         "allow" | "prefer" => (SslMode::Prefer, TlsVerify::None),
@@ -442,6 +449,13 @@ mod tests {
     }
 
     #[test]
+    fn verify_ca_needs_a_root_of_its_own() {
+        // The public web roots with no name checked would vouch for anyone.
+        assert!(refusal("postgresql://h/d?sslmode=verify-ca", &[]).contains("needs a root certificate"));
+        assert!(refusal("host=h", &[("PGSSLMODE", "verify-ca")]).contains("needs a root certificate"));
+    }
+
+    #[test]
     fn sslmode_is_extracted_from_either_form() {
         let parts = split_connection_string("postgresql://h/d?sslmode=require").unwrap();
         assert_eq!((parts.conn.as_str(), parts.sslmode.as_deref()), ("postgresql://h/d", Some("require")));
@@ -463,7 +477,6 @@ mod tests {
             ("prefer", true, SslMode::Prefer, TlsVerify::None),
             ("require", false, SslMode::Require, TlsVerify::None),
             ("require", true, SslMode::Require, TlsVerify::Ca),
-            ("verify-ca", false, SslMode::Require, TlsVerify::Ca),
             ("verify-ca", true, SslMode::Require, TlsVerify::Ca),
             ("verify-full", false, SslMode::Require, TlsVerify::Full),
             ("verify-full", true, SslMode::Require, TlsVerify::Full),

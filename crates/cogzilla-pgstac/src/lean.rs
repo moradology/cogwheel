@@ -395,8 +395,9 @@ fn set_hrefs(item: &mut MosaicItem, assets: &[String], hrefs: Vec<Option<String>
     }
     for (key, href) in assets.iter().zip(hrefs) {
         // A relative href needs the item's `self` link, which is not read here: the
-        // reference path, which returns whole items, answers for it.
-        let Some(href) = href.filter(|h| crate::href_is_absolute(h)) else {
+        // reference path, which returns whole items, answers for it. A path from the root
+        // is a file of this machine unless that link says otherwise.
+        let Some(href) = href.filter(|h| crate::href_is_absolute(h) || h.starts_with('/')) else {
             return false;
         };
         item.assets.insert(key.clone(), serde_json::json!({ "href": href }));

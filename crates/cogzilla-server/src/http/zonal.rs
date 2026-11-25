@@ -108,7 +108,9 @@ pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: u
         // Cells a ring passes through that the fill did not already take.
         while next_edge < edge_cells.len() && edge_cells[next_edge].0 as usize == row {
             let x = edge_cells[next_edge].1 as usize;
-            if !spans.iter().any(|&(a, b)| a <= x && x <= b) {
+            // The spans are in order and apart, so the one that could hold `x` is found, not looked for.
+            let at = spans.partition_point(|&(_, b)| b < x);
+            if spans.get(at).is_none_or(|&(a, _)| x < a) {
                 counts[out_row + x / scale] += 1;
             }
             next_edge += 1;
@@ -120,8 +122,9 @@ pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: u
 /// How many cells the rings of one polygon may burn: eight bytes each before they are sorted.
 const MAX_EDGE_CELLS: u64 = 16_000_000;
 
-/// How many times a row of the fine grid may look at a segment.
-const MAX_ROW_CHECKS: u64 = 400_000_000;
+/// How many times a row of the fine grid may look at a segment. The largest polygon a
+/// request may carry, at the default size and a `cover_scale` of ten, is within it.
+const MAX_ROW_CHECKS: u64 = 1_000_000_000;
 
 /// Every cell a segment passes through, as GDAL's all-touched line burner walks it.
 fn burn_line(from: (f64, f64), to: (f64, f64), width: i64, height: i64, out: &mut Vec<(u32, u32)>) {
