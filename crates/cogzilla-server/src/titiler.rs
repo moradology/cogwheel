@@ -375,6 +375,7 @@ const SUPPORTED_ALGORITHMS: &[&str] = &[
     "sum",
     "grayscale",
     "bitonal",
+    "contours",
 ];
 
 /// TiTiler 2.4 `AlgorithmFactory` `GET /algorithms` response.
@@ -549,6 +550,18 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [1] },
             "parameters": {
                 "threshold": { "default": 128.0, "title": "Threshold", "type": "number" }
+            }
+        }),
+        "contours" => serde_json::json!({
+            "title": "Contours",
+            "description": "Overlay elevation contour lines at regular elevation intervals.",
+            "inputs": { "nbands": 1 },
+            "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [255] },
+            "parameters": {
+                "increment": { "default": 35.0, "title": "Increment", "type": "number" },
+                "thickness": { "default": 1, "title": "Thickness", "type": "integer" },
+                "minz": { "default": -12000.0, "title": "Minz", "type": "number" },
+                "maxz": { "default": 8000.0, "title": "Maxz", "type": "number" }
             }
         }),
         _ => {
@@ -3874,6 +3887,7 @@ async fn render_bbox_impl(
                     }
                     if wsum > 1e-6 { sum / wsum } else { f32::NAN }
                 }
+                other => cogzilla_kernel::sample_general(src, u, v, other),
             }
         };
 

@@ -43,6 +43,18 @@ pub enum ResampleMode {
     Nearest,
     Bilinear,
     Cubic,
+    CubicSpline,
+    Lanczos,
+    Average,
+    Mode,
+    Gauss,
+    Rms,
+    Min,
+    Max,
+    Med,
+    Q1,
+    Q3,
+    Sum,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -532,6 +544,217 @@ pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
         acc += row_acc * wy[j];
     }
     acc
+}
+
+#[inline(always)]
+fn cubic_spline_weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let omt = 1.0 - t;
+    [
+        (omt * omt * omt) * (1.0 / 6.0),
+        (3.0 * t3 - 6.0 * t2 + 4.0) * (1.0 / 6.0),
+        (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) * (1.0 / 6.0),
+        t3 * (1.0 / 6.0),
+    ]
+}
+
+#[inline(always)]
+fn lanczos3_weight(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 1e-6 {
+        return 1.0;
+    }
+    if ax >= 3.0 {
+        return 0.0;
+    }
+    let px = std::f32::consts::PI * ax;
+    let px3 = px * (1.0 / 3.0);
+    (px.sin() / px) * (px3.sin() / px3)
+}
+
+/// General sampler supporting all 15 GDAL/TiTiler resampling methods.
+#[inline]
+pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) -> f32 {
+    match mode {
+        ResampleMode::Nearest => sample_nearest::<false>(src, u, v),
+        ResampleMode::Bilinear => sample_bilinear::<false>(src, u, v),
+        ResampleMode::Cubic => sample_cubic(src, u, v),
+        ResampleMode::CubicSpline => {
+            if !u.is_finite()
+                || !v.is_finite()
+                || u < -2.0
+                || v < -2.0
+                || u > src.ifd_w as f32 + 1.0
+                || v > src.ifd_h as f32 + 1.0
+            {
+                return f32::NAN;
+            }
+            let (x0, fx) = fast_floor_i32(u);
+            let (y0, fy) = fast_floor_i32(v);
+            let wx = cubic_spline_weights(fx);
+            let wy = cubic_spline_weights(fy);
+            let mut sum = 0.0f32;
+            let mut wsum = 0.0f32;
+            for j in 0..4 {
+                let ry = y0 + (j as i32) - 1;
+                let wyj = wy[j];
+                for i in 0..4 {
+                    let s = src.sample_checked(x0 + (i as i32) - 1, ry);
+                    if !s.is_nan() {
+                        let w = wx[i] * wyj;
+                        sum += s * w;
+                        wsum += w;
+                    }
+                }
+            }
+            if wsum > 1e-6 { sum / wsum } else { f32::NAN }
+        }
+        ResampleMode::Lanczos => {
+            if !u.is_finite()
+                || !v.is_finite()
+                || u < -3.0
+                || v < -3.0
+                || u > src.ifd_w as f32 + 2.0
+                || v > src.ifd_h as f32 + 2.0
+            {
+                return f32::NAN;
+            }
+            let (x0, fx) = fast_floor_i32(u);
+            let (y0, fy) = fast_floor_i32(v);
+            let mut wx = [0.0f32; 6];
+            let mut wy = [0.0f32; 6];
+            for k in 0..6 {
+                let d = (k as i32 - 2) as f32;
+                wx[k] = lanczos3_weight(d - fx);
+                wy[k] = lanczos3_weight(d - fy);
+            }
+            let mut sum = 0.0f32;
+            let mut wsum = 0.0f32;
+            for j in 0..6 {
+                let ry = y0 + (j as i32) - 2;
+                let wyj = wy[j];
+                for i in 0..6 {
+                    let s = src.sample_checked(x0 + (i as i32) - 2, ry);
+                    if !s.is_nan() {
+                        let w = wx[i] * wyj;
+                        sum += s * w;
+                        wsum += w;
+                    }
+                }
+            }
+            if wsum.abs() > 1e-6 { sum / wsum } else { f32::NAN }
+        }
+        ResampleMode::Gauss => {
+            if !u.is_finite()
+                || !v.is_finite()
+                || u < -1.5
+                || v < -1.5
+                || u > src.ifd_w as f32 + 0.5
+                || v > src.ifd_h as f32 + 0.5
+            {
+                return f32::NAN;
+            }
+            let cx = u.round() as i32;
+            let cy = v.round() as i32;
+            let mut sum = 0.0f32;
+            let mut wsum = 0.0f32;
+            for dy in -1..=1 {
+                let ry = cy + dy;
+                let ydiff = ry as f32 - v;
+                for dx in -1..=1 {
+                    let rx = cx + dx;
+                    let s = src.sample_checked(rx, ry);
+                    if !s.is_nan() {
+                        let xdiff = rx as f32 - u;
+                        let w = (-0.888_888_9 * (xdiff * xdiff + ydiff * ydiff)).exp();
+                        sum += s * w;
+                        wsum += w;
+                    }
+                }
+            }
+            if wsum > 1e-6 { sum / wsum } else { f32::NAN }
+        }
+        ResampleMode::Average
+        | ResampleMode::Mode
+        | ResampleMode::Rms
+        | ResampleMode::Min
+        | ResampleMode::Max
+        | ResampleMode::Med
+        | ResampleMode::Q1
+        | ResampleMode::Q3
+        | ResampleMode::Sum => {
+            if !u.is_finite()
+                || !v.is_finite()
+                || u < -1.5
+                || v < -1.5
+                || u > src.ifd_w as f32 + 0.5
+                || v > src.ifd_h as f32 + 0.5
+            {
+                return f32::NAN;
+            }
+            let cx = u.round() as i32;
+            let cy = v.round() as i32;
+            let mut vals = [0.0f32; 9];
+            let mut n = 0usize;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let s = src.sample_checked(cx + dx, cy + dy);
+                    if !s.is_nan() {
+                        vals[n] = s;
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 {
+                return f32::NAN;
+            }
+            let slice = &mut vals[..n];
+            match mode {
+                ResampleMode::Average => slice.iter().sum::<f32>() / (n as f32),
+                ResampleMode::Sum => slice.iter().sum::<f32>(),
+                ResampleMode::Rms => {
+                    let sq: f32 = slice.iter().map(|&x| x * x).sum();
+                    (sq / (n as f32)).sqrt()
+                }
+                ResampleMode::Min => slice.iter().copied().fold(f32::INFINITY, f32::min),
+                ResampleMode::Max => slice.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                ResampleMode::Med | ResampleMode::Q1 | ResampleMode::Q3 => {
+                    slice.sort_unstable_by(f32::total_cmp);
+                    let q = match mode {
+                        ResampleMode::Q1 => 0.25f32,
+                        ResampleMode::Med => 0.50f32,
+                        ResampleMode::Q3 => 0.75f32,
+                        _ => 0.50f32,
+                    };
+                    let pos = q * ((n - 1) as f32);
+                    let lo = pos.floor() as usize;
+                    let hi = (lo + 1).min(n - 1);
+                    let frac = pos - lo as f32;
+                    slice[lo] + (slice[hi] - slice[lo]) * frac
+                }
+                ResampleMode::Mode => {
+                    let mut best_val = slice[0];
+                    let mut best_cnt = 0usize;
+                    for i in 0..n {
+                        let bits = slice[i].to_bits();
+                        let mut cnt = 1usize;
+                        for j in (i + 1)..n {
+                            if slice[j].to_bits() == bits {
+                                cnt += 1;
+                            }
+                        }
+                        if cnt > best_cnt {
+                            best_cnt = cnt;
+                            best_val = slice[i];
+                        }
+                    }
+                    best_val
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 #[inline(always)]
@@ -1132,6 +1355,7 @@ pub fn render_single_band<const N: usize>(
         (ResampleMode::Nearest, true) => render_single_specialized::<N, false, true>(plan, src, style),
         (ResampleMode::Nearest, false) => render_single_specialized::<N, false, false>(plan, src, style),
         (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| sample_cubic(src, u, v)),
+        (other, _) => render_eval_fn(plan, style, |u, v| sample_general(src, u, v, other)),
     }
 }
 
@@ -2095,6 +2319,7 @@ pub fn render_rgb_bands<const N: usize>(
         (ResampleMode::Nearest, true) => render_rgb_specialized::<N, false, true>(plan, srcs, style),
         (ResampleMode::Nearest, false) => render_rgb_specialized::<N, false, false>(plan, srcs, style),
         (ResampleMode::Cubic, _) => render_rgb_cubic::<N>(plan, srcs, style),
+        (_, _) => render_rgb_cubic::<N>(plan, srcs, style),
     }
 }
 
@@ -2109,13 +2334,21 @@ fn render_rgb_cubic<const N: usize>(
         255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
+    let mode = style.resample;
+    let sample_px = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
+        if mode == ResampleMode::Cubic {
+            sample_cubic(src, u, v)
+        } else {
+            sample_general(src, u, v, mode)
+        }
+    };
     match style.format {
         OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 12);
             for b in 0..3 {
                 for py in 0..N {
                     for_each_pixel_in_row(plan, py, |_px, u, v| {
-                        out.put_slice(&sample_cubic(&srcs[b], u, v).to_le_bytes());
+                        out.put_slice(&sample_px(&srcs[b], u, v).to_le_bytes());
                     });
                 }
             }
@@ -2135,9 +2368,9 @@ fn render_rgb_cubic<const N: usize>(
             for py in 0..N {
                 let row = &mut sc.row_buf[..N * 4];
                 for_each_pixel_in_row(plan, py, |px, u, v| {
-                    let r = sample_cubic(&srcs[0], u, v);
-                    let g = sample_cubic(&srcs[1], u, v);
-                    let b = sample_cubic(&srcs[2], u, v);
+                    let r = sample_px(&srcs[0], u, v);
+                    let g = sample_px(&srcs[1], u, v);
+                    let b = sample_px(&srcs[2], u, v);
                     let off = px * 4;
                     if r.is_nan() || g.is_nan() || b.is_nan() {
                         row[off..off + 4].fill(0);
@@ -2162,9 +2395,9 @@ fn render_rgb_cubic<const N: usize>(
             let buf = &mut sc.img_buf[..total];
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |px, u, v| {
-                    let r = sample_cubic(&srcs[0], u, v);
-                    let g = sample_cubic(&srcs[1], u, v);
-                    let b = sample_cubic(&srcs[2], u, v);
+                    let r = sample_px(&srcs[0], u, v);
+                    let g = sample_px(&srcs[1], u, v);
+                    let b = sample_px(&srcs[2], u, v);
                     let off = (py * N + px) * 4;
                     if r.is_nan() || g.is_nan() || b.is_nan() {
                         buf[off..off + 4].fill(0);
@@ -2315,6 +2548,9 @@ pub fn render_bandmath1<const N: usize>(
         (ResampleMode::Cubic, _) => {
             render_eval_fn(plan, style, |u, v| expr.eval1(sample_cubic(src, u, v)))
         }
+        (other, _) => {
+            render_eval_fn(plan, style, |u, v| expr.eval1(sample_general(src, u, v, other)))
+        }
     }
 }
 
@@ -2360,6 +2596,10 @@ pub fn render_sar_rgb<const N: usize>(
             (ResampleMode::Nearest, false) => (
                 sample_nearest::<false>(&srcs[0], u, v),
                 sample_nearest::<false>(&srcs[1], u, v),
+            ),
+            (other, _) => (
+                sample_general(&srcs[0], u, v, other),
+                sample_general(&srcs[1], u, v, other),
             ),
         };
         let vv_db = fast_db_from_power(vv);
@@ -2509,6 +2749,15 @@ pub fn render_bandmath2<const N: usize>(
                 expr.eval2(a, b)
             }
         }),
+        (other, _) => render_eval_fn(plan, style, |u, v| {
+            let a = sample_general(&srcs[0], u, v, other);
+            let b = sample_general(&srcs[1], u, v, other);
+            if a.is_nan() || b.is_nan() {
+                f32::NAN
+            } else {
+                expr.eval2(a, b)
+            }
+        }),
     }
 }
 
@@ -2565,6 +2814,16 @@ pub fn render_bandmath3<const N: usize>(
             let a = sample_cubic(&srcs[0], u, v);
             let b = sample_cubic(&srcs[1], u, v);
             let c = sample_cubic(&srcs[2], u, v);
+            if a.is_nan() || b.is_nan() || c.is_nan() {
+                f32::NAN
+            } else {
+                expr.eval3(a, b, c)
+            }
+        }),
+        (other, _) => render_eval_fn(plan, style, |u, v| {
+            let a = sample_general(&srcs[0], u, v, other);
+            let b = sample_general(&srcs[1], u, v, other);
+            let c = sample_general(&srcs[2], u, v, other);
             if a.is_nan() || b.is_nan() || c.is_nan() {
                 f32::NAN
             } else {
@@ -2659,6 +2918,13 @@ pub fn render_expr_vm<const N: usize>(
                 for_each_pixel_in_row(plan, py, |px, u, v| {
                     for b in 0..nb {
                         band_rows[b][px] = sample_cubic(&srcs[b], u, v);
+                    }
+                });
+            }
+            (other, _) => {
+                for_each_pixel_in_row(plan, py, |px, u, v| {
+                    for b in 0..nb {
+                        band_rows[b][px] = sample_general(&srcs[b], u, v, other);
                     }
                 });
             }
@@ -2818,6 +3084,7 @@ pub fn render_terrain_tile<const N: usize>(
             (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
             (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
+            (other, _) => sample_general(src, u, v, other),
         }
     };
 
@@ -3026,6 +3293,13 @@ pub enum DemAlgorithm {
     Slope { z_factor: f32 },
     /// Compass aspect in degrees `[0.0, 360.0)` clockwise from North (`0=N, 90=E, 180=S, 270=W`).
     Aspect,
+    /// Elevation contour lines at multiples of `increment` overlaid on `[minz, maxz]`.
+    Contours {
+        increment: f32,
+        thickness: u32,
+        minz: f32,
+        maxz: f32,
+    },
 }
 
 /// Rescale denominator preserving sign for inverted stretches (`?rescale=255,0`) and negative
@@ -3123,6 +3397,33 @@ pub fn eval_horn_3x3_aniso(
             // Downhill vector in (East, North) is (-dz_dx, +dz_dy)
             let bearing = (-dz_dx).atan2(dz_dy).to_degrees();
             bearing.rem_euclid(360.0)
+        }
+        DemAlgorithm::Contours {
+            increment,
+            thickness,
+            minz,
+            maxz,
+        } => {
+            let inc = increment.max(1e-4);
+            let in_range = z_c >= minz && z_c <= maxz;
+            let level = (z_c / inc).floor();
+            let is_line = if in_range {
+                if thickness >= 2 {
+                    (n / inc).floor() != level
+                        || (s / inc).floor() != level
+                        || (e / inc).floor() != level
+                        || (w / inc).floor() != level
+                } else {
+                    (n / inc).floor() > level || (e / inc).floor() > level
+                }
+            } else {
+                false
+            };
+            if is_line {
+                0.0
+            } else {
+                (((z_c - minz) / safe_rescale_denom(minz, maxz)) * 255.0).clamp(1.0, 255.0)
+            }
         }
     }
 }
@@ -3331,6 +3632,7 @@ pub fn render_dem_algorithm<const N: usize>(
             (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
             (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
+            (other, _) => sample_general(src, u, v, other),
         }
     };
     // Sub-pixel bounds-checked sampler for the 1-pixel extrapolated border so tile edges
@@ -3340,6 +3642,7 @@ pub fn render_dem_algorithm<const N: usize>(
             ResampleMode::Bilinear => sample_bilinear::<false>(src, u, v),
             ResampleMode::Nearest => sample_nearest::<false>(src, u, v),
             ResampleMode::Cubic => sample_cubic(src, u, v),
+            other => sample_general(src, u, v, other),
         }
     };
 
