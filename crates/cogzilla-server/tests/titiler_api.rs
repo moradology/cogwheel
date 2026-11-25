@@ -1118,6 +1118,14 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .unwrap();
             assert_eq!(buf_x0.status(), 200, "buffered x=0 WebMercatorQuad tile must not false-404");
 
+            // Audit c48 regression check: constant & where() expression statistics
+            let const_stats = get_json(
+                &client,
+                format!("{base}/cog/statistics?url={merc_url}&expression=42&max_size=64"),
+            )
+            .await;
+            assert!((const_stats["42"]["mean"].as_f64().unwrap() - 42.0).abs() < 1e-4);
+
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];
             pal[299] = [200, 150, 100, 255];

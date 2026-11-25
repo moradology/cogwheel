@@ -1689,18 +1689,21 @@ fn build_tile_polygon_mask(
     let base_col = (tx * ifd.tile_width) as usize;
     let base_row = (ty * ifd.tile_height) as usize;
 
-    // Zero-allocation 3x3 probe fast-reject before allocating the full 16-px grid.
-    // Cuts OOB/small-polygon tile rejection from ~1,089 projections + 2 heap Vecs down to 9 projections.
+    // Zero-allocation 4x3 probe fast-reject before allocating the full 16-px grid.
+    // Cuts OOB/small-polygon tile rejection from ~1,089 projections + 2 heap Vecs down to 12 projections,
+    // while sampling thirds in X so odd-width global 0..360 tiles never miss the Western Hemisphere.
     {
-        let cols = [0usize, x_max / 2, x_max];
+        let cols = [0usize, x_max / 3, (2 * x_max) / 3, x_max];
         let rows = [0usize, y_max / 2, y_max];
         let mut p_min_lon = f64::INFINITY;
         let mut p_max_lon = f64::NEG_INFINITY;
         let mut p_min_lat = f64::INFINITY;
         let mut p_max_lat = f64::NEG_INFINITY;
         let mut non_finite = false;
+        let mut probe_antimeridian = false;
         for &ry in &rows {
             let row_f = (base_row + ry) as f64;
+            let mut prev_lon: Option<f64> = None;
             for &cx in &cols {
                 let col_f = (base_col + cx) as f64;
                 let (sx, sy) = ifd.pixel_to_crs.forward(col_f, row_f);
@@ -1709,6 +1712,12 @@ fn build_tile_polygon_mask(
                     non_finite = true;
                     break;
                 }
+                if let Some(pl) = prev_lon
+                    && (lon - pl).abs() > 180.0
+                {
+                    probe_antimeridian = true;
+                }
+                prev_lon = Some(lon);
                 p_min_lon = p_min_lon.min(lon);
                 p_max_lon = p_max_lon.max(lon);
                 p_min_lat = p_min_lat.min(lat);
@@ -1725,7 +1734,7 @@ fn build_tile_polygon_mask(
             if p_max_lat + lat_pad < pm.bbox[1] || p_min_lat - lat_pad > pm.bbox[3] {
                 return None;
             }
-            if lon_span < 180.0 {
+            if !probe_antimeridian && lon_span < 120.0 {
                 let lon_pad = (lon_span * 0.15).max(1e-4);
                 if p_max_lon + lon_pad < pm.bbox[0] || p_min_lon - lon_pad > pm.bbox[2] {
                     return None;
@@ -2306,24 +2315,43 @@ fn compute_expression_statistics_cpu(
         StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
     };
 
+    let has_where: Vec<bool> = exprs
+        .iter()
+        .map(|(_, prog)| prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where))
+        .collect();
+    let has_const_expr = exprs.iter().any(|(_, prog)| prog.used_bands.is_empty());
+
     let mut eval_px = |bands: &[Option<&cogzilla_codec::BandData>], idx: usize| {
         let mut slot_vals = [0.0f32; 16];
         for (ei, (_, prog)) in exprs.iter().enumerate() {
+            let allow_nan = has_where[ei];
             let mut valid = true;
             for (si, &b1) in prog.used_bands.iter().enumerate() {
                 let bi = (b1.saturating_sub(1)) as usize;
                 let Some(Some(bd)) = bands.get(bi) else {
+                    if allow_nan {
+                        slot_vals[si] = f32::NAN;
+                        continue;
+                    }
                     valid = false;
                     break;
                 };
                 let raw = bd.get_f32(idx);
                 if !raw.is_finite() {
+                    if allow_nan {
+                        slot_vals[si] = f32::NAN;
+                        continue;
+                    }
                     valid = false;
                     break;
                 }
                 if let Some(nd) = nodata_override
                     && raw == nd
                 {
+                    if allow_nan {
+                        slot_vals[si] = f32::NAN;
+                        continue;
+                    }
                     valid = false;
                     break;
                 }
@@ -2368,7 +2396,7 @@ fn compute_expression_statistics_cpu(
                 }
             }
         }
-        if !any_band {
+        if !any_band && !has_const_expr {
             continue;
         }
         let tx = (ti as u32) % ifd.tiles_across;
@@ -3018,10 +3046,41 @@ pub async fn compute_statistics_with_options(
             }
         }
         PlanarConfig::Planar => {
+            // Only fetch and decode bands actually referenced by `?expression=` or `?bidx=`.
+            let needed_bands: Vec<bool> = if let Some(ref exprs) = opts.expressions
+                && !exprs.is_empty()
+            {
+                let mut mask = vec![false; count];
+                for (_, prog) in exprs {
+                    for &b1 in &prog.used_bands {
+                        if let Some(slot) = mask.get_mut((b1.saturating_sub(1)) as usize) {
+                            *slot = true;
+                        }
+                    }
+                }
+                mask
+            } else if let Some(ref bidx) = opts.bidx
+                && !bidx.is_empty()
+            {
+                let mut mask = vec![false; count];
+                for &b1 in bidx {
+                    if let Some(slot) = mask.get_mut((b1.saturating_sub(1)) as usize) {
+                        *slot = true;
+                    }
+                }
+                mask
+            } else {
+                vec![true; count]
+            };
+
             // Coalesce all `count * n_tiles` band-plane block indices into one concurrent
             // `get_blocks` batch instead of `count` sequential remote round trips.
             let mut all_indices = Vec::with_capacity(count * n_tiles);
-            for b in 0..count {
+            for (b, &need_b) in needed_bands.iter().enumerate().take(count) {
+                if !need_b {
+                    all_indices.resize(all_indices.len() + n_tiles, None);
+                    continue;
+                }
                 for ty in 0..ifd.tiles_down {
                     for tx in 0..ifd.tiles_across {
                         let ti = (ty * ifd.tiles_across + tx) as usize;
