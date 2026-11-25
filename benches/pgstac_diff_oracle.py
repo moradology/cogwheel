@@ -155,10 +155,13 @@ def compare_arrays(cz: bytes, tt: bytes) -> tuple[bool, str]:
     va, vb = a[:-1][:, both].astype(np.float64), b[:-1][:, both].astype(np.float64)
     if a.dtype.kind == "f":
         # Fractions are not equal from one pixel to its neighbour: the means are compared.
-        close = abs(va.mean() - vb.mean()) <= 0.02 * abs(vb.mean()) + 1e-9
+        # Halved first: the largest double, which a division by zero is written as, has no sum.
+        ha, hb = (va / 2).mean(), (vb / 2).mean()
+        close = ha == hb or abs(ha - hb) <= 0.02 * abs(hb) + 1e-9
         return mask >= 99.0 and tops and close, f"{a.dtype} {a.shape}, mask {mask:.2f}%, mean {va.mean():.5g} vs {vb.mean():.5g}"
-    same = float((va == vb).mean()) * 100
-    return mask >= 99.0 and tops and same >= 75.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, {same:.1f}% of values equal"
+    # Band by band: one band that is wrong is not hidden by the others that are right.
+    same = min(float((va[i] == vb[i]).mean()) * 100 for i in range(va.shape[0]))
+    return mask >= 99.0 and tops and same >= 75.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, {same:.1f}% of values equal in the worst band"
 
 
 def wmts_view(text: str, base: str):
@@ -708,6 +711,15 @@ def main() -> int:
         # Arrays keep the data's type and carry the mask as a band of their own.
         o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)
         o.check("feature as an array, 16-bit", "image", f"/searches/{sid}/feature/120x80.npy?assets=red", "POST", triangle)
+        abox = f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/120x80.npy"
+        o.check("box as an array, five bands of three items", "image",
+                f"{abox}?assets=red&assets=green&assets=blue&assets=nir&assets=scl&items_limit=3")
+        o.check("box as an array, the wider type first or last", "image", f"{abox}?assets=scl&assets=red")
+        o.check("box as an array, two bands rescaled", "image", f"{abox}?assets=red&assets=nir&rescale=0,3000&rescale=0,5000")
+        o.check("box as an array, five bands rescaled", "image",
+                f"{abox}?assets=red&assets=green&assets=blue&assets=nir&assets=scl&rescale=0,3000")
+        o.check("box as an array, a root of float32", "image", f"{abox}?assets=red&expression=sqrt(b1)&unscale=true")
+        o.check("box as an array, a division by nothing", "image", f"{abox}?assets=red&expression=b1/0")
         o.check("box as an array, band math in doubles", "image",
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/120x80.npy?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)")
         o.check("feature as an array, band math", "image",

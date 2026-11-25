@@ -14,8 +14,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cogzilla_kernel::{ColormapName, OutputFormat, ResampleMode};
 use cogzilla_pgstac::{
-    Lookup, MosaicItem, PgStac, PgStacError, SampleGrid, SearchField, SearchLimits, SearchOrder,
-    SearchRecord, jsonb_key_order,
+    Lookup, MosaicItem, PgStac, PgStacError, SampleGrid, SearchField, SearchLimits, SearchOrder, SearchRecord,
+    jsonb_key_order,
 };
 use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{CrsModel, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
@@ -25,14 +25,14 @@ use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
-use super::pixel_selection::{Fold, Selected, Selection};
-use super::point_expr::Program;
-use super::zonal::{self, Bins, StatsOptions};
 use super::{
     ParsedQuery, apply_unscale_cogs, build_band_request, build_tile_request, parse_bbox4,
     parse_ext_format, parse_wxh_ext, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
+use super::pixel_selection::{Fold, Selected, Selection};
+use super::point_expr::Program;
+use super::zonal::{self, Bins, StatsOptions};
 use crate::engine::{BandRequest, EngineError, MOSAIC_SCENES_AHEAD, TileEngine};
 use crate::stac::{StacItem, stac_item_from_json};
 use crate::titiler::{
@@ -75,10 +75,7 @@ async fn pixel_items(
 ) -> Result<Arc<Vec<MosaicItem>>, cogzilla_pgstac::PgStacError> {
     match ctx.only {
         Some(only) => Ok(only.clone()),
-        None => {
-            pg.items_for_pixels(geometry, hash, limits, names, grid, lookup)
-                .await
-        }
+        None => pg.items_for_pixels(geometry, hash, limits, names, grid, lookup).await,
     }
 }
 
@@ -126,10 +123,7 @@ fn db_error(err: &PgStacError) -> Resp {
         PgStacError::ReadOnly => detail(StatusCode::BAD_REQUEST, err.to_string()),
         PgStacError::Unavailable(_) | PgStacError::Config(_) => {
             tracing::warn!(error = %err, "pgSTAC database unavailable");
-            detail(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "pgSTAC database is unavailable",
-            )
+            detail(StatusCode::SERVICE_UNAVAILABLE, "pgSTAC database is unavailable")
         }
         // What Postgres raised describes the request (a bad filter, an unknown search).
         // Anything else stays in the log.
@@ -183,11 +177,7 @@ fn query_pairs(raw_query: &str) -> Vec<(String, String)> {
 }
 
 fn query_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    pairs
-        .iter()
-        .rev()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
+    pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
 /// Python's `urllib.parse.quote_plus`, which is how TiTiler writes query strings back out.
@@ -195,9 +185,7 @@ fn quote_plus(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
-                out.push(b as char)
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => out.push(b as char),
             b' ' => out.push('+'),
             other => out.push_str(&format!("%{other:02X}")),
         }
@@ -218,10 +206,11 @@ fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
     let mut limits = SearchLimits::default();
     let int = |name: &str, slot: &mut i32| -> Result<(), Resp> {
         if let Some(v) = query_value(pairs, name) {
-            let given =
-                v.parse::<i32>().ok().filter(|n| *n >= 0).ok_or_else(|| {
-                    invalid_param("query", name, "Input should be a valid integer")
-                })?;
+            let given = v
+                .parse::<i32>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| invalid_param("query", name, "Input should be a valid integer"))?;
             // Zero is no limit given, as in titiler-pgstac: the default stands.
             if given > 0 {
                 *slot = given;
@@ -272,28 +261,13 @@ fn part_grid(size: PartSize, bbox: [f64; 4]) -> Option<SampleGrid> {
     }
     // rio-tiler takes the ratio from whole pixel counts; the box's own is that but for
     // rounding, which must not tip a size over to the next pixel.
-    let scaled = |side: u32, by: f64| {
-        (f64::from(side) * by - 1e-6)
-            .ceil()
-            .clamp(1.0, f64::from(u32::MAX)) as u32
-    };
+    let scaled = |side: u32, by: f64| (f64::from(side) * by - 1e-6).ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
     let (width, height) = match size {
-        PartSize::Exact(w, h)
-        | PartSize::Query {
-            width: Some(w),
-            height: Some(h),
-            ..
-        } => (w, h),
+        PartSize::Exact(w, h) | PartSize::Query { width: Some(w), height: Some(h), .. } => (w, h),
         PartSize::Query { width: Some(w), .. } => (w, scaled(w, ratio)),
-        PartSize::Query {
-            height: Some(h), ..
-        } => (scaled(h, 1.0 / ratio), h),
-        PartSize::Query {
-            max_size: Some(m), ..
-        } if ratio > 1.0 => (scaled(m, 1.0 / ratio), m),
-        PartSize::Query {
-            max_size: Some(m), ..
-        } => (m, scaled(m, ratio)),
+        PartSize::Query { height: Some(h), .. } => (scaled(h, 1.0 / ratio), h),
+        PartSize::Query { max_size: Some(m), .. } if ratio > 1.0 => (scaled(m, 1.0 / ratio), m),
+        PartSize::Query { max_size: Some(m), .. } => (m, scaled(m, ratio)),
         PartSize::Query { .. } => return None,
     };
     SampleGrid::for_image(width, height, false)
@@ -344,10 +318,7 @@ fn py_str(v: &Value) -> String {
         Value::Object(o) => {
             let mut keys: Vec<String> = o.keys().cloned().collect();
             jsonb_key_order(&mut keys);
-            let body: Vec<String> = keys
-                .iter()
-                .map(|k| format!("'{k}': {}", repr(&o[k])))
-                .collect();
+            let body: Vec<String> = keys.iter().map(|k| format!("'{k}': {}", repr(&o[k]))).collect();
             format!("{{{}}}", body.join(", "))
         }
     }
@@ -356,10 +327,7 @@ fn py_str(v: &Value) -> String {
 /// Python's `json.dumps` with its default separators, keys in Postgres' jsonb order.
 fn py_json_dumps(v: &Value) -> String {
     match v {
-        Value::Array(a) => format!(
-            "[{}]",
-            a.iter().map(py_json_dumps).collect::<Vec<_>>().join(", ")
-        ),
+        Value::Array(a) => format!("[{}]", a.iter().map(py_json_dumps).collect::<Vec<_>>().join(", ")),
         Value::Object(o) => {
             let mut keys: Vec<String> = o.keys().cloned().collect();
             jsonb_key_order(&mut keys);
@@ -407,10 +375,8 @@ fn layer_queries(metadata: &Value, adapt: bool) -> Vec<(String, String)> {
         // Python reads the keys in jsonb order, then moves the ones it rewrites to the end.
         let mut keys: Vec<String> = values.keys().cloned().collect();
         jsonb_key_order(&mut keys);
-        let mut params: Vec<(String, Value)> = keys
-            .into_iter()
-            .map(|k| (k.clone(), values[&k].clone()))
-            .collect();
+        let mut params: Vec<(String, Value)> =
+            keys.into_iter().map(|k| (k.clone(), values[&k].clone())).collect();
         for key in ["rescale", "colormap", "assets", "asset_bidx"] {
             let Some(pos) = params.iter().position(|(k, _)| k == key) else {
                 continue;
@@ -464,13 +430,7 @@ fn layer_queries(metadata: &Value, adapt: bool) -> Vec<(String, String)> {
             let merged: Vec<Value> = assets
                 .iter()
                 .zip(&options)
-                .map(|(a, o)| {
-                    if o.is_empty() {
-                        json!(a)
-                    } else {
-                        json!(format!("{a}|{}", o.join("|")))
-                    }
-                })
+                .map(|(a, o)| if o.is_empty() { json!(a) } else { json!(format!("{a}|{}", o.join("|"))) })
                 .collect();
             if let Some(slot) = params.iter_mut().find(|(k, _)| k == "assets") {
                 slot.1 = Value::Array(merged);
@@ -480,11 +440,7 @@ fn layer_queries(metadata: &Value, adapt: bool) -> Vec<(String, String)> {
         for (k, v) in &params {
             match v {
                 Value::Array(items) => {
-                    qs.extend(
-                        items
-                            .iter()
-                            .map(|i| format!("{}={}", quote_plus(k), quote_plus(&py_str(i)))),
-                    );
+                    qs.extend(items.iter().map(|i| format!("{}={}", quote_plus(k), quote_plus(&py_str(i)))));
                 }
                 other => qs.push(format!("{}={}", quote_plus(k), quote_plus(&py_str(other)))),
             }
@@ -540,22 +496,12 @@ fn list_item_links(host: &str, id: &str) -> Value {
 /// the way titiler-pgstac's model does.
 fn split_register_body(body: Value) -> Result<(Value, Value), Resp> {
     let Value::Object(mut obj) = body else {
-        return Err(invalid_param(
-            "body",
-            "",
-            "Input should be a valid dictionary or object",
-        ));
+        return Err(invalid_param("body", "", "Input should be a valid dictionary or object"));
     };
     let metadata = match obj.remove("metadata") {
         None | Some(Value::Null) => serde_json::Map::new(),
         Some(Value::Object(m)) => m,
-        Some(_) => {
-            return Err(invalid_param(
-                "body",
-                "metadata",
-                "Input should be a valid dictionary",
-            ));
-        }
+        Some(_) => return Err(invalid_param("body", "metadata", "Input should be a valid dictionary")),
     };
     let mut metadata: serde_json::Map<String, Value> =
         metadata.into_iter().filter(|(_, v)| !v.is_null()).collect();
@@ -574,11 +520,7 @@ fn split_register_body(body: Value) -> Result<(Value, Value), Resp> {
     match obj.get("filter-lang").and_then(Value::as_str) {
         None | Some("cql2-json") => {}
         Some(_) => {
-            return Err(invalid_param(
-                "body",
-                "filter-lang",
-                "Input should be 'cql2-json'",
-            ));
+            return Err(invalid_param("body", "filter-lang", "Input should be 'cql2-json'"));
         }
     }
     // titiler-pgstac always stores the language, and the stored JSON is what gets hashed.
@@ -621,22 +563,11 @@ async fn list(ctx: &Ctx<'_>, pg: &PgStac, pairs: &[(String, String)]) -> Resp {
     let offset = match query_value(pairs, "offset").map(str::parse::<i64>) {
         None => 0,
         Some(Ok(n)) if n >= 0 => n,
-        Some(_) => {
-            return invalid_param(
-                "query",
-                "offset",
-                "Input should be greater than or equal to 0",
-            );
-        }
+        Some(_) => return invalid_param("query", "offset", "Input should be greater than or equal to 0"),
     };
     // Sorted by `lastused` or `usecount`, or by any key of the searches' metadata.
     let mut order = Vec::new();
-    for spec in query_value(pairs, "sortby")
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim_start)
-        .filter(|s| !s.is_empty())
-    {
+    for spec in query_value(pairs, "sortby").unwrap_or("").split(',').map(str::trim_start).filter(|s| !s.is_empty()) {
         let (descending, field) = match spec.as_bytes()[0] {
             b'-' => (true, &spec[1..]),
             b'+' => (false, &spec[1..]),
@@ -656,10 +587,7 @@ async fn list(ctx: &Ctx<'_>, pg: &PgStac, pairs: &[(String, String)]) -> Resp {
     // twice, the last value is the one meant.
     let mut wanted: Vec<(String, String)> = Vec::new();
     for (k, v) in pairs {
-        if matches!(
-            k.to_ascii_lowercase().as_str(),
-            "limit" | "offset" | "properties" | "sortby"
-        ) {
+        if matches!(k.to_ascii_lowercase().as_str(), "limit" | "offset" | "properties" | "sortby") {
             continue;
         }
         match wanted.iter_mut().find(|(seen, _)| seen == k) {
@@ -687,10 +615,7 @@ async fn list(ctx: &Ctx<'_>, pg: &PgStac, pairs: &[(String, String)]) -> Resp {
                 None => params.push((k.to_string(), v)),
             }
         }
-        let query: Vec<String> = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v)))
-            .collect();
+        let query: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v))).collect();
         format!("{}/searches/list?{}", ctx.host, query.join("&"))
     };
     // As titiler-pgstac has it: a next page whenever this one is not all there is,
@@ -720,10 +645,7 @@ async fn list(ctx: &Ctx<'_>, pg: &PgStac, pairs: &[(String, String)]) -> Resp {
 async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
     match pg.get_search_cached(id).await {
         Ok(Some(rec)) => Ok(rec),
-        Ok(None) => Err(detail(
-            StatusCode::NOT_FOUND,
-            format!("SearchId `{id}` not found"),
-        )),
+        Ok(None) => Err(detail(StatusCode::NOT_FOUND, format!("SearchId `{id}` not found"))),
         Err(e) => Err(db_error(&e)),
     }
 }
@@ -731,308 +653,68 @@ async fn find_search(pg: &PgStac, id: &str) -> Result<Arc<SearchRecord>, Resp> {
 /// The pgSTAC routes: path, method and summary.
 const OPENAPI_ROUTES: [(&str, &str, &str); 63] = [
     ("/searches/list", "get", "List registered pgSTAC searches"),
-    (
-        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}",
-        "get",
-        "Render pgSTAC search mosaic tile, format from the pixels",
-    ),
-    (
-        "/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}",
-        "get",
-        "Image of a pgSTAC search mosaic over a bounding box, at a size",
-    ),
-    (
-        "/searches/{search_id}/feature",
-        "post",
-        "Image of a pgSTAC search mosaic clipped to a GeoJSON feature, format from the pixels",
-    ),
-    (
-        "/searches/{search_id}/feature/{width}x{height}.{format}",
-        "post",
-        "Image of a pgSTAC search mosaic clipped to a GeoJSON feature, at a size",
-    ),
-    (
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}",
-        "get",
-        "Render pgSTAC collection mosaic tile, format from the pixels",
-    ),
-    (
-        "/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}",
-        "get",
-        "Image of a pgSTAC collection mosaic over a bounding box, at a size",
-    ),
-    (
-        "/collections/{collection_id}/feature",
-        "post",
-        "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature, format from the pixels",
-    ),
-    (
-        "/collections/{collection_id}/feature/{width}x{height}.{format}",
-        "post",
-        "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature, at a size",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/statistics",
-        "post",
-        "pgSTAC item statistics under GeoJSON features",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}",
-        "get",
-        "Render pgSTAC item tile, format from the pixels",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/preview",
-        "get",
-        "pgSTAC item preview, format from the pixels",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/preview/{width}x{height}.{format}",
-        "get",
-        "pgSTAC item preview, at a size",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}",
-        "get",
-        "pgSTAC item image for a bounding box, at a size",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/feature",
-        "post",
-        "pgSTAC item image for a GeoJSON feature, format from the pixels",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/feature/{width}x{height}.{format}",
-        "post",
-        "pgSTAC item image for a GeoJSON feature, at a size",
-    ),
-    (
-        "/searches/{search_id}/statistics",
-        "post",
-        "Statistics of a pgSTAC search mosaic under GeoJSON features",
-    ),
-    (
-        "/collections/{collection_id}/statistics",
-        "post",
-        "Statistics of a pgSTAC collection mosaic under GeoJSON features",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/renders/{render_id}",
-        "get",
-        "One of a pgSTAC item's renders",
-    ),
-    (
-        "/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}",
-        "get",
-        "Image of a pgSTAC search mosaic over a bounding box",
-    ),
-    (
-        "/searches/{search_id}/feature.{format}",
-        "post",
-        "Image of a pgSTAC search mosaic clipped to a GeoJSON feature",
-    ),
-    (
-        "/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}",
-        "get",
-        "Image of a pgSTAC collection mosaic over a bounding box",
-    ),
-    (
-        "/collections/{collection_id}/feature.{format}",
-        "post",
-        "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature",
-    ),
-    (
-        "/searches/{search_id}/point/{lon},{lat}",
-        "get",
-        "Values of the items under a point",
-    ),
-    (
-        "/collections/{collection_id}/point/{lon},{lat}",
-        "get",
-        "Values of the items under a point",
-    ),
-    (
-        "/searches/{search_id}/WMTSCapabilities.xml",
-        "get",
-        "pgSTAC search WMTS capabilities",
-    ),
-    (
-        "/collections/{collection_id}/WMTSCapabilities.xml",
-        "get",
-        "pgSTAC collection WMTS capabilities",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/WMTSCapabilities.xml",
-        "get",
-        "pgSTAC item WMTS capabilities",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/assets",
-        "get",
-        "Assets of a pgSTAC item",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/info",
-        "get",
-        "pgSTAC item asset metadata",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/info.geojson",
-        "get",
-        "pgSTAC item asset metadata as GeoJSON",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/statistics",
-        "get",
-        "pgSTAC item statistics",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/asset_statistics",
-        "get",
-        "pgSTAC item per-asset statistics",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/tiles",
-        "get",
-        "pgSTAC item tilesets",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}",
-        "get",
-        "pgSTAC item tileset description",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}",
-        "get",
-        "Render pgSTAC item tile",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/tilejson.json",
-        "get",
-        "pgSTAC item TileJSON 3.0",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/map.html",
-        "get",
-        "pgSTAC item map viewer",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/point/{lon},{lat}",
-        "get",
-        "pgSTAC item values at a point",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/preview.{format}",
-        "get",
-        "pgSTAC item preview",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}",
-        "get",
-        "pgSTAC item image for a bounding box",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/feature.{format}",
-        "post",
-        "pgSTAC item image for a GeoJSON feature",
-    ),
-    (
-        "/collections/{collection_id}/items/{item_id}/renders",
-        "get",
-        "pgSTAC item renders",
-    ),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get", "Render pgSTAC search mosaic tile, format from the pixels"),
+    ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get", "Image of a pgSTAC search mosaic over a bounding box, at a size"),
+    ("/searches/{search_id}/feature", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature, format from the pixels"),
+    ("/searches/{search_id}/feature/{width}x{height}.{format}", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature, at a size"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get", "Render pgSTAC collection mosaic tile, format from the pixels"),
+    ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get", "Image of a pgSTAC collection mosaic over a bounding box, at a size"),
+    ("/collections/{collection_id}/feature", "post", "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature, format from the pixels"),
+    ("/collections/{collection_id}/feature/{width}x{height}.{format}", "post", "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature, at a size"),
+    ("/collections/{collection_id}/items/{item_id}/statistics", "post", "pgSTAC item statistics under GeoJSON features"),
+    ("/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}", "get", "Render pgSTAC item tile, format from the pixels"),
+    ("/collections/{collection_id}/items/{item_id}/preview", "get", "pgSTAC item preview, format from the pixels"),
+    ("/collections/{collection_id}/items/{item_id}/preview/{width}x{height}.{format}", "get", "pgSTAC item preview, at a size"),
+    ("/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}", "get", "pgSTAC item image for a bounding box, at a size"),
+    ("/collections/{collection_id}/items/{item_id}/feature", "post", "pgSTAC item image for a GeoJSON feature, format from the pixels"),
+    ("/collections/{collection_id}/items/{item_id}/feature/{width}x{height}.{format}", "post", "pgSTAC item image for a GeoJSON feature, at a size"),
+    ("/searches/{search_id}/statistics", "post", "Statistics of a pgSTAC search mosaic under GeoJSON features"),
+    ("/collections/{collection_id}/statistics", "post", "Statistics of a pgSTAC collection mosaic under GeoJSON features"),
+    ("/collections/{collection_id}/items/{item_id}/renders/{render_id}", "get", "One of a pgSTAC item's renders"),
+    ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC search mosaic over a bounding box"),
+    ("/searches/{search_id}/feature.{format}", "post", "Image of a pgSTAC search mosaic clipped to a GeoJSON feature"),
+    ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "Image of a pgSTAC collection mosaic over a bounding box"),
+    ("/collections/{collection_id}/feature.{format}", "post", "Image of a pgSTAC collection mosaic clipped to a GeoJSON feature"),
+    ("/searches/{search_id}/point/{lon},{lat}", "get", "Values of the items under a point"),
+    ("/collections/{collection_id}/point/{lon},{lat}", "get", "Values of the items under a point"),
+    ("/searches/{search_id}/WMTSCapabilities.xml", "get", "pgSTAC search WMTS capabilities"),
+    ("/collections/{collection_id}/WMTSCapabilities.xml", "get", "pgSTAC collection WMTS capabilities"),
+    ("/collections/{collection_id}/items/{item_id}/WMTSCapabilities.xml", "get", "pgSTAC item WMTS capabilities"),
+    ("/collections/{collection_id}/items/{item_id}/assets", "get", "Assets of a pgSTAC item"),
+    ("/collections/{collection_id}/items/{item_id}/info", "get", "pgSTAC item asset metadata"),
+    ("/collections/{collection_id}/items/{item_id}/info.geojson", "get", "pgSTAC item asset metadata as GeoJSON"),
+    ("/collections/{collection_id}/items/{item_id}/statistics", "get", "pgSTAC item statistics"),
+    ("/collections/{collection_id}/items/{item_id}/asset_statistics", "get", "pgSTAC item per-asset statistics"),
+    ("/collections/{collection_id}/items/{item_id}/tiles", "get", "pgSTAC item tilesets"),
+    ("/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}", "get", "pgSTAC item tileset description"),
+    ("/collections/{collection_id}/items/{item_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get", "Render pgSTAC item tile"),
+    ("/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/tilejson.json", "get", "pgSTAC item TileJSON 3.0"),
+    ("/collections/{collection_id}/items/{item_id}/{tileMatrixSetId}/map.html", "get", "pgSTAC item map viewer"),
+    ("/collections/{collection_id}/items/{item_id}/point/{lon},{lat}", "get", "pgSTAC item values at a point"),
+    ("/collections/{collection_id}/items/{item_id}/preview.{format}", "get", "pgSTAC item preview"),
+    ("/collections/{collection_id}/items/{item_id}/bbox/{minx},{miny},{maxx},{maxy}.{format}", "get", "pgSTAC item image for a bounding box"),
+    ("/collections/{collection_id}/items/{item_id}/feature.{format}", "post", "pgSTAC item image for a GeoJSON feature"),
+    ("/collections/{collection_id}/items/{item_id}/renders", "get", "pgSTAC item renders"),
     ("/searches/register", "post", "Register a pgSTAC search"),
     ("/searches/", "get", "List registered pgSTAC searches"),
-    (
-        "/searches/{search_id}/info",
-        "get",
-        "pgSTAC search metadata",
-    ),
-    (
-        "/searches/{search_id}/{tileMatrixSetId}/tilejson.json",
-        "get",
-        "pgSTAC search TileJSON 3.0",
-    ),
-    (
-        "/searches/{search_id}/{tileMatrixSetId}/map.html",
-        "get",
-        "pgSTAC search map viewer",
-    ),
-    (
-        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}",
-        "get",
-        "Render pgSTAC search mosaic tile",
-    ),
-    (
-        "/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets",
-        "get",
-        "Items covering a tile",
-    ),
-    (
-        "/searches/{search_id}/tiles",
-        "get",
-        "pgSTAC search tilesets",
-    ),
-    (
-        "/searches/{search_id}/tiles/{tileMatrixSetId}",
-        "get",
-        "pgSTAC search tileset description",
-    ),
-    (
-        "/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/assets",
-        "get",
-        "Items intersecting a bounding box",
-    ),
-    (
-        "/searches/{search_id}/point/{lon},{lat}/assets",
-        "get",
-        "Items covering a point",
-    ),
-    (
-        "/collections/{collection_id}/info",
-        "get",
-        "pgSTAC collection mosaic metadata",
-    ),
-    (
-        "/collections/{collection_id}/{tileMatrixSetId}/tilejson.json",
-        "get",
-        "pgSTAC collection TileJSON 3.0",
-    ),
-    (
-        "/collections/{collection_id}/{tileMatrixSetId}/map.html",
-        "get",
-        "pgSTAC collection map viewer",
-    ),
-    (
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}",
-        "get",
-        "Render pgSTAC collection mosaic tile",
-    ),
-    (
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets",
-        "get",
-        "Items covering a tile",
-    ),
-    (
-        "/collections/{collection_id}/tiles",
-        "get",
-        "pgSTAC collection tilesets",
-    ),
-    (
-        "/collections/{collection_id}/tiles/{tileMatrixSetId}",
-        "get",
-        "pgSTAC collection tileset description",
-    ),
-    (
-        "/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/assets",
-        "get",
-        "Items intersecting a bounding box",
-    ),
-    (
-        "/collections/{collection_id}/point/{lon},{lat}/assets",
-        "get",
-        "Items covering a point",
-    ),
+    ("/searches/{search_id}/info", "get", "pgSTAC search metadata"),
+    ("/searches/{search_id}/{tileMatrixSetId}/tilejson.json", "get", "pgSTAC search TileJSON 3.0"),
+    ("/searches/{search_id}/{tileMatrixSetId}/map.html", "get", "pgSTAC search map viewer"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get", "Render pgSTAC search mosaic tile"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets", "get", "Items covering a tile"),
+    ("/searches/{search_id}/tiles", "get", "pgSTAC search tilesets"),
+    ("/searches/{search_id}/tiles/{tileMatrixSetId}", "get", "pgSTAC search tileset description"),
+    ("/searches/{search_id}/bbox/{minx},{miny},{maxx},{maxy}/assets", "get", "Items intersecting a bounding box"),
+    ("/searches/{search_id}/point/{lon},{lat}/assets", "get", "Items covering a point"),
+    ("/collections/{collection_id}/info", "get", "pgSTAC collection mosaic metadata"),
+    ("/collections/{collection_id}/{tileMatrixSetId}/tilejson.json", "get", "pgSTAC collection TileJSON 3.0"),
+    ("/collections/{collection_id}/{tileMatrixSetId}/map.html", "get", "pgSTAC collection map viewer"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get", "Render pgSTAC collection mosaic tile"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}/assets", "get", "Items covering a tile"),
+    ("/collections/{collection_id}/tiles", "get", "pgSTAC collection tilesets"),
+    ("/collections/{collection_id}/tiles/{tileMatrixSetId}", "get", "pgSTAC collection tileset description"),
+    ("/collections/{collection_id}/bbox/{minx},{miny},{maxx},{maxy}/assets", "get", "Items intersecting a bounding box"),
+    ("/collections/{collection_id}/point/{lon},{lat}/assets", "get", "Items covering a point"),
 ];
 
 /// The pgSTAC routes, as entries for the OpenAPI document's `paths`.
@@ -1109,11 +791,7 @@ fn collection_search(
     // is turned into the JSON its converter gives, so the search has the same hash.
     let filter_lang = query_value(pairs, "filter-lang").unwrap_or("cql2-text");
     if !matches!(filter_lang, "cql2-text" | "cql2-json") {
-        return Err(invalid_param(
-            "query",
-            "filter-lang",
-            "Input should be 'cql2-text' or 'cql2-json'",
-        ));
+        return Err(invalid_param("query", "filter-lang", "Input should be 'cql2-text' or 'cql2-json'"));
     }
     if let Some(v) = query_value(pairs, "filter") {
         let parsed: Value = if filter_lang == "cql2-json" {
@@ -1123,23 +801,14 @@ fn collection_search(
             // titiler-pgstac's converter reads CQL2 JSON too where it expects text, and
             // writes it back as it writes text.
             let given: Value = serde_json::from_str(v).map_err(|e| {
-                detail(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("invalid CQL2 JSON filter: {e}"),
-                )
+                detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 JSON filter: {e}"))
             })?;
             super::cql2_text::json_to_json(&given).map_err(|e| {
-                detail(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("invalid CQL2 JSON filter: {e}"),
-                )
+                detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 JSON filter: {e}"))
             })?
         } else {
             super::cql2_text::to_json(v).map_err(|e| {
-                detail(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("invalid CQL2 text filter: {e}"),
-                )
+                detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 text filter: {e}"))
             })?
         };
         search.insert("filter".into(), parsed);
@@ -1147,10 +816,7 @@ fn collection_search(
 
     let mut metadata = serde_json::Map::new();
     metadata.insert("type".into(), json!("mosaic"));
-    metadata.insert(
-        "name".into(),
-        json!(format!("Mosaic for '{id}' Collection")),
-    );
+    metadata.insert("name".into(), json!(format!("Mosaic for '{id}' Collection")));
     let extent = collection
         .pointer("/extent/spatial/bbox/0")
         .and_then(Value::as_array)
@@ -1195,26 +861,15 @@ async fn collection_mosaic(
 ) -> Result<Arc<SearchRecord>, Resp> {
     // One request always derives the same search, so its registration is remembered under
     // the parameters that shape it.
-    let narrowing: Vec<String> = [
-        "ids",
-        "bbox",
-        "datetime",
-        "sortby",
-        "query",
-        "filter",
-        "filter-lang",
-    ]
-    .iter()
-    .filter_map(|k| query_value(pairs, k).map(|v| format!("{k}={v}")))
-    .collect();
+    let narrowing: Vec<String> = ["ids", "bbox", "datetime", "sortby", "query", "filter", "filter-lang"]
+        .iter()
+        .filter_map(|k| query_value(pairs, k).map(|v| format!("{k}={v}")))
+        .collect();
     let key = format!("collection|{id}|{}", narrowing.join("&"));
     let collection = match pg.get_collection_cached(id).await {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return Err(detail(
-                StatusCode::NOT_FOUND,
-                format!("CollectionId `{id}` not found"),
-            ));
+            return Err(detail(StatusCode::NOT_FOUND, format!("CollectionId `{id}` not found")));
         }
         Err(e) => return Err(db_error(&e)),
     };
@@ -1240,24 +895,13 @@ fn mosaic_extent(
         }
     };
     let meta_i64 = |k: &str| metadata.get(k).and_then(Value::as_i64);
-    let minzoom = zoom("minzoom")?
-        .or_else(|| meta_i64("minzoom"))
-        .unwrap_or(0);
-    let maxzoom = zoom("maxzoom")?
-        .or_else(|| meta_i64("maxzoom"))
-        .unwrap_or(24);
+    let minzoom = zoom("minzoom")?.or_else(|| meta_i64("minzoom")).unwrap_or(0);
+    let maxzoom = zoom("maxzoom")?.or_else(|| meta_i64("maxzoom")).unwrap_or(24);
     let bounds: [f64; 4] = metadata
         .get("bounds")
         .and_then(Value::as_array)
         .filter(|a| a.len() == 4)
-        .and_then(|a| {
-            Some([
-                a[0].as_f64()?,
-                a[1].as_f64()?,
-                a[2].as_f64()?,
-                a[3].as_f64()?,
-            ])
-        })
+        .and_then(|a| Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?, a[3].as_f64()?]))
         .unwrap_or([-180.0, -85.0511287798066, 180.0, 85.0511287798066]);
     Ok((minzoom, maxzoom, bounds))
 }
@@ -1305,13 +949,7 @@ fn tileset(
     };
     let host = ctx.host;
     let qs = encoded_query(pairs);
-    let with_qs = |url: String| {
-        if qs.is_empty() {
-            url
-        } else {
-            format!("{url}?{qs}")
-        }
-    };
+    let with_qs = |url: String| if qs.is_empty() { url } else { format!("{url}?{qs}") };
     let limits: Vec<Value> = (minzoom.clamp(0, 30)..=maxzoom.clamp(0, 30))
         .map(|z| tile_limits(z, bounds))
         .collect();
@@ -1344,13 +982,7 @@ fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, Strin
     let host = ctx.host;
     let tms = "WebMercatorQuad";
     let qs = encoded_query(pairs);
-    let with_qs = |url: String| {
-        if qs.is_empty() {
-            url
-        } else {
-            format!("{url}?{qs}")
-        }
-    };
+    let with_qs = |url: String| if qs.is_empty() { url } else { format!("{url}?{qs}") };
     json_resp(
         StatusCode::OK,
         &json!({ "tilesets": [{
@@ -1369,10 +1001,7 @@ fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, Strin
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// A float the way Python prints it (`-180.0`, not `-180`).
@@ -1406,9 +1035,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         "tif" | "tiff" | "jp2" | "pngraw" => {
             return detail(
                 StatusCode::BAD_REQUEST,
-                format!(
-                    "tile_format={tile_format} is not supported on pgSTAC routes (use png, jpg, jpeg, webp or npy)"
-                ),
+                format!("tile_format={tile_format} is not supported on pgSTAC routes (use png, jpg, jpeg, webp or npy)"),
             );
         }
         _ => {
@@ -1431,11 +1058,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
     for (_, v) in pairs.iter().filter(|(k, _)| k == "zooms") {
         let parsed = v.split_once("::").and_then(|(tms, range)| {
             let (lo, hi) = range.split_once(',')?;
-            Some((
-                tms,
-                lo.trim().parse::<i64>().ok()?,
-                hi.trim().parse::<i64>().ok()?,
-            ))
+            Some((tms, lo.trim().parse::<i64>().ok()?, hi.trim().parse::<i64>().ok()?))
         });
         match parsed {
             Some((TMS, lo, hi)) => zoom_override = Some((lo, hi)),
@@ -1456,24 +1079,13 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         .into_iter()
         .map(|(name, qs)| {
             // The tile size is the service's to choose, not the layer's.
-            let qs: Vec<&str> = qs
-                .split('&')
-                .filter(|kv| !kv.starts_with("tilesize="))
-                .collect();
+            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.starts_with("tilesize=")).collect();
             (name, qs.join("&"), (source.minzoom, source.maxzoom))
         })
         .collect();
     const NOT_TILE_PARAMS: [&str; 10] = [
-        "tile_format",
-        "use_epsg",
-        "tilesize",
-        "zooms",
-        "service",
-        "request",
-        "acceptversions",
-        "sections",
-        "updatesequence",
-        "acceptformats",
+        "tile_format", "use_epsg", "tilesize", "zooms", "service", "request", "acceptversions",
+        "sections", "updatesequence", "acceptformats",
     ];
     if query_value(pairs, "assets").is_some_and(|a| !a.is_empty()) {
         let qs: Vec<String> = pairs
@@ -1541,9 +1153,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         let template = xml_escape(&if qs.is_empty() {
             format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}")
         } else {
-            format!(
-                "{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}?{qs}"
-            )
+            format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}?{qs}")
         });
         xml.push_str(&format!(
             r#"        <Layer>
@@ -1578,11 +1188,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
             "                </TileMatrixSetLimits>\n            </TileMatrixSetLink>\n            <ResourceURL format=\"{media_type}\" resourceType=\"tile\" template=\"{template}\" />\n        </Layer>\n"
         ));
     }
-    let crs = if use_epsg {
-        "EPSG:3857"
-    } else {
-        "http://www.opengis.net/def/crs/EPSG/0/3857"
-    };
+    let crs = if use_epsg { "EPSG:3857" } else { "http://www.opengis.net/def/crs/EPSG/0/3857" };
     xml.push_str(&format!(
         "        <TileMatrixSet>\n            <ows:Identifier>{TMS}</ows:Identifier>\n            <ows:SupportedCRS>{crs}</ows:SupportedCRS>\n"
     ));
@@ -1597,19 +1203,14 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         "        </TileMatrixSet>\n    </Contents>\n    <ServiceMetadataURL xlink:href=\"{this_url}\" />\n</Capabilities>"
     ));
     let mut resp = Response::new(Full::new(Bytes::from(xml)));
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-    resp.headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     resp
 }
 
 /// Only WGS84 coordinates are taken on the bbox and point routes for now.
 fn check_coord_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
-    match query_value(pairs, "coord_crs")
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+    match query_value(pairs, "coord_crs").map(str::to_ascii_lowercase).as_deref() {
         None | Some("epsg:4326" | "ogc:crs84") => Ok(()),
         Some(other) => Err(detail(
             StatusCode::BAD_REQUEST,
@@ -1620,12 +1221,7 @@ fn check_coord_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
 
 /// A position given in the request's `coord_crs`, in degrees: Web Mercator metres are
 /// turned into them, and any other system is refused.
-fn in_degrees(
-    pq: &ParsedQuery,
-    pairs: &[(String, String)],
-    x: f64,
-    y: f64,
-) -> Result<(f64, f64), Resp> {
+fn in_degrees(pq: &ParsedQuery, pairs: &[(String, String)], x: f64, y: f64) -> Result<(f64, f64), Resp> {
     if pq.coord_crs_3857 {
         return Ok(mercator_to_lonlat_deg(x, y));
     }
@@ -1634,12 +1230,10 @@ fn in_degrees(
 
 fn check_dst_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
     match query_value(pairs, "dst_crs") {
-        Some(dst) if !matches!(dst.to_ascii_lowercase().as_str(), "epsg:4326" | "ogc:crs84") => {
-            Err(detail(
-                StatusCode::BAD_REQUEST,
-                format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
-            ))
-        }
+        Some(dst) if !matches!(dst.to_ascii_lowercase().as_str(), "epsg:4326" | "ogc:crs84") => Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
+        )),
         _ => Ok(()),
     }
 }
@@ -1675,8 +1269,7 @@ async fn listed_items(
 ) -> Result<Arc<Vec<MosaicItem>>, Resp> {
     let found = if parse_lookup(pairs)? == Lookup::Lean {
         let names: Vec<String> = parse_assets(pairs)?.into_iter().map(|a| a.name).collect();
-        pg.items_for_pixels(geometry, hash, limits, &names, grid, Lookup::Lean)
-            .await
+        pg.items_for_pixels(geometry, hash, limits, &names, grid, Lookup::Lean).await
     } else {
         pg.items_for_geometry(geometry, hash, limits).await
     };
@@ -1709,16 +1302,10 @@ fn check_tms(tms: &str) -> Result<(), Resp> {
     } else if TITILER_TMS.contains(&tms) {
         Err(detail(
             StatusCode::BAD_REQUEST,
-            format!(
-                "tile matrix set '{tms}' is not supported on pgSTAC mosaic routes (use WebMercatorQuad)"
-            ),
+            format!("tile matrix set '{tms}' is not supported on pgSTAC mosaic routes (use WebMercatorQuad)"),
         ))
     } else {
-        Err(invalid_param(
-            "path",
-            "tileMatrixSetId",
-            "Input should be a supported TileMatrixSet",
-        ))
+        Err(invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet"))
     }
 }
 
@@ -1738,13 +1325,7 @@ fn tilejson(
     };
 
     // TiTiler drops the parameters that shape the TileJSON itself and pins the tile size.
-    let dropped = [
-        "tilematrixsetid",
-        "tile_format",
-        "tile_scale",
-        "minzoom",
-        "maxzoom",
-    ];
+    let dropped = ["tilematrixsetid", "tile_format", "tile_scale", "minzoom", "maxzoom"];
     let mut qs: Vec<String> = pairs
         .iter()
         .filter(|(k, _)| !dropped.contains(&k.to_ascii_lowercase().as_str()))
@@ -1772,11 +1353,7 @@ fn tilejson(
     out.insert("bounds".into(), json!(bounds));
     out.insert(
         "center".into(),
-        json!([
-            (bounds[0] + bounds[2]) / 2.0,
-            (bounds[1] + bounds[3]) / 2.0,
-            minzoom
-        ]),
+        json!([(bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0, minzoom]),
     );
     out.insert("raster_layers".into(), json!({}));
     json_resp(StatusCode::OK, &Value::Object(out))
@@ -1804,21 +1381,14 @@ fn parse_assets(pairs: &[(String, String)]) -> Result<Vec<AssetSpec>, Resp> {
         .filter(|(k, _)| k == "assets")
         .flat_map(|(_, v)| {
             let whole = v.contains('|');
-            v.split(move |c| c == ',' && !whole)
-                .filter(|part| !part.is_empty())
+            v.split(move |c| c == ',' && !whole).filter(|part| !part.is_empty())
         })
         .map(|entry| {
-            let (name, options) = entry
-                .split_once('|')
-                .map_or((entry, None), |(n, o)| (n, Some(o)));
+            let (name, options) = entry.split_once('|').map_or((entry, None), |(n, o)| (n, Some(o)));
             if name.is_empty() {
                 return Err(detail(StatusCode::BAD_REQUEST, "an asset has no name"));
             }
-            let mut spec = AssetSpec {
-                name: name.to_string(),
-                indexes: None,
-                expression: None,
-            };
+            let mut spec = AssetSpec { name: name.to_string(), indexes: None, expression: None };
             for option in options.into_iter().flat_map(|o| o.split('|')) {
                 let (key, value) = option
                     .split_once('=')
@@ -1826,14 +1396,10 @@ fn parse_assets(pairs: &[(String, String)]) -> Result<Vec<AssetSpec>, Resp> {
                 match key {
                     "bidx" => {
                         // Bands are counted from one.
-                        let indexes: Option<Vec<u16>> = value
-                            .split(',')
-                            .map(|i| i.parse().ok().filter(|b| *b > 0))
-                            .collect();
+                        let indexes: Option<Vec<u16>> =
+                            value.split(',').map(|i| i.parse().ok().filter(|b| *b > 0)).collect();
                         spec.indexes = Some(indexes.ok_or_else(|| {
-                            bad(&format!(
-                                "invalid literal for int() with base 10: '{value}'"
-                            ))
+                            bad(&format!("invalid literal for int() with base 10: '{value}'"))
                         })?);
                     }
                     "expression" => spec.expression = Some(value.to_string()),
@@ -1856,17 +1422,11 @@ enum AssetBands {
 /// The bands an asset with `bands` bands contributes, and how TiTiler describes them:
 /// `visual_b3` for a band, the expression after the asset's name for band math, and the
 /// bare name with `asset_as_band`, which only single-band assets can be used with.
-fn asset_bands(
-    spec: &AssetSpec,
-    bands: usize,
-    as_band: bool,
-) -> Result<(AssetBands, Vec<String>), String> {
+fn asset_bands(spec: &AssetSpec, bands: usize, as_band: bool) -> Result<(AssetBands, Vec<String>), String> {
     let (out, mut descriptions) = if let Some(expression) = &spec.expression {
         let program = Program::parse(expression, bands)?;
-        let descriptions: Vec<String> = program
-            .sources()
-            .map(|part| format!("{}_{part}", spec.name))
-            .collect();
+        let descriptions: Vec<String> =
+            program.sources().map(|part| format!("{}_{part}", spec.name)).collect();
         (AssetBands::Math(program), descriptions)
     } else {
         let picked: Vec<usize> = match &spec.indexes {
@@ -1874,24 +1434,15 @@ fn asset_bands(
             Some(indexes) => indexes
                 .iter()
                 .map(|&i| {
-                    usize::from(i)
-                        .checked_sub(1)
-                        .filter(|i| *i < bands)
-                        .ok_or_else(|| {
-                            let known: Vec<String> = (1..=bands).map(|b| b.to_string()).collect();
-                            let tail = if bands == 1 { "," } else { "" };
-                            format!(
-                                "band index {i} out of range (not in ({}{tail}))",
-                                known.join(", ")
-                            )
-                        })
+                    usize::from(i).checked_sub(1).filter(|i| *i < bands).ok_or_else(|| {
+                        let known: Vec<String> = (1..=bands).map(|b| b.to_string()).collect();
+                        let tail = if bands == 1 { "," } else { "" };
+                        format!("band index {i} out of range (not in ({}{tail}))", known.join(", "))
+                    })
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let descriptions = picked
-            .iter()
-            .map(|i| format!("{}_b{}", spec.name, i + 1))
-            .collect();
+        let descriptions = picked.iter().map(|i| format!("{}_b{}", spec.name, i + 1)).collect();
         (AssetBands::Pick(picked), descriptions)
     };
     if as_band {
@@ -1907,10 +1458,9 @@ impl AssetBands {
     /// The contribution for whole planes, one per band of the asset.
     fn planes(&self, bands: &[Vec<f32>]) -> Vec<Vec<f64>> {
         match self {
-            AssetBands::Pick(picked) => picked
-                .iter()
-                .map(|&i| bands[i].iter().map(|v| f64::from(*v)).collect())
-                .collect(),
+            AssetBands::Pick(picked) => {
+                picked.iter().map(|&i| bands[i].iter().map(|v| f64::from(*v)).collect()).collect()
+            }
             AssetBands::Math(program) => {
                 let len = bands.first().map_or(0, Vec::len);
                 let mut out = vec![Vec::with_capacity(len); program.len()];
@@ -1924,11 +1474,7 @@ impl AssetBands {
                         any |= !band[i].is_nan();
                     }
                     for (part, plane) in out.iter_mut().enumerate() {
-                        let v = if any {
-                            program.eval(part, &pixel)
-                        } else {
-                            f64::NAN
-                        };
+                        let v = if any { program.eval(part, &pixel) } else { f64::NAN };
                         plane.push(if v.is_finite() { v } else { f64::NAN });
                     }
                 }
@@ -1976,8 +1522,7 @@ const MAX_WORKING_BYTES: usize = 512 * 1024 * 1024;
 fn check_working_bytes(bytes: usize) -> Result<(), EngineError> {
     if bytes > MAX_WORKING_BYTES {
         return Err(EngineError::BadRequest(
-            "the image is too large for this pixel_selection; pass max_size, or width and height"
-                .into(),
+            "the image is too large for this pixel_selection; pass max_size, or width and height".into(),
         ));
     }
     Ok(())
@@ -1996,11 +1541,7 @@ fn whole_numbers(unscale: bool, bands: &BandRequest, sample_type: SampleType) ->
 /// Done in another order or in single precision, a value on a boundary lands a level off.
 fn rescale_byte(v: f32, min: f32, max: f32) -> u8 {
     let (v, min, max) = (f64::from(v), f64::from(min), f64::from(max));
-    let span = if (max - min).abs() < 1e-12 {
-        1e-12
-    } else {
-        max - min
-    };
+    let span = if (max - min).abs() < 1e-12 { 1e-12 } else { max - min };
     let share = (v.max(min).min(max) - min) / span;
     (share * 255.0).clamp(0.0, 255.0) as u8
 }
@@ -2008,56 +1549,22 @@ fn rescale_byte(v: f32, min: f32, max: f32) -> u8 {
 /// How the values a pixel selection leaves become colours: the request's own rescaling
 /// and colour map, applied as the renderer applies them to a single scene.
 enum Paint {
-    Gray {
-        min: f32,
-        max: f32,
-        colormap: ColormapName,
-    },
-    Rgb {
-        min: [f32; 3],
-        max: [f32; 3],
-    },
+    Gray { min: f32, max: f32, colormap: ColormapName },
+    Rgb { min: [f32; 3], max: [f32; 3] },
 }
 
 impl Paint {
     /// `None` for a request whose pixels are not values put through a rescale (a terrain encoding).
     fn of(bands: &BandRequest) -> Option<Self> {
         Some(match bands {
-            BandRequest::Single {
-                rescale, colormap, ..
-            }
-            | BandRequest::Spectral1 {
-                rescale, colormap, ..
-            }
-            | BandRequest::Spectral2 {
-                rescale, colormap, ..
-            }
-            | BandRequest::Spectral3 {
-                rescale, colormap, ..
-            }
-            | BandRequest::CustomExpr {
-                rescale, colormap, ..
-            }
-            | BandRequest::Dem {
-                rescale, colormap, ..
-            } => Self::Gray {
-                min: rescale.0,
-                max: rescale.1,
-                colormap: *colormap,
-            },
-            BandRequest::Rgb {
-                rescale_min,
-                rescale_max,
-                ..
-            }
-            | BandRequest::SarRgb {
-                rescale_min,
-                rescale_max,
-                ..
-            } => Self::Rgb {
-                min: *rescale_min,
-                max: *rescale_max,
-            },
+            BandRequest::Single { rescale, colormap, .. }
+            | BandRequest::Spectral1 { rescale, colormap, .. }
+            | BandRequest::Spectral2 { rescale, colormap, .. }
+            | BandRequest::Spectral3 { rescale, colormap, .. }
+            | BandRequest::CustomExpr { rescale, colormap, .. }
+            | BandRequest::Dem { rescale, colormap, .. } => Self::Gray { min: rescale.0, max: rescale.1, colormap: *colormap },
+            BandRequest::Rgb { rescale_min, rescale_max, .. }
+            | BandRequest::SarRgb { rescale_min, rescale_max, .. } => Self::Rgb { min: *rescale_min, max: *rescale_max },
             BandRequest::Terrain { .. } | BandRequest::CustomExprRgb { .. } => return None,
         })
     }
@@ -2069,20 +1576,12 @@ impl Paint {
         match (self, selected.bands) {
             (Self::Rgb { min, max }, 3) => {
                 for (i, px) in out.chunks_exact_mut(4).enumerate() {
-                    let v = [
-                        selected.values[i],
-                        selected.values[pixels + i],
-                        selected.values[2 * pixels + i],
-                    ];
+                    let v = [selected.values[i], selected.values[pixels + i], selected.values[2 * pixels + i]];
                     if v.iter().all(|v| v.is_nan()) {
                         continue;
                     }
                     for k in 0..3 {
-                        px[k] = if v[k].is_nan() {
-                            0
-                        } else {
-                            byte(v[k], min[k], max[k])
-                        };
+                        px[k] = if v[k].is_nan() { 0 } else { byte(v[k], min[k], max[k]) };
                     }
                     px[3] = 255;
                 }
@@ -2138,17 +1637,13 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     }
     let asset_as_band = match query_value(pairs, "asset_as_band") {
         None => false,
-        Some(v) => parse_bool(v).ok_or_else(|| {
-            invalid_param("query", "asset_as_band", "Input should be a valid boolean")
-        })?,
+        Some(v) => parse_bool(v)
+            .ok_or_else(|| invalid_param("query", "asset_as_band", "Input should be a valid boolean"))?,
     };
     if assets.len() > MAX_ASSETS_PER_ITEM {
         return Err(detail(
             StatusCode::BAD_REQUEST,
-            format!(
-                "at most {MAX_ASSETS_PER_ITEM} assets per item are supported, got {}",
-                assets.len()
-            ),
+            format!("at most {MAX_ASSETS_PER_ITEM} assets per item are supported, got {}", assets.len()),
         ));
     }
     let selection = match query_value(pairs, "pixel_selection") {
@@ -2166,17 +1661,11 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         },
     };
     if query_value(pairs, "algorithm_params").is_some() {
-        return Err(detail(
-            StatusCode::BAD_REQUEST,
-            "parameter 'algorithm_params' is not supported yet",
-        ));
+        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
     }
     // A tile's `buffer` is taken before this is asked; anything else has none.
     if pq.buffer > 0.0 {
-        return Err(detail(
-            StatusCode::BAD_REQUEST,
-            "parameter 'buffer' is for tiles",
-        ));
+        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'buffer' is for tiles"));
     }
     if pq.unscale && assets.len() > 1 {
         return Err(detail(
@@ -2216,28 +1705,19 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// Returns each asset's bands and the request's own `bidx`, or `None` when no asset has
 /// options. Only the info, statistics and point handlers read bands asset by asset; on
 /// the others several assets with bands of their own are refused too.
-pub(super) fn item_asset_options(
-    rest: &[&str],
-    raw_query: &str,
-) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
+pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
     let pairs = query_pairs(raw_query);
     let specs = parse_assets(&pairs)?;
     if let Some(spec) = specs.iter().find(|s| s.expression.is_some()) {
         return Err(detail(
             StatusCode::BAD_REQUEST,
-            format!(
-                "assets={}|expression= is not supported on this item route yet; use `expression`",
-                spec.name
-            ),
+            format!("assets={}|expression= is not supported on this item route yet; use `expression`", spec.name),
         ));
     }
     if specs.iter().all(|s| s.indexes.is_none()) {
         return Ok(None);
     }
-    let by_asset = matches!(
-        rest,
-        ["info" | "info.geojson" | "statistics" | "asset_statistics"] | ["point", _]
-    );
+    let by_asset = matches!(rest, ["info" | "info.geojson" | "statistics" | "asset_statistics"] | ["point", _]);
     if specs.len() > 1 && !by_asset {
         return Err(detail(
             StatusCode::BAD_REQUEST,
@@ -2250,13 +1730,7 @@ pub(super) fn item_asset_options(
         .flat_map(|(_, v)| v.split(','))
         .filter_map(|b| b.trim().parse().ok())
         .collect();
-    Ok(Some((
-        specs
-            .into_iter()
-            .filter_map(|s| s.indexes.map(|i| (s.name, i)))
-            .collect(),
-        own,
-    )))
+    Ok(Some((specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect(), own)))
 }
 
 /// Whether the shared parser's complaint is about something these routes read for
@@ -2283,19 +1757,13 @@ fn error_parameter(e: &str) -> Option<&str> {
     if let Some(rest) = e.strip_prefix("invalid ") {
         return rest.split_once('=').map(|(name, _)| name);
     }
-    e.strip_prefix("parameter '")?
-        .split_once('\'')
-        .map(|(name, _)| name)
+    e.strip_prefix("parameter '")?.split_once('\'').map(|(name, _)| name)
 }
 
 /// The request's `expression`, under any of the names the shared parser takes for it; as
 /// there, the last one given is the one used.
 fn request_expression(pairs: &[(String, String)]) -> Option<&str> {
-    pairs
-        .iter()
-        .rev()
-        .find(|(k, _)| matches!(k.as_str(), "expression" | "expr" | "index"))
-        .map(|(_, v)| v.as_str())
+    pairs.iter().rev().find(|(k, _)| matches!(k.as_str(), "expression" | "expr" | "index")).map(|(_, v)| v.as_str())
 }
 
 /// The asset names of a request, once its `expression` is known not to use them: band math
@@ -2304,14 +1772,8 @@ fn expression_names(pq: &ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>
     let names: Vec<String> = query.assets.iter().map(|a| a.name.clone()).collect();
     if let Some(expression) = &pq.expr_raw {
         let words = expression.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
-        if let Some(name) = words
-            .filter(|w| !w.is_empty())
-            .find(|w| names.iter().any(|n| n == w))
-        {
-            return Err(detail(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid band/asset name '{name}'"),
-            ));
+        if let Some(name) = words.filter(|w| !w.is_empty()).find(|w| names.iter().any(|n| n == w)) {
+            return Err(detail(StatusCode::BAD_REQUEST, format!("Invalid band/asset name '{name}'")));
         }
     }
     Ok(names)
@@ -2322,8 +1784,7 @@ fn expression_names(pq: &ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>
 /// three on one grid. Assets on different grids are found out later, from the rasters.
 fn wants_planes(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
     let math = pq.expr_raw.as_deref();
-    let plain =
-        |a: &AssetSpec| a.expression.is_none() && a.indexes.as_ref().is_none_or(|i| i == &[1]);
+    let plain = |a: &AssetSpec| a.expression.is_none() && a.indexes.as_ref().is_none_or(|i| i == &[1]);
     query.selection.is_some_and(Selection::by_last_band)
         || math.is_some_and(|e| e.contains(';'))
         || match query.assets.as_slice() {
@@ -2351,11 +1812,7 @@ const MAX_BANDS_PER_ITEM: usize = 32;
 /// engine knows names and functions it does not (`ndvi`, `^`, `max(a, b)`).
 fn planes_read_all(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
     let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok();
-    pq.expr_raw.as_ref().is_none_or(reads)
-        && query
-            .assets
-            .iter()
-            .all(|a| a.expression.as_ref().is_none_or(reads))
+    pq.expr_raw.as_ref().is_none_or(reads) && query.assets.iter().all(|a| a.expression.as_ref().is_none_or(reads))
 }
 
 /// A tile made from planes: what to read of each item and what to make of it.
@@ -2389,15 +1846,7 @@ enum Window {
     /// A box at a size in pixels, optionally cut to a polygon: in degrees, or with
     /// `mercator` in Web Mercator metres. `size` is what was asked for, from which each
     /// raster's own size follows.
-    Part {
-        bbox: [f64; 4],
-        mercator: bool,
-        width: u32,
-        height: u32,
-        size: PartSize,
-        mask: Option<PartMask>,
-        unscale: bool,
-    },
+    Part { bbox: [f64; 4], mercator: bool, width: u32, height: u32, size: PartSize, mask: Option<PartMask>, unscale: bool },
 }
 
 impl Window {
@@ -2430,23 +1879,13 @@ impl Window {
         nodata: Option<f32>,
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
         // Only the reader of nearest pixels takes a `nodata` of the request's own.
-        let nearest_only = || {
-            EngineError::BadRequest(
-                "`nodata` is read with nearest-neighbour resampling only".into(),
-            )
-        };
+        let nearest_only = || EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into());
         let (bbox, mercator, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
                 let cog = engine.store.open_uri(href).await?;
                 let crs = engine.get_or_build_crs(&cog)?;
-                let resample = if matches!(crs, CrsModel::Epsg3857) {
-                    resampling
-                } else {
-                    reproject
-                };
-                let Some(res) =
-                    mercator_resolution(&crs, &cog).filter(|_| resample == ResampleMode::Nearest)
-                else {
+                let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
+                let Some(res) = mercator_resolution(&crs, &cog).filter(|_| resample == ResampleMode::Nearest) else {
                     if nodata.is_some() {
                         return Err(nearest_only());
                     }
@@ -2456,18 +1895,12 @@ impl Window {
                             request.tile_size
                         )));
                     }
-                    return engine
-                        .raster_planes(href, bands_1based, request, resampling, reproject)
-                        .await;
+                    return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
                 };
                 // The way GDAL's warp reads a tile: from the overview it would pick for
                 // the tile's span at the raster's own resolution.
                 let full = cog.index.full_res();
-                let wanted = TileEngine::wanted_bands(
-                    full.samples_per_pixel,
-                    full.extra_samples.len(),
-                    bands_1based,
-                )?;
+                let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
                 let (w, s, e, n) = tile_bounds_3857(request.tile);
                 let side = request.tile_size as usize;
                 if wanted.len() * side * side > max_values {
@@ -2480,50 +1913,23 @@ impl Window {
                 // One road whatever bands are asked for. GDAL takes another when only some
                 // are, and a band then comes from other pixels than it does in the whole
                 // raster; a band is the same band here either way.
-                let read = warp_nearest(
-                    engine,
-                    &cog,
-                    &crs,
-                    [w, s, e, n],
-                    true,
-                    (side, side),
-                    (own(e - w), own(n - s)),
-                    WarpPath::Direct,
-                    request.unscale,
-                    pool,
-                    &wanted,
-                    true,
-                    nodata,
-                )
-                .await?;
+                let read =
+                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted, true, nodata)
+                        .await?;
                 let mut planes = Vec::with_capacity(wanted.len());
                 for band in &wanted {
                     planes.push(read.get(usize::from(*band) - 1).cloned().ok_or_else(|| {
-                        EngineError::BadRequest(
-                            "unexpected number of planes from the reader".into(),
-                        )
+                        EngineError::BadRequest("unexpected number of planes from the reader".into())
                     })?);
                 }
                 return Ok((planes, full.sample_type));
             }
-            Window::Part {
-                bbox,
-                mercator,
-                width,
-                height,
-                size,
-                mask,
-                unscale,
-            } => (*bbox, *mercator, *width, *height, *size, mask, *unscale),
+            Window::Part { bbox, mercator, width, height, size, mask, unscale } => (*bbox, *mercator, *width, *height, *size, mask, *unscale),
         };
         let cog = engine.store.open_uri(href).await?;
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
-        let wanted = TileEngine::wanted_bands(
-            full.samples_per_pixel,
-            full.extra_samples.len(),
-            bands_1based,
-        )?;
+        let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
         let pixels = self.pixels();
         // Known from the header alone, so nothing is read of an image too large to hold.
         if wanted.len() * pixels > max_values {
@@ -2540,38 +1946,21 @@ impl Window {
             _ => reproject,
         };
         if mercator && resample != ResampleMode::Nearest {
-            return Err(EngineError::BadRequest(
-                "a picture in Web Mercator is read with nearest-neighbour resampling only".into(),
-            ));
+            return Err(EngineError::BadRequest("a picture in Web Mercator is read with nearest-neighbour resampling only".into()));
         }
         if resample == ResampleMode::Nearest {
             // As rio-tiler does: the raster is read at the size its own resolution gives
             // for what was asked, the way GDAL's warp reads it, and brought to the
             // picture's size afterwards.
             let crs = engine.get_or_build_crs(&cog)?;
-            let res = if mercator {
-                mercator_resolution(&crs, &cog)
-            } else {
-                wgs84_resolution(&crs, &cog)
-            }
-            .ok_or_else(|| EngineError::BadRequest("cannot place an asset in WGS84".into()))?;
-            let native = part_dims(
-                PartSize::Query {
-                    max_size: None,
-                    width: None,
-                    height: None,
-                },
-                bbox,
-                res,
-            );
+            let res = if mercator { mercator_resolution(&crs, &cog) } else { wgs84_resolution(&crs, &cog) }
+                .ok_or_else(|| EngineError::BadRequest("cannot place an asset in WGS84".into()))?;
+            let native = part_dims(PartSize::Query { max_size: None, width: None, height: None }, bbox, res);
             let (w, h) = part_dims(size, bbox, res);
             let all = usize::from(full.samples_per_pixel);
             // A raster finer than the first item's, which set the picture's size, would be
             // read larger than an image may be: it is read at the picture's size instead.
-            let own = if w > u64::from(MAX_PART_SIDE)
-                || h > u64::from(MAX_PART_SIDE)
-                || all as u64 * w * h > max_values as u64
-            {
+            let own = if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) || all as u64 * w * h > max_values as u64 {
                 (width as usize, height as usize)
             } else {
                 (w as usize, h as usize)
@@ -2583,23 +1972,7 @@ impl Window {
                 )));
             }
             // One road whatever bands are asked for: see the tile's reading above.
-            let read = match warp_nearest(
-                engine,
-                &cog,
-                &crs,
-                bbox,
-                mercator,
-                own,
-                native,
-                WarpPath::Direct,
-                unscale,
-                true,
-                &[],
-                true,
-                nodata,
-            )
-            .await
-            {
+            let read = match warp_nearest(engine, &cog, &crs, bbox, mercator, own, native, WarpPath::Direct, unscale, true, &[], true, nodata).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -2672,11 +2045,7 @@ impl Window {
         let cogs = [cog];
         let mut planes = Vec::with_capacity(wanted.len());
         for band in wanted {
-            let bands = BandRequest::Single {
-                band_1based: band,
-                rescale: (0.0, 255.0),
-                colormap: ColormapName::Grayscale,
-            };
+            let bands = BandRequest::Single { band_1based: band, rescale: (0.0, 255.0), colormap: ColormapName::Grayscale };
             let values = render_wgs84_bbox(
                 engine,
                 &cogs,
@@ -2695,16 +2064,9 @@ impl Window {
             )
             .await?;
             if values.len() != pixels * 4 {
-                return Err(EngineError::BadRequest(
-                    "unexpected plane size from the renderer".into(),
-                ));
+                return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
             }
-            planes.push(
-                values
-                    .chunks_exact(4)
-                    .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
-                    .collect(),
-            );
+            planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
         }
         Ok((planes, sample_type))
     }
@@ -2768,27 +2130,16 @@ impl PlanesTile {
             _ => &[],
         };
         // Each asset may take its share of what an item may hold.
-        let (planes, sample_type) = self
-            .window
-            .read(
-                engine,
-                href,
-                wanted,
-                self.resampling,
-                self.reproject,
-                MAX_PLANE_VALUES / self.assets.len().max(1),
-                self.pool,
-                self.nodata,
-            )
-            .await?;
+        let (planes, sample_type) =
+            self.window
+                .read(engine, href, wanted, self.resampling, self.reproject, MAX_PLANE_VALUES / self.assets.len().max(1), self.pool, self.nodata)
+                .await?;
         let planes = match &spec.expression {
             Some(expression) => band_math(expression, &planes)?,
             None => planes,
         };
         if self.as_band && planes.len() != 1 {
-            return Err(EngineError::BadRequest(
-                "Can't use `asset_as_band` for multibands asset".into(),
-            ));
+            return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
         }
         Ok((planes, sample_type, spec.expression.is_none()))
     }
@@ -2803,36 +2154,21 @@ impl PlanesTile {
         let parts = futures_util::future::try_join_all(reads).await?;
         let sample_type = parts.first().map_or(SampleType::Uint8, |(_, st, _)| *st);
         // The one type that holds every asset's numbers, as numpy stacks them.
-        let widest = parts
-            .iter()
-            .map(|(_, st, _)| *st)
-            .reduce(wider_type)
-            .unwrap_or(sample_type);
+        let widest = parts.iter().map(|(_, st, _)| *st).reduce(wider_type).unwrap_or(sample_type);
         let integer = self.expression.is_none()
             && !self.window.unscale()
-            && parts.iter().all(|(_, st, own)| {
-                *own && !matches!(st, SampleType::Float32 | SampleType::Float64)
-            });
+            && parts.iter().all(|(_, st, own)| *own && !matches!(st, SampleType::Float32 | SampleType::Float64));
         let stacked: usize = parts.iter().map(|(planes, _, _)| planes.len()).sum();
         if stacked > MAX_BANDS_PER_ITEM {
             return Err(EngineError::BadRequest(format!(
                 "{stacked} bands per item are too many for a tile (at most {MAX_BANDS_PER_ITEM}); choose bands with `bidx`"
             )));
         }
-        let mut bands: Vec<Vec<f32>> = parts
-            .into_iter()
-            .flat_map(|(planes, _, _)| planes)
-            .collect();
+        let mut bands: Vec<Vec<f32>> = parts.into_iter().flat_map(|(planes, _, _)| planes).collect();
         if let Some(expression) = &self.expression {
             bands = band_math(expression, &bands)?;
         }
-        Ok(ItemBands {
-            bands,
-            stacked,
-            integer,
-            sample_type,
-            widest,
-        })
+        Ok(ItemBands { bands, stacked, integer, sample_type, widest })
     }
 
     /// The mosaic of the items' bands, and the first raster's sample type. Items are read
@@ -2864,9 +2200,8 @@ impl PlanesTile {
             };
             let item = item?;
             if !small {
-                ahead = (2 * MAX_PLANE_VALUES
-                    / (item.stacked.max(item.bands.len()).max(1) * pixels).max(1))
-                .clamp(1, MOSAIC_SCENES_AHEAD);
+                ahead = (2 * MAX_PLANE_VALUES / (item.stacked.max(item.bands.len()).max(1) * pixels).max(1))
+                    .clamp(1, MOSAIC_SCENES_AHEAD);
             }
             let (fold, _, _) = match &mut fold {
                 Some(fold) => fold,
@@ -2877,21 +2212,14 @@ impl PlanesTile {
                             "pixel_selection by the last band needs at least two bands".into(),
                         ));
                     }
-                    if Fold::<f32>::held_bytes(self.selection, scenes.len(), bands, pixels)
-                        > MAX_HELD_BYTES
-                    {
+                    if Fold::<f32>::held_bytes(self.selection, scenes.len(), bands, pixels) > MAX_HELD_BYTES {
                         return Err(EngineError::BadRequest(format!(
                             "{} items are too many for a median at this tile size; narrow the search or lower items_limit",
                             scenes.len()
                         )));
                     }
                     check_working_bytes(Fold::<f32>::working_bytes(self.selection, bands, pixels))?;
-                    fold.insert((
-                        Fold::new(self.selection, bands, pixels, item.integer)
-                            .absent_as(self.nodata.unwrap_or(0.0)),
-                        item.sample_type,
-                        item.widest,
-                    ))
+                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer).absent_as(self.nodata.unwrap_or(0.0)), item.sample_type, item.widest))
                 }
             };
             if item.bands.len() != fold.bands() {
@@ -2911,10 +2239,7 @@ impl PlanesTile {
                 break;
             }
         }
-        Ok(fold.and_then(|(fold, sample_type, widest)| {
-            fold.finish()
-                .map(|selected| (selected, sample_type, widest))
-        }))
+        Ok(fold.and_then(|(fold, sample_type, widest)| fold.finish().map(|selected| (selected, sample_type, widest))))
     }
 }
 
@@ -2949,8 +2274,7 @@ impl PlanesTile {
             Some((selected, sample_type, widest)) => {
                 // Without `rescale`: the type's own range for a raster's numbers, and the
                 // renderer's default for band math.
-                let math =
-                    self.expression.is_some() || self.assets.iter().any(|a| a.expression.is_some());
+                let math = self.expression.is_some() || self.assets.iter().any(|a| a.expression.is_some());
                 let default = if math {
                     (-1.0, 1.0)
                 } else {
@@ -2958,14 +2282,8 @@ impl PlanesTile {
                 };
                 // A pixel is there when any band of it is.
                 let per_band = selected.values.len() / selected.bands.max(1);
-                let full = (0..per_band).all(|i| {
-                    selected
-                        .values
-                        .iter()
-                        .skip(i)
-                        .step_by(per_band)
-                        .any(|v| !v.is_nan())
-                });
+                let full =
+                    (0..per_band).all(|i| selected.values.iter().skip(i).step_by(per_band).any(|v| !v.is_nan()));
                 // The driver TiTiler would have tried: the one asked for, or JPEG when
                 // every pixel is there and PNG when not.
                 let driver = match look.asked {
@@ -2980,10 +2298,7 @@ impl PlanesTile {
                 }
                 // An array of the values as they are, when nothing was asked that turns
                 // them into a picture's bytes.
-                let shown = !look.rescale.is_empty()
-                    || look.mapped
-                    || look.custom.is_some()
-                    || look.formula.is_some();
+                let shown = !look.rescale.is_empty() || look.mapped || look.custom.is_some() || look.formula.is_some();
                 if let (Some((OutputFormat::Npy, content_type)), false) = (look.asked, shown) {
                     // Band math comes out in numexpr's types: whole numbers of up to 16
                     // bits stay whole, as 32-bit ones, through sums, differences and
@@ -2992,40 +2307,24 @@ impl PlanesTile {
                     let whole = |e: &String| {
                         let mut rest = e.as_str();
                         while let Some(at) = rest.find('b') {
-                            let digits = rest[at + 1..]
-                                .bytes()
-                                .take_while(u8::is_ascii_digit)
-                                .count();
+                            let digits = rest[at + 1..].bytes().take_while(u8::is_ascii_digit).count();
                             if digits == 0 {
                                 return false;
                             }
                             rest = &rest[at + 1 + digits..];
                         }
-                        !e.bytes().any(|c| {
-                            c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b')
-                        })
+                        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
                     };
-                    let math_of = || {
-                        self.expression
-                            .iter()
-                            .chain(self.assets.iter().filter_map(|a| a.expression.as_ref()))
-                    };
+                    let math_of = || self.expression.iter().chain(self.assets.iter().filter_map(|a| a.expression.as_ref()));
                     let whole_math = math_of().all(whole);
                     // float32 stays float32 through operations and functions alike; a literal
                     // with a fraction or an exponent is a double and makes the result one.
                     let plain_math = math_of().all(|e| {
                         let e = e.as_bytes();
-                        !e.contains(&b'.')
-                            && !e
-                                .windows(2)
-                                .any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
+                        !e.contains(&b'.') && !e.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
                     });
                     // What the bands are before any math: floats once unscaled.
-                    let read = if self.window.unscale() {
-                        SampleType::Float32
-                    } else {
-                        widest
-                    };
+                    let read = if self.window.unscale() { SampleType::Float32 } else { widest };
                     let kind = if matches!(self.selection, Selection::Stdev) {
                         SampleType::Float64
                     } else if matches!(self.selection, Selection::Count) {
@@ -3038,33 +2337,15 @@ impl PlanesTile {
                         SampleType::Float64
                     } else {
                         match read {
-                            SampleType::Uint8
-                            | SampleType::Int8
-                            | SampleType::Uint16
-                            | SampleType::Int16 => SampleType::Int32,
+                            SampleType::Uint8 | SampleType::Int8 | SampleType::Uint16 | SampleType::Int16 => SampleType::Int32,
                             _ => SampleType::Float64,
                         }
                     };
-                    return Ok((
-                        npy_array(
-                            &selected.values,
-                            selected.bands,
-                            width,
-                            height,
-                            kind,
-                            look.return_mask,
-                            self.nodata,
-                        ),
-                        content_type,
-                    ));
+                    return Ok((npy_array(&selected.values, selected.bands, width, height, kind, look.return_mask, self.nodata), content_type));
                 }
                 // An array of rescaled values and nothing else: each band's bytes, however
                 // many bands there are.
-                if matches!(look.asked, Some((OutputFormat::Npy, _)))
-                    && !look.mapped
-                    && look.custom.is_none()
-                    && look.formula.is_none()
-                {
+                if matches!(look.asked, Some((OutputFormat::Npy, _))) && !look.mapped && look.custom.is_none() && look.formula.is_none() {
                     let range = |band: usize| match look.rescale {
                         [] => default,
                         [one] => *one,
@@ -3076,28 +2357,11 @@ impl PlanesTile {
                         .enumerate()
                         .flat_map(|(band, plane)| {
                             let (min, max) = range(band);
-                            plane.iter().map(move |v| {
-                                if v.is_nan() {
-                                    f32::NAN
-                                } else {
-                                    f32::from(rescale_byte(*v, min, max))
-                                }
-                            })
+                            plane.iter().map(move |v| if v.is_nan() { f32::NAN } else { f32::from(rescale_byte(*v, min, max)) })
                         })
                         .collect();
                     let content_type = look.asked.map_or("application/x-binary", |(_, ct)| ct);
-                    return Ok((
-                        npy_array(
-                            &values,
-                            selected.bands,
-                            width,
-                            height,
-                            SampleType::Uint8,
-                            look.return_mask,
-                            None,
-                        ),
-                        content_type,
-                    ));
+                    return Ok((npy_array(&values, selected.bands, width, height, SampleType::Uint8, look.return_mask, None), content_type));
                 }
                 let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap, look.custom).map_err(|bands| {
                     EngineError::BadRequest(format!(
@@ -3106,11 +2370,7 @@ impl PlanesTile {
                 })?;
                 // Under a colour map of the request's own, a pixel is there when its colour
                 // is not wholly transparent: that is the mask TiTiler picks a format by.
-                let full = if look.custom.is_some() {
-                    rgba.chunks_exact(4).all(|p| p[3] != 0)
-                } else {
-                    full
-                };
+                let full = if look.custom.is_some() { rgba.chunks_exact(4).all(|p| p[3] != 0) } else { full };
                 (rgba, selected.bands, full)
             }
         };
@@ -3136,37 +2396,11 @@ impl PlanesTile {
             let shown = if grey { 1 } else { 3 };
             let mut values = Vec::with_capacity(shown * pixels);
             for band in 0..shown {
-                values.extend(rgba.chunks_exact(4).map(|p| {
-                    if p[3] == 0 {
-                        f32::NAN
-                    } else {
-                        f32::from(p[band])
-                    }
-                }));
+                values.extend(rgba.chunks_exact(4).map(|p| if p[3] == 0 { f32::NAN } else { f32::from(p[band]) }));
             }
-            return Ok((
-                npy_array(
-                    &values,
-                    shown,
-                    width,
-                    height,
-                    SampleType::Uint8,
-                    look.return_mask,
-                    None,
-                ),
-                content_type,
-            ));
+            return Ok((npy_array(&values, shown, width, height, SampleType::Uint8, look.return_mask, None), content_type));
         }
-        encode_picture(
-            rgba,
-            width,
-            height,
-            look.formula,
-            Some(asked),
-            look.jpeg_quality,
-            look.return_mask,
-            grey,
-        )
+        encode_picture(rgba, width, height, look.formula, Some(asked), look.jpeg_quality, look.return_mask, grey)
     }
 }
 
@@ -3186,36 +2420,16 @@ fn wider_type(a: SampleType, b: SampleType) -> SampleType {
     };
     if float(a) || float(b) {
         // float32 holds whole numbers of 16 bits and no more.
-        let narrow = |t| {
-            if float(t) {
-                bits(t) == 32
-            } else {
-                bits(t) <= 16
-            }
-        };
-        return if narrow(a) && narrow(b) {
-            T::Float32
-        } else {
-            T::Float64
-        };
+        let narrow = |t| if float(t) { bits(t) == 32 } else { bits(t) <= 16 };
+        return if narrow(a) && narrow(b) { T::Float32 } else { T::Float64 };
     }
-    let sized = |kinds: [SampleType; 3], width: u32| {
-        kinds[match width {
-            8 => 0,
-            16 => 1,
-            _ => 2,
-        }]
-    };
+    let sized = |kinds: [SampleType; 3], width: u32| kinds[match width { 8 => 0, 16 => 1, _ => 2 }];
     match (signed(a), signed(b)) {
         (false, false) => sized([T::Uint8, T::Uint16, T::Uint32], bits(a).max(bits(b))),
         (true, true) => sized([T::Int8, T::Int16, T::Int32], bits(a).max(bits(b))),
         // A signed type one size up from the unsigned one, or the signed one's own if larger.
         _ => {
-            let (own, unsigned) = if signed(a) {
-                (bits(a), bits(b))
-            } else {
-                (bits(b), bits(a))
-            };
+            let (own, unsigned) = if signed(a) { (bits(a), bits(b)) } else { (bits(b), bits(a)) };
             match (unsigned * 2).max(own) {
                 16 => T::Int16,
                 32 => T::Int32,
@@ -3250,9 +2464,7 @@ fn npy_array(
         SampleType::Float64 => ("<f8", 8),
     };
     let planes = bands + usize::from(mask);
-    let mut dict = format!(
-        "{{'descr': '{descr}', 'fortran_order': False, 'shape': ({planes}, {height}, {width}), }}"
-    );
+    let mut dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({planes}, {height}, {width}), }}");
     // The header ends on a multiple of 64 bytes, in spaces and a newline.
     let pad = (64 - (10 + dict.len() + 1) % 64) % 64;
     dict.extend(std::iter::repeat_n(' ', pad));
@@ -3265,35 +2477,13 @@ fn npy_array(
     let mut put = |v: f64, top: bool| match kind {
         SampleType::Uint8 => out.push(if top { u8::MAX } else { v as u8 }),
         SampleType::Int8 => out.push((if top { i8::MAX } else { v as i8 }) as u8),
-        SampleType::Uint16 => {
-            out.extend_from_slice(&(if top { u16::MAX } else { v as u16 }).to_le_bytes())
-        }
-        SampleType::Int16 => {
-            out.extend_from_slice(&(if top { i16::MAX } else { v as i16 }).to_le_bytes())
-        }
-        SampleType::Uint32 => {
-            out.extend_from_slice(&(if top { u32::MAX } else { v as u32 }).to_le_bytes())
-        }
-        SampleType::Int32 => {
-            out.extend_from_slice(&(if top { i32::MAX } else { v as i32 }).to_le_bytes())
-        }
+        SampleType::Uint16 => out.extend_from_slice(&(if top { u16::MAX } else { v as u16 }).to_le_bytes()),
+        SampleType::Int16 => out.extend_from_slice(&(if top { i16::MAX } else { v as i16 }).to_le_bytes()),
+        SampleType::Uint32 => out.extend_from_slice(&(if top { u32::MAX } else { v as u32 }).to_le_bytes()),
+        SampleType::Int32 => out.extend_from_slice(&(if top { i32::MAX } else { v as i32 }).to_le_bytes()),
         // Band math's largest number is an infinity once it has been through a plane of f32.
-        SampleType::Float32 => out.extend_from_slice(
-            &(if top {
-                f32::MAX
-            } else {
-                (v as f32).clamp(f32::MIN, f32::MAX)
-            })
-            .to_le_bytes(),
-        ),
-        SampleType::Float64 => out.extend_from_slice(
-            &(if top {
-                f64::MAX
-            } else {
-                v.clamp(f64::MIN, f64::MAX)
-            })
-            .to_le_bytes(),
-        ),
+        SampleType::Float32 => out.extend_from_slice(&(if top { f32::MAX } else { (v as f32).clamp(f32::MIN, f32::MAX) }).to_le_bytes()),
+        SampleType::Float64 => out.extend_from_slice(&(if top { f64::MAX } else { v.clamp(f64::MIN, f64::MAX) }).to_le_bytes()),
     };
     let absent = f64::from(absent.unwrap_or(0.0));
     for v in values.iter().take(bands * pixels) {
@@ -3301,8 +2491,7 @@ fn npy_array(
     }
     if mask {
         for i in 0..pixels {
-            let there =
-                (0..bands).any(|band| values.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+            let there = (0..bands).any(|band| values.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
             put(0.0, there);
         }
     }
@@ -3323,19 +2512,14 @@ const MAX_COLORMAP_INTERVALS: usize = 256;
 impl MosaicColormap {
     /// `None` for a map with nothing in it, which TiTiler takes as no map at all.
     fn parse(json: &str) -> Result<Option<Self>, String> {
-        let given: Value =
-            serde_json::from_str(json).map_err(|e| format!("invalid colormap JSON: {e}"))?;
+        let given: Value = serde_json::from_str(json).map_err(|e| format!("invalid colormap JSON: {e}"))?;
         let every_byte = match &given {
             Value::Object(classes) if classes.is_empty() => return Ok(None),
             Value::Array(spans) if spans.is_empty() => return Ok(None),
             Value::Array(spans) if spans.len() > MAX_COLORMAP_INTERVALS => {
-                return Err(format!(
-                    "a colormap takes at most {MAX_COLORMAP_INTERVALS} intervals"
-                ));
+                return Err(format!("a colormap takes at most {MAX_COLORMAP_INTERVALS} intervals"));
             }
-            Value::Object(classes) => {
-                classes.len() == 256 && (0..256).all(|k| classes.contains_key(&k.to_string()))
-            }
+            Value::Object(classes) => classes.len() == 256 && (0..256).all(|k| classes.contains_key(&k.to_string())),
             _ => false,
         };
         let map = cogzilla_kernel::CustomColormap::from_json_str(json, false)?;
@@ -3364,11 +2548,7 @@ impl MosaicColormap {
             cogzilla_kernel::CustomColormap::Intervals(spans) => {
                 let x = scaled.map_or(v, |(min, max)| f32::from(rescale_byte(v, min, max)));
                 // Where intervals overlap, the one given last is the one that shows.
-                spans
-                    .iter()
-                    .rev()
-                    .find(|(low, high, _)| x >= *low && x < *high)
-                    .map_or(NOTHING, |span| span.2)
+                spans.iter().rev().find(|(low, high, _)| x >= *low && x < *high).map_or(NOTHING, |span| span.2)
             }
         }
     }
@@ -3413,19 +2593,11 @@ fn paint_bands(
         }
         3 => {
             let (r, g, b) = (range(0), range(1), range(2));
-            Ok(Paint::Rgb {
-                min: [r.0, g.0, b.0],
-                max: [r.1, g.1, b.1],
-            }
-            .rgba(selected, pixels))
+            Ok(Paint::Rgb { min: [r.0, g.0, b.0], max: [r.1, g.1, b.1] }.rgba(selected, pixels))
         }
         2 => {
             let byte = |v: f32, (min, max): (f32, f32)| {
-                if v.is_nan() {
-                    0
-                } else {
-                    rescale_byte(v, min, max)
-                }
+                if v.is_nan() { 0 } else { rescale_byte(v, min, max) }
             };
             let mut out = vec![255u8; pixels * 4];
             for (i, px) in out.chunks_exact_mut(4).enumerate() {
@@ -3447,19 +2619,14 @@ fn paint_bands(
 /// and does not come here: it is made from planes ([`wants_planes`]).
 fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>, Resp> {
     let unsupported = |what: &str| {
-        detail(
-            StatusCode::BAD_REQUEST,
-            format!("{what} is not supported by the renderer"),
-        )
+        detail(StatusCode::BAD_REQUEST, format!("{what} is not supported by the renderer"))
     };
     // TiTiler 2 takes band indexes per asset only; a bare `bidx` is passed over.
     pq.bidx.clear();
     let names = expression_names(pq, query)?;
     pq.assets = names.clone();
     if names.len() > MAX_ASSETS_PER_SCENE {
-        return Err(unsupported(&format!(
-            "more than {MAX_ASSETS_PER_SCENE} assets per item"
-        )));
+        return Err(unsupported(&format!("more than {MAX_ASSETS_PER_SCENE} assets per item")));
     }
     if query.selection.is_some_and(Selection::by_last_band) {
         return Err(unsupported("pixel_selection by the last band"));
@@ -3468,9 +2635,7 @@ fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<Stri
         [one] => {
             if let Some(expression) = &one.expression {
                 if pq.expr_raw.is_some() {
-                    return Err(unsupported(
-                        "an `expression` on top of an asset's own expression",
-                    ));
+                    return Err(unsupported("an `expression` on top of an asset's own expression"));
                 }
                 if expression.contains(';') {
                     return Err(unsupported("an asset expression with several results"));
@@ -3481,26 +2646,21 @@ fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<Stri
                     return Err(unsupported("an `expression` over bands chosen with `bidx`"));
                 }
                 if !matches!(indexes.len(), 1 | 3) {
-                    return Err(unsupported(
-                        "`bidx` with a number of bands other than one or three",
-                    ));
+                    return Err(unsupported("`bidx` with a number of bands other than one or three"));
                 }
                 pq.bidx = indexes.clone();
             }
         }
         several => {
-            let plain = |a: &AssetSpec| {
-                a.expression.is_none() && a.indexes.as_ref().is_none_or(|i| i == &[1])
-            };
+            let plain = |a: &AssetSpec| a.expression.is_none() && a.indexes.as_ref().is_none_or(|i| i == &[1]);
             if !several.iter().all(plain) {
-                return Err(unsupported(
-                    "options other than `bidx=1` when several assets are given",
-                ));
+                return Err(unsupported("options other than `bidx=1` when several assets are given"));
             }
         }
     }
     Ok(names)
 }
+
 
 /// `Ok(None)` is a tile past the edge of the grid. That is not an error in
 /// titiler-pgstac: no item covers it, so the answer is empty.
@@ -3520,9 +2680,7 @@ async fn tile_assets(pg: &PgStac, id: &str, tile: TileCoord, pairs: &[(String, S
         Err(r) => return r,
     };
     // `tilesize` matters only to the lean lookup, which samples the tile as its picture would.
-    let side = query_value(pairs, "tilesize")
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(256);
+    let side = query_value(pairs, "tilesize").and_then(|v| v.parse::<u32>().ok()).unwrap_or(256);
     let grid = SampleGrid::for_image(side, side, true);
     match listed_items(pg, id, &tile_polygon(tile), limits, pairs, grid).await {
         Ok(items) => json_resp(
@@ -3540,10 +2698,7 @@ fn unknown_asset(asset: &str, item: &MosaicItem) -> Resp {
     let known: Vec<String> = names.iter().map(|k| format!("'{k}'")).collect();
     detail(
         StatusCode::NOT_FOUND,
-        format!(
-            "'{asset}' is not valid, should be one of [{}]",
-            known.join(", ")
-        ),
+        format!("'{asset}' is not valid, should be one of [{}]", known.join(", ")),
     )
 }
 
@@ -3556,11 +2711,7 @@ enum PartSize {
     /// `{width}x{height}` in the path.
     Exact(u32, u32),
     /// From the query string; whatever is missing follows the data's own resolution.
-    Query {
-        max_size: Option<u32>,
-        width: Option<u32>,
-        height: Option<u32>,
-    },
+    Query { max_size: Option<u32>, width: Option<u32>, height: Option<u32> },
 }
 
 fn part_size_from_query(pairs: &[(String, String)]) -> Result<PartSize, Resp> {
@@ -3577,16 +2728,8 @@ fn part_size_from_query(pairs: &[(String, String)]) -> Result<PartSize, Resp> {
     };
     let (width, height) = (int("width")?, int("height")?);
     // As in rio-tiler, `max_size` is ignored once a width or a height is given.
-    let max_size = if width.is_some() || height.is_some() {
-        None
-    } else {
-        int("max_size")?
-    };
-    Ok(PartSize::Query {
-        max_size,
-        width,
-        height,
-    })
+    let max_size = if width.is_some() || height.is_some() { None } else { int("max_size")? };
+    Ok(PartSize::Query { max_size, width, height })
 }
 
 /// Output size of a part of a raster, by rio-tiler's rules. `res` is the raster's
@@ -3597,18 +2740,10 @@ fn part_dims(size: PartSize, bbox: [f64; 4], res: f64) -> (u64, u64) {
     let ratio = native_h / native_w;
     let (w, h) = match size {
         PartSize::Exact(w, h) => (f64::from(w), f64::from(h)),
-        PartSize::Query {
-            width: Some(w),
-            height: Some(h),
-            ..
-        } => (f64::from(w), f64::from(h)),
+        PartSize::Query { width: Some(w), height: Some(h), .. } => (f64::from(w), f64::from(h)),
         PartSize::Query { width: Some(w), .. } => (f64::from(w), (f64::from(w) * ratio).ceil()),
-        PartSize::Query {
-            height: Some(h), ..
-        } => ((f64::from(h) / ratio).ceil(), f64::from(h)),
-        PartSize::Query {
-            max_size: Some(m), ..
-        } if native_w.max(native_h) >= f64::from(m) => {
+        PartSize::Query { height: Some(h), .. } => ((f64::from(h) / ratio).ceil(), f64::from(h)),
+        PartSize::Query { max_size: Some(m), .. } if native_w.max(native_h) >= f64::from(m) => {
             if ratio > 1.0 {
                 ((f64::from(m) / ratio).ceil(), f64::from(m))
             } else {
@@ -3650,10 +2785,7 @@ async fn part_image(
     pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
-    part_image_of(
-        ctx, pg, hash, geometry, None, bbox, mask, size, ext, pq, pairs,
-    )
-    .await
+    part_image_of(ctx, pg, hash, geometry, None, bbox, mask, size, ext, pq, pairs).await
 }
 
 /// [`part_image`], with the items looked up under `searched` when it is given and not
@@ -3681,34 +2813,23 @@ async fn part_image_of(
     // An image is made from planes, each raster read the way GDAL's nearest-neighbour warp
     // reads it, which is what TiTiler's pixels are. The shared renderer draws the rest:
     // the other resampling methods and the algorithms, where it can.
-    let nearest =
-        query.resampling == ResampleMode::Nearest && query.reproject == ResampleMode::Nearest;
+    let nearest = query.resampling == ResampleMode::Nearest && query.reproject == ResampleMode::Nearest;
     // The renderer's band math knows names and functions that band math over planes does
     // not (`ndvi`, `^`, `max(a, b)`); what only it can read, it draws.
     let planes_can = planes_read_all(&pq, &query);
     // A colour map given as JSON is applied to planes; the renderer on this road has none.
-    let custom = match pq
-        .custom_colormap_json
-        .as_deref()
-        .map(MosaicColormap::parse)
-        .transpose()
-    {
+    let custom = match pq.custom_colormap_json.as_deref().map(MosaicColormap::parse).transpose() {
         Ok(map) => map.flatten(),
         Err(e) => return detail(StatusCode::BAD_REQUEST, e),
     };
     // So is a `nodata` of the request's own: the renderer on this road reads the raster's.
     // And a NumPy array, which is written from planes in the data's own type.
     let array = matches!(ext.or(pq.format_param.as_deref()), Some("npy"));
-    let planes_needed =
-        wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some() || array;
+    let planes_needed = wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some() || array;
     let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
-    let names = if planes_needed {
-        expression_names(&pq, &query)
-    } else {
-        renderer_assets(&mut pq, &query)
-    };
+    let names = if planes_needed { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
     let names = match names {
         Ok(names) => names,
         Err(r) => return r,
@@ -3720,18 +2841,14 @@ async fn part_image_of(
         return r;
     }
     // `dst_crs` is read as `coord_crs` is, in any of the spellings TiTiler takes.
-    let mercator = match query_value(pairs, "dst_crs")
-        .map(|dst| (dst, super::parse_coord_crs_with_epsg(dst)))
-    {
+    let mercator = match query_value(pairs, "dst_crs").map(|dst| (dst, super::parse_coord_crs_with_epsg(dst))) {
         None => given_in_metres,
         Some((_, Ok((_, 4326)))) => false,
         Some((_, Ok((_, 3857)))) => true,
         Some((dst, _)) => {
             return detail(
                 StatusCode::BAD_REQUEST,
-                format!(
-                    "dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"
-                ),
+                format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
             );
         }
     };
@@ -3739,26 +2856,16 @@ async fn part_image_of(
     // corner there, and is refused sooner than drawn cut short under its own bounds.
     const MERCATOR_EDGE: f64 = 85.051_128_78;
     if mercator && !given_in_metres && (bbox[1] < -MERCATOR_EDGE || bbox[3] > MERCATOR_EDGE) {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "the box reaches past the edge of Web Mercator, 85.05 degrees north or south",
-        );
+        return detail(StatusCode::BAD_REQUEST, "the box reaches past the edge of Web Mercator, 85.05 degrees north or south");
     }
     if given_in_metres && mask.is_some() {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "coord_crs 'epsg:3857' is not supported for a posted shape (use epsg:4326)",
-        );
+        return detail(StatusCode::BAD_REQUEST, "coord_crs 'epsg:3857' is not supported for a posted shape (use epsg:4326)");
     }
     let corners = |bbox: [f64; 4], to: fn(f64, f64) -> (f64, f64)| {
         let ((w, s), (e, n)) = (to(bbox[0], bbox[1]), to(bbox[2], bbox[3]));
         [w, s, e, n]
     };
-    let in_degrees = if given_in_metres {
-        corners(bbox, mercator_to_lonlat_deg)
-    } else {
-        bbox
-    };
+    let in_degrees = if given_in_metres { corners(bbox, mercator_to_lonlat_deg) } else { bbox };
     // The box as the picture's grid has it, and as the search is asked about it.
     let bbox = match (mercator, given_in_metres) {
         (true, true) => bbox,
@@ -3766,10 +2873,7 @@ async fn part_image_of(
         (false, _) => in_degrees,
     };
     if bbox.iter().any(|c| !c.is_finite()) || bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "the box has no area in the coordinate system asked for",
-        );
+        return detail(StatusCode::BAD_REQUEST, "the box has no area in the coordinate system asked for");
     }
     let own_geometry = given_in_metres.then(|| bbox_polygon(in_degrees));
     let geometry = searched.or(own_geometry.as_ref()).unwrap_or(geometry);
@@ -3791,10 +2895,7 @@ async fn part_image_of(
     // A NumPy array is written from planes, in the data's own type and with its mask; the
     // renderer's is float32 without one, and bare bytes say nothing of either.
     if matches!(format, Some((OutputFormat::RawF32, _))) {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "bare arrays are not written on pgSTAC bbox and feature routes; ask for `.npy`",
-        );
+        return detail(StatusCode::BAD_REQUEST, "bare arrays are not written on pgSTAC bbox and feature routes; ask for `.npy`");
     }
     // A JPEG has no mask to carry the polygon, and TiTiler then writes the whole box as it
     // was read. With `rescale` it does not: rescaling leaves zero wherever the mask is.
@@ -3805,23 +2906,8 @@ async fn part_image_of(
     // set of pixel centres, so there pgSTAC's own search lists the items.
     // Nor does it list for a `nodata` of the request's own: it passes over an item whose
     // footprint adds nothing, and such an item's raster may still hold values there.
-    let grid = if mercator || pq.nodata.is_some() {
-        None
-    } else {
-        part_grid(size, bbox)
-    };
-    let items = match pixel_items(
-        ctx,
-        pg,
-        geometry,
-        hash,
-        query.limits,
-        &names,
-        grid,
-        query.lookup,
-    )
-    .await
-    {
+    let grid = if mercator || pq.nodata.is_some() { None } else { part_grid(size, bbox) };
+    let items = match pixel_items(ctx, pg, geometry, hash, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -4046,10 +3132,8 @@ async fn part_image_of(
     match rendered {
         Ok((body, content_type)) => {
             let mut resp = Response::new(Full::new(body));
-            resp.headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-            resp.headers_mut()
-                .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             // The system drawn in is `dst_crs`, or `coord_crs` without one.
             let spelled = query_value(pairs, "dst_crs").or_else(|| query_value(pairs, "coord_crs"));
             placed_as(resp, bbox, if mercator { 3857 } else { 4326 }, spelled)
@@ -4091,31 +3175,15 @@ async fn feature_image(
         return not_a_feature();
     };
     // As in TiTiler the body is a Feature; a bare geometry is not taken.
-    if geojson.get("type").and_then(Value::as_str) != Some("Feature")
-        || !geojson["geometry"].is_object()
-    {
+    if geojson.get("type").and_then(Value::as_str) != Some("Feature") || !geojson["geometry"].is_object() {
         return not_a_feature();
     }
-    let (mask, bbox) = match polygons_of_collection(&geojson)
-        .and_then(|shape| PolygonMask::from_geojson(&shape))
-    {
+    let (mask, bbox) = match polygons_of_collection(&geojson).and_then(|shape| PolygonMask::from_geojson(&shape)) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
     };
     // As in titiler-pgstac, the items are those of the feature's bounding box.
-    part_image(
-        ctx,
-        pg,
-        hash,
-        &bbox_polygon(bbox),
-        bbox,
-        Some(&mask),
-        size,
-        ext,
-        pq,
-        pairs,
-    )
-    .await
+    part_image(ctx, pg, hash, &bbox_polygon(bbox), bbox, Some(&mask), size, ext, pq, pairs).await
 }
 
 /// A feature whose geometry is a GeometryCollection of polygons, as the one MultiPolygon
@@ -4133,11 +3201,9 @@ fn polygons_of_collection(feature: &Value) -> Result<std::borrow::Cow<'_, Value>
                 into.extend(polygons);
                 true
             }),
-            Some("GeometryCollection") if depth < 16 => {
-                geometry["geometries"].as_array().is_some_and(|members| {
-                    members.iter().all(|member| gather(member, into, depth + 1))
-                })
-            }
+            Some("GeometryCollection") if depth < 16 => geometry["geometries"]
+                .as_array()
+                .is_some_and(|members| members.iter().all(|member| gather(member, into, depth + 1))),
             _ => false,
         }
     }
@@ -4153,9 +3219,7 @@ fn polygons_of_collection(feature: &Value) -> Result<std::borrow::Cow<'_, Value>
     }
     // The geometry alone, which the mask reads as it reads a feature: one copy of the
     // coordinates, checked against the mask's own limits as any other shape is.
-    Ok(std::borrow::Cow::Owned(
-        json!({ "type": "MultiPolygon", "coordinates": polygons }),
-    ))
+    Ok(std::borrow::Cow::Owned(json!({ "type": "MultiPolygon", "coordinates": polygons })))
 }
 
 /// GDAL's default grid for a raster warped to WGS84: where it starts and its pixel size.
@@ -4215,8 +3279,7 @@ fn gdal_overview_level(sizes: &[(u32, u32)], native: (u64, u64), out: (usize, us
     let wanted = (native.0 as f64 / out.0.max(1) as f64).min(native.1 as f64 / out.1.max(1) as f64);
     let (mut best, mut best_factor) = (0usize, 0f64);
     for (level, &(w, h)) in sizes.iter().enumerate().skip(1) {
-        let factor =
-            (f64::from(full_w) / f64::from(w.max(1))).min(f64::from(full_h) / f64::from(h.max(1)));
+        let factor = (f64::from(full_w) / f64::from(w.max(1))).min(f64::from(full_h) / f64::from(h.max(1)));
         if factor < wanted * 1.2 && factor > best_factor {
             (best, best_factor) = (level, factor);
         }
@@ -4311,18 +3374,10 @@ fn curved_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)],
         // How far the curve is from the exact position at the two columns it is checked at.
         let (quarter, three_quarters) = (middle / 2, middle + (last - middle) / 2);
         let (q1, q3) = (exact(lo + quarter), exact(lo + three_quarters));
-        let (first, second) = (
-            (at(quarter).0 - q1.0, at(quarter).1 - q1.1),
-            (at(three_quarters).0 - q3.0, at(three_quarters).1 - q3.1),
-        );
+        let (first, second) = ((at(quarter).0 - q1.0, at(quarter).1 - q1.1), (at(three_quarters).0 - q3.0, at(three_quarters).1 - q3.1));
         // Any of the five positions outside the projection leaves one of these not a number.
         let finite = (first.0 + first.1 + second.0 + second.1).is_finite();
-        let error = first
-            .0
-            .abs()
-            .max(first.1.abs())
-            .max(second.0.abs())
-            .max(second.1.abs());
+        let error = first.0.abs().max(first.1.abs()).max(second.0.abs()).max(second.1.abs());
         // What a smooth row leaves at the two columns is equal and opposite, bar a sliver.
         // A row that jumps, as a longitude does where it wraps, leaves them lopsided by at
         // least a quarter of the jump, even when the row's bend hides the jump from each
@@ -4361,12 +3416,7 @@ fn near_pixel_edge(p: f64) -> bool {
 
 /// Where every column of one row of the grid reads from, a stretch of `block` columns at
 /// a time: for a picture the checked curve, otherwise GDAL's straight lines.
-fn row_source_positions(
-    exact: &impl Fn(usize) -> (f64, f64),
-    block: usize,
-    every_pixel: bool,
-    out: &mut [(f64, f64)],
-) {
+fn row_source_positions(exact: &impl Fn(usize) -> (f64, f64), block: usize, every_pixel: bool, out: &mut [(f64, f64)]) {
     let block = block.max(1);
     for (n, stretch) in out.chunks_mut(block).enumerate() {
         if every_pixel {
@@ -4403,10 +3453,7 @@ fn source_cell(
         }
     }
     (u.is_finite() && v.is_finite() && inside(u, v)).then(|| {
-        (
-            ((u + 1e-10).floor() as i32).min(width as i32 - 1),
-            ((v + 1e-10).floor() as i32).min(height as i32 - 1),
-        )
+        (((u + 1e-10).floor() as i32).min(width as i32 - 1), ((v + 1e-10).floor() as i32).min(height as i32 - 1))
     })
 }
 
@@ -4460,19 +3507,13 @@ async fn warp_nearest(
     if let (Some(named), Some(ifd)) = (nodata, cog.index.ifds.first())
         && !nodata_fits(named, ifd.sample_type)
     {
-        return Err(EngineError::BadRequest(format!(
-            "`nodata` of {named} is not a value the raster's samples can hold"
-        )));
+        return Err(EngineError::BadRequest(format!("`nodata` of {named} is not a value the raster's samples can hold")));
     }
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
     // The grid the warp is worked out on, and how wide a stretch of a row GDAL
     // approximates in one go.
     let (level, (grid_w, grid_h), block) = match path {
-        WarpPath::Direct => (
-            gdal_overview_level(&sizes, native, (width, height)),
-            (width, height),
-            width,
-        ),
+        WarpPath::Direct => (gdal_overview_level(&sizes, native, (width, height)), (width, height), width),
         WarpPath::Blocks => {
             // The warped raster has one overview per source overview, reduced as much.
             let (full_w, full_h) = sizes.first().copied().unwrap_or((1, 1));
@@ -4485,20 +3526,12 @@ async fn warp_nearest(
                 })
                 .collect();
             let level = gdal_overview_level(&reduced, native, (width, height));
-            let grid = if level == 0 {
-                (native.0 as usize, native.1 as usize)
-            } else {
-                (reduced[level].0 as usize, reduced[level].1 as usize)
-            };
+            let grid = if level == 0 { (native.0 as usize, native.1 as usize) } else { (reduced[level].0 as usize, reduced[level].1 as usize) };
             // Each output row is worked out along a whole row of that grid. A box far
             // larger than what is asked of it makes the grid enormous; past what a
             // picture's own rows cost many times over, the direct road is taken.
             if grid.0 > 16 * width.max(MAX_PART_SIDE as usize) {
-                (
-                    gdal_overview_level(&sizes, native, (width, height)),
-                    (width, height),
-                    width,
-                )
+                (gdal_overview_level(&sizes, native, (width, height)), (width, height), width)
             } else {
                 (level, grid, grid.0.min(512))
             }
@@ -4506,10 +3539,7 @@ async fn warp_nearest(
     };
     let ifd = &cog.index.ifds[level];
     let bands = ifd.samples_per_pixel as usize;
-    let (dx, dy) = (
-        (bounds[2] - bounds[0]) / grid_w as f64,
-        (bounds[3] - bounds[1]) / grid_h as f64,
-    );
+    let (dx, dy) = ((bounds[2] - bounds[0]) / grid_w as f64, (bounds[3] - bounds[1]) / grid_h as f64);
 
     // Where each output pixel reads from, as (column, row) of the level. With `pool`
     // this and the sampling below are worked out on the pool for heavy work, so that the
@@ -4517,79 +3547,50 @@ async fn warp_nearest(
     // requests; one raster of a tile is quicker done here than handed over.
     let (cog_for_cells, crs_for_cells) = (cog.clone(), crs.clone());
     let work = move || {
-        let (cog, crs) = (cog_for_cells, crs_for_cells);
-        let ifd = &cog.index.ifds[level];
-        let mut cells: Vec<(i32, i32)> = Vec::with_capacity(width * height);
-        let mut row_positions = vec![(0f64, 0f64); grid_w];
-        let (mut c0, mut c1, mut r0, mut r1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
-        let mut worked_row = usize::MAX;
-        for j in 0..height {
-            // The row and columns of the grid an output pixel takes: its own, or when the
-            // grid is being resized the one its centre falls in.
-            let grid_row = if grid_h == height {
-                j
-            } else {
-                ((2 * j + 1) * grid_h / (2 * height)).min(grid_h - 1)
-            };
-            let lat = bounds[3] - (grid_row as f64 + 0.5) * dy;
-            let exact = |i: usize| {
-                let across = bounds[0] + (i as f64 + 0.5) * dx;
-                // The grid is in degrees, or in Web Mercator metres for a map tile. A raster
-                // in Web Mercator is then on the grid's own terms: going through degrees and
-                // back would leave noise where pixel centres fall on source pixel edges.
-                if mercator && matches!(crs, CrsModel::Epsg3857) {
-                    return ifd.crs_to_pixel.forward(across, lat);
-                }
-                let (lon, lat) = if mercator {
-                    mercator_to_lonlat_deg(across, lat)
-                } else {
-                    (across, lat)
-                };
-                let (x, y) = crs.from_lonlat_deg(lon, lat);
-                ifd.crs_to_pixel.forward(x, y)
-            };
-            if grid_row != worked_row {
-                row_source_positions(&exact, block, every_pixel, &mut row_positions);
-                worked_row = grid_row;
+    let (cog, crs) = (cog_for_cells, crs_for_cells);
+    let ifd = &cog.index.ifds[level];
+    let mut cells: Vec<(i32, i32)> = Vec::with_capacity(width * height);
+    let mut row_positions = vec![(0f64, 0f64); grid_w];
+    let (mut c0, mut c1, mut r0, mut r1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    let mut worked_row = usize::MAX;
+    for j in 0..height {
+        // The row and columns of the grid an output pixel takes: its own, or when the
+        // grid is being resized the one its centre falls in.
+        let grid_row = if grid_h == height { j } else { ((2 * j + 1) * grid_h / (2 * height)).min(grid_h - 1) };
+        let lat = bounds[3] - (grid_row as f64 + 0.5) * dy;
+        let exact = |i: usize| {
+            let across = bounds[0] + (i as f64 + 0.5) * dx;
+            // The grid is in degrees, or in Web Mercator metres for a map tile. A raster
+            // in Web Mercator is then on the grid's own terms: going through degrees and
+            // back would leave noise where pixel centres fall on source pixel edges.
+            if mercator && matches!(crs, CrsModel::Epsg3857) {
+                return ifd.crs_to_pixel.forward(across, lat);
             }
-            for i in 0..width {
-                let grid_col = if grid_w == width {
-                    i
-                } else {
-                    ((2 * i + 1) * grid_w / (2 * width)).min(grid_w - 1)
-                };
-                match source_cell(
-                    row_positions[grid_col],
-                    (ifd.width, ifd.height),
-                    every_pixel,
-                    || exact(grid_col),
-                ) {
-                    Some((col, row)) => {
-                        (c0, c1, r0, r1) = (c0.min(col), c1.max(col), r0.min(row), r1.max(row));
-                        cells.push((col, row));
-                    }
-                    None => cells.push((-1, -1)),
+            let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, lat) } else { (across, lat) };
+            let (x, y) = crs.from_lonlat_deg(lon, lat);
+            ifd.crs_to_pixel.forward(x, y)
+        };
+        if grid_row != worked_row {
+            row_source_positions(&exact, block, every_pixel, &mut row_positions);
+            worked_row = grid_row;
+        }
+        for i in 0..width {
+            let grid_col = if grid_w == width { i } else { ((2 * i + 1) * grid_w / (2 * width)).min(grid_w - 1) };
+            match source_cell(row_positions[grid_col], (ifd.width, ifd.height), every_pixel, || exact(grid_col)) {
+                Some((col, row)) => {
+                    (c0, c1, r0, r1) = (c0.min(col), c1.max(col), r0.min(row), r1.max(row));
+                    cells.push((col, row));
                 }
+                None => cells.push((-1, -1)),
             }
         }
-        (cells, c0, c1, r0, r1)
+    }
+    (cells, c0, c1, r0, r1)
     };
-    let (cells, c0, c1, r0, r1) = if pool {
-        engine.store.run_heavy_cpu(work).await?
-    } else {
-        work()
-    };
+    let (cells, c0, c1, r0, r1) = if pool { engine.store.run_heavy_cpu(work).await? } else { work() };
     let read = |band: usize| only.is_empty() || only.contains(&(band as u16 + 1));
     if c0 > c1 {
-        return Ok((0..bands)
-            .map(|b| {
-                if read(b) {
-                    vec![f32::NAN; width * height]
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect());
+        return Ok((0..bands).map(|b| if read(b) { vec![f32::NAN; width * height] } else { Vec::new() }).collect());
     }
 
     let (tx0, tx1) = (c0 as u32 / ifd.tile_width, c1 as u32 / ifd.tile_width);
@@ -4601,15 +3602,10 @@ async fn warp_nearest(
     // A raster stored band by band is fetched band by band, and every band's blocks are
     // held until the planes are made: what that comes to is bounded before any is read.
     let held = (0..fetches).filter(|b| !planar || read(*b)).count() as u64
-        * u64::from(grid_w)
-        * u64::from(grid_h)
-        * u64::from(ifd.tile_width)
-        * u64::from(ifd.tile_height)
-        * 4;
+        * u64::from(grid_w) * u64::from(grid_h) * u64::from(ifd.tile_width) * u64::from(ifd.tile_height) * 4;
     if planar && held > MAX_WORKING_BYTES as u64 {
         return Err(EngineError::BadRequest(
-            "the bands asked for are too many to read at this size; choose fewer with `bidx`"
-                .into(),
+            "the bands asked for are too many to read at this size; choose fewer with `bidx`".into(),
         ));
     }
     for plane in 0..fetches {
@@ -4627,91 +3623,72 @@ async fn warp_nearest(
     }
 
     let cog_for_planes = cog.clone();
-    let skip: Vec<bool> = if only.is_empty() {
-        Vec::new()
-    } else {
-        (0..bands).map(|b| !read(b)).collect()
-    };
+    let skip: Vec<bool> = if only.is_empty() { Vec::new() } else { (0..bands).map(|b| !read(b)).collect() };
     let work = move || {
-        let cog = cog_for_planes;
-        let ifd = &cog.index.ifds[level];
-        let mut planes = Vec::with_capacity(bands);
-        for band in 0..bands {
-            if !skip.is_empty() && skip[band] {
-                planes.push(Vec::new());
-                continue;
+    let cog = cog_for_planes;
+    let ifd = &cog.index.ifds[level];
+    let mut planes = Vec::with_capacity(bands);
+    for band in 0..bands {
+        if !skip.is_empty() && skip[band] {
+            planes.push(Vec::new());
+            continue;
+        }
+        let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = if planar {
+            tiles[band].iter().map(|t| t.as_ref().and_then(|t| t.bands.first())).collect()
+        } else {
+            tiles[0].iter().map(|t| t.as_ref().and_then(|t| t.bands.get(band))).collect()
+        };
+        let mut source = cogzilla_kernel::BandSource::new(
+            ifd.width,
+            ifd.height,
+            ifd.tile_width,
+            ifd.tile_height,
+            tx0,
+            ty0,
+            grid_w,
+            grid_h,
+            &blocks,
+        );
+        // A `nodata` of the request's own is told from the raster's values as stored.
+        if unscale && nodata.is_none() {
+            let scale = cog.index.scales.get(band).copied().unwrap_or(1.0);
+            let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
+            source = source.with_scale_offset(scale, offset);
+        }
+        planes.push(cells.iter().map(|&(col, row)| source.sample_checked(col, row)).collect::<Vec<f32>>());
+    }
+    if let Some(named) = nodata {
+        // The request's value stands in the place of the raster's own, as in GDAL: where
+        // the raster had none, its own value is a number again, and each band is without
+        // data where it holds the value named. A pixel some bands of which are left is
+        // still drawn, and a mosaic fills the others from the items below.
+        let own = cog.index.nodata.filter(|n| !n.is_nan());
+        for plane in planes.iter_mut().filter(|p| !p.is_empty()) {
+            for (v, &(col, _)) in plane.iter_mut().zip(&cells) {
+                if col < 0 {
+                    continue;
+                }
+                if let (true, Some(own)) = (v.is_nan(), own) {
+                    *v = own;
+                }
+                if *v == named {
+                    *v = f32::NAN;
+                }
             }
-            let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = if planar {
-                tiles[band]
-                    .iter()
-                    .map(|t| t.as_ref().and_then(|t| t.bands.first()))
-                    .collect()
-            } else {
-                tiles[0]
-                    .iter()
-                    .map(|t| t.as_ref().and_then(|t| t.bands.get(band)))
-                    .collect()
-            };
-            let mut source = cogzilla_kernel::BandSource::new(
-                ifd.width,
-                ifd.height,
-                ifd.tile_width,
-                ifd.tile_height,
-                tx0,
-                ty0,
-                grid_w,
-                grid_h,
-                &blocks,
-            );
-            // A `nodata` of the request's own is told from the raster's values as stored.
-            if unscale && nodata.is_none() {
+        }
+        if unscale {
+            for (band, plane) in planes.iter_mut().enumerate() {
                 let scale = cog.index.scales.get(band).copied().unwrap_or(1.0);
                 let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
-                source = source.with_scale_offset(scale, offset);
-            }
-            planes.push(
-                cells
-                    .iter()
-                    .map(|&(col, row)| source.sample_checked(col, row))
-                    .collect::<Vec<f32>>(),
-            );
-        }
-        if let Some(named) = nodata {
-            // The request's value stands in the place of the raster's own, as in GDAL: where
-            // the raster had none, its own value is a number again, and each band is without
-            // data where it holds the value named. A pixel some bands of which are left is
-            // still drawn, and a mosaic fills the others from the items below.
-            let own = cog.index.nodata.filter(|n| !n.is_nan());
-            for plane in planes.iter_mut().filter(|p| !p.is_empty()) {
-                for (v, &(col, _)) in plane.iter_mut().zip(&cells) {
-                    if col < 0 {
-                        continue;
-                    }
-                    if let (true, Some(own)) = (v.is_nan(), own) {
-                        *v = own;
-                    }
-                    if *v == named {
-                        *v = f32::NAN;
-                    }
-                }
-            }
-            if unscale {
-                for (band, plane) in planes.iter_mut().enumerate() {
-                    let scale = cog.index.scales.get(band).copied().unwrap_or(1.0);
-                    let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
-                    if scale != 1.0 || offset != 0.0 {
-                        plane.iter_mut().for_each(|v| *v = *v * scale + offset);
-                    }
+                if scale != 1.0 || offset != 0.0 {
+                    plane.iter_mut().for_each(|v| *v = *v * scale + offset);
                 }
             }
         }
-        planes
+    }
+    planes
     };
-    Ok(if pool {
-        engine.store.run_heavy_cpu(work).await?
-    } else {
-        work()
-    })
+    Ok(if pool { engine.store.run_heavy_cpu(work).await? } else { work() })
 }
 
 /// Every band of one raster on a WGS84 grid through the shared renderer, for the
@@ -4749,25 +3726,15 @@ async fn resampled_planes(
         )
         .await?;
         if raw.len() != width * height * 4 {
-            return Err(EngineError::BadRequest(
-                "unexpected array size from the renderer".into(),
-            ));
+            return Err(EngineError::BadRequest("unexpected array size from the renderer".into()));
         }
-        planes.push(
-            raw.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        );
+        planes.push(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
     }
     Ok(planes)
 }
 
 /// A plane brought to another size by taking, for each pixel, the one its centre falls in.
-fn resize_nearest(
-    plane: Vec<f32>,
-    (w, h): (usize, usize),
-    (out_w, out_h): (usize, usize),
-) -> Vec<f32> {
+fn resize_nearest(plane: Vec<f32>, (w, h): (usize, usize), (out_w, out_h): (usize, usize)) -> Vec<f32> {
     if (w, h) == (out_w, out_h) {
         return plane;
     }
@@ -4794,12 +3761,7 @@ fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Re
             invalid_param("query", "categorical", "Input should be a valid boolean")
         })?;
     }
-    let all = |name: &'static str| {
-        pairs
-            .iter()
-            .filter(move |(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    };
+    let all = |name: &'static str| pairs.iter().filter(move |(k, _)| k == name).map(|(_, v)| v.as_str());
     for v in all("c") {
         let c = v.parse::<f64>().ok().filter(|c| c.is_finite());
         opts.categories
@@ -4818,13 +3780,7 @@ fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Re
         opts.percentiles = percentiles;
     }
     if let Some(v) = query_value(pairs, "histogram_bins") {
-        let bad = || {
-            invalid_param(
-                "query",
-                "histogram_bins",
-                r"String should match pattern '^\d+(,\d+)*$'",
-            )
-        };
+        let bad = || invalid_param("query", "histogram_bins", r"String should match pattern '^\d+(,\d+)*$'");
         let parts: Option<Vec<u32>> = v.split(',').map(|p| p.parse::<u32>().ok()).collect();
         opts.bins = match parts.as_deref() {
             Some([n]) if (1..=65_536).contains(n) => Bins::Count(*n as usize),
@@ -4840,26 +3796,14 @@ fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Re
             .and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))
             .filter(|(a, b)| a.is_finite() && b.is_finite() && a <= b);
         opts.range = Some(range.ok_or_else(|| {
-            invalid_param(
-                "query",
-                "histogram_range",
-                "Input should be two numbers, the lower one first",
-            )
+            invalid_param("query", "histogram_range", "Input should be two numbers, the lower one first")
         })?);
     }
     let cover_scale = match query_value(pairs, "cover_scale") {
         None => 10,
-        Some(v) => v
-            .parse::<usize>()
-            .ok()
-            .filter(|n| (1..=1000).contains(n))
-            .ok_or_else(|| {
-                invalid_param(
-                    "query",
-                    "cover_scale",
-                    "Input should be an integer from 1 to 1000",
-                )
-            })?,
+        Some(v) => v.parse::<usize>().ok().filter(|n| (1..=1000).contains(n)).ok_or_else(|| {
+            invalid_param("query", "cover_scale", "Input should be an integer from 1 to 1000")
+        })?,
     };
     Ok((opts, cover_scale))
 }
@@ -4892,27 +3836,15 @@ async fn feature_statistics(
     // is read on a grid of its own, which no one set of sample points stands for, so the
     // numbers come from pgSTAC's list unless the request asks for the lean one.
     let names: Vec<String> = req.query.assets.iter().map(|a| a.name.clone()).collect();
-    let lookup = if req.query.lookup == Lookup::Lean {
-        Lookup::Lean
-    } else {
-        Lookup::Reference
-    };
+    let lookup = if req.query.lookup == Lookup::Lean { Lookup::Lean } else { Lookup::Reference };
     let items = pg
-        .items_for_pixels(
-            &bbox_polygon(bbox),
-            hash,
-            req.query.limits,
-            &names,
-            part_grid(req.size, bbox),
-            lookup,
-        )
+        .items_for_pixels(&bbox_polygon(bbox), hash, req.query.limits, &names, part_grid(req.size, bbox), lookup)
         .await
         .map_err(|e| db_error(&e))?;
     if items.is_empty() {
         return Ok(None);
     }
-    let mut scenes: Vec<(String, Vec<String>)> =
-        Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
+    let mut scenes: Vec<(String, Vec<String>)> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
     let assets = &req.query.assets;
     for item in items.iter().take(MAX_SCENES_PER_TILE) {
         let mut hrefs = Vec::with_capacity(assets.len());
@@ -5194,18 +4126,9 @@ async fn mosaic_statistics(
     pairs: &[(String, String)],
 ) -> Resp {
     // Read here; the shared parser does not know them on this route.
-    const OWN: [&str; 8] = [
-        "width",
-        "height",
-        "categorical",
-        "c",
-        "p",
-        "histogram_bins",
-        "histogram_range",
-        "cover_scale",
-    ];
-    pq.errors
-        .retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
+    const OWN: [&str; 8] =
+        ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
+    pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -5214,10 +4137,7 @@ async fn mosaic_statistics(
         return r;
     }
     if query_value(pairs, "algorithm").is_some() {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "parameter 'algorithm' is not supported on statistics routes yet",
-        );
+        return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet");
     }
     let size = match part_size_from_query(pairs) {
         Ok(s) => s,
@@ -5227,19 +4147,11 @@ async fn mosaic_statistics(
         Ok(o) => o,
         Err(r) => return r,
     };
-    let bad_body = || {
-        invalid_param(
-            "body",
-            "body",
-            "Input should be a GeoJSON Feature or FeatureCollection",
-        )
-    };
+    let bad_body = || invalid_param("body", "body", "Input should be a GeoJSON Feature or FeatureCollection");
     let Some(geojson) = body.and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
         return bad_body();
     };
-    let is_feature = |v: &Value| {
-        v.get("type").and_then(Value::as_str) == Some("Feature") && v.get("geometry").is_some()
-    };
+    let is_feature = |v: &Value| v.get("type").and_then(Value::as_str) == Some("Feature") && v.get("geometry").is_some();
     let (features, single): (Vec<Value>, bool) = match geojson.get("type").and_then(Value::as_str) {
         Some("Feature") if is_feature(&geojson) => (vec![geojson], true),
         Some("FeatureCollection") => match geojson.get("features").and_then(Value::as_array) {
@@ -5267,12 +4179,7 @@ async fn mosaic_statistics(
         // TiTiler's order: the statistics, the feature's own properties, the items used.
         let mut properties = serde_json::Map::new();
         properties.insert("statistics".into(), stats);
-        for (k, v) in feature
-            .get("properties")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-        {
+        for (k, v) in feature.get("properties").and_then(Value::as_object).into_iter().flatten() {
             if k != "statistics" && k != "used_assets" {
                 properties.insert(k.clone(), v.clone());
             }
@@ -5295,10 +4202,7 @@ async fn mosaic_statistics(
         json!({ "type": "FeatureCollection", "features": out })
     };
     let mut resp = json_resp(StatusCode::OK, &doc);
-    resp.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/geo+json"),
-    );
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/geo+json"));
     resp
 }
 
@@ -5313,10 +4217,7 @@ fn point_expression(
     let numbers: Vec<Option<f64>> = values.iter().map(Value::as_f64).collect();
     let (results, described) = super::point_expr::apply(expression, &numbers, descriptions)?;
     let names = (1..=results.len()).map(|i| format!("b{i}")).collect();
-    let values = results
-        .into_iter()
-        .map(|v| v.map_or(Value::Null, |v| json!(v)))
-        .collect();
+    let values = results.into_iter().map(|v| v.map_or(Value::Null, |v| json!(v))).collect();
     Ok((values, names, described))
 }
 
@@ -5358,9 +4259,7 @@ async fn point_values(
     let as_band = match query_value(pairs, "asset_as_band").map(parse_bool) {
         None => false,
         Some(Some(flag)) => flag,
-        Some(None) => {
-            return invalid_param("query", "asset_as_band", "Input should be a valid boolean");
-        }
+        Some(None) => return invalid_param("query", "asset_as_band", "Input should be a valid boolean"),
     };
     let expression = query_value(pairs, "expression").map(str::to_string);
     let (lon, lat) = if pq.coord_crs_3857 {
@@ -5384,10 +4283,7 @@ async fn point_values(
         Err(r) => return r,
     };
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
-    let items = match pg
-        .items_for_pixels(&point, hash, limits, &names, None, lookup)
-        .await
-    {
+    let items = match pg.items_for_pixels(&point, hash, limits, &names, None, lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -5443,10 +4339,7 @@ async fn point_values(
                     asset_bands(spec, bands.len(), as_band).map_err(EngineError::BadRequest)?;
                 let mut out = Vec::new();
                 plan.pixel(&bands, &mut out);
-                values.extend(
-                    out.into_iter()
-                        .map(|v| if v.is_nan() { Value::Null } else { json!(v) }),
-                );
+                values.extend(out.into_iter().map(|v| if v.is_nan() { Value::Null } else { json!(v) }));
                 descriptions.extend(described);
             }
             let mut band_names: Vec<String> = (1..=values.len()).map(|i| format!("b{i}")).collect();
@@ -5479,10 +4372,7 @@ async fn point_values(
     if assets.is_empty() {
         return no_content();
     }
-    json_resp(
-        StatusCode::OK,
-        &json!({ "coordinates": [x, y], "assets": assets }),
-    )
+    json_resp(StatusCode::OK, &json!({ "coordinates": [x, y], "assets": assets }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5506,8 +4396,7 @@ async fn tile(
         pq.buffer = 0.0;
         // What the renderer draws of a tile, it draws without a `buffer`: said here, in a
         // tile's words, sooner than further on in a box's.
-        let raw = matches!(ext, "bin" | "raw" | "f32")
-            || matches!(query_value(pairs, "format"), Some("bin" | "raw" | "f32"));
+        let raw = matches!(ext, "bin" | "raw" | "f32") || matches!(query_value(pairs, "format"), Some("bin" | "raw" | "f32"));
         match check_mosaic_query(&pq, pairs) {
             Ok(q)
                 if q.resampling != ResampleMode::Nearest
@@ -5527,46 +4416,19 @@ async fn tile(
         let buffer = buffer_asked;
         // As in rio-tiler, which grows the tile by whole pixels: halves, since both sides grow.
         if (buffer * 2.0).fract() != 0.0 {
-            return detail(
-                StatusCode::BAD_REQUEST,
-                "`buffer` must be a multiple of `0.5`",
-            );
+            return detail(StatusCode::BAD_REQUEST, "`buffer` must be a multiple of `0.5`");
         }
         let side = scale.map_or(pq.tile_size, |s| s * 256);
         let grown = (side as f32 + 2.0 * buffer).round() as u32;
         let bbox = super::web_mercator_buffered_3857_bbox(tile.z, tile.x, tile.y, buffer, side);
         pq.coord_crs_3857 = true;
         // What a box reads and a tile passes over: the system is the tile's, and so is the size.
-        const OF_A_BOX: [&str; 6] = [
-            "buffer",
-            "coord_crs",
-            "dst_crs",
-            "width",
-            "height",
-            "max_size",
-        ];
-        let pairs: Vec<(String, String)> = pairs
-            .iter()
-            .filter(|(k, _)| !OF_A_BOX.contains(&k.as_str()))
-            .cloned()
-            .collect();
+        const OF_A_BOX: [&str; 6] = ["buffer", "coord_crs", "dst_crs", "width", "height", "max_size"];
+        let pairs: Vec<(String, String)> = pairs.iter().filter(|(k, _)| !OF_A_BOX.contains(&k.as_str())).cloned().collect();
         let ext = (!ext.is_empty()).then_some(ext);
         let size = PartSize::Exact(grown, grown);
         let under = tile_polygon(tile);
-        return Box::pin(part_image_of(
-            ctx,
-            pg,
-            id,
-            &under,
-            Some(&under),
-            bbox,
-            None,
-            size,
-            ext,
-            pq,
-            &pairs,
-        ))
-        .await;
+        return Box::pin(part_image_of(ctx, pg, id, &under, Some(&under), bbox, None, size, ext, pq, &pairs)).await;
     }
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
@@ -5577,12 +4439,7 @@ async fn tile(
     // and are TiTiler's pixels; the renderer draws the other methods, the algorithms, and
     // band math only its own engine reads.
     // A colour map given as JSON is applied to planes; the renderer on this road has none.
-    let custom = match pq
-        .custom_colormap_json
-        .as_deref()
-        .map(MosaicColormap::parse)
-        .transpose()
-    {
+    let custom = match pq.custom_colormap_json.as_deref().map(MosaicColormap::parse).transpose() {
         Ok(map) => map.flatten(),
         Err(e) => return detail(StatusCode::BAD_REQUEST, e),
     };
@@ -5595,11 +4452,7 @@ async fn tile(
         && pq.algorithm.is_none();
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
-    let names = if planes_wanted {
-        expression_names(&pq, &query)
-    } else {
-        renderer_assets(&mut pq, &query)
-    };
+    let names = if planes_wanted { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
     let names = match names {
         Ok(names) => names,
         Err(r) => return r,
@@ -5610,23 +4463,8 @@ async fn tile(
     }
     // A `nodata` of the request's own leaves the listing to pgSTAC's search: the lean
     // lookup passes over an item whose footprint adds nothing, and its raster may not.
-    let grid = if pq.nodata.is_some() {
-        None
-    } else {
-        tile_grid(scale, &pq)
-    };
-    let items = match pixel_items(
-        ctx,
-        pg,
-        &tile_polygon(tile),
-        id,
-        query.limits,
-        &names,
-        grid,
-        query.lookup,
-    )
-    .await
-    {
+    let grid = if pq.nodata.is_some() { None } else { tile_grid(scale, &pq) };
+    let items = match pixel_items(ctx, pg, &tile_polygon(tile), id, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -5663,12 +4501,7 @@ async fn tile(
     let specs = query.assets;
     // The tile is of these rasters: a search that comes to list others, or an item whose
     // asset has moved, is another tile, not this one served again.
-    let cache_key = format!(
-        "{}?{}#{:x}",
-        ctx.path,
-        ctx.raw_query,
-        source_identity(&scenes)
-    );
+    let cache_key = format!("{}?{}#{:x}", ctx.path, ctx.raw_query, source_identity(&scenes));
     let rendered = engine
         .tile_cache
         .get_or_render(cache_key, || async {
@@ -5861,11 +4694,7 @@ async fn tile(
     match rendered {
         Ok(made) => {
             let (west, south, east, north) = tile_bounds_3857(tile);
-            placed(
-                to_http_response_cached(engine, Ok(made), ctx.if_none_match),
-                [west, south, east, north],
-                3857,
-            )
+            placed(to_http_response_cached(engine, Ok(made), ctx.if_none_match), [west, south, east, north], 3857)
         }
         Err(e) => engine_error(&e),
     }
@@ -5893,16 +4722,10 @@ fn nodata_fits(named: f32, kind: cogzilla_tiff::SampleType) -> bool {
 fn python_float(c: f64) -> String {
     let c = c + 0.0;
     let short = format!("{c:e}");
-    let Some((digits, power)) = short.split_once('e') else {
-        return short;
-    };
+    let Some((digits, power)) = short.split_once('e') else { return short };
     match power.parse::<i32>() {
         Ok(power) if c.is_finite() && !(-4..16).contains(&power) => {
-            format!(
-                "{digits}e{}{:02}",
-                if power < 0 { '-' } else { '+' },
-                power.abs()
-            )
+            format!("{digits}e{}{:02}", if power < 0 { '-' } else { '+' }, power.abs())
         }
         _ => format!("{c:?}"),
     }
@@ -5919,8 +4742,7 @@ fn placed(resp: Resp, bounds: [f64; 4], epsg: u16) -> Resp {
 fn placed_as(mut resp: Resp, bounds: [f64; 4], epsg: u16, spelled: Option<&str>) -> Resp {
     if resp.status() == StatusCode::OK {
         let bbox = bounds.map(python_float).join(",");
-        let crs84 =
-            epsg == 4326 && spelled.is_some_and(|s| s.to_ascii_lowercase().contains("crs84"));
+        let crs84 = epsg == 4326 && spelled.is_some_and(|s| s.to_ascii_lowercase().contains("crs84"));
         let crs = if crs84 {
             "<http://www.opengis.net/def/crs/OGC/0/CRS84>".to_string()
         } else {
@@ -5944,21 +4766,10 @@ fn as_geotiff(
     epsg: u16,
     return_mask: bool,
 ) -> (Bytes, &'static str) {
-    if content_type != super::GEOTIFF_CONTENT_TYPE || width == 0 || body.len() != width * height * 4
-    {
+    if content_type != super::GEOTIFF_CONTENT_TYPE || width == 0 || body.len() != width * height * 4 {
         return (body, content_type);
     }
-    (
-        crate::titiler::encode_geotiff_rgba(
-            width as u32,
-            height as u32,
-            &body,
-            bounds,
-            epsg,
-            return_mask,
-        ),
-        content_type,
-    )
+    (crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &body, bounds, epsg, return_mask), content_type)
 }
 
 /// An RGBA picture as the response's bytes and media type: the colour formula, then
@@ -5978,15 +4789,13 @@ fn encode_picture(
         formula.apply_buffer_in_place(&mut rgba, 4);
         // One band is the formula's red, and the picture is of that band alone.
         if grey {
-            rgba.chunks_exact_mut(4)
-                .for_each(|p| (p[1], p[2]) = (p[0], p[0]));
+            rgba.chunks_exact_mut(4).for_each(|p| (p[1], p[2]) = (p[0], p[0]));
         }
     }
     let (format, content_type) = match asked {
         Some(asked) => asked,
         None => {
-            let opaque =
-                rgba.len() == width * height * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
+            let opaque = rgba.len() == width * height * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
             parse_ext_format(if opaque { "jpg" } else { "png" }, None, jpeg_quality)?
         }
     };
@@ -6000,27 +4809,13 @@ fn encode_picture(
         match format {
             OutputFormat::Png => return Ok((grey_png(&rgba, width, height, alpha), content_type)),
             OutputFormat::Jpeg { quality } => {
-                let luma: Vec<u8> = rgba
-                    .chunks_exact(4)
-                    .map(|p| if p[3] == 0 { 0 } else { p[0] })
-                    .collect();
-                return Ok((
-                    cogzilla_kernel::jpeg_fast::encode_jpeg_luma(
-                        width as u32,
-                        height as u32,
-                        &luma,
-                        quality,
-                    ),
-                    content_type,
-                ));
+                let luma: Vec<u8> = rgba.chunks_exact(4).map(|p| if p[3] == 0 { 0 } else { p[0] }).collect();
+                return Ok((cogzilla_kernel::jpeg_fast::encode_jpeg_luma(width as u32, height as u32, &luma, quality), content_type));
             }
             _ => {}
         }
     }
-    Ok((
-        encode_rgba_output(width, height, &rgba, format, alpha),
-        content_type,
-    ))
+    Ok((encode_rgba_output(width, height, &rgba, format, alpha), content_type))
 }
 
 /// A grey PNG of an RGBA picture whose red is the grey: one channel, or two with `alpha`.
@@ -6029,10 +4824,7 @@ fn grey_png(rgba: &[u8], width: usize, height: usize, alpha: bool) -> Bytes {
     let channels = if alpha { 2 } else { 1 };
     let stride = 1 + width * channels;
     let mut filtered = vec![0u8; height * stride];
-    for (row, out) in rgba
-        .chunks_exact(width * 4)
-        .zip(filtered.chunks_exact_mut(stride))
-    {
+    for (row, out) in rgba.chunks_exact(width * 4).zip(filtered.chunks_exact_mut(stride)) {
         // PNG's Sub filter: each byte less the same channel of the pixel before.
         out[0] = 1;
         let mut before = [0u8; 2];
@@ -6044,12 +4836,7 @@ fn grey_png(rgba: &[u8], width: usize, height: usize, alpha: bool) -> Bytes {
             before = now;
         }
     }
-    cogzilla_kernel::png_fast::encode_filtered_png(
-        width as u32,
-        height as u32,
-        if alpha { 4 } else { 0 },
-        &filtered,
-    )
+    cogzilla_kernel::png_fast::encode_filtered_png(width as u32, height as u32, if alpha { 4 } else { 0 }, &filtered)
 }
 
 /// What the router does with `/collections/{c}/items/{i}/...`.
@@ -6084,9 +4871,7 @@ fn proj_crs_string(obj: &Value) -> Option<String> {
     if let Some(code) = obj.get("proj:code").and_then(Value::as_str) {
         return Some(code.to_string());
     }
-    obj.get("proj:epsg")
-        .and_then(Value::as_i64)
-        .map(|e| format!("EPSG:{e}"))
+    obj.get("proj:epsg").and_then(Value::as_i64).map(|e| format!("EPSG:{e}"))
 }
 
 fn proj_grid_of(obj: &Value) -> Option<ProjGrid> {
@@ -6096,23 +4881,15 @@ fn proj_grid_of(obj: &Value) -> Option<ProjGrid> {
         .iter()
         .map(Value::as_f64)
         .collect::<Option<_>>()?;
-    let shape: Vec<f64> = obj
-        .get("proj:shape")?
-        .as_array()?
-        .iter()
-        .map(Value::as_f64)
-        .collect::<Option<_>>()?;
+    let shape: Vec<f64> =
+        obj.get("proj:shape")?.as_array()?.iter().map(Value::as_f64).collect::<Option<_>>()?;
     if t.len() < 6 || shape.len() != 2 || t[0] == 0.0 || t[4] == 0.0 {
         return None;
     }
     let (height, width) = (shape[0], shape[1]);
     let (x0, y0) = (t[2], t[5]);
     let (x1, y1) = (x0 + t[0] * width, y0 + t[4] * height);
-    Some(ProjGrid {
-        bounds: [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)],
-        width,
-        height,
-    })
+    Some(ProjGrid { bounds: [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)], width, height })
 }
 
 /// The grid rio-tiler gives an item: the union of its assets' grids at the finest asset's
@@ -6136,9 +4913,7 @@ fn item_proj_grid(item: &Value, readable: &[String]) -> Option<ProjGrid> {
     }
     if !grids.is_empty() && crs_strings.iter().all(|c| c == &crs_strings[0]) {
         let fold = |i: usize, f: fn(f64, f64) -> f64, init: f64| {
-            grids
-                .iter()
-                .fold(init, |acc, (g, _, _)| f(acc, g.bounds[i]))
+            grids.iter().fold(init, |acc, (g, _, _)| f(acc, g.bounds[i]))
         };
         let bounds = [
             fold(0, f64::min, f64::INFINITY),
@@ -6147,17 +4922,11 @@ fn item_proj_grid(item: &Value, readable: &[String]) -> Option<ProjGrid> {
             fold(3, f64::max, f64::NEG_INFINITY),
         ];
         let (_, xres, yres) = grids.iter().copied().min_by(|a, b| {
-            (a.1.abs(), a.2.abs())
-                .partial_cmp(&(b.1.abs(), b.2.abs()))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            (a.1.abs(), a.2.abs()).partial_cmp(&(b.1.abs(), b.2.abs())).unwrap_or(std::cmp::Ordering::Equal)
         })?;
         let height = ((bounds[3] - bounds[1]) / yres).floor().abs();
         let width = ((bounds[2] - bounds[0]) / xres).floor().abs();
-        return Some(ProjGrid {
-            bounds,
-            width,
-            height,
-        });
+        return Some(ProjGrid { bounds, width, height });
     }
     item_crs.as_ref()?;
     proj_grid_of(props)
@@ -6177,21 +4946,14 @@ fn edge_points(b: [f64; 4]) -> Vec<(f64, f64)> {
 /// Extent and zoom range of a grid, following rio-tiler: bounds from twenty-one points per
 /// edge, zooms from the size the grid would have once warped to Web Mercator.
 fn grid_extent(crs: &CrsModel, grid: ProjGrid) -> ItemExtent {
-    let lonlat: Vec<(f64, f64)> = edge_points(grid.bounds)
-        .iter()
-        .map(|&(x, y)| crs.to_lonlat_deg(x, y))
-        .collect();
+    let lonlat: Vec<(f64, f64)> =
+        edge_points(grid.bounds).iter().map(|&(x, y)| crs.to_lonlat_deg(x, y)).collect();
     let span = |pts: &[(f64, f64)]| -> Option<[f64; 4]> {
         if pts.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
             return None;
         }
         Some(pts.iter().fold(
-            [
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-            ],
+            [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             |a, p| [a[0].min(p.0), a[1].min(p.1), a[2].max(p.0), a[3].max(p.1)],
         ))
     };
@@ -6199,10 +4961,7 @@ fn grid_extent(crs: &CrsModel, grid: ProjGrid) -> ItemExtent {
     let merc_pts: Vec<(f64, f64)> = if matches!(crs, CrsModel::Epsg3857) {
         edge_points(grid.bounds)
     } else {
-        lonlat
-            .iter()
-            .map(|&(lon, lat)| lonlat_deg_to_mercator(lon, lat))
-            .collect()
+        lonlat.iter().map(|&(lon, lat)| lonlat_deg_to_mercator(lon, lat)).collect()
     };
     let mercator = span(&merc_pts);
     // The same rule `/cog` and `/stac` TileJSON use, on the item's grid.
@@ -6216,12 +4975,7 @@ fn grid_extent(crs: &CrsModel, grid: ProjGrid) -> ItemExtent {
     };
     let (minzoom, maxzoom) =
         crs.web_mercator_zoom_range(&pixel_to_crs, grid.width as u32, grid.height as u32, 1.0);
-    ItemExtent {
-        wgs84,
-        mercator,
-        minzoom: i64::from(minzoom),
-        maxzoom: i64::from(maxzoom),
-    }
+    ItemExtent { wgs84, mercator, minzoom: i64::from(minzoom), maxzoom: i64::from(maxzoom) }
 }
 
 /// The extent of an item. The coordinate system comes from one of its rasters: the first
@@ -6238,30 +4992,16 @@ async fn item_extent(
         let b = item.bbox.unwrap_or([-180.0, -90.0, 180.0, 90.0]);
         let (x0, y0) = lonlat_deg_to_mercator(b[0], b[1]);
         let (x1, y1) = lonlat_deg_to_mercator(b[2], b[3]);
-        let mercator = [x0, y0, x1, y1]
-            .iter()
-            .all(|v| v.is_finite())
-            .then_some([x0, y0, x1, y1]);
-        return Ok(ItemExtent {
-            wgs84: b,
-            mercator,
-            minzoom: 0,
-            maxzoom: 24,
-        });
+        let mercator = [x0, y0, x1, y1].iter().all(|v| v.is_finite()).then_some([x0, y0, x1, y1]);
+        return Ok(ItemExtent { wgs84: b, mercator, minzoom: 0, maxzoom: 24 });
     };
-    let wanted = pq
-        .assets
-        .first()
-        .map(|a| a.split('|').next().unwrap_or(a).to_string());
+    let wanted = pq.assets.first().map(|a| a.split('|').next().unwrap_or(a).to_string());
     let href = match &wanted {
         Some(name) => item.assets.get(name),
         None => readable.iter().find_map(|name| item.assets.get(name)),
     };
     let Some(href) = href else {
-        return Err(detail(
-            StatusCode::NOT_FOUND,
-            "the item has no readable raster asset",
-        ));
+        return Err(detail(StatusCode::NOT_FOUND, "the item has no readable raster asset"));
     };
     let crs = async {
         let cog = ctx.engine.store.open_uri(href).await?;
@@ -6295,10 +5035,7 @@ pub(super) async fn item_tile_auto_format(
     let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
     let (format, content_type) =
         parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?;
-    Ok((
-        encode_rgba_output(dim, dim, &rgba, format, pq.return_mask),
-        content_type,
-    ))
+    Ok((encode_rgba_output(dim, dim, &rgba, format, pq.return_mask), content_type))
 }
 
 /// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
@@ -6321,11 +5058,7 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     };
     match sub {
         ["tiles", "WebMercatorQuad", z, x, y] => {
-            let (Ok(z), Ok(x), Some((y, _, _))) = (
-                z.parse::<u8>(),
-                x.parse::<u32>(),
-                super::parse_y_scale_ext(y),
-            ) else {
+            let (Ok(z), Ok(x), Some((y, _, _))) = (z.parse::<u8>(), x.parse::<u32>(), super::parse_y_scale_ext(y)) else {
                 return resp;
             };
             if z > 30 || u64::from(x.max(y)) >= 1u64 << z {
@@ -6344,10 +5077,7 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
                 return resp;
             };
             // 4326 or 3857, or nothing for a system not placed here.
-            let system = |key: &str, default: u16| match asked(key)
-                .as_deref()
-                .map(super::parse_coord_crs_with_epsg)
-            {
+            let system = |key: &str, default: u16| match asked(key).as_deref().map(super::parse_coord_crs_with_epsg) {
                 None => Some(default),
                 Some(Ok((_, epsg @ (4326 | 3857)))) => Some(epsg),
                 Some(_) => None,
@@ -6392,10 +5122,7 @@ pub(super) fn item_fixup(
     {
         return Ok((body, "image/jpg"));
     }
-    let wants_json = matches!(
-        sub,
-        ["info" | "info.geojson"] | ["point", _] | [_, "tilejson.json"]
-    );
+    let wants_json = matches!(sub, ["info" | "info.geojson"] | ["point", _] | [_, "tilejson.json"]);
     if !wants_json {
         return Ok((body, content_type));
     }
@@ -6463,11 +5190,8 @@ pub(super) fn item_fixup(
                     doc["maxzoom"] = json!(e.maxzoom);
                 }
                 let minzoom = doc["minzoom"].clone();
-                doc["center"] = json!([
-                    (e.wgs84[0] + e.wgs84[2]) / 2.0,
-                    (e.wgs84[1] + e.wgs84[3]) / 2.0,
-                    minzoom
-                ]);
+                doc["center"] =
+                    json!([(e.wgs84[0] + e.wgs84[2]) / 2.0, (e.wgs84[1] + e.wgs84[3]) / 2.0, minzoom]);
             }
         }
         _ => {}
@@ -6516,11 +5240,7 @@ fn urlencode_doseq(obj: &serde_json::Map<String, Value>) -> String {
     for k in keys {
         match &obj[&k] {
             Value::Array(items) => {
-                out.extend(
-                    items
-                        .iter()
-                        .map(|i| format!("{}={}", quote_plus(&k), quote_plus(&py_str(i)))),
-                );
+                out.extend(items.iter().map(|i| format!("{}={}", quote_plus(&k), quote_plus(&py_str(i)))));
             }
             other => out.push(format!("{}={}", quote_plus(&k), quote_plus(&py_str(other)))),
         }
@@ -6539,10 +5259,7 @@ struct ItemRender {
 
 /// The renders in an item's properties, in jsonb key order.
 fn item_renders(item: &Value) -> Vec<ItemRender> {
-    let Some(renders) = item
-        .pointer("/properties/renders")
-        .and_then(Value::as_object)
-    else {
+    let Some(renders) = item.pointer("/properties/renders").and_then(Value::as_object) else {
         return Vec::new();
     };
     let as_list = |v: &Value| match v {
@@ -6579,21 +5296,11 @@ fn item_renders(item: &Value) -> Vec<ItemRender> {
             let merged: Vec<Value> = assets
                 .iter()
                 .zip(&options)
-                .map(|(a, o)| {
-                    if o.is_empty() {
-                        json!(a)
-                    } else {
-                        json!(format!("{a}|{}", o.join("|")))
-                    }
-                })
+                .map(|(a, o)| if o.is_empty() { json!(a) } else { json!(format!("{a}|{}", o.join("|"))) })
                 .collect();
             params.insert("assets".into(), Value::Array(merged));
         }
-        out.push(ItemRender {
-            name,
-            params,
-            valid: !assets.is_empty(),
-        });
+        out.push(ItemRender { name, params, valid: !assets.is_empty() });
     }
     out
 }
@@ -6683,21 +5390,16 @@ pub(super) async fn item_route(
     // asset `/assets` lists can be read, whatever its href looks like.
     for name in &readable {
         if !item.assets.contains_key(name)
-            && let Some(href) = doc["assets"][name]["href"]
-                .as_str()
-                .filter(|h| !h.is_empty())
+            && let Some(href) = doc["assets"][name]["href"].as_str().filter(|h| !h.is_empty())
         {
-            item.assets
-                .insert(name.clone(), crate::stac::resolve_href(self_href, href));
+            item.assets.insert(name.clone(), crate::stac::resolve_href(self_href, href));
         }
     }
     // With no `self` link a relative href is relative to nothing: such an asset is not
     // read from wherever the server happens to run.
     if self_href.is_empty() {
         item.assets.retain(|name, _| {
-            doc["assets"][name]["href"]
-                .as_str()
-                .is_some_and(|h| h.contains("://") || h.starts_with('/'))
+            doc["assets"][name]["href"].as_str().is_some_and(|h| h.contains("://") || h.starts_with('/'))
         });
     }
     let item = Arc::new(item);
@@ -6709,12 +5411,7 @@ pub(super) async fn item_route(
         ["renders"] if get => {
             let renders: serde_json::Map<String, Value> = item_renders(&doc)
                 .iter()
-                .map(|r| {
-                    (
-                        r.name.clone(),
-                        item_render_json(ctx.host, &base, &item_id, r),
-                    )
-                })
+                .map(|r| (r.name.clone(), item_render_json(ctx.host, &base, &item_id, r)))
                 .collect();
             return Done(json_resp(
                 StatusCode::OK,
@@ -6729,10 +5426,7 @@ pub(super) async fn item_route(
         ["renders", render_id] if get => {
             let wanted = percent_decode(render_id);
             return Done(match item_renders(&doc).iter().find(|r| r.name == wanted) {
-                Some(r) => json_resp(
-                    StatusCode::OK,
-                    &item_render_json(ctx.host, &base, &item_id, r),
-                ),
+                Some(r) => json_resp(StatusCode::OK, &item_render_json(ctx.host, &base, &item_id, r)),
                 None => detail(StatusCode::NOT_FOUND, "Render not found"),
             });
         }
@@ -6792,19 +5486,13 @@ pub(super) async fn item_route(
                 let known: Vec<String> = readable.iter().map(|r| format!("'{r}'")).collect();
                 return Done(detail(
                     StatusCode::NOT_FOUND,
-                    format!(
-                        "'{name}' is not valid, should be one of [{}]",
-                        known.join(", ")
-                    ),
+                    format!("'{name}' is not valid, should be one of [{}]", known.join(", ")),
                 ));
             }
         }
     }
     // The routes whose answer depends on where the item lies.
-    let needs_extent = matches!(
-        rest,
-        ["info.geojson"] | ["tiles", _, _, _, _] | [_, "tilejson.json"]
-    );
+    let needs_extent = matches!(rest, ["info.geojson"] | ["tiles", _, _, _, _] | [_, "tilejson.json"]);
     let extent = if needs_extent {
         match item_extent(ctx, &doc, &item, &readable, pq).await {
             Ok(e) => Some(e),
@@ -6837,26 +5525,11 @@ pub(super) async fn item_route(
     if get && item_picture_by_asset(rest, &pairs) {
         let assets: std::collections::BTreeMap<String, Value> = doc["assets"]
             .as_object()
-            .map(|a| {
-                a.iter()
-                    .filter(|(name, _)| readable.contains(name))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
+            .map(|a| a.iter().filter(|(name, _)| readable.contains(name)).map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
         let bbox = doc["bbox"].as_array().and_then(|b| match b.len() {
-            4 => Some([
-                b[0].as_f64()?,
-                b[1].as_f64()?,
-                b[2].as_f64()?,
-                b[3].as_f64()?,
-            ]),
-            6 => Some([
-                b[0].as_f64()?,
-                b[1].as_f64()?,
-                b[3].as_f64()?,
-                b[4].as_f64()?,
-            ]),
+            4 => Some([b[0].as_f64()?, b[1].as_f64()?, b[2].as_f64()?, b[3].as_f64()?]),
+            6 => Some([b[0].as_f64()?, b[1].as_f64()?, b[3].as_f64()?, b[4].as_f64()?]),
             _ => None,
         });
         // What is drawn is cached under the item and where its assets are read from.
@@ -6888,25 +5561,15 @@ pub(super) async fn item_route(
         };
         // A tile the grid does not have is outside the item like any other.
         if let ["tiles", _, zs, xs, ys] = rest
-            && let (Ok(z), Ok(x), Some((y, _, _))) = (
-                zs.parse::<u32>(),
-                xs.parse::<u64>(),
-                super::parse_y_scale_ext(ys),
-            )
+            && let (Ok(z), Ok(x), Some((y, _, _))) = (zs.parse::<u32>(), xs.parse::<u64>(), super::parse_y_scale_ext(ys))
             && (z > 30 || x >= (1u64 << z) || u64::from(y) >= (1u64 << z))
         {
-            return Done(detail(
-                StatusCode::NOT_FOUND,
-                format!("Tile(x={x}, y={y}, z={z}) is outside bounds"),
-            ));
+            return Done(detail(StatusCode::NOT_FOUND, format!("Tile(x={x}, y={y}, z={z}) is outside bounds")));
         }
         // What only a search reads means nothing to an item, and titiler-pgstac passes it
         // over there: the search routes are not shown it.
         let query = without_search_options(ctx.raw_query);
-        let (own, pairs) = (
-            super::parse_query((!query.is_empty()).then_some(query.as_str())),
-            query_pairs(&query),
-        );
+        let (own, pairs) = (super::parse_query((!query.is_empty()).then_some(query.as_str())), query_pairs(&query));
         return Done(mosaic_route(&ctx, pg, &base, &rec, rest, None, own, &pairs).await);
     }
     ItemRoute::Stac(item, extent)
@@ -6915,22 +5578,13 @@ pub(super) async fn item_route(
 /// A query string without the parameters only a search's routes read: how its items are
 /// chosen among and how many are looked for.
 fn without_search_options(raw_query: &str) -> String {
-    let algorithm = raw_query
-        .split('&')
-        .any(|part| part.starts_with("algorithm="));
+    let algorithm = raw_query.split('&').any(|part| part.starts_with("algorithm="));
     let kept: Vec<&str> = raw_query
         .split('&')
         .filter(|part| {
             let name = part.split('=').next().unwrap_or(part);
-            !matches!(
-                name,
-                "pixel_selection"
-                    | "items_limit"
-                    | "scan_limit"
-                    | "time_limit"
-                    | "exitwhenfull"
-                    | "skipcovered"
-            ) && (algorithm || name != "algorithm_params")
+            !matches!(name, "pixel_selection" | "items_limit" | "scan_limit" | "time_limit" | "exitwhenfull" | "skipcovered")
+                && (algorithm || name != "algorithm_params")
         })
         .collect();
     kept.join("&")
@@ -6949,11 +5603,8 @@ fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
     if !picture {
         return false;
     }
-    let Ok(specs) = parse_assets(pairs) else {
-        return false;
-    };
-    specs.iter().any(|s| s.expression.is_some())
-        || (specs.len() > 1 && specs.iter().any(|s| s.indexes.is_some()))
+    let Ok(specs) = parse_assets(pairs) else { return false };
+    specs.iter().any(|s| s.expression.is_some()) || (specs.len() > 1 && specs.iter().any(|s| s.indexes.is_some()))
 }
 
 /// Serve a request whose path starts with `/searches`.
@@ -6981,9 +5632,7 @@ where
 
     match segs {
         ["searches", "register"] if *method == Method::POST => register(&ctx, pg, req).await,
-        ["searches"] | ["searches", ""] | ["searches", "list"] if get => {
-            list(&ctx, pg, &pairs).await
-        }
+        ["searches"] | ["searches", ""] | ["searches", "list"] if get => list(&ctx, pg, &pairs).await,
         // Item routes with a path are answered before this is reached.
         ["collections", _, "items", ..] => not_found(),
         [family @ ("searches" | "collections"), id, rest @ ..]
@@ -7038,9 +5687,7 @@ async fn mosaic_route(
     // The routes that take a body.
     let takes_body = |rest: &[&str]| {
         rest == ["statistics"]
-            || rest
-                .first()
-                .is_some_and(|f| *f == "feature" || f.starts_with("feature."))
+            || rest.first().is_some_and(|f| *f == "feature" || f.starts_with("feature."))
     };
     if body.is_some() != takes_body(rest) {
         return if body.is_some() {
@@ -7069,10 +5716,8 @@ async fn mosaic_route(
                 ctx.forwarded_prefix, ctx.raw_query
             );
             let mut resp = Response::new(Full::new(Bytes::from(build_map_html(&tilejson_url))));
-            resp.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            );
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
             resp
         }
         ["WMTSCapabilities.xml"] => {
@@ -7098,10 +5743,7 @@ async fn mosaic_route(
         ["tiles", _, zs, xs, ys, "assets"] => {
             let coord = match ys.parse::<u32>() {
                 Ok(y) => parse_zxy(zs, xs, y),
-                Err(_) => Err(detail(
-                    StatusCode::BAD_REQUEST,
-                    "invalid z/x/y tile coordinate",
-                )),
+                Err(_) => Err(detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate")),
             };
             match coord {
                 Err(r) => r,
@@ -7114,11 +5756,7 @@ async fn mosaic_route(
                 return detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
             };
             // Without an extension the format is chosen from the rendered pixels.
-            let ext = if ys.contains('.') {
-                ext.unwrap_or("")
-            } else {
-                ""
-            };
+            let ext = if ys.contains('.') { ext.unwrap_or("") } else { "" };
             match parse_zxy(zs, xs, y) {
                 Err(r) => r,
                 Ok(None) if pq.assets.is_empty() => missing_query_param("assets"),
@@ -7146,26 +5784,13 @@ async fn mosaic_route(
                 Err(r) => return r,
             };
             let polygon = bbox_polygon(bbox);
-            part_image(
-                ctx,
-                pg,
-                &rec.hash,
-                &polygon,
-                bbox,
-                None,
-                size,
-                Some(ext),
-                pq,
-                pairs,
-            )
-            .await
+            part_image(ctx, pg, &rec.hash, &polygon, bbox, None, size, Some(ext), pq, pairs).await
         }
         ["bbox", bbox, "assets"] => {
             let Some(([w, s, e, n], None)) = parse_bbox4(bbox) else {
                 return not_found();
             };
-            let corners = in_degrees(&pq, pairs, w, s)
-                .and_then(|low| Ok((low, in_degrees(&pq, pairs, e, n)?)));
+            let corners = in_degrees(&pq, pairs, w, s).and_then(|low| Ok((low, in_degrees(&pq, pairs, e, n)?)));
             let (((w, s), (e, n)), limits) = match (corners, parse_limits(pairs)) {
                 (Err(r), _) | (_, Err(r)) => return r,
                 (Ok(corners), Ok(l)) => (corners, l),
@@ -7177,27 +5802,12 @@ async fn mosaic_route(
             // A size matters only to the lean lookup, and this route has no size of its own:
             // without a usable one the box is sampled as a 1024-pixel picture would be.
             let size = match part_size_from_query(pairs) {
-                Ok(PartSize::Query {
-                    max_size: None,
-                    width: None,
-                    height: None,
-                })
-                | Err(_) => PartSize::Query {
-                    max_size: Some(1024),
-                    width: None,
-                    height: None,
-                },
+                Ok(PartSize::Query { max_size: None, width: None, height: None }) | Err(_) => {
+                    PartSize::Query { max_size: Some(1024), width: None, height: None }
+                }
                 Ok(size) => size,
             };
-            geometry_assets(
-                pg,
-                &rec.hash,
-                polygon,
-                limits,
-                pairs,
-                part_grid(size, [w, s, e, n]),
-            )
-            .await
+            geometry_assets(pg, &rec.hash, polygon, limits, pairs, part_grid(size, [w, s, e, n])).await
         }
         ["bbox", seg, dims] => {
             let (Some((bbox, None)), Some((w, h, ext))) = (parse_bbox4(seg), parse_wxh_ext(dims))
@@ -7208,19 +5818,8 @@ async fn mosaic_route(
                 return not_found();
             }
             let polygon = bbox_polygon(bbox);
-            part_image(
-                ctx,
-                pg,
-                &rec.hash,
-                &polygon,
-                bbox,
-                None,
-                PartSize::Exact(w, h),
-                ext,
-                pq,
-                pairs,
-            )
-            .await
+            part_image(ctx, pg, &rec.hash, &polygon, bbox, None, PartSize::Exact(w, h), ext, pq, pairs)
+                .await
         }
         ["statistics"] => mosaic_statistics(ctx, pg, &rec.hash, body, pq, pairs).await,
         ["point", lonlat] => point_values(ctx, pg, &rec.hash, lonlat, &pq, pairs).await,
@@ -7232,11 +5831,10 @@ async fn mosaic_route(
             let Some((lon, lat)) = coords else {
                 return not_found();
             };
-            let ((lon, lat), mut limits) =
-                match (in_degrees(&pq, pairs, lon, lat), parse_limits(pairs)) {
-                    (Err(r), _) | (_, Err(r)) => return r,
-                    (Ok(at), Ok(l)) => (at, l),
-                };
+            let ((lon, lat), mut limits) = match (in_degrees(&pq, pairs, lon, lat), parse_limits(pairs)) {
+                (Err(r), _) | (_, Err(r)) => return r,
+                (Ok(at), Ok(l)) => (at, l),
+            };
             // A point is never "covered", so every item under it is wanted.
             limits.exitwhenfull = false;
             limits.skipcovered = false;
@@ -7253,34 +5851,16 @@ mod tests {
 
     #[test]
     fn complaints_are_matched_by_the_parameter_they_name() {
-        assert_eq!(
-            error_parameter("invalid width=wide: expected width in 1..=4096"),
-            Some("width")
-        );
-        assert_eq!(
-            error_parameter("parameter 'cover_scale' is not supported by cogzilla"),
-            Some("cover_scale")
-        );
-        assert!(own_error(
-            "invalid asset_as_band=perhaps: expected a boolean"
-        ));
-        assert!(own_error(
-            "invalid assets=visual|bidx=x: expected positive integer band indices in |bidx="
-        ));
+        assert_eq!(error_parameter("invalid width=wide: expected width in 1..=4096"), Some("width"));
+        assert_eq!(error_parameter("parameter 'cover_scale' is not supported by cogzilla"), Some("cover_scale"));
+        assert!(own_error("invalid asset_as_band=perhaps: expected a boolean"));
+        assert!(own_error("invalid assets=visual|bidx=x: expected positive integer band indices in |bidx="));
         // A value that spells a parameter's name is not that parameter.
-        assert!(!own_error(
-            "invalid nodata=histogram_bins: expected a number"
-        ));
+        assert!(!own_error("invalid nodata=histogram_bins: expected a number"));
         assert!(!own_size_error("invalid nodata=width=3: expected a number"));
         let pairs = |q: &str| query_pairs(q);
-        assert_eq!(
-            request_expression(&pairs("assets=red&expr=b1*2")),
-            Some("b1*2")
-        );
-        assert_eq!(
-            request_expression(&pairs("expression=b1&index=b2")),
-            Some("b2")
-        );
+        assert_eq!(request_expression(&pairs("assets=red&expr=b1*2")), Some("b1*2"));
+        assert_eq!(request_expression(&pairs("expression=b1&index=b2")), Some("b2"));
         assert_eq!(request_expression(&pairs("assets=red")), None);
     }
 
@@ -7292,38 +5872,26 @@ mod tests {
             "metadata": { "name": "alps", "minzoom": null }
         }))
         .unwrap();
-        assert_eq!(
-            search,
-            json!({ "collections": ["sentinel-2-l2a"], "filter-lang": "cql2-json" })
-        );
+        assert_eq!(search, json!({ "collections": ["sentinel-2-l2a"], "filter-lang": "cql2-json" }));
         assert_eq!(metadata, json!({ "name": "alps", "type": "mosaic" }));
 
-        let (_, metadata) =
-            split_register_body(json!({ "metadata": { "type": "search" } })).unwrap();
+        let (_, metadata) = split_register_body(json!({ "metadata": { "type": "search" } })).unwrap();
         assert_eq!(metadata, json!({ "type": "search" }));
     }
 
     #[test]
     fn register_body_rejects_what_titiler_pgstac_rejects() {
         let both = json!({ "bbox": [0, 0, 1, 1], "intersects": { "type": "Point", "coordinates": [0, 0] } });
-        assert_eq!(
-            split_register_body(both).unwrap_err().status(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(split_register_body(both).unwrap_err().status(), StatusCode::UNPROCESSABLE_ENTITY);
         let lang = json!({ "filter-lang": "cql2-text" });
-        assert_eq!(
-            split_register_body(lang).unwrap_err().status(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(split_register_body(lang).unwrap_err().status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(split_register_body(json!([1, 2])).is_err());
     }
 
     #[test]
     fn limits_default_and_parse() {
         assert_eq!(parse_limits(&[]).unwrap(), SearchLimits::default());
-        let pairs = query_pairs(
-            "scan_limit=50&items_limit=3&time_limit=1&exitwhenfull=false&skipcovered=0",
-        );
+        let pairs = query_pairs("scan_limit=50&items_limit=3&time_limit=1&exitwhenfull=false&skipcovered=0");
         let l = parse_limits(&pairs).unwrap();
         assert_eq!((l.scan_limit, l.items_limit, l.time_limit_secs), (50, 3, 1));
         assert!(!l.exitwhenfull && !l.skipcovered);
@@ -7351,10 +5919,7 @@ mod tests {
             "item_assets": { "visual": {}, "aot": {}, "red-jp2": {}, "nir": {}, "blue": {} }
         });
         let (search, metadata) = collection_search("c", &collection, &[]).unwrap();
-        assert_eq!(
-            search,
-            json!({ "collections": ["c"], "filter-lang": "cql2-json" })
-        );
+        assert_eq!(search, json!({ "collections": ["c"], "filter-lang": "cql2-json" }));
         assert_eq!(
             metadata,
             json!({
@@ -7407,30 +5972,14 @@ mod tests {
             })
         );
 
-        let status = |q: &str| {
-            collection_search("c", &json!({}), &query_pairs(q))
-                .unwrap_err()
-                .status()
-        };
+        let status = |q: &str| collection_search("c", &json!({}), &query_pairs(q)).unwrap_err().status();
         assert_eq!(status("bbox=1,2,3"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("bbox=1,2,x,4"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("query=nope"), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            status("filter=eo:cloud_cover%3C"),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert_eq!(
-            status("filter=eo:cloud_cover"),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert_eq!(
-            status("filter=a%3D1&filter-lang=cql2-nope"),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert_eq!(
-            status("filter=a%3D1&filter-lang=cql2-json"),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(status("filter=eo:cloud_cover%3C"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=eo:cloud_cover"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=a%3D1&filter-lang=cql2-nope"), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status("filter=a%3D1&filter-lang=cql2-json"), StatusCode::UNPROCESSABLE_ENTITY);
 
         // A filter is CQL2 text unless `filter-lang` says otherwise, and is stored as the
         // JSON titiler-pgstac's converter gives: numbers as floats, `filter-lang` JSON.
@@ -7477,11 +6026,7 @@ mod tests {
             ]
         );
         // Registration links keep asset_bidx as its own parameter.
-        assert!(
-            layer_queries(&metadata, false)[1]
-                .1
-                .ends_with("&assets=red&asset_bidx=red%7C1")
-        );
+        assert!(layer_queries(&metadata, false)[1].1.ends_with("&assets=red&asset_bidx=red%7C1"));
         assert!(layer_queries(&json!({ "name": "x" }), true).is_empty());
     }
 
@@ -7499,14 +6044,7 @@ mod tests {
         // Expected values are rio-tiler 9.4's for the same grids (rasterio's
         // calculate_default_transform, then zoom_for_res).
         let zooms = |crs: &CrsModel, width: f64, height: f64, bounds: [f64; 4]| {
-            let e = grid_extent(
-                crs,
-                ProjGrid {
-                    bounds,
-                    width,
-                    height,
-                },
-            );
+            let e = grid_extent(crs, ProjGrid { bounds, width, height });
             (e.minzoom, e.maxzoom)
         };
         let s2 = [699_960.0, 4_790_220.0, 809_760.0, 4_900_020.0];
@@ -7514,75 +6052,30 @@ mod tests {
         assert_eq!(zooms(&utm(32631), 5490.0, 5490.0, s2), (7, 12));
         assert_eq!(zooms(&utm(32631), 1830.0, 1830.0, s2), (8, 11));
         assert_eq!(
-            zooms(
-                &utm(32632),
-                10980.0,
-                10980.0,
-                [399_960.0, 5_090_220.0, 509_760.0, 5_200_020.0]
-            ),
+            zooms(&utm(32632), 10980.0, 10980.0, [399_960.0, 5_090_220.0, 509_760.0, 5_200_020.0]),
             (7, 13)
         );
         assert_eq!(
-            zooms(
-                &utm(32633),
-                10980.0,
-                10980.0,
-                [499_980.0, 6_790_200.0, 609_780.0, 6_900_000.0]
-            ),
+            zooms(&utm(32633), 10980.0, 10980.0, [499_980.0, 6_790_200.0, 609_780.0, 6_900_000.0]),
             (7, 13)
         );
         assert_eq!(
-            zooms(
-                &utm(32619),
-                7621.0,
-                7791.0,
-                [300_000.0, 100_000.0, 528_630.0, 333_730.0]
-            ),
+            zooms(&utm(32619), 7621.0, 7791.0, [300_000.0, 100_000.0, 528_630.0, 333_730.0]),
             (7, 12)
         );
         assert_eq!(
-            zooms(
-                &utm(32755),
-                10980.0,
-                10980.0,
-                [300_000.0, 5_690_220.0, 409_800.0, 5_800_020.0]
-            ),
+            zooms(&utm(32755), 10980.0, 10980.0, [300_000.0, 5_690_220.0, 409_800.0, 5_800_020.0]),
             (8, 14)
         );
+        assert_eq!(zooms(&CrsModel::Geographic, 3600.0, 1800.0, [-10.0, 30.0, 26.0, 48.0]), (3, 7));
         assert_eq!(
-            zooms(
-                &CrsModel::Geographic,
-                3600.0,
-                1800.0,
-                [-10.0, 30.0, 26.0, 48.0]
-            ),
-            (3, 7)
-        );
-        assert_eq!(
-            zooms(
-                &CrsModel::Epsg3857,
-                4096.0,
-                2048.0,
-                [500_000.0, 5_300_000.0, 622_304.0, 5_361_152.0]
-            ),
+            zooms(&CrsModel::Epsg3857, 4096.0, 2048.0, [500_000.0, 5_300_000.0, 622_304.0, 5_361_152.0]),
             (9, 12)
         );
 
         // The extent of the Sentinel-2 tile in WGS84, as rasterio's transform_bounds gives it.
-        let e = grid_extent(
-            &utm(32631),
-            ProjGrid {
-                bounds: s2,
-                width: 10980.0,
-                height: 10980.0,
-            },
-        );
-        let want = [
-            5.462735477681616,
-            43.201211354944526,
-            6.875738946301351,
-            44.22597512756446,
-        ];
+        let e = grid_extent(&utm(32631), ProjGrid { bounds: s2, width: 10980.0, height: 10980.0 });
+        let want = [5.462735477681616, 43.201211354944526, 6.875738946301351, 44.22597512756446];
         for (got, want) in e.wgs84.iter().zip(want) {
             assert!((got - want).abs() < 1e-9, "{got} vs {want}");
         }
@@ -7610,10 +6103,7 @@ mod tests {
         assert_eq!(readable, ["aot", "visual", "aot-jp2", "untyped"]);
         // The union of the assets' grids at the finest asset's resolution.
         let grid = item_proj_grid(&item, &readable).unwrap();
-        assert_eq!(
-            grid.bounds,
-            [699_960.0, 4_790_220.0, 809_760.0, 4_900_020.0]
-        );
+        assert_eq!(grid.bounds, [699_960.0, 4_790_220.0, 809_760.0, 4_900_020.0]);
         assert_eq!((grid.width, grid.height), (10980.0, 10980.0));
 
         // Item-level fields are used when no asset has its own.
@@ -7623,10 +6113,7 @@ mod tests {
             "assets": { "data": { "href": "d.tif" } }
         });
         let grid = item_proj_grid(&item_level, &["data".to_string()]).unwrap();
-        assert_eq!(
-            grid.bounds,
-            [500_000.0, 3_997_000.0, 506_000.0, 4_000_000.0]
-        );
+        assert_eq!(grid.bounds, [500_000.0, 3_997_000.0, 506_000.0, 4_000_000.0]);
         assert_eq!((grid.width, grid.height), (200.0, 100.0));
 
         // Assets in different coordinate systems, or no projection fields: nothing to go on.
@@ -7642,100 +6129,40 @@ mod tests {
 
     #[test]
     fn item_answers_are_reshaped_like_titiler_pgstac() {
-        let extent = ItemExtent {
-            wgs84: [5.0, 43.0, 7.0, 44.0],
-            mercator: None,
-            minzoom: 7,
-            maxzoom: 13,
-        };
+        let extent = ItemExtent { wgs84: [5.0, 43.0, 7.0, 44.0], mercator: None, minzoom: 7, maxzoom: 13 };
         let fix = |sub: &[&str], query: &str, body: Value| {
-            let (bytes, _) = item_fixup(
-                sub,
-                Some(&extent),
-                query,
-                Bytes::from(body.to_string()),
-                "application/json",
-            )
-            .unwrap();
+            let (bytes, _) =
+                item_fixup(sub, Some(&extent), query, Bytes::from(body.to_string()), "application/json").unwrap();
             serde_json::from_slice::<Value>(&bytes).unwrap()
         };
         let info = json!({ "visual": { "dtype": "uint8", "minzoom": 9, "maxzoom": 14, "wgs84_bounds": [1, 2, 3, 4] } });
-        assert_eq!(
-            fix(&["info"], "", info.clone()),
-            json!({ "visual": { "dtype": "uint8" } })
-        );
+        assert_eq!(fix(&["info"], "", info.clone()), json!({ "visual": { "dtype": "uint8" } }));
 
-        let feature = fix(
-            &["info.geojson"],
-            "",
-            json!({ "type": "Feature", "geometry": null, "properties": info }),
-        );
+        let feature = fix(&["info.geojson"], "", json!({ "type": "Feature", "geometry": null, "properties": info }));
         assert_eq!(feature["bbox"], json!([5.0, 43.0, 7.0, 44.0]));
         assert_eq!(feature["geometry"]["coordinates"][0][2], json!([7.0, 44.0]));
-        assert_eq!(
-            feature["properties"],
-            json!({ "visual": { "dtype": "uint8" } })
-        );
+        assert_eq!(feature["properties"], json!({ "visual": { "dtype": "uint8" } }));
 
-        let point = fix(
-            &["point", "6,43"],
-            "",
-            json!({ "band_names": ["red_b1", "nir_b1"], "values": [1.0, 2.0] }),
-        );
+        let point = fix(&["point", "6,43"], "", json!({ "band_names": ["red_b1", "nir_b1"], "values": [1.0, 2.0] }));
         assert_eq!(point["band_names"], json!(["b1", "b2"]));
 
-        let tj =
-            json!({ "minzoom": 9, "maxzoom": 14, "bounds": [0, 0, 1, 1], "center": [0.5, 0.5, 9] });
-        let fixed = fix(
-            &["WebMercatorQuad", "tilejson.json"],
-            "assets=visual",
-            tj.clone(),
-        );
-        assert_eq!(
-            (&fixed["minzoom"], &fixed["maxzoom"]),
-            (&json!(7), &json!(13))
-        );
+        let tj = json!({ "minzoom": 9, "maxzoom": 14, "bounds": [0, 0, 1, 1], "center": [0.5, 0.5, 9] });
+        let fixed = fix(&["WebMercatorQuad", "tilejson.json"], "assets=visual", tj.clone());
+        assert_eq!((&fixed["minzoom"], &fixed["maxzoom"]), (&json!(7), &json!(13)));
         assert_eq!(fixed["center"], json!([6.0, 43.5, 7]));
         // Zooms given in the query string stand.
-        let fixed = fix(
-            &["WebMercatorQuad", "tilejson.json"],
-            "assets=visual&minzoom=10",
-            tj,
-        );
-        assert_eq!(
-            (&fixed["minzoom"], &fixed["maxzoom"]),
-            (&json!(9), &json!(13))
-        );
+        let fixed = fix(&["WebMercatorQuad", "tilejson.json"], "assets=visual&minzoom=10", tj);
+        assert_eq!((&fixed["minzoom"], &fixed["maxzoom"]), (&json!(9), &json!(13)));
 
         // Tiles are passed through; only the media type of `.jpg` changes.
-        let jpg = item_fixup(
-            &["tiles", "WebMercatorQuad", "1", "2", "3.jpg"],
-            None,
-            "",
-            Bytes::from_static(b"x"),
-            "image/jpeg",
-        )
-        .unwrap();
+        let jpg = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.jpg"], None, "", Bytes::from_static(b"x"), "image/jpeg").unwrap();
         assert_eq!(jpg.1, "image/jpg");
-        let png = item_fixup(
-            &["tiles", "WebMercatorQuad", "1", "2", "3.png"],
-            None,
-            "",
-            Bytes::from_static(b"x"),
-            "image/png",
-        )
-        .unwrap();
+        let png = item_fixup(&["tiles", "WebMercatorQuad", "1", "2", "3.png"], None, "", Bytes::from_static(b"x"), "image/png").unwrap();
         assert_eq!((png.0.as_ref(), png.1), (b"x".as_ref(), "image/png"));
 
         assert!(item_route_needs_assets(&["info"]));
         assert!(item_route_needs_assets(&["preview.png"]));
-        assert!(item_route_needs_assets(&[
-            "tiles",
-            "WebMercatorQuad",
-            "1",
-            "2",
-            "3"
-        ]));
+        assert!(item_route_needs_assets(&["tiles", "WebMercatorQuad", "1", "2", "3"]));
         assert!(!item_route_needs_assets(&["assets"]));
         assert!(!item_route_needs_assets(&["tiles", "WebMercatorQuad"]));
         assert!(!item_route_needs_assets(&["nope"]));
@@ -7744,8 +6171,7 @@ mod tests {
     #[test]
     fn wmts_lists_default_layers_and_the_query_layer() {
         let engine = Arc::new(TileEngine::new(1 << 20));
-        let raw_query =
-            "assets=visual&rescale=0,255&tilesize=512&tile_format=jpg&zooms=WebMercatorQuad::8,9";
+        let raw_query = "assets=visual&rescale=0,255&tilesize=512&tile_format=jpg&zooms=WebMercatorQuad::8,9";
         let ctx = Ctx {
             engine: &engine,
             host: "http://example.test",
@@ -7792,32 +6218,19 @@ mod tests {
         assert_eq!(xml.matches("<Layer>").count(), 2);
         assert_eq!(xml.matches("<Format>image/jpg</Format>").count(), 2);
         assert!(xml.contains("<ows:LowerCorner>5.0 43.5</ows:LowerCorner>"));
-        assert!(xml.contains(
-            "<ows:SupportedCRS>http://www.opengis.net/def/crs/EPSG/0/3857</ows:SupportedCRS>"
-        ));
+        assert!(xml.contains("<ows:SupportedCRS>http://www.opengis.net/def/crs/EPSG/0/3857</ows:SupportedCRS>"));
         assert!(xml.contains("<ScaleDenominator>559082264.0287178</ScaleDenominator>"));
         assert!(xml.contains("<ScaleDenominator>33.323899747652874</ScaleDenominator>"));
-        assert!(
-            xml.contains("WMTSCapabilities.xml?assets=visual&amp;rescale=0,255&amp;tilesize=512")
-        );
+        assert!(xml.contains("WMTSCapabilities.xml?assets=visual&amp;rescale=0,255&amp;tilesize=512"));
 
         // Nothing that can make a tile, an unknown format, and a format these routes cannot write.
-        let bare = WmtsSource {
-            default_layers: Vec::new(),
-            ..source()
-        };
-        assert_eq!(
-            wmts(&ctx, "/searches/abc", bare, &[]).status(),
-            StatusCode::BAD_REQUEST
-        );
+        let bare = WmtsSource { default_layers: Vec::new(), ..source() };
+        assert_eq!(wmts(&ctx, "/searches/abc", bare, &[]).status(), StatusCode::BAD_REQUEST);
         let status = |q: &str| wmts(&ctx, "/searches/abc", source(), &query_pairs(q)).status();
         assert_eq!(status("tile_format=nope"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("tile_format=tif"), StatusCode::BAD_REQUEST);
         assert_eq!(status("use_epsg=maybe"), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            status("zooms=WebMercatorQuad"),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(status("zooms=WebMercatorQuad"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status(""), StatusCode::OK);
     }
 
@@ -7825,76 +6238,23 @@ mod tests {
     fn selected_values_are_painted_with_the_requests_own_rescale() {
         let nan = f32::NAN;
         // One band through a colour map: 0 to 100 onto 0 to 255, the fraction dropped.
-        let gray = Paint::of(&BandRequest::Single {
-            band_1based: 1,
-            rescale: (0.0, 100.0),
-            colormap: ColormapName::Grayscale,
-        })
-        .unwrap();
-        let rgba = gray.rgba(
-            &Selected {
-                bands: 1,
-                values: vec![0.0, 50.0, 100.0, 250.0, -5.0, nan],
-            },
-            6,
-        );
-        assert_eq!(
-            rgba,
-            [
-                0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0,
-                255, 0, 0, 0, 0
-            ]
-        );
-        let viridis = Paint::of(&BandRequest::Single {
-            band_1based: 1,
-            rescale: (0.0, 255.0),
-            colormap: ColormapName::Viridis,
-        })
-        .unwrap();
-        let rgba = viridis.rgba(
-            &Selected {
-                bands: 1,
-                values: vec![0.0, 255.0],
-            },
-            2,
-        );
-        assert_eq!(
-            rgba[..4],
-            [
-                ColormapName::Viridis.lut().rgb[0][0],
-                ColormapName::Viridis.lut().rgb[0][1],
-                ColormapName::Viridis.lut().rgb[0][2],
-                255
-            ]
-        );
+        let gray = Paint::of(&BandRequest::Single { band_1based: 1, rescale: (0.0, 100.0), colormap: ColormapName::Grayscale }).unwrap();
+        let rgba = gray.rgba(&Selected { bands: 1, values: vec![0.0, 50.0, 100.0, 250.0, -5.0, nan] }, 6);
+        assert_eq!(rgba, [0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 0]);
+        let viridis = Paint::of(&BandRequest::Single { band_1based: 1, rescale: (0.0, 255.0), colormap: ColormapName::Viridis }).unwrap();
+        let rgba = viridis.rgba(&Selected { bands: 1, values: vec![0.0, 255.0] }, 2);
+        assert_eq!(rgba[..4], [ColormapName::Viridis.lut().rgb[0][0], ColormapName::Viridis.lut().rgb[0][1], ColormapName::Viridis.lut().rgb[0][2], 255]);
         assert_eq!(rgba[4..7], ColormapName::Viridis.lut().rgb[255]);
 
         // Three bands, each with its own range. A pixel is there when any band of it is.
-        let rgb = Paint::of(&BandRequest::Rgb {
-            bands_1based: [1, 2, 3],
-            rescale_min: [0.0, 0.0, 0.0],
-            rescale_max: [255.0, 100.0, 10.0],
-        })
-        .unwrap();
-        let selected = Selected {
-            bands: 3,
-            values: vec![255.0, nan, nan, 50.0, 50.0, nan, 5.0, nan, nan],
-        };
-        assert_eq!(
-            rgb.rgba(&selected, 3),
-            [255, 127, 127, 255, 0, 127, 0, 255, 0, 0, 0, 0]
-        );
+        let rgb = Paint::of(&BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0, 0.0, 0.0], rescale_max: [255.0, 100.0, 10.0] }).unwrap();
+        let selected = Selected { bands: 3, values: vec![255.0, nan, nan, 50.0, 50.0, nan, 5.0, nan, nan] };
+        assert_eq!(rgb.rgba(&selected, 3), [255, 127, 127, 255, 0, 127, 0, 255, 0, 0, 0, 0]);
         // A count is one band whatever was asked for: grey on the first band's range.
-        let count = Selected {
-            bands: 1,
-            values: vec![0.0, 255.0],
-        };
+        let count = Selected { bands: 1, values: vec![0.0, 255.0] };
         assert_eq!(rgb.rgba(&count, 2), [0, 0, 0, 255, 255, 255, 255, 255]);
 
-        let terrain = BandRequest::Terrain {
-            band_1based: 1,
-            encoding: cogzilla_kernel::TerrainEncoding::Terrarium,
-        };
+        let terrain = BandRequest::Terrain { band_1based: 1, encoding: cogzilla_kernel::TerrainEncoding::Terrarium };
         assert!(Paint::of(&terrain).is_none());
     }
 
@@ -7903,188 +6263,44 @@ mod tests {
         let nan = f32::NAN;
         let ranges = [(0.0, 100.0), (0.0, 10.0), (0.0, 1.0)];
         // One range is for every band, several are one each, none is the default.
-        let one = Selected {
-            bands: 1,
-            values: vec![50.0, nan],
-        };
-        assert_eq!(
-            paint_bands(
-                &one,
-                2,
-                &ranges[..1],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                None
-            )
-            .unwrap(),
-            [127, 127, 127, 255, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale, None).unwrap()[..4],
-            [255, 255, 255, 255]
-        );
+        let one = Selected { bands: 1, values: vec![50.0, nan] };
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 127, 127, 255, 0, 0, 0, 0]);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale, None).unwrap()[..4], [255, 255, 255, 255]);
         // A colour map of the request's own: classes over the values themselves, or over
         // the byte `rescale` makes of them, or intervals; nothing where there is no value
         // or no class for it.
         let map = |json: &str| MosaicColormap::parse(json).unwrap().unwrap();
-        let classes =
-            map(r#"{"50": [1, 2, 3, 200], "127": [9, 9, 9, 255], "700": [7, 7, 7, 255]}"#);
-        assert_eq!(
-            paint_bands(
-                &one,
-                2,
-                &[],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                Some(&classes)
-            )
-            .unwrap(),
-            [1, 2, 3, 200, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            paint_bands(
-                &one,
-                2,
-                &ranges[..1],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                Some(&classes)
-            )
-            .unwrap()[..4],
-            [9, 9, 9, 255]
-        );
+        let classes = map(r#"{"50": [1, 2, 3, 200], "127": [9, 9, 9, 255], "700": [7, 7, 7, 255]}"#);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap(), [1, 2, 3, 200, 0, 0, 0, 0]);
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap()[..4], [9, 9, 9, 255]);
         // A class is for the value that equals it: none for one beside it, or with no class.
-        let near = Selected {
-            bands: 1,
-            values: vec![50.4, 70.0, 700.0],
-        };
-        assert_eq!(
-            paint_bands(
-                &near,
-                3,
-                &[],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                Some(&classes)
-            )
-            .unwrap(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 255]
-        );
+        let near = Selected { bands: 1, values: vec![50.4, 70.0, 700.0] };
+        assert_eq!(paint_bands(&near, 3, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap(), [0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 255]);
         // Intervals: by the value, or under `rescale` by the byte, and the last given wins.
-        let spans = map(
-            "[[[0, 40], [1, 1, 1, 255]], [[40, 60], [2, 2, 2, 255]], [[45, 55], [3, 3, 3, 255]], [[120, 130], [4, 4, 4, 255]]]",
-        );
-        assert_eq!(
-            paint_bands(
-                &one,
-                2,
-                &[],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                Some(&spans)
-            )
-            .unwrap()[..4],
-            [3, 3, 3, 255]
-        );
-        assert_eq!(
-            paint_bands(
-                &one,
-                2,
-                &ranges[..1],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                Some(&spans)
-            )
-            .unwrap()[..4],
-            [4, 4, 4, 255]
-        );
+        let spans = map("[[[0, 40], [1, 1, 1, 255]], [[40, 60], [2, 2, 2, 255]], [[45, 55], [3, 3, 3, 255]], [[120, 130], [4, 4, 4, 255]]]");
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&spans)).unwrap()[..4], [3, 3, 3, 255]);
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&spans)).unwrap()[..4], [4, 4, 4, 255]);
         // Classes for every byte take the value as a byte: cut towards zero, round the clock.
-        let bytes: Vec<String> = (0..256)
-            .map(|k| format!(r#""{k}": [{k}, 0, 0, 255]"#))
-            .collect();
+        let bytes: Vec<String> = (0..256).map(|k| format!(r#""{k}": [{k}, 0, 0, 255]"#)).collect();
         let bytes = map(&format!("{{{}}}", bytes.join(",")));
-        let wide = Selected {
-            bands: 1,
-            values: vec![300.9, -1.0, 7.9],
-        };
-        assert_eq!(
-            paint_bands(
-                &wide,
-                3,
-                &[],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                Some(&bytes)
-            )
-            .unwrap(),
-            [44, 0, 0, 255, 255, 0, 0, 255, 7, 0, 0, 255]
-        );
+        let wide = Selected { bands: 1, values: vec![300.9, -1.0, 7.9] };
+        assert_eq!(paint_bands(&wide, 3, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&bytes)).unwrap(), [44, 0, 0, 255, 255, 0, 0, 255, 7, 0, 0, 255]);
         // A map with nothing in it is no map, and one with too many intervals is refused.
-        assert!(
-            MosaicColormap::parse("{}").unwrap().is_none()
-                && MosaicColormap::parse("[]").unwrap().is_none()
-        );
-        let many: Vec<String> = (0..257)
-            .map(|k| format!("[[{k}, {}], [1, 1, 1, 255]]", k + 1))
-            .collect();
-        assert!(
-            MosaicColormap::parse(&format!("[{}]", many.join(","))).is_err()
-                && MosaicColormap::parse("{nope").is_err()
-        );
-        let three = Selected {
-            bands: 3,
-            values: vec![50.0, 5.0, 0.5],
-        };
-        assert_eq!(
-            paint_bands(
-                &three,
-                1,
-                &ranges,
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                None
-            )
-            .unwrap(),
-            [127, 127, 127, 255]
-        );
-        assert_eq!(
-            paint_bands(
-                &three,
-                1,
-                &ranges[..1],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                None
-            )
-            .unwrap(),
-            [127, 12, 1, 255]
-        );
+        assert!(MosaicColormap::parse("{}").unwrap().is_none() && MosaicColormap::parse("[]").unwrap().is_none());
+        let many: Vec<String> = (0..257).map(|k| format!("[[{k}, {}], [1, 1, 1, 255]]", k + 1)).collect();
+        assert!(MosaicColormap::parse(&format!("[{}]", many.join(","))).is_err() && MosaicColormap::parse("{nope").is_err());
+        let three = Selected { bands: 3, values: vec![50.0, 5.0, 0.5] };
+        assert_eq!(paint_bands(&three, 1, &ranges, (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 127, 127, 255]);
+        assert_eq!(paint_bands(&three, 1, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 12, 1, 255]);
         // Two bands: red and green, and the mask for blue; never transparent.
-        let two = Selected {
-            bands: 2,
-            values: vec![50.0, nan, nan, 5.0, 10.0, nan],
-        };
+        let two = Selected { bands: 2, values: vec![50.0, nan, nan, 5.0, 10.0, nan] };
         assert_eq!(
-            paint_bands(
-                &two,
-                3,
-                &ranges[..2],
-                (0.0, 1.0),
-                ColormapName::Grayscale,
-                None
-            )
-            .unwrap(),
+            paint_bands(&two, 3, &ranges[..2], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(),
             [127, 127, 255, 255, 0, 255, 255, 255, 0, 0, 0, 255]
         );
         // Four bands and more are no picture.
-        let four = Selected {
-            bands: 4,
-            values: vec![1.0; 4],
-        };
-        assert_eq!(
-            paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale, None).unwrap_err(),
-            4
-        );
+        let four = Selected { bands: 4, values: vec![1.0; 4] };
+        assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale, None).unwrap_err(), 4);
     }
 
     #[test]
@@ -8092,43 +6308,17 @@ mod tests {
         let bands = [vec![1.0f32; 4]];
         // Results, length and nesting all come from a URL.
         let many = vec!["b1"; super::super::point_expr::MAX_RESULTS + 1].join(";");
-        assert!(
-            band_math(&many, &bands)
-                .unwrap_err()
-                .to_string()
-                .contains("results")
-        );
-        let long = format!(
-            "b1{}",
-            "+b1".repeat(super::super::point_expr::MAX_EXPRESSION_BYTES / 3)
-        );
-        assert!(
-            band_math(&long, &bands)
-                .unwrap_err()
-                .to_string()
-                .contains("longer")
-        );
+        assert!(band_math(&many, &bands).unwrap_err().to_string().contains("results"));
+        let long = format!("b1{}", "+b1".repeat(super::super::point_expr::MAX_EXPRESSION_BYTES / 3));
+        assert!(band_math(&long, &bands).unwrap_err().to_string().contains("longer"));
         let deep = format!("{}b1{}", "(".repeat(1000), ")".repeat(1000));
-        assert!(
-            band_math(&deep, &bands)
-                .unwrap_err()
-                .to_string()
-                .contains("nests")
-        );
+        assert!(band_math(&deep, &bands).unwrap_err().to_string().contains("nests"));
         let minus = format!("{}b1", "-".repeat(1000));
-        assert!(
-            band_math(&minus, &bands)
-                .unwrap_err()
-                .to_string()
-                .contains("nests")
-        );
+        assert!(band_math(&minus, &bands).unwrap_err().to_string().contains("nests"));
         // What band math is in practice is far inside the limits.
         let chain = format!("b1{}", "+b1".repeat(500));
         assert_eq!(band_math(&chain, &bands).unwrap()[0][0], 501.0);
-        assert_eq!(
-            band_math("((((b1+1)*2)-3)/(b1+1))**2", &bands).unwrap()[0][0],
-            0.25
-        );
+        assert_eq!(band_math("((((b1+1)*2)-3)/(b1+1))**2", &bands).unwrap()[0][0], 0.25);
     }
 
     #[test]
@@ -8144,19 +6334,9 @@ mod tests {
         assert_eq!(rescale_byte(3.0, 3.0, 3.0), 0);
         let _ = rescale_byte(3.0, 10.0, 0.0);
         // Grey is the byte itself, for every level.
-        let grey = Paint::Gray {
-            min: 0.0,
-            max: 255.0,
-            colormap: ColormapName::Grayscale,
-        };
+        let grey = Paint::Gray { min: 0.0, max: 255.0, colormap: ColormapName::Grayscale };
         let all: Vec<f32> = (0..=255).map(|v| v as f32).collect();
-        let rgba = grey.rgba(
-            &Selected {
-                bands: 1,
-                values: all,
-            },
-            256,
-        );
+        let rgba = grey.rgba(&Selected { bands: 1, values: all }, 256);
         for (level, px) in rgba.chunks_exact(4).enumerate() {
             assert_eq!(px, [level as u8, level as u8, level as u8, 255]);
         }
@@ -8171,11 +6351,7 @@ mod tests {
         assert_eq!(out[0][1], -1.0);
         assert!(out[0][2].is_nan(), "no data in, no data out");
         assert_eq!(out[0][3], 0.0);
-        assert_eq!(
-            out[1][1],
-            f32::INFINITY,
-            "a division by zero is the largest number, as numpy's nan_to_num makes it"
-        );
+        assert_eq!(out[1][1], f32::INFINITY, "a division by zero is the largest number, as numpy's nan_to_num makes it");
         assert!(band_math("b3", &bands).is_err());
     }
 
@@ -8184,77 +6360,37 @@ mod tests {
         // A 0.2 by 0.1 degree box over data whose resolution makes it 1802 by 901 pixels.
         let bbox = [8.4, 45.7, 8.6, 45.8];
         let res = 0.2 / 1802.0;
-        let query = |max_size, width, height| PartSize::Query {
-            max_size,
-            width,
-            height,
-        };
+        let query = |max_size, width, height| PartSize::Query { max_size, width, height };
         assert_eq!(part_dims(query(None, None, None), bbox, res), (1802, 901));
-        assert_eq!(
-            part_dims(query(Some(256), None, None), bbox, res),
-            (256, 128)
-        );
-        assert_eq!(
-            part_dims(query(None, Some(300), None), bbox, res),
-            (300, 150)
-        );
+        assert_eq!(part_dims(query(Some(256), None, None), bbox, res), (256, 128));
+        assert_eq!(part_dims(query(None, Some(300), None), bbox, res), (300, 150));
         assert_eq!(part_dims(query(None, None, Some(90)), bbox, res), (180, 90));
-        assert_eq!(
-            part_dims(query(None, Some(300), Some(200)), bbox, res),
-            (300, 200)
-        );
+        assert_eq!(part_dims(query(None, Some(300), Some(200)), bbox, res), (300, 200));
         assert_eq!(part_dims(PartSize::Exact(64, 48), bbox, res), (64, 48));
         // `max_size` only shrinks: a box smaller than it keeps the data's resolution.
-        assert_eq!(
-            part_dims(query(Some(4096), None, None), bbox, res),
-            (1802, 901)
-        );
+        assert_eq!(part_dims(query(Some(4096), None, None), bbox, res), (1802, 901));
         // A tall box is limited by its height.
-        assert_eq!(
-            part_dims(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2], res),
-            (50, 100)
-        );
+        assert_eq!(part_dims(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2], res), (50, 100));
 
         // The lean lookup samples the box as the picture will: the same sizes, wherever
         // they do not depend on the data.
         let grid = |w, h| SampleGrid::for_image(w, h, false);
-        assert_eq!(
-            part_grid(query(Some(256), None, None), bbox),
-            grid(256, 128)
-        );
-        assert_eq!(
-            part_grid(query(None, Some(300), None), bbox),
-            grid(300, 150)
-        );
+        assert_eq!(part_grid(query(Some(256), None, None), bbox), grid(256, 128));
+        assert_eq!(part_grid(query(None, Some(300), None), bbox), grid(300, 150));
         assert_eq!(part_grid(query(None, None, Some(90)), bbox), grid(180, 90));
-        assert_eq!(
-            part_grid(query(None, Some(300), Some(200)), bbox),
-            grid(300, 200)
-        );
+        assert_eq!(part_grid(query(None, Some(300), Some(200)), bbox), grid(300, 200));
         assert_eq!(part_grid(PartSize::Exact(64, 48), bbox), grid(64, 48));
-        assert_eq!(
-            part_grid(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2]),
-            grid(50, 100)
-        );
+        assert_eq!(part_grid(query(Some(100), None, None), [0.0, 0.0, 0.1, 0.2]), grid(50, 100));
         assert!(grid(64, 48).is_some());
         // The data's own resolution is not known yet, and a picture this large is not sampled.
         assert_eq!(part_grid(query(None, None, None), bbox), None);
         assert_eq!(part_grid(PartSize::Exact(5000, 10), bbox), None);
-        assert_eq!(
-            part_grid(PartSize::Exact(64, 48), [0.0, 0.0, 0.0, 1.0]),
-            None
-        );
+        assert_eq!(part_grid(PartSize::Exact(64, 48), [0.0, 0.0, 0.0, 1.0]), None);
 
         // `max_size` is dropped once a width or a height is given, as in rio-tiler.
         let pairs = query_pairs("max_size=64&width=300");
-        assert_eq!(
-            part_size_from_query(&pairs).unwrap(),
-            query(None, Some(300), None)
-        );
-        assert_eq!(
-            part_size_from_query(&query_pairs("max_size=64")).unwrap(),
-            query(Some(64), None, None)
-        );
+        assert_eq!(part_size_from_query(&pairs).unwrap(), query(None, Some(300), None));
+        assert_eq!(part_size_from_query(&query_pairs("max_size=64")).unwrap(), query(Some(64), None, None));
         assert!(part_size_from_query(&query_pairs("width=wide")).is_err());
         assert!(part_size_from_query(&query_pairs("height=0")).is_err());
     }
@@ -8282,33 +6418,19 @@ mod tests {
             urlencode_doseq(&renders[1].params),
             "title=NDVI&assets=red&assets=nir&rescale=%5B-1%2C+1%5D&expression=%28nir-red%29%2F%28nir%2Bred%29&colormap_name=viridis"
         );
-        assert_eq!(
-            urlencode_doseq(&renders[2].params),
-            "assets=red%7Cbidx%3D1&minmax_zoom=8&minmax_zoom=12"
-        );
+        assert_eq!(urlencode_doseq(&renders[2].params), "assets=red%7Cbidx%3D1&minmax_zoom=8&minmax_zoom=12");
 
         let doc = item_render_json("http://h", "/collections/c/items/i", "i", &renders[1]);
         assert_eq!(doc["valid"], true);
-        assert_eq!(
-            doc["links"][0]["href"],
-            "http://h/collections/c/items/i/renders/ndvi?url=%3CItem+id%3Di%3E"
-        );
+        assert_eq!(doc["links"][0]["href"], "http://h/collections/c/items/i/renders/ndvi?url=%3CItem+id%3Di%3E");
         assert_eq!(doc["links"][1]["rel"], "tilesets-map");
         assert!(doc["links"][1]["href"].as_str().unwrap().starts_with(
             "http://h/collections/c/items/i/%7BtileMatrixSetId%7D/tilejson.json?url=%3CItem+id%3Di%3E&title=NDVI&"
         ));
-        assert!(
-            doc["links"][2]["href"]
-                .as_str()
-                .unwrap()
-                .contains("/WMTSCapabilities.xml?url=")
-        );
+        assert!(doc["links"][2]["href"].as_str().unwrap().contains("/WMTSCapabilities.xml?url="));
         // A render that cannot make a tile has only its own link.
         let doc = item_render_json("http://h", "/collections/c/items/i", "i", &renders[3]);
-        assert_eq!(
-            (doc["valid"].clone(), doc["links"].as_array().unwrap().len()),
-            (json!(false), 1)
-        );
+        assert_eq!((doc["valid"].clone(), doc["links"].as_array().unwrap().len()), (json!(false), 1));
         assert!(item_renders(&json!({ "properties": {} })).is_empty());
     }
 
@@ -8316,52 +6438,31 @@ mod tests {
     fn point_values_take_band_math() {
         let values = [json!(1060.0), json!(2386.0)];
         let names = ["red_b1".to_string(), "nir_b1".to_string()];
-        let (v, band_names, described) =
-            point_expression("(b2-b1)/(b2+b1);b1*2", &values, &names).unwrap();
+        let (v, band_names, described) = point_expression("(b2-b1)/(b2+b1);b1*2", &values, &names).unwrap();
         assert_eq!(v, [json!(0.3847939640162507), json!(2120.0)]);
         assert_eq!(band_names, ["b1", "b2"]);
         assert_eq!(described, ["(nir_b1-red_b1)/(nir_b1+red_b1)", "red_b1*2"]);
         // A band without a value gives an empty result, and asset names are not band names.
         let (v, _, _) = point_expression("b1+b2", &[Value::Null, json!(1.0)], &names).unwrap();
         assert_eq!(v, [Value::Null]);
-        assert_eq!(
-            point_expression("nir-red", &values, &names).unwrap_err(),
-            "Invalid band/asset name 'nir'"
-        );
+        assert_eq!(point_expression("nir-red", &values, &names).unwrap_err(), "Invalid band/asset name 'nir'");
 
         // On item routes the expression is applied to the `/stac` handler's answer.
         let body = json!({ "coordinates": [1.0, 2.0], "values": [1060.0, 2386.0],
                            "band_names": ["red_b1", "nir_b1"], "band_descriptions": ["red_b1", "nir_b1"] });
-        let fix = |query: &str| {
-            item_fixup(
-                &["point", "1,2"],
-                None,
-                query,
-                Bytes::from(body.to_string()),
-                "application/json",
-            )
-        };
+        let fix = |query: &str| item_fixup(&["point", "1,2"], None, query, Bytes::from(body.to_string()), "application/json");
         let (bytes, _) = fix("assets=red&assets=nir&expression=b2-b1").unwrap();
         let doc: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(doc["values"], json!([1326.0]));
         assert_eq!(doc["band_names"], json!(["b1"]));
         assert_eq!(doc["band_descriptions"], json!(["nir_b1-red_b1"]));
-        assert_eq!(
-            fix("assets=red&expression=nope").unwrap_err().status(),
-            StatusCode::BAD_REQUEST
-        );
+        assert_eq!(fix("assets=red&expression=nope").unwrap_err().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn statistics_grid_follows_gdal() {
         // A Sentinel-2 10 m raster: full resolution and four overviews.
-        let levels = [
-            (10980, 10980),
-            (5490, 5490),
-            (2745, 2745),
-            (1373, 1373),
-            (687, 687),
-        ];
+        let levels = [(10980, 10980), (5490, 5490), (2745, 2745), (1373, 1373), (687, 687)];
         // Read at its own size, or a little reduced: the full resolution.
         assert_eq!(gdal_overview_level(&levels, (541, 542), (541, 542)), 0);
         assert_eq!(gdal_overview_level(&levels, (541, 542), (512, 512)), 0);
@@ -8375,25 +6476,15 @@ mod tests {
         assert_eq!(gdal_overview_level(&levels[..1], (1000, 1000), (10, 10)), 0);
 
         // The box grows outwards to whole pixels of the grid.
-        let grid = Wgs84Grid {
-            west: 0.0,
-            north: 10.0,
-            res: 0.5,
-        };
+        let grid = Wgs84Grid { west: 0.0, north: 10.0, res: 0.5 };
         assert_eq!(grid.align([0.6, 8.1, 1.9, 9.4]), [0.5, 8.0, 2.0, 9.5]);
         assert_eq!(grid.align([0.5, 8.0, 2.0, 9.5]), [0.5, 8.0, 2.0, 9.5]);
 
         // Nearest-neighbour resize, both ways.
         let plane = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         assert_eq!(resize_nearest(plane.clone(), (4, 2), (2, 1)), [6.0, 8.0]);
-        assert_eq!(
-            resize_nearest(plane.clone(), (4, 2), (2, 2)),
-            [2.0, 4.0, 6.0, 8.0]
-        );
-        assert_eq!(
-            resize_nearest(vec![1.0, 2.0], (2, 1), (4, 1)),
-            [1.0, 1.0, 2.0, 2.0]
-        );
+        assert_eq!(resize_nearest(plane.clone(), (4, 2), (2, 2)), [2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(resize_nearest(vec![1.0, 2.0], (2, 1), (4, 1)), [1.0, 1.0, 2.0, 2.0]);
         assert_eq!(resize_nearest(plane.clone(), (4, 2), (4, 2)), plane);
     }
 
@@ -8401,11 +6492,7 @@ mod tests {
     fn scanlines_are_approximated_like_gdal() {
         // A straight row is its two ends joined, whatever lies between.
         let mut out = vec![(0.0, 0.0); 100];
-        approx_scanline(
-            &|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01),
-            &mut out,
-            0.125,
-        );
+        approx_scanline(&|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01), &mut out, 0.125);
         assert!((out[50].0 - 101.0).abs() < 1e-9 && (out[50].1 - 6.5).abs() < 1e-9);
 
         // A gently curved row is still one straight line: the middle is 0.1 off, under
@@ -8419,37 +6506,21 @@ mod tests {
         let curve = |i: usize| (i as f64, 40.0 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
         approx_scanline(&curve, &mut out, 0.125);
         for (i, got) in out.iter().enumerate() {
-            assert!(
-                (got.1 - curve(i).1).abs() <= 0.125,
-                "column {i}: {} vs {}",
-                got.1,
-                curve(i).1
-            );
+            assert!((got.1 - curve(i).1).abs() <= 0.125, "column {i}: {} vs {}", got.1, curve(i).1);
         }
         // Five points or fewer are worked out one by one, and so is a row that leaves
         // the projection.
         let mut short = vec![(0.0, 0.0); 5];
         approx_scanline(&curve, &mut short, 0.125);
         assert_eq!(short[2], curve(2));
-        let broken = |i: usize| {
-            if i < 30 {
-                (f64::NAN, f64::NAN)
-            } else {
-                (i as f64, 1.0)
-            }
-        };
+        let broken = |i: usize| if i < 30 { (f64::NAN, f64::NAN) } else { (i as f64, 1.0) };
         approx_scanline(&broken, &mut out, 0.125);
         assert!(out[10].0.is_nan());
         assert_eq!(out[60], (60.0, 1.0));
 
         // A picture's rows are held to a tolerance at which, with the positions near a
         // source pixel's edge worked out again, every pixel is the projection's own.
-        let wave = |i: usize| {
-            (
-                i as f64 * 0.37,
-                300.0 * ((i as f64) / 255.0).powi(2) + (i as f64 * 0.05).sin(),
-            )
-        };
+        let wave = |i: usize| (i as f64 * 0.37, 300.0 * ((i as f64) / 255.0).powi(2) + (i as f64 * 0.05).sin());
         let mut row = vec![(0.0, 0.0); 256];
         curved_scanline(&wave, &mut row, PICTURE_TOLERANCE);
         for (i, drawn) in row.iter().enumerate() {
@@ -8458,18 +6529,10 @@ mod tests {
             assert!(off <= 2.0 * PICTURE_TOLERANCE, "column {i} is {off} off");
             // So a drawn position names another pixel than the exact one only near an edge.
             if (drawn.0.floor(), drawn.1.floor()) != (exact.0.floor(), exact.1.floor()) {
-                assert!(
-                    near_pixel_edge(drawn.0) || near_pixel_edge(drawn.1),
-                    "column {i}"
-                );
+                assert!(near_pixel_edge(drawn.0) || near_pixel_edge(drawn.1), "column {i}");
             }
         }
-        assert!(
-            near_pixel_edge(7.001)
-                && near_pixel_edge(7.999)
-                && !near_pixel_edge(7.5)
-                && !near_pixel_edge(7.01)
-        );
+        assert!(near_pixel_edge(7.001) && near_pixel_edge(7.999) && !near_pixel_edge(7.5) && !near_pixel_edge(7.01));
 
         // A row that bends evenly is one curve: three positions and the two it is checked at.
         let asked = std::cell::Cell::new(0);
@@ -8481,13 +6544,7 @@ mod tests {
         assert_eq!(asked.get(), 5);
         assert!((row[100].1 - 50.0 * (100.0f64 / 255.0).powi(2)).abs() < 1e-9);
         // One that leaves the projection is worked out column by column.
-        let broken = |i: usize| {
-            if i < 30 {
-                (f64::NAN, f64::NAN)
-            } else {
-                (i as f64, 1.0)
-            }
-        };
+        let broken = |i: usize| if i < 30 { (f64::NAN, f64::NAN) } else { (i as f64, 1.0) };
         curved_scanline(&broken, &mut row, PICTURE_TOLERANCE);
         assert!(row[10].0.is_nan());
         assert_eq!(row[60], (60.0, 1.0));
@@ -8513,48 +6570,21 @@ mod tests {
 
         let mut systems: Vec<(String, CrsModel, (f64, f64))> = Vec::new();
         for (code, home) in [
-            (3857u16, (10.0, 45.0)),
-            (3395, (10.0, 45.0)),
-            (4326, (10.0, 45.0)),
-            (32601, (-177.0, 10.0)),
-            (32631, (3.0, 50.0)),
-            (32660, (177.0, 70.0)),
-            (32733, (15.0, -30.0)),
-            (32760, (177.0, -79.0)),
-            (3031, (0.0, -80.0)),
-            (3413, (-45.0, 75.0)),
-            (3995, (0.0, 85.0)),
-            (3035, (10.0, 52.0)),
-            (3575, (10.0, 80.0)),
-            (5070, (-96.0, 37.0)),
-            (3338, (-154.0, 60.0)),
-            (2154, (3.0, 46.5)),
-            (3978, (-95.0, 60.0)),
-            (2193, (173.0, -41.0)),
-            (3006, (15.0, 62.0)),
+            (3857u16, (10.0, 45.0)), (3395, (10.0, 45.0)), (4326, (10.0, 45.0)),
+            (32601, (-177.0, 10.0)), (32631, (3.0, 50.0)), (32660, (177.0, 70.0)), (32733, (15.0, -30.0)), (32760, (177.0, -79.0)),
+            (3031, (0.0, -80.0)), (3413, (-45.0, 75.0)), (3995, (0.0, 85.0)), (3035, (10.0, 52.0)), (3575, (10.0, 80.0)),
+            (5070, (-96.0, 37.0)), (3338, (-154.0, 60.0)), (2154, (3.0, 46.5)), (3978, (-95.0, 60.0)), (2193, (173.0, -41.0)), (3006, (15.0, 62.0)),
         ] {
             match CrsModel::from_epsg(code) {
                 Ok(crs) => systems.push((format!("EPSG:{code}"), crs, home)),
                 Err(e) => panic!("EPSG:{code}: {e:?}"),
             }
         }
-        systems.push((
-            "sinusoidal".into(),
-            CrsModel::Sinusoidal(Sinusoidal::new(
-                Ellipsoid::sphere(6_371_007.181),
-                0.0,
-                0.0,
-                0.0,
-            )),
-            (20.0, 40.0),
-        ));
+        systems.push(("sinusoidal".into(), CrsModel::Sinusoidal(Sinusoidal::new(Ellipsoid::sphere(6_371_007.181), 0.0, 0.0, 0.0)), (20.0, 40.0)));
 
         let world = cogzilla_proj::ORIGIN_SHIFT;
         // `HOSTILE_CASES` runs more of them: twenty thousand is half a billion pixels.
-        let cases: usize = std::env::var("HOSTILE_CASES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let cases: usize = std::env::var("HOSTILE_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
         let (mut pixels, mut worst_off) = (0u64, 0f64);
         for case in 0..cases {
             let (name, crs, natural) = &systems[pick(systems.len())];
@@ -8587,86 +6617,34 @@ mod tests {
                 ([a, b, c, d], format!("tile z{z} {what}"))
             } else {
                 match view {
-                    0 | 1 => (
-                        [home.0 - 0.5, home.1 - 0.5, home.0 + 0.5, home.1 + 0.5],
-                        "box at home".into(),
-                    ),
-                    2 => (
-                        [
-                            home.0 - 0.001,
-                            home.1 - 0.001,
-                            home.0 + 0.001,
-                            home.1 + 0.001,
-                        ],
-                        "tiny box".into(),
-                    ),
+                    0 | 1 => ([home.0 - 0.5, home.1 - 0.5, home.0 + 0.5, home.1 + 0.5], "box at home".into()),
+                    2 => ([home.0 - 0.001, home.1 - 0.001, home.0 + 0.001, home.1 + 0.001], "tiny box".into()),
                     3 => ([-180.0, -90.0, 180.0, 90.0], "whole world".into()),
                     4 => ([-200.0, -95.0, 200.0, 95.0], "past the world".into()),
-                    5 => (
-                        [170.0, home.1 - 10.0, 190.0, home.1 + 10.0],
-                        "over the antimeridian".into(),
-                    ),
-                    _ => (
-                        [
-                            -180.0,
-                            80.0f64.copysign(home.1).min(90.0f64.copysign(home.1)),
-                            180.0,
-                            80.0f64.copysign(home.1).max(90.0f64.copysign(home.1)),
-                        ],
-                        "polar cap".into(),
-                    ),
+                    5 => ([170.0, home.1 - 10.0, 190.0, home.1 + 10.0], "over the antimeridian".into()),
+                    _ => ([-180.0, 80.0f64.copysign(home.1).min(90.0f64.copysign(home.1)), 180.0, 80.0f64.copysign(home.1).max(90.0f64.copysign(home.1))], "polar cap".into()),
                 }
             };
-            let (grid_w, grid_h) = [
-                (256, 256),
-                (512, 512),
-                (1024, 1024),
-                (4096, 64),
-                (37, 1000),
-                (10, 10),
-                (2048, 2048),
-                (1531, 311),
-            ][pick(8)];
+            let (grid_w, grid_h) = [(256, 256), (512, 512), (1024, 1024), (4096, 64), (37, 1000), (10, 10), (2048, 2048), (1531, 311)][pick(8)];
             let block = [grid_w, 512.min(grid_w), 100.min(grid_w)][pick(3)];
-            let (dx, dy) = (
-                (bounds[2] - bounds[0]) / grid_w as f64,
-                (bounds[3] - bounds[1]) / grid_h as f64,
-            );
+            let (dx, dy) = ((bounds[2] - bounds[0]) / grid_w as f64, (bounds[3] - bounds[1]) / grid_h as f64);
             let project = |across: f64, up: f64| {
                 if mercator && matches!(crs, CrsModel::Epsg3857) {
                     return (across, up);
                 }
-                let (lon, lat) = if mercator {
-                    mercator_to_lonlat_deg(across, up)
-                } else {
-                    (across, up)
-                };
+                let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, up) } else { (across, up) };
                 crs.from_lonlat_deg(lon, lat)
             };
             // The raster: its pixels a chosen number of times the picture's, turned, and
             // either endless or small enough that its edges cross the picture.
             let centre = {
-                let h = if mercator && !matches!(crs, CrsModel::Epsg3857) {
-                    crs.from_lonlat_deg(home.0, home.1)
-                } else if mercator {
-                    lonlat_deg_to_mercator(home.0, home.1)
-                } else {
-                    crs.from_lonlat_deg(home.0, home.1)
-                };
-                if h.0.is_finite() && h.1.is_finite() {
-                    h
-                } else {
-                    (0.0, 0.0)
-                }
+                let h = if mercator && !matches!(crs, CrsModel::Epsg3857) { crs.from_lonlat_deg(home.0, home.1) } else if mercator { lonlat_deg_to_mercator(home.0, home.1) } else { crs.from_lonlat_deg(home.0, home.1) };
+                if h.0.is_finite() && h.1.is_finite() { h } else { (0.0, 0.0) }
             };
             let (mid_x, mid_y) = ((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
             let (p, q) = (project(mid_x, mid_y), project(mid_x + dx, mid_y));
             let step = (q.0 - p.0).hypot(q.1 - p.1);
-            let step = if step.is_finite() && step > 0.0 {
-                step
-            } else {
-                10.0
-            };
+            let step = if step.is_finite() && step > 0.0 { step } else { 10.0 };
             let ratio = [0.05, 0.7, 1.0, 1.7, 30.0][pick(5)];
             let res = step * ratio;
             let turn = [0.0f64, 0.0, 30.0, 90.0, -137.0][pick(5)].to_radians();
@@ -8674,23 +6652,10 @@ mod tests {
             let half = f64::from(side) / 2.0;
             let (cos, sin) = (turn.cos() * res, turn.sin() * res);
             // pixel -> crs: turned, north up when not turned, the home at the middle.
-            let to_crs = Affine2D {
-                a: cos,
-                b: sin,
-                c: centre.0 - cos * half - sin * half,
-                d: sin,
-                e: -cos,
-                f: centre.1 - sin * half + cos * half,
-            };
-            let Some(to_pixel) = to_crs.invert() else {
-                continue;
-            };
+            let to_crs = Affine2D { a: cos, b: sin, c: centre.0 - cos * half - sin * half, d: sin, e: -cos, f: centre.1 - sin * half + cos * half };
+            let Some(to_pixel) = to_crs.invert() else { continue };
 
-            let rows: Vec<usize> = if grid_h <= 24 {
-                (0..grid_h).collect()
-            } else {
-                (0..24).map(|k| k * (grid_h - 1) / 23).collect()
-            };
+            let rows: Vec<usize> = if grid_h <= 24 { (0..grid_h).collect() } else { (0..24).map(|k| k * (grid_h - 1) / 23).collect() };
             let mut row_positions = vec![(0f64, 0f64); grid_w];
             for &j in &rows {
                 let up = bounds[3] - (j as f64 + 0.5) * dy;
@@ -8704,8 +6669,7 @@ mod tests {
                     let got = source_cell(drawn, (side, side), true, || exact(i));
                     let want = source_cell(real, (side, side), true, || real);
                     assert_eq!(
-                        got,
-                        want,
+                        got, want,
                         "case {case}: {name} raster at {home:?}, {view_name}, {grid_w}x{grid_h} in stretches of {block}, \
                          pixels {ratio} times the picture's, turned {:.0}, {side} a side: row {j} column {i} drawn {drawn:?}, exactly {real:?}",
                         turn.to_degrees()
@@ -8713,26 +6677,15 @@ mod tests {
                     pixels += 1;
                     // How far a drawn position strays matters where it could name a pixel.
                     let reach = f64::from(side) + 2.0;
-                    if drawn.0.is_finite()
-                        && drawn.1.is_finite()
-                        && real.0 > -2.0
-                        && real.1 > -2.0
-                        && real.0 < reach
-                        && real.1 < reach
-                    {
-                        worst_off =
-                            worst_off.max((drawn.0 - real.0).abs().max((drawn.1 - real.1).abs()));
+                    if drawn.0.is_finite() && drawn.1.is_finite() && real.0 > -2.0 && real.1 > -2.0 && real.0 < reach && real.1 < reach {
+                        worst_off = worst_off.max((drawn.0 - real.0).abs().max((drawn.1 - real.1).abs()));
                     }
                 }
             }
         }
         assert!(pixels > 1_000_000, "{pixels} pixels");
         // The check at a source pixel's edge allows for twice the tolerance.
-        assert!(
-            worst_off <= 2.0 * PICTURE_TOLERANCE,
-            "a position was drawn {} tolerances out",
-            worst_off / PICTURE_TOLERANCE
-        );
+        assert!(worst_off <= 2.0 * PICTURE_TOLERANCE, "a position was drawn {} tolerances out", worst_off / PICTURE_TOLERANCE);
     }
 
     /// What a row may do that no map projection does smoothly: jump (a wrapped longitude),
@@ -8749,9 +6702,7 @@ mod tests {
             // A jump of every size around the tolerance, after every column, on a row that
             // is otherwise straight, bowed, or bent so as to hide the jump from the check.
             for at in 0..points - 1 {
-                for &jump in &[
-                    0.2, 0.5, 0.9, 1.0, 1.5, 2.0, 2.6, 3.0, 5.0, 7.9, 12.0, 100.0,
-                ] {
+                for &jump in &[0.2, 0.5, 0.9, 1.0, 1.5, 2.0, 2.6, 3.0, 5.0, 7.9, 12.0, 100.0] {
                     for &bend in &[0.0, 1.0, -2.0 / 3.0, 2.0 / 3.0, -2.0, 6.0] {
                         let jump = jump * PICTURE_TOLERANCE;
                         let real = |i: usize| {
@@ -8759,28 +6710,19 @@ mod tests {
                             // A cubic through the three fitted columns, sized against the jump.
                             let hidden = bend * jump * 8.0 * x * (x - 0.5) * (x - 1.0);
                             let step = if i > at { jump } else { 0.0 };
-                            (
-                                i as f64 * 0.83 + 0.4 * x * x + step + hidden,
-                                100.0 + 3.0 * x - step,
-                            )
+                            (i as f64 * 0.83 + 0.4 * x * x + step + hidden, 100.0 + 3.0 * x - step)
                         };
                         curved_scanline(&real, &mut row, PICTURE_TOLERANCE);
                         for (i, drawn) in row.iter().enumerate() {
                             let want = real(i);
-                            worst_jump = worst_jump
-                                .max((drawn.0 - want.0).abs().max((drawn.1 - want.1).abs()));
+                            worst_jump = worst_jump.max((drawn.0 - want.0).abs().max((drawn.1 - want.1).abs()));
                         }
                     }
                 }
                 // A corner at every column.
                 for &turn in &[0.5, 1.0, 3.0, 10.0, 40.0, 1000.0] {
                     let turn = turn * PICTURE_TOLERANCE / n;
-                    let real = |i: usize| {
-                        (
-                            i as f64 * 1.3,
-                            7.0 + turn * (i as f64 - at as f64 - 0.5).abs() * 4.0,
-                        )
-                    };
+                    let real = |i: usize| (i as f64 * 1.3, 7.0 + turn * (i as f64 - at as f64 - 0.5).abs() * 4.0);
                     curved_scanline(&real, &mut row, PICTURE_TOLERANCE);
                     for (i, drawn) in row.iter().enumerate() {
                         worst_kink = worst_kink.max((drawn.1 - real(i).1).abs());
@@ -8789,28 +6731,14 @@ mod tests {
                 // A stretch of columns outside the projection, long enough that it cannot
                 // lie between two of the columns a curve is fitted and checked at, in one
                 // coordinate or both: nothing may be drawn across it.
-                for hole in [
-                    (f64::NAN, 1.0),
-                    (1.0, f64::NAN),
-                    (f64::INFINITY, 1.0),
-                    (f64::NAN, f64::NAN),
-                ] {
+                for hole in [(f64::NAN, 1.0), (1.0, f64::NAN), (f64::INFINITY, 1.0), (f64::NAN, f64::NAN)] {
                     let end = (at + points / 4 + 2).min(points);
-                    let real = |i: usize| {
-                        if (at..end).contains(&i) {
-                            hole
-                        } else {
-                            (i as f64 * 0.5, 9.0)
-                        }
-                    };
+                    let real = |i: usize| if (at..end).contains(&i) { hole } else { (i as f64 * 0.5, 9.0) };
                     curved_scanline(&real, &mut row, PICTURE_TOLERANCE);
                     let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
                     for (i, drawn) in row.iter().enumerate() {
                         let want = real(i);
-                        assert!(
-                            same(drawn.0, want.0) && same(drawn.1, want.1),
-                            "{points} points, hole {hole:?} from {at}: column {i} drew {drawn:?}"
-                        );
+                        assert!(same(drawn.0, want.0) && same(drawn.1, want.1), "{points} points, hole {hole:?} from {at}: column {i} drew {drawn:?}");
                     }
                 }
             }
@@ -8829,59 +6757,30 @@ mod tests {
         let tile = ["tiles", "WebMercatorQuad", "11", "1059", "746.png"];
         // Band math on an asset, and bands chosen on more than one.
         assert!(by_asset(&tile, "assets=red%7Cexpression=b1*2"));
-        assert!(by_asset(
-            &tile,
-            "assets=visual%7Cbidx=1&assets=red%7Cbidx=1"
-        ));
+        assert!(by_asset(&tile, "assets=visual%7Cbidx=1&assets=red%7Cbidx=1"));
         assert!(by_asset(&tile, "assets=visual%7Cbidx=3,1&assets=red"));
-        assert!(by_asset(
-            &["bbox", "6,43,7,44.png"],
-            "assets=red%7Cexpression=b1*2"
-        ));
-        assert!(by_asset(
-            &["bbox", "6,43,7,44", "256x256.png"],
-            "assets=red%7Cexpression=b1*2"
-        ));
+        assert!(by_asset(&["bbox", "6,43,7,44.png"], "assets=red%7Cexpression=b1*2"));
+        assert!(by_asset(&["bbox", "6,43,7,44", "256x256.png"], "assets=red%7Cexpression=b1*2"));
         // What `/stac` draws stays there: plain assets, and bands of a single one.
         assert!(!by_asset(&tile, "assets=visual"));
         assert!(!by_asset(&tile, "assets=red&assets=green&expression=b1/b2"));
         assert!(!by_asset(&tile, "assets=visual%7Cbidx=1"));
         // So does every other route, and a tile in another tile matrix set.
-        for rest in [
-            &["preview.png"][..],
-            &["info"],
-            &["statistics"],
-            &["point", "6,43"],
-            &["bbox", "6,43,7,44", "assets"],
-        ] {
+        for rest in [&["preview.png"][..], &["info"], &["statistics"], &["point", "6,43"], &["bbox", "6,43,7,44", "assets"]] {
             assert!(!by_asset(rest, "assets=red%7Cexpression=b1*2"), "{rest:?}");
         }
-        assert!(!by_asset(
-            &["tiles", "WGS1984Quad", "11", "1059", "746.png"],
-            "assets=red%7Cexpression=b1*2"
-        ));
+        assert!(!by_asset(&["tiles", "WGS1984Quad", "11", "1059", "746.png"], "assets=red%7Cexpression=b1*2"));
         // Options that cannot be read are answered for by the route they were sent to.
         assert!(!by_asset(&tile, "assets=red%7Cbidx=x&assets=green"));
         // A box without a format in its path is not one of an item's routes.
-        assert!(!by_asset(
-            &["bbox", "6,43,7,44"],
-            "assets=red%7Cexpression=b1*2"
-        ));
-        assert!(!by_asset(
-            &["bbox", "6,43,7,44", "64x64"],
-            "assets=red%7Cexpression=b1*2"
-        ));
+        assert!(!by_asset(&["bbox", "6,43,7,44"], "assets=red%7Cexpression=b1*2"));
+        assert!(!by_asset(&["bbox", "6,43,7,44", "64x64"], "assets=red%7Cexpression=b1*2"));
         // What only a search reads is not shown to the search routes.
         assert_eq!(
-            without_search_options(
-                "assets=red%7Cexpression=b1*2&pixel_selection=count&items_limit=many&rescale=0,9&scan_limit=-1&algorithm_params={}"
-            ),
+            without_search_options("assets=red%7Cexpression=b1*2&pixel_selection=count&items_limit=many&rescale=0,9&scan_limit=-1&algorithm_params={}"),
             "assets=red%7Cexpression=b1*2&rescale=0,9"
         );
-        assert_eq!(
-            without_search_options("algorithm=hillshade&algorithm_params={}"),
-            "algorithm=hillshade&algorithm_params={}"
-        );
+        assert_eq!(without_search_options("algorithm=hillshade&algorithm_params={}"), "algorithm=hillshade&algorithm_params={}");
     }
 
     #[test]
@@ -8889,34 +6788,13 @@ mod tests {
         // Bare RGBA pixels under the GeoTIFF content type become a TIFF; anything else,
         // and a body that is not the pixels it should be, is left alone.
         let pixels = Bytes::from(vec![7u8; 4 * 3 * 4]);
-        let (tiff, kind) = as_geotiff(
-            (pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE),
-            4,
-            3,
-            [8.0, 45.0, 9.0, 46.0],
-            4326,
-            true,
-        );
+        let (tiff, kind) = as_geotiff((pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE), 4, 3, [8.0, 45.0, 9.0, 46.0], 4326, true);
         assert_eq!(kind, super::super::GEOTIFF_CONTENT_TYPE);
         assert_eq!(&tiff[..4], b"II*\0");
         assert!(tiff.len() > pixels.len());
-        let (png, _) = as_geotiff(
-            (pixels.clone(), "image/png"),
-            4,
-            3,
-            [8.0, 45.0, 9.0, 46.0],
-            4326,
-            true,
-        );
+        let (png, _) = as_geotiff((pixels.clone(), "image/png"), 4, 3, [8.0, 45.0, 9.0, 46.0], 4326, true);
         assert_eq!(png, pixels);
-        let (short, _) = as_geotiff(
-            (pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE),
-            4,
-            4,
-            [8.0, 45.0, 9.0, 46.0],
-            4326,
-            true,
-        );
+        let (short, _) = as_geotiff((pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE), 4, 4, [8.0, 45.0, 9.0, 46.0], 4326, true);
         assert_eq!(short, pixels);
     }
 
@@ -8928,38 +6806,20 @@ mod tests {
             indexes,
             expression: expression.map(str::to_string),
         };
-        assert_eq!(
-            parse("assets=red&assets=nir").unwrap(),
-            [spec("red", None, None), spec("nir", None, None)]
-        );
+        assert_eq!(parse("assets=red&assets=nir").unwrap(), [spec("red", None, None), spec("nir", None, None)]);
         // Options keep their commas; a plain entry may still list names with them.
         assert_eq!(
             parse("assets=visual%7Cbidx%3D3,2,1&assets=red,nir").unwrap(),
-            [
-                spec("visual", Some(vec![3, 2, 1]), None),
-                spec("red", None, None),
-                spec("nir", None, None)
-            ]
+            [spec("visual", Some(vec![3, 2, 1]), None), spec("red", None, None), spec("nir", None, None)]
         );
         assert_eq!(
             parse("assets=red%7Cexpression%3Db1*2%7Cnope%3D1%7Cbands%3Dx").unwrap(),
             [spec("red", None, Some("b1*2"))]
         );
-        for bad in [
-            "assets=visual%7Cbidx",
-            "assets=visual%7Cbidx%3Dx",
-            "assets=visual%7Cbidx%3D1,",
-        ] {
-            assert_eq!(
-                parse(bad).unwrap_err().status(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "{bad}"
-            );
+        for bad in ["assets=visual%7Cbidx", "assets=visual%7Cbidx%3Dx", "assets=visual%7Cbidx%3D1,"] {
+            assert_eq!(parse(bad).unwrap_err().status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
         }
-        assert_eq!(
-            parse("assets=%7Cbidx%3D1").unwrap_err().status(),
-            StatusCode::BAD_REQUEST
-        );
+        assert_eq!(parse("assets=%7Cbidx%3D1").unwrap_err().status(), StatusCode::BAD_REQUEST);
 
         // What an asset gives, and how it is described.
         let pixel = |spec: &AssetSpec, as_band: bool| {
@@ -8969,46 +6829,15 @@ mod tests {
             Ok::<_, String>((out, described))
         };
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            pixel(&spec("visual", None, None), false).unwrap(),
-            (
-                vec![109.0, 79.0, 46.0],
-                names(&["visual_b1", "visual_b2", "visual_b3"])
-            )
-        );
-        assert_eq!(
-            pixel(&spec("visual", Some(vec![3, 1]), None), false).unwrap(),
-            (vec![46.0, 109.0], names(&["visual_b3", "visual_b1"]))
-        );
-        assert_eq!(
-            pixel(&spec("visual", None, Some("b1+b2;b3")), false).unwrap(),
-            (vec![188.0, 46.0], names(&["visual_b1+b2", "visual_b3"]))
-        );
+        assert_eq!(pixel(&spec("visual", None, None), false).unwrap(), (vec![109.0, 79.0, 46.0], names(&["visual_b1", "visual_b2", "visual_b3"])));
+        assert_eq!(pixel(&spec("visual", Some(vec![3, 1]), None), false).unwrap(), (vec![46.0, 109.0], names(&["visual_b3", "visual_b1"])));
+        assert_eq!(pixel(&spec("visual", None, Some("b1+b2;b3")), false).unwrap(), (vec![188.0, 46.0], names(&["visual_b1+b2", "visual_b3"])));
         // Band math wins over band indexes, and sees the asset's own bands.
-        assert_eq!(
-            pixel(&spec("visual", Some(vec![3]), Some("b1*2")), false)
-                .unwrap()
-                .0,
-            [218.0]
-        );
-        assert_eq!(
-            pixel(&spec("visual", Some(vec![2]), None), true).unwrap(),
-            (vec![79.0], names(&["visual"]))
-        );
-        assert_eq!(
-            pixel(&spec("visual", None, None), true).unwrap_err(),
-            "Can't use `asset_as_band` for multibands asset"
-        );
-        assert_eq!(
-            pixel(&spec("visual", Some(vec![9]), None), false).unwrap_err(),
-            "band index 9 out of range (not in (1, 2, 3))"
-        );
-        assert_eq!(
-            asset_bands(&spec("red", Some(vec![0]), None), 1, false)
-                .err()
-                .unwrap(),
-            "band index 0 out of range (not in (1,))"
-        );
+        assert_eq!(pixel(&spec("visual", Some(vec![3]), Some("b1*2")), false).unwrap().0, [218.0]);
+        assert_eq!(pixel(&spec("visual", Some(vec![2]), None), true).unwrap(), (vec![79.0], names(&["visual"])));
+        assert_eq!(pixel(&spec("visual", None, None), true).unwrap_err(), "Can't use `asset_as_band` for multibands asset");
+        assert_eq!(pixel(&spec("visual", Some(vec![9]), None), false).unwrap_err(), "band index 9 out of range (not in (1, 2, 3))");
+        assert_eq!(asset_bands(&spec("red", Some(vec![0]), None), 1, false).err().unwrap(), "band index 0 out of range (not in (1,))");
         // Whole planes go the same way.
         let (plan, _) = asset_bands(&spec("v", None, Some("b2/b1")), 2, false).unwrap();
         let planes = plan.planes(&[vec![2.0, 0.0], vec![1.0, 1.0]]);
@@ -9026,34 +6855,17 @@ mod tests {
             Ok::<_, StatusCode>((names, pq.bidx, pq.expr_raw, query.asset_as_band))
         };
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            run("assets=visual").unwrap(),
-            (names(&["visual"]), vec![], None, false)
-        );
+        assert_eq!(run("assets=visual").unwrap(), (names(&["visual"]), vec![], None, false));
         // A bare `bidx` is passed over, as in TiTiler 2; an asset's own is used.
         assert_eq!(run("assets=visual&bidx=2").unwrap().1, Vec::<u16>::new());
-        assert_eq!(
-            run("assets=visual%7Cbidx%3D3,2,1").unwrap(),
-            (names(&["visual"]), vec![3, 2, 1], None, false)
-        );
-        assert_eq!(
-            run("assets=red%7Cexpression%3Db1*2").unwrap().2.as_deref(),
-            Some("b1*2")
-        );
+        assert_eq!(run("assets=visual%7Cbidx%3D3,2,1").unwrap(), (names(&["visual"]), vec![3, 2, 1], None, false));
+        assert_eq!(run("assets=red%7Cexpression%3Db1*2").unwrap().2.as_deref(), Some("b1*2"));
         assert_eq!(
             run("assets=red%7Cbidx%3D1&assets=nir&asset_as_band=true&expression=b2-b1").unwrap(),
-            (
-                names(&["red", "nir"]),
-                vec![],
-                Some("b2-b1".to_string()),
-                true
-            )
+            (names(&["red", "nir"]), vec![], Some("b2-b1".to_string()), true)
         );
         // Band math is over b1..bn; asset names are refused as TiTiler refuses them.
-        assert_eq!(
-            run("assets=red&assets=nir&expression=nir-red").unwrap_err(),
-            StatusCode::BAD_REQUEST
-        );
+        assert_eq!(run("assets=red&assets=nir&expression=nir-red").unwrap_err(), StatusCode::BAD_REQUEST);
         // What the renderer cannot draw is refused, not drawn differently. On tiles all of
         // it is made from planes instead, and nothing else is.
         let planes = |q: &str| {
@@ -9089,31 +6901,17 @@ mod tests {
             assert_eq!(run(q).unwrap_err(), StatusCode::BAD_REQUEST, "{q}");
             assert!(planes(q), "{q}");
         }
-        assert_eq!(
-            run("assets=red&asset_as_band=perhaps").unwrap_err(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(run("assets=red&asset_as_band=perhaps").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
         // An `assets` that names nothing is a missing parameter.
-        assert_eq!(
-            run("assets=,").unwrap_err(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(run("assets=,").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
     fn statistics_options_are_titilers() {
         let pairs = |q: &str| query_pairs(q);
         let (opts, cover) = stats_options(&pairs("assets=red")).unwrap();
-        assert_eq!(
-            (
-                opts.categorical,
-                opts.percentiles.clone(),
-                opts.bins.clone(),
-                opts.range,
-                cover
-            ),
-            (false, vec![2, 98], Bins::Count(10), None, 10)
-        );
+        assert_eq!((opts.categorical, opts.percentiles.clone(), opts.bins.clone(), opts.range, cover),
+                   (false, vec![2, 98], Bins::Count(10), None, 10));
         let (opts, cover) = stats_options(&pairs(
             "categorical=true&c=1&c=2.5&p=5&p=95&histogram_bins=4&histogram_range=0,2000.5&cover_scale=4",
         ))
@@ -9127,16 +6925,8 @@ mod tests {
         let (opts, _) = stats_options(&pairs("histogram_bins=0,100,255")).unwrap();
         assert_eq!(opts.bins, Bins::Edges(vec![0.0, 100.0, 255.0]));
         for bad in [
-            "categorical=maybe",
-            "c=x",
-            "p=101",
-            "p=1.5",
-            "histogram_bins=ten",
-            "histogram_bins=0",
-            "histogram_bins=3,2,1",
-            "histogram_range=5",
-            "histogram_range=9,1",
-            "cover_scale=0",
+            "categorical=maybe", "c=x", "p=101", "p=1.5", "histogram_bins=ten", "histogram_bins=0",
+            "histogram_bins=3,2,1", "histogram_range=5", "histogram_range=9,1", "cover_scale=0",
             "cover_scale=1001",
         ] {
             let resp = stats_options(&pairs(bad)).unwrap_err();
@@ -9177,22 +6967,13 @@ mod tests {
         assert!(parse_zxy("3", "7", 7).unwrap().is_some());
         assert!(parse_zxy("3", "8", 0).unwrap().is_none());
         assert!(parse_zxy("31", "0", 0).unwrap().is_none());
-        assert_eq!(
-            parse_zxy("x", "0", 0).unwrap_err().status(),
-            StatusCode::BAD_REQUEST
-        );
+        assert_eq!(parse_zxy("x", "0", 0).unwrap_err().status(), StatusCode::BAD_REQUEST);
     }
     #[test]
     fn bounds_are_written_as_python_writes_floats() {
         for (given, written) in [
-            (6.0, "6.0"),
-            (43.580390855607845, "43.580390855607845"),
-            (-0.0, "0.0"),
-            (0.00001, "1e-05"),
-            (-0.00001234, "-1.234e-05"),
-            (0.0001, "0.0001"),
-            (1e16, "1e+16"),
-            (1234567890123456.0, "1234567890123456.0"),
+            (6.0, "6.0"), (43.580390855607845, "43.580390855607845"), (-0.0, "0.0"), (0.00001, "1e-05"),
+            (-0.00001234, "-1.234e-05"), (0.0001, "0.0001"), (1e16, "1e+16"), (1234567890123456.0, "1234567890123456.0"),
             (-20037508.342789244, "-20037508.342789244"),
         ] {
             assert_eq!(python_float(given), written);
@@ -9202,11 +6983,7 @@ mod tests {
     #[test]
     fn a_nodata_the_samples_cannot_hold_is_refused() {
         use cogzilla_tiff::SampleType as T;
-        assert!(
-            nodata_fits(1000.0, T::Uint16)
-                && nodata_fits(1000.5, T::Uint16)
-                && nodata_fits(-1.0, T::Int16)
-        );
+        assert!(nodata_fits(1000.0, T::Uint16) && nodata_fits(1000.5, T::Uint16) && nodata_fits(-1.0, T::Int16));
         for bad in [f32::NAN, f32::INFINITY, -1.0, 70000.0] {
             assert!(!nodata_fits(bad, T::Uint16));
         }
@@ -9215,63 +6992,27 @@ mod tests {
 
     #[test]
     fn item_pictures_say_where_they_lie() {
-        let ok = || {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::new()))
-                .unwrap()
-        };
+        let ok = || Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap();
         let said = |sub: &[&str], query: &str| {
             let resp = item_placed(ok(), sub, query);
-            let header = |name: &str| {
-                resp.headers()
-                    .get(name)
-                    .map(|v| v.to_str().unwrap().to_string())
-            };
+            let header = |name: &str| resp.headers().get(name).map(|v| v.to_str().unwrap().to_string());
             header("content-bbox").zip(header("content-crs"))
         };
         let crs = |epsg: u16| format!("<http://www.opengis.net/def/crs/EPSG/0/{epsg}>");
-        let (bbox, system) = said(
-            &["tiles", "WebMercatorQuad", "0", "0", "0.png"],
-            "assets=visual",
-        )
-        .unwrap();
+        let (bbox, system) = said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "assets=visual").unwrap();
         assert_eq!(system, crs(3857));
         assert!(bbox.starts_with("-20037508.34278") && bbox.split(',').count() == 4);
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "assets=visual").unwrap(), ("6.3,43.6,6.5,43.8".into(), crs(4326)));
         assert_eq!(
-            said(&["bbox", "6.3,43.6,6.5,43.8.png"], "assets=visual").unwrap(),
-            ("6.3,43.6,6.5,43.8".into(), crs(4326))
-        );
-        assert_eq!(
-            said(
-                &["bbox", "701000,5404000,720000,5420000", "64x64.png"],
-                "coord_crs=epsg:3857"
-            )
-            .unwrap(),
+            said(&["bbox", "701000,5404000,720000,5420000", "64x64.png"], "coord_crs=epsg:3857").unwrap(),
             ("701000.0,5404000.0,720000.0,5420000.0".into(), crs(3857))
         );
-        assert_eq!(
-            said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=EPSG%3A3857")
-                .unwrap()
-                .1,
-            crs(3857)
-        );
-        assert_eq!(
-            said(
-                &["bbox", "701000,5404000,720000,5420000.png"],
-                "coord_crs=epsg:3857&dst_crs=epsg:4326"
-            )
-            .unwrap()
-            .1,
-            crs(4326)
-        );
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=EPSG%3A3857").unwrap().1, crs(3857));
+        assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
         // Systems not placed here, tiles that are not tiles, and other routes go without.
         for (sub, query) in [
             (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:32631"),
-            (
-                &["bbox", "6.3,43.6,6.5,43.8.png"][..],
-                "coord_crs=epsg:32631",
-            ),
+            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "coord_crs=epsg:32631"),
             (&["tiles", "WebMercatorQuad", "1", "2", "0.png"][..], ""),
             (&["tiles", "WGS1984Quad", "0", "0", "0.png"][..], ""),
             (&["preview.png"][..], ""),
@@ -9280,56 +7021,16 @@ mod tests {
             assert_eq!(said(sub, query), None, "{sub:?} {query}");
         }
         // A key the handlers do not read as that parameter is not read as it here either.
-        assert_eq!(
-            said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857")
-                .unwrap()
-                .1,
-            crs(4326)
-        );
-        assert_eq!(
-            said(
-                &["bbox", "6.3,43.6,6.5,43.8.png"],
-                "dst_crs=epsg:3857&dst_crs=epsg:4326"
-            )
-            .unwrap()
-            .1,
-            crs(4326)
-        );
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857").unwrap().1, crs(4326));
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
         // Degrees asked for as CRS84 are named so; a buffered tile is not placed.
         let ogc = "<http://www.opengis.net/def/crs/OGC/0/CRS84>";
-        assert_eq!(
-            said(&["bbox", "6.3,43.6,6.5,43.8.png"], "coord_crs=OGC:CRS84")
-                .unwrap()
-                .1,
-            ogc
-        );
-        assert_eq!(
-            said(
-                &["bbox", "701000,5404000,720000,5420000.png"],
-                "coord_crs=epsg:3857&dst_crs=OGC%3ACRS84"
-            )
-            .unwrap()
-            .1,
-            ogc
-        );
-        assert_eq!(
-            said(
-                &["tiles", "WebMercatorQuad", "0", "0", "0.png"],
-                "buffer=10"
-            ),
-            None
-        );
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "coord_crs=OGC:CRS84").unwrap().1, ogc);
+        assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=OGC%3ACRS84").unwrap().1, ogc);
+        assert_eq!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=10"), None);
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
-        let missing = Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        assert!(
-            item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "")
-                .headers()
-                .get("content-bbox")
-                .is_none()
-        );
+        let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
+        assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
     }
 
     #[test]
@@ -9340,24 +7041,15 @@ mod tests {
         let header = usize::from(u16::from_le_bytes([made[8], made[9]]));
         assert_eq!((10 + header) % 64, 0);
         let dict = std::str::from_utf8(&made[10..10 + header]).unwrap();
-        assert!(
-            dict.starts_with("{'descr': '<u2', 'fortran_order': False, 'shape': (3, 1, 2), }")
-                && dict.ends_with('\n')
-        );
-        let words: Vec<u16> = made[10 + header..]
-            .chunks_exact(2)
-            .map(|w| u16::from_le_bytes([w[0], w[1]]))
-            .collect();
+        assert!(dict.starts_with("{'descr': '<u2', 'fortran_order': False, 'shape': (3, 1, 2), }") && dict.ends_with('\n'));
+        let words: Vec<u16> = made[10 + header..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
         // Two bands, then the mask: a pixel is there when any band of it is.
         assert_eq!(words, [1, 0, 300, 4, u16::MAX, u16::MAX]);
         // Without the mask, and a missing value as the number the request named.
         let bare = npy_array(&values, 2, 2, 1, SampleType::Uint8, false, Some(9.0));
         assert_eq!(&bare[bare.len() - 4..], [1, 9, 255, 4]);
         let doubles = npy_array(&[f32::NAN, 0.5], 1, 2, 1, SampleType::Float64, true, None);
-        assert_eq!(
-            &doubles[doubles.len() - 16..doubles.len() - 8],
-            0f64.to_le_bytes()
-        );
+        assert_eq!(&doubles[doubles.len() - 16..doubles.len() - 8], 0f64.to_le_bytes());
         assert_eq!(&doubles[doubles.len() - 8..], f64::MAX.to_le_bytes());
     }
 
@@ -9365,21 +7057,14 @@ mod tests {
     fn stacked_bands_take_the_type_that_holds_them_all() {
         use SampleType as T;
         for (a, b, both) in [
-            (T::Uint8, T::Uint16, T::Uint16),
-            (T::Uint16, T::Int16, T::Int32),
-            (T::Uint8, T::Int8, T::Int16),
-            (T::Uint8, T::Int16, T::Int16),
-            (T::Uint8, T::Int32, T::Int32),
-            (T::Int8, T::Int16, T::Int16),
-            (T::Uint16, T::Float32, T::Float32),
-            (T::Uint32, T::Float32, T::Float64),
-            (T::Float32, T::Float64, T::Float64),
-            (T::Uint32, T::Int32, T::Float64),
-            (T::Uint8, T::Uint8, T::Uint8),
-            (T::Uint16, T::Uint32, T::Uint32),
+            (T::Uint8, T::Uint16, T::Uint16), (T::Uint16, T::Int16, T::Int32), (T::Uint8, T::Int8, T::Int16),
+            (T::Uint8, T::Int16, T::Int16), (T::Uint8, T::Int32, T::Int32), (T::Int8, T::Int16, T::Int16),
+            (T::Uint16, T::Float32, T::Float32), (T::Uint32, T::Float32, T::Float64), (T::Float32, T::Float64, T::Float64),
+            (T::Uint32, T::Int32, T::Float64), (T::Uint8, T::Uint8, T::Uint8), (T::Uint16, T::Uint32, T::Uint32),
         ] {
             assert_eq!(wider_type(a, b), both, "{a:?} with {b:?}");
             assert_eq!(wider_type(b, a), both, "{b:?} with {a:?}");
         }
     }
+
 }
