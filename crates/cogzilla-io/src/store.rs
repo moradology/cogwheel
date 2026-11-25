@@ -172,6 +172,80 @@ pub struct CogStore {
     pub metrics: Arc<IoMetrics>,
 }
 
+/// Build default outbound HTTP headers from standard GDAL environment variables:
+/// `GDAL_HTTP_BEARER`, `GDAL_HTTP_USERPWD`, `GDAL_HTTP_HEADERS`, and `GDAL_HTTP_HEADER_FILE`.
+fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    let mut push_line = |line: &str| {
+        if let Some((k, v)) = line.split_once(':') {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.trim().as_bytes()),
+                HeaderValue::from_str(v.trim()),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    };
+
+    if let Ok(path) = std::env::var("GDAL_HTTP_HEADER_FILE") {
+        if !path.trim().is_empty()
+            && let Ok(contents) = std::fs::read_to_string(path.trim())
+        {
+            for line in contents.lines() {
+                push_line(line);
+            }
+        }
+    }
+    if let Ok(raw) = std::env::var("GDAL_HTTP_HEADERS") {
+        for part in raw.split(['\n', '\r']) {
+            push_line(part);
+        }
+    }
+    if let Ok(bearer) = std::env::var("GDAL_HTTP_BEARER") {
+        let tok = bearer.trim();
+        if !tok.is_empty()
+            && let Ok(val) = HeaderValue::from_str(&format!("Bearer {tok}"))
+        {
+            headers.insert(AUTHORIZATION, val);
+        }
+    } else if let Ok(userpwd) = std::env::var("GDAL_HTTP_USERPWD") {
+        let up = userpwd.trim();
+        if !up.is_empty() {
+            let b64 = encode_base64_std(up.as_bytes());
+            if let Ok(val) = HeaderValue::from_str(&format!("Basic {b64}")) {
+                headers.insert(AUTHORIZATION, val);
+            }
+        }
+    }
+    headers
+}
+
+fn encode_base64_std(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 impl CogStore {
     pub fn new(cache_max_bytes: usize) -> Self {
         let max_open_uris = std::env::var("COGZILLA_MAX_OPEN_URIS")
@@ -198,7 +272,8 @@ impl CogStore {
         };
         let connect_timeout = Duration::from_secs(env_secs("GDAL_HTTP_CONNECTTIMEOUT", 10));
         let read_timeout = Duration::from_secs(env_secs("GDAL_HTTP_TIMEOUT", 30));
-        let client = reqwest::Client::builder()
+        let gdal_headers = build_gdal_http_headers();
+        let mut client_builder = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
             .connect_timeout(connect_timeout)
@@ -211,9 +286,11 @@ impl CogStore {
                     return attempt.error(e);
                 }
                 attempt.follow()
-            }))
-            .build()
-            .expect("reqwest client");
+            }));
+        if !gdal_headers.is_empty() {
+            client_builder = client_builder.default_headers(gdal_headers);
+        }
+        let client = client_builder.build().expect("reqwest client");
         let cloud_client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)

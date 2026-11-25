@@ -157,6 +157,7 @@ struct ParsedQuery {
     coord_crs: Option<cogzilla_proj::CrsModel>,
     dst_crs: Option<(cogzilla_proj::CrsModel, u16)>,
     bounds_crs: Option<(cogzilla_proj::CrsModel, u16)>,
+    bbox_param: Option<[f64; 4]>,
     format_param: Option<String>,
     minzoom: Option<u8>,
     maxzoom: Option<u8>,
@@ -215,6 +216,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         coord_crs: None,
         dst_crs: None,
         bounds_crs: None,
+        bbox_param: None,
         format_param: None,
         minzoom: None,
         maxzoom: None,
@@ -298,6 +300,14 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 _ => bad("expected boolean"),
             },
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
+            "bbox" => {
+                let dec = percent_decode(v);
+                if let Some((b, None)) = parse_bbox4(&dec) {
+                    pq.bbox_param = Some(b);
+                } else {
+                    bad("expected bbox=minx,miny,maxx,maxy");
+                }
+            }
             "algorithm" => pq.algorithm = Some(percent_decode(v).to_ascii_lowercase()),
             "algorithm_params" => {
                 let dec = percent_decode(v);
@@ -789,17 +799,17 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
     }
-    if !(route("preview") || route("bbox") || route("feature")) {
+    if !(route("preview") || route("bbox") || route("feature") || route("map")) {
         if let Some(k) = has(&["width", "height", "dst_crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on preview, bbox, and feature routes"
+                "parameter '{k}' is only supported on preview, bbox, feature, and map routes"
             ));
         }
     }
-    if !(route("bounds") || route("info")) {
+    if !(route("bounds") || route("info") || route("map")) {
         if let Some(k) = has(&["crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on bounds and info routes"
+                "parameter '{k}' is only supported on bounds, info, and map routes"
             ));
         }
     }
@@ -2155,9 +2165,17 @@ where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
+    let t0 = std::time::Instant::now();
     let is_head = *req.method() == Method::HEAD;
     let is_post = *req.method() == Method::POST;
     let mut resp = handle_request_inner(engine, req, is_head).await?;
+    let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
+        resp.headers_mut().insert(
+            hyper::header::HeaderName::from_static("server-timing"),
+            hv,
+        );
+    }
     if is_post {
         // RFC 9110: POST responses depend on the request body and must not carry public Cache-Control/ETag.
         resp.headers_mut().remove(CACHE_CONTROL);
@@ -2262,6 +2280,28 @@ where
 
     if method == Method::GET && path == "/healthz" {
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"ok"), "text/plain"));
+    }
+
+    if method == Method::GET && (path == "/conformance" || path == "/conformance/") {
+        let conf = serde_json::json!({
+            "conformsTo": [
+                "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+                "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+                "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+                "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/json",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+                "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
+                "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset"
+            ]
+        });
+        return Ok(plain_resp(
+            StatusCode::OK,
+            Bytes::from(conf.to_string()),
+            "application/json",
+        ));
     }
 
     if method == Method::GET && (path == "/" || path == "/index.html") {
@@ -2400,7 +2440,7 @@ where
         Some(&raw_query)
     });
 
-    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
 
     if let Err(msg) = validate_query(&segs, &pq) {
         let body = serde_json::json!({
@@ -2542,6 +2582,38 @@ where
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "info.geojson"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let [w, s, e, n] = mj.bounds;
+                let feat = serde_json::json!({
+                    "type": "Feature",
+                    "bbox": mj.bounds,
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]
+                    },
+                    "properties": mj.info_json()
+                });
+                Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+            }
+            .await,
+            ["mosaicjson", "assets"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let assets: Vec<String> = if let Some([w, s, e, n]) = pq.bbox_param {
+                    let (mx0, my0) = lonlat_deg_to_mercator(w, s);
+                    let (mx1, my1) = lonlat_deg_to_mercator(e, n);
+                    mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1))
+                } else {
+                    let [w, s, e, n] = mj.bounds;
+                    let (mx0, my0) = lonlat_deg_to_mercator(w, s);
+                    let (mx1, my1) = lonlat_deg_to_mercator(e, n);
+                    mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1))
+                };
+                Ok((Bytes::from(serde_json::json!(assets).to_string()), "application/json"))
             }
             .await,
             ["mosaicjson", "bounds"] => async {
@@ -3517,6 +3589,46 @@ where
                 let tj_url = format!("{forwarded_prefix}/stac/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            // GET /stac/map (OGC API - Maps)
+            (Method::GET, ["map"]) => async {
+                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let (_, cogs, rewritten_expr) =
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                let mut pq_stac = pq;
+                pq_stac.expr_raw = rewritten_expr;
+                let crs = engine.get_or_build_crs(&cogs[0])?;
+                let full = cogs[0].index.full_res();
+                let wgs_bbox = pq_stac.bbox_param.unwrap_or_else(|| {
+                    item.bbox.unwrap_or_else(|| crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                });
+                let (dst_crs, dst_epsg) = pq_stac
+                    .dst_crs
+                    .clone()
+                    .or_else(|| pq_stac.bounds_crs.clone())
+                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
+                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq_stac.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = pq_stac.format_param.as_deref().unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
+                let mut bands = build_band_request(&pq_stac, db, full.sample_type)?;
+                if pq_stac.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
+                let cf = pq_stac.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), true);
+                let data = render_crs_bbox(
+                    &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
+                    pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                )
+                .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, dst_epsg, pq_stac.return_mask);
+                Ok((data, ct))
+            }
+            .await,
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
@@ -4493,6 +4605,41 @@ where
                 let tj_url = format!("{forwarded_prefix}/cog/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            // GET /cog/map (OGC API - Maps)
+            (Method::GET, ["map"]) => async {
+                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let crs = engine.get_or_build_crs(&cogs[0])?;
+                let full = cogs[0].index.full_res();
+                let wgs_bbox = pq.bbox_param.unwrap_or_else(|| {
+                    crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                });
+                let (dst_crs, dst_epsg) = pq
+                    .dst_crs
+                    .clone()
+                    .or_else(|| pq.bounds_crs.clone())
+                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
+                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let ext = pq.format_param.as_deref().unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let mut bands = build_band_request(&pq, db, full.sample_type)?;
+                if pq.unscale {
+                    apply_unscale_cogs(&mut bands, &cogs);
+                }
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
+                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
+                let data = render_crs_bbox(
+                    &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
+                    pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                )
+                .await?;
+                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, dst_epsg, pq.return_mask);
+                Ok((data, ct))
+            }
+            .await,
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
@@ -4837,11 +4984,7 @@ where
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
-    Ok(plain_resp(
-        StatusCode::NOT_FOUND,
-        Bytes::from(path),
-        "text/plain",
-    ))
+    Ok(json_error_resp(StatusCode::NOT_FOUND, &path))
 }
 
 fn cache_control_header() -> &'static HeaderValue {
@@ -5000,45 +5143,40 @@ fn binary_or_plain_response(
     }
 }
 
+fn json_error_resp(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({ "detail": msg }).to_string();
+    plain_resp(status, Bytes::from(body), "application/json")
+}
+
 fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
     match err {
         EngineError::Shared(inner) => error_to_http_response(inner),
-        EngineError::NotFound(msg) => {
-            plain_resp(StatusCode::NOT_FOUND, Bytes::from(msg.clone()), "text/plain")
-        }
-        EngineError::BadRequest(msg) => {
-            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(msg.clone()), "text/plain")
-        }
+        EngineError::NotFound(msg) => json_error_resp(StatusCode::NOT_FOUND, msg),
+        EngineError::BadRequest(msg) => json_error_resp(StatusCode::BAD_REQUEST, msg),
         // The file is in a coordinate system this server cannot place. That is a
         // property of the requested source, not a server fault.
-        EngineError::Proj(e) => {
-            plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
-        }
+        EngineError::Proj(e) => json_error_resp(StatusCode::BAD_REQUEST, &e.to_string()),
         EngineError::Io(io_e) => match io_e.root() {
             e @ cogzilla_io::IoError::InvalidUri(_) => {
-                plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+                json_error_resp(StatusCode::BAD_REQUEST, &e.to_string())
             }
             e @ cogzilla_io::IoError::Tiff(_) => {
-                plain_resp(StatusCode::BAD_REQUEST, Bytes::from(e.to_string()), "text/plain")
+                json_error_resp(StatusCode::BAD_REQUEST, &e.to_string())
             }
             e @ cogzilla_io::IoError::Forbidden(_) => {
-                plain_resp(StatusCode::FORBIDDEN, Bytes::from(e.to_string()), "text/plain")
+                json_error_resp(StatusCode::FORBIDDEN, &e.to_string())
             }
             e @ cogzilla_io::IoError::HttpStatus { status: 404, .. } => {
-                plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
+                json_error_resp(StatusCode::NOT_FOUND, &e.to_string())
             }
             e @ cogzilla_io::IoError::Fs(io_err)
                 if io_err.kind() == std::io::ErrorKind::NotFound =>
             {
-                plain_resp(StatusCode::NOT_FOUND, Bytes::from(e.to_string()), "text/plain")
+                json_error_resp(StatusCode::NOT_FOUND, &e.to_string())
             }
             e => {
                 tracing::warn!(error = %e, "request failed with 500");
-                plain_resp(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Bytes::from(e.to_string()),
-                    "text/plain",
-                )
+                json_error_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
             }
         },
     }

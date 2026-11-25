@@ -25,12 +25,12 @@ fn parse_channels(tok: &str) -> Result<(bool, bool, bool), String> {
     let (mut r, mut g, mut b) = (false, false, false);
     for ch in tok.chars() {
         match ch.to_ascii_uppercase() {
-            'R' => r = true,
-            'G' => g = true,
-            'B' => b = true,
+            'R' | '1' => r = true,
+            'G' | '2' => g = true,
+            'B' | '3' => b = true,
             other => {
                 return Err(format!(
-                    "invalid color_formula channel '{other}' in '{tok}' (expected R, G, B)"
+                    "invalid color_formula channel '{other}' in '{tok}' (expected R, G, B, or 1, 2, 3)"
                 ));
             }
         }
