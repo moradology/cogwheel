@@ -939,17 +939,6 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             if segs[0] != "cog" || route("asset_statistics") {
                 return Err(format!("parameter '{k}' is only supported on /cog/statistics routes"));
             }
-            if let Some(alg) = pq.algorithm.as_deref() {
-                let low = alg.to_ascii_lowercase();
-                if matches!(
-                    low.as_str(),
-                    "hillshade" | "slope" | "aspect" | "contours" | "terrarium" | "terrainrgb"
-                ) {
-                    return Err(format!(
-                        "algorithm '{alg}' is not supported on statistics routes"
-                    ));
-                }
-            }
         }
         if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
             if let Some(k) = has(&["expression", "expr", "index"]) {
@@ -1522,6 +1511,7 @@ fn wants_f32_geotiff(
         }
         BandRequest::CustomExpr { .. }
         | BandRequest::CustomExprRgb { .. }
+        | BandRequest::MultiBand { .. }
         | BandRequest::Spectral1 { .. }
         | BandRequest::Spectral2 { .. }
         | BandRequest::Spectral3 { .. }
@@ -2048,10 +2038,15 @@ fn build_band_request(
     }
 
     if !pq.bidx.is_empty() && pq.bidx.len() != 1 && pq.bidx.len() != 3 {
-        return Err(EngineError::BadRequest(format!(
-            "unsupported bidx count {} (expected 1 or 3 bands)",
-            pq.bidx.len()
-        )));
+        if pq.bidx.len() > 15 {
+            return Err(EngineError::BadRequest(format!(
+                "bidx count {} exceeds maximum of 15 bands",
+                pq.bidx.len()
+            )));
+        }
+        return Ok(BandRequest::MultiBand {
+            bands_1based: pq.bidx.clone(),
+        });
     }
 
     if pq.bidx.len() == 3 || (pq.bidx.is_empty() && default_bands >= 3) {
@@ -2836,7 +2831,7 @@ async fn render_mosaic_tile_styled(
     let mut needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0.0
-        || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
+        || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
     if !needs_bbox_mosaic
         && !pq.colormap_explicit
@@ -4898,7 +4893,7 @@ where
                                             | BandRequest::Terrain { .. }
                                     ))
                                 || (treq.tile_size != 256 && treq.tile_size != 512)
-                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
+                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
                                 || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                                 || !crate::engine::cogs_share_base_grid(&cogs);
                             if needs_general_path {
@@ -5280,6 +5275,19 @@ where
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .collect();
+                    if parts.len() > 16 {
+                        return Err(EngineError::BadRequest(
+                            "expression exceeds max 16 semicolon-separated outputs".into(),
+                        ));
+                    }
+                    let raw_parts: Vec<&str> = pq
+                        .expr_raw
+                        .as_deref()
+                        .unwrap_or(expr_str)
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     let mut map = serde_json::Map::new();
                     for (idx, part) in parts.iter().enumerate() {
                         let prog = ExprProgram::compile(part).map_err(EngineError::BadRequest)?;
@@ -5311,7 +5319,7 @@ where
                             .chunks_exact(4)
                             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect();
-                        let desc = pq.expr_raw.as_deref().unwrap_or(part);
+                        let desc = raw_parts.get(idx).copied().unwrap_or(part);
                         map.insert(
                             format!("b{}", idx + 1),
                             compute_f32_band_stats(&pixels, desc, &stats_opts),
@@ -5728,7 +5736,7 @@ where
                                         | BandRequest::CustomExprRgb { .. }
                                         | BandRequest::Terrain { .. }
                                 ))
-                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
+                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);
@@ -6454,7 +6462,69 @@ where
             // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
             (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let db = cogs[0].index.full_res().samples_per_pixel;
+                let full = cogs[0].index.full_res();
+                let db = full.samples_per_pixel;
+                let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
+                    matches!(
+                        a.to_ascii_lowercase().as_str(),
+                        "hillshade" | "slope" | "aspect" | "contours" | "terrarium" | "terrainrgb" | "terrain-rgb" | "mapbox"
+                    )
+                });
+                if is_dem_alg {
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                    let mut bands = build_band_request(&pq, db, full.sample_type)?;
+                    if pq.unscale {
+                        apply_unscale_cogs(&mut bands, &cogs);
+                    }
+                    let stats_opts = build_stats_options(&pq, false)?;
+                    let raw = render_native_preview(
+                        &engine,
+                        &cogs,
+                        bbox,
+                        out_w,
+                        out_h,
+                        &bands,
+                        pq.resample,
+                        OutputFormat::RawF32,
+                        pq.nodata,
+                        None,
+                        None,
+                        true,
+                        pq.unscale,
+                    )
+                    .await?;
+                    let n_px = (out_w as usize) * (out_h as usize);
+                    let nb = if n_px > 0 && raw.len() >= n_px * 4 {
+                        (raw.len() / (n_px * 4)).clamp(1, 16)
+                    } else {
+                        1
+                    };
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    let mut map = serde_json::Map::new();
+                    for b in 0..nb {
+                        let start = b * n_px * 4;
+                        let end = (start + n_px * 4).min(raw.len());
+                        let plane: Vec<f32> = raw[start..end]
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let desc = if nb == 1 {
+                            alg_name.to_string()
+                        } else {
+                            format!("{alg_name}_b{}", b + 1)
+                        };
+                        map.insert(
+                            format!("b{}", b + 1),
+                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                        );
+                    }
+                    return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
+                }
                 let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
                 let json = compute_statistics_with_options(
                     &engine,
@@ -6655,7 +6725,7 @@ where
                                         | BandRequest::CustomExprRgb { .. }
                                         | BandRequest::Terrain { .. }
                                 ))
-                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
+                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);

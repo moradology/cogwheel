@@ -3625,18 +3625,28 @@ impl PolygonMask {
         dst_crs: &cogzilla_proj::CrsModel,
     ) -> Vec<bool> {
         let mut mask = vec![false; w * h];
-        let dlx = (bbox[2] - bbox[0]) / (w.max(1) as f64);
-        let dly = (bbox[3] - bbox[1]) / (h.max(1) as f64);
-        if dlx <= 0.0 || dly <= 0.0 {
+        if w == 0 || h == 0 {
             return mask;
         }
+        let dlx = (bbox[2] - bbox[0]) / (w as f64);
+        let dly = (bbox[3] - bbox[1]) / (h as f64);
+        if !dlx.is_finite() || !dly.is_finite() || dlx <= 0.0 || dly <= 0.0 {
+            return mask;
+        }
+        let wrap_hi = self.bbox[2] > 180.0;
+        let wrap_lo = self.bbox[0] < -180.0;
         for py in 0..h {
             let y = bbox[3] - (py as f64 + 0.5) * dly;
             let row_off = py * w;
             for px in 0..w {
                 let x = bbox[0] + (px as f64 + 0.5) * dlx;
                 let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
-                if lon.is_finite() && lat.is_finite() && self.contains(lon, lat) {
+                if lon.is_finite()
+                    && lat.is_finite()
+                    && (self.contains(lon, lat)
+                        || (wrap_hi && self.contains(lon + 360.0, lat))
+                        || (wrap_lo && self.contains(lon - 360.0, lat)))
+                {
                     mask[row_off + px] = true;
                 }
             }
@@ -3682,10 +3692,10 @@ impl PolygonMask {
                     }
                 }
             }
-            let sx = x0 + t0 * dx;
-            let sy = y0 + t0 * dy;
-            let ex = x0 + t1 * dx;
-            let ey = y0 + t1 * dy;
+            let sx = (x0 + t0 * dx).clamp(0.0, w as f64);
+            let sy = (y0 + t0 * dy).clamp(0.0, h as f64);
+            let ex = (x0 + t1 * dx).clamp(0.0, w as f64);
+            let ey = (y0 + t1 * dy).clamp(0.0, h as f64);
             let mut ix = (sx.floor() as isize).clamp(0, w as isize - 1);
             let mut iy = (sy.floor() as isize).clamp(0, h as isize - 1);
             let end_x = (ex.floor() as isize).clamp(0, w as isize - 1);
@@ -3693,19 +3703,15 @@ impl PolygonMask {
             mask[iy as usize * w + ix as usize] = true;
             let sdx = ex - sx;
             let sdy = ey - sy;
-            let step_x: isize = if sdx > 0.0 {
-                1
-            } else if sdx < 0.0 {
-                -1
-            } else {
-                0
+            let step_x: isize = match end_x.cmp(&ix) {
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
             };
-            let step_y: isize = if sdy > 0.0 {
-                1
-            } else if sdy < 0.0 {
-                -1
-            } else {
-                0
+            let step_y: isize = match end_y.cmp(&iy) {
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
             };
             let mut t_max_x = if step_x > 0 {
                 ((ix + 1) as f64 - sx) / sdx
@@ -4101,6 +4107,14 @@ async fn render_bbox_impl(
             )));
         }
     }
+    if let BandRequest::MultiBand { bands_1based } = bands
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+    {
+        return Err(EngineError::BadRequest(format!(
+            "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
+            bands_1based.len()
+        )));
+    }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
     let primary = &cogs[0];
@@ -4473,22 +4487,25 @@ async fn render_bbox_impl(
                     | BandRequest::SarRgb { .. }
                     | BandRequest::CustomExprRgb { .. }
                     | BandRequest::Terrain { .. } => 3,
+                    BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
                     _ => 1,
                 };
-                let hdr = if format == OutputFormat::Npy {
-                    Some(cogzilla_kernel::encode_npy_f32_header(nb, h as u32, w as u32))
-                } else {
-                    None
-                };
-                let hdr_len = hdr.as_ref().map_or(0, |v| v.len());
-                let mut b = BytesMut::with_capacity(hdr_len + nb * w * h * 4);
-                if let Some(hdr) = hdr {
-                    b.put_slice(&hdr);
-                }
+                let mut b = BytesMut::with_capacity(nb * w * h * 4);
                 for _ in 0..(nb * w * h) {
                     b.put_slice(&f32::NAN.to_le_bytes());
                 }
-                b.freeze()
+                let raw = b.freeze();
+                if format == OutputFormat::Npy {
+                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                        raw,
+                        nb,
+                        h as u32,
+                        w as u32,
+                        return_mask,
+                    )
+                } else {
+                    raw
+                }
             }
             OutputFormat::RawRgba => Bytes::from(vec![0u8; w * h * 4]),
             _ => encode_rgba_output(w, h, &vec![0u8; w * h * 4], format, return_mask),
@@ -4566,6 +4583,11 @@ async fn render_bbox_impl(
                     for &b in &prog.used_bands {
                         check_band(b)?;
                     }
+                }
+            }
+            BandRequest::MultiBand { bands_1based } => {
+                for &b in bands_1based {
+                    check_band(b)?;
                 }
             }
         }
@@ -5136,6 +5158,16 @@ async fn render_bbox_impl(
                     out.put_slice(&vh_plane);
                     out.put_slice(&diff_plane);
                 }
+                BandRequest::MultiBand { bands_1based } => {
+                    out.reserve(w * h * 4 * bands_1based.len().saturating_sub(1));
+                    for (slot, &b1) in bands_1based.iter().enumerate() {
+                        let r = get_band_refs(b1, slot);
+                        let s = make_src!(&r);
+                        for i in 0..(w * h) {
+                            out.put_slice(&sample(&s, u_map[i], v_map[i]).to_le_bytes());
+                        }
+                    }
+                }
             }
             let raw = out.freeze();
             if format == OutputFormat::Npy {
@@ -5144,6 +5176,7 @@ async fn render_bbox_impl(
                     | BandRequest::SarRgb { .. }
                     | BandRequest::CustomExprRgb { .. }
                     | BandRequest::Terrain { .. } => 3,
+                    BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
                     _ => 1,
                 };
                 return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
@@ -5487,6 +5520,7 @@ async fn render_bbox_impl(
                     }
                 }
             }
+            BandRequest::MultiBand { .. } => {}
         }
 
         if cf_single_lut.is_none()
@@ -5699,6 +5733,11 @@ async fn render_mixed_grid_bbox(
                 for &b in &p.used_bands {
                     push_b(b)?;
                 }
+            }
+        }
+        BandRequest::MultiBand { bands_1based } => {
+            for &b in bands_1based {
+                push_b(b)?;
             }
         }
     }
@@ -5992,6 +6031,14 @@ async fn render_mixed_grid_bbox(
                 }
                 3
             }
+            BandRequest::MultiBand { bands_1based } => {
+                for &b1 in bands_1based {
+                    for &v in get_plane(b1) {
+                        out.put_slice(&v.to_le_bytes());
+                    }
+                }
+                bands_1based.len().max(1)
+            }
         };
         let raw = out.freeze();
         if format == OutputFormat::Npy {
@@ -6223,6 +6270,12 @@ async fn render_mixed_grid_bbox(
                     rgba[i * 4 + 3] = 255;
                 }
             }
+        }
+        BandRequest::MultiBand { bands_1based } => {
+            return Err(EngineError::BadRequest(format!(
+                "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
+                bands_1based.len()
+            )));
         }
     }
     if cf_single_lut.is_none()

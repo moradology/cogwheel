@@ -59,7 +59,6 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("bad tilesize", format!("{tile}&tilesize=7")),
         ("unknown tms tile", format!("{base}/cog/tiles/FakeQuad/10/163/395.png?url={sat_url}")),
         ("unknown tms tilejson", format!("{base}/cog/FakeQuad/tilejson.json?url={sat_url}")),
-        ("statistics algorithm", format!("{base}/cog/statistics?url={sat_url}&algorithm=hillshade")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
         ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
         ("point unsupported coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:4267")),
