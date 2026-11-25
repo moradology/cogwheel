@@ -1096,6 +1096,18 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let parsed_contours = cogzilla_tiff::parse_cog(&contours_tif.bytes().await.unwrap()).unwrap();
             assert_eq!(parsed_contours.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
 
+            // Audit c45 regression check: unknown/malformed TMS on WMTSCapabilities.xml must return 404/422 (never 200 XML)
+            let bad_wmts = client
+                .get(format!("{base}/cog/a&b/WMTSCapabilities.xml?url={merc_url}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                bad_wmts.status() == 404 || bad_wmts.status() == 422,
+                "unknown WMTS TMS should be rejected, got {}",
+                bad_wmts.status()
+            );
+
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];
             pal[299] = [200, 150, 100, 255];

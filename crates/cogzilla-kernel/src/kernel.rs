@@ -2832,7 +2832,10 @@ pub fn render_expr_vm<const N: usize>(
     prog: &ExprProgram,
     style: &SingleBandStyle,
 ) -> Bytes {
-    if srcs.is_empty() || srcs.iter().any(|s| s.all_nodata) {
+    if !srcs.is_empty()
+        && !prog.ops.contains(&crate::expr_vm::Op::Where)
+        && srcs.iter().any(|s| s.all_nodata)
+    {
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let nb = srcs.len().min(16);
