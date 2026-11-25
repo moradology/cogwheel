@@ -1520,6 +1520,26 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(mj_root.get("name").is_none());
             assert!(mj_root.get("attribution").is_none());
             assert!(mj_root["tiles"].is_object());
+
+            // Sweep #8 H3: color_formula on single-band mosaic stays grayscale PNG (no red tint)
+            // Quadkey "0230102033" corresponds to WebMercatorQuad tile 10/163/395.
+            let mj_cf_resp = client
+                .get(format!(
+                    "{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.png?url={}&rescale=0,1000&color_formula=gamma%20r%201.6",
+                    mj_root_path.to_str().unwrap()
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_cf_resp.status(), 200);
+            let mj_cf_bytes = mj_cf_resp.bytes().await.unwrap();
+            assert!(mj_cf_bytes.len() > 26 && &mj_cf_bytes[..8] == b"\x89PNG\r\n\x1a\n");
+            // PNG IHDR color_type byte at offset 25: 0 = Grayscale (L), 4 = Grayscale+Alpha (LA)
+            let color_type = mj_cf_bytes[25];
+            assert!(
+                color_type == 0 || color_type == 4,
+                "single-band mosaic with color_formula must encode grayscale PNG (color_type 0 or 4), got {color_type}"
+            );
             let _ = std::fs::remove_file(&mj_root_path);
 
             // Sweep #1 D4, D6, E2 regression checks

@@ -466,7 +466,23 @@ impl CrsModel {
             (rx, ry)
         };
 
-        let (rx, ry) = probe(0.5, 0.5);
+        let (mut rx, mut ry) = probe(0.5, 0.5);
+        // For polar stereographic rasters, Web Mercator ground resolution shrinks by cos(lat)
+        // toward the pole-ward edge of low-zoom tiles where the polar raster actually lies.
+        // Taking the minimum across center and pole-ward edge avoids picking an overly coarse overview.
+        if let Self::PolarStereographic(ps) = self {
+            let pole_fy = if ps.south { 0.01 } else { 0.99 };
+            let (prx, pry) = probe(0.5, pole_fy);
+            if prx.is_finite() && pry.is_finite() && prx > 0.0 && pry > 0.0 {
+                if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+                    rx = rx.min(prx);
+                    ry = ry.min(pry);
+                } else {
+                    rx = prx;
+                    ry = pry;
+                }
+            }
+        }
         if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
             return (rx, ry);
         }
@@ -562,13 +578,38 @@ impl CrsModel {
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
     /// 32 points along the 4 edges of the raster plus checking whether either pole lies inside.
     pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
+        let w = width as f64;
+        let h = height as f64;
+        if matches!(self, Self::Geographic) {
+            let mut min_lon = f64::INFINITY;
+            let mut min_lat = f64::INFINITY;
+            let mut max_lon = f64::NEG_INFINITY;
+            let mut max_lat = f64::NEG_INFINITY;
+            for &(col, row) in &[(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+                let (lon, lat) = pixel_to_crs.forward(col, row);
+                if lon.is_finite() && lat.is_finite() {
+                    min_lon = min_lon.min(lon);
+                    max_lon = max_lon.max(lon);
+                    min_lat = min_lat.min(lat);
+                    max_lat = max_lat.max(lat);
+                }
+            }
+            if !min_lon.is_finite() || !min_lat.is_finite() {
+                return [-180.0, -85.05112878, 180.0, 85.05112878];
+            }
+            // Global 0..360° grids (e.g. NOAA GFS / ECMWF ERA5) normalize to [-180, 180],
+            // while regional antimeridian-crossing files (e.g. 170..190 or -190..-170) keep
+            // their native geographic bounds so map clients don't zoom out to the whole world.
+            if self.is_geographic_0_360(pixel_to_crs, width) && max_lon - min_lon >= 359.0 {
+                return [-180.0, min_lat, 180.0, max_lat];
+            }
+            return [min_lon, min_lat, max_lon, max_lat];
+        }
         let mut min_lon = f64::INFINITY;
         let mut min_lat = f64::INFINITY;
         let mut max_lon = f64::NEG_INFINITY;
         let mut max_lat = f64::NEG_INFINITY;
         let mut crosses_antimeridian = false;
-        let w = width as f64;
-        let h = height as f64;
         let steps = 8;
 
         let sample_pt = |col: f64, row: f64| -> Option<(f64, f64)> {
@@ -757,43 +798,81 @@ impl CrsModel {
                 let wh = ((max_y - min_y) / res + 0.5).floor().max(1.0);
                 (res, ww, wh)
             } else {
-                // Safe fallback for polar / antimeridian-crossing / partially out-of-domain rasters:
-                // local 1-pixel Jacobian at the raster center.
-                let cx = wf * 0.5;
-                let cy = hf * 0.5;
-                let step_px = (wf.min(hf) * 0.01).clamp(1.0, 64.0);
-                let px_m = if let (Some((mx0, my0)), Some((mxx, myx)), Some((mxy, myy))) = (
-                    to_merc(cx, cy),
-                    to_merc(cx + step_px, cy),
-                    to_merc(cx, cy + step_px),
-                ) {
-                    let wrap_dx = |dx: f64| -> f64 {
-                        if dx > ORIGIN_SHIFT {
-                            dx - 2.0 * ORIGIN_SHIFT
-                        } else if dx < -ORIGIN_SHIFT {
-                            dx + 2.0 * ORIGIN_SHIFT
-                        } else {
-                            dx
+                // Check if a pole lies inside the raster (e.g. Antarctic EPSG:3031 or Arctic UPS).
+                // At/near a pole, a local center Jacobian explodes because longitude swings 90°-180°
+                // across a few pixels; instead match GDAL's warped-extent diagonal resolution.
+                let mut pole_inside = false;
+                if !matches!(self, Self::Epsg3857 | Self::Geographic | Self::WorldMercator) {
+                    if let Some(crs_to_pixel) = pixel_to_crs.invert() {
+                        for &pole_lat in &[90.0_f64, -90.0_f64] {
+                            let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
+                            if px_crs.is_finite() && py_crs.is_finite() {
+                                let (col, row) = crs_to_pixel.forward(px_crs, py_crs);
+                                if col >= 0.0 && col <= wf && row >= 0.0 && row <= hf {
+                                    pole_inside = true;
+                                    min_x = -ORIGIN_SHIFT;
+                                    max_x = ORIGIN_SHIFT;
+                                    if pole_lat > 0.0 {
+                                        max_y = ORIGIN_SHIFT;
+                                    } else {
+                                        min_y = -ORIGIN_SHIFT;
+                                    }
+                                }
+                            }
                         }
-                    };
-                    let dx_m = wrap_dx(mxx - mx0).hypot(myx - my0) / step_px;
-                    let dy_m = wrap_dx(mxy - mx0).hypot(myy - my0) / step_px;
-                    let local = dx_m.max(dy_m);
-                    if local.is_finite() && local > 1e-3 {
-                        local
+                    }
+                }
+                if pole_inside
+                    && min_x.is_finite()
+                    && max_x.is_finite()
+                    && min_y.is_finite()
+                    && max_y.is_finite()
+                {
+                    let span_x = (max_x - min_x).max(1.0);
+                    let span_y = (max_y - min_y).max(1.0);
+                    let res = span_x.hypot(span_y) / wf.hypot(hf);
+                    let ww = (span_x / res + 0.5).floor().max(1.0);
+                    let wh = (span_y / res + 0.5).floor().max(1.0);
+                    (res, ww, wh)
+                } else {
+                    // Safe fallback for antimeridian-crossing / partially out-of-domain rasters:
+                    // local 1-pixel Jacobian at the raster center.
+                    let cx = wf * 0.5;
+                    let cy = hf * 0.5;
+                    let step_px = (wf.min(hf) * 0.01).clamp(1.0, 64.0);
+                    let px_m = if let (Some((mx0, my0)), Some((mxx, myx)), Some((mxy, myy))) = (
+                        to_merc(cx, cy),
+                        to_merc(cx + step_px, cy),
+                        to_merc(cx, cy + step_px),
+                    ) {
+                        let wrap_dx = |dx: f64| -> f64 {
+                            if dx > ORIGIN_SHIFT {
+                                dx - 2.0 * ORIGIN_SHIFT
+                            } else if dx < -ORIGIN_SHIFT {
+                                dx + 2.0 * ORIGIN_SHIFT
+                            } else {
+                                dx
+                            }
+                        };
+                        let dx_m = wrap_dx(mxx - mx0).hypot(myx - my0) / step_px;
+                        let dy_m = wrap_dx(mxy - mx0).hypot(myy - my0) / step_px;
+                        let local = dx_m.max(dy_m);
+                        if local.is_finite() && local > 1e-3 {
+                            local
+                        } else {
+                            let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                            let (a0, b0) = lonlat_deg_to_mercator(w, s);
+                            let (a1, b1) = lonlat_deg_to_mercator(e, n);
+                            (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
+                        }
                     } else {
                         let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
                         let (a0, b0) = lonlat_deg_to_mercator(w, s);
                         let (a1, b1) = lonlat_deg_to_mercator(e, n);
                         (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
-                    }
-                } else {
-                    let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
-                    let (a0, b0) = lonlat_deg_to_mercator(w, s);
-                    let (a1, b1) = lonlat_deg_to_mercator(e, n);
-                    (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
-                };
-                (px_m, wf, hf)
+                    };
+                    (px_m, wf, hf)
+                }
             }
         };
 
@@ -2031,5 +2110,86 @@ mod tests {
                 "antipode tile {tile:?} in South Pacific must not intersect Europe EPSG:3035 COG"
             );
         }
+    }
+
+    #[test]
+    fn geographic_antimeridian_preserves_native_bounds_and_west_tile_wrapping() {
+        // 170..190 × -20..0 (20° × 20° at 1024×1024)
+        let p2c_east = Affine2D {
+            a: 20.0 / 1024.0,
+            b: 0.0,
+            c: 170.0,
+            d: 0.0,
+            e: -20.0 / 1024.0,
+            f: 0.0,
+        };
+        assert_eq!(
+            CrsModel::Geographic.wgs84_bounds(&p2c_east, 1024, 1024),
+            [170.0, -20.0, 190.0, 0.0]
+        );
+        // Still serves tiles west of antimeridian (z=4/0/8 covers lon -180..-157.5, lat -21.9..0)
+        let c2p_east = p2c_east.invert().unwrap();
+        assert!(
+            CoordPlan::<256>::build(
+                &CrsModel::Geographic,
+                &c2p_east,
+                1024,
+                1024,
+                TileCoord { z: 4, x: 0, y: 8 },
+            )
+            .is_some(),
+            "170..190 geographic COG must still render tiles west of the antimeridian"
+        );
+
+        // -190..-170 × -20..0 (20° × 20° at 1024×1024)
+        let p2c_west = Affine2D {
+            a: 20.0 / 1024.0,
+            b: 0.0,
+            c: -190.0,
+            d: 0.0,
+            e: -20.0 / 1024.0,
+            f: 0.0,
+        };
+        assert_eq!(
+            CrsModel::Geographic.wgs84_bounds(&p2c_west, 1024, 1024),
+            [-190.0, -20.0, -170.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn polar_stereographic_zoom_range_and_tile_resolution() {
+        // Antarctic EPSG:3031 (-1e6..1e6, 1024×1024) enclosing the South Pole
+        let ps3031 = CrsModel::from_epsg(3031).unwrap();
+        let p2c_3031 = Affine2D {
+            a: 2_000_000.0 / 1024.0,
+            b: 0.0,
+            c: -1_000_000.0,
+            d: 0.0,
+            e: -2_000_000.0 / 1024.0,
+            f: 1_000_000.0,
+        };
+        assert_eq!(ps3031.web_mercator_zoom_range(&p2c_3031, 1024, 1024, 4.0), (2, 2));
+        let (rx_3031, ry_3031) = ps3031.target_resolution_for_tile(TileCoord { z: 1, x: 1, y: 1 }, 256);
+        assert!(
+            rx_3031.min(ry_3031) < 7_812.5,
+            "EPSG:3031 tile 1/1/1 must resolve finer than 4x overview (7812.5m), got ({rx_3031}, {ry_3031})"
+        );
+
+        // Arctic UPS North EPSG:32661 (1.5e6..2.5e6, 1024×1024) enclosing the North Pole
+        let ups = CrsModel::from_epsg(32661).unwrap();
+        let p2c_ups = Affine2D {
+            a: 1_000_000.0 / 1024.0,
+            b: 0.0,
+            c: 1_500_000.0,
+            d: 0.0,
+            e: -1_000_000.0 / 1024.0,
+            f: 2_500_000.0,
+        };
+        assert_eq!(ups.web_mercator_zoom_range(&p2c_ups, 1024, 1024, 4.0), (2, 2));
+        let (rx_ups, ry_ups) = ups.target_resolution_for_tile(TileCoord { z: 3, x: 6, y: 0 }, 256);
+        assert!(
+            rx_ups.min(ry_ups) < 1_953.125,
+            "UPS tile 3/6/0 must resolve finer than 2x overview (1953.1m), got ({rx_ups}, {ry_ups})"
+        );
     }
 }
