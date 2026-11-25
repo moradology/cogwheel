@@ -406,6 +406,7 @@ pub struct MosaicJsonCatalog {
     pub maxzoom: u8,
     pub quadkey_zoom: u8,
     pub bounds: [f64; 4],
+    pub raw_json: serde_json::Value,
     tiles: HashMap<String, Vec<String>, ahash::RandomState>,
 }
 
@@ -488,6 +489,7 @@ impl MosaicJsonCatalog {
             maxzoom,
             quadkey_zoom,
             bounds,
+            raw_json: val,
             tiles,
         })
     }
