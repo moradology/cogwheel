@@ -3817,6 +3817,31 @@ impl PolygonMask {
     }
 }
 
+/// TiTiler auto-format encoder for extension-less routes: emits `image/jpeg` when all pixels
+/// are opaque (alpha == 255) and `image/png` when any pixel is transparent/masked.
+pub(crate) fn encode_auto_image(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    jpeg_quality: u8,
+    return_mask: bool,
+) -> (Bytes, &'static str) {
+    let pixels = w.saturating_mul(h);
+    let all_opaque = !return_mask
+        || (pixels > 0 && rgba.chunks_exact(4).take(pixels).all(|p| p[3] == 255));
+    if all_opaque {
+        (
+            encode_rgba_output(w, h, rgba, OutputFormat::Jpeg { quality: jpeg_quality }, false),
+            "image/jpeg",
+        )
+    } else {
+        (
+            encode_rgba_output(w, h, rgba, OutputFormat::Png, return_mask),
+            "image/png",
+        )
+    }
+}
+
 /// Encode an RGBA8 buffer to the requested `OutputFormat`, optionally stripping the alpha mask.
 pub(crate) fn encode_rgba_output(
     w: usize,

@@ -364,6 +364,7 @@ def main():
             ("GET /cog/tiles/...?algorithm=sum (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=sum&rescale=0,1.0&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=std (3-band ddof=1)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=std&rescale=0,0.15&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=var (3-band ddof=1)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=var&rescale=0,0.02&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/... (extension-less auto format)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "auto_ct"),
 
             # --- /cog point, statistics, preview, bbox, feature, map ---
             ("GET /cog/point/-122.65,37.773", "GET", f"/cog/point/-122.65,37.773?url={sat}", None, "json_point"),
@@ -647,6 +648,11 @@ def main():
                         j_cw, j_tt = set(r_cw.json()), set(r_tt.json())
                         ok = j_cw == j_tt
                         parity = f"assets={sorted(j_cw)} exact_match={ok}"
+                    elif kind == "auto_ct":
+                        ct_cw = r_cw.headers.get("content-type", "").split(";")[0].strip().lower()
+                        ct_tt = r_tt.headers.get("content-type", "").split(";")[0].strip().lower()
+                        ok = ct_cw == ct_tt and ct_cw in ("image/jpeg", "image/png")
+                        parity = f"content-type cw={ct_cw} vs tt={ct_tt}"
                     elif kind == "json_stac_info":
                         j_cw, j_tt = r_cw.json(), r_tt.json()
                         ok = sorted(j_cw.keys()) == sorted(j_tt.keys())
