@@ -968,6 +968,22 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 b_default, b_json,
                 "algorithm_params JSON should alter hillshade lighting"
             );
+
+            // Mixed-resolution / mixed-CRS multi-COG composite (UTM10N RGB + WebMercator f32 DEM)
+            let mixed_resp = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.png?url={sat_url}&url={merc_url}&expression=b1+b2&rescale=0,500"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                mixed_resp.status(),
+                200,
+                "mixed-resolution/mixed-CRS multi-COG composite should succeed"
+            );
+            let mixed_bytes = mixed_resp.bytes().await.unwrap();
+            assert_eq!(&mixed_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         }
     }
 }
