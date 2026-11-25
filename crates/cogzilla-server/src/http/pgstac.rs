@@ -4205,14 +4205,13 @@ async fn tile(
                 one_grid = TileEngine::on_one_grid(&cogs);
             }
             // Left to the renderer: a raster with an alpha band, which it reads as the mask,
-            // raw arrays, and tile sizes it alone takes.
+            // and raw arrays.
             let dim = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
             let raw = matches!(explicit.as_str(), "npy" | "bin" | "raw" | "f32");
             // And a raster of two bands, or four and more: the renderer draws the first, or
             // the first three, where planes would stack them all and TiTiler refuse most.
             let preferred = planes_preferred
                 && !raw
-                && matches!(dim, 256 | 512)
                 && full.extra_samples.is_empty()
                 && (scenes[0].len() > 1 || matches!(full.samples_per_pixel, 1 | 3));
             // A plain request that takes this road only because it is the better reader keeps
@@ -4226,11 +4225,6 @@ async fn tile(
                 }
             }
             if planes_wanted || !one_grid || preferred {
-                if dim != 256 && dim != 512 {
-                    return Err(EngineError::BadRequest(format!(
-                        "tilesize={dim} is not supported on mosaic routes (use 256 or 512)"
-                    )));
-                }
                 if pq.algorithm.is_some() {
                     return Err(EngineError::BadRequest(
                         "`algorithm` is not supported with these assets and options yet".into(),
@@ -4303,9 +4297,11 @@ async fn tile(
                 CrsModel::Epsg3857 => resampling,
                 _ => reproject,
             };
+            // The renderer draws tiles of 256 and 512 pixels; any other size is read as
+            // planes, which is where a request with nearest-neighbour pixels has gone.
             if treq.tile_size != 256 && treq.tile_size != 512 {
                 return Err(EngineError::BadRequest(format!(
-                    "tilesize={} is not supported on mosaic routes (use 256 or 512)",
+                    "tilesize={} is drawn with nearest-neighbour resampling, without `algorithm`, as a picture, and of rasters without an alpha band; use 256 or 512 otherwise",
                     treq.tile_size
                 )));
             }
