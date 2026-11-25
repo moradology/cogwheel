@@ -1163,10 +1163,49 @@ pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
 
 /// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes.
 pub fn wrap_raw_f32_as_npy(raw: Bytes, bands: usize, height: u32, width: u32) -> Bytes {
-    let hdr = encode_npy_f32_header(bands, height, width);
-    let mut out = BytesMut::with_capacity(hdr.len() + raw.len());
+    wrap_raw_f32_as_npy_with_mask(raw, bands, height, width, false)
+}
+
+/// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes,
+/// optionally stacking a `(1, H, W)` float32 validity mask band (`255.0` valid / `0.0` nodata)
+/// when `return_mask` is `true` (matching TiTiler / `rio-tiler` `.npy` output).
+pub fn wrap_raw_f32_as_npy_with_mask(
+    raw: Bytes,
+    bands: usize,
+    height: u32,
+    width: u32,
+    return_mask: bool,
+) -> Bytes {
+    if !return_mask {
+        let hdr = encode_npy_f32_header(bands, height, width);
+        let mut out = BytesMut::with_capacity(hdr.len() + raw.len());
+        out.put_slice(&hdr);
+        out.put_slice(&raw);
+        return out.freeze();
+    }
+    let n_px = (height as usize).saturating_mul(width as usize);
+    let plane_bytes = n_px * 4;
+    let hdr = encode_npy_f32_header(bands + 1, height, width);
+    let mut out = BytesMut::with_capacity(hdr.len() + raw.len() + plane_bytes);
     out.put_slice(&hdr);
     out.put_slice(&raw);
+    let valid_le = 255.0f32.to_le_bytes();
+    let zero_le = 0.0f32.to_le_bytes();
+    for px in 0..n_px {
+        let px_off = px * 4;
+        let mut any_valid = false;
+        for b in 0..bands {
+            let off = b * plane_bytes + px_off;
+            if off + 4 <= raw.len() {
+                let v = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                if v.is_finite() {
+                    any_valid = true;
+                    break;
+                }
+            }
+        }
+        out.put_slice(if any_valid { &valid_le } else { &zero_le });
+    }
     out.freeze()
 }
 

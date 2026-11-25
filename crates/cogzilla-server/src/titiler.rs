@@ -2694,22 +2694,26 @@ pub fn encode_geotiff_rgba(
 }
 
 /// Encode a CHW `f32` little-endian buffer as a spec-compliant uncompressed Classic IEEE Float32
-/// GeoTIFF (`SampleFormat=3`, `BitsPerSample=32`, `GDAL_NODATA="nan"`).
+/// GeoTIFF (`SampleFormat=3`, `BitsPerSample=32`, `GDAL_NODATA="nan"`). When `return_mask` is
+/// `true`, appends an extra float32 validity mask band (`255.0` valid / `0.0` nodata) matching
+/// TiTiler / `rio-tiler` GeoTIFF output.
 pub fn encode_geotiff_f32(
     width: u32,
     height: u32,
     raw_f32_chw: &[u8],
     bbox: [f64; 4],
     epsg: u16,
+    return_mask: bool,
 ) -> Bytes {
     let width = width.clamp(1, 4096);
     let height = height.clamp(1, 4096);
     let n_px = (width as usize) * (height as usize);
-    let spp: u16 = if n_px > 0 && raw_f32_chw.len() >= n_px * 4 {
-        (raw_f32_chw.len() / (n_px * 4)).clamp(1, 16) as u16
+    let data_spp: u16 = if n_px > 0 && raw_f32_chw.len() >= n_px * 4 {
+        (raw_f32_chw.len() / (n_px * 4)).clamp(1, 15) as u16
     } else {
         1
     };
+    let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
     let pixel_bytes = n_px * (spp as usize) * 4;
     let photometric: u32 = if spp == 3 { 2 } else { 1 }; // RGB for 3-band, MinIsBlack otherwise
     let extra_samples_count: u16 = if spp == 2 || spp > 3 { spp - 1 } else { 0 };
@@ -2834,8 +2838,8 @@ pub fn encode_geotiff_f32(
         buf.put_u16_le(k);
     }
 
-    // Pixel data: interleave CHW f32 planes into Chunky f32
-    if spp == 1 {
+    // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
+    if spp == 1 && !return_mask {
         let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
         buf.put_slice(&raw_f32_chw[..take]);
         if take < pixel_bytes {
@@ -2845,17 +2849,30 @@ pub fn encode_geotiff_f32(
             }
         }
     } else {
-        let spp_us = spp as usize;
+        let data_spp_us = data_spp as usize;
         let plane_bytes = n_px * 4;
+        let valid_le = 255.0f32.to_le_bytes();
+        let zero_le = 0.0f32.to_le_bytes();
         for px in 0..n_px {
             let px_off = px * 4;
-            for b in 0..spp_us {
+            let mut any_valid = false;
+            for b in 0..data_spp_us {
                 let off = b * plane_bytes + px_off;
                 if off + 4 <= raw_f32_chw.len() {
-                    buf.put_slice(&raw_f32_chw[off..off + 4]);
+                    let sl = &raw_f32_chw[off..off + 4];
+                    if return_mask
+                        && !any_valid
+                        && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
+                    {
+                        any_valid = true;
+                    }
+                    buf.put_slice(sl);
                 } else {
                     buf.put_f32_le(f32::NAN);
                 }
+            }
+            if return_mask {
+                buf.put_slice(if any_valid { &valid_le } else { &zero_le });
             }
         }
     }
@@ -5129,7 +5146,13 @@ async fn render_bbox_impl(
                     | BandRequest::Terrain { .. } => 3,
                     _ => 1,
                 };
-                return cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32);
+                return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    nb,
+                    h as u32,
+                    w as u32,
+                    return_mask,
+                );
             }
             return raw;
         }
@@ -5972,7 +5995,13 @@ async fn render_mixed_grid_bbox(
         };
         let raw = out.freeze();
         if format == OutputFormat::Npy {
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32));
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                raw,
+                nb,
+                h as u32,
+                w as u32,
+                return_mask,
+            ));
         }
         return Ok(raw);
     }

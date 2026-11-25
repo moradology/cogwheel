@@ -157,6 +157,7 @@ struct ParsedQuery {
     return_mask: bool,
     shape_mask: bool,
     buffer: f32,
+    alg_buffer: Option<f32>,
     coord_crs_3857: bool,
     coord_crs: Option<cogzilla_proj::CrsModel>,
     coord_crs_epsg: Option<u16>,
@@ -218,6 +219,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         return_mask: true,
         shape_mask: true,
         buffer: 0.0,
+        alg_buffer: None,
         coord_crs_3857: false,
         coord_crs: None,
         coord_crs_epsg: None,
@@ -399,6 +401,14 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             match val.as_f64().map(|x| x as f32) {
                                 Some(x) if x.is_finite() => pq.contour_minz = x,
                                 _ => bad("minz must be a finite number"),
+                            }
+                        }
+                        if let Some(val) = obj.get("buffer") {
+                            match val.as_f64().map(|x| x as f32) {
+                                Some(b) if b.is_finite() && (0.0..=99.0).contains(&b) => {
+                                    pq.alg_buffer = Some(b);
+                                }
+                                _ => bad("buffer must be a number in 0..=99"),
                             }
                         }
                         if let Some(val) = obj.get("maxz") {
@@ -739,6 +749,18 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     // TiTiler precedence: colormap_name wins over inline JSON colormap when both are supplied.
     if pq.colormap_name_set {
         pq.custom_colormap_json = None;
+    }
+    // TiTiler HillShade/Slope crop `algorithm_params.buffer` (default 3) back out of the buffered
+    // input tile; since cogzilla's Horn 3×3 already fetches its own neighbor halo seamlessly,
+    // subtract that crop from `pq.buffer` so `?algorithm=hillshade&buffer=3` outputs 256×256.
+    if pq.buffer > 0.0
+        && pq
+            .algorithm
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case("hillshade") || a.eq_ignore_ascii_case("slope"))
+    {
+        let crop = pq.alg_buffer.unwrap_or(3.0).min(pq.buffer);
+        pq.buffer = (pq.buffer - crop).max(0.0);
     }
     pq.errors = pq_errors;
     pq
@@ -1496,7 +1518,7 @@ fn wrap_geotiff_fmt(
 ) -> Bytes {
     if ct == GEOTIFF_CONTENT_TYPE {
         if matches!(fmt, OutputFormat::RawF32) {
-            encode_geotiff_f32(w, h, &data, bbox, epsg)
+            encode_geotiff_f32(w, h, &data, bbox, epsg, return_mask)
         } else {
             encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
         }
@@ -4386,6 +4408,7 @@ where
                             let needs_general_path = pq.nodata.is_some()
                                 || pq.custom_colormap_json.is_some()
                                 || pq.buffer > 0.0
+                                || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
                                 || (pq.color_formula.is_some()
                                     && !matches!(
                                         treq.bands,
@@ -5216,6 +5239,7 @@ where
                             || pq_stac.buffer > 0.0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some()
+                            || (!pq_stac.return_mask && matches!(treq.format, OutputFormat::Npy))
                             || (pq_stac.color_formula.is_some()
                                 && !matches!(
                                     treq.bands,
@@ -6142,6 +6166,7 @@ where
                             || pq.buffer > 0.0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some()
+                            || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
                             || (pq.color_formula.is_some()
                                 && !matches!(
                                     treq.bands,

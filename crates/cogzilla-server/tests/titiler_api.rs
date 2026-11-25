@@ -971,7 +971,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             // Opaque RGB PNG (color_type=2) for clean DEM tile
             assert_eq!(bytes[25], 2, "expected RGB PNG for algorithm={alg}");
 
-            // Terrain NPY must emit 3-band RGB (3, 256, 256), not raw 1-band elevation
+            // Terrain NPY must emit 3-band RGB + mask (4, 256, 256), not raw 1-band elevation
             let npy_resp = client
                 .get(format!(
                     "{base}/cog/tiles/WebMercatorQuad/12/655/1583.npy?url={merc_url}&algorithm={alg}"
@@ -983,8 +983,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let npy_bytes = npy_resp.bytes().await.unwrap();
             let hdr_str = std::str::from_utf8(&npy_bytes[10..128]).unwrap_or("");
             assert!(
-                hdr_str.contains("(3, 256, 256)"),
-                "expected 3-band RGB NPY for algorithm={alg}, got header: {hdr_str}"
+                hdr_str.contains("(4, 256, 256)"),
+                "expected 3-band RGB + mask NPY for algorithm={alg}, got header: {hdr_str}"
             );
         }
 
