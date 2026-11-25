@@ -522,18 +522,26 @@ impl CrsModel {
         (norm_lon, lat)
     }
 
-    /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
-    /// (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western overhang).
-    pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
+    /// Returns `Some(min_lon)` when this is a Geographic CRS whose raster extent uses `0..360`
+    /// longitudes (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western
+    /// overhang), so longitudes `< min_lon` should be wrapped by `+360.0` while longitudes in
+    /// `[min_lon, 0.0)` remain directly in column 0.
+    pub fn geographic_0_360_min_lon(&self, pixel_to_crs: &Affine2D, width: u32) -> Option<f64> {
         if !matches!(self, CrsModel::Geographic) {
-            return false;
+            return None;
         }
         let (x0, _) = pixel_to_crs.forward(0.0, 0.0);
         let (x1, _) = pixel_to_crs.forward(width as f64, 0.0);
         let lo = x0.min(x1);
         let hi = x0.max(x1);
         let px_w = ((hi - lo) / (width.max(1) as f64)).max(1e-6);
-        lo >= -px_w && hi > 180.0 + 1e-6
+        (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo)
+    }
+
+    /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
+    /// (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western overhang).
+    pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
+        self.geographic_0_360_min_lon(pixel_to_crs, width).is_some()
     }
 
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
@@ -1027,20 +1035,22 @@ impl<const N: usize> CoordPlan<N> {
                     }
                 }
                 CrsModel::Geographic => {
-                    let wrap_360 = if crs_to_pixel.a.abs() > 1e-18 {
+                    let wrap_lo = if crs_to_pixel.a.abs() > 1e-18 {
                         let x0 = -crs_to_pixel.c / crs_to_pixel.a;
                         let x1 = (ifd_w as f64 - crs_to_pixel.c) / crs_to_pixel.a;
                         let lo = x0.min(x1);
                         let hi = x0.max(x1);
                         let px_w = ((hi - lo) / (ifd_w.max(1) as f64)).max(1e-6);
-                        lo >= -px_w && hi > 180.0 + 1e-6
+                        (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo)
                     } else {
-                        false
+                        None
                     };
                     for px in 0..N {
                         let mx = min_x + (px as f64 + 0.5) * step_x;
                         let (mut lon, _) = mercator_to_lonlat_deg(mx, 0.0);
-                        if wrap_360 && lon < 0.0 {
+                        if let Some(lo) = wrap_lo
+                            && lon < lo
+                        {
                             lon += 360.0;
                         }
                         let uu = (crs_to_pixel.a * lon + crs_to_pixel.c - 0.5) as f32;

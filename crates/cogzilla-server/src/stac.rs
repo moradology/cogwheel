@@ -142,16 +142,12 @@ pub async fn load_stac_item(
         .unwrap_or("stac-item")
         .to_string();
     let bbox = val.get("bbox").and_then(|v| v.as_array()).and_then(|a| {
-        if a.len() >= 4 {
-            Some([
-                a[0].as_f64()?,
-                a[1].as_f64()?,
-                a[2].as_f64()?,
-                a[3].as_f64()?,
-            ])
-        } else {
-            None
-        }
+        let coords = match a.len() {
+            4 => [a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?, a[3].as_f64()?],
+            6 => [a[0].as_f64()?, a[1].as_f64()?, a[3].as_f64()?, a[4].as_f64()?],
+            _ => return None,
+        };
+        coords.iter().all(|x| x.is_finite()).then_some(coords)
     });
     let geometry = val.get("geometry").cloned();
 

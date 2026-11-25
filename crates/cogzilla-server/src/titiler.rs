@@ -643,6 +643,7 @@ pub fn build_wmts_capabilities(
     ));
     let tile_base = xml_escape(&format!("{origin}/{family}/tiles/{tms}"));
     let title_esc = xml_escape(title);
+    let tms_esc = xml_escape(tms);
     let tile_px = 256u32 * tile_scale.clamp(1, 4);
 
     let tms_def = crate::tms::lookup_tms(tms)
@@ -753,13 +754,13 @@ pub fn build_wmts_capabilities(
             </Style>
             <Format>{media_type}</Format>
             <TileMatrixSetLink>
-                <TileMatrixSet>{tms}</TileMatrixSet>
+                <TileMatrixSet>{tms_esc}</TileMatrixSet>
             </TileMatrixSetLink>
             <ResourceURL format="{media_type}" resourceType="tile" template="{tile_template}"/>
         </Layer>
         <TileMatrixSet>
-            <ows:Title>{tms}</ows:Title>
-            <ows:Identifier>{tms}</ows:Identifier>
+            <ows:Title>{tms_esc}</ows:Title>
+            <ows:Identifier>{tms_esc}</ows:Identifier>
             <ows:SupportedCRS>{crs_urn}</ows:SupportedCRS>
 {matrices_xml}        </TileMatrixSet>
     </Contents>
@@ -829,7 +830,9 @@ pub async fn query_point(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
-    let q_lon = if crs.is_geographic_0_360(&ifd.pixel_to_crs, ifd.width) && lon < 0.0 {
+    let q_lon = if let Some(lo) = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width)
+        && lon < lo
+    {
         lon + 360.0
     } else {
         lon
@@ -1683,10 +1686,56 @@ fn build_tile_polygon_mask(
     y_max: usize,
 ) -> Option<(Vec<u8>, usize)> {
     const STEP: usize = 16;
-    let gw = x_max.div_ceil(STEP) + 1;
-    let gh = y_max.div_ceil(STEP) + 1;
     let base_col = (tx * ifd.tile_width) as usize;
     let base_row = (ty * ifd.tile_height) as usize;
+
+    // Zero-allocation 3x3 probe fast-reject before allocating the full 16-px grid.
+    // Cuts OOB/small-polygon tile rejection from ~1,089 projections + 2 heap Vecs down to 9 projections.
+    {
+        let cols = [0usize, x_max / 2, x_max];
+        let rows = [0usize, y_max / 2, y_max];
+        let mut p_min_lon = f64::INFINITY;
+        let mut p_max_lon = f64::NEG_INFINITY;
+        let mut p_min_lat = f64::INFINITY;
+        let mut p_max_lat = f64::NEG_INFINITY;
+        let mut non_finite = false;
+        for &ry in &rows {
+            let row_f = (base_row + ry) as f64;
+            for &cx in &cols {
+                let col_f = (base_col + cx) as f64;
+                let (sx, sy) = ifd.pixel_to_crs.forward(col_f, row_f);
+                let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+                if !lon.is_finite() || !lat.is_finite() {
+                    non_finite = true;
+                    break;
+                }
+                p_min_lon = p_min_lon.min(lon);
+                p_max_lon = p_max_lon.max(lon);
+                p_min_lat = p_min_lat.min(lat);
+                p_max_lat = p_max_lat.max(lat);
+            }
+            if non_finite {
+                break;
+            }
+        }
+        if !non_finite && p_min_lat > -85.0 && p_max_lat < 85.0 {
+            let lon_span = p_max_lon - p_min_lon;
+            let lat_span = p_max_lat - p_min_lat;
+            let lat_pad = (lat_span * 0.15).max(1e-4);
+            if p_max_lat + lat_pad < pm.bbox[1] || p_min_lat - lat_pad > pm.bbox[3] {
+                return None;
+            }
+            if lon_span < 180.0 {
+                let lon_pad = (lon_span * 0.15).max(1e-4);
+                if p_max_lon + lon_pad < pm.bbox[0] || p_min_lon - lon_pad > pm.bbox[2] {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let gw = x_max.div_ceil(STEP) + 1;
+    let gh = y_max.div_ceil(STEP) + 1;
 
     let mut grid_lon = vec![0.0f64; gw * gh];
     let mut grid_lat = vec![0.0f64; gw * gh];
@@ -1694,6 +1743,8 @@ fn build_tile_polygon_mask(
     let mut t_max_lon = f64::NEG_INFINITY;
     let mut t_min_lat = f64::INFINITY;
     let mut t_max_lat = f64::NEG_INFINITY;
+    let mut has_non_finite = false;
+    let mut crosses_antimeridian = false;
 
     for gy in 0..gh {
         let row_f = (base_row + (gy * STEP).min(y_max)) as f64;
@@ -1703,20 +1754,40 @@ fn build_tile_polygon_mask(
             let (lon, lat) = crs.to_lonlat_deg(sx, sy);
             grid_lon[gy * gw + gx] = lon;
             grid_lat[gy * gw + gx] = lat;
+            if !lon.is_finite() || !lat.is_finite() {
+                has_non_finite = true;
+                continue;
+            }
+            if gx > 0 {
+                let prev = grid_lon[gy * gw + gx - 1];
+                if prev.is_finite() && (lon - prev).abs() > 180.0 {
+                    crosses_antimeridian = true;
+                }
+            }
+            if gy > 0 {
+                let above = grid_lon[(gy - 1) * gw + gx];
+                if above.is_finite() && (lon - above).abs() > 180.0 {
+                    crosses_antimeridian = true;
+                }
+            }
             t_min_lon = t_min_lon.min(lon);
             t_max_lon = t_max_lon.max(lon);
             t_min_lat = t_min_lat.min(lat);
             t_max_lat = t_max_lat.max(lat);
         }
     }
+    if t_max_lon - t_min_lon > 180.0 {
+        crosses_antimeridian = true;
+    }
 
-    // Fast tile-level reject against polygon bbox
-    if t_max_lon < pm.bbox[0]
-        || t_min_lon > pm.bbox[2]
-        || t_max_lat < pm.bbox[1]
-        || t_min_lat > pm.bbox[3]
-    {
-        return None;
+    // Fast tile-level reject against polygon bbox (skip lon reject across antimeridian jumps).
+    if !has_non_finite {
+        if t_max_lat < pm.bbox[1] || t_min_lat > pm.bbox[3] {
+            return None;
+        }
+        if !crosses_antimeridian && (t_max_lon < pm.bbox[0] || t_min_lon > pm.bbox[2]) {
+            return None;
+        }
     }
 
     let mut bits = vec![0u8; x_max * y_max];
@@ -2686,7 +2757,13 @@ fn polygon_window_dims(
     let mut cmax = f64::NEG_INFINITY;
     let mut rmin = f64::INFINITY;
     let mut rmax = f64::NEG_INFINITY;
-    for (lon, lat) in pts {
+    let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+    for (mut lon, lat) in pts {
+        if let Some(lo) = wrap_lo
+            && lon < lo
+        {
+            lon += 360.0;
+        }
         let (sx, sy) = crs.from_lonlat_deg(lon, lat);
         if sx.is_finite() && sy.is_finite() {
             let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
@@ -3603,7 +3680,7 @@ async fn render_bbox_impl(
         let build_uv_maps = {
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
-        let wrap_360 = crs.is_geographic_0_360(&ifd.pixel_to_crs, ifd.width);
+        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
         let ifd_width = ifd.width;
         let ifd_height = ifd.height;
@@ -3622,7 +3699,10 @@ async fn render_bbox_impl(
                         }
                     }
                 };
-                if wrap_360 && sx.is_finite() && sx < 0.0 {
+                if let Some(lo) = wrap_lo
+                    && sx.is_finite()
+                    && sx < lo
+                {
                     sx += 360.0;
                 }
                 (sx, sy)
@@ -4991,9 +5071,7 @@ async fn render_mixed_grid_bbox(
     // Avoid double-unscaling when Single/Rgb already folded GDAL scale/offset into rescale bounds.
     let sub_unscale = unscale
         && (crate::engine::needs_source_unscale(bands, format)
-            || custom_lut.is_some_and(|c| {
-                matches!(c, CustomColormap::Discrete { direct_lookup: true, .. })
-            }));
+            || custom_lut.is_some_and(CustomColormap::uses_direct_lookup));
     let mut planes: Vec<(u16, Vec<f32>)> = Vec::with_capacity(needed.len());
     for &b1 in &needed {
         let single_cog = [cogs[(b1 - 1) as usize].clone()];

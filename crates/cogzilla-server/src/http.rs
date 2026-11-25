@@ -3451,6 +3451,9 @@ where
             ["mosaicjson", _, "WMTSCapabilities.xml"] | ["mosaicjson", "WMTSCapabilities.xml"] => {
                 async {
                     let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
+                    if crate::tms::lookup_tms(tms).is_none() {
+                        return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
+                    }
                     let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                     let mj = load_mosaicjson(&engine, &u).await?;
                     let minz = pq.minzoom.unwrap_or(mj.minzoom);
@@ -4462,6 +4465,9 @@ where
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
+                    if crate::tms::lookup_tms(tms).is_none() {
+                        return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
+                    }
                     let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                     let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                     let (_, cogs, _) =
@@ -5526,6 +5532,9 @@ where
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
+                    if crate::tms::lookup_tms(tms).is_none() {
+                        return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
+                    }
                     let cogs = open_query_urls(&engine, &pq.urls).await?;
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
