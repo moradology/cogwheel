@@ -2592,17 +2592,24 @@ async fn part_image(
     if !given_in_metres && let Err(r) = check_coord_crs(pairs) {
         return r;
     }
-    let mercator = match query_value(pairs, "dst_crs").map(str::to_ascii_lowercase).as_deref() {
+    // `dst_crs` is read as `coord_crs` is, in any of the spellings TiTiler takes.
+    let mercator = match query_value(pairs, "dst_crs").map(|dst| (dst, super::parse_coord_crs_with_epsg(dst))) {
         None => given_in_metres,
-        Some("epsg:4326" | "ogc:crs84") => false,
-        Some("epsg:3857") => true,
-        Some(other) => {
+        Some((_, Ok((_, 4326)))) => false,
+        Some((_, Ok((_, 3857)))) => true,
+        Some((dst, _)) => {
             return detail(
                 StatusCode::BAD_REQUEST,
-                format!("dst_crs '{other}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
+                format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
             );
         }
     };
+    // Web Mercator ends at 85.05 degrees: a box in degrees that goes past it has no
+    // corner there, and is refused sooner than drawn cut short under its own bounds.
+    const MERCATOR_EDGE: f64 = 85.051_128_78;
+    if mercator && !given_in_metres && (bbox[1] < -MERCATOR_EDGE || bbox[3] > MERCATOR_EDGE) {
+        return detail(StatusCode::BAD_REQUEST, "the box reaches past the edge of Web Mercator, 85.05 degrees north or south");
+    }
     if given_in_metres && mask.is_some() {
         return detail(StatusCode::BAD_REQUEST, "coord_crs 'epsg:3857' is not supported for a posted shape (use epsg:4326)");
     }
@@ -2625,7 +2632,7 @@ async fn part_image(
     if mercator && !(nearest && planes_can && pq.algorithm.is_none()) {
         return detail(
             StatusCode::BAD_REQUEST,
-            "dst_crs 'epsg:3857' is drawn with nearest-neighbour resampling only, and not with `algorithm`",
+            "dst_crs 'epsg:3857' is drawn with nearest-neighbour resampling only, and not with `algorithm` or band math only the renderer reads",
         );
     }
     // The extension in the path, then `format=`; with neither, the pixels decide.
@@ -2688,6 +2695,12 @@ async fn part_image(
         // or the first three, where planes would stack them all and TiTiler refuse most.
         let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty())
             || (first.len() == 1 && !matches!(first[0].index.full_res().samples_per_pixel, 1 | 3));
+        // Those the renderer draws, and it draws in degrees only.
+        if mercator && alpha && !planes_needed {
+            return Err(EngineError::BadRequest(
+                "dst_crs 'epsg:3857' is not supported for a raster with an alpha band, or of two bands or more than three asked for whole".into(),
+            ));
+        }
         if mercator || planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
             if pq.algorithm.is_some() {
                 return Err(EngineError::BadRequest(
