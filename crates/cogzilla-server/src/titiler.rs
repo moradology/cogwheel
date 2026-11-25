@@ -2715,8 +2715,18 @@ pub fn encode_geotiff_f32(
     };
     let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
     let pixel_bytes = n_px * (spp as usize) * 4;
-    let photometric: u32 = if spp == 3 { 2 } else { 1 }; // RGB for 3-band, MinIsBlack otherwise
-    let extra_samples_count: u16 = if spp == 2 || spp > 3 { spp - 1 } else { 0 };
+    let photometric: u32 = if data_spp == 3 { 2 } else { 1 }; // RGB when data has 3 bands, MinIsBlack otherwise
+    let extra_samples_count: u16 = if photometric == 2 {
+        spp.saturating_sub(3)
+    } else {
+        spp.saturating_sub(1)
+    };
+    let mut extra_samples = Vec::with_capacity(extra_samples_count as usize);
+    for idx in 0..extra_samples_count {
+        let is_mask = return_mask && idx + 1 == extra_samples_count;
+        // 2 = UnassociatedAlpha for the appended validity mask, 0 = Unspecified for extra data bands.
+        extra_samples.push(if is_mask { 2u16 } else { 0u16 });
+    }
     let n_entries: u16 = if extra_samples_count > 0 { 16 } else { 15 };
 
     let ifd_size = 2 + 12 * (n_entries as usize) + 4;
@@ -2730,12 +2740,15 @@ pub fn encode_geotiff_f32(
         extra_off += (spp as u32) * 2;
         off
     };
-    let extra_samples_val = if extra_samples_count >= 3 {
-        let off = extra_off;
-        extra_off += (extra_samples_count as u32) * 2;
-        off
-    } else {
-        0u32 // inline zeros (0 = Unspecified) for count 1 or 2
+    let extra_samples_val = match extra_samples_count {
+        0 => 0u32,
+        1 => extra_samples[0] as u32,
+        2 => (extra_samples[0] as u32) | ((extra_samples[1] as u32) << 16),
+        _ => {
+            let off = extra_off;
+            extra_off += (extra_samples_count as u32) * 2;
+            off
+        }
     };
     let sf_val = if spp == 1 {
         3u32
@@ -2796,8 +2809,8 @@ pub fn encode_geotiff_f32(
         }
     }
     if extra_samples_count >= 3 {
-        for _ in 0..extra_samples_count {
-            buf.put_u16_le(0);
+        for &es in &extra_samples {
+            buf.put_u16_le(es);
         }
     }
     if spp >= 3 {
