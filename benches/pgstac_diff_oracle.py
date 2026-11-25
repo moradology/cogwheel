@@ -593,8 +593,8 @@ def main() -> int:
         o.check("bbox, exact size", "image", f"/searches/{sid}/bbox/{part}/300x200.png?assets=visual")
         o.check("bbox, width only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&width=300")
         o.check("bbox, height only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&height=90")
-        o.check("bbox at the data's own resolution", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual",
-                known="shared bbox renderer: a pixel with a zero in any band is nodata; TiTiler needs every band")
+        o.check("bbox at the data's own resolution", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual")
+        o.check("bbox, reproject=bilinear", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=256&reproject=bilinear")
         o.check("bbox, jpg", "image", f"/searches/{sid}/bbox/{part}.jpg?assets=visual&max_size=256")
         o.check("bbox, webp", "image", f"/searches/{sid}/bbox/{part}/256x128.webp?assets=visual")
         o.check("bbox over several items", "image", f"/searches/{sid}/bbox/{wide}.png?assets=visual&max_size=512")
@@ -772,9 +772,27 @@ def main() -> int:
         ]:
             o.check(f"statistics, pixel_selection={method}, {'band math' if 'expression' in q else q.count('assets=')} assets" if q.count('assets=') > 1 else f"statistics, pixel_selection={method}, one asset", "zonal",
                     f"{st}?{q}&max_size=64&pixel_selection={method}{every}", "POST", five)
-        o.check("bbox, pixel_selection=lastbandhigh", "status",
-                f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=64&pixel_selection=lastbandhigh{every}",
-                known="bbox and feature images do not take the last-band methods, more than three assets or assets on different grids yet")
+        # The same on images: each asset read on its own grid over the box.
+        bb = f"/searches/{sid}/bbox/{part}"
+        for name, q in [
+            ("two assets", ".png?assets=red&assets=nir&rescale=0,4000&max_size=256"),
+            ("four assets, band math", f".png?{four}&expression={ndvi}&rescale=-1,1&max_size=256"),
+            ("four assets, pixel_selection=lastbandhigh", f".png?{four}&rescale=0,4000&max_size=256&pixel_selection=lastbandhigh{every}"),
+            ("one asset, pixel_selection=lastbandlow", f".png?assets=visual&max_size=256&pixel_selection=lastbandlow{every}"),
+            ("assets on two grids, pixel_selection=mean", f".png?{mixed}&max_size=256&pixel_selection=mean{every}"),
+            ("assets on two grids, the data's own resolution", f".png?{mixed}"),
+            ("assets on two grids, the coarser first", f".png?assets=swir16&assets=red&asset_as_band=true&expression={opt('b1-b2')}&rescale=-2000,2000"),
+            ("assets on two grids, exact size", f"/300x200.png?{mixed}"),
+            ("band math on one asset of several", f".png?assets={opt('red|expression=b1*2')}&assets=nir&assets=green&rescale=0,8000&max_size=256"),
+        ]:
+            o.check(f"planes bbox, {name}", "image", f"{bb}{q}")
+        o.check("planes bbox, assets on two grids", "image", f"{bb}.png?{mixed}&max_size=256")
+        o.check("planes bbox, four bands", "json", f"{bb}.png?{four}&rescale=0,4000&max_size=64")
+        o.check("planes feature, assets on two grids", "image", f"/searches/{sid}/feature/300x200.png?{mixed}", "POST", triangle)
+        o.check("planes feature, two assets", "image", f"/searches/{sid}/feature.png?assets=red&assets=nir&rescale=0,4000&max_size=256", "POST", triangle)
+        o.check("feature, jpg with a rescale", "image",
+                f"/searches/{sid}/feature.jpg?assets=red&assets=green&assets=blue&asset_as_band=true&rescale=0,4000&max_size=256", "POST", triangle)
+        o.check("planes collection bbox", "image", f"/collections/{collection}/bbox/{part}/300x200.png?{mixed}")
         for method, q in [
             ("highest", "assets=visual"),
             ("lowest", "assets=red&rescale=0,3000&colormap_name=viridis"),

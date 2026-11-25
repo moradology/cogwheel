@@ -225,15 +225,12 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     }
     let bbox = format!("{base}/searches/{id}/bbox/6,44,7,45.png?assets=visual&max_size=64");
     let plain = client.get(&bbox).send().await.unwrap().status().as_u16();
-    for method in ["highest", "lowest", "mean", "median", "stdev", "count"] {
+    for method in ["highest", "lowest", "mean", "median", "stdev", "count", "lastbandlow", "lastbandhigh"] {
         let image = client.get(format!("{bbox}&pixel_selection={method}")).send().await.unwrap();
         assert_eq!(image.status().as_u16(), plain, "{method}");
     }
-    let image = client.get(format!("{bbox}&pixel_selection=lastbandlow")).send().await.unwrap();
-    assert_eq!(image.status().as_u16(), 400);
-    assert!(body_json(image).await["detail"].as_str().unwrap().contains("last band"));
-    // More than three assets, or two without band math, are tiles made from planes; over
-    // nothing they are nothing, and on an image they are refused.
+    // More than three assets, or two without band math, are made from planes, on tiles
+    // and on images; over nothing they are nothing.
     for assets in ["assets=red&assets=green&assets=blue&assets=nir&asset_as_band=true", "assets=red&assets=nir"] {
         let resp = client.get(format!("{tile}.png?{assets}")).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 204, "{assets}");
@@ -243,7 +240,7 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         .send()
         .await
         .unwrap();
-    assert_eq!(image.status().as_u16(), 400);
+    assert_eq!(image.status().as_u16(), plain);
     let seventeen: String = (0..17).map(|n| format!("assets=a{n}&")).collect();
     let resp = client.get(format!("{tile}.png?{seventeen}")).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 400);
