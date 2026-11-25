@@ -2320,6 +2320,7 @@ fn compute_expression_statistics_cpu(
         .map(|(_, prog)| prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where))
         .collect();
     let has_const_expr = exprs.iter().any(|(_, prog)| prog.used_bands.is_empty());
+    let needs_empty_tiles = has_const_expr || has_where.iter().any(|&w| w);
 
     let mut eval_px = |bands: &[Option<&cogzilla_codec::BandData>], idx: usize| {
         let mut slot_vals = [0.0f32; 16];
@@ -2378,10 +2379,19 @@ fn compute_expression_statistics_cpu(
         let mut any_band = false;
         match &fetched {
             StatsTiles::Chunky { tiles, .. } => {
-                let Some(tile) = &tiles[ti] else { continue };
-                for (b, slot) in band_ptrs.iter_mut().enumerate().take(count) {
-                    *slot = tile.bands.get(b).filter(|tb| !tb.stats.all_nodata).map(|tb| &tb.data);
-                    any_band |= slot.is_some();
+                if let Some(tile) = &tiles[ti] {
+                    for (b, slot) in band_ptrs.iter_mut().enumerate().take(count) {
+                        *slot = tile
+                            .bands
+                            .get(b)
+                            .filter(|tb| !tb.stats.all_nodata)
+                            .map(|tb| &tb.data);
+                        any_band |= slot.is_some();
+                    }
+                } else if needs_empty_tiles {
+                    band_ptrs.fill(None);
+                } else {
+                    continue;
                 }
             }
             StatsTiles::Planar { band_tiles, .. } => {
@@ -2396,7 +2406,7 @@ fn compute_expression_statistics_cpu(
                 }
             }
         }
-        if !any_band && !has_const_expr {
+        if !any_band && !needs_empty_tiles {
             continue;
         }
         let tx = (ti as u32) % ifd.tiles_across;
