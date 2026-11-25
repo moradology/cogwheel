@@ -1663,9 +1663,9 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if query_value(pairs, "algorithm_params").is_some() {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
     }
-    // The mosaic engine renders whole tiles at the two native sizes without these.
+    // A tile's `buffer` is taken before this is asked; anything else has none.
     if pq.buffer > 0.0 {
-        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'buffer' is not supported on mosaic routes yet"));
+        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'buffer' is for tiles"));
     }
     if pq.unscale && assets.len() > 1 {
         return Err(detail(
@@ -2601,6 +2601,25 @@ async fn part_image(
     mask: Option<&PolygonMask>,
     size: PartSize,
     ext: Option<&str>,
+    pq: ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    part_image_of(ctx, pg, hash, geometry, None, bbox, mask, size, ext, pq, pairs).await
+}
+
+/// [`part_image`], with the items looked up under `searched` when it is given and not
+/// under the box: a buffered tile is drawn past its bounds from the items of the tile.
+#[allow(clippy::too_many_arguments)]
+async fn part_image_of(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    hash: &str,
+    geometry: &Value,
+    searched: Option<&Value>,
+    bbox: [f64; 4],
+    mask: Option<&PolygonMask>,
+    size: PartSize,
+    ext: Option<&str>,
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
@@ -2674,7 +2693,7 @@ async fn part_image(
         return detail(StatusCode::BAD_REQUEST, "the box has no area in the coordinate system asked for");
     }
     let own_geometry = given_in_metres.then(|| bbox_polygon(in_degrees));
-    let geometry = own_geometry.as_ref().unwrap_or(geometry);
+    let geometry = searched.or(own_geometry.as_ref()).unwrap_or(geometry);
     if mercator && !(nearest && planes_can && pq.algorithm.is_none()) {
         return detail(
             StatusCode::BAD_REQUEST,
@@ -4184,6 +4203,34 @@ async fn tile(
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
+    // A tile with a `buffer` is the tile's box grown by that many pixels on every side,
+    // at a size grown as much: to rio-tiler, and here, a box in Web Mercator like any other.
+    if pq.buffer > 0.0 {
+        let buffer_asked = pq.buffer;
+        if scale.is_some_and(|s| !(1..=8).contains(&s)) {
+            return detail(StatusCode::BAD_REQUEST, "a tile's scale is from @1x to @8x");
+        }
+        pq.buffer = 0.0;
+        match check_mosaic_query(&pq, pairs) {
+            Ok(q) if q.resampling != ResampleMode::Nearest || q.reproject != ResampleMode::Nearest => {
+                return detail(StatusCode::BAD_REQUEST, "a tile with a `buffer` is read with nearest-neighbour resampling only");
+            }
+            Ok(_) => {}
+            Err(r) => return r,
+        }
+        let buffer = buffer_asked;
+        let side = scale.map_or(pq.tile_size, |s| s * 256);
+        let grown = (side as f32 + 2.0 * buffer).round() as u32;
+        let bbox = super::web_mercator_buffered_3857_bbox(tile.z, tile.x, tile.y, buffer, side);
+        pq.coord_crs_3857 = true;
+        // What a box reads and a tile passes over: the system is the tile's, and so is the size.
+        const OF_A_BOX: [&str; 6] = ["buffer", "coord_crs", "dst_crs", "width", "height", "max_size"];
+        let pairs: Vec<(String, String)> = pairs.iter().filter(|(k, _)| !OF_A_BOX.contains(&k.as_str())).cloned().collect();
+        let ext = (!ext.is_empty()).then_some(ext);
+        let size = PartSize::Exact(grown, grown);
+        let under = tile_polygon(tile);
+        return Box::pin(part_image_of(ctx, pg, id, &under, Some(&under), bbox, None, size, ext, pq, &pairs)).await;
+    }
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,

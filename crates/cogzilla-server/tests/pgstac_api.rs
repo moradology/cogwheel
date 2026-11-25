@@ -207,7 +207,7 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("an asset option without a value", "assets=visual%7Cbidx"),
         ("asset names in an expression", "assets=red&assets=nir&expression=nir-red"),
         ("too many assets", "assets=a&assets=b&assets=c&assets=d&assets=e&assets=f&assets=g&assets=h&assets=i&assets=j&assets=k&assets=l&assets=m&assets=n&assets=o&assets=p&assets=q"),
-        ("buffer", "assets=visual&buffer=2"),
+        ("a buffer with another resampling", "assets=visual&buffer=2&resampling=bilinear"),
         ("bad limit", "assets=visual&items_limit=many"),
     ] {
         let resp = client.get(format!("{tile}.png?{query}")).send().await.unwrap();
