@@ -1955,6 +1955,12 @@ impl CogStore {
         offset: u64,
         byte_len: u32,
     ) -> Result<bytes::Bytes, IoError> {
+        const MAX_RAW_PASSTHROUGH_BYTES: u32 = 16 * 1024 * 1024;
+        if byte_len > MAX_RAW_PASSTHROUGH_BYTES {
+            return Err(IoError::Tiff(TiffError::Corrupt(
+                "raw passthrough tile exceeds 16 MiB limit",
+            )));
+        }
         let is_local = matches!(cog.source, CogSource::LocalMmap { .. });
         let want = byte_len as usize;
         if !is_local {
