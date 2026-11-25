@@ -3335,6 +3335,14 @@ async fn render_mosaic_tile_styled(
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0.0
         || matches!(treq.format, OutputFormat::Npy)
+        || (pq.color_formula.is_some()
+            && !matches!(
+                treq.bands,
+                BandRequest::Rgb { .. }
+                    | BandRequest::SarRgb { .. }
+                    | BandRequest::CustomExprRgb { .. }
+                    | BandRequest::Terrain { .. }
+            ))
         || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
     if !needs_bbox_mosaic
@@ -3485,7 +3493,7 @@ async fn render_mosaic_tile_styled(
                 OutputFormat::RawRgba,
                 pq.nodata,
                 scene_lut.as_ref(),
-                None,
+                cf.as_ref(),
                 true,
                 pq.unscale,
             )
@@ -3503,9 +3511,6 @@ async fn render_mosaic_tile_styled(
             if filled >= n_px {
                 break;
             }
-        }
-        if let Some(cf) = cf {
-            cf.apply_buffer_in_place(&mut comp, 4);
         }
         return Ok(encode_rgba_output(
             out_dim as usize,
