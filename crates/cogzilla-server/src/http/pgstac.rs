@@ -1666,9 +1666,6 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.nodata.is_some() {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'nodata' is not supported on mosaic routes yet"));
     }
-    if pq.custom_colormap_json.is_some() {
-        return Err(detail(StatusCode::BAD_REQUEST, "a JSON 'colormap' is not supported on mosaic routes yet"));
-    }
     if pq.unscale && assets.len() > 1 {
         return Err(detail(
             StatusCode::BAD_REQUEST,
@@ -2191,6 +2188,8 @@ impl PlanesTile {
 struct Look<'a> {
     rescale: &'a [(f32, f32)],
     colormap: ColormapName,
+    /// The request's own colour map, given as JSON: classes or intervals of values.
+    custom: Option<&'a cogzilla_kernel::CustomColormap>,
     formula: Option<&'a cogzilla_kernel::ColorFormula>,
     /// The format asked for and its media type; `None` leaves it to the mask.
     asked: Option<(OutputFormat, &'static str)>,
@@ -2233,11 +2232,17 @@ impl PlanesTile {
                     None if full => "JPEG",
                     None => "PNG",
                 };
-                let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap).map_err(|bands| {
+                if look.custom.is_some() && selected.bands != 1 {
+                    return Err(EngineError::BadRequest("Source data must be 1 band".into()));
+                }
+                let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap, look.custom).map_err(|bands| {
                     EngineError::BadRequest(format!(
                         "Could not encode array of shape ({bands},{height},{width}) and of datatype `uint8` using {driver} driver"
                     ))
                 })?;
+                // Under a colour map of the request's own, a pixel is there when its colour
+                // is not wholly transparent: that is the mask TiTiler picks a format by.
+                let full = if look.custom.is_some() { rgba.chunks_exact(4).all(|p| p[3] != 0) } else { full };
                 (rgba, selected.bands, full)
             }
         };
@@ -2267,6 +2272,7 @@ fn paint_bands(
     rescale: &[(f32, f32)],
     default: (f32, f32),
     colormap: ColormapName,
+    custom: Option<&cogzilla_kernel::CustomColormap>,
 ) -> Result<Vec<u8>, usize> {
     // One range is for every band; several are one each.
     let range = |band: usize| match rescale {
@@ -2277,7 +2283,22 @@ fn paint_bands(
     match selected.bands {
         1 => {
             let (min, max) = range(0);
-            Ok(Paint::Gray { min, max, colormap }.rgba(selected, pixels))
+            let Some(custom) = custom else {
+                return Ok(Paint::Gray { min, max, colormap }.rgba(selected, pixels));
+            };
+            // A colour map of the request's own: each value's class or interval, with
+            // the transparency it names, and nothing where there is no value.
+            // With `rescale` the map is over the byte the value becomes, the same byte a
+            // grey picture would show; without, over the value itself.
+            let direct = custom.uses_direct_lookup();
+            let mut out = vec![0u8; pixels * 4];
+            for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
+                if !v.is_nan() {
+                    let colour = if direct { custom.lookup(*v, 0.0, 1.0) } else { custom.lookup(f32::from(rescale_byte(*v, min, max)), 0.0, 1.0) };
+                    px.copy_from_slice(&colour);
+                }
+            }
+            Ok(out)
         }
         3 => {
             let (r, g, b) = (range(0), range(1), range(2));
@@ -2486,7 +2507,13 @@ async fn part_image(
     // The renderer's band math knows names and functions that band math over planes does
     // not (`ndvi`, `^`, `max(a, b)`); what only it can read, it draws.
     let planes_can = planes_read_all(&pq, &query);
-    let planes_needed = wants_planes(&pq, &query);
+    // A colour map given as JSON is applied to planes; the renderer on this road has none.
+    let custom = match pq.custom_colormap_json.as_deref().map(|j| cogzilla_kernel::CustomColormap::from_json_str(j, !pq.rescale.is_empty())) {
+        None => None,
+        Some(Ok(map)) => Some(map),
+        Some(Err(e)) => return detail(StatusCode::BAD_REQUEST, e),
+    };
+    let planes_needed = wants_planes(&pq, &query) || custom.is_some();
     let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
@@ -2593,6 +2620,7 @@ async fn part_image(
             let look = Look {
                 rescale: &pq.rescale,
                 colormap: pq.colormap,
+                custom: custom.as_ref(),
                 formula: formula.as_ref(),
                 asked: format.map(|(f, ct)| (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct })),
                 jpeg_quality: pq.jpeg_quality,
@@ -3917,7 +3945,13 @@ async fn tile(
     // with nearest-neighbour resampling, whose planes are read the way GDAL's warp reads
     // and are TiTiler's pixels; the renderer draws the other methods, the algorithms, and
     // band math only its own engine reads.
-    let planes_wanted = wants_planes(&pq, &query);
+    // A colour map given as JSON is applied to planes; the renderer on this road has none.
+    let custom = match pq.custom_colormap_json.as_deref().map(|j| cogzilla_kernel::CustomColormap::from_json_str(j, !pq.rescale.is_empty())) {
+        None => None,
+        Some(Ok(map)) => Some(map),
+        Some(Err(e)) => return detail(StatusCode::BAD_REQUEST, e),
+    };
+    let planes_wanted = wants_planes(&pq, &query) || custom.is_some();
     let planes_preferred = planes_read_all(&pq, &query)
         && query.resampling == ResampleMode::Nearest
         && query.reproject == ResampleMode::Nearest
@@ -4064,6 +4098,7 @@ async fn tile(
                 let look = Look {
                     rescale: &pq.rescale,
                     colormap: pq.colormap,
+                    custom: custom.as_ref(),
                     formula: formula.as_ref(),
                     asked,
                     jpeg_quality,
@@ -5561,20 +5596,31 @@ mod tests {
         let ranges = [(0.0, 100.0), (0.0, 10.0), (0.0, 1.0)];
         // One range is for every band, several are one each, none is the default.
         let one = Selected { bands: 1, values: vec![50.0, nan] };
-        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale).unwrap(), [127, 127, 127, 255, 0, 0, 0, 0]);
-        assert_eq!(paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale).unwrap()[..4], [255, 255, 255, 255]);
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 127, 127, 255, 0, 0, 0, 0]);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale, None).unwrap()[..4], [255, 255, 255, 255]);
+        // A colour map of the request's own: classes over the values themselves, or over
+        // the byte `rescale` makes of them, or intervals; nothing where there is no value
+        // or no class for it.
+        let classes = cogzilla_kernel::CustomColormap::from_json_str(r#"{"50": [1, 2, 3, 200], "127": [9, 9, 9, 255]}"#, false).unwrap();
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap(), [1, 2, 3, 200, 0, 0, 0, 0]);
+        let scaled = cogzilla_kernel::CustomColormap::from_json_str(r#"{"50": [1, 2, 3, 200], "127": [9, 9, 9, 255]}"#, true).unwrap();
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&scaled)).unwrap()[..4], [9, 9, 9, 255]);
+        let spans = cogzilla_kernel::CustomColormap::from_json_str("[[[0, 40], [1, 1, 1, 255]], [[40, 60], [2, 2, 2, 255]]]", false).unwrap();
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&spans)).unwrap()[..4], [2, 2, 2, 255]);
+        let other = Selected { bands: 1, values: vec![7.0, 70.0] };
+        assert_eq!(paint_bands(&other, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap(), [0u8; 8]);
         let three = Selected { bands: 3, values: vec![50.0, 5.0, 0.5] };
-        assert_eq!(paint_bands(&three, 1, &ranges, (0.0, 1.0), ColormapName::Grayscale).unwrap(), [127, 127, 127, 255]);
-        assert_eq!(paint_bands(&three, 1, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale).unwrap(), [127, 12, 1, 255]);
+        assert_eq!(paint_bands(&three, 1, &ranges, (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 127, 127, 255]);
+        assert_eq!(paint_bands(&three, 1, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 12, 1, 255]);
         // Two bands: red and green, and the mask for blue; never transparent.
         let two = Selected { bands: 2, values: vec![50.0, nan, nan, 5.0, 10.0, nan] };
         assert_eq!(
-            paint_bands(&two, 3, &ranges[..2], (0.0, 1.0), ColormapName::Grayscale).unwrap(),
+            paint_bands(&two, 3, &ranges[..2], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(),
             [127, 127, 255, 255, 0, 255, 255, 255, 0, 0, 0, 255]
         );
         // Four bands and more are no picture.
         let four = Selected { bands: 4, values: vec![1.0; 4] };
-        assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale).unwrap_err(), 4);
+        assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale, None).unwrap_err(), 4);
     }
 
     #[test]

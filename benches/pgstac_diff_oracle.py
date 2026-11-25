@@ -451,6 +451,14 @@ def main() -> int:
         o.check("reproject=bilinear", "image", f"{base12}.png?assets=visual&reproject=bilinear")
         o.check("three assets as RGB", "image", f"{base12}.png?assets=red&assets=green&assets=blue&rescale=0,3000")
         o.check("one band with a colormap", "image", f"{base12}.png?assets=nir&rescale=0,5000&colormap_name=viridis")
+        classes = "%7B%224%22%3A%5B0%2C128%2C0%2C255%5D%2C%225%22%3A%22%23c8c800%22%2C%226%22%3A%5B0%2C0%2C255%2C255%5D%2C%228%22%3A%5B200%2C200%2C200%2C255%5D%2C%229%22%3A%5B255%2C255%2C255%2C255%5D%7D"
+        # Neighbouring intervals in near colours: the pixels the two servers take from
+        # either side of an edge then weigh what they would in any other picture.
+        spans = "%5B%5B%5B0%2C500%5D%2C%5B60%2C70%2C80%2C255%5D%5D%2C%5B%5B500%2C1500%5D%2C%5B110%2C120%2C130%2C255%5D%5D%2C%5B%5B1500%2C20000%5D%2C%5B170%2C180%2C190%2C255%5D%5D%5D"
+        o.check("one band with classes of colour", "image", f"{base12}.png?assets=scl&colormap={classes}")
+        o.check("one band with classes of colour, format from the pixels", "image", f"{base12}?assets=scl&colormap={classes}")
+        o.check("one band with intervals of colour", "image", f"{base12}.png?assets=red&colormap={spans}")
+        o.check("three bands with classes of colour", "json", f"{base12}.png?assets=visual&colormap={classes}")
         o.check("expression across two assets", "image",
                 f"{base12}.png?assets=nir&assets=red&expression=(b1-b2)/(b1%2Bb2)&rescale=-1,1&colormap_name=rdylgn")
         o.check("filtered search", "image",
@@ -635,6 +643,7 @@ def main() -> int:
         o.check("bbox over several items", "image", f"/searches/{sid}/bbox/{wide}.png?assets=visual&max_size=512")
         o.check("bbox, three assets", "image",
                 f"/searches/{sid}/bbox/{part}.png?assets=red&assets=green&assets=blue&rescale=0,3000&max_size=256")
+        o.check("bbox, one band with classes of colour", "image", f"/searches/{sid}/bbox/{part}.png?assets=scl&max_size=256&colormap={classes}")
         o.check("bbox, one band with a colormap", "image",
                 f"/searches/{sid}/bbox/{part}.png?assets=nir&rescale=0,5000&colormap_name=viridis&max_size=256")
         o.check("bbox, filtered search", "image", f"/searches/{sid_meta}/bbox/{part}.png?assets=visual&max_size=256")
