@@ -2554,6 +2554,9 @@ impl MosaicColormap {
                 // Where intervals overlap, the one given last is the one that shows.
                 spans.iter().rev().find(|(low, high, _)| x >= *low && x < *high).map_or(NOTHING, |span| span.2)
             }
+            // A ramp between stops is made only for `colormap_type=linear`, which these
+            // routes do not read: `parse` above never makes one.
+            cogzilla_kernel::CustomColormap::Linear { .. } => NOTHING,
         }
     }
 }
