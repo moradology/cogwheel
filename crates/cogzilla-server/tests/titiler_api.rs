@@ -1137,6 +1137,67 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             pal[299] = [200, 150, 100, 255];
             let cmap = cogzilla_kernel::CustomColormap::from_rgba_palette(&pal);
             assert_eq!(cmap.lookup(299.0, 0.0, 1.0), [200, 150, 100, 255]);
+
+            // Audit c69 regression check: antimeridian (w > e) and inverted (s > n) STAC Item
+            // bboxes on /stac/map must not panic in render_bbox_impl and must preserve 5:4 aspect.
+            let am_stac_path = std::env::temp_dir().join(format!(
+                "cogzilla_stac_antimeridian_{}.json",
+                std::process::id()
+            ));
+            let am_stac = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "fiji-antimeridian",
+                "bbox": [177.0, -20.0, -178.0, -16.0],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "b1": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                }
+            });
+            std::fs::write(&am_stac_path, am_stac.to_string()).unwrap();
+            let am_stac_url = am_stac_path.to_str().unwrap();
+            let am_resp = client
+                .get(format!(
+                    "{base}/stac/map?url={am_stac_url}&assets=b1&max_size=128&rescale=0,1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(am_resp.status(), 200, "antimeridian /stac/map must not panic");
+            let am_bytes = am_resp.bytes().await.unwrap();
+            assert_eq!(&am_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            let am_w = u32::from_be_bytes([am_bytes[16], am_bytes[17], am_bytes[18], am_bytes[19]]);
+            let am_h = u32::from_be_bytes([am_bytes[20], am_bytes[21], am_bytes[22], am_bytes[23]]);
+            assert_eq!((am_w, am_h), (128, 102));
+
+            let inv_stac = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "inverted-bbox",
+                "bbox": [0.0, 10.0, 1.0, -10.0],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "b1": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                }
+            });
+            let inv_stac_path = std::env::temp_dir().join(format!(
+                "cogzilla_stac_inverted_{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&inv_stac_path, inv_stac.to_string()).unwrap();
+            let inv_stac_url = inv_stac_path.to_str().unwrap();
+            let inv_resp = client
+                .get(format!(
+                    "{base}/stac/map?url={inv_stac_url}&assets=b1&rescale=0,1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(inv_resp.status(), 400, "inverted s > n STAC bbox must return 400");
+            let _ = std::fs::remove_file(&am_stac_path);
+            let _ = std::fs::remove_file(&inv_stac_path);
         }
     }
 }
