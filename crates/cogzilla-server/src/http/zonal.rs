@@ -10,11 +10,12 @@ pub(super) type Ring = Vec<(f64, f64)>;
 /// For every pixel of a `width` x `height` grid, how many of its `scale` x `scale`
 /// sub-cells the polygon touches. With `scale` 1 this is rasterio's
 /// `rasterize(all_touched=True)`; a sub-cell is touched when its centre is inside the
-/// polygon (even-odd over all rings) or a ring passes through it.
+/// polygon (even-odd over its rings) or a ring passes through it. Each polygon is burned
+/// on its own, as GDAL burns them, so where two overlap a sub-cell is counted once.
 ///
 /// The polygon and the scale come from a request, so the work they ask for is counted
 /// first and refused when it is more than a statistics request has any use for.
-pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: usize) -> Result<Vec<u32>, String> {
+pub(super) fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, scale: usize) -> Result<Vec<u32>, String> {
     let scale = scale.max(1);
     let (fw, fh) = (width * scale, height * scale);
     let mut counts = vec![0u32; width * height];
@@ -24,13 +25,13 @@ pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: u
     // Every row of the fine grid looks at every segment, and a segment burns a cell for
     // every row and column it crosses inside the grid.
     let too_much = || "the polygon has too many vertices for this size and cover_scale; simplify it, or lower cover_scale".to_string();
-    let segments: u64 = rings.iter().map(|ring| ring.len() as u64).sum();
+    let segments: u64 = polygons.iter().flatten().map(|ring| ring.len() as u64).sum();
     if segments.saturating_mul(fh as u64) > MAX_ROW_CHECKS {
         return Err(too_much());
     }
     let s = scale as f64;
     let mut burned = 0u64;
-    for ring in rings {
+    for ring in polygons.iter().flatten() {
         let closing = ring.first().zip(ring.last()).filter(|(a, b)| a != b).map(|(a, b)| [*b, *a]);
         for pair in ring.windows(2).map(|p| [p[0], p[1]]).chain(closing) {
             let across = (pair[0].0 * s).clamp(0.0, fw as f64) - (pair[1].0 * s).clamp(0.0, fw as f64);
@@ -43,22 +44,27 @@ pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: u
     if burned > MAX_EDGE_CELLS {
         return Err(too_much());
     }
-    let fine: Vec<Ring> = rings
+    let fine: Vec<Vec<Ring>> = polygons
         .iter()
-        .map(|ring| {
-            let mut ring: Ring = ring.iter().map(|&(x, y)| (x * s, y * s)).collect();
-            // Rings are closed for the edge walk whether or not the input repeats the start.
-            if ring.len() > 1 && ring.first() != ring.last() {
-                ring.push(ring[0]);
-            }
-            ring
+        .map(|rings| {
+            rings
+                .iter()
+                .map(|ring| {
+                    let mut ring: Ring = ring.iter().map(|&(x, y)| (x * s, y * s)).collect();
+                    // Rings are closed for the edge walk whether or not the input repeats the start.
+                    if ring.len() > 1 && ring.first() != ring.last() {
+                        ring.push(ring[0]);
+                    }
+                    ring
+                })
+                .filter(|ring| ring.len() >= 2)
+                .collect()
         })
-        .filter(|ring| ring.len() >= 2)
         .collect();
 
     // Cells the rings pass through, as (row, column).
     let mut edge_cells: Vec<(u32, u32)> = Vec::new();
-    for ring in &fine {
+    for ring in fine.iter().flatten() {
         for pair in ring.windows(2) {
             burn_line(pair[0], pair[1], fw as i64, fh as i64, &mut edge_cells);
         }
@@ -72,30 +78,46 @@ pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: u
     for row in 0..fh {
         // Cells whose centre is inside: GDAL's scanline fill at the row's centre line.
         let dy = row as f64 + 0.5;
-        crossings.clear();
-        for ring in &fine {
-            for pair in ring.windows(2) {
-                let ((mut x1, mut y1), (mut x2, mut y2)) = (pair[0], pair[1]);
-                if (y1 < dy && y2 < dy) || (y1 > dy && y2 > dy) || y1 == y2 {
-                    continue;
+        spans.clear();
+        for rings in &fine {
+            crossings.clear();
+            for ring in rings {
+                for pair in ring.windows(2) {
+                    let ((mut x1, mut y1), (mut x2, mut y2)) = (pair[0], pair[1]);
+                    if (y1 < dy && y2 < dy) || (y1 > dy && y2 > dy) || y1 == y2 {
+                        continue;
+                    }
+                    if y1 > y2 {
+                        std::mem::swap(&mut x1, &mut x2);
+                        std::mem::swap(&mut y1, &mut y2);
+                    }
+                    if dy < y2 && dy >= y1 {
+                        let x = (dy - y1) * (x2 - x1) / (y2 - y1) + x1;
+                        crossings.push((x + 0.5).floor() as i64);
+                    }
                 }
-                if y1 > y2 {
-                    std::mem::swap(&mut x1, &mut x2);
-                    std::mem::swap(&mut y1, &mut y2);
-                }
-                if dy < y2 && dy >= y1 {
-                    let x = (dy - y1) * (x2 - x1) / (y2 - y1) + x1;
-                    crossings.push((x + 0.5).floor() as i64);
+            }
+            crossings.sort_unstable();
+            for pair in crossings.chunks_exact(2) {
+                let (a, b) = (pair[0].max(0), (pair[1] - 1).min(fw as i64 - 1));
+                if a <= b {
+                    spans.push((a as usize, b as usize));
                 }
             }
         }
-        crossings.sort_unstable();
-        spans.clear();
-        for pair in crossings.chunks_exact(2) {
-            let (a, b) = (pair[0].max(0), (pair[1] - 1).min(fw as i64 - 1));
-            if a <= b {
-                spans.push((a as usize, b as usize));
+        // In order and apart: the spans of polygons that overlap are run together.
+        if fine.len() > 1 {
+            spans.sort_unstable();
+            let mut kept = 0;
+            for i in 1..spans.len() {
+                if spans[i].0 <= spans[kept].1 {
+                    spans[kept].1 = spans[kept].1.max(spans[i].1);
+                } else {
+                    kept += 1;
+                    spans[kept] = spans[i];
+                }
             }
+            spans.truncate((kept + 1).min(spans.len()));
         }
         let out_row = (row / scale) * width;
         for &(a, b) in &spans {
@@ -425,12 +447,12 @@ mod tests {
         // A square from (1.2, 1.2) to (3.6, 3.6): centres of cells 2 and 3 are inside
         // (1.5 is too), and the outline also touches row and column 1.
         let square = vec![vec![(1.2, 1.2), (3.6, 1.2), (3.6, 3.6), (1.2, 3.6), (1.2, 1.2)]];
-        let mask = cover_counts(&square, 5, 5, 1).unwrap();
+        let mask = cover_counts(std::slice::from_ref(&square), 5, 5, 1).unwrap();
         assert_eq!(grid(&mask, 5), [".....", ".###.", ".###.", ".###.", "....."]);
 
         // A thin sliver holds no cell centre and is still burned along its length.
         let sliver = vec![vec![(0.1, 0.1), (3.9, 2.2), (3.9, 2.3), (0.1, 0.2), (0.1, 0.1)]];
-        let mask = cover_counts(&sliver, 4, 3, 1).unwrap();
+        let mask = cover_counts(std::slice::from_ref(&sliver), 4, 3, 1).unwrap();
         assert_eq!(grid(&mask, 4), ["##..", ".###", "...#"]);
 
         // An unclosed ring is closed, and a hole is left out (even-odd).
@@ -438,7 +460,7 @@ mod tests {
             vec![(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
             vec![(1.6, 1.6), (4.4, 1.6), (4.4, 4.4), (1.6, 4.4), (1.6, 1.6)],
         ];
-        let mask = cover_counts(&holed, 6, 6, 1).unwrap();
+        let mask = cover_counts(std::slice::from_ref(&holed), 6, 6, 1).unwrap();
         assert_eq!(grid(&mask, 6), ["######", "######", "##..##", "##..##", "######", "######"]);
     }
 
@@ -446,20 +468,20 @@ mod tests {
     fn coverage_is_the_share_of_sub_cells() {
         // The left half of a 2x1 grid, plus a tenth of the right pixel.
         let ring = vec![vec![(0.0, 0.0), (1.1, 0.0), (1.1, 1.0), (0.0, 1.0), (0.0, 0.0)]];
-        let counts = cover_counts(&ring, 2, 1, 10).unwrap();
+        let counts = cover_counts(std::slice::from_ref(&ring), 2, 1, 10).unwrap();
         assert_eq!(counts[0], 100);
         // Sub-columns 10 (centre inside) and 11 (the edge at 11.0 runs along its left side).
         assert_eq!(counts[1], 20);
         // Vertices far outside the grid: the walk is clipped to it and still ends.
         let huge = vec![vec![(-1.0e9, -1.0e9), (2.0e9, -1.0e9), (0.0, 2.0e9), (-1.0e9, -1.0e9)]];
-        assert_eq!(cover_counts(&huge, 2, 1, 10).unwrap(), [100, 100]);
+        assert_eq!(cover_counts(std::slice::from_ref(&huge), 2, 1, 10).unwrap(), [100, 100]);
         // A polygon away from the grid touches nothing.
         let far = vec![vec![(10.0, 10.0), (12.0, 10.0), (12.0, 12.0), (10.0, 10.0)]];
-        assert!(cover_counts(&far, 2, 1, 10).unwrap().iter().all(|c| *c == 0));
+        assert!(cover_counts(std::slice::from_ref(&far), 2, 1, 10).unwrap().iter().all(|c| *c == 0));
         // A polygon that asks for more work than statistics have a use for is refused.
         let comb: Vec<Ring> = (0..4096).map(|i| vec![(0.0, i as f64), (64.0, i as f64), (64.0, i as f64 + 0.5), (0.0, i as f64)]).collect();
-        assert!(cover_counts(&comb, 64, 64, 1).is_ok());
-        assert!(cover_counts(&comb, 64, 64, 1000).is_err());
+        assert!(cover_counts(std::slice::from_ref(&comb), 64, 64, 1).is_ok());
+        assert!(cover_counts(std::slice::from_ref(&comb), 64, 64, 1000).is_err());
     }
 
     #[test]
@@ -515,4 +537,17 @@ mod tests {
         assert_eq!(s["valid_pixels"], 0.0);
         assert_eq!(s["histogram"][0], json!([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
     }
+    #[test]
+    fn polygons_that_overlap_are_counted_once() {
+        let square = |x: f64| vec![(x, 0.0), (x + 2.0, 0.0), (x + 2.0, 2.0), (x, 2.0), (x, 0.0)];
+        // Half of column 0, then columns 1 to 3, the last by the edge that runs along it:
+        // the overlap is in both squares and counted once.
+        let both = [vec![square(0.5)], vec![square(1.5)]];
+        let counts = cover_counts(&both, 5, 2, 2).unwrap();
+        assert_eq!(counts, [2, 4, 4, 4, 0, 2, 4, 4, 4, 0]);
+        // As one polygon of two rings the overlap is a hole.
+        let one = [vec![square(0.5), square(1.5)]];
+        assert_ne!(cover_counts(&one, 5, 2, 2).unwrap(), counts);
+    }
+
 }
