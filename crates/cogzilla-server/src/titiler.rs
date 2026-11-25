@@ -2494,6 +2494,156 @@ pub fn encode_geotiff_rgba(
     buf.freeze()
 }
 
+/// Encode a CHW `f32` little-endian buffer as a spec-compliant uncompressed Classic IEEE Float32
+/// GeoTIFF (`SampleFormat=3`, `BitsPerSample=32`, `GDAL_NODATA="nan"`).
+pub fn encode_geotiff_f32(
+    width: u32,
+    height: u32,
+    raw_f32_chw: &[u8],
+    bbox: [f64; 4],
+    epsg: u16,
+) -> Bytes {
+    let width = width.clamp(1, 4096);
+    let height = height.clamp(1, 4096);
+    let n_px = (width as usize) * (height as usize);
+    let spp: u16 = if n_px > 0 && raw_f32_chw.len() >= n_px * 4 {
+        (raw_f32_chw.len() / (n_px * 4)).clamp(1, 16) as u16
+    } else {
+        1
+    };
+    let pixel_bytes = n_px * (spp as usize) * 4;
+    let n_entries: u16 = 15;
+
+    let ifd_size = 2 + 12 * (n_entries as usize) + 4;
+    let mut extra_off = (8 + ifd_size) as u32;
+    let bps_val = if spp == 1 {
+        32u32
+    } else if spp == 2 {
+        32u32 | (32u32 << 16)
+    } else {
+        let off = extra_off;
+        extra_off += (spp as u32) * 2;
+        off
+    };
+    let sf_val = if spp == 1 {
+        3u32
+    } else if spp == 2 {
+        3u32 | (3u32 << 16)
+    } else {
+        let off = extra_off;
+        extra_off += (spp as u32) * 2;
+        off
+    };
+    let scale_off = extra_off;
+    let tie_off = scale_off + 24;
+    let gkd_off = tie_off + 48;
+    let pixel_off = gkd_off + 32;
+
+    let mut buf = BytesMut::with_capacity((pixel_off as usize) + pixel_bytes);
+    // TIFF little-endian header
+    buf.put_slice(b"II");
+    buf.put_u16_le(42);
+    buf.put_u32_le(8);
+
+    // IFD entries (must be in strictly ascending tag order)
+    buf.put_u16_le(n_entries);
+    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
+        buf.put_u16_le(tag);
+        buf.put_u16_le(ty);
+        buf.put_u32_le(count);
+        buf.put_u32_le(val);
+    };
+    const ASCII: u16 = 2;
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    const DOUBLE: u16 = 12;
+
+    put_entry(256, LONG, 1, width);
+    put_entry(257, LONG, 1, height);
+    put_entry(258, SHORT, spp as u32, bps_val); // BitsPerSample = 32
+    put_entry(259, SHORT, 1, 1); // Compression = None
+    put_entry(262, SHORT, 1, 1); // Photometric = MinIsBlack
+    put_entry(273, LONG, 1, pixel_off); // StripOffsets
+    put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
+    put_entry(278, LONG, 1, height); // RowsPerStrip
+    put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
+    put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
+    put_entry(339, SHORT, spp as u32, sf_val); // SampleFormat = IEEEFloat (3)
+    put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
+    put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
+    put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
+    put_entry(42113, ASCII, 4, u32::from_le_bytes(*b"nan\0")); // GDAL_NODATA = "nan"
+    buf.put_u32_le(0); // Next IFD = 0
+
+    if spp >= 3 {
+        for _ in 0..spp {
+            buf.put_u16_le(32);
+        }
+        for _ in 0..spp {
+            buf.put_u16_le(3);
+        }
+    }
+    // ModelPixelScaleTag: [dx, dy, 0.0]
+    let dx = ((bbox[2] - bbox[0]).abs() / (width.max(1) as f64)).max(1e-12);
+    let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
+    buf.put_f64_le(dx);
+    buf.put_f64_le(dy);
+    buf.put_f64_le(0.0);
+    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(bbox[0]);
+    buf.put_f64_le(bbox[3]);
+    buf.put_f64_le(0.0);
+    // GeoKeyDirectoryTag
+    let is_geographic = matches!(
+        cogzilla_proj::CrsModel::from_epsg(epsg),
+        Ok(cogzilla_proj::CrsModel::Geographic)
+    );
+    let (model_type, crs_key): (u16, u16) = if is_geographic {
+        (2, 2048)
+    } else {
+        (1, 3072)
+    };
+    let gkd: [u16; 16] = [
+        1, 1, 0, 3,
+        1024, 0, 1, model_type,
+        1025, 0, 1, 1,
+        crs_key, 0, 1, epsg,
+    ];
+    for &k in &gkd {
+        buf.put_u16_le(k);
+    }
+
+    // Pixel data: interleave CHW f32 planes into Chunky f32
+    if spp == 1 {
+        let take = pixel_bytes.min(raw_f32_chw.len());
+        buf.put_slice(&raw_f32_chw[..take]);
+        if take < pixel_bytes {
+            let rem_f32 = (pixel_bytes - take) / 4;
+            for _ in 0..rem_f32 {
+                buf.put_f32_le(f32::NAN);
+            }
+        }
+    } else {
+        let spp_us = spp as usize;
+        let plane_bytes = n_px * 4;
+        for px in 0..n_px {
+            let px_off = px * 4;
+            for b in 0..spp_us {
+                let off = b * plane_bytes + px_off;
+                if off + 4 <= raw_f32_chw.len() {
+                    buf.put_slice(&raw_f32_chw[off..off + 4]);
+                } else {
+                    buf.put_f32_le(f32::NAN);
+                }
+            }
+        }
+    }
+    buf.freeze()
+}
+
 /// Project a WGS84 polygon bbox into an IFD's pixel space and return its clipped `(win_w, win_h)`.
 fn polygon_window_dims(
     ifd: &cogzilla_tiff::IfdMeta,

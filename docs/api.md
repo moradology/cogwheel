@@ -1,44 +1,42 @@
 # API
 
-`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing when last run at v0.1.0. The mosaic routes and `algorithm=` are not covered yet.
+`cogzilla-server` implements the routers of TiTiler 2.4 that do not need Postgres, so MapLibre, Leaflet, OpenLayers and QGIS clients can switch by changing the base URL. The `/cog`, `/stac`, `/colorMaps`, and `/tileMatrixSets` routes below are covered by 39 differential HTTP checks against a live TiTiler (`benches/titiler_diff_oracle.py`), all passing on `v0.7.0`.
 
 **`/cog/*`** (TiTiler's `TilerFactory`)
 
-- Tiles: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|webp|jpg|npy|f32}]`, for `WebMercatorQuad` and `WorldCRS84Quad`. `@1x` is 256 px and `@2x` is 512 px.
-- Tile parameters: `rescale`, `colormap_name`, `colormap` (JSON discrete or interval), `expression`, `algorithm` (`terrarium`, `terrainrgb`, `hillshade`, `slope`, `aspect`, with `azimuth`, `altitude`, `z_factor`), `resampling`, `reproject`, `nodata`, `unscale`, `return_mask`, `color_formula`, `buffer`.
-- Metadata: `GET /cog/info`, `/cog/info.geojson`, `/cog/bounds`, `/cog/validate`, `/cog/{tms}/tilejson.json`, `/cog/{tms}/WMTSCapabilities.xml`, `/cog/tiles`, `/cog/tiles/{tms}`, `/cog/{tms}/map.html`.
+- Tiles: `GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@{scale}x][.{png|pngraw|webp|jpg|tif|tiff|npy|f32}]`, across all 13 `morecantile` OGC TileMatrixSets (`WebMercatorQuad`, `WorldCRS84Quad`, `WGS1984Quad`, `WorldMercatorWGS84Quad`, `CanadianNAD83_LCC`, `EuropeanETRS89_LAEAQuad`, `NZTM2000Quad`, `UPSArcticWGS84Quad`, `UPSAntarcticWGS84Quad`, `UTM31WGS84Quad`, `GNOSISGlobalGrid`, `CDB1GlobalGrid`, `LINZAntarticaMapTilegrid`). `@1x` is 256 px and `@2x` is 512 px (`@1x`..`@4x` supported).
+- Tile parameters: `rescale`, `colormap_name`, `colormap` (JSON discrete or interval, plus automatic TIFF Tag 320 embedded palette support), `expression`, `algorithm` (all 19 TiTiler algorithms + `aspect`, with `algorithm_params` JSON), `resampling` & `reproject` (all 15 GDAL methods), `nodata`, `unscale`, `return_mask`, `color_formula`, `buffer` (fractional float).
+- Metadata & OGC: `GET /conformance`, `/cog/info`, `/cog/info.geojson`, `/cog/bounds`, `/cog/validate`, `/cog/{tms}/tilejson.json`, `/cog/{tms}/WMTSCapabilities.xml`, `/cog/tiles`, `/cog/tiles/{tms}`, `/cog/{tms}/map.html`, `/cog/map`.
 - Point and statistics: `GET /cog/point/{lon},{lat}` (with `coord_crs`), `GET|POST /cog/statistics` (POST clips to a GeoJSON `Feature`, `FeatureCollection`, or geometry).
-- Crops: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]` (also accepts `?width=`/`?height=` query params).
+- Crops: `GET /cog/preview[/{w}x{h}][.{ext}]`, `GET /cog/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]`, `POST /cog/feature[/{w}x{h}][.{ext}]` (supports `?width=`, `?height=`, `?max_size=0` for full native resolution, `?coord_crs=`, `?dst_crs=`, `?crs=`).
 
 **`/stac/*`** (TiTiler's `MultiBaseTilerFactory` with `STACReader`)
 
-- `GET /stac/assets`, `/stac/bounds`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/WMTSCapabilities.xml`, `/stac/{tms}/map.html`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
+- `GET /stac/assets`, `/stac/bounds`, `/stac/info`, `/stac/info.geojson`, `/stac/asset_statistics`, `/stac/tiles`, `/stac/tiles/{tms}`, `/stac/tiles/{tms}/{z}/{x}/{y}[@{scale}x][.{ext}]`, `/stac/{tms}/tilejson.json`, `/stac/{tms}/WMTSCapabilities.xml`, `/stac/{tms}/map.html`, `/stac/map`, `/stac/point/{lon},{lat}`, `/stac/preview[/{w}x{h}][.{ext}]`, `/stac/bbox/...`; `GET|POST /stac/statistics`; `POST /stac/feature[/{w}x{h}][.{ext}]`.
+- Supports per-asset `?asset_bidx=name|1,2,3`, mixed-resolution & mixed-CRS multi-asset compositing (e.g. Sentinel-2 10 m + 20 m bands), and `X-Assets` response headers.
 - The STAC item can be a local path, an HTTP(S) URL or an `s3://` URI. Its JSON is cached, and assets named with `?assets=red&assets=green&assets=blue` are opened concurrently.
 - Expressions can use band positions, `(b1-b2)/(b1+b2)`, or asset names, `(red-green)/(red+green)` or `{asset}_b{k}`.
-- On the M5 at v0.1.0, with local fixtures, a warm cache and one request at a time, these routes ran 4–84× faster than TiTiler. The large multiples are tiles (2.1 ms against 52.3 ms, 25×), info (50×), TileJSON (70×) and three-asset point queries (84×); asset listing, statistics and previews were 4–11×.
 
-**`/algorithms`**, **`/colorMaps`**, and **`/tileMatrixSets`**
+**`/mosaicjson/*`**, **`/algorithms`**, **`/colorMaps`**, and **`/tileMatrixSets`**
 
-- `GET /algorithms`, `GET /algorithms/{algorithmId}`: TiTiler `AlgorithmFactory` metadata for all 18 supported algorithms (`hillshade`, `slope`, `aspect`, `terrarium`, `terrainrgb`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale`, `bitonal`).
-- `GET /colorMaps`, `GET /colorMaps/{colorMapId}`: the lookup tables match `rio-tiler`'s exactly, and `?f=png` returns a 256×20 colorbar.
-- `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}`: `WebMercatorQuad` (25 levels) and `WorldCRS84Quad` as OGC TileMatrixSet 2.0 JSON.
+- `GET /mosaicjson/{info,info.geojson,bounds,assets,statistics,point/{lon},{lat},bbox/{bbox}[/{w}x{h}][.{ext}],tiles/{tms}/{z}/{x}/{y}[@scale][.{ext}],{tms}/tilejson.json,{tms}/WMTSCapabilities.xml,{tms}/map.html}` and `POST /mosaicjson/{validate,statistics,feature[/{w}x{h}][.{ext}]}`.
+- `GET /algorithms`, `GET /algorithms/{algorithmId}`: TiTiler `AlgorithmFactory` metadata for all 19 supported algorithms (`hillshade`, `slope`, `aspect`, `contours`, `terrarium`, `terrainrgb`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale`, `bitonal`).
+- `GET /colorMaps`, `GET /colorMaps/{colorMapId}`: all 211 lookup tables match `rio-tiler` bit-for-bit, and `?f=png` returns a 256×20 colorbar.
+- `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}`: all 13 `morecantile` OGC TileMatrixSet 2.0 JSON definitions.
 
-## Differences from TiTiler
+## Notes on TiTiler Compatibility
 
-- **Unsupported or invalid options return `422` JSON, never a silently different picture.** Both invalid parameter values and unsupported TiTiler options return HTTP `422` with FastAPI's `{"detail": [{"type": "value_error", "loc": ["query"], "msg": "..."}]}` JSON schema. Query parameters that neither server defines (cache-busters, tokens) are ignored, as in TiTiler.
-- `resampling` and `reproject` accept `nearest`, `bilinear` and `cubic`. `lanczos` and `cubic_spline` are served as cubic. The other GDAL methods (`average`, `mode`, `gauss`, `rms`, `max`, `min`, `med`, `q1`, `q3`, `sum`) are rejected.
-- `algorithm` accepts `hillshade`, `slope`, `aspect`, `terrarium`, `terrainrgb`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale` and `bitonal`. Only TiTiler's `contours` is rejected. `aspect` is a `cogzilla` addition.
-- Tile matrix sets are `WebMercatorQuad` and `WorldCRS84Quad`; TiTiler's other eleven are rejected.
-- Rejected parameters: `padding` (other than `0`), `dst_crs`, `crs`, and `cover_scale`.
-- Statistics support `bidx`/`indexes`, custom percentiles (`p`), `histogram_bins`, `histogram_range`, `categorical`, `c`, and (on `/cog/statistics`) `;`-separated `expression`; `algorithm` is rejected on statistics routes. Point queries support `bidx`/`indexes` and `;`-separated `expression`. `POST /statistics` and `POST /feature` both support a single Feature, geometry, or `FeatureCollection` (up to 64 features).
-- `coord_crs` accepts `EPSG:4326`/`CRS84`, `EPSG:3857`, and all 3,260+ supported EPSG codes on point queries and `/bbox`. `max_size` is supported on format-only `/bbox` routes (and rejected when explicit `{w}x{h}` dimensions are given). `POST /feature` also supports `?shape_mask=true|false`.
-- `tilesize` accepts 64 to 2048.
-- Output formats are `png`, `pngraw`, `jpg`, `webp`, `tif`/`tiff` (GeoTIFF), `npy` and raw `f32`. JPEG 2000 is not available.
-- `expression` supports arithmetic, comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`), `where(cond, a, b)`, and functions (`sqrt`, `log10`, `ln`, `log2`, `db`, `exp`, `abs`, `ceil`, `floor`, `round`, `min`, `max`, `clip`), plus `;`-separated multi-band outputs on `/point`, `/cog/statistics`, and 3-band RGB tile/crop routes.
-- A tile outside the dataset's bounds returns `404` on `/cog/tiles` and `/stac/tiles` (matching TiTiler); `/mosaic` returns a transparent `200` tile.
-- Remote sources are `http(s)://`, `/vsicurl/http(s)://`, `s3://`, `/vsis3/`, `gs://`, `/vsigs/`, `az://`, `abfs[s]://`, and `/vsiaz/`. Other GDAL virtual filesystems such as `/vsizip/` or `/vsimem/` are not recognized.
-- Mosaics: `GET /mosaicjson/{info,{tms}/tilejson.json,tiles/...}?url=...` serves quadkey-indexed MosaicJSON documents; `GET /mosaic/tiles/{tms}/{z}/{x}/{y}?url=a&url=b`, `GET /mosaic/{name}/tiles/{tms}/{z}/{x}/{y}`, and `POST /mosaic/register` serve front-to-back dynamic or spatially indexed mosaics (including live STAC-API `/search`) with early exit once 100% of pixels are filled.
-- Shorthands that TiTiler does not have: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `expr=` is an alias for `expression=` (both accept the preset names), and `/tiles/{name}/...` serves datasets registered at startup.
+- **FastAPI-compatible error responses**: invalid parameter values and unsupported options return HTTP `422` (or `400`/`404`) with FastAPI's JSON `{"detail": ...}` schema. Query parameters that neither server defines (cache-busters, tokens) are ignored, as in TiTiler.
+- **Resampling**: `resampling` and `reproject` implement all 15 GDAL methods (`nearest`, `bilinear`, `cubic`, `cubic_spline`, `lanczos`, `gauss`, `average`, `mode`, `rms`, `min`, `max`, `med`, `q1`, `q3`, `sum`).
+- **GeoTIFF (`.tif`/`.tiff`) output**: styled renders (`rescale`, `colormap_name`, `colormap`, `color_formula`, `hillshade`, `terrarium`, `terrainrgb`, 8-bit RGB) emit 8-bit RGB/RGBA GeoTIFFs; unstyled scientific/float/DEM/expression renders emit native IEEE Float32 GeoTIFFs (`SampleFormat=3`, `GDAL_NODATA="nan"`).
+- **Output formats**: `png`, `pngraw`, `jpg`/`jpeg`, `webp`, `tif`/`tiff` (GeoTIFF), `npy` (`application/x-binary`), and raw `f32`. JPEG 2000 is not available.
+- **Response headers**: `Server-Timing: total;dur=<ms>`, `ETag` + `304 Not Modified`, and `X-Assets` on `/stac/*`.
+- **Statistics & points**: statistics support `bidx`/`indexes`, `asset_bidx`, custom percentiles (`p`), `histogram_bins`, `histogram_range`, `categorical`, `c`, and `;`-separated `expression`; `algorithm` is rejected on statistics routes. Point queries support `bidx`/`indexes`, `asset_bidx`, and `;`-separated `expression`. `POST /statistics` and `POST /feature` both support a single Feature, geometry, or `FeatureCollection` (up to 64 features).
+- **CRS & dimensions**: `coord_crs`, `dst_crs`, and `crs` accept `EPSG:4326`/`CRS84`, `EPSG:3857`, `EPSG:3395`, and all 3,260+ supported EPSG codes. `max_size=0` renders at full native resolution (up to 4096 px); `tilesize` accepts 64 to 2048.
+- **Expressions**: `expression` supports arithmetic, comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`), `where(cond, a, b)`, and functions (`sqrt`, `log10`, `ln`, `log2`, `db`, `exp`, `abs`, `ceil`, `floor`, `round`, `min`, `max`, `clip`), plus `;`-separated multi-band outputs on `/point`, `/cog/statistics`, and 3-band RGB tile/crop routes.
+- **Out-of-bounds tiles**: returns `404` on `/cog/tiles` and `/stac/tiles` (matching TiTiler); `/mosaic` returns a transparent `200` tile.
+- **Remote sources & auth**: `http(s)://`, `/vsicurl/http(s)://`, `s3://`, `/vsis3/`, `gs://`, `/vsigs/`, `az://`, `abfs[s]://`, and `/vsiaz/`, with `GDAL_HTTP_BEARER`, `GDAL_HTTP_USERPWD`, `GDAL_HTTP_HEADERS`, and `GDAL_HTTP_HEADER_FILE` (gated on `COGZILLA_ALLOWED_URL_PREFIXES`).
+- **Cogzilla extensions**: `GET /cog/tiles/{z}/{x}/{y}` assumes `WebMercatorQuad`, `expr=` aliases `expression=` (including presets), `/tiles/{name}/...` serves pre-registered datasets, and `/mosaic/{tiles,register,{name}/tiles}` serves dynamic/spatially indexed mosaics (including live STAC-API `/search`).
 
 ## Coordinate systems
 
