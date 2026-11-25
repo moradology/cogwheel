@@ -3201,6 +3201,33 @@ where
     }
 
     if method == Method::GET && (path == "/" || path == "/index.html") {
+        let wants_json = raw_query.split('&').any(|kv| kv == "f=json")
+            || (path == "/"
+                && req
+                    .headers()
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|a| a.contains("application/json") && !a.contains("text/html")));
+        if wants_json {
+            let landing = serde_json::json!({
+                "title": "cogzilla",
+                "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG, STAC & MosaicJSON tile server",
+                "links": [
+                    { "href": format!("{host}/"), "rel": "self", "type": "application/json", "title": "Landing Page" },
+                    { "href": format!("{host}/api"), "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.0", "title": "OpenAPI definition" },
+                    { "href": format!("{host}/api.html"), "rel": "service-doc", "type": "text/html", "title": "Swagger UI" },
+                    { "href": format!("{host}/conformance"), "rel": "conformance", "type": "application/json", "title": "OGC API conformance classes" },
+                    { "href": format!("{host}/tileMatrixSets"), "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-schemes", "type": "application/json", "title": "TileMatrixSets" },
+                    { "href": format!("{host}/colorMaps"), "rel": "data", "type": "application/json", "title": "ColorMaps" },
+                    { "href": format!("{host}/algorithms"), "rel": "data", "type": "application/json", "title": "Algorithms" }
+                ]
+            });
+            return Ok(plain_resp(
+                StatusCode::OK,
+                Bytes::from(landing.to_string()),
+                "application/json",
+            ));
+        }
         let base_path_js = serde_json::to_string(&forwarded_prefix)
             .unwrap_or_else(|_| "\"\"".to_string())
             .replace("</", "<\\/");
@@ -3211,7 +3238,7 @@ where
         return Ok(plain_resp(StatusCode::OK, Bytes::from(html), "text/html; charset=utf-8"));
     }
 
-    if method == Method::GET && path == "/openapi.json" {
+    if method == Method::GET && (path == "/openapi.json" || path == "/api") {
         let spec = serde_json::json!({
             "openapi": "3.1.0",
             "info": {
@@ -3258,7 +3285,7 @@ where
         return Ok(plain_resp(StatusCode::OK, Bytes::from(spec), "application/json"));
     }
 
-    if method == Method::GET && path == "/docs" {
+    if method == Method::GET && (path == "/docs" || path == "/api.html") {
         let spec_url_js = serde_json::to_string(&format!("{forwarded_prefix}/openapi.json"))
             .unwrap_or_else(|_| "\"/openapi.json\"".to_string())
             .replace("</", "<\\/");
@@ -4488,20 +4515,28 @@ where
                 None | Some("json") => {
                     get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
                 }
-                Some("png") => {
-                    get_colormap_image(id, OutputFormat::Png, pq.orientation_vertical)
-                        .map(|b| (b, "image/png"))
-                }
+                Some("png") => get_colormap_image(
+                    id,
+                    OutputFormat::Png,
+                    pq.orientation_vertical,
+                    pq.width,
+                    pq.height,
+                )
+                .map(|b| (b, "image/png")),
                 Some("jpg" | "jpeg") => get_colormap_image(
                     id,
                     OutputFormat::Jpeg { quality: pq.jpeg_quality },
                     pq.orientation_vertical,
+                    pq.width,
+                    pq.height,
                 )
                 .map(|b| (b, "image/jpeg")),
                 Some("webp") => get_colormap_image(
                     id,
                     OutputFormat::Webp { quality: pq.webp_quality },
                     pq.orientation_vertical,
+                    pq.width,
+                    pq.height,
                 )
                 .map(|b| (b, "image/webp")),
                 Some(other) => Err(EngineError::BadRequest(format!(
@@ -7278,7 +7313,10 @@ mod tests {
         assert!(xml.contains("<ows:Identifier>10</ows:Identifier>"));
 
         // Vertical colormap PNG (20x256) + orientation/width/height query validation
-        let vpng = get_colormap_image("viridis", OutputFormat::Png, true).unwrap();
+        let vpng = get_colormap_image("viridis", OutputFormat::Png, true, None, None).unwrap();
+        let sized = get_colormap_image("viridis", OutputFormat::Png, false, Some(128), Some(16)).unwrap();
+        assert_eq!(&sized[16..20], &128u32.to_be_bytes());
+        assert_eq!(&sized[20..24], &16u32.to_be_bytes());
         assert_eq!(&vpng[0..8], b"\x89PNG\r\n\x1a\n");
         let w = u32::from_be_bytes([vpng[16], vpng[17], vpng[18], vpng[19]]);
         let h = u32::from_be_bytes([vpng[20], vpng[21], vpng[22], vpng[23]]);

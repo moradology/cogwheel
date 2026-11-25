@@ -423,6 +423,8 @@ def main():
             ("GET /colorMaps", "GET", "/colorMaps", None, "json_cmaps"),
             ("GET /colorMaps/viridis (256-entry exact LUT)", "GET", "/colorMaps/viridis", None, "json_cmap_lut"),
             ("GET /colorMaps/viridis?f=png", "GET", "/colorMaps/viridis?f=png", None, "png"),
+            ("GET /colorMaps/viridis?f=png&width=128&height=16", "GET", "/colorMaps/viridis?f=png&width=128&height=16", None, "png"),
+            ("GET /colorMaps/viridis?f=png&w=16&h=128&vertical", "GET", "/colorMaps/viridis?f=png&width=16&height=128&orientation=vertical", None, "png"),
             ("GET /tileMatrixSets", "GET", "/tileMatrixSets", None, "json_tms_list"),
             ("GET /tileMatrixSets/WebMercatorQuad", "GET", "/tileMatrixSets/WebMercatorQuad", None, "json_tms_one"),
             ("GET /stac/assets", "GET", f"/stac/assets?url={stac_item}", None, "json_stac_assets"),
