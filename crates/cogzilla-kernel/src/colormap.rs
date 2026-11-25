@@ -33,9 +33,9 @@ fn parse_json_rgba(v: &serde_json::Value) -> Option<[u8; 4]> {
     None
 }
 
-/// Custom TiTiler JSON `?colormap=` supporting both discrete class maps (`{"10": [r,g,b,a], ...}`)
-/// with arbitrary signed integer keys (including `< 0` and `>= 256`) and interval colormaps
-/// (`[[[min, max], [r,g,b,a]], ...]`).
+/// Custom TiTiler JSON `?colormap=` supporting discrete class maps (`{"10": [r,g,b,a], ...}`),
+/// linear continuous ramps (`?colormap_type=linear&colormap={"0":"#0000ff","255":"#ff0000"}`),
+/// and interval colormaps (`[[[min, max], [r,g,b,a]], ...]`).
 #[derive(Clone)]
 pub enum CustomColormap {
     Discrete {
@@ -43,6 +43,11 @@ pub enum CustomColormap {
         extra: HashMap<i64, [u8; 4]>,
         /// When true (`?rescale=` was NOT explicitly supplied), look up raw integer values directly
         /// instead of rescaling by the dtype range (fixes classified `Uint16`/`Int16`/`Float32` COGs).
+        direct_lookup: bool,
+    },
+    Linear {
+        /// Sorted `(stop_value, [r, g, b, a])` control points.
+        stops: Vec<(f32, [u8; 4])>,
         direct_lookup: bool,
     },
     Intervals(Vec<(f32, f32, [u8; 4])>),
@@ -71,9 +76,42 @@ impl CustomColormap {
 
     /// Parse a TiTiler custom JSON colormap (object for discrete classes, array for intervals).
     pub fn from_json_str(json_str: &str, rescale_explicit: bool) -> Result<Self, String> {
+        Self::from_json_str_with_type(json_str, rescale_explicit, false)
+    }
+
+    /// Parse a TiTiler custom JSON colormap with optional `colormap_type=linear` interpolation.
+    pub fn from_json_str_with_type(
+        json_str: &str,
+        rescale_explicit: bool,
+        linear: bool,
+    ) -> Result<Self, String> {
         let val: serde_json::Value =
             serde_json::from_str(json_str).map_err(|e| format!("invalid colormap JSON: {e}"))?;
         if let Some(obj) = val.as_object() {
+            if linear {
+                let mut stops: Vec<(f32, [u8; 4])> = Vec::with_capacity(obj.len());
+                for (k, v) in obj {
+                    let Ok(key) = k.trim().parse::<f32>() else {
+                        continue;
+                    };
+                    if !key.is_finite() {
+                        continue;
+                    }
+                    let Some(rgba) = parse_json_rgba(v) else {
+                        continue;
+                    };
+                    stops.push((key, rgba));
+                }
+                if stops.is_empty() {
+                    return Err("linear colormap JSON must contain at least one numeric stop".to_string());
+                }
+                stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                stops.dedup_by(|a, b| a.0 == b.0);
+                return Ok(Self::Linear {
+                    stops,
+                    direct_lookup: !rescale_explicit,
+                });
+            }
             let mut rgba_u32 = [0u32; 256];
             let mut rgb = [[0u8; 3]; 256];
             let mut extra = HashMap::new();
@@ -138,7 +176,9 @@ impl CustomColormap {
     #[inline(always)]
     pub fn uses_direct_lookup(&self) -> bool {
         match self {
-            Self::Discrete { direct_lookup, .. } => *direct_lookup,
+            Self::Discrete { direct_lookup, .. } | Self::Linear { direct_lookup, .. } => {
+                *direct_lookup
+            }
             Self::Intervals(_) => true,
         }
     }
@@ -163,6 +203,48 @@ impl CustomColormap {
                     let idx = ((v - rescale_min) * inv_range).clamp(0.0, 255.0) as usize;
                     lut.rgba_u32[idx].to_le_bytes()
                 }
+            }
+            Self::Linear {
+                stops,
+                direct_lookup,
+            } => {
+                let x = if *direct_lookup {
+                    v
+                } else {
+                    ((v - rescale_min) * inv_range).clamp(0.0, 255.0)
+                };
+                if stops.is_empty() {
+                    return [0, 0, 0, 0];
+                }
+                if x <= stops[0].0 {
+                    return stops[0].1;
+                }
+                let last = stops.len() - 1;
+                if x >= stops[last].0 {
+                    return stops[last].1;
+                }
+                let hi_idx = stops.partition_point(|&(k, _)| k < x);
+                if hi_idx == 0 {
+                    return stops[0].1;
+                }
+                let (k0, c0) = stops[hi_idx - 1];
+                let (k1, c1) = stops[hi_idx];
+                let span = k1 - k0;
+                if span <= 0.0 {
+                    return c1;
+                }
+                let t = ((x - k0) / span).clamp(0.0, 1.0);
+                let lerp = |a: u8, b: u8| -> u8 {
+                    (a as f32 + t * (b as f32 - a as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                [
+                    lerp(c0[0], c1[0]),
+                    lerp(c0[1], c1[1]),
+                    lerp(c0[2], c1[2]),
+                    lerp(c0[3], c1[3]),
+                ]
             }
             Self::Intervals(intervals) => {
                 for &(lo, hi, rgba) in intervals {
@@ -355,5 +437,18 @@ mod tests {
         assert_eq!(cmap.lookup(100.0, 0.0, 1.0), [0, 255, 0, 255]);
         assert_eq!(cmap.lookup(499.9, 0.0, 1.0), [0, 255, 0, 255]);
         assert_eq!(cmap.lookup(500.0, 0.0, 1.0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn custom_colormap_linear_interpolates_stops() {
+        let json = r##"{"0":"#0000ff","255":"#ff0000"}"##;
+        let cmap = CustomColormap::from_json_str_with_type(json, false, true).unwrap();
+        assert_eq!(cmap.lookup(0.0, 0.0, 1.0), [0, 0, 255, 255]);
+        assert_eq!(cmap.lookup(255.0, 0.0, 1.0), [255, 0, 0, 255]);
+        let mid = cmap.lookup(127.5, 0.0, 1.0);
+        assert!((mid[0] as i32 - 128).abs() <= 1);
+        assert_eq!(mid[1], 0);
+        assert!((mid[2] as i32 - 128).abs() <= 1);
+        assert_eq!(mid[3], 255);
     }
 }

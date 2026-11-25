@@ -36,7 +36,7 @@ use super::zonal::{self, Bins, StatsOptions};
 use crate::engine::{BandRequest, EngineError, MOSAIC_SCENES_AHEAD, TileEngine};
 use crate::stac::{StacItem, stac_item_from_json};
 use crate::titiler::{
-    PolygonMask, build_map_html, encode_rgba_output, query_point, render_wgs84_bbox,
+    PolygonMask, build_map_html, encode_rgba_output_colour, query_point, render_wgs84_bbox,
 };
 
 /// Most scenes one tile may read. titiler-pgstac's default `items_limit` is 100.
@@ -1565,7 +1565,7 @@ impl Paint {
             | BandRequest::Dem { rescale, colormap, .. } => Self::Gray { min: rescale.0, max: rescale.1, colormap: *colormap },
             BandRequest::Rgb { rescale_min, rescale_max, .. }
             | BandRequest::SarRgb { rescale_min, rescale_max, .. } => Self::Rgb { min: *rescale_min, max: *rescale_max },
-            BandRequest::Terrain { .. } | BandRequest::CustomExprRgb { .. } => return None,
+            BandRequest::Terrain { .. } | BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => return None,
         })
     }
 
@@ -1737,6 +1737,10 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
 /// themselves and answer for: `reproject`, whose methods are checked here, and
 /// `asset_as_band`, `histogram_bins` and the options of `assets`, which get a 422.
 fn own_error(e: &str) -> bool {
+    // The selection is read here, and one nobody has is a 422 as titiler-pgstac answers it.
+    if e.starts_with("unsupported pixel_selection") {
+        return true;
+    }
     match error_parameter(e) {
         Some("reproject" | "asset_as_band" | "histogram_bins") => true,
         Some("assets") => e.ends_with("in |bidx="),
@@ -2550,6 +2554,9 @@ impl MosaicColormap {
                 // Where intervals overlap, the one given last is the one that shows.
                 spans.iter().rev().find(|(low, high, _)| x >= *low && x < *high).map_or(NOTHING, |span| span.2)
             }
+            // A ramp between stops is made only for `colormap_type=linear`, which these
+            // routes do not read: `parse` above never makes one.
+            cogzilla_kernel::CustomColormap::Linear { .. } => NOTHING,
         }
     }
 }
@@ -3125,7 +3132,7 @@ async fn part_image_of(
                 parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?
             }
         };
-        let made = (encode_rgba_output(width, height, &canvas, format, pq.return_mask), content_type);
+        let made = (encode_rgba_output_colour(width, height, &canvas, format, pq.return_mask), content_type);
         Ok(as_geotiff(made, width, height, bbox, 4326, pq.return_mask))
     }
     .await;
@@ -4815,7 +4822,7 @@ fn encode_picture(
             _ => {}
         }
     }
-    Ok((encode_rgba_output(width, height, &rgba, format, alpha), content_type))
+    Ok((encode_rgba_output_colour(width, height, &rgba, format, alpha), content_type))
 }
 
 /// A grey PNG of an RGBA picture whose red is the grey: one channel, or two with `alpha`.
@@ -5035,7 +5042,28 @@ pub(super) async fn item_tile_auto_format(
     let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
     let (format, content_type) =
         parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?;
-    Ok((encode_rgba_output(dim, dim, &rgba, format, pq.return_mask), content_type))
+    Ok((encode_rgba_output_colour(dim, dim, &rgba, format, pq.return_mask), content_type))
+}
+
+/// The place a tile already says it lies, written as titiler-pgstac writes it: degrees
+/// are `EPSG/0/4326` (the shared routes say `OGC/0/CRS84`), and a number is a Python float.
+fn respelled(resp: Resp) -> Resp {
+    let read = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let (Some(bbox), Some(crs)) = (read("content-bbox"), read("content-crs")) else {
+        return resp;
+    };
+    let epsg = if crs.contains("OGC/0/CRS84") || crs.contains("EPSG/0/4326") {
+        4326
+    } else if crs.contains("EPSG/0/3857") {
+        3857
+    } else {
+        return resp;
+    };
+    let numbers: Vec<f64> = bbox.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+    match numbers[..] {
+        [west, south, east, north] => placed(resp, [west, south, east, north], epsg),
+        _ => resp,
+    }
 }
 
 /// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
@@ -5067,11 +5095,12 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             // A buffered tile reaches past its bounds by an amount that depends on its
             // size: it goes without the headers sooner than with the wrong ones.
             if asked("buffer").is_some_and(|b| b.parse::<f64>().map_or(true, |b| b != 0.0)) {
-                return resp;
+                return respelled(resp);
             }
             let (west, south, east, north) = tile_bounds_3857(TileCoord { z, x, y });
             placed(resp, [west, south, east, north], 3857)
         }
+        ["tiles", ..] => respelled(resp),
         ["bbox", seg] | ["bbox", seg, _] => {
             let Some((bbox, _)) = super::parse_bbox4(seg) else {
                 return resp;

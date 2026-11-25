@@ -324,6 +324,8 @@ def main():
             ("GET /cog/tiles/.../12/652/1583.tif (GeoTIFF output)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.tif?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "geotiff"),
             ("GET /cog/tiles/.../12/657/1582.tif (f32 + mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={merc}", None, "geotiff"),
             ("GET /cog/tiles/.../12/657/1582.tif (f32 no mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={merc}&return_mask=false", None, "geotiff"),
+            ("GET /cog/tiles/.../12/652/1583.tif (2-band + mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.tif?url={sat}&bidx=1&bidx=2", None, "geotiff"),
+            ("GET /cog/tiles/.../12/652/1583.npy (2-band + mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat}&bidx=1&bidx=2", None, "npy"),
             ("GET /cog/tiles/.../12/652/1583.npy (NPY + mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat}&bidx=1", None, "npy"),
             ("GET /cog/tiles/.../12/652/1583.npy (NPY no mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat}&bidx=1&return_mask=false", None, "npy"),
             ("GET /cog/tiles/...?buffer=8 (Buffered 272px)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&buffer=8", None, "png"),
@@ -343,6 +345,7 @@ def main():
             ("GET /cog/tiles/...?resampling=average (Mercator)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&rescale=0,1000&colormap_name=viridis&resampling=average", None, "png"),
             ("GET /cog/tiles/...?colormap=interval JSON", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&colormap={interval_cmap}", None, "png"),
             ("GET /cog/tiles/...?colormap=discrete JSON (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&colormap={discrete_cmap}", None, "png"),
+            ("GET /cog/tiles/...?expression=sin(b1/100)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&expression=sin(b1/100)&rescale=-1,1&colormap_name=viridis", None, "png"),
             ("GET /cog/tiles/...?algorithm=hillshade (buffer=0)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&algorithm_params={hs_params}", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=hillshade&buffer=3", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&buffer=3", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=normalizedIndex", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&algorithm=normalizedIndex&rescale=-1,1&colormap_name=viridis&reproject=bilinear", None, "png"),
@@ -376,6 +379,9 @@ def main():
             ("GET /cog/statistics?categorical=true&c=10&c=20", "GET", f"/cog/statistics?url={u8_path}&max_size=64&categorical=true&c=10&c=20", None, "json_stats_cat"),
             ("GET /cog/statistics?expression=(b1-b2)/(b1+b2)", "GET", f"/cog/statistics?url={sat}&max_size=128&expression=(b1-b2)/(b1%2Bb2)", None, "json_stats"),
             ("GET /cog/statistics?algorithm=normalizedIndex", "GET", f"/cog/statistics?url={sat}&max_size=128&bidx=1&bidx=2&algorithm=normalizedIndex", None, "json_stats"),
+            ("GET /cog/statistics?algorithm=hillshade", "GET", f"/cog/statistics?url={merc}&max_size=64&algorithm=hillshade", None, "json_stats_keys"),
+            ("GET /cog/statistics?algorithm=contours", "GET", f"/cog/statistics?url={merc}&max_size=64&algorithm=contours", None, "json_stats_keys"),
+            ("GET /cog/statistics?algorithm=terrarium", "GET", f"/cog/statistics?url={merc}&max_size=64&algorithm=terrarium", None, "json_stats_keys"),
             ("GET /cog/statistics?width=64&height=64", "GET", f"/cog/statistics?url={sat}&width=64&height=64", None, "json_stats"),
             ("POST /cog/statistics (GeoJSON Polygon clip)", "POST", f"/cog/statistics?url={sat}&max_size=512", poly_feature, "json_post_stats"),
             ("POST /cog/statistics (Triangle clip)", "POST", f"/cog/statistics?url={sat}&max_size=256", tri_feature, "json_post_stats"),
@@ -401,6 +407,7 @@ def main():
             ("ERR /stac/info missing assets -> 400/422", "GET", f"/stac/info?url={stac_item}", None, "status_4xx"),
             ("ERR /colorMaps/nonexistent -> 404/422", "GET", "/colorMaps/nonexistent_cmap_xyz", None, "status_4xx"),
             ("ERR /algorithms/nonexistent -> 404/422", "GET", "/algorithms/nonexistent_alg_xyz", None, "status_4xx"),
+            ("ERR /cog/tiles 3-band RGB + colormap_name -> 4xx", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&colormap_name=viridis", None, "status_4xx"),
         ]
 
         # ALL 8 GDAL numeric data types
@@ -440,9 +447,39 @@ def main():
             ("GET /stac/tiles/...?expression=(b1-b2)/(b1+b2)", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_item}&assets=red&assets=green&expression=(b1-b2)/(b1%2Bb2)&rescale=-0.5,0.5&colormap_name=rdylgn&reproject=bilinear", None, "png"),
             ("GET /stac/WebMercatorQuad/tilejson.json", "GET", f"/stac/WebMercatorQuad/tilejson.json?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_tj"),
             ("GET /stac/point/-122.65,37.773 (3-asset)", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_point"),
+            ("GET /stac/point?asset_as_band=true", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red&assets=green&asset_as_band=true", None, "json_point"),
             ("GET /stac/asset_statistics?assets=red&assets=green", "GET", f"/stac/asset_statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stac_asset_stats"),
             ("GET /stac/statistics?assets=red&assets=green", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stats"),
             ("GET /stac/statistics?expression=(b1-b2)/(b1+b2)", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=128&expression=(b1-b2)/(b1%2Bb2)", None, "json_stats"),
+            ("GET /stac/statistics?algorithm=normalizedIndex", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=128&algorithm=normalizedIndex", None, "json_stats"),
+            ("POST /cog/feature (coord_crs=EPSG:3857)", "POST", f"/cog/feature/64x64.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&coord_crs=EPSG:3857", {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-13670000.0, 4523000.0],
+                        [-13636000.0, 4523000.0],
+                        [-13636000.0, 4565000.0],
+                        [-13670000.0, 4565000.0],
+                        [-13670000.0, 4523000.0],
+                    ]]
+                },
+                "properties": {}
+            }, "png"),
+            ("POST /cog/statistics (coord_crs=EPSG:3857)", "POST", f"/cog/statistics?url={sat}&max_size=256&coord_crs=EPSG:3857", {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-13670000.0, 4523000.0],
+                        [-13636000.0, 4523000.0],
+                        [-13636000.0, 4565000.0],
+                        [-13670000.0, 4565000.0],
+                        [-13670000.0, 4523000.0],
+                    ]]
+                },
+                "properties": {}
+            }, "json_post_stats"),
             ("POST /stac/statistics (Polygon)", "POST", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", poly_feature, "json_post_stats"),
             ("GET /stac/preview/256x256.png (3-asset RGB)", "GET", f"/stac/preview/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
             ("GET /stac/bbox/.../256x256.png (3-asset RGB)", "GET", f"/stac/bbox/-122.8,37.6,-122.5,37.9/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),

@@ -166,6 +166,13 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
     if let Some(nv) = nodata_value {
         info["nodata_value"] = nv;
     }
+    if let Some(ref pal) = cog.index.color_map {
+        let mut cmap = serde_json::Map::with_capacity(pal.len());
+        for (i, &[r, g, b, a]) in pal.iter().enumerate() {
+            cmap.insert(i.to_string(), serde_json::json!([r, g, b, a]));
+        }
+        info["colormap"] = serde_json::Value::Object(cmap);
+    }
     Ok(info)
 }
 
@@ -2715,8 +2722,18 @@ pub fn encode_geotiff_f32(
     };
     let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
     let pixel_bytes = n_px * (spp as usize) * 4;
-    let photometric: u32 = if spp == 3 { 2 } else { 1 }; // RGB for 3-band, MinIsBlack otherwise
-    let extra_samples_count: u16 = if spp == 2 || spp > 3 { spp - 1 } else { 0 };
+    let photometric: u32 = if data_spp == 3 { 2 } else { 1 }; // RGB when data has 3 bands, MinIsBlack otherwise
+    let extra_samples_count: u16 = if photometric == 2 {
+        spp.saturating_sub(3)
+    } else {
+        spp.saturating_sub(1)
+    };
+    let mut extra_samples = Vec::with_capacity(extra_samples_count as usize);
+    for idx in 0..extra_samples_count {
+        let is_mask = return_mask && idx + 1 == extra_samples_count;
+        // 2 = UnassociatedAlpha for the appended validity mask, 0 = Unspecified for extra data bands.
+        extra_samples.push(if is_mask { 2u16 } else { 0u16 });
+    }
     let n_entries: u16 = if extra_samples_count > 0 { 16 } else { 15 };
 
     let ifd_size = 2 + 12 * (n_entries as usize) + 4;
@@ -2730,12 +2747,15 @@ pub fn encode_geotiff_f32(
         extra_off += (spp as u32) * 2;
         off
     };
-    let extra_samples_val = if extra_samples_count >= 3 {
-        let off = extra_off;
-        extra_off += (extra_samples_count as u32) * 2;
-        off
-    } else {
-        0u32 // inline zeros (0 = Unspecified) for count 1 or 2
+    let extra_samples_val = match extra_samples_count {
+        0 => 0u32,
+        1 => extra_samples[0] as u32,
+        2 => (extra_samples[0] as u32) | ((extra_samples[1] as u32) << 16),
+        _ => {
+            let off = extra_off;
+            extra_off += (extra_samples_count as u32) * 2;
+            off
+        }
     };
     let sf_val = if spp == 1 {
         3u32
@@ -2796,8 +2816,8 @@ pub fn encode_geotiff_f32(
         }
     }
     if extra_samples_count >= 3 {
-        for _ in 0..extra_samples_count {
-            buf.put_u16_le(0);
+        for &es in &extra_samples {
+            buf.put_u16_le(es);
         }
     }
     if spp >= 3 {
@@ -3362,6 +3382,13 @@ pub struct PolygonMask {
 
 impl PolygonMask {
     pub fn from_geojson(val: &serde_json::Value) -> Result<(Self, [f64; 4]), EngineError> {
+        Self::from_geojson_in_crs(val, None)
+    }
+
+    pub fn from_geojson_in_crs(
+        val: &serde_json::Value,
+        coord_crs: Option<&cogzilla_proj::CrsModel>,
+    ) -> Result<(Self, [f64; 4]), EngineError> {
         let mut geometries: Vec<&serde_json::Value> = Vec::new();
         match val.get("type").and_then(|v| v.as_str()) {
             Some("FeatureCollection") => {
@@ -3476,16 +3503,27 @@ impl PolygonMask {
                 if p.len() < 2 {
                     return Err(EngineError::BadRequest("coord needs [lon, lat]".into()));
                 }
-                let (Some(lon), Some(lat)) = (p[0].as_f64(), p[1].as_f64()) else {
+                let (Some(x), Some(y)) = (p[0].as_f64(), p[1].as_f64()) else {
                     return Err(EngineError::BadRequest(
                         "GeoJSON coordinates must be numeric".into(),
                     ));
                 };
-                if !lon.is_finite() || !lat.is_finite() {
+                if !x.is_finite() || !y.is_finite() {
                     return Err(EngineError::BadRequest(
                         "GeoJSON coordinates must be finite".into(),
                     ));
                 }
+                let (lon, lat) = if let Some(crs) = coord_crs {
+                    let (lo, la) = crs.to_lonlat_deg(x, y);
+                    if !lo.is_finite() || !la.is_finite() {
+                        return Err(EngineError::BadRequest(
+                            "reprojected GeoJSON coordinates are non-finite".into(),
+                        ));
+                    }
+                    (lo, la)
+                } else {
+                    (x, y)
+                };
                 ring.push((lon, lat));
             }
             Ok(ring)
@@ -3625,18 +3663,28 @@ impl PolygonMask {
         dst_crs: &cogzilla_proj::CrsModel,
     ) -> Vec<bool> {
         let mut mask = vec![false; w * h];
-        let dlx = (bbox[2] - bbox[0]) / (w.max(1) as f64);
-        let dly = (bbox[3] - bbox[1]) / (h.max(1) as f64);
-        if dlx <= 0.0 || dly <= 0.0 {
+        if w == 0 || h == 0 {
             return mask;
         }
+        let dlx = (bbox[2] - bbox[0]) / (w as f64);
+        let dly = (bbox[3] - bbox[1]) / (h as f64);
+        if !dlx.is_finite() || !dly.is_finite() || dlx <= 0.0 || dly <= 0.0 {
+            return mask;
+        }
+        let wrap_hi = self.bbox[2] > 180.0;
+        let wrap_lo = self.bbox[0] < -180.0;
         for py in 0..h {
             let y = bbox[3] - (py as f64 + 0.5) * dly;
             let row_off = py * w;
             for px in 0..w {
                 let x = bbox[0] + (px as f64 + 0.5) * dlx;
                 let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
-                if lon.is_finite() && lat.is_finite() && self.contains(lon, lat) {
+                if lon.is_finite()
+                    && lat.is_finite()
+                    && (self.contains(lon, lat)
+                        || (wrap_hi && self.contains(lon + 360.0, lat))
+                        || (wrap_lo && self.contains(lon - 360.0, lat)))
+                {
                     mask[row_off + px] = true;
                 }
             }
@@ -3682,10 +3730,10 @@ impl PolygonMask {
                     }
                 }
             }
-            let sx = x0 + t0 * dx;
-            let sy = y0 + t0 * dy;
-            let ex = x0 + t1 * dx;
-            let ey = y0 + t1 * dy;
+            let sx = (x0 + t0 * dx).clamp(0.0, w as f64);
+            let sy = (y0 + t0 * dy).clamp(0.0, h as f64);
+            let ex = (x0 + t1 * dx).clamp(0.0, w as f64);
+            let ey = (y0 + t1 * dy).clamp(0.0, h as f64);
             let mut ix = (sx.floor() as isize).clamp(0, w as isize - 1);
             let mut iy = (sy.floor() as isize).clamp(0, h as isize - 1);
             let end_x = (ex.floor() as isize).clamp(0, w as isize - 1);
@@ -3693,19 +3741,15 @@ impl PolygonMask {
             mask[iy as usize * w + ix as usize] = true;
             let sdx = ex - sx;
             let sdy = ey - sy;
-            let step_x: isize = if sdx > 0.0 {
-                1
-            } else if sdx < 0.0 {
-                -1
-            } else {
-                0
+            let step_x: isize = match end_x.cmp(&ix) {
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
             };
-            let step_y: isize = if sdy > 0.0 {
-                1
-            } else if sdy < 0.0 {
-                -1
-            } else {
-                0
+            let step_y: isize = match end_y.cmp(&iy) {
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
             };
             let mut t_max_x = if step_x > 0 {
                 ((ix + 1) as f64 - sx) / sdx
@@ -3781,6 +3825,30 @@ pub(crate) fn encode_rgba_output(
     format: OutputFormat,
     return_mask: bool,
 ) -> Bytes {
+    encode_rgba_output_as(w, h, rgba, format, return_mask, true)
+}
+
+/// [`encode_rgba_output`] for a picture known to be of three bands: it is written in
+/// colour whatever its pixels hold, where the other writes a grey picture when every
+/// pixel that is there happens to be grey (which an empty picture always is).
+pub(crate) fn encode_rgba_output_colour(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: OutputFormat,
+    return_mask: bool,
+) -> Bytes {
+    encode_rgba_output_as(w, h, rgba, format, return_mask, false)
+}
+
+fn encode_rgba_output_as(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: OutputFormat,
+    return_mask: bool,
+    grey_if_grey: bool,
+) -> Bytes {
     thread_local! {
         static PNG_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
             const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -3789,10 +3857,11 @@ pub(crate) fn encode_rgba_output(
     match format {
         OutputFormat::Png => {
             let pixels = w.saturating_mul(h);
-            let is_gray = rgba
-                .chunks_exact(4)
-                .take(pixels)
-                .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+            let is_gray = grey_if_grey
+                && rgba
+                    .chunks_exact(4)
+                    .take(pixels)
+                    .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
             let all_opaque = return_mask
                 && rgba.chunks_exact(4).take(pixels).all(|p| p[3] == 255);
             PNG_SCRATCH.with(|cell| {
@@ -3891,7 +3960,10 @@ pub(crate) fn encode_rgba_output(
                 encode_webp_rgba(w as u32, h as u32, rgba, quality)
             }
         }
-        OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
+        OutputFormat::Jpeg { quality } if grey_if_grey => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
+        OutputFormat::Jpeg { quality } => {
+            cogzilla_kernel::jpeg_fast::encode_jpeg_rgba_colour(w as u32, h as u32, rgba, quality)
+        }
         OutputFormat::RawF32 | OutputFormat::Npy | OutputFormat::RawRgba => {
             Bytes::copy_from_slice(rgba)
         }
@@ -4101,6 +4173,14 @@ async fn render_bbox_impl(
             )));
         }
     }
+    if let BandRequest::MultiBand { bands_1based } = bands
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+    {
+        return Err(EngineError::BadRequest(format!(
+            "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
+            bands_1based.len()
+        )));
+    }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
     let primary = &cogs[0];
@@ -4201,6 +4281,7 @@ async fn render_bbox_impl(
             color_formula,
             return_mask,
             unscale,
+            None,
         )
         .await;
     }
@@ -4473,22 +4554,25 @@ async fn render_bbox_impl(
                     | BandRequest::SarRgb { .. }
                     | BandRequest::CustomExprRgb { .. }
                     | BandRequest::Terrain { .. } => 3,
+                    BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
                     _ => 1,
                 };
-                let hdr = if format == OutputFormat::Npy {
-                    Some(cogzilla_kernel::encode_npy_f32_header(nb, h as u32, w as u32))
-                } else {
-                    None
-                };
-                let hdr_len = hdr.as_ref().map_or(0, |v| v.len());
-                let mut b = BytesMut::with_capacity(hdr_len + nb * w * h * 4);
-                if let Some(hdr) = hdr {
-                    b.put_slice(&hdr);
-                }
+                let mut b = BytesMut::with_capacity(nb * w * h * 4);
                 for _ in 0..(nb * w * h) {
                     b.put_slice(&f32::NAN.to_le_bytes());
                 }
-                b.freeze()
+                let raw = b.freeze();
+                if format == OutputFormat::Npy {
+                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                        raw,
+                        nb,
+                        h as u32,
+                        w as u32,
+                        return_mask,
+                    )
+                } else {
+                    raw
+                }
             }
             OutputFormat::RawRgba => Bytes::from(vec![0u8; w * h * 4]),
             _ => encode_rgba_output(w, h, &vec![0u8; w * h * 4], format, return_mask),
@@ -4566,6 +4650,11 @@ async fn render_bbox_impl(
                     for &b in &prog.used_bands {
                         check_band(b)?;
                     }
+                }
+            }
+            BandRequest::MultiBand { bands_1based } => {
+                for &b in bands_1based {
+                    check_band(b)?;
                 }
             }
         }
@@ -5136,6 +5225,16 @@ async fn render_bbox_impl(
                     out.put_slice(&vh_plane);
                     out.put_slice(&diff_plane);
                 }
+                BandRequest::MultiBand { bands_1based } => {
+                    out.reserve(w * h * 4 * bands_1based.len().saturating_sub(1));
+                    for (slot, &b1) in bands_1based.iter().enumerate() {
+                        let r = get_band_refs(b1, slot);
+                        let s = make_src!(&r);
+                        for i in 0..(w * h) {
+                            out.put_slice(&sample(&s, u_map[i], v_map[i]).to_le_bytes());
+                        }
+                    }
+                }
             }
             let raw = out.freeze();
             if format == OutputFormat::Npy {
@@ -5144,6 +5243,7 @@ async fn render_bbox_impl(
                     | BandRequest::SarRgb { .. }
                     | BandRequest::CustomExprRgb { .. }
                     | BandRequest::Terrain { .. } => 3,
+                    BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
                     _ => 1,
                 };
                 return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
@@ -5487,6 +5587,7 @@ async fn render_bbox_impl(
                     }
                 }
             }
+            BandRequest::MultiBand { .. } => {}
         }
 
         if cf_single_lut.is_none()
@@ -5578,6 +5679,55 @@ pub fn build_map_html(tilejson_url: &str) -> String {
 /// Fallback multi-COG / STAC renderer when assets have mixed resolutions, tile grids, overview
 /// counts, or CRSes (e.g. Sentinel-2 10m + 20m bands). Samples each needed asset independently
 /// into a `(w * h)` f32 plane in the target CRS, then evaluates the band math / styling / encoding.
+/// Render a multi-asset request where each slot in `cogs` selects a specific 1-based band
+/// from `asset_bands` (for multi-asset STAC `?asset_bidx=a|2&asset_bidx=b|1`).
+#[allow(clippy::too_many_arguments)]
+pub async fn render_multi_asset_bbox(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    asset_bands: &[u16],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    native_preview: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&CustomColormap>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    let w = (width as usize).clamp(1, 4096);
+    let h = (height as usize).clamp(1, 4096);
+    if let Some(pm) = poly_mask {
+        pm.check_work_budget(w.saturating_mul(h))?;
+    }
+    render_mixed_grid_bbox(
+        engine,
+        cogs,
+        bbox,
+        dst_crs,
+        native_preview,
+        w,
+        h,
+        poly_mask,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+        unscale,
+        Some(asset_bands),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_mixed_grid_bbox(
     engine: &TileEngine,
@@ -5596,6 +5746,7 @@ async fn render_mixed_grid_bbox(
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
+    asset_bands: Option<&[u16]>,
 ) -> Result<Bytes, EngineError> {
     let max_b = cogs.len() as u16;
     // DEM algorithms (hillshade, slope, aspect, contours) operate on a single band using a 3x3
@@ -5614,8 +5765,11 @@ async fn render_mixed_grid_bbox(
             )));
         }
         let single_cog = [cogs[(*band_1based - 1) as usize].clone()];
+        let src_band = asset_bands
+            .and_then(|ab| ab.get((*band_1based - 1) as usize).copied())
+            .unwrap_or(1);
         let single_dem = BandRequest::Dem {
-            band_1based: 1,
+            band_1based: src_band,
             algorithm: *algorithm,
             rescale: *rescale,
             colormap: *colormap,
@@ -5701,6 +5855,11 @@ async fn render_mixed_grid_bbox(
                 }
             }
         }
+        BandRequest::MultiBand { bands_1based } => {
+            for &b in bands_1based {
+                push_b(b)?;
+            }
+        }
     }
 
     // Sample each needed COG independently into a w*h f32 plane in target CRS.
@@ -5711,8 +5870,11 @@ async fn render_mixed_grid_bbox(
     let mut planes: Vec<(u16, Vec<f32>)> = Vec::with_capacity(needed.len());
     for &b1 in &needed {
         let single_cog = [cogs[(b1 - 1) as usize].clone()];
+        let src_band = asset_bands
+            .and_then(|ab| ab.get((b1 - 1) as usize).copied())
+            .unwrap_or(1);
         let single_band = BandRequest::Single {
-            band_1based: 1,
+            band_1based: src_band,
             rescale: (0.0, 1.0),
             colormap: ColormapName::Grayscale,
         };
@@ -5992,6 +6154,14 @@ async fn render_mixed_grid_bbox(
                 }
                 3
             }
+            BandRequest::MultiBand { bands_1based } => {
+                for &b1 in bands_1based {
+                    for &v in get_plane(b1) {
+                        out.put_slice(&v.to_le_bytes());
+                    }
+                }
+                bands_1based.len().max(1)
+            }
         };
         let raw = out.freeze();
         if format == OutputFormat::Npy {
@@ -6223,6 +6393,12 @@ async fn render_mixed_grid_bbox(
                     rgba[i * 4 + 3] = 255;
                 }
             }
+        }
+        BandRequest::MultiBand { bands_1based } => {
+            return Err(EngineError::BadRequest(format!(
+                "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
+                bands_1based.len()
+            )));
         }
     }
     if cf_single_lut.is_none()

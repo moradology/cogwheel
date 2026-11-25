@@ -64,8 +64,19 @@ pub fn encode_jpeg_gray(width: u32, height: u32, gray: &[u8], quality: u8) -> By
 /// matching TiTiler's 1-band greyscale JPEG output and reducing size by ~30%.
 /// Reuses a thread-local scratch buffer to avoid per-tile heap allocations.
 pub fn encode_jpeg_rgba(width: u32, height: u32, rgba: &[u8], quality: u8) -> Bytes {
+    encode_jpeg_rgba_as(width, height, rgba, quality, true)
+}
+
+/// [`encode_jpeg_rgba`], always in three components: for a caller that knows the picture
+/// is of three bands, whatever its pixels happen to hold.
+pub fn encode_jpeg_rgba_colour(width: u32, height: u32, rgba: &[u8], quality: u8) -> Bytes {
+    encode_jpeg_rgba_as(width, height, rgba, quality, false)
+}
+
+fn encode_jpeg_rgba_as(width: u32, height: u32, rgba: &[u8], quality: u8, grey_if_grey: bool) -> Bytes {
     let pixels = (width as usize).saturating_mul(height as usize);
-    let is_gray = rgba
+    let is_gray = grey_if_grey
+        && rgba
         .chunks_exact(4)
         .take(pixels)
         .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
