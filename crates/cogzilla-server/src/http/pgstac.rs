@@ -1836,9 +1836,10 @@ type PartMask = (Arc<PolygonMask>, tokio::sync::OnceCell<Vec<bool>>);
 enum Window {
     /// A map tile: the tile, its size and `unscale`; the rest is set for each read.
     Tile(crate::engine::TileRequest),
-    /// A box in WGS84 at a size in pixels, optionally cut to a polygon. `size` is what was
-    /// asked for, from which each raster's own size follows.
-    Part { bbox: [f64; 4], width: u32, height: u32, size: PartSize, mask: Option<PartMask>, unscale: bool },
+    /// A box at a size in pixels, optionally cut to a polygon: in degrees, or with
+    /// `mercator` in Web Mercator metres. `size` is what was asked for, from which each
+    /// raster's own size follows.
+    Part { bbox: [f64; 4], mercator: bool, width: u32, height: u32, size: PartSize, mask: Option<PartMask>, unscale: bool },
 }
 
 impl Window {
@@ -1869,7 +1870,7 @@ impl Window {
         max_values: usize,
         pool: bool,
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
-        let (bbox, width, height, size, mask, unscale) = match self {
+        let (bbox, mercator, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
                 let cog = engine.store.open_uri(href).await?;
                 let crs = engine.get_or_build_crs(&cog)?;
@@ -1904,7 +1905,7 @@ impl Window {
                 }
                 return Ok((planes, full.sample_type));
             }
-            Window::Part { bbox, width, height, size, mask, unscale } => (*bbox, *width, *height, *size, mask, *unscale),
+            Window::Part { bbox, mercator, width, height, size, mask, unscale } => (*bbox, *mercator, *width, *height, *size, mask, *unscale),
         };
         let cog = engine.store.open_uri(href).await?;
         let full = cog.index.full_res();
@@ -1921,15 +1922,19 @@ impl Window {
         // As on tiles: `resampling` for a source already in the output's projection,
         // `reproject` for one that has to be warped into it.
         let resample = match engine.get_or_build_crs(&cog)? {
-            CrsModel::Geographic => resampling,
+            CrsModel::Geographic if !mercator => resampling,
+            CrsModel::Epsg3857 if mercator => resampling,
             _ => reproject,
         };
+        if mercator && resample != ResampleMode::Nearest {
+            return Err(EngineError::BadRequest("a picture in Web Mercator is read with nearest-neighbour resampling only".into()));
+        }
         if resample == ResampleMode::Nearest {
             // As rio-tiler does: the raster is read at the size its own resolution gives
             // for what was asked, the way GDAL's warp reads it, and brought to the
             // picture's size afterwards.
             let crs = engine.get_or_build_crs(&cog)?;
-            let res = wgs84_resolution(&crs, &cog)
+            let res = if mercator { mercator_resolution(&crs, &cog) } else { wgs84_resolution(&crs, &cog) }
                 .ok_or_else(|| EngineError::BadRequest("cannot place an asset in WGS84".into()))?;
             let native = part_dims(PartSize::Query { max_size: None, width: None, height: None }, bbox, res);
             let (w, h) = part_dims(size, bbox, res);
@@ -1948,7 +1953,7 @@ impl Window {
                 )));
             }
             // One road whatever bands are asked for: see the tile's reading above.
-            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true, &[], true).await {
+            let read = match warp_nearest(engine, &cog, &crs, bbox, mercator, own, native, WarpPath::Direct, unscale, true, &[], true).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -1975,8 +1980,13 @@ impl Window {
                                     ((bbox[2] - bbox[0]) / f64::from(width), (bbox[3] - bbox[1]) / f64::from(height));
                                 let mut inside = Vec::with_capacity(out.0 * out.1);
                                 for row in 0..out.1 {
-                                    let lat = bbox[3] - (row as f64 + 0.5) * dy;
-                                    inside.extend((0..out.0).map(|col| mask.contains(bbox[0] + (col as f64 + 0.5) * dx, lat)));
+                                    let up = bbox[3] - (row as f64 + 0.5) * dy;
+                                    inside.extend((0..out.0).map(|col| {
+                                        // The shape is in degrees whatever the grid is in.
+                                        let across = bbox[0] + (col as f64 + 0.5) * dx;
+                                        let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, up) } else { (across, up) };
+                                        mask.contains(lon, lat)
+                                    }));
                                 }
                                 inside
                             })
@@ -2576,11 +2586,47 @@ async fn part_image(
         Ok(names) => names,
         Err(r) => return r,
     };
-    if let Err(r) = check_coord_crs(pairs) {
+    // The box is given in `coord_crs` and drawn in `dst_crs`, which is `coord_crs` unless
+    // given: degrees or Web Mercator metres, either way round. A posted shape is in degrees.
+    let given_in_metres = pq.coord_crs_3857;
+    if !given_in_metres && let Err(r) = check_coord_crs(pairs) {
         return r;
     }
-    if let Err(r) = check_dst_crs(pairs) {
-        return r;
+    let mercator = match query_value(pairs, "dst_crs").map(str::to_ascii_lowercase).as_deref() {
+        None => given_in_metres,
+        Some("epsg:4326" | "ogc:crs84") => false,
+        Some("epsg:3857") => true,
+        Some(other) => {
+            return detail(
+                StatusCode::BAD_REQUEST,
+                format!("dst_crs '{other}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
+            );
+        }
+    };
+    if given_in_metres && mask.is_some() {
+        return detail(StatusCode::BAD_REQUEST, "coord_crs 'epsg:3857' is not supported for a posted shape (use epsg:4326)");
+    }
+    let corners = |bbox: [f64; 4], to: fn(f64, f64) -> (f64, f64)| {
+        let ((w, s), (e, n)) = (to(bbox[0], bbox[1]), to(bbox[2], bbox[3]));
+        [w, s, e, n]
+    };
+    let in_degrees = if given_in_metres { corners(bbox, mercator_to_lonlat_deg) } else { bbox };
+    // The box as the picture's grid has it, and as the search is asked about it.
+    let bbox = match (mercator, given_in_metres) {
+        (true, true) => bbox,
+        (true, false) => corners(bbox, lonlat_deg_to_mercator),
+        (false, _) => in_degrees,
+    };
+    if bbox.iter().any(|c| !c.is_finite()) || bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
+        return detail(StatusCode::BAD_REQUEST, "the box has no area in the coordinate system asked for");
+    }
+    let own_geometry = given_in_metres.then(|| bbox_polygon(in_degrees));
+    let geometry = own_geometry.as_ref().unwrap_or(geometry);
+    if mercator && !(nearest && planes_can && pq.algorithm.is_none()) {
+        return detail(
+            StatusCode::BAD_REQUEST,
+            "dst_crs 'epsg:3857' is drawn with nearest-neighbour resampling only, and not with `algorithm`",
+        );
     }
     // The extension in the path, then `format=`; with neither, the pixels decide.
     let explicit = ext.map(str::to_string).or_else(|| pq.format_param.clone());
@@ -2602,7 +2648,9 @@ async fn part_image(
     let whole_box = matches!(format, Some((OutputFormat::Jpeg { .. }, _))) && pq.rescale.is_empty();
     let mask = if whole_box { None } else { mask };
 
-    let grid = part_grid(size, bbox);
+    // The lean lookup samples the box as a grid in degrees. A grid in metres is another
+    // set of pixel centres, so there pgSTAC's own search lists the items.
+    let grid = if mercator { None } else { part_grid(size, bbox) };
     let items = match pixel_items(ctx, pg, geometry, hash, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
@@ -2640,7 +2688,7 @@ async fn part_image(
         // or the first three, where planes would stack them all and TiTiler refuse most.
         let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty())
             || (first.len() == 1 && !matches!(first[0].index.full_res().samples_per_pixel, 1 | 3));
-        if planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
+        if mercator || planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
             if pq.algorithm.is_some() {
                 return Err(EngineError::BadRequest(
                     "`algorithm` is not supported with these assets and options yet".into(),
@@ -2651,9 +2699,8 @@ async fn part_image(
             let mut res = f64::INFINITY;
             for cog in &first {
                 let crs = engine.get_or_build_crs(cog)?;
-                res = res.min(wgs84_resolution(&crs, cog).ok_or_else(|| {
-                    EngineError::BadRequest("cannot place the first item in WGS84".into())
-                })?);
+                let own = if mercator { mercator_resolution(&crs, cog) } else { wgs84_resolution(&crs, cog) };
+                res = res.min(own.ok_or_else(|| EngineError::BadRequest("cannot place the first item in WGS84".into()))?);
             }
             let (w, h) = part_dims(size, bbox, res);
             if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) {
@@ -2668,7 +2715,7 @@ async fn part_image(
                 selection: query.selection.unwrap_or(Selection::First),
                 resampling: query.resampling,
                 reproject: query.reproject,
-                window: Window::Part { bbox, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
+                window: Window::Part { bbox, mercator, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
                 pool: true,
             };
             let look = Look {
@@ -2681,7 +2728,7 @@ async fn part_image(
                 return_mask: pq.return_mask,
             };
             let made = job.picture(engine, &scenes, w as usize, h as usize, &look).await?;
-            return Ok(as_geotiff(made, w as usize, h as usize, bbox, 4326, pq.return_mask));
+            return Ok(as_geotiff(made, w as usize, h as usize, bbox, if mercator { 3857 } else { 4326 }, pq.return_mask));
         }
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
