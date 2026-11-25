@@ -3502,17 +3502,39 @@ where
                 let urls = mj.query_bbox_3857(mx0, my0, mx1, my1);
                 let stats_opts = build_stats_options(&pq, false)?;
                 let mut last_err: Option<EngineError> = None;
+                let mut first_empty: Option<serde_json::Value> = None;
                 for cand in urls.iter().take(16) {
                     match engine.store.open_uri(cand).await {
                         Ok(cog) => {
-                            let json = compute_statistics_with_options(
+                            match compute_statistics_with_options(
                                 &engine, &cog, pq.max_size, None, pq.unscale, pq.nodata, &stats_opts,
                             )
-                            .await?;
-                            return Ok((Bytes::from(json.to_string()), "application/json"));
+                            .await
+                            {
+                                Ok(json) => {
+                                    let has_valid = json.as_object().is_some_and(|obj| {
+                                        obj.values().any(|b| {
+                                            b.get("valid_pixels")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0)
+                                                > 0
+                                        })
+                                    });
+                                    if has_valid {
+                                        return Ok((Bytes::from(json.to_string()), "application/json"));
+                                    }
+                                    if first_empty.is_none() {
+                                        first_empty = Some(json);
+                                    }
+                                }
+                                Err(e) => last_err = Some(e),
+                            }
                         }
                         Err(e) => last_err = Some(e.into()),
                     }
+                }
+                if let Some(empty) = first_empty {
+                    return Ok((Bytes::from(empty.to_string()), "application/json"));
                 }
                 Err(last_err.unwrap_or_else(|| {
                     EngineError::NotFound("mosaicjson contains no readable raster scenes".into())

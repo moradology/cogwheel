@@ -1178,6 +1178,15 @@ impl TileEngine {
                         )));
                     }
                 }
+                if nb == 0 {
+                    return Ok(render_expr_vm::<N>(
+                        &plan,
+                        &[],
+                        prog,
+                        &style,
+                        (ifd.width, ifd.height),
+                    ));
+                }
                 match ifd.planar_config {
                     PlanarConfig::Chunky => {
                         let mut indices = Vec::with_capacity(grid_len);
@@ -1218,7 +1227,7 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * nb);
@@ -1261,7 +1270,7 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
                     }
                 }
             }
@@ -1598,7 +1607,7 @@ impl TileEngine {
                 for &b in &prog.used_bands {
                     ordered.push(make_src(b)?);
                 }
-                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
+                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height)))
             }
         }
     }
