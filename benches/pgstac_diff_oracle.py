@@ -678,6 +678,13 @@ def main() -> int:
         o.check("feature, format from the pixels", "image", f"/searches/{sid}/feature?assets=visual&max_size=128", "POST", triangle)
         o.check("feature, format=jpg", "image", f"/searches/{sid}/feature?assets=visual&max_size=128&format=jpg", "POST", triangle)
         o.check("feature without assets", "json", f"/searches/{sid}/feature.png", "POST", triangle)
+        # A GeometryCollection of polygons is burned as their union, an overlap included.
+        cx, cy = triangle["geometry"]["coordinates"][0][0]
+        square = [[[cx - 0.05, cy - 0.05], [cx + 0.05, cy - 0.05], [cx + 0.05, cy + 0.05], [cx - 0.05, cy + 0.05], [cx - 0.05, cy - 0.05]]]
+        polygons = {"type": "Feature", "properties": {}, "geometry": {"type": "GeometryCollection", "geometries": [
+            triangle["geometry"], {"type": "Polygon", "coordinates": square}]}}
+        o.check("feature, a collection of polygons", "image", f"/searches/{sid}/feature/200x150.png?assets=visual", "POST", polygons)
+        o.check("statistics of a collection of polygons", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64", "POST", polygons)
         o.check("collection feature", "image", f"/collections/{collection}/feature.png?assets=visual&max_size=256", "POST", triangle)
         o.check("feature, a bare geometry", "status", f"/searches/{sid}/feature.png?assets=visual&max_size=64", "POST", triangle["geometry"])
         o.check("feature, an empty object", "status", f"/searches/{sid}/feature/64x64.png?assets=visual", "POST", {})

@@ -1987,22 +1987,39 @@ impl Window {
                         engine
                             .store
                             .run_heavy_cpu(move || {
-                                // A pixel is inside the polygon when its centre is.
+                                // GDAL's all-touched rule, which is how rio-tiler burns a
+                                // shape: a pixel is inside when its centre is, or when an
+                                // edge passes through it. Each polygon is burned on its own,
+                                // so two that overlap are their union.
                                 let (dx, dy) =
-                                    ((bbox[2] - bbox[0]) / f64::from(width), (bbox[3] - bbox[1]) / f64::from(height));
-                                let mut inside = Vec::with_capacity(out.0 * out.1);
-                                for row in 0..out.1 {
-                                    let up = bbox[3] - (row as f64 + 0.5) * dy;
-                                    inside.extend((0..out.0).map(|col| {
-                                        // The shape is in degrees whatever the grid is in.
-                                        let across = bbox[0] + (col as f64 + 0.5) * dx;
-                                        let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, up) } else { (across, up) };
-                                        mask.contains(lon, lat)
-                                    }));
-                                }
-                                inside
+                                    ((bbox[2] - bbox[0]) / out.0 as f64, (bbox[3] - bbox[1]) / out.1 as f64);
+                                let polygons: Vec<Vec<zonal::Ring>> = mask
+                                    .polygons
+                                    .iter()
+                                    .map(|polygon| {
+                                        polygon
+                                            .iter()
+                                            .map(|ring| {
+                                                ring.iter()
+                                                    .map(|&(lon, lat)| {
+                                                        // The shape is in degrees whatever the grid is in.
+                                                        let (across, up) = if mercator {
+                                                            cogzilla_proj::mercator::lonlat_deg_to_mercator(lon, lat)
+                                                        } else {
+                                                            (lon, lat)
+                                                        };
+                                                        ((across - bbox[0]) / dx, (bbox[3] - up) / dy)
+                                                    })
+                                                    .collect()
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                                let burned = zonal::cover_counts(&polygons, out.0, out.1, 1).map_err(EngineError::BadRequest)?;
+                                let inside: Vec<bool> = burned.into_iter().map(|n| n > 0).collect();
+                                Ok::<_, EngineError>(inside)
                             })
-                            .await
+                            .await?
                     })
                     .await?;
                 for plane in &mut planes {
@@ -2946,12 +2963,45 @@ async fn feature_image(
     if geojson.get("type").and_then(Value::as_str) != Some("Feature") || !geojson["geometry"].is_object() {
         return not_a_feature();
     }
-    let (mask, bbox) = match PolygonMask::from_geojson(&geojson) {
+    let (mask, bbox) = match PolygonMask::from_geojson(&polygons_of_collection(&geojson)) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
     };
     // As in titiler-pgstac, the items are those of the feature's bounding box.
     part_image(ctx, pg, hash, &bbox_polygon(bbox), bbox, Some(&mask), size, ext, pq, pairs).await
+}
+
+/// A feature whose geometry is a GeometryCollection of polygons, as the one MultiPolygon
+/// the mask reads: GDAL burns every member, which is their union. Any other feature is
+/// returned as it is, a collection with a line or a point in it among them.
+fn polygons_of_collection(feature: &Value) -> std::borrow::Cow<'_, Value> {
+    fn gather<'a>(geometry: &'a Value, into: &mut Vec<&'a Value>, depth: usize) -> bool {
+        match geometry.get("type").and_then(Value::as_str) {
+            Some("Polygon") => {
+                into.push(&geometry["coordinates"]);
+                true
+            }
+            Some("MultiPolygon") => geometry["coordinates"].as_array().is_some_and(|polygons| {
+                into.extend(polygons);
+                true
+            }),
+            Some("GeometryCollection") if depth < 4 => geometry["geometries"]
+                .as_array()
+                .is_some_and(|members| members.iter().all(|member| gather(member, into, depth + 1))),
+            _ => false,
+        }
+    }
+    let geometry = &feature["geometry"];
+    if geometry.get("type").and_then(Value::as_str) != Some("GeometryCollection") {
+        return std::borrow::Cow::Borrowed(feature);
+    }
+    let mut polygons = Vec::new();
+    if !gather(geometry, &mut polygons, 0) || polygons.is_empty() {
+        return std::borrow::Cow::Borrowed(feature);
+    }
+    let mut feature = feature.clone();
+    feature["geometry"] = json!({ "type": "MultiPolygon", "coordinates": polygons });
+    std::borrow::Cow::Owned(feature)
 }
 
 /// GDAL's default grid for a raster warped to WGS84: where it starts and its pixel size.
@@ -3559,7 +3609,7 @@ async fn feature_statistics(
     feature: &Value,
     req: &StatsRequest<'_>,
 ) -> Result<Option<(Value, Vec<String>)>, Resp> {
-    let (mask, bbox) = PolygonMask::from_geojson(feature).map_err(|e| engine_error(&e))?;
+    let (mask, bbox) = PolygonMask::from_geojson(&polygons_of_collection(feature)).map_err(|e| engine_error(&e))?;
     // As in titiler-pgstac, the items are those of the feature's bounding box. Each raster
     // is read on a grid of its own, which no one set of sample points stands for, so the
     // numbers come from pgSTAC's list unless the request asks for the lean one.
@@ -3799,12 +3849,14 @@ async fn feature_statistics(
             width as f64 / (bounds[2] - bounds[0]),
             height as f64 / (bounds[3] - bounds[1]),
         );
-        let rings: Vec<zonal::Ring> = mask
+        let rings: Vec<Vec<zonal::Ring>> = mask
             .polygons
             .iter()
-            .flatten()
-            .map(|ring| {
-                ring.iter().map(|&(lon, lat)| ((lon - bounds[0]) * sx, (bounds[3] - lat) * sy)).collect()
+            .map(|polygon| {
+                polygon
+                    .iter()
+                    .map(|ring| ring.iter().map(|&(lon, lat)| ((lon - bounds[0]) * sx, (bounds[3] - lat) * sy)).collect())
+                    .collect()
             })
             .collect();
         let (opts, cover_scale) = (req.opts.clone(), req.cover_scale);

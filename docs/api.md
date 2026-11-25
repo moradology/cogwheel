@@ -26,7 +26,7 @@
 
 ## pgSTAC
 
-With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind a tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, or from the [lean lookup](#the-lean-item-lookup), which lists the same items in the same order without the items a picture cannot show. `benches/pgstac_diff_oracle.py` sends 425 requests to both servers on one database and compares status codes, JSON bodies, item lists, WMTS documents, statistics and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 370 agreed and 8 were known differences, listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; none of the agreeing pairs is identical now that pixels are projected exactly, and they were 25.8 dB and up.
+With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind a tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, or from the [lean lookup](#the-lean-item-lookup), which lists the same items in the same order without the items a picture cannot show. `benches/pgstac_diff_oracle.py` sends 427 requests to both servers on one database and compares status codes, JSON bodies, item lists, WMTS documents, statistics and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 370 agreed and 8 were known differences, listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; none of the agreeing pairs is identical now that pixels are projected exactly, and they were 25.8 dB and up.
 
 - `POST /searches/register` with a STAC search body (`collections`, `ids`, `bbox`, `intersects`, `datetime`, `query`, `filter`, `sortby`) and optional `metadata`. The returned `id` is pgSTAC's hash, the same one titiler-pgstac returns for the same body.
 - `GET /searches/` and `/searches/list`, with `limit`, `offset` and `sortby` (comma-separated, `-` for descending) on `lastused`, `usecount` or any key of the searches' metadata; every other parameter is metadata a search must have (`name=low cloud`), compared as text as in titiler-pgstac. `GET /searches/{id}/info`.
@@ -84,7 +84,7 @@ Tiles and images with nearest-neighbour resampling, which is the default, are re
 GDAL is followed where it decides what the picture is, and not where it is only inconsistent:
 
 - One band of several is read from the same pixels as all of them. GDAL takes another road for a partial selection and returns other pixels.
-- The edge of a `feature`'s polygon is where pixel centres fall inside it; GDAL cuts in the source raster's pixels. 99.0 to 99.6% of pixels agree.
+- A `feature`'s polygon takes every pixel it touches, as rio-tiler burns it: on the shapes compared the pixels inside are titiler-pgstac's to within two. A GeometryCollection of polygons is their union.
 - Four bands are refused as JPEG; TiTiler sends them as CMYK.
 - The projection along a row is not approximated to an eighth of a pixel as GDAL does: each pixel is the one the projection gives.
 - Still as GDAL has it, though it need not be: an overview up to a fifth coarser than asked is preferred to the next finer one.
