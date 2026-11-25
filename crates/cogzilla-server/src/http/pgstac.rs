@@ -1786,12 +1786,18 @@ impl Window {
                 let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
                 let (w, s, e, n) = tile_bounds_3857(request.tile);
                 let side = request.tile_size as usize;
+                if wanted.len() * side * side > max_values {
+                    return Err(EngineError::BadRequest(format!(
+                        "{} bands of an asset are too many to hold for a tile; choose fewer with `bidx`",
+                        wanted.len()
+                    )));
+                }
                 let own = |span: f64| ((span / res).round() as u64).max(1);
                 // One road whatever bands are asked for. GDAL takes another when only some
                 // are, and a band then comes from other pixels than it does in the whole
                 // raster; a band is the same band here either way.
                 let read =
-                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool)
+                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted)
                         .await?;
                 let mut planes = Vec::with_capacity(wanted.len());
                 for band in &wanted {
@@ -1845,7 +1851,7 @@ impl Window {
                 )));
             }
             // One road whatever bands are asked for: see the tile's reading above.
-            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true).await {
+            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true, &[]).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -2810,7 +2816,8 @@ fn mercator_resolution(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<f
 /// Every band of one raster on a WGS84 grid, or with `mercator` on a Web Mercator one, read the way GDAL's nearest-neighbour warp
 /// reads it: from the overview GDAL would pick, each output pixel taking the source pixel
 /// its centre falls in. A pixel outside the raster, or without data, is NaN. `native` is
-/// the size of the grid at the raster's own resolution.
+/// the size of the grid at the raster's own resolution. With `only`, bands counted from
+/// one, the other bands are neither fetched nor held: their planes come back empty.
 #[allow(clippy::too_many_arguments)]
 async fn warp_nearest(
     engine: &TileEngine,
@@ -2823,6 +2830,7 @@ async fn warp_nearest(
     path: WarpPath,
     unscale: bool,
     pool: bool,
+    only: &[u16],
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
     // The grid the warp is worked out on, and how wide a stretch of a row GDAL
@@ -2913,8 +2921,9 @@ async fn warp_nearest(
     (cells, c0, c1, r0, r1)
     };
     let (cells, c0, c1, r0, r1) = if pool { engine.store.run_heavy_cpu(work).await? } else { work() };
+    let read = |band: usize| only.is_empty() || only.contains(&(band as u16 + 1));
     if c0 > c1 {
-        return Ok(vec![vec![f32::NAN; width * height]; bands]);
+        return Ok((0..bands).map(|b| if read(b) { vec![f32::NAN; width * height] } else { Vec::new() }).collect());
     }
 
     let (tx0, tx1) = (c0 as u32 / ifd.tile_width, c1 as u32 / ifd.tile_width);
@@ -2923,7 +2932,20 @@ async fn warp_nearest(
     let planar = ifd.planar_config == cogzilla_tiff::PlanarConfig::Planar;
     let fetches = if planar { bands } else { 1 };
     let mut tiles = Vec::with_capacity(fetches);
+    // A raster stored band by band is fetched band by band, and every band's blocks are
+    // held until the planes are made: what that comes to is bounded before any is read.
+    let held = (0..fetches).filter(|b| !planar || read(*b)).count() as u64
+        * u64::from(grid_w) * u64::from(grid_h) * u64::from(ifd.tile_width) * u64::from(ifd.tile_height) * 4;
+    if planar && held > MAX_WORKING_BYTES as u64 {
+        return Err(EngineError::BadRequest(
+            "the bands asked for are too many to read at this size; choose fewer with `bidx`".into(),
+        ));
+    }
     for plane in 0..fetches {
+        if planar && !read(plane) {
+            tiles.push(Vec::new());
+            continue;
+        }
         let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
@@ -2934,11 +2956,16 @@ async fn warp_nearest(
     }
 
     let cog_for_planes = cog.clone();
+    let skip: Vec<bool> = if only.is_empty() { Vec::new() } else { (0..bands).map(|b| !read(b)).collect() };
     let work = move || {
     let cog = cog_for_planes;
     let ifd = &cog.index.ifds[level];
     let mut planes = Vec::with_capacity(bands);
     for band in 0..bands {
+        if !skip.is_empty() && skip[band] {
+            planes.push(Vec::new());
+            continue;
+        }
         let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = if planar {
             tiles[band].iter().map(|t| t.as_ref().and_then(|t| t.bands.first())).collect()
         } else {
@@ -3189,7 +3216,7 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[]).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
@@ -3749,6 +3776,16 @@ async fn tile(
                 && matches!(dim, 256 | 512)
                 && full.extra_samples.is_empty()
                 && (scenes[0].len() > 1 || matches!(full.samples_per_pixel, 1 | 3));
+            // A plain request that takes this road only because it is the better reader keeps
+            // the bands of its first raster for every item, as the renderer does: a later
+            // item with more bands gives the same ones, not a tile of another shape.
+            let mut specs = specs.clone();
+            if !planes_wanted && one_grid && preferred && specs.len() == 1 && scenes[0].len() == 1 {
+                let spec = &mut specs[0];
+                if spec.indexes.is_none() && spec.expression.is_none() {
+                    spec.indexes = Some((1..=full.samples_per_pixel).collect());
+                }
+            }
             if planes_wanted || !one_grid || preferred {
                 if dim != 256 && dim != 512 {
                     return Err(EngineError::BadRequest(format!(
