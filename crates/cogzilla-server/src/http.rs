@@ -12,7 +12,8 @@ use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
 use http_body_util::{BodyExt, Full};
 use hyper::header::{
-    ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH,
+    ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderName, HeaderValue,
+    IF_NONE_MATCH,
 };
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -3356,6 +3357,7 @@ where
     // ------------------------------------------------------------------------
     if method == Method::POST && segs.first() == Some(&"mosaicjson") {
         let mj_url = pq.urls.first().cloned();
+        let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
         let res: Result<(Bytes, &'static str), EngineError> = match segs.as_slice() {
             ["mosaicjson", "validate"] => async {
                 let body_bytes = read_limited_body(req.into_body()).await?;
@@ -3523,6 +3525,7 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, mask_opt, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -3551,16 +3554,22 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, mask_opt, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
             }
             .await,
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+        let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
+        if let Some((bbox, epsg, is_crs84)) = geo_meta {
+            attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
+        }
+        return Ok(resp);
     }
 
     if method == Method::GET && segs.first() == Some(&"mosaicjson") {
         let mj_url = pq.urls.first().cloned();
+        let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
         let res: Result<(Bytes, &'static str), EngineError> = match segs.as_slice() {
             ["mosaicjson", "info"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -3687,6 +3696,7 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -3719,6 +3729,7 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -3963,11 +3974,21 @@ where
                         }
                     })
                     .await;
-                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                if let (Ok(z), Ok(x), Some((y, sc, _))) =
+                    (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+                {
+                    attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
+                }
+                return Ok(resp);
             }
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+        let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
+        if let Some((bbox, epsg, is_crs84)) = geo_meta {
+            attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
+        }
+        return Ok(resp);
     }
 
     // ------------------------------------------------------------------------
@@ -4048,7 +4069,9 @@ where
                             Ok((b, ct))
                         })
                         .await;
-                    return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                    let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                    attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
+                    return Ok(resp);
                 }
             }
             _ => Err(EngineError::BadRequest(
@@ -4169,7 +4192,9 @@ where
                         }
                     })
                     .await;
-                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
+                return Ok(resp);
             }
             _ => Err(EngineError::BadRequest(
                 "invalid /mosaic/{name}/tiles coordinate path".into(),
@@ -4326,7 +4351,9 @@ where
                             }
                         })
                         .await;
-                    return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                    let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                    attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
+                    return Ok(resp);
                 }
             }
             _ => Err(EngineError::BadRequest(
@@ -4432,6 +4459,7 @@ where
                 attach_x_assets(resp, &names);
             }
         };
+        let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // GET /stac/assets?url=item.json
             (Method::GET, ["assets"]) => async {
@@ -4873,6 +4901,7 @@ where
                 )
                 .await?;
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, dst_epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -4929,6 +4958,7 @@ where
             (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
                 let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
+                let stac_tile_geo = TileGeoOpts::from_pq(&pq);
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
@@ -5091,6 +5121,11 @@ where
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_resolved_stac_assets(&mut resp);
+                if let (Ok(z), Ok(x), Some((y, sc, _))) =
+                    (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+                {
+                    attach_tile_geo_headers_opts(&mut resp, tms, z, x, y, sc, stac_tile_geo);
+                }
                 return Ok(resp);
             }
 
@@ -5254,6 +5289,7 @@ where
                     }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -5330,6 +5366,7 @@ where
                     }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -5420,6 +5457,7 @@ where
                     (d, wgs_bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -5500,6 +5538,7 @@ where
                     (d, wgs_bbox, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -5556,6 +5595,7 @@ where
                     (d, bbox, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -5615,6 +5655,7 @@ where
                     (d, bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -5628,6 +5669,9 @@ where
         ) {
             attach_resolved_stac_assets(&mut resp);
         }
+        if let Some((bbox, epsg, is_crs84)) = geo_meta {
+            attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
+        }
         return Ok(resp);
     }
 
@@ -5636,6 +5680,7 @@ where
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"cog") {
         let sub = &segs[1..];
+        let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // 1. GET /cog/info
             (Method::GET, ["info"]) => async {
@@ -5991,7 +6036,13 @@ where
                         }
                     })
                     .await;
-                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                if let (Ok(z), Ok(x), Some((y, sc, _))) =
+                    (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+                {
+                    attach_tile_geo_headers(&mut resp, tms, z, x, y, sc, &pq);
+                }
+                return Ok(resp);
             }
 
             // 8. GET /cog/{tileMatrixSetId}/tilejson.json & /cog/tilejson.json
@@ -6050,6 +6101,7 @@ where
                 )
                 .await?;
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, dst_epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -6182,6 +6234,7 @@ where
                     }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -6247,6 +6300,7 @@ where
                     }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -6327,6 +6381,7 @@ where
                     (d, wgs_bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -6397,6 +6452,7 @@ where
                     (d, wgs_bbox, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -6447,6 +6503,7 @@ where
                     (d, bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
@@ -6491,13 +6548,18 @@ where
                     (d, bbox, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                geo_meta = Some((out_bbox, Some(out_epsg), false));
                 Ok((data, ct))
             }
             .await,
 
             _ => Err(EngineError::NotFound(path)),
         };
-        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+        let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
+        if let Some((bbox, epsg, is_crs84)) = geo_meta {
+            attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
+        }
+        return Ok(resp);
     }
 
     Ok(json_error_resp(StatusCode::NOT_FOUND, &path))
@@ -6589,6 +6651,113 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
         let _ = writeln!(out, "cogzilla_disk_cache_bytes {}", s.bytes_used);
     }
     out
+}
+
+fn attach_geo_headers(
+    resp: &mut Response<Full<Bytes>>,
+    bbox: [f64; 4],
+    epsg: Option<u16>,
+    is_crs84: bool,
+) {
+    if resp.status() != StatusCode::OK {
+        return;
+    }
+    if let Ok(hv) = HeaderValue::from_str(&format!(
+        "{},{},{},{}",
+        bbox[0], bbox[1], bbox[2], bbox[3]
+    )) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("content-bbox"), hv);
+    }
+    let crs_hv = if is_crs84 {
+        Some(HeaderValue::from_static(
+            "<http://www.opengis.net/def/crs/OGC/0/CRS84>",
+        ))
+    } else if let Some(code) = epsg {
+        match code {
+            3857 => Some(HeaderValue::from_static(
+                "<http://www.opengis.net/def/crs/EPSG/0/3857>",
+            )),
+            4326 => Some(HeaderValue::from_static(
+                "<http://www.opengis.net/def/crs/EPSG/0/4326>",
+            )),
+            other => HeaderValue::from_str(&format!(
+                "<http://www.opengis.net/def/crs/EPSG/0/{other}>"
+            ))
+            .ok(),
+        }
+    } else {
+        None
+    };
+    if let Some(hv) = crs_hv {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("content-crs"), hv);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TileGeoOpts {
+    buffer: f32,
+    tile_size: u32,
+    has_explicit_ts: bool,
+}
+
+impl TileGeoOpts {
+    fn from_pq(pq: &ParsedQuery) -> Self {
+        let has_explicit_ts = pq
+            .keys
+            .iter()
+            .any(|k| matches!(k.as_str(), "tile_size" | "tilesize" | "size" | "scale"));
+        Self {
+            buffer: pq.buffer,
+            tile_size: pq.tile_size,
+            has_explicit_ts,
+        }
+    }
+}
+
+fn attach_tile_geo_headers(
+    resp: &mut Response<Full<Bytes>>,
+    tms: &str,
+    z: u8,
+    x: u32,
+    y: u32,
+    scale_opt: Option<u32>,
+    pq: &ParsedQuery,
+) {
+    attach_tile_geo_headers_opts(resp, tms, z, x, y, scale_opt, TileGeoOpts::from_pq(pq));
+}
+
+fn attach_tile_geo_headers_opts(
+    resp: &mut Response<Full<Bytes>>,
+    tms: &str,
+    z: u8,
+    x: u32,
+    y: u32,
+    scale_opt: Option<u32>,
+    opts: TileGeoOpts,
+) {
+    if resp.status() != StatusCode::OK {
+        return;
+    }
+    if tms == "WebMercatorQuad" {
+        let ts = scale_opt
+            .map(|sc| sc.saturating_mul(256))
+            .unwrap_or(if opts.has_explicit_ts { opts.tile_size } else { 256 });
+        let bbox = web_mercator_buffered_3857_bbox(z, x, y, opts.buffer, ts);
+        attach_geo_headers(resp, bbox, Some(3857), false);
+    } else if let Some(tms_def) = crate::tms::lookup_tms(tms)
+        && let Some(m) = tms_def.matrix(z)
+    {
+        let base_ts = m.tile_width.clamp(64, 4096);
+        let ts = scale_opt
+            .map(|sc| sc.saturating_mul(base_ts))
+            .unwrap_or(if opts.has_explicit_ts { opts.tile_size } else { base_ts });
+        if let Some(bbox) = tms_def.tile_bounds(z, x, y, opts.buffer, ts) {
+            let is_crs84 = matches!(tms, "WorldCRS84Quad" | "GNOSISGlobalGrid" | "WGS1984Quad");
+            attach_geo_headers(resp, bbox, Some(tms_def.epsg), is_crs84);
+        }
+    }
 }
 
 fn to_http_response(

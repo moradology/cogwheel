@@ -249,9 +249,20 @@ pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
     }
 }
 
+/// Apply PNG Sub filter (type = 1) to a Gray+Alpha (`bpp = 2`) scanline.
+#[inline(always)]
+pub fn filter_sub_ga_row(src_ga: &[u8], dst_filtered: &mut [u8]) {
+    dst_filtered[0] = 1;
+    let out = &mut dst_filtered[1..1 + src_ga.len()];
+    for i in 0..src_ga.len() {
+        let left = if i >= 2 { src_ga[i - 2] } else { 0 };
+        out[i] = src_ga[i].wrapping_sub(left);
+    }
+}
+
 /// Compress already-filtered PNG scanlines in a single whole-buffer `libdeflate` call
 /// and frame into a complete valid PNG `Bytes` buffer.
-/// `color_type`: `2` = RGB8, `6` = RGBA8.
+/// `color_type`: `0` = Gray8 (`L`), `2` = RGB8, `4` = GrayAlpha8 (`LA`), `6` = RGBA8.
 pub fn encode_filtered_png(width: u32, height: u32, color_type: u8, filtered: &[u8]) -> Bytes {
     PNG_ENC.with(|cell| {
         let mut guard = cell.borrow_mut();

@@ -416,6 +416,21 @@ def main():
             ("GET /stac/bbox/.../256x256.png (3-asset RGB)", "GET", f"/stac/bbox/-122.8,37.6,-122.5,37.9/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
             ("POST /stac/feature/256x256.png (Triangle)", "POST", f"/stac/feature/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", tri_feature, "png"),
             ("GET /stac/map (OGC API Maps)", "GET", f"/stac/map?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000&width=128&height=128", None, "png"),
+
+            # --- Content-Bbox / Content-Crs header parity & 1-band greyscale PNG/JPEG mode ---
+            ("HDR /cog/tiles WebMercatorQuad", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&rescale=0,0.35", None, "geo_headers"),
+            ("HDR /cog/tiles WorldCRS84Quad", "GET", f"/cog/tiles/WorldCRS84Quad/10/325/297.png?url={sat}&bidx=1&rescale=0,0.35", None, "geo_headers"),
+            ("HDR /cog/preview native CRS", "GET", f"/cog/preview/64x64.png?url={sat}&bidx=1&rescale=0,0.35", None, "geo_headers"),
+            ("HDR /cog/bbox default 4326", "GET", f"/cog/bbox/-122.8,37.6,-122.5,37.9/64x64.png?url={sat}&bidx=1&rescale=0,0.35", None, "geo_headers"),
+            ("HDR /cog/bbox dst_crs=EPSG:3857", "GET", f"/cog/bbox/-122.8,37.6,-122.5,37.9/64x64.png?url={sat}&dst_crs=EPSG:3857&bidx=1&rescale=0,0.35", None, "geo_headers"),
+            ("HDR POST /cog/feature", "POST", f"/cog/feature/64x64.png?url={sat}&bidx=1&rescale=0,0.35", poly_feature, "geo_headers"),
+            ("HDR /stac/tiles WebMercatorQuad", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_item}&assets=red&rescale=7000,20000", None, "geo_headers"),
+            ("HDR /stac/preview native CRS", "GET", f"/stac/preview/64x64.png?url={stac_item}&assets=red&rescale=7000,20000", None, "geo_headers"),
+            ("MODE 1-band /cog/tiles PNG -> L/LA", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&rescale=0,0.35", None, "gray_png"),
+            ("MODE 1-band /cog/preview PNG -> L/LA", "GET", f"/cog/preview/64x64.png?url={sat}&bidx=1&rescale=0,0.35", None, "gray_png"),
+            ("MODE 1-band /cog/preview return_mask=false -> L", "GET", f"/cog/preview/64x64.png?url={sat}&bidx=1&rescale=0,0.35&return_mask=false", None, "gray_png_l"),
+            ("MODE 1-band /cog/tiles JPEG -> L", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.jpg?url={sat}&bidx=1&rescale=0,0.35", None, "gray_jpg"),
+            ("MODE 1-band /cog/preview JPEG -> L", "GET", f"/cog/preview/64x64.jpg?url={sat}&bidx=1&rescale=0,0.35", None, "gray_jpg"),
         ])
 
         print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks) ===")
@@ -557,6 +572,28 @@ def main():
                         m_err = abs(j_cw["red"]["b1"]["mean"] - j_tt["red"]["b1"]["mean"])
                         ok = sorted(j_cw.keys()) == sorted(j_tt.keys()) and m_err < 5.0
                         parity = f"keys={sorted(j_cw.keys())}=={sorted(j_tt.keys())} red.b1.mean_err={m_err:.2f}"
+                    elif kind == "geo_headers":
+                        crs_cw, crs_tt = r_cw.headers.get("content-crs"), r_tt.headers.get("content-crs")
+                        bb_cw, bb_tt = r_cw.headers.get("content-bbox"), r_tt.headers.get("content-bbox")
+                        crs_ok = bool(crs_cw) and crs_cw == crs_tt
+                        bb_ok = False
+                        max_rel = 1.0
+                        if bb_cw and bb_tt:
+                            v_cw = [float(x) for x in bb_cw.split(",")]
+                            v_tt = [float(x) for x in bb_tt.split(",")]
+                            if len(v_cw) == 4 and len(v_tt) == 4:
+                                max_rel = max(abs(a - b) / max(1.0, abs(b)) for a, b in zip(v_cw, v_tt))
+                                bb_ok = max_rel < 1e-4
+                        ok = crs_ok and bb_ok
+                        parity = f"crs={crs_cw} vs {crs_tt} bbox_rel_err={max_rel:.2e}"
+                    elif kind in ("gray_png", "gray_png_l", "gray_jpg"):
+                        im_cw = Image.open(io.BytesIO(r_cw.content))
+                        im_tt = Image.open(io.BytesIO(r_tt.content))
+                        if kind == "gray_png":
+                            ok = im_cw.mode in ("L", "LA") and im_tt.mode in ("L", "LA")
+                        else:
+                            ok = im_cw.mode == "L" and im_tt.mode == "L"
+                        parity = f"mode cw={im_cw.mode} vs tt={im_tt.mode}"
                     else:
                         ok, parity = True, "ok"
 
