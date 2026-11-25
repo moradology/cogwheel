@@ -4262,8 +4262,17 @@ async fn render_bbox_impl(
             .collect()
     };
 
-    let dst_is_3857 = matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857);
+    let dst_is_merc = matches!(
+        dst_crs,
+        cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator
+    );
     let dst_is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
+    let dst_unit_m = dst_crs.linear_unit_metres();
+    let dst_center_lat = if dst_is_merc {
+        dst_crs.to_lonlat_deg(cx, cy).1
+    } else {
+        0.5 * (bbox[1] + bbox[3])
+    };
     let native_dem_dxy: Option<(f32, f32)> = if native_preview {
         let full = primary.index.full_res();
         let rx = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d) * (full.width as f64) / (w as f64);
@@ -4276,7 +4285,7 @@ async fn render_bbox_impl(
                     (ry * 111_320.0).max(1e-3) as f32,
                 )
             }
-            cogzilla_proj::CrsModel::Epsg3857 => {
+            cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator => {
                 let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
                 let cos_lat = lat_rad.cos().max(0.05);
                 (
@@ -4284,7 +4293,13 @@ async fn render_bbox_impl(
                     (ry * cos_lat).max(1e-3) as f32,
                 )
             }
-            _ => (rx.max(1e-3) as f32, ry.max(1e-3) as f32),
+            other => {
+                let unit_m = other.linear_unit_metres();
+                (
+                    (rx * unit_m).max(1e-3) as f32,
+                    (ry * unit_m).max(1e-3) as f32,
+                )
+            }
         };
         Some((dx_m, dy_m))
     } else {
@@ -4517,21 +4532,23 @@ async fn render_bbox_impl(
         let dem_inv_8dxy = || -> (f32, f32) {
             let (dx_m, dy_m) = if let Some(dxy) = native_dem_dxy {
                 dxy
-            } else if dst_is_3857 {
-                let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
-                let cos_lat = center_lat.to_radians().cos().max(0.05);
+            } else if dst_is_merc {
+                let cos_lat = dst_center_lat.to_radians().cos().max(0.05);
                 (
                     (dlx.abs() * cos_lat).max(1e-3) as f32,
                     (dly.abs() * cos_lat).max(1e-3) as f32,
                 )
             } else if dst_is_geo {
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                let lat_rad = dst_center_lat.to_radians();
                 (
                     (dlx.abs() * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
                     (dly.abs() * 111_320.0).max(1e-3) as f32,
                 )
             } else {
-                (dlx.abs().max(1e-3) as f32, dly.abs().max(1e-3) as f32)
+                (
+                    (dlx.abs() * dst_unit_m).max(1e-3) as f32,
+                    (dly.abs() * dst_unit_m).max(1e-3) as f32,
+                )
             };
             (1.0 / (8.0 * dx_m), 1.0 / (8.0 * dy_m))
         };
