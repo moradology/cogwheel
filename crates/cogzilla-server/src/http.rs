@@ -3529,8 +3529,18 @@ where
                             )));
                         }
                         let tile = TileCoord { z, x, y };
-                        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
-                        let urls = mj.query_bbox_3857(min_x, min_y, max_x, max_y);
+                        let query_ts = match sc {
+                            Some(s) if (1..=4).contains(&s) => s * 256,
+                            _ => pq.tile_size,
+                        };
+                        let buf_bbox =
+                            web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, query_ts);
+                        let urls = mj.query_bbox_3857(
+                            buf_bbox[0],
+                            buf_bbox[1],
+                            buf_bbox[2],
+                            buf_bbox[3],
+                        );
                         if urls.is_empty() {
                             let (treq, ct) = build_tile_request(
                                 Some(&engine),
@@ -3544,6 +3554,7 @@ where
                                 None,
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. }
                                 | BandRequest::SarRgb { .. }
@@ -3551,14 +3562,14 @@ where
                                 | BandRequest::CustomExprRgb { .. } => 3,
                                 _ => 1,
                             };
-                            let b = cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb);
+                            let b = cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb);
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
                                 treq.format,
-                                treq.tile_size,
-                                treq.tile_size,
-                                [min_x, min_y, max_x, max_y],
+                                out_dim,
+                                out_dim,
+                                buf_bbox,
                                 3857,
                                 pq.return_mask,
                             );
@@ -3710,8 +3721,18 @@ where
                             )));
                         }
                         let tile = TileCoord { z, x, y };
-                        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
-                        let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
+                        let query_ts = match sc {
+                            Some(s) if (1..=4).contains(&s) => s * 256,
+                            _ => pq.tile_size,
+                        };
+                        let buf_bbox =
+                            web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, query_ts);
+                        let urls = catalog.query_bbox_3857(
+                            buf_bbox[0],
+                            buf_bbox[1],
+                            buf_bbox[2],
+                            buf_bbox[3],
+                        );
                         if urls.is_empty() {
                             let (treq, ct) = build_tile_request(
                                 Some(&engine),
@@ -3725,6 +3746,7 @@ where
                                 None,
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                             let nb = match treq.bands {
                                 BandRequest::Rgb { .. }
                                 | BandRequest::SarRgb { .. }
@@ -3732,14 +3754,14 @@ where
                                 | BandRequest::CustomExprRgb { .. } => 3,
                                 _ => 1,
                             };
-                            let b = cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb);
+                            let b = cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb);
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
                                 treq.format,
-                                treq.tile_size,
-                                treq.tile_size,
-                                [min_x, min_y, max_x, max_y],
+                                out_dim,
+                                out_dim,
+                                buf_bbox,
                                 3857,
                                 pq.return_mask,
                             );
