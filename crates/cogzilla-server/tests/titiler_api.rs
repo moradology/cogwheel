@@ -106,7 +106,12 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("mosaic tile buffer+nodata", format!("{base}/mosaic/tiles/WebMercatorQuad/10/163/395.png?url={sat_url}&rescale=0,1&buffer=4&nodata=0")),
         ("algorithm grayscale", format!("{tile}&algorithm=grayscale")),
         ("algorithm normalizedIndex", format!("{tile}&algorithm=normalizedIndex&bidx=1,2")),
-        ("algorithm median", format!("{tile}&algorithm=median")),
+        ("algorithm median 4-band", format!("{tile}&algorithm=median&bidx=1&bidx=2&bidx=3&bidx=1")),
+        ("algorithm std 1-band", format!("{tile}&algorithm=std&bidx=1")),
+        ("algorithm cast uint8 3-band", format!("{tile}&algorithm=cast&algorithm_params=%7B%22dtype%22:%22uint8%22%7D")),
+        ("algorithm ceil 3-band", format!("{tile}&algorithm=ceil")),
+        ("algorithm floor 3-band", format!("{tile}&algorithm=floor")),
+        ("fractional buffer=0.5", format!("{tile}&buffer=0.5&rescale=0,1")),
         ("algorithm bitonal", format!("{tile}&algorithm=bitonal&algorithm_params=%7B%22threshold%22:0.5%7D")),
         ("statistics expression", format!("{base}/cog/statistics?url={sat_url}&expression=b1-b2;b2-b3")),
         ("point multi-expression", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&expression=b1-b2;b2-b3")),
@@ -881,6 +886,22 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
             // Opaque RGB PNG (color_type=2) for clean DEM tile
             assert_eq!(bytes[25], 2, "expected RGB PNG for algorithm={alg}");
+
+            // Terrain NPY must emit 3-band RGB (3, 256, 256), not raw 1-band elevation
+            let npy_resp = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.npy?url={merc_url}&algorithm={alg}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(npy_resp.status(), 200);
+            let npy_bytes = npy_resp.bytes().await.unwrap();
+            let hdr_str = std::str::from_utf8(&npy_bytes[10..128]).unwrap_or("");
+            assert!(
+                hdr_str.contains("(3, 256, 256)"),
+                "expected 3-band RGB NPY for algorithm={alg}, got header: {hdr_str}"
+            );
         }
 
         // --------------------------------------------------------------------

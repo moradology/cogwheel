@@ -258,7 +258,9 @@ impl TileEngine {
                 }
             };
             let nb = match req.bands {
-                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                BandRequest::Rgb { .. }
+                | BandRequest::SarRgb { .. }
+                | BandRequest::Terrain { .. } => 3,
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
@@ -307,7 +309,9 @@ impl TileEngine {
         ) else {
             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
             let nb = match req.bands {
-                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                BandRequest::Rgb { .. }
+                | BandRequest::SarRgb { .. }
+                | BandRequest::Terrain { .. } => 3,
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
@@ -1226,7 +1230,9 @@ impl TileEngine {
                 }
             };
             let nb = match req.bands {
-                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                BandRequest::Rgb { .. }
+                | BandRequest::SarRgb { .. }
+                | BandRequest::Terrain { .. } => 3,
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
@@ -1272,7 +1278,9 @@ impl TileEngine {
         ) else {
             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
             let nb = match req.bands {
-                BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+                BandRequest::Rgb { .. }
+                | BandRequest::SarRgb { .. }
+                | BandRequest::Terrain { .. } => 3,
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
@@ -2062,6 +2070,7 @@ mod tests {
             offsets: vec![0.0; 3],
             band_metadata: vec![Vec::new(); 3],
             band_descriptions: vec![String::new(); 3],
+            color_map: None,
             ifds: vec![ifd],
         };
         let source = cogzilla_io::CogSource::open_local(&tmp_path).unwrap();

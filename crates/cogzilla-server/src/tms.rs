@@ -414,7 +414,7 @@ impl TmsDef {
 
     /// Return `[min_x, min_y, max_x, max_y]` in the TMS's native `(easting/lon, northing/lat)` CRS,
     /// expanded by `buffer` pixels on all 4 sides.
-    pub fn tile_bounds(&self, z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> Option<[f64; 4]> {
+    pub fn tile_bounds(&self, z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> Option<[f64; 4]> {
         let m = self.matrix(z)?;
         let span_x = m.cell_size * (m.tile_width as f64);
         let span_y = m.cell_size * (m.tile_height as f64);
