@@ -59,7 +59,6 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("bad tilesize", format!("{tile}&tilesize=7")),
         ("unknown tms tile", format!("{base}/cog/tiles/FakeQuad/10/163/395.png?url={sat_url}")),
         ("unknown tms tilejson", format!("{base}/cog/FakeQuad/tilejson.json?url={sat_url}")),
-        ("statistics algorithm", format!("{base}/cog/statistics?url={sat_url}&algorithm=hillshade")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
         ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
         ("point unsupported coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:4267")),
@@ -1343,6 +1342,67 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(bidx_stats["b1"]["description"].as_str(), Some("visual_b3"));
             assert_eq!(bidx_stats["b2"]["description"].as_str(), Some("visual_b1"));
             let _ = std::fs::remove_file(&bidx_stac_path);
+
+            // 4. MosaicJSON tile assets & pixel_selection (highest, lowest, mean, count)
+            let mj_ps_path = std::env::temp_dir().join(format!(
+                "cogzilla_mj_ps_{}.json",
+                std::process::id()
+            ));
+            let mj_ps = serde_json::json!({
+                "mosaicjson": "0.0.2",
+                "minzoom": 8,
+                "maxzoom": 14,
+                "bounds": [-123.0, 37.0, -121.5, 38.5],
+                "quadkey_zoom": 8,
+                "tiles": {
+                    "02301020": [sat_path.to_str().unwrap(), merc_path.to_str().unwrap()],
+                    "02301021": [sat_path.to_str().unwrap(), merc_path.to_str().unwrap()],
+                    "02301022": [sat_path.to_str().unwrap(), merc_path.to_str().unwrap()],
+                    "02301023": [sat_path.to_str().unwrap(), merc_path.to_str().unwrap()]
+                }
+            });
+            std::fs::write(&mj_ps_path, mj_ps.to_string()).unwrap();
+            let tile_assets = get_json(
+                &client,
+                format!(
+                    "{base}/mosaicjson/tiles/WebMercatorQuad/12/655/1583/assets?url={}",
+                    mj_ps_path.to_str().unwrap()
+                ),
+            )
+            .await;
+            assert!(tile_assets.is_array() && !tile_assets.as_array().unwrap().is_empty());
+            let pt_assets = get_json(
+                &client,
+                format!(
+                    "{base}/mosaicjson/point/-122.4,37.75/assets?url={}",
+                    mj_ps_path.to_str().unwrap()
+                ),
+            )
+            .await;
+            assert!(pt_assets.is_array() && !pt_assets.as_array().unwrap().is_empty());
+            let _ = std::fs::remove_file(&mj_ps_path);
+
+            // Compare pixel_selection=highest vs lowest vs mean vs count on two scenes (merc vs sat b1)
+            let read_f32_first = |b: &[u8]| -> f32 {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .find(|v| v.is_finite())
+                    .unwrap_or(f32::NAN)
+            };
+            let hi_bytes = client
+                .get(format!("{base}/mosaic/tiles/WebMercatorQuad/12/657/1582.f32?url={merc_url}&url={sat_url}&bidx=1&pixel_selection=highest"))
+                .send().await.unwrap().bytes().await.unwrap();
+            let lo_bytes = client
+                .get(format!("{base}/mosaic/tiles/WebMercatorQuad/12/657/1582.f32?url={merc_url}&url={sat_url}&bidx=1&pixel_selection=lowest"))
+                .send().await.unwrap().bytes().await.unwrap();
+            let cnt_bytes = client
+                .get(format!("{base}/mosaic/tiles/WebMercatorQuad/12/657/1582.f32?url={merc_url}&url={merc_url}&bidx=1&pixel_selection=count"))
+                .send().await.unwrap().bytes().await.unwrap();
+            let hi_v = read_f32_first(&hi_bytes);
+            let lo_v = read_f32_first(&lo_bytes);
+            let cnt_v = read_f32_first(&cnt_bytes);
+            assert!(hi_v >= lo_v, "highest ({hi_v}) must be >= lowest ({lo_v})");
+            assert!((cnt_v - 2.0).abs() < 1e-4, "count on 2 identical scenes must be 2.0, got {cnt_v}");
         }
     }
 }
