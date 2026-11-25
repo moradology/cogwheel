@@ -31,7 +31,7 @@ Download the prebuilt arm64 zip from the [releases page](https://github.com/mora
 
 ```bash
 mkdir -p dist
-curl -fL https://github.com/moradology/cogzilla/releases/latest/download/cogzilla-lambda-v0.7.0-aarch64-unknown-linux-gnu.zip \
+curl -fL https://github.com/moradology/cogzilla/releases/latest/download/cogzilla-lambda-v0.7.1-aarch64-unknown-linux-gnu.zip \
   -o dist/cogzilla-lambda-aarch64.zip
 
 sam deploy \
@@ -49,9 +49,9 @@ Reference it directly from your own Terraform repo:
 
 ```hcl
 module "cogzilla" {
-  source = "github.com/moradology/cogzilla//deploy/lambda/terraform?ref=v0.7.0"
+  source = "github.com/moradology/cogzilla//deploy/lambda/terraform?ref=v0.7.1"
 
-  cogzilla_version     = "v0.7.0"
+  cogzilla_version     = "v0.7.1"
   s3_bucket_arns       = ["arn:aws:s3:::my-cogs-bucket"]
   allowed_url_prefixes = ["s3://my-cogs-bucket/"]
   enable_cloudfront    = true # optional CDN in front of the Function URL
@@ -73,7 +73,7 @@ terraform apply \
   -var='enable_cloudfront=true'
 ```
 
-The module downloads the matching `cogzilla-lambda-v0.7.0-aarch64-unknown-linux-gnu.zip` automatically (or pass `zip_path = "/path/to/bootstrap.zip"` to use a local build). Tear down with `terraform destroy`.
+The module downloads the matching `cogzilla-lambda-v0.7.1-aarch64-unknown-linux-gnu.zip` automatically (or pass `zip_path = "/path/to/bootstrap.zip"` to use a local build). Tear down with `terraform destroy`.
 
 ## Configuration
 
