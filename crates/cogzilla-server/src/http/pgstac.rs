@@ -4211,14 +4211,30 @@ async fn tile(
             return detail(StatusCode::BAD_REQUEST, "a tile's scale is from @1x to @8x");
         }
         pq.buffer = 0.0;
+        // What the renderer draws of a tile, it draws without a `buffer`: said here, in a
+        // tile's words, sooner than further on in a box's.
+        let raw = matches!(ext, "npy" | "bin" | "raw" | "f32") || matches!(query_value(pairs, "format"), Some("npy" | "bin" | "raw" | "f32"));
         match check_mosaic_query(&pq, pairs) {
-            Ok(q) if q.resampling != ResampleMode::Nearest || q.reproject != ResampleMode::Nearest => {
-                return detail(StatusCode::BAD_REQUEST, "a tile with a `buffer` is read with nearest-neighbour resampling only");
+            Ok(q)
+                if q.resampling != ResampleMode::Nearest
+                    || q.reproject != ResampleMode::Nearest
+                    || pq.algorithm.is_some()
+                    || raw
+                    || !planes_read_all(&pq, &q) =>
+            {
+                return detail(
+                    StatusCode::BAD_REQUEST,
+                    "a tile with a `buffer` is drawn with nearest-neighbour resampling, as a picture, and without `algorithm` or band math only the renderer reads",
+                );
             }
             Ok(_) => {}
             Err(r) => return r,
         }
         let buffer = buffer_asked;
+        // As in rio-tiler, which grows the tile by whole pixels: halves, since both sides grow.
+        if (buffer * 2.0).fract() != 0.0 {
+            return detail(StatusCode::BAD_REQUEST, "`buffer` must be a multiple of `0.5`");
+        }
         let side = scale.map_or(pq.tile_size, |s| s * 256);
         let grown = (side as f32 + 2.0 * buffer).round() as u32;
         let bbox = super::web_mercator_buffered_3857_bbox(tile.z, tile.x, tile.y, buffer, side);
