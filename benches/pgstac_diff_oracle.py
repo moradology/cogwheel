@@ -378,7 +378,9 @@ def main() -> int:
                          ("list sorted by something no search has", "limit=5&sortby=-hash"),
                          ("list of searches with some metadata", "name=low%20cloud&limit=4"),
                          ("list of searches with metadata none has", "limit=3&name=nope&owner=me"),
-                         ("list page two", "limit=2&offset=2&sortby=usecount")]:
+                         ("list page two", "limit=2&offset=2&sortby=usecount"),
+                         ("list of searches with a number in their metadata", "minzoom=3&limit=5"),
+                         ("list past the last page", "limit=2&offset=100000")]:
             o.check(name, "list", f"/searches/list?{qs}")
 
         print("metadata")
@@ -433,6 +435,7 @@ def main() -> int:
         o.check("format chosen from the pixels", "image", f"{base12}?assets=visual")
         o.check("jpg", "image", f"{base12}.jpg?assets=visual")
         o.check("tif", "image", f"{base12}.tif?assets=visual")
+        o.check("tif, bilinear", "image", f"{base12}.tif?assets=visual&resampling=bilinear")
         o.check("webp", "image", f"{base12}.webp?assets=visual")
         o.check("tilesize=512", "image", f"{base12}.png?assets=visual&tilesize=512")
         o.check("resampling=bilinear on a reprojected source", "image", f"{base12}.png?assets=visual&resampling=bilinear")

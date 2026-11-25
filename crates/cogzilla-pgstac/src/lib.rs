@@ -488,13 +488,26 @@ impl PgStac {
         limit: i64,
         offset: i64,
         order: &[SearchOrder],
-        metadata: &serde_json::Map<String, Value>,
+        metadata: &[(String, String)],
     ) -> Result<(Vec<SearchRecord>, i64), PgStacError> {
         let client = self.client().await?;
         // Nothing of the request is written into the SQL: the metadata asked for and the
-        // metadata keys sorted by are parameters, and the rest is fixed text.
-        let wanted = Value::Object(metadata.clone()).to_string();
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&wanted];
+        // metadata keys sorted by are parameters, and the rest is fixed text. As in
+        // titiler-pgstac a metadata value is compared as text, whatever its JSON type.
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let mut filter = String::from("WHERE metadata->>'type' = 'mosaic'");
+        for (key, value) in metadata {
+            params.push(key);
+            params.push(value);
+            filter.push_str(&format!(" AND metadata->>(${}::text) = ${}::text", params.len() - 1, params.len()));
+        }
+        // The statements differ with the request, so they are not kept: a client cannot
+        // grow the connection's statement cache by varying what it sorts and filters by.
+        let matched: i64 = client
+            .query_one(&format!("SELECT count(*) FROM searches {filter}"), &params)
+            .await?
+            .try_get(0)
+            .map_err(|e| PgStacError::Shape(e.to_string()))?;
         let mut terms = Vec::with_capacity(order.len());
         for term in order {
             let column = match &term.field {
@@ -508,23 +521,14 @@ impl PgStac {
             terms.push(format!("{column} {}", if term.descending { "DESC" } else { "ASC" }));
         }
         let order_sql = if terms.is_empty() { String::new() } else { format!("ORDER BY {}", terms.join(", ")) };
-        const WHERE: &str = "WHERE metadata->>'type' = 'mosaic' AND metadata @> ($1::text)::jsonb";
-        let count = client.prepare_cached(&format!("SELECT count(*) FROM searches {WHERE}")).await?;
-        let matched: i64 = client
-            .query_one(&count, &[&wanted])
-            .await?
-            .try_get(0)
-            .map_err(|e| PgStacError::Shape(e.to_string()))?;
         let sql = format!(
-            "SELECT {SEARCH_COLUMNS} FROM searches {WHERE} {order_sql} LIMIT ${} OFFSET ${}",
+            "SELECT {SEARCH_COLUMNS} FROM searches {filter} {order_sql} LIMIT ${} OFFSET ${}",
             params.len() + 1,
             params.len() + 2
         );
         params.push(&limit);
         params.push(&offset);
-        // Statements are kept per shape, and a shape is how many metadata keys sort it.
-        let stmt = client.prepare_cached(&sql).await?;
-        let rows = client.query(&stmt, &params).await?;
+        let rows = client.query(&sql, &params).await?;
         let searches = rows.iter().map(search_from_row).collect::<Result<Vec<_>, _>>()?;
         Ok((searches, matched))
     }
