@@ -38,6 +38,17 @@ async fn post_json(client: &reqwest::Client, url: String, body: &Value) -> reqwe
         .unwrap()
 }
 
+/// A connection for a test that writes to the catalog. Tests run side by side on one
+/// database, and pgSTAC's item writes take locks on partitions and their bookkeeping in an
+/// order that two writers at once can deadlock on; a session lock, held until the
+/// connection closes with the test, lets one write at a time.
+async fn writer(url: &str) -> tokio_postgres::Client {
+    let (db, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    db.execute("SELECT pg_advisory_lock(7203117)", &[]).await.unwrap();
+    db
+}
+
 async fn start(engine: Arc<TileEngine>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -192,12 +203,10 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     assert_eq!(unsupported_tms.status().as_u16(), 400);
 
     for (what, query) in [
-        ("a pixel selection that is not there yet", "assets=visual&pixel_selection=lastbandlow"),
         ("a pixel selection nobody has", "assets=visual&pixel_selection=nope"),
         ("an asset option without a value", "assets=visual%7Cbidx"),
-        ("options on several assets", "assets=visual%7Cbidx%3D2&assets=nir"),
         ("asset names in an expression", "assets=red&assets=nir&expression=nir-red"),
-        ("too many assets", "assets=a&assets=b&assets=c&assets=d"),
+        ("too many assets", "assets=a&assets=b&assets=c&assets=d&assets=e&assets=f&assets=g&assets=h&assets=i&assets=j&assets=k&assets=l&assets=m&assets=n&assets=o&assets=p&assets=q"),
         ("buffer", "assets=visual&buffer=2"),
         ("bad limit", "assets=visual&items_limit=many"),
     ] {
@@ -210,7 +219,7 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     let unknown = client.get(format!("{tile}.png?assets=visual&pixel_selection=nope")).send().await.unwrap();
     assert_eq!(unknown.status().as_u16(), 422);
     assert_eq!(body_json(unknown).await["detail"][0]["loc"], json!(["query", "pixel_selection"]));
-    for method in ["first", "highest", "lowest", "mean", "median", "stdev", "count"] {
+    for method in ["first", "highest", "lowest", "mean", "median", "stdev", "count", "lastbandlow", "lastbandhigh"] {
         let resp = client.get(format!("{tile}.png?assets=visual&pixel_selection={method}")).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 204, "{method}");
     }
@@ -222,7 +231,22 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     }
     let image = client.get(format!("{bbox}&pixel_selection=lastbandlow")).send().await.unwrap();
     assert_eq!(image.status().as_u16(), 400);
-    assert!(body_json(image).await["detail"].as_str().unwrap().contains("lastbandlow"));
+    assert!(body_json(image).await["detail"].as_str().unwrap().contains("last band"));
+    // More than three assets, or two without band math, are tiles made from planes; over
+    // nothing they are nothing, and on an image they are refused.
+    for assets in ["assets=red&assets=green&assets=blue&assets=nir&asset_as_band=true", "assets=red&assets=nir"] {
+        let resp = client.get(format!("{tile}.png?{assets}")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 204, "{assets}");
+    }
+    let image = client
+        .get(format!("{base}/searches/{id}/bbox/6,44,7,45.png?assets=red&assets=green&assets=blue&assets=nir&max_size=64"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(image.status().as_u16(), 400);
+    let seventeen: String = (0..17).map(|n| format!("assets=a{n}&")).collect();
+    let resp = client.get(format!("{tile}.png?{seventeen}")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
     let image = client.get(format!("{bbox}&pixel_selection=nope")).send().await.unwrap();
     assert_eq!(image.status().as_u16(), 422);
 
@@ -321,7 +345,7 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("statistics?assets=visual&dst_crs=epsg:3857", &triangle, 400),
         ("statistics?assets=visual&algorithm=hillshade", &triangle, 400),
         ("statistics?assets=visual&pixel_selection=mean", &triangle, 204),
-        ("statistics?assets=visual&pixel_selection=lastbandhigh", &triangle, 400),
+        ("statistics?assets=visual&pixel_selection=lastbandhigh", &triangle, 204),
         ("statistics?assets=visual&pixel_selection=nope", &triangle, 422),
         ("statistics/extra?assets=visual", &triangle, 404),
     ] {
@@ -378,8 +402,7 @@ async fn collection_routes_match_titiler_pgstac_shapes() {
         },
         "item_assets": { "visual": {}, "thumbnail": {}, "red": {}, "nir08": {} }
     });
-    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
+    let db = writer(&url).await;
     db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()])
         .await
         .unwrap();
@@ -521,8 +544,7 @@ async fn item_routes_match_titiler_pgstac_shapes() {
             "metadata": { "href": "https://example.invalid/cogzilla-test/meta.xml", "type": "application/xml" }
         }
     });
-    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
+    let db = writer(&url).await;
     db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()])
         .await
         .unwrap();
@@ -653,8 +675,7 @@ async fn lean_lookup_lists_the_items_a_picture_samples() {
     // from minus infinity to infinity.
     let cid = "cogzilla-test-lean";
     let flat = "cogzilla-test-lean-flat";
-    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
+    let db = writer(&url).await;
     for id in [cid, flat] {
         let collection = json!({
             "id": id, "type": "Collection", "stac_version": "1.0.0",

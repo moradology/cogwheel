@@ -721,9 +721,60 @@ def main() -> int:
                 f"{base12}?assets=visual&color_formula={opt('sigmoidal rgb 6 0.4')}")
         o.check("tile, no mask", "image", f"{base12}.png?assets=visual&return_mask=false")
         o.check("tile, a pixel_selection nobody has", "status", f"{base12}.png?assets=visual&pixel_selection=nope")
-        o.check("tile, pixel_selection=lastbandhigh", "status",
-                f"{base12}.png?assets=red&assets=nir&asset_as_band=true&rescale=0,4000&pixel_selection=lastbandhigh{every}",
-                known="lastbandlow and lastbandhigh are not there yet")
+        # Tiles the renderer cannot draw in one pass, made from planes: each asset read on
+        # its own grid, then stacked, put through band math and the pixel selection.
+        four = "assets=red&assets=green&assets=blue&assets=nir&asset_as_band=true"
+        mixed = "assets=swir16&assets=nir&assets=red&asset_as_band=true&rescale=0,4000"
+        ndvi = opt("(b4-b1)/(b4+b1)")
+        for name, q in [
+            ("two assets", ".png?assets=red&assets=nir&rescale=0,4000"),
+            ("two assets as bands, a range each", ".png?assets=red&assets=nir&asset_as_band=true&rescale=0,3000&rescale=0,6000"),
+            ("four assets, band math", f".png?{four}&expression={ndvi}&rescale=-1,1"),
+            ("four assets, band math and a colour map", f".png?{four}&expression={ndvi}&rescale=-1,1&colormap_name=viridis"),
+            ("four assets, three results", f".png?{four}&expression={opt('b4;b1;b2')}&rescale=0,4000"),
+            ("two assets, two results", f".png?assets=red&assets=nir&asset_as_band=true&expression={opt('b2;b1')}&rescale=0,4000"),
+            ("four assets, pixel_selection=lastbandhigh", f".png?{four}&rescale=0,4000&pixel_selection=lastbandhigh{every}"),
+            ("four assets, pixel_selection=lastbandlow", f".png?{four}&rescale=0,4000&pixel_selection=lastbandlow{every}"),
+            ("two assets, pixel_selection=lastbandhigh", f".png?assets=red&assets=nir&asset_as_band=true&rescale=0,4000&pixel_selection=lastbandhigh{every}"),
+            ("one asset, pixel_selection=lastbandlow", f".png?assets=visual&pixel_selection=lastbandlow{every}"),
+            ("assets on two grids", f".png?{mixed}"),
+            ("assets on two grids, format chosen from the pixels", f"?{mixed}"),
+            ("assets on two grids, webp", f".webp?{mixed}"),
+            ("assets on two grids, pixel_selection=mean", f".png?{mixed}&pixel_selection=mean{every}"),
+            ("assets on two grids, band math", f".png?assets=swir16&assets=nir&asset_as_band=true&expression={opt('(b2-b1)/(b2+b1)')}&rescale=-1,1"),
+            ("assets on two grids, a colour formula", f".png?{mixed}&color_formula={opt('gamma rgb 1.5')}"),
+            ("assets on two grids, reproject=bilinear", f".png?{mixed}&reproject=bilinear"),
+            ("band math on one asset of several", f".png?assets={opt('red|expression=b1*2')}&assets=nir&assets=green&rescale=0,8000"),
+            ("band math over an asset's own", f".png?assets={opt('visual|expression=b1+b2;b3')}&expression={opt('b1/(b2+1)')}&rescale=0,4"),
+        ]:
+            o.check(f"planes tile, {name}", "image", f"{base12}{q}")
+        o.check("planes tile, on a collection", "image", f"/collections/{collection}/tiles/WebMercatorQuad/12/{t12.x}/{t12.y}.png?{mixed}")
+        # A tile at the edge of the data, where the mask is not full and decides the format.
+        edge = f"/searches/{sid}/tiles/WebMercatorQuad/8/131/88"
+        o.check("planes tile, two bands, format chosen from the pixels", "image", f"{edge}?assets=red&assets=nir&rescale=0,4000")
+        o.check("planes tile, two grids, format chosen from the pixels", "image", f"{edge}?{mixed}")
+        o.check("planes tile, asset_as_band after bidx", "image",
+                f"{base12}.png?assets={opt('visual|bidx=2')}&assets=nir&asset_as_band=true&rescale=0,255&rescale=0,4000")
+        o.check("planes tile, asset_as_band on three bands", "status", f"{base12}.png?assets=visual&assets=nir&asset_as_band=true",
+                known="titiler-pgstac answers 500 for asset_as_band on a multi-band asset; cogzilla answers 400")
+        o.check("planes tile, four bands as png", "json", f"{base12}.png?{four}&rescale=0,4000")
+        o.check("planes tile, five bands", "json", f"{base12}.png?{four}&assets=swir16&rescale=0,4000")
+        o.check("planes tile, two bands as jpeg", "json", f"{base12}?assets=red&assets=nir&asset_as_band=true&rescale=0,4000")
+        o.check("planes tile, four bands as jpeg", "status", f"{base12}.jpg?{four}&rescale=0,4000",
+                known="TiTiler sends four bands as a CMYK JPEG; cogzilla refuses them as it does for PNG")
+        o.check("planes tile, two bands of three", "image", f"{base12}.png?assets={opt('visual|bidx=3,2')}&rescale=0,255")
+        for method, q in [
+            ("first", f"{four}&expression={ndvi}"),
+            ("first", "assets=red&assets=green&assets=blue&assets=nir&assets=swir16"),
+            ("lastbandhigh", "assets=red&assets=nir&asset_as_band=true"),
+            ("lastbandlow", "assets=visual"),
+            ("mean", f"{four}&expression={ndvi}"),
+        ]:
+            o.check(f"statistics, pixel_selection={method}, {'band math' if 'expression' in q else q.count('assets=')} assets" if q.count('assets=') > 1 else f"statistics, pixel_selection={method}, one asset", "zonal",
+                    f"{st}?{q}&max_size=64&pixel_selection={method}{every}", "POST", five)
+        o.check("bbox, pixel_selection=lastbandhigh", "status",
+                f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=64&pixel_selection=lastbandhigh{every}",
+                known="bbox and feature images do not take the last-band methods, more than three assets or assets on different grids yet")
         for method, q in [
             ("highest", "assets=visual"),
             ("lowest", "assets=red&rescale=0,3000&colormap_name=viridis"),
