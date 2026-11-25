@@ -828,7 +828,7 @@ def main() -> int:
                 {"type": "FeatureCollection", "features": [five, holed]})
         o.check("statistics, a pixel_selection nobody has", "status", f"{st}?assets=red&pixel_selection=nope", "POST", five)
         o.check("tile, one band of three", "image", f"{base12}.png?assets={opt('visual|bidx=1')}",
-                known="GDAL reads a subset of an RGB raster's bands from other pixels than all of them (rio-tiler tile(indexes=(1,)) differs from tile(indexes=(1,2,3))[0] in 43% of pixels); cogzilla reads the same pixels either way")
+                known="on purpose: GDAL reads a subset of a raster's bands from other pixels than it reads all of them (43% of pixels differ); cogzilla reads the same pixels either way")
         o.check("bbox, bidx=1 on a one-band asset", "image", f"/searches/{sid}/bbox/{part}.png?assets={opt('red|bidx=1')}&rescale=0,3000&max_size=256")
         o.check("bbox, asset_as_band", "image", f"/searches/{sid}/bbox/{part}.png?assets=red&assets=green&assets=blue&rescale=0,3000&asset_as_band=true&max_size=256")
         o.check("statistics, one band of three", "zonal", f"{st}?assets={opt('visual|bidx=2')}&max_size=64", "POST", five)
