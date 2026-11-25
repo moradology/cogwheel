@@ -38,6 +38,17 @@ async fn post_json(client: &reqwest::Client, url: String, body: &Value) -> reqwe
         .unwrap()
 }
 
+/// A connection for a test that writes to the catalog. Tests run side by side on one
+/// database, and pgSTAC's item writes take locks on partitions and their bookkeeping in an
+/// order that two writers at once can deadlock on; a session lock, held until the
+/// connection closes with the test, lets one write at a time.
+async fn writer(url: &str) -> tokio_postgres::Client {
+    let (db, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    db.execute("SELECT pg_advisory_lock(7203117)", &[]).await.unwrap();
+    db
+}
+
 async fn start(engine: Arc<TileEngine>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -391,8 +402,7 @@ async fn collection_routes_match_titiler_pgstac_shapes() {
         },
         "item_assets": { "visual": {}, "thumbnail": {}, "red": {}, "nir08": {} }
     });
-    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
+    let db = writer(&url).await;
     db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()])
         .await
         .unwrap();
@@ -534,8 +544,7 @@ async fn item_routes_match_titiler_pgstac_shapes() {
             "metadata": { "href": "https://example.invalid/cogzilla-test/meta.xml", "type": "application/xml" }
         }
     });
-    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
+    let db = writer(&url).await;
     db.execute("SELECT pgstac.upsert_collection($1::text::jsonb)", &[&collection.to_string()])
         .await
         .unwrap();
@@ -666,8 +675,7 @@ async fn lean_lookup_lists_the_items_a_picture_samples() {
     // from minus infinity to infinity.
     let cid = "cogzilla-test-lean";
     let flat = "cogzilla-test-lean-flat";
-    let (db, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
+    let db = writer(&url).await;
     for id in [cid, flat] {
         let collection = json!({
             "id": id, "type": "Collection", "stac_version": "1.0.0",
