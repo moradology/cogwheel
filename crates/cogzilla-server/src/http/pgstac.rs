@@ -4673,13 +4673,16 @@ async fn tile(
             // Left to the renderer: a raster with an alpha band, which it reads as the mask,
             // and raw arrays.
             let dim = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
-            let raw = matches!(explicit.as_str(), "npy" | "bin" | "raw" | "f32");
+            let raw = matches!(explicit.as_str(), "bin" | "raw" | "f32");
+            // A NumPy array is written from planes, in the data's own type and with its
+            // mask, whatever the number of bands.
+            let array = explicit == "npy";
             // And a raster of two bands, or four and more: the renderer draws the first, or
             // the first three, where planes would stack them all and TiTiler refuse most.
             let preferred = planes_preferred
                 && !raw
                 && full.extra_samples.is_empty()
-                && (scenes[0].len() > 1 || matches!(full.samples_per_pixel, 1 | 3));
+                && (array || scenes[0].len() > 1 || matches!(full.samples_per_pixel, 1 | 3));
             // A plain request that takes this road only because it is the better reader keeps
             // the bands of its first raster for every item, as the renderer does: a later
             // item with more bands gives the same ones, not a tile of another shape.
@@ -4700,7 +4703,7 @@ async fn tile(
                     None
                 } else {
                     let (format, content_type) = parse_ext_format(&explicit, pq.webp_quality, jpeg_quality)?;
-                    if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
+                    if matches!(format, OutputFormat::RawF32) {
                         return Err(EngineError::BadRequest(
                             "raw array formats are not supported with these assets and options yet".into(),
                         ));
@@ -4715,7 +4718,7 @@ async fn tile(
                     resampling,
                     reproject,
                     nodata,
-                    array: false,
+                    array,
                     window: Window::Tile(crate::engine::TileRequest {
                         tile,
                         tile_size: dim,

@@ -721,6 +721,12 @@ def main() -> int:
                 f"{abox}?assets=red&assets=green&assets=blue&assets=nir&assets=scl&rescale=0,3000")
         o.check("box as an array, a root of float32", "image", f"{abox}?assets=red&expression=sqrt(b1)&unscale=true")
         o.check("box as an array, a division by nothing", "image", f"{abox}?assets=red&expression=b1/0")
+        # A tile is an array as a box is: the data's type, and the mask as a band.
+        o.check("tile as an array", "image", f"{base12}.npy?assets=red")
+        o.check("tile as an array, three bands of bytes", "image", f"{base12}.npy?assets=visual")
+        o.check("tile as an array, five assets", "image", f"{base12}.npy?assets=red&assets=green&assets=blue&assets=nir&assets=scl")
+        o.check("tile as an array, band math", "image", f"{base12}.npy?assets=red&expression=b1*2")
+        o.check("tile as an array, a mean", "image", f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3")
         o.check("box as an array, band math in doubles", "image",
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/120x80.npy?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)")
         o.check("feature as an array, band math", "image",
