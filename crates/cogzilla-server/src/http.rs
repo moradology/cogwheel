@@ -29,7 +29,8 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
-    build_map_html, build_tilejson, build_wmts_capabilities, compute_f32_band_stats,
+    build_map_html, build_tilejson, build_wmts_capabilities, build_wmts_capabilities_multi,
+    compute_f32_band_stats,
     compute_statistics_with_options,
     encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
     get_algorithm_json,
@@ -4137,6 +4138,41 @@ pub async fn handle_bytes_request(
     Response::from_parts(rparts, bytes)
 }
 
+fn header_accepts_gzip(val: &str) -> bool {
+    for part in val.split(',') {
+        let mut iter = part.split(';');
+        let enc = iter.next().unwrap_or("").trim();
+        if !enc.eq_ignore_ascii_case("gzip") && !enc.eq_ignore_ascii_case("x-gzip") {
+            continue;
+        }
+        let mut q_ok = true;
+        for param in iter {
+            let p = param.trim();
+            if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                if let Ok(q) = qv.trim().parse::<f32>() {
+                    if q <= 0.0 {
+                        q_ok = false;
+                    }
+                }
+            }
+        }
+        if q_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_compressible_content_type(ct: &str) -> bool {
+    let media = ct.split(';').next().unwrap_or("").trim();
+    media.eq_ignore_ascii_case("application/json")
+        || media.eq_ignore_ascii_case("application/geo+json")
+        || media.eq_ignore_ascii_case("application/xml")
+        || media.eq_ignore_ascii_case("application/vnd.oai.openapi+json")
+        || media.eq_ignore_ascii_case("image/svg+xml")
+        || media.starts_with("text/")
+}
+
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
     req: Request<B>,
@@ -4148,6 +4184,13 @@ where
     let t0 = std::time::Instant::now();
     let is_head = *req.method() == Method::HEAD;
     let is_post = *req.method() == Method::POST;
+    let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
+    let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics");
+    let accepts_gzip = req
+        .headers()
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(header_accepts_gzip);
     let mut resp = handle_request_inner(engine, req, is_head).await?;
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
@@ -4160,7 +4203,60 @@ where
         // RFC 9110: POST responses depend on the request body and must not carry public Cache-Control/ETag.
         resp.headers_mut().remove(CACHE_CONTROL);
         resp.headers_mut().remove(ETAG);
+    } else if is_get_or_head
+        && resp.status() == StatusCode::OK
+        && !is_health_or_metrics
+        && !resp.headers().contains_key(CACHE_CONTROL)
+    {
+        resp.headers_mut()
+            .insert(CACHE_CONTROL, cache_control_header().clone());
     }
+
+    let compressible = resp.status() == StatusCode::OK
+        && resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_compressible_content_type);
+    if compressible {
+        if let Some(existing) = resp.headers().get(hyper::header::VARY).and_then(|v| v.to_str().ok()) {
+            if !existing.to_ascii_lowercase().contains("accept-encoding") {
+                if let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
+                    resp.headers_mut().insert(hyper::header::VARY, hv);
+                }
+            }
+        } else {
+            resp.headers_mut()
+                .insert(hyper::header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
+        if accepts_gzip
+            && !is_head
+            && !resp.headers().contains_key(hyper::header::CONTENT_ENCODING)
+        {
+            let (mut parts, body) = resp.into_parts();
+            let raw = body
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            if raw.len() >= 500
+                && let Ok(gz) = cogzilla_codec::compress_gzip(&raw)
+                && gz.len() < raw.len()
+            {
+                parts.headers.insert(
+                    hyper::header::CONTENT_ENCODING,
+                    HeaderValue::from_static("gzip"),
+                );
+                if let Ok(hv) = HeaderValue::from_str(&gz.len().to_string()) {
+                    parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
+                }
+                resp = Response::from_parts(parts, Full::new(Bytes::from(gz)));
+            } else {
+                resp = Response::from_parts(parts, Full::new(raw));
+            }
+        }
+    }
+
     if is_head {
         let (mut parts, body) = resp.into_parts();
         if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT {
@@ -5087,8 +5183,10 @@ where
             .await,
             ["mosaicjson", _, "WMTSCapabilities.xml"] | ["mosaicjson", "WMTSCapabilities.xml"] => {
                 async {
-                    let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
-                    if crate::tms::lookup_tms(tms).is_none() {
+                    let explicit_tms = (segs.len() == 3).then_some(segs[1]);
+                    if let Some(tms) = explicit_tms
+                        && crate::tms::lookup_tms(tms).is_none()
+                    {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
                     let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -5098,20 +5196,40 @@ where
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
-                    let xml = build_wmts_capabilities(
-                        &host,
-                        "mosaicjson",
-                        tms,
-                        "MosaicJSON",
-                        mj.bounds,
-                        minz,
-                        maxz,
-                        fmt,
-                        scale,
-                        &tile_q,
-                        &raw_query,
-                        pq.use_epsg,
-                    );
+                    let xml = if let Some(tms) = explicit_tms {
+                        build_wmts_capabilities(
+                            &host,
+                            "mosaicjson",
+                            tms,
+                            "MosaicJSON",
+                            mj.bounds,
+                            minz,
+                            maxz,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    } else {
+                        let entries: Vec<(&str, u8, u8)> = crate::tms::ALL_TMS
+                            .iter()
+                            .map(|t| (t.id, minz, maxz))
+                            .collect();
+                        build_wmts_capabilities_multi(
+                            &host,
+                            "mosaicjson",
+                            &entries,
+                            None,
+                            "MosaicJSON",
+                            mj.bounds,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    };
                     Ok((Bytes::from(xml), "application/xml"))
                 }
                 .await
@@ -6681,8 +6799,10 @@ where
             .await,
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
-                    let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                    if crate::tms::lookup_tms(tms).is_none() {
+                    let explicit_tms = (sub.len() == 2).then_some(sub[0]);
+                    if let Some(tms) = explicit_tms
+                        && crate::tms::lookup_tms(tms).is_none()
+                    {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
                     let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -6698,30 +6818,60 @@ where
                     let coarsest = cogs[0].index.ifds.last().unwrap();
                     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
                         .max(full.height as f64 / coarsest.height.max(1) as f64);
-                    let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
-                        tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
-                    } else {
-                        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
-                    };
-                    let (minz, maxz) =
-                        resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
-                    let xml = build_wmts_capabilities(
-                        &host,
-                        "stac",
-                        tms,
-                        &item.id,
-                        bounds,
-                        minz,
-                        maxz,
-                        fmt,
-                        scale,
-                        &tile_q,
-                        &raw_query,
-                        pq.use_epsg,
-                    );
+                    let xml = if let Some(tms) = explicit_tms {
+                        let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
+                            tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
+                        } else {
+                            crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                        };
+                        let (minz, maxz) =
+                            resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
+                        build_wmts_capabilities(
+                            &host,
+                            "stac",
+                            tms,
+                            &item.id,
+                            bounds,
+                            minz,
+                            maxz,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    } else {
+                        let entries: Vec<(&str, u8, u8)> = crate::tms::ALL_TMS
+                            .iter()
+                            .map(|t| {
+                                let (dmin, dmax) = t.zoom_range_for_cog(
+                                    &crs,
+                                    &full.pixel_to_crs,
+                                    full.width,
+                                    full.height,
+                                    ov_factor,
+                                );
+                                let (z0, z1) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                                (t.id, z0, z1)
+                            })
+                            .collect();
+                        build_wmts_capabilities_multi(
+                            &host,
+                            "stac",
+                            &entries,
+                            None,
+                            &item.id,
+                            bounds,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    };
                     Ok((Bytes::from(xml), "application/xml"))
                 }
                 .await
@@ -8379,8 +8529,10 @@ where
             .await,
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
-                    let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                    if crate::tms::lookup_tms(tms).is_none() {
+                    let explicit_tms = (sub.len() == 2).then_some(sub[0]);
+                    if let Some(tms) = explicit_tms
+                        && crate::tms::lookup_tms(tms).is_none()
+                    {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
                     let cogs = open_query_urls(&engine, &pq.urls).await?;
@@ -8390,30 +8542,60 @@ where
                     let coarsest = cogs[0].index.ifds.last().unwrap();
                     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
                         .max(full.height as f64 / coarsest.height.max(1) as f64);
-                    let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
-                        tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
-                    } else {
-                        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
-                    };
-                    let (minz, maxz) =
-                        resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
-                    let xml = build_wmts_capabilities(
-                        &host,
-                        "cog",
-                        tms,
-                        "Cloud Optimized GeoTIFF",
-                        bounds,
-                        minz,
-                        maxz,
-                        fmt,
-                        scale,
-                        &tile_q,
-                        &raw_query,
-                        pq.use_epsg,
-                    );
+                    let xml = if let Some(tms) = explicit_tms {
+                        let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
+                            tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
+                        } else {
+                            crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                        };
+                        let (minz, maxz) =
+                            resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
+                        build_wmts_capabilities(
+                            &host,
+                            "cog",
+                            tms,
+                            "Cloud Optimized GeoTIFF",
+                            bounds,
+                            minz,
+                            maxz,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    } else {
+                        let entries: Vec<(&str, u8, u8)> = crate::tms::ALL_TMS
+                            .iter()
+                            .map(|t| {
+                                let (dmin, dmax) = t.zoom_range_for_cog(
+                                    &crs,
+                                    &full.pixel_to_crs,
+                                    full.width,
+                                    full.height,
+                                    ov_factor,
+                                );
+                                let (z0, z1) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                                (t.id, z0, z1)
+                            })
+                            .collect();
+                        build_wmts_capabilities_multi(
+                            &host,
+                            "cog",
+                            &entries,
+                            None,
+                            "Cloud Optimized GeoTIFF",
+                            bounds,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    };
                     Ok((Bytes::from(xml), "application/xml"))
                 }
                 .await

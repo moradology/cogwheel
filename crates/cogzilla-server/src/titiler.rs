@@ -645,7 +645,8 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// Build an OGC WMTS 1.0.0 `WMTSCapabilities.xml` document for `/cog`, `/stac`, or `/mosaicjson`.
+/// Build an OGC WMTS 1.0.0 `WMTSCapabilities.xml` document for `/cog`, `/stac`, or `/mosaicjson`
+/// advertising a single TileMatrixSet.
 #[allow(clippy::too_many_arguments)]
 pub fn build_wmts_capabilities(
     host: &str,
@@ -655,6 +656,38 @@ pub fn build_wmts_capabilities(
     bounds: [f64; 4],
     minzoom: u8,
     maxzoom: u8,
+    tile_format: &str,
+    tile_scale: u32,
+    tile_query: &str,
+    capabilities_query: &str,
+    use_epsg: bool,
+) -> String {
+    build_wmts_capabilities_multi(
+        host,
+        family,
+        &[(tms, minzoom, maxzoom)],
+        Some(tms),
+        title,
+        bounds,
+        tile_format,
+        tile_scale,
+        tile_query,
+        capabilities_query,
+        use_epsg,
+    )
+}
+
+/// Build an OGC WMTS 1.0.0 `WMTSCapabilities.xml` document advertising one or more TileMatrixSets.
+/// When `explicit_tms` is `None` (root `/{family}/WMTSCapabilities.xml`), advertises a `<Layer>`
+/// and `<TileMatrixSet>` for every entry in `tms_entries` (all 13 supported TMSs).
+#[allow(clippy::too_many_arguments)]
+pub fn build_wmts_capabilities_multi(
+    host: &str,
+    family: &str,
+    tms_entries: &[(&str, u8, u8)],
+    explicit_tms: Option<&str>,
+    title: &str,
+    bounds: [f64; 4],
     tile_format: &str,
     tile_scale: u32,
     tile_query: &str,
@@ -689,69 +722,115 @@ pub fn build_wmts_capabilities(
     } else {
         format!("?{capabilities_query}")
     };
-    let capabilities_url = xml_escape(&format!(
-        "{origin}/{family}/{tms}/WMTSCapabilities.xml{q_cap}"
-    ));
-    let tile_template = xml_escape(&format!(
-        "{origin}/{family}/tiles/{tms}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}{scale_str}.{tile_format}{q_tile}"
-    ));
-    let tile_base = xml_escape(&format!("{origin}/{family}/tiles/{tms}"));
-    let title_esc = xml_escape(title);
-    let tms_esc = xml_escape(tms);
-    let tile_px = 256u32 * tile_scale.clamp(1, 4);
-
-    let tms_def = crate::tms::lookup_tms(tms)
-        .unwrap_or_else(|| crate::tms::lookup_tms("WebMercatorQuad").unwrap());
-    let crs_urn = if use_epsg {
-        format!("urn:ogc:def:crs:EPSG::{}", tms_def.epsg)
+    let capabilities_url = if let Some(tms) = explicit_tms {
+        xml_escape(&format!("{origin}/{family}/{tms}/WMTSCapabilities.xml{q_cap}"))
     } else {
-        tms_def.crs_uri.to_string()
+        xml_escape(&format!("{origin}/{family}/WMTSCapabilities.xml{q_cap}"))
     };
+    let tile_base = if let Some(tms) = explicit_tms {
+        xml_escape(&format!("{origin}/{family}/tiles/{tms}"))
+    } else {
+        xml_escape(&format!("{origin}/{family}/tiles"))
+    };
+    let title_esc = xml_escape(title);
+    let multi = explicit_tms.is_none() && tms_entries.len() > 1;
 
-    let max_tms_z = tms_def
-        .matrices
-        .iter()
-        .filter_map(|m| m.id.parse::<u8>().ok())
-        .max()
-        .unwrap_or(0);
-    let min_tms_z = tms_def
-        .matrices
-        .iter()
-        .filter_map(|m| m.id.parse::<u8>().ok())
-        .min()
-        .unwrap_or(0);
-    let eff_minz = minzoom.clamp(min_tms_z, max_tms_z);
-    let eff_maxz = maxzoom.clamp(eff_minz, max_tms_z);
+    let mut layers_xml = String::new();
+    let mut tms_sets_xml = String::new();
+    let scale = tile_scale.clamp(1, 4);
 
-    let mut matrices_xml = String::new();
-    for m in tms_def.matrices {
-        if let Ok(z) = m.id.parse::<u8>()
-            && (eff_minz..=eff_maxz).contains(&z)
-        {
-            let (tl0, tl1) = if tms_def.invert_axis {
-                (m.origin_y, m.origin_x)
-            } else {
-                (m.origin_x, m.origin_y)
-            };
-            let scale = tile_scale.clamp(1, 4);
-            let tw = m.tile_width * scale;
-            let th = m.tile_height * scale;
-            let scale_denom = m.scale_denominator / (scale as f64);
-            matrices_xml.push_str(&format!(
-                "            <TileMatrix>\n\
-                 \x20               <ows:Identifier>{}</ows:Identifier>\n\
-                 \x20               <ScaleDenominator>{scale_denom:.6}</ScaleDenominator>\n\
-                 \x20               <TopLeftCorner>{tl0} {tl1}</TopLeftCorner>\n\
-                 \x20               <TileWidth>{tw}</TileWidth>\n\
-                 \x20               <TileHeight>{th}</TileHeight>\n\
-                 \x20               <MatrixWidth>{}</MatrixWidth>\n\
-                 \x20               <MatrixHeight>{}</MatrixHeight>\n\
-                 \x20           </TileMatrix>\n",
-                m.id, m.matrix_width, m.matrix_height
-            ));
+    for &(tms, minzoom, maxzoom) in tms_entries {
+        let tms_esc = xml_escape(tms);
+        let tile_template = xml_escape(&format!(
+            "{origin}/{family}/tiles/{tms}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}{scale_str}.{tile_format}{q_tile}"
+        ));
+        let layer_title = if multi {
+            format!("{title_esc}_{tms_esc}")
+        } else {
+            title_esc.clone()
+        };
+        let layer_id = if multi {
+            tms_esc.as_str()
+        } else {
+            "cogeo"
+        };
+        layers_xml.push_str(&format!(
+            "        <Layer>\n\
+             \x20           <ows:Title>{layer_title}</ows:Title>\n\
+             \x20           <ows:Identifier>{layer_id}</ows:Identifier>\n\
+             \x20           <ows:WGS84BoundingBox crs=\"urn:ogc:def:crs:OGC:2:84\">\n\
+             \x20               <ows:LowerCorner>{} {}</ows:LowerCorner>\n\
+             \x20               <ows:UpperCorner>{} {}</ows:UpperCorner>\n\
+             \x20           </ows:WGS84BoundingBox>\n\
+             \x20           <Style isDefault=\"true\">\n\
+             \x20               <ows:Identifier>default</ows:Identifier>\n\
+             \x20           </Style>\n\
+             \x20           <Format>{media_type}</Format>\n\
+             \x20           <TileMatrixSetLink>\n\
+             \x20               <TileMatrixSet>{tms_esc}</TileMatrixSet>\n\
+             \x20           </TileMatrixSetLink>\n\
+             \x20           <ResourceURL format=\"{media_type}\" resourceType=\"tile\" template=\"{tile_template}\"/>\n\
+             \x20       </Layer>\n",
+            bounds[0], bounds[1], bounds[2], bounds[3]
+        ));
+
+        let tms_def = crate::tms::lookup_tms(tms)
+            .unwrap_or_else(|| crate::tms::lookup_tms("WebMercatorQuad").unwrap());
+        let crs_urn = if use_epsg {
+            format!("urn:ogc:def:crs:EPSG::{}", tms_def.epsg)
+        } else {
+            tms_def.crs_uri.to_string()
+        };
+        let max_tms_z = tms_def
+            .matrices
+            .iter()
+            .filter_map(|m| m.id.parse::<u8>().ok())
+            .max()
+            .unwrap_or(0);
+        let min_tms_z = tms_def
+            .matrices
+            .iter()
+            .filter_map(|m| m.id.parse::<u8>().ok())
+            .min()
+            .unwrap_or(0);
+        let eff_minz = minzoom.clamp(min_tms_z, max_tms_z);
+        let eff_maxz = maxzoom.clamp(eff_minz, max_tms_z);
+
+        let mut matrices_xml = String::new();
+        for m in tms_def.matrices {
+            if let Ok(z) = m.id.parse::<u8>()
+                && (eff_minz..=eff_maxz).contains(&z)
+            {
+                let (tl0, tl1) = if tms_def.invert_axis {
+                    (m.origin_y, m.origin_x)
+                } else {
+                    (m.origin_x, m.origin_y)
+                };
+                let tw = m.tile_width * scale;
+                let th = m.tile_height * scale;
+                let scale_denom = m.scale_denominator / (scale as f64);
+                matrices_xml.push_str(&format!(
+                    "            <TileMatrix>\n\
+                     \x20               <ows:Identifier>{}</ows:Identifier>\n\
+                     \x20               <ScaleDenominator>{scale_denom:.6}</ScaleDenominator>\n\
+                     \x20               <TopLeftCorner>{tl0} {tl1}</TopLeftCorner>\n\
+                     \x20               <TileWidth>{tw}</TileWidth>\n\
+                     \x20               <TileHeight>{th}</TileHeight>\n\
+                     \x20               <MatrixWidth>{}</MatrixWidth>\n\
+                     \x20               <MatrixHeight>{}</MatrixHeight>\n\
+                     \x20           </TileMatrix>\n",
+                    m.id, m.matrix_width, m.matrix_height
+                ));
+            }
         }
+        tms_sets_xml.push_str(&format!(
+            "        <TileMatrixSet>\n\
+             \x20           <ows:Title>{tms_esc}</ows:Title>\n\
+             \x20           <ows:Identifier>{tms_esc}</ows:Identifier>\n\
+             \x20           <ows:SupportedCRS>{crs_urn}</ows:SupportedCRS>\n\
+             {matrices_xml}        </TileMatrixSet>\n"
+        ));
     }
-    let _ = tile_px;
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -796,31 +875,9 @@ pub fn build_wmts_capabilities(
         </ows:Operation>
     </ows:OperationsMetadata>
     <Contents>
-        <Layer>
-            <ows:Title>{title_esc}</ows:Title>
-            <ows:Identifier>cogeo</ows:Identifier>
-            <ows:WGS84BoundingBox crs="urn:ogc:def:crs:OGC:2:84">
-                <ows:LowerCorner>{} {}</ows:LowerCorner>
-                <ows:UpperCorner>{} {}</ows:UpperCorner>
-            </ows:WGS84BoundingBox>
-            <Style isDefault="true">
-                <ows:Identifier>default</ows:Identifier>
-            </Style>
-            <Format>{media_type}</Format>
-            <TileMatrixSetLink>
-                <TileMatrixSet>{tms_esc}</TileMatrixSet>
-            </TileMatrixSetLink>
-            <ResourceURL format="{media_type}" resourceType="tile" template="{tile_template}"/>
-        </Layer>
-        <TileMatrixSet>
-            <ows:Title>{tms_esc}</ows:Title>
-            <ows:Identifier>{tms_esc}</ows:Identifier>
-            <ows:SupportedCRS>{crs_urn}</ows:SupportedCRS>
-{matrices_xml}        </TileMatrixSet>
-    </Contents>
+{layers_xml}{tms_sets_xml}    </Contents>
 </Capabilities>
-"#,
-        bounds[0], bounds[1], bounds[2], bounds[3]
+"#
     )
 }
 
