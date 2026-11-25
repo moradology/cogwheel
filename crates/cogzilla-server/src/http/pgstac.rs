@@ -2487,27 +2487,36 @@ fn npy_array(
     out.extend_from_slice(b"\x93NUMPY\x01\x00");
     out.extend_from_slice(&(dict.len() as u16).to_le_bytes());
     out.extend_from_slice(dict.as_bytes());
-    // One value in the array's type; `top` is the type's largest, which marks the mask.
-    let mut put = |v: f64, top: bool| match kind {
-        SampleType::Uint8 => out.push(if top { u8::MAX } else { v as u8 }),
-        SampleType::Int8 => out.push((if top { i8::MAX } else { v as i8 }) as u8),
-        SampleType::Uint16 => out.extend_from_slice(&(if top { u16::MAX } else { v as u16 }).to_le_bytes()),
-        SampleType::Int16 => out.extend_from_slice(&(if top { i16::MAX } else { v as i16 }).to_le_bytes()),
-        SampleType::Uint32 => out.extend_from_slice(&(if top { u32::MAX } else { v as u32 }).to_le_bytes()),
-        SampleType::Int32 => out.extend_from_slice(&(if top { i32::MAX } else { v as i32 }).to_le_bytes()),
-        // Band math's largest number is an infinity once it has been through a plane of f32.
-        SampleType::Float32 => out.extend_from_slice(&(if top { f32::MAX } else { (v as f32).clamp(f32::MIN, f32::MAX) }).to_le_bytes()),
-        SampleType::Float64 => out.extend_from_slice(&(if top { f64::MAX } else { v.clamp(f64::MIN, f64::MAX) }).to_le_bytes()),
-    };
     let absent = f64::from(absent.unwrap_or(0.0));
-    for v in values.iter().take(bands * pixels) {
-        put(if v.is_nan() { absent } else { f64::from(*v) }, false);
+    let data = &values[..(bands * pixels).min(values.len())];
+    // The values in the array's type, then the mask: the type's largest number where any
+    // band has a value. One loop for each type, so the type is not asked about per value.
+    macro_rules! write {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for v in data {
+                let x: $t = cast(if v.is_nan() { absent } else { f64::from(*v) });
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if mask {
+                for i in 0..pixels {
+                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+                    let x: $t = if there { <$t>::MAX } else { cast(0.0) };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
     }
-    if mask {
-        for i in 0..pixels {
-            let there = (0..bands).any(|band| values.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
-            put(0.0, there);
-        }
+    match kind {
+        SampleType::Uint8 => write!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write!(i32, |v: f64| v as i32),
+        // Band math's largest number is an infinity once it has been through a plane of f32.
+        SampleType::Float32 => write!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }
     Bytes::from(out)
 }
