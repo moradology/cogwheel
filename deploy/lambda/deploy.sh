@@ -8,7 +8,7 @@ set -euo pipefail
 #   ./deploy.sh                                    # deploy public demo (latest release)
 #   ./deploy.sh --bucket my-cogs                   # grant s3:GetObject on s3://my-cogs/*
 #   ./deploy.sh --allow-prefixes s3://my-cogs/     # lock down allowed URL prefixes
-#   ./deploy.sh --version v0.7.18 --name my-tiler   # custom version / function name
+#   ./deploy.sh --version v0.7.19 --name my-tiler   # custom version / function name
 #   ./deploy.sh --zip /path/to/bootstrap.zip       # deploy a locally built zip
 #   ./deploy.sh --destroy                          # delete the Lambda function
 
@@ -95,11 +95,18 @@ if [[ -n "$BUCKET" ]]; then
     --policy-document "$POLICY"
 fi
 
-# 3. Build environment variables JSON
-ENV_VARS="COGZILLA_CACHE_MB=${CACHE_MB},COGZILLA_DISK_CACHE_MB=${DISK_CACHE_MB},COGZILLA_DISK_CACHE_DIR=/tmp/cogzilla-cache,COGZILLA_CACHE_CONTROL_MAX_AGE=3600,RUST_LOG=info"
+# 3. Build environment variables JSON (avoids AWS CLI shorthand comma-splitting on ALLOW_PREFIXES)
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+ENV_JSON="{\"Variables\":{\"COGZILLA_CACHE_MB\":\"$(json_escape "$CACHE_MB")\",\"COGZILLA_DISK_CACHE_MB\":\"$(json_escape "$DISK_CACHE_MB")\",\"COGZILLA_DISK_CACHE_DIR\":\"/tmp/cogzilla-cache\",\"COGZILLA_CACHE_CONTROL_MAX_AGE\":\"3600\",\"RUST_LOG\":\"info\""
 if [[ -n "$ALLOW_PREFIXES" ]]; then
-  ENV_VARS="${ENV_VARS},COGZILLA_ALLOWED_URL_PREFIXES=${ALLOW_PREFIXES}"
+  ENV_JSON="${ENV_JSON},\"COGZILLA_ALLOWED_URL_PREFIXES\":\"$(json_escape "$ALLOW_PREFIXES")\""
 fi
+ENV_JSON="${ENV_JSON}}}"
 
 # 4. Create or update Lambda function
 if aws lambda get-function --region "$REGION" --function-name "$NAME" >/dev/null 2>&1; then
@@ -115,7 +122,7 @@ if aws lambda get-function --region "$REGION" --function-name "$NAME" >/dev/null
     --function-name "$NAME" \
     --memory-size "$MEMORY" \
     --timeout 30 \
-    --environment "Variables={${ENV_VARS}}" >/dev/null
+    --environment "$ENV_JSON" >/dev/null
 else
   echo "Creating Lambda function '$NAME' (provided.al2023, arm64, ${MEMORY} MiB) in $REGION..."
   aws lambda create-function \
@@ -128,7 +135,7 @@ else
     --zip-file "fileb://$ZIP_PATH" \
     --memory-size "$MEMORY" \
     --timeout 30 \
-    --environment "Variables={${ENV_VARS}}" >/dev/null
+    --environment "$ENV_JSON" >/dev/null
 fi
 aws lambda wait function-active-v2 --region "$REGION" --function-name "$NAME"
 
