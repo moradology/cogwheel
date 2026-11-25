@@ -4264,6 +4264,32 @@ async fn render_bbox_impl(
 
     let dst_is_3857 = matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857);
     let dst_is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
+    let native_dem_dxy: Option<(f32, f32)> = if native_preview {
+        let full = primary.index.full_res();
+        let rx = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d) * (full.width as f64) / (w as f64);
+        let ry = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e) * (full.height as f64) / (h as f64);
+        let (dx_m, dy_m) = match &crs {
+            cogzilla_proj::CrsModel::Geographic => {
+                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                (
+                    (rx * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
+                    (ry * 111_320.0).max(1e-3) as f32,
+                )
+            }
+            cogzilla_proj::CrsModel::Epsg3857 => {
+                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                let cos_lat = lat_rad.cos().max(0.05);
+                (
+                    (rx * cos_lat).max(1e-3) as f32,
+                    (ry * cos_lat).max(1e-3) as f32,
+                )
+            }
+            _ => (rx.max(1e-3) as f32, ry.max(1e-3) as f32),
+        };
+        Some((dx_m, dy_m))
+    } else {
+        None
+    };
     let render_cpu = move |u_map: Vec<f32>,
                            v_map: Vec<f32>,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
@@ -4489,7 +4515,9 @@ async fn render_bbox_impl(
         };
 
         let dem_inv_8dxy = || -> (f32, f32) {
-            let (dx_m, dy_m) = if dst_is_3857 {
+            let (dx_m, dy_m) = if let Some(dxy) = native_dem_dxy {
+                dxy
+            } else if dst_is_3857 {
                 let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
                 let cos_lat = center_lat.to_radians().cos().max(0.05);
                 (

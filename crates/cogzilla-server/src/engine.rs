@@ -334,7 +334,8 @@ impl TileEngine {
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. } => 3,
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
@@ -1290,7 +1291,8 @@ impl TileEngine {
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. } => 3,
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
