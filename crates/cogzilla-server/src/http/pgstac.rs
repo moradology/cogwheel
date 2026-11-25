@@ -2371,7 +2371,7 @@ impl PlanesTile {
                 // One band under a colour map takes the formula before the map; the
                 // formula is then done with.
                 let before_map = formula.filter(|_| {
-                    selected.bands == 1 && (look.mapped || (look.custom.is_some() && !look.rescale.is_empty()))
+                    selected.bands == 1 && (look.mapped || look.custom.is_some())
                 });
                 if before_map.is_some() {
                     formula = None;
@@ -2625,12 +2625,11 @@ fn paint_bands(
             let mut out = vec![0u8; pixels * 4];
             for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
                 if !v.is_nan() {
-                    px.copy_from_slice(&match (&levels, scaled) {
-                        // The map is over the byte, and the byte is the formula's.
-                        (Some(levels), Some((min, max))) => {
-                            custom.colour(f32::from(levels[usize::from(rescale_byte(*v, min, max))]), Some((0.0, 255.0)))
-                        }
-                        _ => custom.colour(*v, scaled),
+                    px.copy_from_slice(&match &levels {
+                        // The map is over the byte, and the byte is the formula's: of the
+                        // value over `rescale`, or over its type's range without one.
+                        Some(levels) => custom.colour(f32::from(levels[usize::from(rescale_byte(*v, min, max))]), Some((0.0, 255.0))),
+                        None => custom.colour(*v, scaled),
                     });
                 }
             }

@@ -6456,6 +6456,16 @@ where
                                 .await?;
                                 (d, bbox_3857, 3857u16)
                             };
+                            // An item's picture with pixels missing is a PNG whether or not
+                            // the mask was asked for: the format is chosen from the pixels.
+                            if item_auto_format
+                                && !pq_stac.return_mask
+                                && data.len() == (out_dim as usize).pow(2) * 4
+                                && data.chunks_exact(4).any(|p| p[3] != 255)
+                            {
+                                let (w, h) = (out_dim as usize, out_dim as usize);
+                                return Ok((encode_rgba_output(w, h, &data, OutputFormat::Png, false), "image/png"));
+                            }
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq_stac.jpeg_quality, pq_stac.return_mask))
                         } else if item_auto_format {
                             pgstac::item_tile_auto_format(&engine, &cogs, treq, &pq_stac).await
