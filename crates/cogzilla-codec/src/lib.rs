@@ -11,6 +11,43 @@ use thiserror::Error;
 
 pub use slab::{AlignedF32Slab, BandData, BlockStats, DecodedBand, DecodedTile};
 
+/// Decompress a gzip-encoded buffer using `libdeflater` with an upper bound on decompressed size
+/// to guard against decompression bombs.
+pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {
+    if input.len() < 18 || input[0] != 0x1f || input[1] != 0x8b {
+        return Err("invalid gzip header".into());
+    }
+    let isize_hint = u32::from_le_bytes([
+        input[input.len() - 4],
+        input[input.len() - 3],
+        input[input.len() - 2],
+        input[input.len() - 1],
+    ]) as usize;
+    let mut cap = isize_hint
+        .max(input.len().saturating_mul(2))
+        .clamp(4096, max_out_bytes);
+    let mut decompressor = libdeflater::Decompressor::new();
+    loop {
+        let mut out = vec![0u8; cap];
+        match decompressor.gzip_decompress(input, &mut out) {
+            Ok(n) => {
+                out.truncate(n);
+                return Ok(out);
+            }
+            Err(libdeflater::DecompressionError::InsufficientSpace) => {
+                if cap >= max_out_bytes {
+                    return Err(format!(
+                        "gzip payload exceeds {} MiB limit",
+                        max_out_bytes / (1024 * 1024)
+                    ));
+                }
+                cap = cap.saturating_mul(2).min(max_out_bytes);
+            }
+            Err(e) => return Err(format!("gzip decompression failed: {e:?}")),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CodecError {
     #[error("deflate decompression failed: {0}")]

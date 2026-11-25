@@ -824,6 +824,20 @@ pub fn build_tilejson(
     } else {
         format!("{origin}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}")
     };
+    let count = full.samples_per_pixel as usize;
+    let band_descriptions: Vec<_> = (0..count)
+        .map(|i| {
+            let bname = format!("b{}", i + 1);
+            let desc = cog
+                .index
+                .band_descriptions
+                .get(i)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| bname.clone());
+            serde_json::json!([bname, desc])
+        })
+        .collect();
     Ok(serde_json::json!({
         "tilejson": "3.0.0",
         "name": cog.uri,
@@ -834,6 +848,8 @@ pub fn build_tilejson(
         "maxzoom": maxzoom,
         "bounds": bounds,
         "center": center,
+        "band_descriptions": band_descriptions,
+        "data_type": full.sample_type.gdal_name(),
     }))
 }
 

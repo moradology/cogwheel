@@ -206,6 +206,7 @@ struct ParsedQuery {
     coord_crs_epsg: Option<u16>,
     dst_crs: Option<(cogzilla_proj::CrsModel, u16)>,
     bounds_crs: Option<(cogzilla_proj::CrsModel, u16)>,
+    bbox_crs: Option<(cogzilla_proj::CrsModel, u16)>,
     bbox_param: Option<[f64; 4]>,
     format_param: Option<String>,
     minzoom: Option<u8>,
@@ -273,6 +274,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         coord_crs_epsg: None,
         dst_crs: None,
         bounds_crs: None,
+        bbox_crs: None,
         bbox_param: None,
         format_param: None,
         minzoom: None,
@@ -730,6 +732,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 let dec = percent_decode(v);
                 match parse_coord_crs_with_epsg(&dec) {
                     Ok(pair) => pq.bounds_crs = Some(pair),
+                    Err(msg) => bad(&msg),
+                }
+            }
+            "bbox-crs" | "bbox_crs" => {
+                let dec = percent_decode(v);
+                match parse_coord_crs_with_epsg(&dec) {
+                    Ok(pair) => pq.bbox_crs = Some(pair),
                     Err(msg) => bad(&msg),
                 }
             }
@@ -2637,8 +2646,11 @@ fn apply_point_filters(
             });
             out_names.push(serde_json::json!(expr));
         }
+        let band_names: Vec<serde_json::Value> = (1..=out_vals.len())
+            .map(|i| serde_json::json!(format!("b{i}")))
+            .collect();
         pt["values"] = serde_json::Value::Array(out_vals);
-        pt["band_names"] = serde_json::Value::Array(out_names.clone());
+        pt["band_names"] = serde_json::Value::Array(band_names);
         pt["band_descriptions"] = serde_json::Value::Array(out_names);
         return Ok(());
     }
@@ -3767,7 +3779,15 @@ async fn load_mosaicjson(
         .store
         .fetch_uri_bytes(uri, MAX_POST_BODY_BYTES)
         .await?;
-    let text = String::from_utf8_lossy(&bytes);
+    let decoded_buf: Vec<u8>;
+    let json_bytes: &[u8] = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        decoded_buf = cogzilla_codec::decompress_gzip_limited(&bytes, MAX_POST_BODY_BYTES)
+            .map_err(|e| EngineError::BadRequest(format!("invalid gzipped MosaicJSON: {e}")))?;
+        &decoded_buf
+    } else {
+        &bytes
+    };
+    let text = String::from_utf8_lossy(json_bytes);
     let cat = Arc::new(MosaicJsonCatalog::from_json_str(&text).map_err(EngineError::BadRequest)?);
     if engine.mosaicjson_cache.len() >= 256 {
         engine.mosaicjson_cache.clear();
@@ -4396,7 +4416,7 @@ where
                 let text = std::str::from_utf8(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid UTF-8 body: {e}")))?;
                 let mj = MosaicJsonCatalog::from_json_str(text).map_err(EngineError::BadRequest)?;
-                Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
+                Ok((Bytes::from(mj.raw_json.to_string()), "application/json"))
             }
             .await,
             ["mosaicjson", "statistics"] => async {
@@ -4601,6 +4621,16 @@ where
         let mj_url = pq.urls.first().cloned();
         let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
         let res: Result<(Bytes, &'static str), EngineError> = match segs.as_slice() {
+            ["mosaicjson"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                Ok((Bytes::from(mj.raw_json.to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "viewer"] => {
+                let tj_url = format!("{forwarded_prefix}/mosaicjson/WebMercatorQuad/tilejson.json?{raw_query}");
+                Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
+            }
             ["mosaicjson", "info"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
@@ -4832,11 +4862,15 @@ where
                             apply_point_filters(&mut pt, pq.expr_raw.as_deref(), &pq.bidx)?;
                             let vals = pt["values"].clone();
                             let names = pt["band_names"].clone();
+                            let descs = pt
+                                .get("band_descriptions")
+                                .cloned()
+                                .unwrap_or_else(|| names.clone());
                             assets_out.push(serde_json::json!({
                                 "name": asset_url,
                                 "values": vals,
                                 "band_names": names,
-                                "band_descriptions": names,
+                                "band_descriptions": descs,
                             }));
                         }
                         Err(EngineError::NotFound(_)) => continue,
@@ -4898,7 +4932,7 @@ where
                 ]);
                 let mut tj = serde_json::json!({
                     "tilejson": "3.0.0",
-                    "version": mj.version,
+                    "version": mj.doc_version,
                     "scheme": "xyz",
                     "tiles": [],
                     "minzoom": mj.minzoom,
@@ -5055,35 +5089,7 @@ where
                                 treq.format = OutputFormat::RawRgba;
                             }
                             if urls.is_empty() {
-                                let nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
-                                let b = if treq.format == OutputFormat::Npy {
-                                    let raw = cogzilla_kernel::empty_tile_bytes(
-                                        out_dim,
-                                        OutputFormat::RawF32,
-                                        nb,
-                                    );
-                                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                                        raw,
-                                        nb,
-                                        out_dim,
-                                        out_dim,
-                                        pq.return_mask,
-                                    )
-                                } else {
-                                    cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb)
-                                };
-                                return Ok(finalize_image_output(
-                                    b,
-                                    ct,
-                                    treq.format,
-                                    auto_fmt,
-                                    out_dim,
-                                    out_dim,
-                                    tb,
-                                    tms_def.epsg,
-                                    pq.jpeg_quality,
-                                    pq.return_mask,
-                                ));
+                                return Err(EngineError::NoContent);
                             }
                             let data = render_mosaic_bbox_composite(
                                 &engine,
@@ -5130,7 +5136,7 @@ where
                             } else {
                                 3
                             };
-                            let (mut treq, ct) = build_tile_request(
+                            let (treq, _) = build_tile_request(
                                 Some(&engine),
                                 tile,
                                 sc,
@@ -5142,39 +5148,7 @@ where
                                 None,
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
-                            let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
-                            if auto_fmt {
-                                treq.format = OutputFormat::RawRgba;
-                            }
-                            let nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
-                            let b = if treq.format == OutputFormat::Npy {
-                                let raw = cogzilla_kernel::empty_tile_bytes(
-                                    out_dim,
-                                    OutputFormat::RawF32,
-                                    nb,
-                                );
-                                cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                                    raw,
-                                    nb,
-                                    out_dim,
-                                    out_dim,
-                                    pq.return_mask,
-                                )
-                            } else {
-                                cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb)
-                            };
-                            Ok(finalize_image_output(
-                                b,
-                                ct,
-                                treq.format,
-                                auto_fmt,
-                                out_dim,
-                                out_dim,
-                                buf_bbox,
-                                3857,
-                                pq.jpeg_quality,
-                                pq.return_mask,
-                            ))
+                            Err(EngineError::NoContent)
                         } else {
                             let first_cog = open_first_mosaic_cog(&engine, &urls).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
@@ -6408,12 +6382,26 @@ where
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
-            (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) => {
+            (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) | (Method::GET, ["viewer"]) => {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let tj_url =
                     format!("{forwarded_prefix}/{stac_prefix}/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            (Method::GET, ["renders"]) => async {
+                let item = stac_source.load(&engine).await?;
+                Ok((Bytes::from(serde_json::json!(item.renders).to_string()), "application/json"))
+            }
+            .await,
+            (Method::GET, ["renders", render_id]) => async {
+                let item = stac_source.load(&engine).await?;
+                let render = item
+                    .renders
+                    .get(*render_id)
+                    .ok_or_else(|| EngineError::NotFound(format!("render '{render_id}' not found")))?;
+                Ok((Bytes::from(render.to_string()), "application/json"))
+            }
+            .await,
             // GET /stac/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
                 let item = stac_source.load(&engine).await?;
@@ -6424,15 +6412,26 @@ where
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let wgs_bbox = pq_stac.bbox_param.unwrap_or_else(|| {
-                    item.bbox.unwrap_or_else(|| crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
-                });
                 let (dst_crs, dst_epsg) = pq_stac
                     .dst_crs
                     .clone()
                     .or_else(|| pq_stac.bounds_crs.clone())
                     .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
-                let out_bbox = normalize_render_bbox(reproject_wgs84_bounds(wgs_bbox, &dst_crs)?, &dst_crs)?;
+                let out_bbox = if let Some(raw_bbox) = pq_stac.bbox_param {
+                    if pq_stac.bbox_crs.as_ref().map(|(_, e)| *e) == Some(dst_epsg)
+                        || (pq_stac.bbox_crs.is_none() && dst_epsg == 4326)
+                    {
+                        normalize_render_bbox(raw_bbox, &dst_crs)?
+                    } else {
+                        let wb = bbox_to_wgs84(raw_bbox, pq_stac.bbox_crs.as_ref().map(|(c, _)| c))?;
+                        normalize_render_bbox(reproject_wgs84_bounds(wb, &dst_crs)?, &dst_crs)?
+                    }
+                } else {
+                    let wb = item.bbox.unwrap_or_else(|| {
+                        crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                    });
+                    normalize_render_bbox(reproject_wgs84_bounds(wb, &dst_crs)?, &dst_crs)?
+                };
                 let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq_stac.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
@@ -7357,7 +7356,14 @@ where
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if !matches!(
             sub,
-            ["assets"] | ["tiles"] | ["tiles", _] | [_, "map.html"] | ["map.html"]
+            ["assets"]
+                | ["tiles"]
+                | ["tiles", _]
+                | [_, "map.html"]
+                | ["map.html"]
+                | ["viewer"]
+                | ["renders"]
+                | ["renders", _]
         ) {
             attach_resolved_stac_assets(&mut resp);
         }
@@ -7844,11 +7850,141 @@ where
             .await,
 
             // 9. GET /cog/{tileMatrixSetId}/map.html & /cog/map.html
-            (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) => {
+            (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) | (Method::GET, ["viewer"]) => {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let tj_url = format!("{forwarded_prefix}/cog/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            // GET /cog/stac — build a STAC 1.0.0 Item JSON from a COG (matching TiTiler / rio-stac)
+            (Method::GET, ["stac"]) => async {
+                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cog = &cogs[0];
+                let (crs, native_epsg, native_bounds) =
+                    dataset_native_crs_and_bounds(&engine, cog)?;
+                let full = cog.index.full_res();
+                let wgs_bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let [w, s, e, n] = wgs_bbox;
+                let mut q_id: Option<String> = None;
+                let mut q_collection: Option<String> = None;
+                let mut q_asset_name: Option<String> = None;
+                let mut q_datetime: Option<String> = None;
+                let mut with_proj = true;
+                let mut with_raster = true;
+                let mut with_eo = true;
+                for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        let dec = percent_decode(v);
+                        match k {
+                            "id" if !dec.is_empty() => q_id = Some(dec),
+                            "collection" if !dec.is_empty() => q_collection = Some(dec),
+                            "asset_name" if !dec.is_empty() => q_asset_name = Some(dec),
+                            "datetime" if !dec.is_empty() => q_datetime = Some(dec),
+                            "with_proj" => with_proj = !dec.eq_ignore_ascii_case("false") && dec != "0",
+                            "with_raster" => with_raster = !dec.eq_ignore_ascii_case("false") && dec != "0",
+                            "with_eo" => with_eo = !dec.eq_ignore_ascii_case("false") && dec != "0",
+                            _ => {}
+                        }
+                    }
+                }
+                let item_id = q_id.unwrap_or_else(|| {
+                    std::path::Path::new(&cog.uri)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("cog-item")
+                        .to_string()
+                });
+                let asset_name = q_asset_name.unwrap_or_else(|| "data".to_string());
+                let mut extensions: Vec<&'static str> = Vec::new();
+                let mut props = serde_json::Map::new();
+                props.insert(
+                    "datetime".into(),
+                    serde_json::json!(q_datetime.unwrap_or_else(|| "1970-01-01T00:00:00Z".into())),
+                );
+                if with_proj {
+                    extensions.push("https://stac-extensions.github.io/projection/v1.1.0/schema.json");
+                    props.insert("proj:epsg".into(), serde_json::json!(native_epsg));
+                    props.insert("proj:shape".into(), serde_json::json!([full.height, full.width]));
+                    props.insert(
+                        "proj:transform".into(),
+                        serde_json::json!([
+                            full.pixel_to_crs.a,
+                            full.pixel_to_crs.b,
+                            full.pixel_to_crs.c,
+                            full.pixel_to_crs.d,
+                            full.pixel_to_crs.e,
+                            full.pixel_to_crs.f,
+                            0.0,
+                            0.0,
+                            1.0
+                        ]),
+                    );
+                    props.insert("proj:bbox".into(), serde_json::json!(native_bounds));
+                }
+                let count = full.samples_per_pixel as usize;
+                let mut asset_obj = serde_json::json!({
+                    "href": cog.uri,
+                    "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                    "roles": ["data"],
+                });
+                if with_raster {
+                    extensions.push("https://stac-extensions.github.io/raster/v1.1.0/schema.json");
+                    let rb: Vec<serde_json::Value> = (0..count)
+                        .map(|i| {
+                            let mut b = serde_json::Map::new();
+                            b.insert("data_type".into(), serde_json::json!(full.sample_type.gdal_name()));
+                            b.insert("scale".into(), serde_json::json!(cog.index.scales.get(i).copied().unwrap_or(1.0)));
+                            b.insert("offset".into(), serde_json::json!(cog.index.offsets.get(i).copied().unwrap_or(0.0)));
+                            if let Some(nd) = cog.index.nodata {
+                                if nd.is_nan() {
+                                    b.insert("nodata".into(), serde_json::json!("nan"));
+                                } else {
+                                    b.insert("nodata".into(), serde_json::json!(nd));
+                                }
+                            }
+                            serde_json::Value::Object(b)
+                        })
+                        .collect();
+                    asset_obj["raster:bands"] = serde_json::Value::Array(rb);
+                }
+                if with_eo {
+                    extensions.push("https://stac-extensions.github.io/eo/v1.1.0/schema.json");
+                    let eb: Vec<serde_json::Value> = (0..count)
+                        .map(|i| {
+                            let name = format!("b{}", i + 1);
+                            let desc = cog
+                                .index
+                                .band_descriptions
+                                .get(i)
+                                .filter(|s| !s.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| name.clone());
+                            serde_json::json!({ "name": name, "description": desc })
+                        })
+                        .collect();
+                    asset_obj["eo:bands"] = serde_json::Value::Array(eb);
+                }
+                let mut assets_map = serde_json::Map::new();
+                assets_map.insert(asset_name, asset_obj);
+                let mut item = serde_json::json!({
+                    "type": "Feature",
+                    "stac_version": "1.0.0",
+                    "stac_extensions": extensions,
+                    "id": item_id,
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]
+                    },
+                    "bbox": wgs_bbox,
+                    "properties": serde_json::Value::Object(props),
+                    "links": [],
+                    "assets": serde_json::Value::Object(assets_map),
+                });
+                if let Some(col) = q_collection {
+                    item["collection"] = serde_json::json!(col);
+                }
+                Ok((Bytes::from(item.to_string()), "application/geo+json"))
+            }
+            .await,
             // GET /cog/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
@@ -7856,22 +7992,67 @@ where
                     dataset_native_crs_and_bounds(&engine, &cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let explicit_crs = pq.dst_crs.clone().or_else(|| pq.bounds_crs.clone());
-                let (dst_crs, dst_epsg, out_bbox) = if let Some((dc, de)) = explicit_crs {
-                    let wgs_bbox = pq.bbox_param.unwrap_or_else(|| {
-                        native_crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
-                    });
-                    let ob = normalize_render_bbox(reproject_wgs84_bounds(wgs_bbox, &dc)?, &dc)?;
-                    (dc, de, ob)
-                } else if let Some(wgs_bbox) = pq.bbox_param {
-                    let ob = normalize_render_bbox(
-                        reproject_wgs84_bounds(wgs_bbox, &native_crs)?,
-                        &native_crs,
+                let (dst_crs, dst_epsg) = explicit_crs
+                    .clone()
+                    .unwrap_or((native_crs.clone(), native_epsg));
+                let (wgs_bbox, out_bbox) = if let Some(raw_bbox) = pq.bbox_param {
+                    let wb = bbox_to_wgs84(
+                        raw_bbox,
+                        pq.bbox_crs.as_ref().map(|(c, _)| c),
                     )?;
-                    (native_crs, native_epsg, ob)
+                    let ob = if pq.bbox_crs.as_ref().map(|(_, e)| *e) == Some(dst_epsg)
+                        || (pq.bbox_crs.is_none() && dst_epsg == 4326)
+                    {
+                        normalize_render_bbox(raw_bbox, &dst_crs)?
+                    } else {
+                        normalize_render_bbox(reproject_wgs84_bounds(wb, &dst_crs)?, &dst_crs)?
+                    };
+                    (wb, ob)
                 } else {
-                    (native_crs, native_epsg, native_bounds)
+                    let wb = native_crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let ob = if explicit_crs.is_some() {
+                        normalize_render_bbox(reproject_wgs84_bounds(wb, &dst_crs)?, &dst_crs)?
+                    } else {
+                        native_bounds
+                    };
+                    (wb, ob)
                 };
-                let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
+                let (def_w, def_h) = if dst_epsg == native_epsg {
+                    let px_x = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d).max(1e-12);
+                    let px_y = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e).max(1e-12);
+                    let nat_w = ((out_bbox[2] - out_bbox[0]).abs() / px_x)
+                        .round()
+                        .clamp(1.0, 4096.0) as u32;
+                    let nat_h = ((out_bbox[3] - out_bbox[1]).abs() / px_y)
+                        .round()
+                        .clamp(1.0, 4096.0) as u32;
+                    let cap = pq.max_size.clamp(1, 4096);
+                    if nat_w.max(nat_h) <= cap {
+                        (nat_w, nat_h)
+                    } else if nat_w >= nat_h {
+                        (
+                            cap,
+                            ((nat_h as f64 / nat_w as f64) * cap as f64)
+                                .ceil()
+                                .clamp(1.0, cap as f64) as u32,
+                        )
+                    } else {
+                        (
+                            ((nat_w as f64 / nat_h as f64) * cap as f64)
+                                .ceil()
+                                .clamp(1.0, cap as f64) as u32,
+                            cap,
+                        )
+                    }
+                } else {
+                    capped_native_bbox_dims(
+                        &engine,
+                        &cogs[0],
+                        wgs_bbox,
+                        out_bbox,
+                        pq.max_size,
+                    )
+                };
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let ext = pq.format_param.as_deref().unwrap_or("png");
@@ -8654,6 +8835,11 @@ fn json_error_resp(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
 fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
     match err {
         EngineError::Shared(inner) => error_to_http_response(inner),
+        EngineError::NoContent => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("access-control-allow-origin", "*")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         EngineError::NotFound(msg) => json_error_resp(StatusCode::NOT_FOUND, msg),
         EngineError::BadRequest(msg) => json_error_resp(StatusCode::BAD_REQUEST, msg),
         // The file is in a coordinate system this server cannot place. That is a

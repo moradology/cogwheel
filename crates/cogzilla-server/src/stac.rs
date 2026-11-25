@@ -18,6 +18,8 @@ pub struct StacItem {
     pub geometry: Option<serde_json::Value>,
     /// Ordered map of raster asset key -> resolved absolute path or HTTP/S3 URL.
     pub assets: BTreeMap<String, String>,
+    /// Optional STAC Render Extension (`renders`) definitions.
+    pub renders: BTreeMap<String, serde_json::Value>,
 }
 
 fn is_raster_asset(key: &str, asset: &serde_json::Value) -> bool {
@@ -183,11 +185,23 @@ pub fn stac_item_from_json(val: &serde_json::Value, item_uri: &str) -> StacItem 
         }
     }
 
+    // The item's named renderings, at its root or among its properties.
+    let mut renders = BTreeMap::new();
+    let renders_obj = val
+        .get("renders")
+        .or_else(|| val.get("properties").and_then(|p| p.get("renders")))
+        .and_then(|v| v.as_object());
+    if let Some(robj) = renders_obj {
+        for (k, v) in robj {
+            renders.insert(k.clone(), v.clone());
+        }
+    }
     StacItem {
         id,
         bbox,
         geometry,
         assets,
+        renders,
     }
 }
 
