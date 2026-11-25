@@ -457,6 +457,8 @@ def main() -> int:
         o.check("one band, the raster's own nodata", "image", f"{edge}&assets=red&rescale=0,3000")
         o.check("one band, nodata named", "image", f"{edge}&assets=red&rescale=0,3000&nodata=1000")
         o.check("three bands, nodata named", "image", f"{edge}&assets=visual&nodata=40")
+        o.check("two items, nodata named band by band", "image", f"{edge.replace('items_limit=1', 'items_limit=2')}&assets=visual&nodata=40")
+        o.check("box, nodata named", "image", f"/searches/{sid}/bbox/6.328125,43.580390855607845,7.03125,44.087585028245165/256x256.png?items_limit=1&exitwhenfull=false&skipcovered=false&assets=visual&nodata=40")
         classes = "%7B%224%22%3A%5B0%2C128%2C0%2C255%5D%2C%225%22%3A%22%23c8c800%22%2C%226%22%3A%5B0%2C0%2C255%2C255%5D%2C%228%22%3A%5B200%2C200%2C200%2C255%5D%2C%229%22%3A%5B255%2C255%2C255%2C255%5D%7D"
         # Neighbouring intervals in near colours: the pixels the two servers take from
         # either side of an edge then weigh what they would in any other picture.
