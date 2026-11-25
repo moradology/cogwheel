@@ -2381,6 +2381,8 @@ pub fn encode_geotiff_rgba(
     epsg: u16,
     return_mask: bool,
 ) -> Bytes {
+    let width = width.clamp(1, 4096);
+    let height = height.clamp(1, 4096);
     let spp: u16 = if return_mask { 4 } else { 3 };
     let n_px = (width as usize) * (height as usize);
     let pixel_bytes = n_px * (spp as usize);
@@ -2452,7 +2454,11 @@ pub fn encode_geotiff_rgba(
     buf.put_f64_le(bbox[3]);
     buf.put_f64_le(0.0);
     // GeoKeyDirectoryTag (16 u16s = 32 bytes)
-    let (model_type, crs_key): (u16, u16) = if epsg == 4326 {
+    let is_geographic = matches!(
+        cogzilla_proj::CrsModel::from_epsg(epsg),
+        Ok(cogzilla_proj::CrsModel::Geographic)
+    );
+    let (model_type, crs_key): (u16, u16) = if is_geographic {
         (2, 2048) // ModelTypeGeographic, GeographicTypeGeoKey
     } else {
         (1, 3072) // ModelTypeProjected, ProjectedCSTypeGeoKey
@@ -3693,19 +3699,16 @@ async fn render_bbox_impl(
         });
     }
 
-    let pad = if matches!(bands, BandRequest::Dem { .. }) {
-        3
-    } else {
-        1
-    };
-    let c0 = (min_u.floor() as i32).saturating_sub(pad).max(0) as u32;
+    let (pad_lo, pad_hi) =
+        crate::engine::resample_fetch_margin(resample, matches!(bands, BandRequest::Dem { .. }));
+    let c0 = (min_u.floor() as i32).saturating_sub(pad_lo).max(0) as u32;
     let c1 = (max_u.ceil() as i32)
-        .saturating_add(pad)
+        .saturating_add(pad_hi)
         .min(ifd.width as i32 - 1)
         .max(0) as u32;
-    let r0 = (min_v.floor() as i32).saturating_sub(pad).max(0) as u32;
+    let r0 = (min_v.floor() as i32).saturating_sub(pad_lo).max(0) as u32;
     let r1 = (max_v.ceil() as i32)
-        .saturating_add(pad)
+        .saturating_add(pad_hi)
         .min(ifd.height as i32 - 1)
         .max(0) as u32;
     let tx0 = c0 / ifd.tile_width;
@@ -4696,7 +4699,7 @@ async fn render_mixed_grid_bbox(
     cogs: &[Arc<OpenedCog>],
     bbox: [f64; 4],
     dst_crs: &cogzilla_proj::CrsModel,
-    _native_preview: bool,
+    native_preview: bool,
     w: usize,
     h: usize,
     poly_mask: Option<&PolygonMask>,
@@ -4710,6 +4713,71 @@ async fn render_mixed_grid_bbox(
     unscale: bool,
 ) -> Result<Bytes, EngineError> {
     let max_b = cogs.len() as u16;
+    // DEM algorithms (hillshade, slope, aspect, contours) operate on a single band using a 3x3
+    // neighborhood; delegate directly to `render_bbox_impl` on that asset so Horn derivatives and
+    // native preview georeferencing work identically to single-COG renders.
+    if let BandRequest::Dem {
+        band_1based,
+        algorithm,
+        rescale,
+        colormap,
+    } = bands
+    {
+        if *band_1based == 0 || *band_1based > max_b {
+            return Err(EngineError::BadRequest(format!(
+                "band {band_1based} out of range (dataset has {max_b} assets)"
+            )));
+        }
+        let single_cog = [cogs[(*band_1based - 1) as usize].clone()];
+        let single_dem = BandRequest::Dem {
+            band_1based: 1,
+            algorithm: *algorithm,
+            rescale: *rescale,
+            colormap: *colormap,
+        };
+        return Box::pin(render_bbox_impl(
+            engine,
+            &single_cog,
+            bbox,
+            dst_crs,
+            native_preview,
+            w as u32,
+            h as u32,
+            poly_mask,
+            &single_dem,
+            resample,
+            format,
+            nodata_override,
+            custom_lut,
+            color_formula,
+            return_mask,
+            unscale,
+        ))
+        .await;
+    }
+
+    // When `native_preview` is requested on a mixed-grid multi-COG / STAC composite, sample all
+    // assets into `cogs[0]`'s native CRS and native full-resolution bounds so output pixels match
+    // the native GeoTIFF georeferencing header stamped by `/{cog,stac}/preview.tif`.
+    let native_crs_owned;
+    let (eff_bbox, eff_crs) = if native_preview {
+        native_crs_owned = cogzilla_proj::CrsModel::from_geo_keys(&cogs[0].index.geo_keys)?;
+        let full = cogs[0].index.full_res();
+        let a = &full.pixel_to_crs;
+        let corners = [
+            a.forward(0.0, 0.0),
+            a.forward(full.width as f64, 0.0),
+            a.forward(0.0, full.height as f64),
+            a.forward(full.width as f64, full.height as f64),
+        ];
+        let min_x = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
+        let max_x = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
+        let max_y = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max);
+        ([min_x, min_y, max_x, max_y], &native_crs_owned)
+    } else {
+        (bbox, dst_crs)
+    };
     let mut needed: Vec<u16> = Vec::new();
     let mut push_b = |b: u16| -> Result<(), EngineError> {
         if b == 0 || b > max_b {
@@ -4768,8 +4836,8 @@ async fn render_mixed_grid_bbox(
         let raw = Box::pin(render_bbox_impl(
             engine,
             &single_cog,
-            bbox,
-            dst_crs,
+            eff_bbox,
+            eff_crs,
             false,
             w as u32,
             h as u32,

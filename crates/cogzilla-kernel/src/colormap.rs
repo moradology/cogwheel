@@ -53,13 +53,18 @@ impl CustomColormap {
     pub fn from_rgba_palette(entries: &[[u8; 4]]) -> Self {
         let mut rgba_u32 = [0u32; 256];
         let mut rgb = [[0u8; 3]; 256];
-        for (idx, &[r, g, b, a]) in entries.iter().take(256).enumerate() {
-            rgb[idx] = [r, g, b];
-            rgba_u32[idx] = u32::from_le_bytes([r, g, b, a]);
+        let mut extra = HashMap::new();
+        for (idx, &[r, g, b, a]) in entries.iter().enumerate() {
+            if idx < 256 {
+                rgb[idx] = [r, g, b];
+                rgba_u32[idx] = u32::from_le_bytes([r, g, b, a]);
+            } else {
+                extra.insert(idx as i64, [r, g, b, a]);
+            }
         }
         Self::Discrete {
             lut: Box::new(ColormapLut { rgb, rgba_u32 }),
-            extra: HashMap::new(),
+            extra,
             direct_lookup: true,
         }
     }

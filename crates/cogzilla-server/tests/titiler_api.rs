@@ -1015,6 +1015,36 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             );
             let mixed_bytes = mixed_resp.bytes().await.unwrap();
             assert_eq!(&mixed_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // Audit c40 regression checks:
+            // 1. Path {w}x{h} > 4096 must be rejected with 400 (no OOM in GeoTIFF/bbox)
+            let oob_dim = client
+                .get(format!("{base}/cog/preview/5000x5000.tif?url={merc_url}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(oob_dim.status(), 400);
+
+            // 2. Non-4326 geographic GeoTIFF (NAD83 EPSG:4269) must write ModelTypeGeographic (2)
+            let nad83_resp = client
+                .get(format!(
+                    "{base}/cog/bbox/-122.5,37.7,-122.4,37.8/16x16.tif?url={merc_url}&dst_crs=EPSG:4269"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(nad83_resp.status(), 200);
+            let nad83_tif = nad83_resp.bytes().await.unwrap();
+            let parsed_nad83 = cogzilla_tiff::parse_cog(&nad83_tif).unwrap();
+            assert_eq!(parsed_nad83.geo_keys.model_type, Some(2));
+            assert_eq!(parsed_nad83.geo_keys.geographic_type, Some(4269));
+            assert_eq!(parsed_nad83.geo_keys.projected_cs_type, None);
+
+            // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
+            let mut pal = vec![[10u8, 20, 30, 255]; 300];
+            pal[299] = [200, 150, 100, 255];
+            let cmap = cogzilla_kernel::CustomColormap::from_rgba_palette(&pal);
+            assert_eq!(cmap.lookup(299.0, 0.0, 1.0), [200, 150, 100, 255]);
         }
     }
 }

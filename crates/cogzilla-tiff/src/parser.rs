@@ -582,8 +582,8 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                         charge_tag(entry.count, 2)?;
                         let vals = entry.read_u16_vec(&r)?;
                         let n = vals.len() / 3;
-                        let mut lut = Vec::with_capacity(n.min(256));
-                        for i in 0..n.min(256) {
+                        let mut lut = Vec::with_capacity(n);
+                        for i in 0..n {
                             let r_c = (vals[i] >> 8) as u8;
                             let g_c = (vals[n + i] >> 8) as u8;
                             let b_c = (vals[2 * n + i] >> 8) as u8;
