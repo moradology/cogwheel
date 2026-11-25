@@ -1695,15 +1695,25 @@ impl TileEngine {
         }
     }
 
-    /// Whether rasters lie on one grid, pixel for pixel at every overview, so that they can
-    /// be read as the bands of one image.
+    /// Whether rasters lie on one grid, pixel for pixel at every overview and in the same
+    /// place, so that they can be read as the bands of one image.
     pub fn on_one_grid(cogs: &[Arc<OpenedCog>]) -> bool {
         let Some(first) = cogs.first() else {
             return true;
         };
-        cogs.iter().all(|c| c.index.ifds.len() == first.index.ifds.len())
-            && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
+        let placed = |c: &OpenedCog| {
+            let t = &c.index.full_res().crs_to_pixel;
+            [t.a, t.b, t.c, t.d, t.e, t.f]
+        };
+        let origin = placed(first);
+        cogs.iter().all(|c| {
+            c.index.ifds.len() == first.index.ifds.len()
+                && placed(c).iter().zip(&origin).all(|(a, b)| (a - b).abs() <= 1e-9 * b.abs().max(1.0))
+        }) && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
     }
+
+    /// The most bands of one raster [`Self::raster_planes`] reads for one tile.
+    pub const MAX_PLANES_PER_RASTER: usize = 32;
 
     /// Bands of one raster over a tile, each a plane of `f32` on the tile's grid whatever
     /// the raster's own, NaN where it has no data. An empty `bands_1based` asks for every
@@ -1731,6 +1741,13 @@ impl TileEngine {
                 known.join(", ")
             )));
         }
+        if wanted.len() > Self::MAX_PLANES_PER_RASTER {
+            return Err(EngineError::BadRequest(format!(
+                "{} bands of one asset are too many to read for a tile (at most {}); choose bands with `bidx`",
+                wanted.len(),
+                Self::MAX_PLANES_PER_RASTER
+            )));
+        }
         let mut one = req.clone();
         one.format = OutputFormat::RawF32;
         one.resample = match self.get_or_build_crs(&cog)? {
@@ -1739,35 +1756,19 @@ impl TileEngine {
         };
         let pixels = (req.tile_size as usize).pow(2);
         let mut planes = Vec::with_capacity(wanted.len());
-        // Three bands at a time where there are three, which is one pass over the raster.
-        for group in wanted.chunks(3) {
-            let requests: Vec<BandRequest> = match group {
-                [a, b, c] => vec![BandRequest::Rgb {
-                    bands_1based: [*a, *b, *c],
-                    rescale_min: [0.0; 3],
-                    rescale_max: [255.0; 3],
-                }],
-                few => few
-                    .iter()
-                    .map(|b| BandRequest::Single {
-                        band_1based: *b,
-                        rescale: (0.0, 255.0),
-                        colormap: ColormapName::Grayscale,
-                    })
-                    .collect(),
+        // One band at a time: read three together and the renderer gives none of them
+        // where it finds one of them empty.
+        for band in &wanted {
+            one.bands = BandRequest::Single {
+                band_1based: *band,
+                rescale: (0.0, 255.0),
+                colormap: ColormapName::Grayscale,
             };
-            for bands in requests {
-                one.bands = bands;
-                let values = self.render_tile(&cog, &one).await?;
-                if values.len() % (pixels * 4) != 0 {
-                    return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
-                }
-                for plane in values.chunks_exact(pixels * 4) {
-                    planes.push(
-                        plane.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect(),
-                    );
-                }
+            let values = self.render_tile(&cog, &one).await?;
+            if values.len() != pixels * 4 {
+                return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
             }
+            planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
         }
         if planes.len() != wanted.len() {
             return Err(EngineError::BadRequest("unexpected number of planes from the renderer".into()));

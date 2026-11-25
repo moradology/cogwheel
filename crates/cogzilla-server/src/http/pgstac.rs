@@ -1617,6 +1617,9 @@ fn wants_planes(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
         }
 }
 
+/// The most bands the assets of one item may stack up to on a tile.
+const MAX_BANDS_PER_ITEM: usize = 32;
+
 /// A tile made from planes: what to read of each item and what to make of it.
 struct PlanesTile {
     assets: Vec<AssetSpec>,
@@ -1699,6 +1702,12 @@ impl PlanesTile {
         let integer = self.expression.is_none()
             && !self.request.unscale
             && parts.iter().all(|(_, st, own)| *own && !matches!(st, SampleType::Float32 | SampleType::Float64));
+        let stacked: usize = parts.iter().map(|(planes, _, _)| planes.len()).sum();
+        if stacked > MAX_BANDS_PER_ITEM {
+            return Err(EngineError::BadRequest(format!(
+                "{stacked} bands per item are too many for a tile (at most {MAX_BANDS_PER_ITEM}); choose bands with `bidx`"
+            )));
+        }
         let mut bands: Vec<Vec<f32>> = parts.into_iter().flat_map(|(planes, _, _)| planes).collect();
         if let Some(expression) = &self.expression {
             bands = band_math(expression, &bands)?;
@@ -1752,7 +1761,14 @@ impl PlanesTile {
                 ));
             }
             fold.add(item.bands.iter().flatten().copied());
-            if fold.is_done() {
+            // More bands than a picture has are refused whatever the other items hold, so
+            // none of them is read; the first is kept to say how the refusal is worded.
+            let left = match self.selection {
+                Selection::Count => 1,
+                method if method.by_last_band() => fold.bands() - 1,
+                _ => fold.bands(),
+            };
+            if fold.is_done() || left > 3 {
                 break;
             }
         }
@@ -2523,6 +2539,8 @@ fn resize_nearest(plane: Vec<f32>, (w, h): (usize, usize), (out_w, out_h): (usiz
 
 /// The most pixels one feature's statistics may read.
 const MAX_STATS_PIXELS: u64 = 8_388_608;
+/// The most values, bands times pixels, the statistics of one feature are worked out over.
+const MAX_STATS_VALUES: u64 = 4 * MAX_STATS_PIXELS;
 /// The finest grid the coverage of a feature is worked out on, per side.
 const MAX_COVER_SIDE: u64 = 65_536;
 
@@ -2716,6 +2734,13 @@ async fn feature_statistics(
                     program = Some(parsed);
                 } else {
                     descriptions = names;
+                }
+                // The pixel limit is each raster's; with many bands it is their sum that is held.
+                let bands = planes.len().max(descriptions.len()) as u64;
+                if bands * (width * height) as u64 > MAX_STATS_VALUES {
+                    return Err(EngineError::BadRequest(format!(
+                        "{bands} bands at {width}x{height} pixels are too many to hold; pass max_size, or width and height"
+                    )));
                 }
                 canvas = vec![vec![f64::NAN; width * height]; descriptions.len()];
                 if let Some(method) = req.query.selection {
@@ -3187,9 +3212,6 @@ async fn tile(
             }
             let first = engine.store.open_uri(&scenes[0][0]).await?;
             let full = first.index.full_res();
-            if asset_as_band && full.samples_per_pixel > 1 {
-                return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
-            }
             let formula = pq
                 .color_formula
                 .as_deref()
@@ -3220,7 +3242,7 @@ async fn tile(
                 let asked = if auto_format {
                     None
                 } else {
-                    let (format, content_type) = parse_ext_format(&explicit, None, jpeg_quality)?;
+                    let (format, content_type) = parse_ext_format(&explicit, pq.webp_quality, jpeg_quality)?;
                     if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
                         return Err(EngineError::BadRequest(
                             "raw array formats are not supported with these assets and options yet".into(),
@@ -3245,8 +3267,8 @@ async fn tile(
                     },
                 };
                 let pixels = (dim as usize).pow(2);
-                let (rgba, bands) = match job.mosaic(engine, &scenes).await? {
-                    None => (vec![0u8; pixels * 4], 1),
+                let (rgba, bands, full) = match job.mosaic(engine, &scenes).await? {
+                    None => (vec![0u8; pixels * 4], 1, false),
                     Some((selected, sample_type)) => {
                         // Without `rescale`: the type's own range for a raster's numbers,
                         // and the renderer's default for band math.
@@ -3256,38 +3278,44 @@ async fn tile(
                         } else {
                             super::default_rescale_for_dtype(sample_type, selected.bands == 1)
                         };
-                        let shape = |bands: usize, driver: &str| {
-                            EngineError::BadRequest(format!(
-                                "Could not encode array of shape ({bands},{dim},{dim}) and of datatype `uint8` using {driver} driver"
-                            ))
-                        };
+                        // A pixel is there when any band of it is.
+                        let per_band = selected.values.len() / selected.bands.max(1);
+                        let full = (0..per_band)
+                            .all(|i| selected.values.iter().skip(i).step_by(per_band).any(|v| !v.is_nan()));
                         // The driver TiTiler would have tried: the one asked for, or JPEG
                         // when every pixel is there and PNG when not.
                         let driver = match asked {
                             Some((OutputFormat::Jpeg { .. }, _)) => "JPEG",
                             Some((OutputFormat::Webp { .. }, _)) => "WEBP",
                             Some(_) => "PNG",
-                            None => {
-                                let per_band = selected.values.len() / selected.bands.max(1);
-                                let full = (0..per_band).all(|i| {
-                                    selected.values.iter().skip(i).step_by(per_band).any(|v| !v.is_nan())
-                                });
-                                if full { "JPEG" } else { "PNG" }
-                            }
+                            None if full => "JPEG",
+                            None => "PNG",
                         };
-                        let rgba = paint_bands(&selected, pixels, &pq.rescale, default, pq.colormap)
-                            .map_err(|bands| shape(bands, driver))?;
-                        (rgba, selected.bands)
+                        let rgba = paint_bands(&selected, pixels, &pq.rescale, default, pq.colormap).map_err(|bands| {
+                            EngineError::BadRequest(format!(
+                                "Could not encode array of shape ({bands},{dim},{dim}) and of datatype `uint8` using {driver} driver"
+                            ))
+                        })?;
+                        (rgba, selected.bands, full)
                     }
                 };
-                let picture = encode_picture(rgba, dim as usize, formula.as_ref(), asked, jpeg_quality, return_mask)?;
+                // With no format asked for, the mask decides it. Two bands carry theirs as
+                // a third, so their picture is never transparent and cannot say.
+                let asked = match asked {
+                    Some(asked) => asked,
+                    None => parse_ext_format(if full { "jpg" } else { "png" }, None, jpeg_quality)?,
+                };
                 // Two bands and a mask are three bands to GDAL, and JPEG has no such picture.
-                if bands == 2 && picture.1.starts_with("image/jp") {
+                if bands == 2 && matches!(asked.0, OutputFormat::Jpeg { .. }) {
                     return Err(EngineError::BadRequest(format!(
                         "Could not encode array of shape (2,{dim},{dim}) and of datatype `uint8` using JPEG driver"
                     )));
                 }
-                return Ok(picture);
+                return encode_picture(rgba, dim as usize, formula.as_ref(), Some(asked), jpeg_quality, return_mask);
+            }
+            // On planes the bands are counted after an asset's own options; here they are the raster's.
+            if asset_as_band && full.samples_per_pixel > 1 {
+                return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
             }
             let default_bands = if scenes[0].len() > 1 {
                 scenes[0].len() as u16
@@ -4643,6 +4671,24 @@ mod tests {
         // Four bands and more are no picture.
         let four = Selected { bands: 4, values: vec![1.0; 4] };
         assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale).unwrap_err(), 4);
+    }
+
+    #[test]
+    fn band_math_is_held_to_what_a_tile_needs() {
+        let bands = [vec![1.0f32; 4]];
+        // Results, length and nesting all come from a URL.
+        let many = vec!["b1"; super::super::point_expr::MAX_RESULTS + 1].join(";");
+        assert!(band_math(&many, &bands).unwrap_err().to_string().contains("results"));
+        let long = format!("b1{}", "+b1".repeat(super::super::point_expr::MAX_EXPRESSION_BYTES / 3));
+        assert!(band_math(&long, &bands).unwrap_err().to_string().contains("longer"));
+        let deep = format!("{}b1{}", "(".repeat(1000), ")".repeat(1000));
+        assert!(band_math(&deep, &bands).unwrap_err().to_string().contains("nests"));
+        let minus = format!("{}b1", "-".repeat(1000));
+        assert!(band_math(&minus, &bands).unwrap_err().to_string().contains("nests"));
+        // What band math is in practice is far inside the limits.
+        let chain = format!("b1{}", "+b1".repeat(500));
+        assert_eq!(band_math(&chain, &bands).unwrap()[0][0], 501.0);
+        assert_eq!(band_math("((((b1+1)*2)-3)/(b1+1))**2", &bands).unwrap()[0][0], 0.25);
     }
 
     #[test]

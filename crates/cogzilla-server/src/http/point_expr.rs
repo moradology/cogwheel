@@ -43,9 +43,17 @@ impl Node {
 impl Program {
     /// Parse `expression` for a pixel of `bands` stacked bands.
     pub(super) fn parse(expression: &str, bands: usize) -> Result<Self, String> {
+        // An expression comes from a URL: its length, its results and its nesting are held
+        // to what band math needs, so that none of them can be used against the server.
+        if expression.len() > MAX_EXPRESSION_BYTES {
+            return Err(format!("expression is longer than {MAX_EXPRESSION_BYTES} bytes"));
+        }
         let mut parts = Vec::new();
         for part in expression.split(';').map(str::trim).filter(|p| !p.is_empty()) {
-            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands };
+            if parts.len() == MAX_RESULTS {
+                return Err(format!("expression has more than {MAX_RESULTS} results"));
+            }
+            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands, depth: 0 };
             let node = parser.sum()?;
             parser.skip_space();
             if parser.pos != parser.src.len() {
@@ -126,10 +134,17 @@ fn describe(part: &str, descriptions: &[String]) -> String {
     out
 }
 
+/// The longest expression taken, the most results one may have, and how deep it may nest.
+pub(super) const MAX_EXPRESSION_BYTES: usize = 4096;
+pub(super) const MAX_RESULTS: usize = 16;
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
     bands: usize,
+    /// How many operands are open around the one being read.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -182,7 +197,18 @@ impl Parser<'_> {
         }
     }
 
+    /// Every way the parser calls itself goes through here, so this is where depth is counted.
     fn unary(&mut self) -> Result<Node, String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!("expression nests deeper than {MAX_DEPTH}"));
+        }
+        let node = self.operand();
+        self.depth -= 1;
+        node
+    }
+
+    fn operand(&mut self) -> Result<Node, String> {
         if self.eat("-") {
             return Ok(Node::Neg(Box::new(self.unary()?)));
         }

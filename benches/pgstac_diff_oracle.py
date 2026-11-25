@@ -749,6 +749,14 @@ def main() -> int:
         ]:
             o.check(f"planes tile, {name}", "image", f"{base12}{q}")
         o.check("planes tile, on a collection", "image", f"/collections/{collection}/tiles/WebMercatorQuad/12/{t12.x}/{t12.y}.png?{mixed}")
+        # A tile at the edge of the data, where the mask is not full and decides the format.
+        edge = f"/searches/{sid}/tiles/WebMercatorQuad/8/131/88"
+        o.check("planes tile, two bands, format chosen from the pixels", "image", f"{edge}?assets=red&assets=nir&rescale=0,4000")
+        o.check("planes tile, two grids, format chosen from the pixels", "image", f"{edge}?{mixed}")
+        o.check("planes tile, asset_as_band after bidx", "image",
+                f"{base12}.png?assets={opt('visual|bidx=2')}&assets=nir&asset_as_band=true&rescale=0,255&rescale=0,4000")
+        o.check("planes tile, asset_as_band on three bands", "status", f"{base12}.png?assets=visual&assets=nir&asset_as_band=true",
+                known="titiler-pgstac answers 500 for asset_as_band on a multi-band asset; cogzilla answers 400")
         o.check("planes tile, four bands as png", "json", f"{base12}.png?{four}&rescale=0,4000")
         o.check("planes tile, five bands", "json", f"{base12}.png?{four}&assets=swir16&rescale=0,4000")
         o.check("planes tile, two bands as jpeg", "json", f"{base12}?assets=red&assets=nir&asset_as_band=true&rescale=0,4000")
