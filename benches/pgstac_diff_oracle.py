@@ -137,6 +137,30 @@ def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     return mask >= 99.0 and psnr >= 25.0, f"mask {mask:.2f}%, PSNR {psnr:.1f} dB"
 
 
+def compare_arrays(cz: bytes, tt: bytes) -> tuple[bool, str]:
+    """NumPy arrays: the same type and shape, the same mask band, and values as close as
+    two pictures of them would be (most equal; the rest from the pixel next door)."""
+    try:
+        a, b = np.load(io.BytesIO(cz)), np.load(io.BytesIO(tt))
+    except Exception as e:  # noqa: BLE001 - an unreadable array is a failed check
+        return False, f"unreadable array: {e}"
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False, f"{a.dtype} {a.shape} vs {b.dtype} {b.shape}"
+    ma, mb = a[-1] != 0, b[-1] != 0
+    mask = float((ma == mb).mean()) * 100
+    tops = set(np.unique(a[-1][ma]).tolist()) == set(np.unique(b[-1][mb]).tolist())
+    both = ma & mb
+    if not both.any():
+        return mask >= 99.0 and tops, f"{a.dtype} {a.shape}, mask {mask:.2f}%"
+    va, vb = a[:-1][:, both].astype(np.float64), b[:-1][:, both].astype(np.float64)
+    if a.dtype.kind == "f":
+        # Fractions are not equal from one pixel to its neighbour: the means are compared.
+        close = abs(va.mean() - vb.mean()) <= 0.02 * abs(vb.mean()) + 1e-9
+        return mask >= 99.0 and tops and close, f"{a.dtype} {a.shape}, mask {mask:.2f}%, mean {va.mean():.5g} vs {vb.mean():.5g}"
+    same = float((va == vb).mean()) * 100
+    return mask >= 99.0 and tops and same >= 75.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, {same:.1f}% of values equal"
+
+
 def wmts_view(text: str, base: str):
     """A WMTS capabilities document as plain lists, keeping only what concerns WebMercatorQuad:
     cogzilla serves these routes in that one tile matrix set, TiTiler lists thirteen."""
@@ -293,6 +317,8 @@ class Oracle:
                 note = f"{cz.status_code}"
             elif ct_cz != ct_tt:
                 ok, note = False, f"content type {ct_cz} vs {ct_tt}"
+            elif cz.content[:6] == b"\x93NUMPY":
+                ok, note = compare_arrays(cz.content, tt.content)
             else:
                 ok, note = compare_images(cz.content, tt.content)
                 note = f"{ct_cz}, {note}"
@@ -679,6 +705,16 @@ def main() -> int:
         o.check("collection bbox", "image", f"/collections/{collection}/bbox/{part}.png?assets=visual&max_size=256")
         o.check("feature, max_size", "image", f"/searches/{sid}/feature.png?assets=visual&max_size=256", "POST", triangle)
         o.check("feature, exact size", "image", f"/searches/{sid}/feature/200x100.png?assets=visual", "POST", triangle)
+        # Arrays keep the data's type and carry the mask as a band of their own.
+        o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)
+        o.check("feature as an array, 16-bit", "image", f"/searches/{sid}/feature/120x80.npy?assets=red", "POST", triangle)
+        o.check("box as an array, band math in doubles", "image",
+                f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/120x80.npy?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)")
+        o.check("feature as an array, band math", "image",
+                f"/searches/{sid}/feature/120x80.npy?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)", "POST", triangle,
+                known="titiler-pgstac loses a feature's polygon when band math is written as an array or a GeoTIFF: "
+                      "every pixel of the box is marked as there, where its own PNG of the same request is cut to the polygon; cogzilla cuts all three")
+        o.check("feature as an array of a picture's bytes", "image", f"/searches/{sid}/feature/120x80.npy?assets=red&rescale=0,3000", "POST", triangle)
         o.check("feature, format from the pixels", "image", f"/searches/{sid}/feature?assets=visual&max_size=128", "POST", triangle)
         o.check("feature, format=jpg", "image", f"/searches/{sid}/feature?assets=visual&max_size=128&format=jpg", "POST", triangle)
         o.check("feature without assets", "json", f"/searches/{sid}/feature.png", "POST", triangle)
