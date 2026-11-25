@@ -224,11 +224,20 @@ fn search_from_row(row: &tokio_postgres::Row) -> Result<SearchRecord, PgStacErro
     })
 }
 
-/// How a search listing is ordered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchOrder {
-    LastUsed { descending: bool },
-    UseCount { descending: bool },
+/// What a list of searches is sorted by: one of the two counters pgSTAC keeps, or a key of
+/// the metadata a search was registered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchField {
+    LastUsed,
+    UseCount,
+    Metadata(String),
+}
+
+/// One term of the order of a list of searches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchOrder {
+    pub field: SearchField,
+    pub descending: bool,
 }
 
 /// A bounded, time-limited memo, standing in for titiler-pgstac's `TTLCache` so repeated
@@ -478,32 +487,45 @@ impl PgStac {
         &self,
         limit: i64,
         offset: i64,
-        order: Option<SearchOrder>,
+        order: &[SearchOrder],
+        metadata: &serde_json::Map<String, Value>,
     ) -> Result<(Vec<SearchRecord>, i64), PgStacError> {
         let client = self.client().await?;
-        // The ORDER BY text is chosen from fixed strings, never from the request.
-        let order_sql = match order {
-            Some(SearchOrder::LastUsed { descending: true }) => "ORDER BY lastused DESC",
-            Some(SearchOrder::LastUsed { descending: false }) => "ORDER BY lastused ASC",
-            Some(SearchOrder::UseCount { descending: true }) => "ORDER BY usecount DESC",
-            Some(SearchOrder::UseCount { descending: false }) => "ORDER BY usecount ASC",
-            None => "",
-        };
-        let sql = format!(
-            "SELECT {SEARCH_COLUMNS} FROM searches WHERE metadata->>'type' = 'mosaic' \
-             {order_sql} LIMIT $1 OFFSET $2"
-        );
-        let stmt = client.prepare_cached(&sql).await?;
-        let rows = client.query(&stmt, &[&limit, &offset]).await?;
-        let searches = rows.iter().map(search_from_row).collect::<Result<Vec<_>, _>>()?;
-        let count = client
-            .prepare_cached("SELECT count(*) FROM searches WHERE metadata->>'type' = 'mosaic'")
-            .await?;
+        // Nothing of the request is written into the SQL: the metadata asked for and the
+        // metadata keys sorted by are parameters, and the rest is fixed text.
+        let wanted = Value::Object(metadata.clone()).to_string();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&wanted];
+        let mut terms = Vec::with_capacity(order.len());
+        for term in order {
+            let column = match &term.field {
+                SearchField::LastUsed => "lastused".to_string(),
+                SearchField::UseCount => "usecount".to_string(),
+                SearchField::Metadata(key) => {
+                    params.push(key);
+                    format!("metadata->>(${}::text)", params.len())
+                }
+            };
+            terms.push(format!("{column} {}", if term.descending { "DESC" } else { "ASC" }));
+        }
+        let order_sql = if terms.is_empty() { String::new() } else { format!("ORDER BY {}", terms.join(", ")) };
+        const WHERE: &str = "WHERE metadata->>'type' = 'mosaic' AND metadata @> ($1::text)::jsonb";
+        let count = client.prepare_cached(&format!("SELECT count(*) FROM searches {WHERE}")).await?;
         let matched: i64 = client
-            .query_one(&count, &[])
+            .query_one(&count, &[&wanted])
             .await?
             .try_get(0)
             .map_err(|e| PgStacError::Shape(e.to_string()))?;
+        let sql = format!(
+            "SELECT {SEARCH_COLUMNS} FROM searches {WHERE} {order_sql} LIMIT ${} OFFSET ${}",
+            params.len() + 1,
+            params.len() + 2
+        );
+        params.push(&limit);
+        params.push(&offset);
+        // Statements are kept per shape, and a shape is how many metadata keys sort it.
+        let stmt = client.prepare_cached(&sql).await?;
+        let rows = client.query(&stmt, &params).await?;
+        let searches = rows.iter().map(search_from_row).collect::<Result<Vec<_>, _>>()?;
         Ok((searches, matched))
     }
 
