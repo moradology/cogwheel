@@ -1686,6 +1686,71 @@ impl BandStatsAcc {
     }
 }
 
+/// Zero-allocation 4×3 probe fast-reject before allocating per-tile polygon grids/masks.
+/// Cuts OOB/small-polygon tile rejection from ~1,089 projections + heap Vecs down to 12 projections,
+/// while sampling thirds in X so odd-width global 0..360 tiles never miss the Western Hemisphere.
+fn tile_probe_outside_polygon(
+    ifd: &cogzilla_tiff::IfdMeta,
+    crs: &cogzilla_proj::CrsModel,
+    pm: &PolygonMask,
+    tx: u32,
+    ty: u32,
+    x_max: usize,
+    y_max: usize,
+) -> bool {
+    let base_col = (tx * ifd.tile_width) as usize;
+    let base_row = (ty * ifd.tile_height) as usize;
+    let cols = [0usize, x_max / 3, (2 * x_max) / 3, x_max];
+    let rows = [0usize, y_max / 2, y_max];
+    let mut p_min_lon = f64::INFINITY;
+    let mut p_max_lon = f64::NEG_INFINITY;
+    let mut p_min_lat = f64::INFINITY;
+    let mut p_max_lat = f64::NEG_INFINITY;
+    let mut non_finite = false;
+    let mut probe_antimeridian = false;
+    for &ry in &rows {
+        let row_f = (base_row + ry) as f64;
+        let mut prev_lon: Option<f64> = None;
+        for &cx in &cols {
+            let col_f = (base_col + cx) as f64;
+            let (sx, sy) = ifd.pixel_to_crs.forward(col_f, row_f);
+            let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+            if !lon.is_finite() || !lat.is_finite() {
+                non_finite = true;
+                break;
+            }
+            if let Some(pl) = prev_lon
+                && (lon - pl).abs() > 180.0
+            {
+                probe_antimeridian = true;
+            }
+            prev_lon = Some(lon);
+            p_min_lon = p_min_lon.min(lon);
+            p_max_lon = p_max_lon.max(lon);
+            p_min_lat = p_min_lat.min(lat);
+            p_max_lat = p_max_lat.max(lat);
+        }
+        if non_finite {
+            break;
+        }
+    }
+    if !non_finite && p_min_lat > -85.0 && p_max_lat < 85.0 {
+        let lon_span = p_max_lon - p_min_lon;
+        let lat_span = p_max_lat - p_min_lat;
+        let lat_pad = (lat_span * 0.15).max(1e-4);
+        if p_max_lat + lat_pad < pm.bbox[1] || p_min_lat - lat_pad > pm.bbox[3] {
+            return true;
+        }
+        if !probe_antimeridian && lon_span < 120.0 {
+            let lon_pad = (lon_span * 0.15).max(1e-4);
+            if p_max_lon + lon_pad < pm.bbox[0] || p_min_lon - lon_pad > pm.bbox[2] {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Build a 1-byte/px polygon mask for a single source tile using a coarse 16-px inverse CRS grid.
 /// Returns `(mask_bits, count_inside)` or `None` if the tile's lon/lat bounds do not intersect `pm.bbox`.
 fn build_tile_polygon_mask(
@@ -1701,58 +1766,8 @@ fn build_tile_polygon_mask(
     let base_col = (tx * ifd.tile_width) as usize;
     let base_row = (ty * ifd.tile_height) as usize;
 
-    // Zero-allocation 4x3 probe fast-reject before allocating the full 16-px grid.
-    // Cuts OOB/small-polygon tile rejection from ~1,089 projections + 2 heap Vecs down to 12 projections,
-    // while sampling thirds in X so odd-width global 0..360 tiles never miss the Western Hemisphere.
-    {
-        let cols = [0usize, x_max / 3, (2 * x_max) / 3, x_max];
-        let rows = [0usize, y_max / 2, y_max];
-        let mut p_min_lon = f64::INFINITY;
-        let mut p_max_lon = f64::NEG_INFINITY;
-        let mut p_min_lat = f64::INFINITY;
-        let mut p_max_lat = f64::NEG_INFINITY;
-        let mut non_finite = false;
-        let mut probe_antimeridian = false;
-        for &ry in &rows {
-            let row_f = (base_row + ry) as f64;
-            let mut prev_lon: Option<f64> = None;
-            for &cx in &cols {
-                let col_f = (base_col + cx) as f64;
-                let (sx, sy) = ifd.pixel_to_crs.forward(col_f, row_f);
-                let (lon, lat) = crs.to_lonlat_deg(sx, sy);
-                if !lon.is_finite() || !lat.is_finite() {
-                    non_finite = true;
-                    break;
-                }
-                if let Some(pl) = prev_lon
-                    && (lon - pl).abs() > 180.0
-                {
-                    probe_antimeridian = true;
-                }
-                prev_lon = Some(lon);
-                p_min_lon = p_min_lon.min(lon);
-                p_max_lon = p_max_lon.max(lon);
-                p_min_lat = p_min_lat.min(lat);
-                p_max_lat = p_max_lat.max(lat);
-            }
-            if non_finite {
-                break;
-            }
-        }
-        if !non_finite && p_min_lat > -85.0 && p_max_lat < 85.0 {
-            let lon_span = p_max_lon - p_min_lon;
-            let lat_span = p_max_lat - p_min_lat;
-            let lat_pad = (lat_span * 0.15).max(1e-4);
-            if p_max_lat + lat_pad < pm.bbox[1] || p_min_lat - lat_pad > pm.bbox[3] {
-                return None;
-            }
-            if !probe_antimeridian && lon_span < 120.0 {
-                let lon_pad = (lon_span * 0.15).max(1e-4);
-                if p_max_lon + lon_pad < pm.bbox[0] || p_min_lon - lon_pad > pm.bbox[2] {
-                    return None;
-                }
-            }
-        }
+    if tile_probe_outside_polygon(ifd, crs, pm, tx, ty, x_max, y_max) {
+        return None;
     }
 
     let gw = x_max.div_ceil(STEP) + 1;
@@ -1924,6 +1939,9 @@ fn build_tile_polygon_mask_strided(
     ly0: usize,
     step: usize,
 ) -> Option<(Vec<u8>, usize)> {
+    if tile_probe_outside_polygon(ifd, crs, pm, tx, ty, x_max, y_max) {
+        return None;
+    }
     let nx = (x_max - lx0).div_ceil(step);
     let ny = (y_max - ly0).div_ceil(step);
     let base_x = (tx * ifd.tile_width) as f64;
@@ -3028,10 +3046,19 @@ pub async fn compute_statistics_with_options(
                                 let ly0 = (step - (y0_tile % step)) % step;
                                 lx0 < x_max && ly0 < y_max
                             };
-                            if !has_sample {
+                            if !has_sample
+                                || tile_probe_outside_polygon(&ifd, &crs, &pm, tx, ty, x_max, y_max)
+                            {
                                 masks.push(None);
                                 continue;
                             }
+                            let tile_px = if step > 1 {
+                                x_max.div_ceil(step).saturating_mul(y_max.div_ceil(step))
+                            } else {
+                                x_max.saturating_mul(y_max)
+                            };
+                            tested_pixels = tested_pixels.saturating_add(tile_px);
+                            pm.check_work_budget(tested_pixels)?;
                             let built = if step > 1 {
                                 let x0_tile = (tx * ifd.tile_width) as usize;
                                 let y0_tile = (ty * ifd.tile_height) as usize;
@@ -3050,13 +3077,6 @@ pub async fn compute_statistics_with_options(
                                         "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
                                     )));
                                 }
-                                let tile_px = if step > 1 {
-                                    x_max.div_ceil(step).saturating_mul(y_max.div_ceil(step))
-                                } else {
-                                    x_max.saturating_mul(y_max)
-                                };
-                                tested_pixels = tested_pixels.saturating_add(tile_px);
-                                pm.check_work_budget(tested_pixels)?;
                                 inside_total += inside;
                                 masks.push(Some(bits));
                             } else {

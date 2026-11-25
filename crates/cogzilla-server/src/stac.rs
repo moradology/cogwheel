@@ -314,7 +314,9 @@ pub async fn resolve_stac_assets(
 
     // Single-pass identifier-boundary rewrite (e.g. `(B4-B3)/(B4+B3)` -> `(b1-b2)/(b1+b2)`),
     // preventing sequential double-replacement bugs when asset names overlap (`?assets=b2,b1`).
-    let rewritten_expr = expr_raw.map(|expr| rewrite_stac_expr(expr, &names));
+    let rewritten_expr = expr_raw
+        .map(|expr| rewrite_stac_expr(expr, &names))
+        .transpose()?;
 
     Ok((names, cogs, rewritten_expr))
 }
@@ -322,7 +324,7 @@ pub async fn resolve_stac_assets(
 /// Single-pass longest-prefix identifier-boundary replacement of STAC asset names with
 /// `b1`, `b2`, ... (handles TiTiler's default `{asset}_b{i}` syntax, bare `{asset}` when
 /// `asset_as_band=true`, unspaced subtraction `nir-red`, and hyphenated names `SR-B5-SR-B4`).
-pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
+pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, EngineError> {
     let mut ordered: Vec<(usize, &str)> = names
         .iter()
         .enumerate()
@@ -357,6 +359,11 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
                             .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
                     {
                         if let Ok(band_k) = expr[after + 2..j].parse::<usize>() {
+                            if !single_asset && band_k != 1 {
+                                return Err(EngineError::BadRequest(format!(
+                                    "multi-asset STAC expression '{name}_b{band_k}' with band != 1 is not supported; use band 1 ({name}_b1) or a single multi-band asset"
+                                )));
+                            }
                             let target_band = if single_asset { band_k } else { asset_1based };
                             matched_band_suffix = Some((target_band, j - i));
                             break;
@@ -388,7 +395,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
         out.push(ch);
         i += ch.len_utf8();
     }
-    out
+    Ok(out)
 }
 
 // ============================================================================
@@ -524,31 +531,38 @@ mod tests {
     fn stac_expr_rewriter_is_single_pass_and_respects_boundaries() {
         // Overlapping asset names (`b2`, `b1`) must NOT double-replace and collapse!
         let names = vec!["b2".to_string(), "b1".to_string()];
-        assert_eq!(rewrite_stac_expr("(b2-b1)/(b2+b1)", &names), "(b1-b2)/(b1+b2)");
+        assert_eq!(
+            rewrite_stac_expr("(b2-b1)/(b2+b1)", &names).unwrap(),
+            "(b1-b2)/(b1+b2)"
+        );
 
         // Short asset names (`r`, `g`, `b`) must NOT clobber function names (`abs`, `sqrt`)
         let rgb = vec!["r".to_string(), "g".to_string(), "b".to_string()];
         assert_eq!(
-            rewrite_stac_expr("sqrt(abs(r - b)) + g", &rgb),
+            rewrite_stac_expr("sqrt(abs(r - b)) + g", &rgb).unwrap(),
             "sqrt(abs(b1 - b3)) + b2"
         );
 
         // Unspaced subtraction with hyphenated asset names (`SR-B5-SR-B4`) must rewrite cleanly
         let hyphenated = vec!["SR-B5".to_string(), "SR-B4".to_string()];
         assert_eq!(
-            rewrite_stac_expr("(SR-B5-SR-B4)/(SR-B5+SR-B4)", &hyphenated),
+            rewrite_stac_expr("(SR-B5-SR-B4)/(SR-B5+SR-B4)", &hyphenated).unwrap(),
             "(b1-b2)/(b1+b2)"
         );
 
         // TiTiler default `{asset}_b{i}` syntax for both multi-asset and single multi-band assets
         let nir_red = vec!["nir".to_string(), "red".to_string()];
         assert_eq!(
-            rewrite_stac_expr("(nir_b1-red_b1)/(nir_b1+red_b1)", &nir_red),
+            rewrite_stac_expr("(nir_b1-red_b1)/(nir_b1+red_b1)", &nir_red).unwrap(),
             "(b1-b2)/(b1+b2)"
         );
+        // Multi-asset `{asset}_b{k}` with k != 1 must fail loud instead of silently mapping to band 1
+        assert!(rewrite_stac_expr("(nir_b2-red_b1)/(nir_b2+red_b1)", &nir_red).is_err());
+        assert!(rewrite_stac_expr("nir_b0 + red_b1", &nir_red).is_err());
+
         let visual = vec!["visual".to_string()];
         assert_eq!(
-            rewrite_stac_expr("(visual_b3-visual_b1)/(visual_b3+visual_b1)", &visual),
+            rewrite_stac_expr("(visual_b3-visual_b1)/(visual_b3+visual_b1)", &visual).unwrap(),
             "(b3-b1)/(b3+b1)"
         );
 
