@@ -3840,6 +3840,7 @@ pub fn render_expr_vm<const N: usize>(
     srcs: &[BandSource<'_>],
     prog: &ExprProgram,
     style: &SingleBandStyle,
+    ifd_dims: (u32, u32),
 ) -> Bytes {
     if !srcs.is_empty()
         && !prog.ops.contains(&crate::expr_vm::Op::Where)
@@ -3848,8 +3849,13 @@ pub fn render_expr_vm<const N: usize>(
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let nb = srcs.len().min(16);
+    let mask_oob =
+        !plan.all_in_bounds() && (nb == 0 || prog.ops.contains(&crate::expr_vm::Op::Where));
+    let max_u = ifd_dims.0 as f32 - 0.5;
+    let max_v = ifd_dims.1 as f32 - 0.5;
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let all_clean = plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
+    let all_clean =
+        plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
     let range = safe_rescale_denom(style.rescale_min, style.rescale_max);
     let inv_range = 255.0 / range;
     let inv_range_254 = 254.0 / range;
@@ -3949,13 +3955,32 @@ pub fn render_expr_vm<const N: usize>(
     let mut band_rows = vec![[0.0f32; N]; nb];
     let mut expr_scratch: Vec<[f32; N]> = Vec::new();
     let mut out_row = [0.0f32; N];
+    let eval_masked_row = |py: usize,
+                           band_rows: &[[f32; N]],
+                           expr_scratch: &mut Vec<[f32; N]>,
+                           out_row: &mut [f32; N]| {
+        prog.eval_row_with_scratch::<N>(band_rows, expr_scratch, out_row);
+        if mask_oob {
+            for_each_pixel_in_row(plan, py, |px, u, v| {
+                if !u.is_finite()
+                    || !v.is_finite()
+                    || u < -0.5
+                    || u > max_u
+                    || v < -0.5
+                    || v > max_v
+                {
+                    out_row[px] = f32::NAN;
+                }
+            });
+        }
+    };
 
     match style.format {
         OutputFormat::RawF32 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 sample_row(py, &mut band_rows);
-                prog.eval_row_with_scratch::<N>(&band_rows, &mut expr_scratch, &mut out_row);
+                eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
                 for &v in &out_row {
                     out.put_slice(&v.to_le_bytes());
                 }
@@ -3978,7 +4003,7 @@ pub fn render_expr_vm<const N: usize>(
                 }
                 for py in 0..N {
                     sample_row(py, &mut band_rows);
-                    prog.eval_row_with_scratch::<N>(&band_rows, &mut expr_scratch, &mut out_row);
+                    eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
                     let row_idx = &mut sc.row_buf[..N];
                     for px in 0..N {
                         let val = out_row[px];
@@ -4012,7 +4037,7 @@ pub fn render_expr_vm<const N: usize>(
                 let buf = &mut sc.img_buf[..total];
                 for py in 0..N {
                     sample_row(py, &mut band_rows);
-                    prog.eval_row_with_scratch::<N>(&band_rows, &mut expr_scratch, &mut out_row);
+                    eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
                     let row_off = py * N * 4;
                     for px in 0..N {
                         let val = out_row[px];
@@ -5695,7 +5720,7 @@ mod tests {
                 format: OutputFormat::RawF32,
                 resample,
             };
-            let got = render_expr_vm(&plan, &pair, &prog, &style);
+            let got = render_expr_vm(&plan, &pair, &prog, &style, (tw, th));
             for py in 0..256 {
                 for px in 0..256 {
                     let idx = (py * 256 + px) * 4;
@@ -5765,5 +5790,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn render_expr_vm_masks_oob_pixels_for_constant_and_where_expressions() {
+        let mut u = [0.0f32; 16];
+        let mut v = [0.0f32; 16];
+        // Left half (-8..-1) is out-of-bounds, right half (0..7) is inside a 16x16 IFD.
+        for i in 0..16 {
+            u[i] = i as f32 - 8.0;
+            v[i] = i as f32;
+        }
+        let plan = CoordPlan::Separable1D {
+            u: Box::new(u),
+            v: Box::new(v),
+            src_min_col: -8,
+            src_max_col: 7,
+            src_min_row: 0,
+            src_max_row: 15,
+            all_in_bounds: false,
+        };
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 10.0,
+            colormap: ColormapName::Grayscale,
+            format: OutputFormat::RawF32,
+            resample: ResampleMode::Nearest,
+        };
+
+        // 1. Constant expression (`1`) with empty sources
+        let const_prog = crate::expr_vm::ExprProgram::compile("1").unwrap();
+        let out_const = render_expr_vm(&plan, &[], &const_prog, &style, (16, 16));
+        let oob_val = f32::from_le_bytes(out_const[0..4].try_into().unwrap());
+        let in_val = f32::from_le_bytes(out_const[8 * 4..9 * 4].try_into().unwrap());
+        assert!(oob_val.is_nan(), "OOB pixel for constant expr must be NaN, got {oob_val}");
+        assert_eq!(in_val, 1.0, "in-bounds pixel for constant expr must be 1.0");
+
+        // 2. where(1, 5, b1) with a real band source
+        let band = cogzilla_codec::DecodedBand {
+            width: 16,
+            height: 16,
+            data: cogzilla_codec::BandData::U8 {
+                data: vec![2u8; 16 * 16].into_boxed_slice(),
+                nodata: None,
+            },
+            stats: cogzilla_codec::BlockStats {
+                min: 2.0,
+                max: 2.0,
+                all_nodata: false,
+                no_nodata: true,
+            },
+        };
+        let refs = [Some(&band)];
+        let src = [BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &refs)];
+        let where_prog = crate::expr_vm::ExprProgram::compile("where(1, 5, b1)").unwrap();
+        let out_where = render_expr_vm(&plan, &src, &where_prog, &style, (16, 16));
+        let oob_w = f32::from_le_bytes(out_where[0..4].try_into().unwrap());
+        let in_w = f32::from_le_bytes(out_where[8 * 4..9 * 4].try_into().unwrap());
+        assert!(oob_w.is_nan(), "OOB pixel for where() expr must be NaN, got {oob_w}");
+        assert_eq!(in_w, 5.0, "in-bounds pixel for where(1, 5, b1) must be 5.0");
     }
 }

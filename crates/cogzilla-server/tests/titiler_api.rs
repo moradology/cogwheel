@@ -1255,6 +1255,25 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .await
                 .unwrap();
             assert_eq!(two_resp.status(), 400, "2-vertex GeoJSON ring must return 400");
+
+            // Audit c77 regression check: mixed-grid multi-COG /cog/feature with constant expr
+            // must still mask outside-polygon pixels to NaN.
+            let mg_resp = client
+                .post(format!(
+                    "{base}/cog/feature/32x32.f32?url={sat_url}&url={merc_url}&expression=1"
+                ))
+                .header("content-type", "application/json")
+                .body(gc_poly.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mg_resp.status(), 200);
+            let mg_bytes = mg_resp.bytes().await.unwrap();
+            assert_eq!(mg_bytes.len(), 32 * 32 * 4);
+            let mg_tr = f32::from_le_bytes(mg_bytes[31 * 4..32 * 4].try_into().unwrap());
+            let mg_bl = f32::from_le_bytes(mg_bytes[bl_off..bl_off + 4].try_into().unwrap());
+            assert!(mg_tr.is_nan(), "mixed-grid outside-polygon pixel must be NaN, got {mg_tr}");
+            assert_eq!(mg_bl, 1.0, "mixed-grid inside-polygon pixel must be 1.0");
         }
     }
 }

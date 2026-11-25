@@ -5427,6 +5427,54 @@ async fn render_mixed_grid_bbox(
         planes.push((b1, vals));
     }
 
+    // For constant or where() expressions in mixed-grid mode, build a polygon + primary-footprint
+    // validity mask so outside-polygon and out-of-bounds pixels stay NaN/transparent.
+    let needs_expr_mask = match bands {
+        BandRequest::CustomExpr { prog, .. } => {
+            prog.used_bands.is_empty() || prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where)
+        }
+        BandRequest::CustomExprRgb { progs, .. } => progs.iter().any(|p| {
+            p.used_bands.is_empty() || p.ops.contains(&cogzilla_kernel::expr_vm::Op::Where)
+        }),
+        _ => false,
+    };
+    let expr_valid_mask: Option<Vec<bool>> = if needs_expr_mask {
+        let one_prog = cogzilla_kernel::ExprProgram::compile("1").map_err(EngineError::BadRequest)?;
+        let mask_band = BandRequest::CustomExpr {
+            prog: one_prog,
+            rescale: (0.0, 1.0),
+            colormap: ColormapName::Grayscale,
+        };
+        let single_cog = [cogs[0].clone()];
+        let raw = Box::pin(render_bbox_impl(
+            engine,
+            &single_cog,
+            eff_bbox,
+            eff_crs,
+            false,
+            w as u32,
+            h as u32,
+            poly_mask,
+            &mask_band,
+            ResampleMode::Nearest,
+            OutputFormat::RawF32,
+            None,
+            None,
+            None,
+            false,
+            false,
+        ))
+        .await?;
+        Some(
+            raw.chunks_exact(4)
+                .take(w * h)
+                .map(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan())
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     let get_plane = |b1: u16| -> &[f32] {
         planes
             .iter()
@@ -5533,6 +5581,10 @@ async fn render_mixed_grid_bbox(
                 let mut vals = [0.0f32; 16];
                 let k = p_refs.len().min(16);
                 for i in 0..npix {
+                    if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                        out.put_slice(&f32::NAN.to_le_bytes());
+                        continue;
+                    }
                     for j in 0..k {
                         vals[j] = p_refs[j][i];
                     }
@@ -5547,6 +5599,10 @@ async fn render_mixed_grid_bbox(
                     let mut vals = [0.0f32; 16];
                     let k = p_refs.len().min(16);
                     for i in 0..npix {
+                        if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                            out.put_slice(&f32::NAN.to_le_bytes());
+                            continue;
+                        }
                         for j in 0..k {
                             vals[j] = p_refs[j][i];
                         }
@@ -5715,6 +5771,9 @@ async fn render_mixed_grid_bbox(
             let mut vals = [0.0f32; 16];
             let k = p_refs.len().min(16);
             for i in 0..npix {
+                if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                    continue;
+                }
                 for j in 0..k {
                     vals[j] = p_refs[j][i];
                 }
@@ -5741,6 +5800,9 @@ async fn render_mixed_grid_bbox(
             ];
             let mut vals = [0.0f32; 16];
             for i in 0..npix {
+                if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                    continue;
+                }
                 let mut ch = [f32::NAN; 3];
                 for c in 0..3 {
                     let k = p_refs[c].len().min(16);
