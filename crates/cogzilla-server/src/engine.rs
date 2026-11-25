@@ -1817,6 +1817,33 @@ impl TileEngine {
         }) && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
     }
 
+    /// The bands to read of a raster that has `count`, `extra` of them extra samples: those
+    /// asked for, counted from one, or all of its own when none is. Refuses a band the raster has not, and more than
+    /// [`Self::MAX_PLANES_PER_RASTER`].
+    pub fn wanted_bands(count: u16, extra: usize, bands_1based: &[u16]) -> Result<Vec<u16>, EngineError> {
+        // With none asked for: every band that is not an extra sample (alpha), as rio-tiler
+        // leaves those out. They come last.
+        let own = count.saturating_sub(extra.min(usize::from(u16::MAX)) as u16).max(1).min(count);
+        let wanted: Vec<u16> =
+            if bands_1based.is_empty() { (1..=own).collect() } else { bands_1based.to_vec() };
+        if let Some(bad) = wanted.iter().find(|b| **b == 0 || **b > count) {
+            let known: Vec<String> = (1..=count).map(|b| b.to_string()).collect();
+            let tail = if count == 1 { "," } else { "" };
+            return Err(EngineError::BadRequest(format!(
+                "band index {bad} out of range (not in ({}{tail}))",
+                known.join(", ")
+            )));
+        }
+        if wanted.len() > Self::MAX_PLANES_PER_RASTER {
+            return Err(EngineError::BadRequest(format!(
+                "{} bands of one asset are too many to read at once (at most {}); choose bands with `bidx`",
+                wanted.len(),
+                Self::MAX_PLANES_PER_RASTER
+            )));
+        }
+        Ok(wanted)
+    }
+
     /// The most bands of one raster [`Self::raster_planes`] reads for one tile.
     pub const MAX_PLANES_PER_RASTER: usize = 32;
 
@@ -1835,24 +1862,8 @@ impl TileEngine {
     ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
         let cog = self.store.open_uri(uri).await?;
         let full = cog.index.full_res();
-        let (count, sample_type) = (full.samples_per_pixel, full.sample_type);
-        let wanted: Vec<u16> =
-            if bands_1based.is_empty() { (1..=count).collect() } else { bands_1based.to_vec() };
-        if let Some(bad) = wanted.iter().find(|b| **b == 0 || **b > count) {
-            let known: Vec<String> = (1..=count).map(|b| b.to_string()).collect();
-            let tail = if count == 1 { "," } else { "" };
-            return Err(EngineError::BadRequest(format!(
-                "band index {bad} out of range (not in ({}{tail}))",
-                known.join(", ")
-            )));
-        }
-        if wanted.len() > Self::MAX_PLANES_PER_RASTER {
-            return Err(EngineError::BadRequest(format!(
-                "{} bands of one asset are too many to read for a tile (at most {}); choose bands with `bidx`",
-                wanted.len(),
-                Self::MAX_PLANES_PER_RASTER
-            )));
-        }
+        let sample_type = full.sample_type;
+        let wanted = Self::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
         let mut one = req.clone();
         one.format = OutputFormat::RawF32;
         one.resample = match self.get_or_build_crs(&cog)? {

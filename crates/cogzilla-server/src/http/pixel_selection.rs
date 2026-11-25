@@ -162,6 +162,18 @@ impl<T: Sample> Fold<T> {
         }
     }
 
+    /// The bytes the method works in whatever the number of scenes: a value kept, or a sum,
+    /// a sum of squares and a count, for each value of each band.
+    pub(super) fn working_bytes(method: Selection, bands: usize, pixels: usize) -> usize {
+        let each = match method {
+            Selection::Mean | Selection::Stdev => 2 * std::mem::size_of::<f64>() + std::mem::size_of::<u32>(),
+            Selection::Median => 0,
+            Selection::Count => return pixels.saturating_mul(std::mem::size_of::<T>()),
+            _ => std::mem::size_of::<T>(),
+        };
+        bands.saturating_mul(pixels).saturating_mul(each)
+    }
+
     /// Take one scene: `bands * pixels` values, band after band, NaN where it has no data.
     pub(super) fn add(&mut self, scene: impl Iterator<Item = T>) {
         self.scenes += 1;
@@ -455,6 +467,16 @@ mod tests {
         assert_eq!(run(Selection::Median, true), [0.0, 6.0, 3.0]);
         assert_eq!(run(Selection::Highest, false), [0.4, 7.0, 4.0]);
         assert_eq!(run(Selection::Count, false), [3.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn what_a_method_works_in_is_known_beforehand() {
+        let px = 1000;
+        assert_eq!(Fold::<f32>::working_bytes(Selection::First, 3, px), 3 * px * 4);
+        assert_eq!(Fold::<f64>::working_bytes(Selection::Highest, 3, px), 3 * px * 8);
+        assert_eq!(Fold::<f32>::working_bytes(Selection::Mean, 3, px), 3 * px * 20);
+        assert_eq!(Fold::<f32>::working_bytes(Selection::Count, 3, px), px * 4);
+        assert_eq!(Fold::<f32>::working_bytes(Selection::Median, 3, px), 0);
     }
 
     #[test]
