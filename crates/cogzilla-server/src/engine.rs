@@ -1921,9 +1921,14 @@ impl TileEngine {
         let mut scene_req = req.clone();
         scene_req.format = OutputFormat::RawF32;
         let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, MOSAIC_SCENES_AHEAD);
+        // A scene that misses the tile comes back as nothing but no data. It is not a scene
+        // of this tile: counted, it would make a tile of zeros out of nothing.
+        let nothing = |scene: &[u8]| {
+            scene.chunks_exact(4).all(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]).is_nan())
+        };
         while let Some(scene) = reading.next().await {
             let scene = scene?;
-            if scene.len() == len {
+            if scene.len() == len && !nothing(&scene) {
                 each(&scene);
             }
         }

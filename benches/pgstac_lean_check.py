@@ -30,6 +30,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import mercantile
@@ -42,19 +43,27 @@ RESULTS = ROOT / "benches" / "results" / "pgstac"
 LOADED = ROOT / "benches" / "fixtures" / "pgstac" / "loaded.json"
 PORT = 18824
 
-SEARCHES = {
-    "all": {"collections": ["sentinel-2-l2a"]},
-    "clear": {"collections": ["sentinel-2-l2a"], "query": {"eo:cloud_cover": {"lt": 10}}},
-    "oldest": {"collections": ["sentinel-2-l2a"], "sortby": [{"field": "datetime", "direction": "asc"}]},
-}
+DEFAULT_COLLECTION = "sentinel-2-l2a"
+SEARCH_NAMES = ("all", "clear", "oldest")
+
+
+def searches(collection: str) -> dict[str, dict]:
+    return {
+        "all": {"collections": [collection]},
+        "clear": {"collections": [collection], "query": {"eo:cloud_cover": {"lt": 10}}},
+        "oldest": {"collections": [collection], "sortby": [{"field": "datetime", "direction": "asc"}]},
+    }
 
 
 def dsn_from_env() -> str:
     if os.environ.get("DATABASE_URL"):
         return os.environ["DATABASE_URL"]
+    # User and password are escaped so a "/" or "@" in either does not break the URL.
     return "postgresql://{}:{}@{}:{}/{}".format(
-        os.environ.get("PGUSER", "username"), os.environ.get("PGPASSWORD", "password"),
-        os.environ.get("PGHOST", "127.0.0.1"), os.environ.get("PGPORT", "5439"),
+        quote(os.environ.get("PGUSER", "username"), safe=""),
+        quote(os.environ.get("PGPASSWORD", "password"), safe=""),
+        os.environ.get("PGHOST", "127.0.0.1"),
+        os.environ.get("PGPORT", os.environ.get("PGSTAC_PORT", "5439")),
         os.environ.get("PGDATABASE", "postgis"),
     )
 
@@ -131,7 +140,7 @@ def main() -> int:
     ap.add_argument("--zooms", default="5-14")
     ap.add_argument("--tiles-per-zoom", type=int, default=12)
     ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--searches", default="all,clear", help=f"comma-separated, from: {', '.join(SEARCHES)}")
+    ap.add_argument("--searches", default="all,clear", help=f"comma-separated, from: {', '.join(SEARCH_NAMES)}")
     ap.add_argument("--asset", default="visual")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--cogzilla-bin", default=str(ROOT / "target" / "release" / "cogzilla-server"))
@@ -141,7 +150,10 @@ def main() -> int:
     if not LOADED.exists():
         print(f"{LOADED} is missing: load the catalog with benches/pgstac_load.py first", file=sys.stderr)
         return 2
-    bbox = [float(v) for v in json.loads(LOADED.read_text())["bbox"].split(",")]
+    loaded = json.loads(LOADED.read_text())
+    bbox = [float(v) for v in loaded["bbox"].split(",")]
+    # The collection the loader put in the database, as it recorded it.
+    bodies = searches(loaded.get("collection", DEFAULT_COLLECTION))
     env = dict(os.environ, DATABASE_URL=dsn, COGZILLA_PGSTAC_LEAN="on")
     proc = subprocess.Popen(
         [args.cogzilla_bin, "--bind", f"127.0.0.1:{PORT}"], env=env,
@@ -156,7 +168,7 @@ def main() -> int:
         with httpx.Client(timeout=120) as client, psycopg.connect(dsn) as conn:
             version = conn.execute("SELECT pgstac.get_version()").fetchone()[0]
             for name in args.searches.split(","):
-                r = client.post(f"{base}/searches/register", json=SEARCHES[name])
+                r = client.post(f"{base}/searches/register", json=bodies[name])
                 r.raise_for_status()
                 sid = r.json()["id"]
                 for z, zt in tiles.items():

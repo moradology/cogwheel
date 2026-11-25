@@ -11,14 +11,38 @@ pub(super) type Ring = Vec<(f64, f64)>;
 /// sub-cells the polygon touches. With `scale` 1 this is rasterio's
 /// `rasterize(all_touched=True)`; a sub-cell is touched when its centre is inside the
 /// polygon (even-odd over all rings) or a ring passes through it.
-pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: usize) -> Vec<u32> {
+///
+/// The polygon and the scale come from a request, so the work they ask for is counted
+/// first and refused when it is more than a statistics request has any use for.
+pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: usize) -> Result<Vec<u32>, String> {
     let scale = scale.max(1);
     let (fw, fh) = (width * scale, height * scale);
     let mut counts = vec![0u32; width * height];
     if fw == 0 || fh == 0 {
-        return counts;
+        return Ok(counts);
+    }
+    // Every row of the fine grid looks at every segment, and a segment burns a cell for
+    // every row and column it crosses inside the grid.
+    let too_much = || "the polygon has too many vertices for this size and cover_scale; simplify it, or lower cover_scale".to_string();
+    let segments: u64 = rings.iter().map(|ring| ring.len() as u64).sum();
+    if segments.saturating_mul(fh as u64) > MAX_ROW_CHECKS {
+        return Err(too_much());
     }
     let s = scale as f64;
+    let mut burned = 0u64;
+    for ring in rings {
+        let closing = ring.first().zip(ring.last()).filter(|(a, b)| a != b).map(|(a, b)| [*b, *a]);
+        for pair in ring.windows(2).map(|p| [p[0], p[1]]).chain(closing) {
+            let across = (pair[0].0 * s).clamp(0.0, fw as f64) - (pair[1].0 * s).clamp(0.0, fw as f64);
+            let down = (pair[0].1 * s).clamp(0.0, fh as f64) - (pair[1].1 * s).clamp(0.0, fh as f64);
+            // Not a number clamps to itself and counts as nothing; such a segment burns nothing.
+            let cells = across.abs() + down.abs() + 2.0;
+            burned = burned.saturating_add(if cells.is_finite() { cells as u64 } else { 0 });
+        }
+    }
+    if burned > MAX_EDGE_CELLS {
+        return Err(too_much());
+    }
     let fine: Vec<Ring> = rings
         .iter()
         .map(|ring| {
@@ -90,8 +114,14 @@ pub(super) fn cover_counts(rings: &[Ring], width: usize, height: usize, scale: u
             next_edge += 1;
         }
     }
-    counts
+    Ok(counts)
 }
+
+/// How many cells the rings of one polygon may burn: eight bytes each before they are sorted.
+const MAX_EDGE_CELLS: u64 = 16_000_000;
+
+/// How many times a row of the fine grid may look at a segment.
+const MAX_ROW_CHECKS: u64 = 400_000_000;
 
 /// Every cell a segment passes through, as GDAL's all-touched line burner walks it.
 fn burn_line(from: (f64, f64), to: (f64, f64), width: i64, height: i64, out: &mut Vec<(u32, u32)>) {
@@ -289,7 +319,9 @@ pub(super) fn band_statistics(
     }
 
     let integral = sorted.iter().all(|v| v.fract() == 0.0);
-    let number = |v: f64| if integral { json!(v as i64) } else { json!(v) };
+    // A whole number only where it is one and an `i64` holds it: a category of 2.5 asked of
+    // whole-numbered data keeps its name.
+    let number = |v: f64| if integral && v.fract() == 0.0 && v.abs() < 9.0e15 { json!(v as i64) } else { json!(v) };
     let histogram = if opts.categorical {
         let wanted = if opts.categories.is_empty() { keys.clone() } else { opts.categories.clone() };
         let counts: Vec<u64> = wanted
@@ -390,12 +422,12 @@ mod tests {
         // A square from (1.2, 1.2) to (3.6, 3.6): centres of cells 2 and 3 are inside
         // (1.5 is too), and the outline also touches row and column 1.
         let square = vec![vec![(1.2, 1.2), (3.6, 1.2), (3.6, 3.6), (1.2, 3.6), (1.2, 1.2)]];
-        let mask = cover_counts(&square, 5, 5, 1);
+        let mask = cover_counts(&square, 5, 5, 1).unwrap();
         assert_eq!(grid(&mask, 5), [".....", ".###.", ".###.", ".###.", "....."]);
 
         // A thin sliver holds no cell centre and is still burned along its length.
         let sliver = vec![vec![(0.1, 0.1), (3.9, 2.2), (3.9, 2.3), (0.1, 0.2), (0.1, 0.1)]];
-        let mask = cover_counts(&sliver, 4, 3, 1);
+        let mask = cover_counts(&sliver, 4, 3, 1).unwrap();
         assert_eq!(grid(&mask, 4), ["##..", ".###", "...#"]);
 
         // An unclosed ring is closed, and a hole is left out (even-odd).
@@ -403,7 +435,7 @@ mod tests {
             vec![(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
             vec![(1.6, 1.6), (4.4, 1.6), (4.4, 4.4), (1.6, 4.4), (1.6, 1.6)],
         ];
-        let mask = cover_counts(&holed, 6, 6, 1);
+        let mask = cover_counts(&holed, 6, 6, 1).unwrap();
         assert_eq!(grid(&mask, 6), ["######", "######", "##..##", "##..##", "######", "######"]);
     }
 
@@ -411,16 +443,20 @@ mod tests {
     fn coverage_is_the_share_of_sub_cells() {
         // The left half of a 2x1 grid, plus a tenth of the right pixel.
         let ring = vec![vec![(0.0, 0.0), (1.1, 0.0), (1.1, 1.0), (0.0, 1.0), (0.0, 0.0)]];
-        let counts = cover_counts(&ring, 2, 1, 10);
+        let counts = cover_counts(&ring, 2, 1, 10).unwrap();
         assert_eq!(counts[0], 100);
         // Sub-columns 10 (centre inside) and 11 (the edge at 11.0 runs along its left side).
         assert_eq!(counts[1], 20);
         // Vertices far outside the grid: the walk is clipped to it and still ends.
         let huge = vec![vec![(-1.0e9, -1.0e9), (2.0e9, -1.0e9), (0.0, 2.0e9), (-1.0e9, -1.0e9)]];
-        assert_eq!(cover_counts(&huge, 2, 1, 10), [100, 100]);
+        assert_eq!(cover_counts(&huge, 2, 1, 10).unwrap(), [100, 100]);
         // A polygon away from the grid touches nothing.
         let far = vec![vec![(10.0, 10.0), (12.0, 10.0), (12.0, 12.0), (10.0, 10.0)]];
-        assert!(cover_counts(&far, 2, 1, 10).iter().all(|c| *c == 0));
+        assert!(cover_counts(&far, 2, 1, 10).unwrap().iter().all(|c| *c == 0));
+        // A polygon that asks for more work than statistics have a use for is refused.
+        let comb: Vec<Ring> = (0..4096).map(|i| vec![(0.0, i as f64), (64.0, i as f64), (64.0, i as f64 + 0.5), (0.0, i as f64)]).collect();
+        assert!(cover_counts(&comb, 64, 64, 1).is_ok());
+        assert!(cover_counts(&comb, 64, 64, 1000).is_err());
     }
 
     #[test]

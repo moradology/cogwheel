@@ -22,7 +22,8 @@ impl Node {
     fn eval(&self, bands: &[f64]) -> f64 {
         match self {
             Node::Num(v) => *v,
-            Node::Band(i) => bands[*i],
+            // A pixel with fewer bands than the expression was parsed for has no value there.
+            Node::Band(i) => bands.get(*i).copied().unwrap_or(f64::NAN),
             Node::Neg(a) => -a.eval(bands),
             Node::Bin(op, a, b) => {
                 let (a, b) = (a.eval(bands), b.eval(bands));
@@ -31,7 +32,8 @@ impl Node {
                     b'-' => a - b,
                     b'*' => a * b,
                     b'/' => a / b,
-                    b'%' => a % b,
+                    // numexpr's modulo takes the sign of the divisor: (-2) % 3 is 1.
+                    b'%' => a - (a / b).floor() * b,
                     _ => a.powf(b),
                 }
             }
@@ -328,6 +330,9 @@ mod tests {
         assert_eq!(one("(b1 + b2) * -b3"), -20.0);
         assert_eq!(one("sqrt(b3) + abs(-b1) + 1e1 + .5"), 14.5);
         assert_eq!(one("b3 % b2"), 1.0);
+        // As numexpr: the sign of the divisor.
+        assert_eq!(one("(-b2) % b3"), 1.0);
+        assert_eq!(one("b2 % (-b3)"), -1.0);
         // b10 is not b1 followed by a zero.
         assert_eq!(run("b10", &v).unwrap_err(), "Invalid band/asset name 'b10'");
     }

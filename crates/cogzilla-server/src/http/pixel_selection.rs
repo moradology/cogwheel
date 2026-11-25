@@ -113,7 +113,8 @@ pub(super) struct Fold<T = f32> {
 enum State<T> {
     /// `first`, `highest`, `lowest` and the last-band methods: the value kept so far.
     Kept(Vec<T>),
-    /// `mean` and `stdev`: the sum, the sum of squares and how many values went into them.
+    /// `mean` and `stdev`: the sum, the sum of squared distances from the mean and how many
+    /// values went into them.
     Moments { sum: Vec<f64>, squares: Vec<f64>, count: Vec<u32> },
     /// `median`: every scene's values, scene after scene.
     All(Vec<T>),
@@ -219,8 +220,14 @@ impl<T: Sample> Fold<T> {
                 for (i, v) in scene.enumerate().take(sum.len()) {
                     if !v.is_nan() {
                         let v = v.to_f64();
+                        // The squared distances are kept, not the squares: the squares of
+                        // large values that sit close together lose the spread between them.
+                        if count[i] > 0 {
+                            let before = v - sum[i] / f64::from(count[i]);
+                            let after = v - (sum[i] + v) / f64::from(count[i] + 1);
+                            squares[i] += before * after;
+                        }
                         sum[i] += v;
-                        squares[i] += v * v;
                         count[i] += 1;
                     }
                 }
@@ -280,7 +287,7 @@ impl<T: Sample> Fold<T> {
                         cast(mean)
                     } else {
                         // The population figure, as `numpy.ma.std` gives; never cast.
-                        T::from_f64((squares[i] / n - mean * mean).max(0.0).sqrt())
+                        T::from_f64((squares[i] / n).max(0.0).sqrt())
                     };
                 }
                 values
@@ -395,6 +402,11 @@ mod tests {
         // One value has no spread.
         let got = select(Selection::Stdev, &[scene(&[41.0])], 1, 1, true).unwrap();
         assert_eq!(got.values, [0.0]);
+        // A small spread around a large value is kept.
+        let mut fold = Fold::<f64>::new(Selection::Stdev, 1, 1, false);
+        fold.add([1_000_000_001.0].into_iter());
+        fold.add([1_000_000_002.0].into_iter());
+        assert_eq!(fold.finish().unwrap().values, [0.5]);
     }
 
     #[test]

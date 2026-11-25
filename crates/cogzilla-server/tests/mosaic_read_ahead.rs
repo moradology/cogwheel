@@ -233,7 +233,9 @@ async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     let ramp = started.elapsed();
     let (peak_ramped, paths) = seen.take();
     assert_eq!(paths.len(), 6);
-    assert_eq!(peak_ramped, 3, "the ramp reads one scene, then two, then the three that are left");
+    // The window grows as each scene comes back, so the last three may start while the
+    // third is still being read.
+    assert!(matches!(peak_ramped, 3 | 4), "the ramp reads one scene, then two, then the rest: {peak_ramped} at once");
     assert_eq!(together, ramped, "how many scenes are read at once must not change the tile");
     // Every scene is the same picture, so six of them composite to what one gives: the same
     // pixels covered, and the same colours to within a step of the colour map, which is how
