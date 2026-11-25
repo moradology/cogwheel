@@ -2810,44 +2810,77 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)],
 /// A row of a picture: the exact source position at the two ends and the middle of a
 /// stretch, and a curve through the three for the columns between. The curve is checked
 /// against the exact position a quarter and three quarters of the way along, and the
-/// stretch is halved until both are within `tolerance`. A straight line through the ends,
-/// which is what GDAL draws, is off by the row's whole bend; the curve is off only by how
-/// that bend changes along the row, which for a map projection is next to nothing, so a
-/// row costs a handful of projections and still lands within a thousandth of a pixel.
+/// stretch is halved until it passes. A straight line through the ends, which is what GDAL
+/// draws, is off by the row's whole bend; the curve is off only by how that bend changes
+/// along the row, which for a map projection is next to nothing, so a row costs a handful
+/// of projections and still lands within a thousandth of a pixel. The two halves of a
+/// stretch share its middle, and the columns it was checked at are their middles, so
+/// halving costs each half only its own two checks.
 fn curved_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)], tolerance: f64) {
-    let mut todo = vec![(0usize, out.len())];
-    while let Some((lo, hi)) = todo.pop() {
-        let points = hi - lo;
-        if points <= 9 {
-            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
-                *slot = exact(lo + k);
+    // Nine columns or fewer are worked out one by one.
+    if out.len() <= 9 {
+        for (k, slot) in out.iter_mut().enumerate() {
+            *slot = exact(k);
+        }
+        return;
+    }
+    let end = out.len() - 1;
+    // A stretch is its first and last column and the exact positions at those two and at
+    // the column midway.
+    let mut todo = vec![(0usize, end, exact(0), exact(end / 2), exact(end))];
+    while let Some((lo, hi, p0, pm, p1)) = todo.pop() {
+        let last = hi - lo;
+        let middle = last / 2;
+        if last < 9 {
+            for k in 0..=last {
+                out[lo + k] = if k == 0 {
+                    p0
+                } else if k == middle {
+                    pm
+                } else if k == last {
+                    p1
+                } else {
+                    exact(lo + k)
+                };
             }
             continue;
         }
-        let (last, middle) = (points - 1, (points - 1) / 2);
-        let (p0, pm, p1) = (exact(lo), exact(lo + middle), exact(hi - 1));
-        // The curve through the three, by Lagrange's formula, at column `k` of the stretch.
+        // The curve through the three, as `a + b x + c x^2` at column `x` of the stretch,
+        // worked out once so that a column costs two multiplications a coordinate.
         let (m, n) = (middle as f64, last as f64);
+        let through = |p0: f64, pm: f64, p1: f64| {
+            let c = ((p1 - p0) / n - (pm - p0) / m) / (n - m);
+            (p0, (pm - p0) / m - c * m, c)
+        };
+        let (u, v) = (through(p0.0, pm.0, p1.0), through(p0.1, pm.1, p1.1));
         let at = |k: usize| {
             let x = k as f64;
-            let (a, b, c) = ((x - m) * (x - n) / (m * n), x * (x - n) / (m * (m - n)), x * (x - m) / (n * (n - m)));
-            (a * p0.0 + b * pm.0 + c * p1.0, a * p0.1 + b * pm.1 + c * p1.1)
+            (u.0 + x * (u.1 + x * u.2), v.0 + x * (v.1 + x * v.2))
         };
-        let off = |k: usize| {
-            let (drawn, real) = (at(k), exact(lo + k));
-            (drawn.0 - real.0).abs().max((drawn.1 - real.1).abs())
-        };
-        let error = off(middle / 2).max(off(middle + (last - middle) / 2));
-        if error.is_finite() && error <= tolerance {
-            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+        // How far the curve is from the exact position at the two columns it is checked at.
+        let (quarter, three_quarters) = (middle / 2, middle + (last - middle) / 2);
+        let (q1, q3) = (exact(lo + quarter), exact(lo + three_quarters));
+        let (first, second) = ((at(quarter).0 - q1.0, at(quarter).1 - q1.1), (at(three_quarters).0 - q3.0, at(three_quarters).1 - q3.1));
+        // Any of the five positions outside the projection leaves one of these not a number.
+        let finite = (first.0 + first.1 + second.0 + second.1).is_finite();
+        let error = first.0.abs().max(first.1.abs()).max(second.0.abs()).max(second.1.abs());
+        // What a smooth row leaves at the two columns is equal and opposite, bar a sliver.
+        // A row that jumps, as a longitude does where it wraps, leaves them lopsided by at
+        // least a quarter of the jump, even when the row's bend hides the jump from each
+        // column on its own. Held to an eighth of the tolerance, no jump of more than half
+        // the tolerance is drawn across, and no position is more than twice the tolerance
+        // out: the margin the check at a source pixel's edge is built on.
+        let lopsided = (first.0 + second.0).abs().max((first.1 + second.1).abs());
+        if finite && error <= tolerance && lopsided <= tolerance / 8.0 {
+            for (k, slot) in out[lo..=hi].iter_mut().enumerate() {
                 *slot = at(k);
             }
-        } else if error.is_finite() {
-            todo.push((lo, lo + middle));
-            todo.push((lo + middle, hi));
+        } else if finite {
+            todo.push((lo, lo + middle, p0, q1, pm));
+            todo.push((lo + middle, hi, pm, q3, p1));
         } else {
             // Part of the row is outside the projection: no curve to draw.
-            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+            for (k, slot) in out[lo..=hi].iter_mut().enumerate() {
                 *slot = exact(lo + k);
             }
         }
@@ -2863,6 +2896,49 @@ const PICTURE_TOLERANCE: f64 = 1.0 / 1024.0;
 fn near_pixel_edge(p: f64) -> bool {
     let part = p - p.floor();
     !(2.0 * PICTURE_TOLERANCE..=1.0 - 2.0 * PICTURE_TOLERANCE).contains(&part)
+}
+
+/// Where every column of one row of the grid reads from, a stretch of `block` columns at
+/// a time: for a picture the checked curve, otherwise GDAL's straight lines.
+fn row_source_positions(exact: &impl Fn(usize) -> (f64, f64), block: usize, every_pixel: bool, out: &mut [(f64, f64)]) {
+    let block = block.max(1);
+    for (n, stretch) in out.chunks_mut(block).enumerate() {
+        if every_pixel {
+            curved_scanline(&|i| exact(n * block + i), stretch, PICTURE_TOLERANCE);
+        } else {
+            approx_scanline(&|i| exact(n * block + i), stretch, 0.125);
+        }
+    }
+}
+
+/// The source pixel, as (column, row), that a position drawn along a row names in a level
+/// `width` by `height`, or none when it is outside the level. `exact` works the position
+/// out again where the drawn one cannot be trusted to name the right pixel.
+#[inline]
+fn source_cell(
+    drawn: (f64, f64),
+    (width, height): (u32, u32),
+    every_pixel: bool,
+    exact: impl FnOnce() -> (f64, f64),
+) -> Option<(i32, i32)> {
+    let (w, h) = (f64::from(width), f64::from(height));
+    let inside = |u: f64, v: f64| u >= 0.0 && v >= 0.0 && u + 1e-10 <= w && v + 1e-10 <= h;
+    let (mut u, mut v) = drawn;
+    // A position less than a pixel outside the raster is worked out again exactly.
+    if !inside(u, v) && u > -1.0 && v > -1.0 && u < w + 1.0 && v < h + 1.0 {
+        (u, v) = exact();
+    } else if every_pixel && u.is_finite() && v.is_finite() {
+        // A position drawn between two exact ones is off by no more than the
+        // tolerance, which only matters next to the edge of a source pixel: there
+        // it could name the neighbour. Those are worked out exactly, so the pixel
+        // taken is always the one the projection itself gives.
+        if near_pixel_edge(u) || near_pixel_edge(v) {
+            (u, v) = exact();
+        }
+    }
+    (u.is_finite() && v.is_finite() && inside(u, v)).then(|| {
+        (((u + 1e-10).floor() as i32).min(width as i32 - 1), ((v + 1e-10).floor() as i32).min(height as i32 - 1))
+    })
 }
 
 /// How GDAL goes about a warped read, which decides the pixels it takes.
@@ -2954,8 +3030,6 @@ async fn warp_nearest(
     let mut cells: Vec<(i32, i32)> = Vec::with_capacity(width * height);
     let mut row_positions = vec![(0f64, 0f64); grid_w];
     let (mut c0, mut c1, mut r0, mut r1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
-    let (w, h) = (f64::from(ifd.width), f64::from(ifd.height));
-    let inside = |u: f64, v: f64| u >= 0.0 && v >= 0.0 && u + 1e-10 <= w && v + 1e-10 <= h;
     let mut worked_row = usize::MAX;
     for j in 0..height {
         // The row and columns of the grid an output pixel takes: its own, or when the
@@ -2975,37 +3049,17 @@ async fn warp_nearest(
             ifd.crs_to_pixel.forward(x, y)
         };
         if grid_row != worked_row {
-            for (n, stretch) in row_positions.chunks_mut(block.max(1)).enumerate() {
-                if every_pixel {
-                    curved_scanline(&|i| exact(n * block + i), stretch, PICTURE_TOLERANCE);
-                } else {
-                    approx_scanline(&|i| exact(n * block + i), stretch, 0.125);
-                }
-            }
+            row_source_positions(&exact, block, every_pixel, &mut row_positions);
             worked_row = grid_row;
         }
         for i in 0..width {
             let grid_col = if grid_w == width { i } else { ((2 * i + 1) * grid_w / (2 * width)).min(grid_w - 1) };
-            let (mut u, mut v) = row_positions[grid_col];
-            // A position less than a pixel outside the raster is worked out again exactly.
-            if !inside(u, v) && u > -1.0 && v > -1.0 && u < w + 1.0 && v < h + 1.0 {
-                (u, v) = exact(grid_col);
-            } else if every_pixel && u.is_finite() && v.is_finite() {
-                // A position drawn between two exact ones is off by no more than the
-                // tolerance, which only matters next to the edge of a source pixel: there
-                // it could name the neighbour. Those are worked out exactly, so the pixel
-                // taken is always the one the projection itself gives.
-                if near_pixel_edge(u) || near_pixel_edge(v) {
-                    (u, v) = exact(grid_col);
+            match source_cell(row_positions[grid_col], (ifd.width, ifd.height), every_pixel, || exact(grid_col)) {
+                Some((col, row)) => {
+                    (c0, c1, r0, r1) = (c0.min(col), c1.max(col), r0.min(row), r1.max(row));
+                    cells.push((col, row));
                 }
-            }
-            if u.is_finite() && v.is_finite() && inside(u, v) {
-                let col = ((u + 1e-10).floor() as i32).min(ifd.width as i32 - 1);
-                let row = ((v + 1e-10).floor() as i32).min(ifd.height as i32 - 1);
-                (c0, c1, r0, r1) = (c0.min(col), c1.max(col), r0.min(row), r1.max(row));
-                cells.push((col, row));
-            } else {
-                cells.push((-1, -1));
+                None => cells.push((-1, -1)),
             }
         }
     }
@@ -5572,6 +5626,207 @@ mod tests {
         curved_scanline(&broken, &mut row, PICTURE_TOLERANCE);
         assert!(row[10].0.is_nan());
         assert_eq!(row[60], (60.0, 1.0));
+    }
+
+    /// Every way a picture's row can be asked of a projection that could trip the curve:
+    /// each family of projection, at home and far outside its area, under tiles that span
+    /// the world, sit on the antimeridian or reach the poles, with rasters turned, tiny,
+    /// coarse and far finer than the picture. The pixel taken must be the projection's own.
+    #[test]
+    fn pictures_take_the_projections_pixel_in_hostile_cases() {
+        use cogzilla_proj::{Ellipsoid, Sinusoidal};
+        use cogzilla_tiff::Affine2D;
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut pick = |n: usize| (next() % n as u64) as usize;
+
+        let mut systems: Vec<(String, CrsModel, (f64, f64))> = Vec::new();
+        for (code, home) in [
+            (3857u16, (10.0, 45.0)), (3395, (10.0, 45.0)), (4326, (10.0, 45.0)),
+            (32601, (-177.0, 10.0)), (32631, (3.0, 50.0)), (32660, (177.0, 70.0)), (32733, (15.0, -30.0)), (32760, (177.0, -79.0)),
+            (3031, (0.0, -80.0)), (3413, (-45.0, 75.0)), (3995, (0.0, 85.0)), (3035, (10.0, 52.0)), (3575, (10.0, 80.0)),
+            (5070, (-96.0, 37.0)), (3338, (-154.0, 60.0)), (2154, (3.0, 46.5)), (3978, (-95.0, 60.0)), (2193, (173.0, -41.0)), (3006, (15.0, 62.0)),
+        ] {
+            match CrsModel::from_epsg(code) {
+                Ok(crs) => systems.push((format!("EPSG:{code}"), crs, home)),
+                Err(e) => panic!("EPSG:{code}: {e:?}"),
+            }
+        }
+        systems.push(("sinusoidal".into(), CrsModel::Sinusoidal(Sinusoidal::new(Ellipsoid::sphere(6_371_007.181), 0.0, 0.0, 0.0)), (20.0, 40.0)));
+
+        let world = cogzilla_proj::ORIGIN_SHIFT;
+        // `HOSTILE_CASES` runs more of them: twenty thousand is half a billion pixels.
+        let cases: usize = std::env::var("HOSTILE_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        let (mut pixels, mut worst_off) = (0u64, 0f64);
+        for case in 0..cases {
+            let (name, crs, natural) = &systems[pick(systems.len())];
+            // Where the raster is: at home, or somewhere the projection is strained.
+            let place = pick(6);
+            let home = match place {
+                0 | 1 => *natural,
+                2 => (natural.0 + 60.0, natural.1),
+                3 => (179.9, natural.1),
+                4 => (natural.0, 84.0f64.copysign(natural.1)),
+                _ => (natural.0 - 90.0, -natural.1),
+            };
+            // What is asked: a map tile or a box in degrees.
+            let mercator = pick(3) != 0;
+            let view = pick(7);
+            let (bounds, view_name): ([f64; 4], String) = if mercator {
+                let z = [0u8, 1, 2, 3, 5, 8, 12, 16, 20][pick(9)];
+                let n = 1u32 << z;
+                let (mx, my) = lonlat_deg_to_mercator(home.0.clamp(-179.99, 179.99), home.1);
+                let hx = (((mx + world) / (2.0 * world) * f64::from(n)) as u32).min(n - 1);
+                let hy = (((world - my) / (2.0 * world) * f64::from(n)) as u32).min(n - 1);
+                let (x, y, what) = match view {
+                    0..=2 => (hx, hy, "home"),
+                    3 => ((hx + 1) % n, hy, "beside"),
+                    4 => (0, hy, "west edge"),
+                    5 => (n - 1, hy, "east edge"),
+                    _ => (hx, if home.1 > 0.0 { 0 } else { n - 1 }, "pole row"),
+                };
+                let (a, b, c, d) = tile_bounds_3857(TileCoord { z, x, y });
+                ([a, b, c, d], format!("tile z{z} {what}"))
+            } else {
+                match view {
+                    0 | 1 => ([home.0 - 0.5, home.1 - 0.5, home.0 + 0.5, home.1 + 0.5], "box at home".into()),
+                    2 => ([home.0 - 0.001, home.1 - 0.001, home.0 + 0.001, home.1 + 0.001], "tiny box".into()),
+                    3 => ([-180.0, -90.0, 180.0, 90.0], "whole world".into()),
+                    4 => ([-200.0, -95.0, 200.0, 95.0], "past the world".into()),
+                    5 => ([170.0, home.1 - 10.0, 190.0, home.1 + 10.0], "over the antimeridian".into()),
+                    _ => ([-180.0, 80.0f64.copysign(home.1).min(90.0f64.copysign(home.1)), 180.0, 80.0f64.copysign(home.1).max(90.0f64.copysign(home.1))], "polar cap".into()),
+                }
+            };
+            let (grid_w, grid_h) = [(256, 256), (512, 512), (1024, 1024), (4096, 64), (37, 1000), (10, 10), (2048, 2048), (1531, 311)][pick(8)];
+            let block = [grid_w, 512.min(grid_w), 100.min(grid_w)][pick(3)];
+            let (dx, dy) = ((bounds[2] - bounds[0]) / grid_w as f64, (bounds[3] - bounds[1]) / grid_h as f64);
+            let project = |across: f64, up: f64| {
+                if mercator && matches!(crs, CrsModel::Epsg3857) {
+                    return (across, up);
+                }
+                let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, up) } else { (across, up) };
+                crs.from_lonlat_deg(lon, lat)
+            };
+            // The raster: its pixels a chosen number of times the picture's, turned, and
+            // either endless or small enough that its edges cross the picture.
+            let centre = {
+                let h = if mercator && !matches!(crs, CrsModel::Epsg3857) { crs.from_lonlat_deg(home.0, home.1) } else if mercator { lonlat_deg_to_mercator(home.0, home.1) } else { crs.from_lonlat_deg(home.0, home.1) };
+                if h.0.is_finite() && h.1.is_finite() { h } else { (0.0, 0.0) }
+            };
+            let (mid_x, mid_y) = ((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
+            let (p, q) = (project(mid_x, mid_y), project(mid_x + dx, mid_y));
+            let step = (q.0 - p.0).hypot(q.1 - p.1);
+            let step = if step.is_finite() && step > 0.0 { step } else { 10.0 };
+            let ratio = [0.05, 0.7, 1.0, 1.7, 30.0][pick(5)];
+            let res = step * ratio;
+            let turn = [0.0f64, 0.0, 30.0, 90.0, -137.0][pick(5)].to_radians();
+            let side = [1u32 << 20, 1000, 257][pick(3)];
+            let half = f64::from(side) / 2.0;
+            let (cos, sin) = (turn.cos() * res, turn.sin() * res);
+            // pixel -> crs: turned, north up when not turned, the home at the middle.
+            let to_crs = Affine2D { a: cos, b: sin, c: centre.0 - cos * half - sin * half, d: sin, e: -cos, f: centre.1 - sin * half + cos * half };
+            let Some(to_pixel) = to_crs.invert() else { continue };
+
+            let rows: Vec<usize> = if grid_h <= 24 { (0..grid_h).collect() } else { (0..24).map(|k| k * (grid_h - 1) / 23).collect() };
+            let mut row_positions = vec![(0f64, 0f64); grid_w];
+            for &j in &rows {
+                let up = bounds[3] - (j as f64 + 0.5) * dy;
+                let exact = |i: usize| {
+                    let (x, y) = project(bounds[0] + (i as f64 + 0.5) * dx, up);
+                    to_pixel.forward(x, y)
+                };
+                row_source_positions(&exact, block, true, &mut row_positions);
+                for (i, &drawn) in row_positions.iter().enumerate() {
+                    let real = exact(i);
+                    let got = source_cell(drawn, (side, side), true, || exact(i));
+                    let want = source_cell(real, (side, side), true, || real);
+                    assert_eq!(
+                        got, want,
+                        "case {case}: {name} raster at {home:?}, {view_name}, {grid_w}x{grid_h} in stretches of {block}, \
+                         pixels {ratio} times the picture's, turned {:.0}, {side} a side: row {j} column {i} drawn {drawn:?}, exactly {real:?}",
+                        turn.to_degrees()
+                    );
+                    pixels += 1;
+                    // How far a drawn position strays matters where it could name a pixel.
+                    let reach = f64::from(side) + 2.0;
+                    if drawn.0.is_finite() && drawn.1.is_finite() && real.0 > -2.0 && real.1 > -2.0 && real.0 < reach && real.1 < reach {
+                        worst_off = worst_off.max((drawn.0 - real.0).abs().max((drawn.1 - real.1).abs()));
+                    }
+                }
+            }
+        }
+        assert!(pixels > 1_000_000, "{pixels} pixels");
+        // The check at a source pixel's edge allows for twice the tolerance.
+        assert!(worst_off <= 2.0 * PICTURE_TOLERANCE, "a position was drawn {} tolerances out", worst_off / PICTURE_TOLERANCE);
+    }
+
+    /// What a row may do that no map projection does smoothly: jump (a wrapped longitude),
+    /// turn a corner (a clamped latitude), or leave the projection at a single column.
+    /// Wherever the curve is drawn all the same, it must be within the allowance the edge
+    /// check is built on, or the pixel next door could be taken.
+    #[test]
+    fn rows_that_jump_turn_or_break_are_not_drawn_across() {
+        let allowed = 2.0 * PICTURE_TOLERANCE;
+        let (mut worst_jump, mut worst_kink) = (0f64, 0f64);
+        for &points in &[10usize, 11, 64, 255, 256, 257, 512, 1000] {
+            let n = (points - 1) as f64;
+            let mut row = vec![(0.0, 0.0); points];
+            // A jump of every size around the tolerance, after every column, on a row that
+            // is otherwise straight, bowed, or bent so as to hide the jump from the check.
+            for at in 0..points - 1 {
+                for &jump in &[0.2, 0.5, 0.9, 1.0, 1.5, 2.0, 2.6, 3.0, 5.0, 7.9, 12.0, 100.0] {
+                    for &bend in &[0.0, 1.0, -2.0 / 3.0, 2.0 / 3.0, -2.0, 6.0] {
+                        let jump = jump * PICTURE_TOLERANCE;
+                        let real = |i: usize| {
+                            let x = i as f64 / n;
+                            // A cubic through the three fitted columns, sized against the jump.
+                            let hidden = bend * jump * 8.0 * x * (x - 0.5) * (x - 1.0);
+                            let step = if i > at { jump } else { 0.0 };
+                            (i as f64 * 0.83 + 0.4 * x * x + step + hidden, 100.0 + 3.0 * x - step)
+                        };
+                        curved_scanline(&real, &mut row, PICTURE_TOLERANCE);
+                        for (i, drawn) in row.iter().enumerate() {
+                            let want = real(i);
+                            worst_jump = worst_jump.max((drawn.0 - want.0).abs().max((drawn.1 - want.1).abs()));
+                        }
+                    }
+                }
+                // A corner at every column.
+                for &turn in &[0.5, 1.0, 3.0, 10.0, 40.0, 1000.0] {
+                    let turn = turn * PICTURE_TOLERANCE / n;
+                    let real = |i: usize| (i as f64 * 1.3, 7.0 + turn * (i as f64 - at as f64 - 0.5).abs() * 4.0);
+                    curved_scanline(&real, &mut row, PICTURE_TOLERANCE);
+                    for (i, drawn) in row.iter().enumerate() {
+                        worst_kink = worst_kink.max((drawn.1 - real(i).1).abs());
+                    }
+                }
+                // A stretch of columns outside the projection, long enough that it cannot
+                // lie between two of the columns a curve is fitted and checked at, in one
+                // coordinate or both: nothing may be drawn across it.
+                for hole in [(f64::NAN, 1.0), (1.0, f64::NAN), (f64::INFINITY, 1.0), (f64::NAN, f64::NAN)] {
+                    let end = (at + points / 4 + 2).min(points);
+                    let real = |i: usize| if (at..end).contains(&i) { hole } else { (i as f64 * 0.5, 9.0) };
+                    curved_scanline(&real, &mut row, PICTURE_TOLERANCE);
+                    let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
+                    for (i, drawn) in row.iter().enumerate() {
+                        let want = real(i);
+                        assert!(same(drawn.0, want.0) && same(drawn.1, want.1), "{points} points, hole {hole:?} from {at}: column {i} drew {drawn:?}");
+                    }
+                }
+            }
+        }
+        assert!(
+            worst_jump <= allowed && worst_kink <= allowed,
+            "drawn {} tolerances out after a jump, {} after a corner",
+            worst_jump / PICTURE_TOLERANCE,
+            worst_kink / PICTURE_TOLERANCE
+        );
     }
 
     #[test]
