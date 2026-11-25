@@ -6,7 +6,8 @@
 
 /// A parsed expression: one tree per `;`-separated part.
 pub(super) struct Program {
-    parts: Vec<(Node, String)>,
+    /// Each part's tree, its text, and the bands it reads, by index.
+    parts: Vec<(Node, String, Box<[usize]>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,23 @@ impl Node {
             Node::Call(f, a) => f(a.eval(bands)),
         }
     }
+
+    /// The bands this tree reads.
+    fn reads(&self, into: &mut Vec<usize>) {
+        match self {
+            Node::Num(_) => {}
+            Node::Band(i) => {
+                if !into.contains(i) {
+                    into.push(*i);
+                }
+            }
+            Node::Neg(a) | Node::Call(_, a) => a.reads(into),
+            Node::Bin(_, a, b) => {
+                a.reads(into);
+                b.reads(into);
+            }
+        }
+    }
 }
 
 impl Program {
@@ -61,7 +79,9 @@ impl Program {
             if parser.pos != parser.src.len() {
                 return Err(format!("Invalid expression '{part}'"));
             }
-            parts.push((node, part.to_string()));
+            let mut reads = Vec::new();
+            node.reads(&mut reads);
+            parts.push((node, part.to_string(), reads.into_boxed_slice()));
         }
         if parts.is_empty() {
             return Err("Invalid expression ''".into());
@@ -75,18 +95,40 @@ impl Program {
     }
 
     /// Result `part` for one pixel; a band with no value is NaN, and so is what uses it.
+    ///
+    /// Where every band read has a value and the arithmetic has none to give, the result
+    /// is a number all the same, as in rio-tiler, which passes it through numpy's
+    /// `nan_to_num`: zero for `0/0`, and the largest number there is, of either sign, for
+    /// a division by zero.
     pub(super) fn eval(&self, part: usize, bands: &[f64]) -> f64 {
-        self.parts[part].0.eval(bands)
+        let (tree, _, reads) = &self.parts[part];
+        let v = tree.eval(bands);
+        if v.is_finite() {
+            return v;
+        }
+        for &i in reads.iter() {
+            match bands.get(i) {
+                Some(band) if !band.is_nan() => {}
+                _ => return f64::NAN,
+            }
+        }
+        if v.is_nan() {
+            0.0
+        } else if v > 0.0 {
+            f64::MAX
+        } else {
+            f64::MIN
+        }
     }
 
     /// The text of each part, as it was written.
     pub(super) fn sources(&self) -> impl Iterator<Item = &str> {
-        self.parts.iter().map(|(_, text)| text.as_str())
+        self.parts.iter().map(|(_, text, _)| text.as_str())
     }
 
     /// Each part with every `bN` replaced by that band's description.
     pub(super) fn describe(&self, descriptions: &[String]) -> Vec<String> {
-        self.parts.iter().map(|(_, text)| describe(text, descriptions)).collect()
+        self.parts.iter().map(|(_, text, _)| describe(text, descriptions)).collect()
     }
 }
 
@@ -342,7 +384,11 @@ mod tests {
         // A band with no value empties the results that use it, and only those.
         let (out, _) = run("b1+b2;b2*2", &[None, Some(3.0)]).unwrap();
         assert_eq!(out, [None, Some(6.0)]);
-        assert_eq!(run("b1/b2", &[Some(1.0), Some(0.0)]).unwrap().0, [None]);
+        // Arithmetic with no answer is a number all the same, as numpy's nan_to_num makes it.
+        assert_eq!(run("b1/b2", &[Some(1.0), Some(0.0)]).unwrap().0, [Some(f64::MAX)]);
+        assert_eq!(run("-b1/b2;b2/b2;sqrt(b2-b1)", &[Some(1.0), Some(0.0)]).unwrap().0, [Some(f64::MIN), Some(0.0), Some(0.0)]);
+        // Not where a band it reads has no value, whatever the other bands hold.
+        assert_eq!(run("b1/b2;b3/b3", &[None, Some(0.0), Some(0.0)]).unwrap().0, [None, Some(0.0)]);
         assert_eq!(run("nir-red", &[Some(1.0)]).unwrap_err(), "Invalid band/asset name 'nir'");
         assert!(run("b1 +", &[Some(1.0)]).is_err());
         assert!(run("(b1", &[Some(1.0)]).is_err());

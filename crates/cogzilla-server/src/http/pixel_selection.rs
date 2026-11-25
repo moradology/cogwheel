@@ -107,6 +107,8 @@ pub(super) struct Fold<T = f32> {
     pixels: usize,
     integer: bool,
     scenes: usize,
+    /// What a last band holds where it has no data: see [`Fold::absent_as`].
+    absent: T,
     state: State<T>,
 }
 
@@ -147,7 +149,15 @@ impl<T: Sample> Fold<T> {
             Selection::Median => State::All(Vec::new()),
             Selection::Count => State::Count(vec![T::ZERO; pixels]),
         };
-        Self { method, bands, pixels, integer, scenes: 0, state }
+        Self { method, bands, pixels, integer, scenes: 0, absent: T::ZERO, state }
+    }
+
+    /// The number a last band holds where it has no data, which the last-band methods
+    /// compare by: the raster's own no-data value, zero in most, or the one the request
+    /// named in its place.
+    pub(super) fn absent_as(mut self, value: T) -> Self {
+        self.absent = value;
+        self
     }
 
     /// How many bands each scene must bring.
@@ -181,8 +191,9 @@ impl<T: Sample> Fold<T> {
         match &mut self.state {
             State::Kept(kept) if self.method.by_last_band() => {
                 // rio-tiler compares the last bands as stored, masked or not; a value that
-                // is not there is taken as the zero that stands for it in most rasters.
-                let stored = |v: T| if v.is_nan() { T::ZERO } else { v };
+                // is not there is taken as the number that stands for it in the raster.
+                let absent = self.absent;
+                let stored = |v: T| if v.is_nan() { absent } else { v };
                 let high = self.method == Selection::LastBandHigh;
                 let (pixels, last) = (self.pixels, (self.bands - 1) * self.pixels);
                 let scene: Vec<T> = scene.take(kept.len()).collect();

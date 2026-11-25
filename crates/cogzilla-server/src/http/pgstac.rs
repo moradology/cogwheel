@@ -1466,11 +1466,15 @@ impl AssetBands {
                 let mut out = vec![Vec::with_capacity(len); program.len()];
                 let mut pixel = vec![0f64; bands.len()];
                 for i in 0..len {
+                    // A pixel with no band at all, which is most of an empty tile, has
+                    // no result either: nothing is worked out for it.
+                    let mut any = false;
                     for (value, band) in pixel.iter_mut().zip(bands) {
                         *value = f64::from(band[i]);
+                        any |= !band[i].is_nan();
                     }
                     for (part, plane) in out.iter_mut().enumerate() {
-                        let v = program.eval(part, &pixel);
+                        let v = if any { program.eval(part, &pixel) } else { f64::NAN };
                         plane.push(if v.is_finite() { v } else { f64::NAN });
                     }
                 }
@@ -2088,8 +2092,15 @@ fn band_math(expression: &str, bands: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Engi
     let mut out = vec![vec![f32::NAN; len]; program.len()];
     let mut pixel = vec![0f64; bands.len()];
     for i in 0..len {
+        // A pixel with no band at all, which is most of an empty tile, has no result
+        // either: nothing is worked out for it.
+        let mut any = false;
         for (value, band) in pixel.iter_mut().zip(bands) {
             *value = f64::from(band[i]);
+            any |= !band[i].is_nan();
+        }
+        if !any {
+            continue;
         }
         for (part, plane) in out.iter_mut().enumerate() {
             let v = program.eval(part, &pixel);
@@ -2201,7 +2212,7 @@ impl PlanesTile {
                         )));
                     }
                     check_working_bytes(Fold::<f32>::working_bytes(self.selection, bands, pixels))?;
-                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer), item.sample_type))
+                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer).absent_as(self.nodata.unwrap_or(0.0)), item.sample_type))
                 }
             };
             if item.bands.len() != fold.bands() {
@@ -3601,6 +3612,8 @@ struct StatsRequest<'a> {
     cover_scale: usize,
     expression: Option<&'a str>,
     unscale: bool,
+    /// A no-data value of the request's own, in the place of each raster's.
+    nodata: Option<f32>,
 }
 
 /// The statistics of one feature and the items they were read from, or `None` when the
@@ -3700,7 +3713,9 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, None).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, req.nodata).await
+                } else if req.nodata.is_some() {
+                    Err(EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into()))
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
@@ -3759,7 +3774,7 @@ async fn feature_statistics(
                         && assets.iter().all(|a| a.expression.is_none())
                         && !matches!(cogs[0].index.full_res().sample_type, SampleType::Float32 | SampleType::Float64);
                     check_working_bytes(Fold::<f64>::working_bytes(method, canvas.len(), width * height))?;
-                    fold = Some(Fold::new(method, canvas.len(), width * height, integer));
+                    fold = Some(Fold::new(method, canvas.len(), width * height, integer).absent_as(req.nodata.map_or(0.0, f64::from)));
                 }
             }
             // The expression was read for the first item's bands; an item with another number
@@ -3910,9 +3925,6 @@ async fn mosaic_statistics(
     const OWN: [&str; 8] =
         ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
     pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
-    if pq.nodata.is_some() {
-        return detail(StatusCode::BAD_REQUEST, "parameter 'nodata' is not supported on mosaic statistics yet");
-    }
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3951,6 +3963,7 @@ async fn mosaic_statistics(
         cover_scale,
         expression: query_value(pairs, "expression"),
         unscale: pq.unscale,
+        nodata: pq.nodata,
     };
     let mut out = Vec::with_capacity(features.len());
     for feature in &features {
@@ -6009,7 +6022,7 @@ mod tests {
         assert_eq!(out[0][1], -1.0);
         assert!(out[0][2].is_nan(), "no data in, no data out");
         assert_eq!(out[0][3], 0.0);
-        assert!(out[1][1].is_nan(), "a division by zero is no data");
+        assert_eq!(out[1][1], f32::INFINITY, "a division by zero is the largest number, as numpy's nan_to_num makes it");
         assert!(band_math("b3", &bands).is_err());
     }
 
@@ -6500,7 +6513,7 @@ mod tests {
         let (plan, _) = asset_bands(&spec("v", None, Some("b2/b1")), 2, false).unwrap();
         let planes = plan.planes(&[vec![2.0, 0.0], vec![1.0, 1.0]]);
         assert_eq!(planes[0][0], 0.5);
-        assert!(planes[0][1].is_nan());
+        assert_eq!(planes[0][1], f64::MAX);
     }
 
     #[test]
