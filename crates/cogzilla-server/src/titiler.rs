@@ -434,9 +434,9 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             "inputs": { "nbands": 1 },
             "outputs": { "nbands": 1, "dtype": "uint8", "min": null, "max": null },
             "parameters": {
-                "azimuth": { "default": 315.0, "maximum": 360.0, "minimum": 0.0, "title": "Azimuth", "type": "number" },
+                "azimuth": { "default": 45.0, "maximum": 360.0, "minimum": 0.0, "title": "Azimuth", "type": "number" },
                 "angle_altitude": { "default": 45.0, "maximum": 90.0, "minimum": -90.0, "title": "Angle Altitude", "type": "number" },
-                "buffer": { "default": 0, "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "buffer": { "default": 3, "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
                 "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
             }
         }),
@@ -1316,6 +1316,7 @@ impl BandStatsAcc {
 pub struct StatsOptions {
     pub percentiles: Vec<f64>,
     pub histogram_bins: usize,
+    pub histogram_edges: Option<Vec<f64>>,
     pub histogram_range: Option<(f64, f64)>,
     pub categorical: bool,
     pub categories: Option<Vec<f64>>,
@@ -1323,6 +1324,7 @@ pub struct StatsOptions {
     pub expressions: Option<Vec<(String, cogzilla_kernel::ExprProgram)>>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub max_size_explicit: bool,
 }
 
 impl Default for StatsOptions {
@@ -1330,6 +1332,7 @@ impl Default for StatsOptions {
         Self {
             percentiles: vec![2.0, 98.0],
             histogram_bins: 10,
+            histogram_edges: None,
             histogram_range: None,
             categorical: false,
             categories: None,
@@ -1337,7 +1340,27 @@ impl Default for StatsOptions {
             expressions: None,
             width: None,
             height: None,
+            max_size_explicit: false,
         }
+    }
+}
+
+/// Bin a value `v` into sorted `edges` (`edges.len() >= 2`) using NumPy `np.histogram` semantics:
+/// `[edges[i], edges[i+1])` for `i < n-1`, and `[edges[n-2], edges[n-1]]` inclusive on the last bin.
+#[inline]
+fn bin_into_edges(edges: &[f64], v: f64) -> Option<usize> {
+    let n_bins = edges.len().checked_sub(1)?;
+    if n_bins == 0 || v < edges[0] || v > edges[n_bins] {
+        return None;
+    }
+    if v == edges[n_bins] {
+        return Some(n_bins - 1);
+    }
+    let idx = edges.partition_point(|&e| e <= v);
+    if idx == 0 {
+        None
+    } else {
+        Some((idx - 1).min(n_bins - 1))
     }
 }
 
@@ -1531,29 +1554,48 @@ impl BandStatsAcc {
         }
 
         let mean = sum / (valid_px as f64);
-        let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
-        let span = (h_max - h_min).max(1e-12);
-        let n_bins = opts.histogram_bins.clamp(1, 1000);
         let mut var_sum = 0.0f64;
-        let mut counts = vec![0u64; n_bins];
-        for (k, &c) in hist.iter().enumerate() {
-            if c == 0 {
-                continue;
+        let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
+            && custom_edges.len() >= 2
+        {
+            let mut counts = vec![0u64; custom_edges.len() - 1];
+            for (k, &c) in hist.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                let v = to_val(k) as f64;
+                let d = v - mean;
+                var_sum += d * d * (c as f64);
+                if let Some(bin) = bin_into_edges(custom_edges, v) {
+                    counts[bin] += c;
+                }
             }
-            let v = to_val(k) as f64;
-            let d = v - mean;
-            var_sum += d * d * (c as f64);
-            if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
-                let bin = (((v - h_min) / span) * (n_bins as f64))
-                    .floor()
-                    .clamp(0.0, (n_bins - 1) as f64) as usize;
-                counts[bin] += c;
+            (counts, custom_edges.clone())
+        } else {
+            let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
+            let span = (h_max - h_min).max(1e-12);
+            let n_bins = opts.histogram_bins.clamp(1, 1000);
+            let mut counts = vec![0u64; n_bins];
+            for (k, &c) in hist.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                let v = to_val(k) as f64;
+                let d = v - mean;
+                var_sum += d * d * (c as f64);
+                if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
+                    let bin = (((v - h_min) / span) * (n_bins as f64))
+                        .floor()
+                        .clamp(0.0, (n_bins - 1) as f64) as usize;
+                    counts[bin] += c;
+                }
             }
-        }
+            let edges: Vec<f64> = (0..=n_bins)
+                .map(|i| h_min + span * (i as f64 / n_bins as f64))
+                .collect();
+            (counts, edges)
+        };
         let std = (var_sum / (valid_px as f64)).sqrt();
-        let edges: Vec<f64> = (0..=n_bins)
-            .map(|i| h_min + span * (i as f64 / n_bins as f64))
-            .collect();
         let mut obj = serde_json::Map::new();
         obj.insert("min".into(), serde_json::json!(min));
         obj.insert("max".into(), serde_json::json!(max));
@@ -1695,29 +1737,45 @@ impl BandStatsAcc {
                     min_val = run_val;
                 }
                 let mean = sum / (valid_px as f64);
-                let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
-                let span = (h_max - h_min).max(1e-12);
-                let n_bins = opts.histogram_bins.clamp(1, 1000);
                 let mut var_sum = 0.0f64;
-                let mut counts = vec![0u64; n_bins];
-                for &v in &vals {
-                    let vf = v as f64;
-                    let d = vf - mean;
-                    var_sum += d * d;
-                    if opts.histogram_range.is_none() || (vf >= h_min && vf <= h_max) {
-                        let bin = (((vf - h_min) / span) * (n_bins as f64))
-                            .floor()
-                            .clamp(0.0, (n_bins - 1) as f64) as usize;
-                        counts[bin] += 1;
+                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
+                    && custom_edges.len() >= 2
+                {
+                    let mut counts = vec![0u64; custom_edges.len() - 1];
+                    for &v in &vals {
+                        let vf = v as f64;
+                        let d = vf - mean;
+                        var_sum += d * d;
+                        if let Some(bin) = bin_into_edges(custom_edges, vf) {
+                            counts[bin] += 1;
+                        }
                     }
-                }
+                    (counts, custom_edges.clone())
+                } else {
+                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
+                    let span = (h_max - h_min).max(1e-12);
+                    let n_bins = opts.histogram_bins.clamp(1, 1000);
+                    let mut counts = vec![0u64; n_bins];
+                    for &v in &vals {
+                        let vf = v as f64;
+                        let d = vf - mean;
+                        var_sum += d * d;
+                        if opts.histogram_range.is_none() || (vf >= h_min && vf <= h_max) {
+                            let bin = (((vf - h_min) / span) * (n_bins as f64))
+                                .floor()
+                                .clamp(0.0, (n_bins - 1) as f64) as usize;
+                            counts[bin] += 1;
+                        }
+                    }
+                    let edges: Vec<f64> = (0..=n_bins)
+                        .map(|i| h_min + span * (i as f64 / n_bins as f64))
+                        .collect();
+                    (counts, edges)
+                };
                 let std = (var_sum / (valid_px as f64)).sqrt();
 
                 let med_idx = valid_px / 2;
                 let median = vals[med_idx];
-                let edges: Vec<f64> = (0..=n_bins)
-                    .map(|i| h_min + span * (i as f64 / n_bins as f64))
-                    .collect();
                 let mut obj = serde_json::Map::new();
                 obj.insert("min".into(), serde_json::json!(min));
                 obj.insert("max".into(), serde_json::json!(max));
@@ -2900,6 +2958,80 @@ pub fn encode_geotiff_f32(
 }
 
 /// Project a WGS84 polygon bbox into an IFD's pixel space and return `(win_w, win_h, intersects)`.
+/// Compute the native pixel dimensions `(w, h)` for a WGS84 bounding box against `ifd`,
+/// matching GDAL `WarpedVRT` / `rio-tiler` suggested output sizing (preserving the target bbox
+/// aspect ratio without upsampling past native resolution).
+pub fn native_bbox_dims_in_crs(
+    ifd: &cogzilla_tiff::IfdMeta,
+    src_crs: &cogzilla_proj::CrsModel,
+    wgs_bbox: [f64; 4],
+    dst_bbox: [f64; 4],
+) -> (u32, u32) {
+    let [w, s, e, n] = wgs_bbox;
+    let mx = 0.5 * (w + e);
+    let my = 0.5 * (s + n);
+    let pts = [
+        (w, s),
+        (e, s),
+        (w, n),
+        (e, n),
+        (mx, s),
+        (mx, n),
+        (w, my),
+        (e, my),
+    ];
+    let mut cmin = f64::INFINITY;
+    let mut cmax = f64::NEG_INFINITY;
+    let mut rmin = f64::INFINITY;
+    let mut rmax = f64::NEG_INFINITY;
+    let Some(crs_to_px) = ifd.pixel_to_crs.invert() else {
+        return (1, 1);
+    };
+    let wrap_lo = src_crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+    for (mut lon, lat) in pts {
+        if let Some(lo) = wrap_lo
+            && lon < lo
+        {
+            lon += 360.0;
+        }
+        let (sx, sy) = src_crs.from_lonlat_deg(lon, lat);
+        if sx.is_finite() && sy.is_finite() {
+            let (col, row) = crs_to_px.forward(sx, sy);
+            if col.is_finite() && row.is_finite() {
+                cmin = cmin.min(col);
+                cmax = cmax.max(col);
+                rmin = rmin.min(row);
+                rmax = rmax.max(row);
+            }
+        }
+    }
+    if !cmin.is_finite() || !rmin.is_finite() {
+        return (1, 1);
+    }
+    let nat_w = (cmax - cmin).abs();
+    let nat_h = (rmax - rmin).abs();
+    let dx = (dst_bbox[2] - dst_bbox[0]).abs();
+    let dy = (dst_bbox[3] - dst_bbox[1]).abs();
+    if dx <= 1e-12 || dy <= 1e-12 || nat_w <= 1e-6 || nat_h <= 1e-6 {
+        return (
+            nat_w.round().clamp(1.0, 4096.0) as u32,
+            nat_h.round().clamp(1.0, 4096.0) as u32,
+        );
+    }
+    // Equal-pixel-density isotropic resolution in dst_crs matching GDAL WarpedVRT:
+    let area_px = (nat_w * nat_h).max(1.0);
+    let res = ((dx * dy) / area_px).sqrt();
+    if !res.is_finite() || res <= 0.0 {
+        return (
+            nat_w.round().clamp(1.0, 4096.0) as u32,
+            nat_h.round().clamp(1.0, 4096.0) as u32,
+        );
+    }
+    let ow = (dx / res).round().clamp(1.0, 4096.0) as u32;
+    let oh = (dy / res).round().clamp(1.0, 4096.0) as u32;
+    (ow, oh)
+}
+
 fn polygon_window_dims(
     ifd: &cogzilla_tiff::IfdMeta,
     crs: &cogzilla_proj::CrsModel,
@@ -3010,6 +3142,162 @@ pub async fn compute_statistics_with_options(
     const MAX_STATS_BLOCKS: usize = 512;
     const MAX_STATS_MASK_TILES: usize = 65_536;
     let crs = engine.get_or_build_crs(cog)?;
+    if let Some(pm) = poly_mask {
+        let full = cog.index.full_res();
+        let count = full.samples_per_pixel;
+        // Pad degenerate zero-span axes (e.g. Point or axis-aligned LineString) by half a source pixel.
+        let mut eff_bbox = pm.bbox;
+        if (eff_bbox[2] - eff_bbox[0]).abs() < 1e-12 || (eff_bbox[3] - eff_bbox[1]).abs() < 1e-12 {
+            let cx = 0.5 * (eff_bbox[0] + eff_bbox[2]);
+            let cy = 0.5 * (eff_bbox[1] + eff_bbox[3]);
+            let (dlon, dlat) = if let Some(crs_to_px) = full.pixel_to_crs.invert() {
+                let (sx, sy) = crs.from_lonlat_deg(cx, cy);
+                let (col, row) = crs_to_px.forward(sx, sy);
+                let (sx1, sy1) = full.pixel_to_crs.forward(col + 1.0, row + 1.0);
+                let (lo1, la1) = crs.to_lonlat_deg(sx1, sy1);
+                ((lo1 - cx).abs().max(1e-6), (la1 - cy).abs().max(1e-6))
+            } else {
+                (1e-5, 1e-5)
+            };
+            if (eff_bbox[2] - eff_bbox[0]).abs() < 1e-12 {
+                eff_bbox[0] = cx - 0.5 * dlon;
+                eff_bbox[2] = cx + 0.5 * dlon;
+            }
+            if (eff_bbox[3] - eff_bbox[1]).abs() < 1e-12 {
+                eff_bbox[1] = cy - 0.5 * dlat;
+                eff_bbox[3] = cy + 0.5 * dlat;
+            }
+        }
+        let (nat_w, nat_h) = native_bbox_dims_in_crs(full, &crs, eff_bbox, eff_bbox);
+        let (out_w, out_h) = match (opts.width, opts.height) {
+            (Some(w), Some(h)) => (w.clamp(1, 4096), h.clamp(1, 4096)),
+            (Some(w), None) => {
+                let w = w.clamp(1, 4096);
+                let h = ((nat_h as f64 / nat_w.max(1) as f64) * w as f64)
+                    .round()
+                    .clamp(1.0, 4096.0) as u32;
+                (w, h)
+            }
+            (None, Some(h)) => {
+                let h = h.clamp(1, 4096);
+                let w = ((nat_w as f64 / nat_h.max(1) as f64) * h as f64)
+                    .round()
+                    .clamp(1.0, 4096.0) as u32;
+                (w, h)
+            }
+            (None, None) => {
+                let cap = if opts.max_size_explicit && max_size > 0 {
+                    max_size.clamp(1, 4096)
+                } else {
+                    4096
+                };
+                if nat_w.max(nat_h) <= cap {
+                    (nat_w.max(1), nat_h.max(1))
+                } else if nat_w >= nat_h {
+                    let h = ((nat_h as f64 / nat_w as f64) * cap as f64)
+                        .round()
+                        .clamp(1.0, 4096.0) as u32;
+                    (cap, h)
+                } else {
+                    let w = ((nat_w as f64 / nat_h as f64) * cap as f64)
+                        .round()
+                        .clamp(1.0, 4096.0) as u32;
+                    (w, cap)
+                }
+            }
+        };
+        let cogs = [cog.clone()];
+        let n_px = (out_w as usize) * (out_h as usize);
+        let mut out = serde_json::Map::new();
+        if let Some(ref exprs) = opts.expressions {
+            for (i, (desc, prog)) in exprs.iter().enumerate() {
+                let bands = BandRequest::CustomExpr {
+                    prog: prog.clone(),
+                    rescale: (0.0, 1.0),
+                    colormap: ColormapName::Grayscale,
+                };
+                let raw = render_wgs84_bbox(
+                    engine,
+                    &cogs,
+                    eff_bbox,
+                    out_w,
+                    out_h,
+                    Some(pm),
+                    &bands,
+                    ResampleMode::Nearest,
+                    OutputFormat::RawF32,
+                    nodata_override,
+                    None,
+                    None,
+                    true,
+                    unscale,
+                )
+                .await?;
+                let pixels: Vec<f32> = raw
+                    .chunks_exact(4)
+                    .take(n_px)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                out.insert(
+                    format!("b{}", i + 1),
+                    compute_f32_band_stats(&pixels, desc, opts),
+                );
+            }
+            return Ok(serde_json::Value::Object(out));
+        }
+        let sel_bands: Vec<u16> = match &opts.bidx {
+            Some(b) if !b.is_empty() => b.clone(),
+            _ => (1..=count).collect(),
+        };
+        for chunk in sel_bands.chunks(15) {
+            let bands_req = if chunk.len() == 1 {
+                BandRequest::Single {
+                    band_1based: chunk[0],
+                    rescale: (0.0, 1.0),
+                    colormap: ColormapName::Grayscale,
+                }
+            } else {
+                BandRequest::MultiBand {
+                    bands_1based: chunk.to_vec(),
+                }
+            };
+            let raw = render_wgs84_bbox(
+                engine,
+                &cogs,
+                eff_bbox,
+                out_w,
+                out_h,
+                Some(pm),
+                &bands_req,
+                ResampleMode::Nearest,
+                OutputFormat::RawF32,
+                nodata_override,
+                None,
+                None,
+                true,
+                unscale,
+            )
+            .await?;
+            for (ci, &b1) in chunk.iter().enumerate() {
+                let start = ci * n_px * 4;
+                let end = (start + n_px * 4).min(raw.len());
+                let pixels: Vec<f32> = raw[start..end]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let desc = cog
+                    .index
+                    .band_descriptions
+                    .get((b1 - 1) as usize)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("b{b1}"));
+                out.insert(format!("b{b1}"), compute_f32_band_stats(&pixels, &desc, opts));
+            }
+        }
+        return Ok(serde_json::Value::Object(out));
+    }
     let max_size = max_size.max(1);
     let (ifd_idx, step, sample_dims, total_pixels, poly_win_pixels) = if let Some(pm) = poly_mask {
         let mut idx = cog.index.ifds.len() - 1;
@@ -3371,11 +3659,17 @@ pub async fn compute_statistics_with_options(
     }
 }
 
-/// Simple ray-casting point-in-polygon check for GeoJSON Feature crop masking (`POST /cog/feature`).
+/// Simple ray-casting / ALL_TOUCHED rasterizer for GeoJSON Feature masking
+/// (`POST /*/feature`, `POST /*/statistics`), supporting Polygon, MultiPolygon,
+/// LineString, MultiLineString, Point, MultiPoint, and GeometryCollection.
 #[derive(Clone)]
 pub struct PolygonMask {
     /// List of polygons; each polygon is `[outer_ring, hole1, ...]`, each ring is `Vec<(lon, lat)>`.
     pub polygons: Vec<Vec<Vec<(f64, f64)>>>,
+    /// List of polylines (`LineString` / `MultiLineString`) in `(lon, lat)`.
+    pub lines: Vec<Vec<(f64, f64)>>,
+    /// List of points (`Point` / `MultiPoint`) in `(lon, lat)`.
+    pub points: Vec<(f64, f64)>,
     /// Precomputed `[min_lon, min_lat, max_lon, max_lat]` for fast bounding-box rejection.
     pub bbox: [f64; 4],
 }
@@ -3474,62 +3768,71 @@ impl PolygonMask {
         let mut total_vertices = 0usize;
         let mut total_rings = 0usize;
 
-        let mut parse_ring = |arr: &serde_json::Value| -> Result<Vec<(f64, f64)>, EngineError> {
-            let list = arr
+        let parse_coord = |pt: &serde_json::Value| -> Result<(f64, f64), EngineError> {
+            let p = pt
                 .as_array()
-                .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON ring".into()))?;
-            if list.len() < 3 {
+                .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON coord".into()))?;
+            if p.len() < 2 {
+                return Err(EngineError::BadRequest("coord needs [lon, lat]".into()));
+            }
+            let (Some(x), Some(y)) = (p[0].as_f64(), p[1].as_f64()) else {
                 return Err(EngineError::BadRequest(
-                    "GeoJSON polygon ring must have at least 3 vertices".into(),
+                    "GeoJSON coordinates must be numeric".into(),
+                ));
+            };
+            if !x.is_finite() || !y.is_finite() {
+                return Err(EngineError::BadRequest(
+                    "GeoJSON coordinates must be finite".into(),
                 ));
             }
-            total_rings += 1;
-            if total_rings > MAX_GEOJSON_RINGS {
+            if let Some(crs) = coord_crs {
+                let (lo, la) = crs.to_lonlat_deg(x, y);
+                if !lo.is_finite() || !la.is_finite() {
+                    return Err(EngineError::BadRequest(
+                        "reprojected GeoJSON coordinates are non-finite".into(),
+                    ));
+                }
+                Ok((lo, la))
+            } else {
+                Ok((x, y))
+            }
+        };
+
+        let parse_ring = |arr: &serde_json::Value,
+                          min_len: usize,
+                          total_rings: &mut usize,
+                          total_vertices: &mut usize|
+         -> Result<Vec<(f64, f64)>, EngineError> {
+            let list = arr
+                .as_array()
+                .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON coordinate array".into()))?;
+            if list.len() < min_len {
                 return Err(EngineError::BadRequest(format!(
-                    "GeoJSON polygon exceeds max {MAX_GEOJSON_RINGS} rings"
+                    "GeoJSON geometry ring/line must have at least {min_len} vertices"
                 )));
             }
-            total_vertices = total_vertices.saturating_add(list.len());
-            if total_vertices > MAX_GEOJSON_VERTICES {
+            *total_rings += 1;
+            if *total_rings > MAX_GEOJSON_RINGS {
                 return Err(EngineError::BadRequest(format!(
-                    "GeoJSON polygon exceeds max {MAX_GEOJSON_VERTICES} vertices"
+                    "GeoJSON geometry exceeds max {MAX_GEOJSON_RINGS} rings/lines"
+                )));
+            }
+            *total_vertices = total_vertices.saturating_add(list.len());
+            if *total_vertices > MAX_GEOJSON_VERTICES {
+                return Err(EngineError::BadRequest(format!(
+                    "GeoJSON geometry exceeds max {MAX_GEOJSON_VERTICES} vertices"
                 )));
             }
             let mut ring = Vec::with_capacity(list.len());
             for pt in list {
-                let p = pt
-                    .as_array()
-                    .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON coord".into()))?;
-                if p.len() < 2 {
-                    return Err(EngineError::BadRequest("coord needs [lon, lat]".into()));
-                }
-                let (Some(x), Some(y)) = (p[0].as_f64(), p[1].as_f64()) else {
-                    return Err(EngineError::BadRequest(
-                        "GeoJSON coordinates must be numeric".into(),
-                    ));
-                };
-                if !x.is_finite() || !y.is_finite() {
-                    return Err(EngineError::BadRequest(
-                        "GeoJSON coordinates must be finite".into(),
-                    ));
-                }
-                let (lon, lat) = if let Some(crs) = coord_crs {
-                    let (lo, la) = crs.to_lonlat_deg(x, y);
-                    if !lo.is_finite() || !la.is_finite() {
-                        return Err(EngineError::BadRequest(
-                            "reprojected GeoJSON coordinates are non-finite".into(),
-                        ));
-                    }
-                    (lo, la)
-                } else {
-                    (x, y)
-                };
-                ring.push((lon, lat));
+                ring.push(parse_coord(pt)?);
             }
             Ok(ring)
         };
 
         let mut polygons = Vec::new();
+        let mut lines = Vec::new();
+        let mut points = Vec::new();
         for geom in flat_geoms {
             let gtype = geom
                 .get("type")
@@ -3545,7 +3848,7 @@ impl PolygonMask {
                         .ok_or_else(|| EngineError::BadRequest("invalid Polygon coords".into()))?;
                     let mut poly = Vec::new();
                     for r in rings {
-                        poly.push(parse_ring(r)?);
+                        poly.push(parse_ring(r, 3, &mut total_rings, &mut total_vertices)?);
                     }
                     polygons.push(poly);
                 }
@@ -3559,14 +3862,48 @@ impl PolygonMask {
                             .ok_or_else(|| EngineError::BadRequest("invalid polygon".into()))?;
                         let mut poly = Vec::new();
                         for r in rings {
-                            poly.push(parse_ring(r)?);
+                            poly.push(parse_ring(r, 3, &mut total_rings, &mut total_vertices)?);
                         }
                         polygons.push(poly);
                     }
                 }
+                "LineString" => {
+                    lines.push(parse_ring(coords, 2, &mut total_rings, &mut total_vertices)?);
+                }
+                "MultiLineString" => {
+                    let ls = coords.as_array().ok_or_else(|| {
+                        EngineError::BadRequest("invalid MultiLineString coords".into())
+                    })?;
+                    for l in ls {
+                        lines.push(parse_ring(l, 2, &mut total_rings, &mut total_vertices)?);
+                    }
+                }
+                "Point" => {
+                    total_vertices = total_vertices.saturating_add(1);
+                    if total_vertices > MAX_GEOJSON_VERTICES {
+                        return Err(EngineError::BadRequest(format!(
+                            "GeoJSON geometry exceeds max {MAX_GEOJSON_VERTICES} vertices"
+                        )));
+                    }
+                    points.push(parse_coord(coords)?);
+                }
+                "MultiPoint" => {
+                    let pts = coords.as_array().ok_or_else(|| {
+                        EngineError::BadRequest("invalid MultiPoint coords".into())
+                    })?;
+                    total_vertices = total_vertices.saturating_add(pts.len());
+                    if total_vertices > MAX_GEOJSON_VERTICES {
+                        return Err(EngineError::BadRequest(format!(
+                            "GeoJSON geometry exceeds max {MAX_GEOJSON_VERTICES} vertices"
+                        )));
+                    }
+                    for pt in pts {
+                        points.push(parse_coord(pt)?);
+                    }
+                }
                 other => {
                     return Err(EngineError::BadRequest(format!(
-                        "unsupported GeoJSON geometry type '{other}' (expected Polygon or MultiPolygon)"
+                        "unsupported GeoJSON geometry type '{other}'"
                     )));
                 }
             }
@@ -3586,13 +3923,33 @@ impl PolygonMask {
                 }
             }
         }
-        if !min_x.is_finite() || !min_y.is_finite() || min_x >= max_x || min_y >= max_y {
+        for line in &lines {
+            for &(x, y) in line {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        for &(x, y) in &points {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        let has_only_polygons = lines.is_empty() && points.is_empty();
+        if !min_x.is_finite()
+            || !min_y.is_finite()
+            || !max_x.is_finite()
+            || !max_y.is_finite()
+            || (has_only_polygons && (min_x >= max_x || min_y >= max_y))
+        {
             return Err(EngineError::BadRequest(
-                "empty or degenerate GeoJSON polygon".into(),
+                "empty or degenerate GeoJSON geometry".into(),
             ));
         }
         let bbox = [min_x, min_y, max_x, max_y];
-        Ok((Self { polygons, bbox }, bbox))
+        Ok((Self { polygons, lines, points, bbox }, bbox))
     }
 
     fn ring_contains(ring: &[(f64, f64)], x: f64, y: f64) -> bool {
@@ -3613,13 +3970,16 @@ impl PolygonMask {
         inside
     }
 
-    /// Total number of polygon vertices across all outer rings and holes.
+    /// Total number of geometry vertices across all rings, lines, and points.
     pub fn vertex_count(&self) -> usize {
-        self.polygons
+        let poly_v: usize = self
+            .polygons
             .iter()
             .flat_map(|rings| rings.iter())
             .map(|ring| ring.len())
-            .sum()
+            .sum();
+        let line_v: usize = self.lines.iter().map(|l| l.len()).sum();
+        poly_v + line_v + self.points.len()
     }
 
     /// Guard against `O(pixels * vertices)` point-in-polygon CPU exhaustion.
@@ -3810,6 +4170,25 @@ impl PolygonMask {
                     let (ax, ay) = dst_crs.from_lonlat_deg(lon0, lat0);
                     let (bx, by) = dst_crs.from_lonlat_deg(lon1, lat1);
                     mark_segment(ax, ay, bx, by);
+                }
+            }
+        }
+        for line in &self.lines {
+            for seg in line.windows(2) {
+                let (ax, ay) = dst_crs.from_lonlat_deg(seg[0].0, seg[0].1);
+                let (bx, by) = dst_crs.from_lonlat_deg(seg[1].0, seg[1].1);
+                mark_segment(ax, ay, bx, by);
+            }
+        }
+        for &(lon, lat) in &self.points {
+            let (px_crs, py_crs) = dst_crs.from_lonlat_deg(lon, lat);
+            let fx = (px_crs - bbox[0]) / dlx;
+            let fy = (bbox[3] - py_crs) / dly;
+            if fx.is_finite() && fy.is_finite() {
+                let ix = fx.floor() as isize;
+                let iy = fy.floor() as isize;
+                if ix >= 0 && ix < w as isize && iy >= 0 && iy < h as isize {
+                    mask[iy as usize * w + ix as usize] = true;
                 }
             }
         }

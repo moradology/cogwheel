@@ -847,6 +847,14 @@ def main() -> int:
         # One band: the formula is on the band's byte, and the colour map is looked up after.
         o.check("tile, a colour formula under a colour map", "image",
                 f"{base12}.png?assets=red&rescale=0,3000&colormap_name=viridis&color_formula={opt('gamma R 1.5')}")
+        smooth = "&resampling=bilinear&reproject=bilinear"
+        o.check("tile, bilinear, a colour formula under a colour map", "image",
+                f"{base12}.png?assets=red&rescale=0,3000&colormap_name=viridis&color_formula={opt('gamma R 1.5')}{smooth}")
+        o.check("tile, bilinear, a colour formula on one band", "image",
+                f"{base12}.png?assets=red&rescale=0,3000&color_formula={opt('gamma R 1.5')}{smooth}")
+        o.check("bbox, bilinear, a colour formula under a colour map", "image",
+                f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/256x256.png?assets=red&rescale=0,3000&colormap_name=viridis"
+                f"&color_formula={opt('gamma R 1.5')}{smooth}")
         o.check("tile, a colour formula under intervals", "image",
                 f"{base12}.png?assets=red&rescale=0,3000&color_formula={opt('gamma R 1.5')}&colormap="
                 + opt("[[[0,100],[255,0,0,255]],[[100,256],[0,0,255,255]]]"))

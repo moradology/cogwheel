@@ -2570,6 +2570,70 @@ impl MosaicColormap {
     }
 }
 
+/// A colour formula on one band under a colour map, for a picture the renderer draws: the
+/// band is drawn in grey, the formula works on that byte, and the colour map is looked up
+/// with what it leaves, which is rio-tiler's order.
+struct MapAfterFormula {
+    levels: [u8; 256],
+    colormap: ColormapName,
+}
+
+impl MapAfterFormula {
+    /// Takes the colour map out of `bands`, when they are one band under a map that is
+    /// not grey. Otherwise nothing, and the formula is for the finished picture.
+    fn take(formula: &cogzilla_kernel::ColorFormula, bands: &mut BandRequest) -> Option<Self> {
+        let colormap = match bands {
+            BandRequest::Single { colormap, .. }
+            | BandRequest::Spectral1 { colormap, .. }
+            | BandRequest::Spectral2 { colormap, .. }
+            | BandRequest::Spectral3 { colormap, .. }
+            | BandRequest::CustomExpr { colormap, .. } => colormap,
+            _ => return None,
+        };
+        if *colormap == ColormapName::Grayscale {
+            return None;
+        }
+        let taken = std::mem::replace(colormap, ColormapName::Grayscale);
+        Some(Self { levels: formula_levels(formula), colormap: taken })
+    }
+
+    /// The grey picture as the coloured one.
+    fn colour(&self, rgba: &mut [u8]) {
+        let lut = self.colormap.lut();
+        for px in rgba.chunks_exact_mut(4) {
+            if px[3] != 0 {
+                let level = self.levels[usize::from(px[0])];
+                px[..3].copy_from_slice(&lut.rgb[usize::from(level)]);
+            }
+        }
+    }
+}
+
+/// Whether the bands are one band's values shown in grey: what a colour formula works on
+/// as a single byte. The renderer's own grey is not that byte (some levels of its grey
+/// table are one below their index), so such a picture is painted here from the values.
+fn one_grey_band(bands: &BandRequest) -> bool {
+    matches!(
+        bands,
+        BandRequest::Single { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral1 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral2 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral3 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::CustomExpr { colormap: ColormapName::Grayscale, .. }
+    )
+}
+
+/// What a colour formula makes of each grey level.
+fn formula_levels(formula: &cogzilla_kernel::ColorFormula) -> [u8; 256] {
+    let mut levels = [0u8; 256];
+    for (level, out) in levels.iter_mut().enumerate() {
+        let mut px = [level as u8, level as u8, level as u8, 255];
+        formula.apply_buffer_in_place(&mut px, 4);
+        *out = px[0];
+    }
+    levels
+}
+
 /// Colours for the bands a mosaic of planes leaves, as TiTiler encodes them: one band
 /// through the colour map, three as red, green and blue, and two as red and green with
 /// the mask for blue (what GDAL makes of two bands and a mask). `Err` is a number of bands
@@ -2594,15 +2658,7 @@ fn paint_bands(
             let (min, max) = range(0);
             // A colour formula works on the band's byte, and the colour map is looked up
             // with what it leaves: rio-tiler's order.
-            let levels = before_map.map(|formula| {
-                let mut levels = [0u8; 256];
-                for (level, out) in levels.iter_mut().enumerate() {
-                    let mut px = [level as u8, level as u8, level as u8, 255];
-                    formula.apply_buffer_in_place(&mut px, 4);
-                    *out = px[0];
-                }
-                levels
-            });
+            let levels = before_map.map(formula_levels);
             let Some(custom) = custom else {
                 let Some(levels) = levels else {
                     return Ok(Paint::Gray { min, max, colormap }.rgba(selected, pixels));
@@ -3043,6 +3099,9 @@ async fn part_image_of(
         let (mut width, mut height) = (0usize, 0usize);
         // With a pixel selection other than `first`: every scene's values, and how to colour them.
         let mut selecting: Option<(Fold, Paint)> = None;
+        // One band under a colour map, with a colour formula: drawn grey, coloured at the end.
+        let mut map_after: Option<MapAfterFormula> = None;
+        let mut one_grey = false;
         for (n, scene) in scenes.iter().enumerate() {
             let mut cogs = Vec::with_capacity(scene.len());
             for href in scene {
@@ -3070,14 +3129,26 @@ async fn part_image_of(
             let default_bands =
                 if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
             let mut bands = build_band_request(&pq, default_bands, full.sample_type)?;
+            // Every scene is drawn the same way, and the first says how the picture is finished.
+            let taken = match &formula {
+                Some(formula) if pq.colormap_explicit => MapAfterFormula::take(formula, &mut bands),
+                _ => None,
+            };
+            if n == 0 {
+                map_after = taken;
+                one_grey = !pq.colormap_explicit && one_grey_band(&bands);
+            }
+            // A formula on one band works on the band's byte, which is made here from the
+            // values: the first there is, as a mosaic is.
+            let exact = formula.is_some() && one_grey_band(&bands) && (map_after.is_some() || one_grey);
             // As on tiles: `resampling` for a source already in the output's projection,
             // `reproject` for one that has to be warped into it.
             let resample = match crs {
                 CrsModel::Geographic => query.resampling,
                 _ => query.reproject,
             };
-            if let Some(method) = query.selection {
-                // The scene's values rather than its colours; nothing stops the reading early.
+            if let Some(method) = query.selection.or(exact.then_some(Selection::First)) {
+                // The scene's values rather than its colours; only `first` stops early.
                 let count = TileEngine::value_bands(&bands);
                 if n == 0 {
                     let paint = Paint::of(&bands).ok_or_else(|| {
@@ -3114,6 +3185,9 @@ async fn part_image_of(
                     && values.len() == count * width * height * 4
                 {
                     fold.add_le_bytes(&values);
+                    if fold.is_done() {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -3159,8 +3233,17 @@ async fn part_image_of(
         {
             canvas = paint.rgba(&selected, width * height);
         }
-        if let Some(formula) = formula {
-            formula.apply_buffer_in_place(&mut canvas, 4);
+        match (&map_after, formula) {
+            (Some(map_after), _) => map_after.colour(&mut canvas),
+            (None, Some(formula)) => {
+                // One band is the formula's red, and the picture is of that band alone.
+                let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+                formula.apply_buffer_in_place(&mut canvas, 4);
+                if grey {
+                    canvas.chunks_exact_mut(4).for_each(|p| (p[1], p[2]) = (p[0], p[0]));
+                }
+            }
+            (None, None) => {}
         }
         let (format, content_type) = match format {
             Some((f, ct)) => (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }),
@@ -4687,7 +4770,28 @@ async fn tile(
             // TiTiler names the media type after the extension that was asked for.
             let content_type = if explicit == "jpg" { "image/jpg" } else { content_type };
             let asked = treq.format;
-            let rgba = if let Some(method) = selection {
+            // One band under a colour map, with a colour formula: drawn grey here, then
+            // the formula, then the map.
+            let map_after = match &formula {
+                Some(formula) if pq.colormap_explicit && !raw_array => MapAfterFormula::take(formula, &mut treq.bands),
+                _ => None,
+            };
+            // A formula on one band works on the band's byte, made here from the values.
+            let exact = formula.is_some()
+                && !raw_array
+                && one_grey_band(&treq.bands)
+                && !super::has_embedded_palette(&pq, &first, &treq.bands);
+            let mut rgba = if let (None, true) = (selection, exact) {
+                let paint = Paint::of(&treq.bands).ok_or_else(|| EngineError::BadRequest("not a band of values".into()))?;
+                treq.format = OutputFormat::RawF32;
+                let raw = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
+                let values: Vec<f32> = raw.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect();
+                if values.len() == dim * dim {
+                    paint.rgba(&Selected { bands: 1, values }, dim * dim)
+                } else {
+                    vec![0u8; dim * dim * 4]
+                }
+            } else if let Some(method) = selection {
                 // Every scene's values, then rio-tiler's arithmetic over them, then colour.
                 let paint = Paint::of(&treq.bands).ok_or_else(|| {
                     EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
@@ -4729,9 +4833,21 @@ async fn tile(
             };
             let asked = (!auto_format).then_some((asked, content_type));
             // A count is one band whatever was counted.
-            let grey = selection.is_some_and(|method| method == Selection::Count || TileEngine::value_bands(&treq.bands) == 1)
+            // So is one band drawn in grey, whichever scene it came from: a raster with a
+            // palette of its own is one band too, and is not grey.
+            let one_grey = matches!(Paint::of(&treq.bands), Some(Paint::Gray { colormap: ColormapName::Grayscale, .. }))
+                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+                && rgba.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+            let grey = (one_grey || selection.is_some_and(|method| method == Selection::Count || TileEngine::value_bands(&treq.bands) == 1))
                 && !pq.colormap_explicit;
-            encode_picture(rgba, dim, dim, formula.as_ref(), asked, jpeg_quality, return_mask, grey)
+            let formula = match &map_after {
+                Some(map_after) => {
+                    map_after.colour(&mut rgba);
+                    None
+                }
+                None => formula.as_ref(),
+            };
+            encode_picture(rgba, dim, dim, formula, asked, jpeg_quality, return_mask, grey)
                 .map(|made| as_geotiff(made, dim, dim, lies, 3857, return_mask))
         })
         .await;
@@ -7144,6 +7260,25 @@ mod tests {
         let got = paint_bands(&one, 2, &[(0.0, 255.0)], (0.0, 255.0), ColormapName::Viridis, None, Some(&formula)).unwrap();
         assert_eq!(got[..3], viridis.rgb[usize::from(level[0])]);
         assert_eq!(got[3..], [255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_renderers_grey_takes_the_formula_and_then_the_map() {
+        let formula = cogzilla_kernel::ColorFormula::parse("gamma r 2").unwrap();
+        let mut bands = BandRequest::Single { band_1based: 1, rescale: (0.0, 255.0), colormap: ColormapName::Viridis };
+        let after = MapAfterFormula::take(&formula, &mut bands).unwrap();
+        assert!(matches!(bands, BandRequest::Single { colormap: ColormapName::Grayscale, .. }));
+        let mut rgba = [64u8, 64, 64, 255, 9, 9, 9, 0];
+        after.colour(&mut rgba);
+        let level = formula_levels(&formula)[64];
+        assert_ne!(level, 64);
+        assert_eq!(rgba[..3], ColormapName::Viridis.lut().rgb[usize::from(level)]);
+        // A pixel that is not there stays as it was.
+        assert_eq!(rgba[3..], [255, 9, 9, 9, 0]);
+        // Grey already, or three bands: the formula is for the finished picture.
+        assert!(MapAfterFormula::take(&formula, &mut bands).is_none());
+        let mut rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
+        assert!(MapAfterFormula::take(&formula, &mut rgb).is_none());
     }
 
 }
