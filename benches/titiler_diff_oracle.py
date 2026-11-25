@@ -345,6 +345,7 @@ def main():
             ("GET /cog/tiles/...?resampling=average (Mercator)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&rescale=0,1000&colormap_name=viridis&resampling=average", None, "png"),
             ("GET /cog/tiles/...?colormap=interval JSON", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&colormap={interval_cmap}", None, "png"),
             ("GET /cog/tiles/...?colormap=discrete JSON (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&colormap={discrete_cmap}", None, "png"),
+            ("GET /cog/tiles/...?expression=sin(b1/100)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&expression=sin(b1/100)&rescale=-1,1&colormap_name=viridis", None, "png"),
             ("GET /cog/tiles/...?algorithm=hillshade (buffer=0)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&algorithm_params={hs_params}", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=hillshade&buffer=3", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&buffer=3", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=normalizedIndex", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&algorithm=normalizedIndex&rescale=-1,1&colormap_name=viridis&reproject=bilinear", None, "png"),
@@ -406,6 +407,7 @@ def main():
             ("ERR /stac/info missing assets -> 400/422", "GET", f"/stac/info?url={stac_item}", None, "status_4xx"),
             ("ERR /colorMaps/nonexistent -> 404/422", "GET", "/colorMaps/nonexistent_cmap_xyz", None, "status_4xx"),
             ("ERR /algorithms/nonexistent -> 404/422", "GET", "/algorithms/nonexistent_alg_xyz", None, "status_4xx"),
+            ("ERR /cog/tiles 3-band RGB + colormap_name -> 4xx", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&colormap_name=viridis", None, "status_4xx"),
         ]
 
         # ALL 8 GDAL numeric data types
