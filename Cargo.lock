@@ -397,6 +397,7 @@ dependencies = [
  "cogzilla-proj",
  "cogzilla-tiff",
  "dashmap",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",

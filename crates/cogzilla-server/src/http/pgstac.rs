@@ -31,7 +31,7 @@ use super::{
 };
 use super::point_expr::Program;
 use super::zonal::{self, Bins, StatsOptions};
-use crate::engine::{BandRequest, EngineError, TileEngine};
+use crate::engine::{BandRequest, EngineError, MOSAIC_SCENES_AHEAD, TileEngine};
 use crate::stac::{StacItem, stac_item_from_json};
 use crate::titiler::{
     PolygonMask, build_map_html, encode_rgba_output, query_point, render_wgs84_bbox,
@@ -2759,6 +2759,16 @@ async fn tile(
     let rendered = engine
         .tile_cache
         .get_or_render(cache_key, || async {
+            // The first scene is opened here, to learn what the tile's bands are. The scenes
+            // after it are put on their way meanwhile, so the mosaic does not start their
+            // headers only once this one has come back. The list holds only scenes whose
+            // footprints add to the tile, so these are opens the tile is going to need.
+            for uri in scenes.iter().skip(1).take(MOSAIC_SCENES_AHEAD - 1).flatten() {
+                let (store, uri) = (engine.store.clone(), uri.clone());
+                tokio::spawn(async move {
+                    let _ = store.open_uri(&uri).await;
+                });
+            }
             let first = engine.store.open_uri(&scenes[0][0]).await?;
             let full = first.index.full_res();
             if asset_as_band && full.samples_per_pixel > 1 {
@@ -2795,10 +2805,10 @@ async fn tile(
             if !auto_format {
                 // TiTiler names the media type after the extension that was asked for.
                 let content_type = if explicit == "jpg" { "image/jpg" } else { content_type };
-                return Ok((engine.render_mosaic_scenes(&scenes, &treq).await?, content_type));
+                return Ok((engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?, content_type));
             }
             treq.format = OutputFormat::RawRgba;
-            let rgba = engine.render_mosaic_scenes(&scenes, &treq).await?;
+            let rgba = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
             let dim = treq.tile_size as usize;
             let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
             let (format, content_type) = if opaque {
