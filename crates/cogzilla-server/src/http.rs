@@ -1000,7 +1000,8 @@ fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16)
 }
 
 /// Transform a WGS84 `[min_lon, min_lat, max_lon, max_lat]` bbox into `dst` CRS by densifying
-/// along the 4 edges so curved projections preserve their full envelope.
+/// along the 4 edges plus an interior lattice so curved/limited-domain projections (e.g. UTM,
+/// NZTM, LAEA on global COGs) preserve their full projected envelope.
 fn reproject_wgs84_bounds(
     wgs84: [f64; 4],
     dst: &cogzilla_proj::CrsModel,
@@ -1013,19 +1014,31 @@ fn reproject_wgs84_bounds(
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
+    let mut accum = |lo: f64, la: f64| {
+        let (x, y) = dst.from_lonlat_deg(lo, la);
+        if x.is_finite() && y.is_finite() {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+    };
     const SAMPLES: usize = 16;
     for i in 0..=SAMPLES {
         let t = i as f64 / SAMPLES as f64;
         let lon = w + (e - w) * t;
         let lat = s + (n - s) * t;
-        for (lo, la) in [(lon, s), (lon, n), (w, lat), (e, lat)] {
-            let (x, y) = dst.from_lonlat_deg(lo, la);
-            if x.is_finite() && y.is_finite() {
-                min_x = min_x.min(x);
-                max_x = max_x.max(x);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y);
-            }
+        accum(lon, s);
+        accum(lon, n);
+        accum(w, lat);
+        accum(e, lat);
+    }
+    const INTERIOR: usize = 8;
+    for iy in 1..INTERIOR {
+        let lat = s + (n - s) * (iy as f64 / INTERIOR as f64);
+        for ix in 1..INTERIOR {
+            let lon = w + (e - w) * (ix as f64 / INTERIOR as f64);
+            accum(lon, lat);
         }
     }
     if !min_x.is_finite() || min_x >= max_x || min_y >= max_y {
@@ -1036,15 +1049,29 @@ fn reproject_wgs84_bounds(
     Ok([min_x, min_y, max_x, max_y])
 }
 
-/// Return the COG's native `(epsg_code, [minx, miny, maxx, maxy])` in its own CRS.
-fn cog_native_epsg_and_bounds(cog: &cogzilla_io::OpenedCog) -> (u16, [f64; 4]) {
+/// Return the standard EPSG code for a COG's GeoKeys, or `None` for user-defined projected CRSes
+/// (`ProjectedCSTypeGeoKey == 32767` or `ModelType == 1` / `ProjCoordTrans` without a standard EPSG).
+fn cog_standard_epsg(gk: &cogzilla_tiff::GeoKeys) -> Option<u16> {
+    if let Some(epsg) = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767) {
+        return Some(epsg);
+    }
+    if gk.model_type == Some(1)
+        || gk.projected_cs_type == Some(32767)
+        || gk.proj_coord_trans.is_some()
+    {
+        return None;
+    }
+    Some(
+        gk.geographic_type
+            .filter(|&c| c > 0 && c != 32767)
+            .unwrap_or(4326),
+    )
+}
+
+/// Return the COG's native `(standard_epsg_opt, [minx, miny, maxx, maxy])` in its own CRS.
+fn cog_native_epsg_and_bounds(cog: &cogzilla_io::OpenedCog) -> (Option<u16>, [f64; 4]) {
     let full = cog.index.full_res();
-    let epsg = cog
-        .index
-        .geo_keys
-        .projected_cs_type
-        .or(cog.index.geo_keys.geographic_type)
-        .unwrap_or(4326);
+    let epsg = cog_standard_epsg(&cog.index.geo_keys);
     let w = full.width as f64;
     let h = full.height as f64;
     let corners = [
@@ -1810,7 +1837,12 @@ fn resolve_resample(
         return pq.resample;
     };
     let gk = &cog.index.geo_keys;
-    if gk.projected_cs_type == Some(target_epsg) || gk.geographic_type == Some(target_epsg) {
+    let is_projected = gk.model_type == Some(1)
+        || gk.projected_cs_type.is_some()
+        || gk.proj_coord_trans.is_some();
+    if (target_epsg != 32767 && gk.projected_cs_type == Some(target_epsg))
+        || (!is_projected && gk.geographic_type == Some(target_epsg))
+    {
         return pq.resample;
     }
     let crs_res = if let Some(eng) = engine {
@@ -4756,14 +4788,25 @@ where
                 }
                 let mut all_vals = Vec::new();
                 let mut all_names = Vec::new();
+                let single_band_per_asset = names.len() > 1 && rewritten_expr.is_some();
                 for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
-                            for &b in sel {
+                            let iter_sel = if single_band_per_asset {
+                                &sel[..sel.len().min(1)]
+                            } else {
+                                sel
+                            };
+                            for &b in iter_sel {
                                 if let Some(v) = vs.get((b as usize).saturating_sub(1)) {
                                     all_vals.push(v.clone());
                                     all_names.push(format!("{name}_b{b}"));
                                 }
+                            }
+                        } else if single_band_per_asset {
+                            if let Some(v) = vs.first() {
+                                all_vals.push(v.clone());
+                                all_names.push(format!("{name}_b1"));
                             }
                         } else {
                             for (i, v) in vs.iter().enumerate() {
@@ -4819,21 +4862,33 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands,
-                        pq_stac.resample, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
+                        rs, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
                         pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
                     (d, dst_bbox, dst_epsg)
                 } else {
-                    let d = render_native_preview(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
-                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
-                    )
-                    .await?;
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    (d, nat_bbox, nat_epsg)
+                    if ct == "image/tiff" && nat_epsg.is_none() {
+                        let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
+                        let d = render_wgs84_bbox(
+                            &engine, &cogs, bbox, out_w, out_h, None, &bands,
+                            rs, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq_stac.return_mask, pq_stac.unscale,
+                        )
+                        .await?;
+                        (d, bbox, 4326)
+                    } else {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
+                            pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, nat_epsg.unwrap_or(4326))
+                    }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
@@ -4871,21 +4926,33 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands,
-                        pq_stac.resample, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
+                        rs, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
                         pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
                     (d, dst_bbox, dst_epsg)
                 } else {
-                    let d = render_native_preview(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
-                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
-                    )
-                    .await?;
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    (d, nat_bbox, nat_epsg)
+                    if ct == "image/tiff" && nat_epsg.is_none() {
+                        let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
+                        let d = render_wgs84_bbox(
+                            &engine, &cogs, bbox, out_w, out_h, None, &bands,
+                            rs, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq_stac.return_mask, pq_stac.unscale,
+                        )
+                        .await?;
+                        (d, bbox, 4326)
+                    } else {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
+                            pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, nat_epsg.unwrap_or(4326))
+                    }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
@@ -5667,21 +5734,33 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands,
-                        pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
+                        rs, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
                         pq.return_mask, pq.unscale,
                     )
                     .await?;
                     (d, dst_bbox, dst_epsg)
                 } else {
-                    let d = render_native_preview(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
-                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
-                    )
-                    .await?;
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    (d, nat_bbox, nat_epsg)
+                    if ct == "image/tiff" && nat_epsg.is_none() {
+                        let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
+                        let d = render_wgs84_bbox(
+                            &engine, &cogs, bbox, out_w, out_h, None, &bands,
+                            rs, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, bbox, 4326)
+                    } else {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                            pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, nat_epsg.unwrap_or(4326))
+                    }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
@@ -5708,21 +5787,33 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, None, &bands,
-                        pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
+                        rs, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
                         pq.return_mask, pq.unscale,
                     )
                     .await?;
                     (d, dst_bbox, dst_epsg)
                 } else {
-                    let d = render_native_preview(
-                        &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
-                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
-                    )
-                    .await?;
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    (d, nat_bbox, nat_epsg)
+                    if ct == "image/tiff" && nat_epsg.is_none() {
+                        let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
+                        let d = render_wgs84_bbox(
+                            &engine, &cogs, bbox, out_w, out_h, None, &bands,
+                            rs, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, bbox, 4326)
+                    } else {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                            pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, nat_epsg.unwrap_or(4326))
+                    }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
@@ -6391,5 +6482,52 @@ mod tests {
         let pq_wmts = parse_query(Some("url=a.tif&minzoom=4&maxzoom=12&tile_format=png&tile_scale=2"));
         assert!(validate_query(&["cog", "WebMercatorQuad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
         assert!(validate_query(&["mosaicjson", "WorldCRS84Quad", "WMTSCapabilities.xml"], &pq_wmts).is_err());
+    }
+
+    #[test]
+    fn geospatial_bounds_reproject_and_user_defined_crs_parity() {
+        // 1. reproject_wgs84_bounds on global COG into UTM31 (EPSG:32631), NZTM (EPSG:2193),
+        //    and LAEA (EPSG:3035) must include interior points (Rome/Berlin/NZ/Europe), not just edges.
+        let global = [-180.0, -85.0, 180.0, 85.0];
+        let utm31 = cogzilla_proj::CrsModel::from_epsg(32631).unwrap();
+        let utm_b = reproject_wgs84_bounds(global, &utm31).unwrap();
+        let (rome_x, rome_y) = utm31.from_lonlat_deg(12.5, 41.9);
+        assert!(
+            rome_x >= utm_b[0] && rome_x <= utm_b[2] && rome_y >= utm_b[1] && rome_y <= utm_b[3],
+            "Rome ({rome_x}, {rome_y}) outside projected UTM31 bounds {utm_b:?}"
+        );
+
+        let nztm = cogzilla_proj::CrsModel::from_epsg(2193).unwrap();
+        let nztm_b = reproject_wgs84_bounds(global, &nztm).unwrap();
+        let (nz_x, nz_y) = nztm.from_lonlat_deg(170.5, -43.5);
+        assert!(
+            nz_x >= nztm_b[0] && nz_x <= nztm_b[2] && nz_y >= nztm_b[1] && nz_y <= nztm_b[3],
+            "NZ ({nz_x}, {nz_y}) outside projected NZTM bounds {nztm_b:?}"
+        );
+
+        let laea = cogzilla_proj::CrsModel::from_epsg(3035).unwrap();
+        let laea_b = reproject_wgs84_bounds([-180.0, -90.0, 180.0, 90.0], &laea).unwrap();
+        let (ber_x, ber_y) = laea.from_lonlat_deg(13.4, 52.5);
+        assert!(
+            ber_x >= laea_b[0] && ber_x <= laea_b[2] && ber_y >= laea_b[1] && ber_y <= laea_b[3],
+            "Berlin ({ber_x}, {ber_y}) outside projected LAEA bounds {laea_b:?}"
+        );
+
+        // 2. cog_standard_epsg returns None for user-defined projected CRS (32767) even with geographic_type=4326
+        let mut gk = cogzilla_tiff::GeoKeys::default();
+        gk.model_type = Some(1);
+        gk.projected_cs_type = Some(32767);
+        gk.geographic_type = Some(4326);
+        assert_eq!(cog_standard_epsg(&gk), None);
+
+        // Standard projected EPSG returns Some(32610)
+        gk.projected_cs_type = Some(32610);
+        assert_eq!(cog_standard_epsg(&gk), Some(32610));
+
+        // Pure geographic returns Some(4326)
+        let mut gk_geo = cogzilla_tiff::GeoKeys::default();
+        gk_geo.model_type = Some(2);
+        gk_geo.geographic_type = Some(4326);
+        assert_eq!(cog_standard_epsg(&gk_geo), Some(4326));
     }
 }

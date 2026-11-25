@@ -103,18 +103,16 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         None => ("None", None),
     };
 
-    let crs_uri = if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .projected_cs_type
-        .filter(|&c| c > 0 && c != 32767)
-    {
+    let gk = &cog.index.geo_keys;
+    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+    let is_user_defined_projected = std_proj_epsg.is_none()
+        && (gk.model_type == Some(1)
+            || gk.projected_cs_type == Some(32767)
+            || gk.proj_coord_trans.is_some());
+    let crs_uri = if let Some(epsg) = std_proj_epsg {
         format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
-    } else if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .geographic_type
-        .filter(|&c| c > 0 && c != 32767)
+    } else if !is_user_defined_projected
+        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
     {
         format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
     } else {
@@ -140,9 +138,14 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         x00.max(x10).max(x01).max(x11),
         y00.max(y10).max(y01).max(y11),
     ];
+    let reported_bounds = if is_user_defined_projected {
+        bounds
+    } else {
+        native_bounds
+    };
 
     let mut info = serde_json::json!({
-        "bounds": native_bounds,
+        "bounds": reported_bounds,
         "crs": crs_uri,
         "wgs84_bounds": bounds,
         "minzoom": minzoom,
@@ -269,18 +272,16 @@ pub fn build_cog_validate(
         None => serde_json::Value::Null,
     };
 
-    let crs_str = if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .projected_cs_type
-        .filter(|&c| c > 0 && c != 32767)
-    {
+    let gk = &cog.index.geo_keys;
+    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+    let is_user_defined_projected = std_proj_epsg.is_none()
+        && (gk.model_type == Some(1)
+            || gk.projected_cs_type == Some(32767)
+            || gk.proj_coord_trans.is_some());
+    let crs_str = if let Some(epsg) = std_proj_epsg {
         format!("EPSG:{epsg}")
-    } else if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .geographic_type
-        .filter(|&c| c > 0 && c != 32767)
+    } else if !is_user_defined_projected
+        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
     {
         format!("EPSG:{epsg}")
     } else {
@@ -293,12 +294,23 @@ pub fn build_cog_validate(
     let (x11, y11) = full
         .pixel_to_crs
         .forward(full.width as f64, full.height as f64);
-    let native_bounds = [
-        x00.min(x10).min(x01).min(x11),
-        y00.min(y10).min(y01).min(y11),
-        x00.max(x10).max(x01).max(x11),
-        y00.max(y10).max(y01).max(y11),
-    ];
+    let native_bounds = if is_user_defined_projected {
+        cogzilla_proj::CrsModel::from_geo_keys(gk)
+            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+            .unwrap_or([
+                x00.min(x10).min(x01).min(x11),
+                y00.min(y10).min(y01).min(y11),
+                x00.max(x10).max(x01).max(x11),
+                y00.max(y10).max(y01).max(y11),
+            ])
+    } else {
+        [
+            x00.min(x10).min(x01).min(x11),
+            y00.min(y10).min(y01).min(y11),
+            x00.max(x10).max(x01).max(x11),
+            y00.max(y10).max(y01).max(y11),
+        ]
+    };
     let (res_x, res_y) = full.pixel_resolution();
 
     let ifds: Vec<serde_json::Value> = cog
