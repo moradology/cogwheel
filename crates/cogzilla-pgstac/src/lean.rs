@@ -362,6 +362,7 @@ impl Walk<'_> {
                 collection: Some(row.try_get(1).map_err(shape)?),
                 bbox: None,
                 assets: Default::default(),
+                self_href: None,
             };
             match row.try_get::<_, Option<Vec<Option<String>>>>(3).map_err(shape)? {
                 Some(hrefs) => {
@@ -393,7 +394,10 @@ fn set_hrefs(item: &mut MosaicItem, assets: &[String], hrefs: Vec<Option<String>
         return false;
     }
     for (key, href) in assets.iter().zip(hrefs) {
-        let Some(href) = href else {
+        // A relative href needs the item's `self` link, which is not read here: the
+        // reference path, which returns whole items, answers for it. A path from the root
+        // is a file of this machine unless that link says otherwise.
+        let Some(href) = href.filter(|h| crate::href_is_absolute(h) || h.starts_with('/')) else {
             return false;
         };
         item.assets.insert(key.clone(), serde_json::json!({ "href": href }));

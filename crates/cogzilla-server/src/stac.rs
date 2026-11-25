@@ -46,7 +46,7 @@ fn is_raster_asset(key: &str, asset: &serde_json::Value) -> bool {
         || (!key.contains("thumbnail") && !key.contains("metadata") && lower_href.contains(".tif"))
 }
 
-fn resolve_href(item_uri: &str, href: &str) -> String {
+pub(crate) fn resolve_href(item_uri: &str, href: &str) -> String {
     if href.starts_with("http://")
         || href.starts_with("https://")
         || href.starts_with("s3://")
@@ -107,16 +107,13 @@ pub fn stac_item_from_json(val: &serde_json::Value, item_uri: &str) -> StacItem 
         .unwrap_or("stac-item")
         .to_string();
     let bbox = val.get("bbox").and_then(|v| v.as_array()).and_then(|a| {
-        if a.len() >= 4 {
-            Some([
-                a[0].as_f64()?,
-                a[1].as_f64()?,
-                a[2].as_f64()?,
-                a[3].as_f64()?,
-            ])
-        } else {
-            None
-        }
+        // Four numbers, or six with heights: west, south, low, east, north, high.
+        let (east, north) = match a.len() {
+            4 => (2, 3),
+            6 => (3, 4),
+            _ => return None,
+        };
+        Some([a[0].as_f64()?, a[1].as_f64()?, a[east].as_f64()?, a[north].as_f64()?])
     });
     let geometry = val.get("geometry").cloned();
 

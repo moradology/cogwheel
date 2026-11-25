@@ -82,8 +82,9 @@ SCAN_LIMIT, ITEMS_LIMIT, TIME_LIMIT = 10000, 100, "5 seconds"
 def dsn_from_env() -> str:
     if os.environ.get("DATABASE_URL"):
         return os.environ["DATABASE_URL"]
-    user = os.environ.get("PGUSER", "username")
-    password = os.environ.get("PGPASSWORD", "password")
+    # Escaped so a "/" or "@" in either does not break the URL.
+    user = quote(os.environ.get("PGUSER", "username"), safe="")
+    password = quote(os.environ.get("PGPASSWORD", "password"), safe="")
     host = os.environ.get("PGHOST", "127.0.0.1")
     port = os.environ.get("PGPORT", os.environ.get("PGSTAC_PORT", "5439"))
     db = os.environ.get("PGDATABASE", "postgis")

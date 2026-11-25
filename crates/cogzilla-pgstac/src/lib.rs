@@ -112,6 +112,13 @@ pub struct MosaicItem {
     pub bbox: Option<[f64; 4]>,
     /// Asset key to the asset object exactly as pgSTAC returned it.
     pub assets: BTreeMap<String, Value>,
+    /// The item's `self` link, which its relative asset hrefs are relative to.
+    pub self_href: Option<String>,
+}
+
+/// Whether an href says where it is by itself: a URL, an absolute path, a GDAL `/vsi` path.
+pub(crate) fn href_is_absolute(href: &str) -> bool {
+    href.contains("://") || href.starts_with("/vsi")
 }
 
 impl MosaicItem {
@@ -140,17 +147,43 @@ impl MosaicItem {
             .and_then(Value::as_object)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
+        let self_href = feature
+            .get("links")
+            .and_then(Value::as_array)
+            .and_then(|links| links.iter().find(|l| l.get("rel").and_then(Value::as_str) == Some("self")))
+            .and_then(|l| l.get("href")?.as_str())
+            .filter(|h| href_is_absolute(h))
+            .map(str::to_string);
         Some(Self {
             id,
             collection,
             bbox,
             assets,
+            self_href,
         })
     }
 
-    /// The `href` of one asset, if the item has it.
-    pub fn asset_href(&self, key: &str) -> Option<&str> {
-        self.assets.get(key)?.get("href")?.as_str()
+    /// The `href` of one asset, if the item has it. A relative href is resolved against the
+    /// item's `self` link; with no such link there is nowhere it is relative to, and the
+    /// item is taken not to have the asset rather than read from wherever the server runs.
+    pub fn asset_href(&self, key: &str) -> Option<std::borrow::Cow<'_, str>> {
+        let href = self.assets.get(key)?.get("href")?.as_str()?;
+        if href_is_absolute(href) {
+            return Some(href.into());
+        }
+        let Some(base) = self.self_href.as_deref() else {
+            // A path from the root is a file of this machine when the item says no more.
+            return href.starts_with('/').then(|| href.into());
+        };
+        let base = base.split(['?', '#']).next().unwrap_or(base);
+        if href.starts_with('/') {
+            // From the root of wherever the item is.
+            let after_scheme = base.find("://")? + 3;
+            let origin = base[after_scheme..].find('/').map_or(base, |at| &base[..after_scheme + at]);
+            return Some(format!("{origin}{href}").into());
+        }
+        let folder = &base[..=base.rfind('/')?];
+        Some(format!("{folder}{}", href.trim_start_matches("./")).into())
     }
 
     /// The item in the shape titiler-pgstac's `/assets` routes return.
@@ -270,7 +303,7 @@ impl PgStac {
     /// Build the pool. No connection is opened until the first query, so a database
     /// that is down at start-up does not stop the server from serving other routes.
     pub fn new(config: PgStacConfig) -> Result<Self, PgStacError> {
-        let connector = tls::make_connector(config.verify)?;
+        let connector = tls::make_connector(config.verify, config.root_cert.as_deref())?;
         let manager = Manager::from_config(
             config.pg.clone(),
             connector,
@@ -682,8 +715,16 @@ mod tests {
         let item = MosaicItem::from_feature(&f).unwrap();
         assert_eq!(item.id, "S2B_31TGJ_20241231_0_L2A");
         assert_eq!(item.bbox, Some([6.8, 44.1, 7.9, 45.1]));
-        assert_eq!(item.asset_href("visual"), Some("https://example.test/TCI.tif"));
+        assert_eq!(item.asset_href("visual").as_deref(), Some("https://example.test/TCI.tif"));
         assert_eq!(item.asset_href("missing"), None);
+        // A relative href is relative to the item's own address, and to nothing without one.
+        let mut relative = item.clone();
+        relative.assets.insert("visual".into(), serde_json::json!({ "href": "./data/TCI.tif" }));
+        assert_eq!(relative.asset_href("visual"), None);
+        relative.self_href = Some("https://example.test/c/items/i.json?x=1".into());
+        assert_eq!(relative.asset_href("visual").as_deref(), Some("https://example.test/c/items/data/TCI.tif"));
+        relative.assets.insert("visual".into(), serde_json::json!({ "href": "/data/TCI.tif" }));
+        assert_eq!(relative.asset_href("visual").as_deref(), Some("https://example.test/data/TCI.tif"));
         let back = item.to_json();
         assert_eq!(back["collection"], "sentinel-2-l2a");
         assert_eq!(back["assets"]["visual"]["type"], "image/tiff");
