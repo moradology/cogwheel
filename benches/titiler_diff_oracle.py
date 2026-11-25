@@ -447,9 +447,39 @@ def main():
             ("GET /stac/tiles/...?expression=(b1-b2)/(b1+b2)", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_item}&assets=red&assets=green&expression=(b1-b2)/(b1%2Bb2)&rescale=-0.5,0.5&colormap_name=rdylgn&reproject=bilinear", None, "png"),
             ("GET /stac/WebMercatorQuad/tilejson.json", "GET", f"/stac/WebMercatorQuad/tilejson.json?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_tj"),
             ("GET /stac/point/-122.65,37.773 (3-asset)", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red&assets=green&assets=blue", None, "json_point"),
+            ("GET /stac/point?asset_as_band=true", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red&assets=green&asset_as_band=true", None, "json_point"),
             ("GET /stac/asset_statistics?assets=red&assets=green", "GET", f"/stac/asset_statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stac_asset_stats"),
             ("GET /stac/statistics?assets=red&assets=green", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", None, "json_stats"),
             ("GET /stac/statistics?expression=(b1-b2)/(b1+b2)", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=128&expression=(b1-b2)/(b1%2Bb2)", None, "json_stats"),
+            ("GET /stac/statistics?algorithm=normalizedIndex", "GET", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=128&algorithm=normalizedIndex", None, "json_stats"),
+            ("POST /cog/feature (coord_crs=EPSG:3857)", "POST", f"/cog/feature/64x64.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&coord_crs=EPSG:3857", {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-13670000.0, 4523000.0],
+                        [-13636000.0, 4523000.0],
+                        [-13636000.0, 4565000.0],
+                        [-13670000.0, 4565000.0],
+                        [-13670000.0, 4523000.0],
+                    ]]
+                },
+                "properties": {}
+            }, "png"),
+            ("POST /cog/statistics (coord_crs=EPSG:3857)", "POST", f"/cog/statistics?url={sat}&max_size=256&coord_crs=EPSG:3857", {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-13670000.0, 4523000.0],
+                        [-13636000.0, 4523000.0],
+                        [-13636000.0, 4565000.0],
+                        [-13670000.0, 4565000.0],
+                        [-13670000.0, 4523000.0],
+                    ]]
+                },
+                "properties": {}
+            }, "json_post_stats"),
             ("POST /stac/statistics (Polygon)", "POST", f"/stac/statistics?url={stac_item}&assets=red&assets=green&max_size=256", poly_feature, "json_post_stats"),
             ("GET /stac/preview/256x256.png (3-asset RGB)", "GET", f"/stac/preview/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
             ("GET /stac/bbox/.../256x256.png (3-asset RGB)", "GET", f"/stac/bbox/-122.8,37.6,-122.5,37.9/256x256.png?url={stac_item}&assets=red&assets=green&assets=blue&rescale=7000,20000", None, "png"),
