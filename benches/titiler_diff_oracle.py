@@ -533,6 +533,9 @@ def main():
             ("OGC /cog/map crs=[EPSG:3857] safe CURIE", "GET", f"/cog/map?url={sat}&crs=[EPSG:3857]&bidx=1&bidx=2&bidx=3&rescale=0,0.35&width=128&height=128", None, "png"),
             ("STAC [1-band styled .tif gray+alpha]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.tif?url={stac_item}&assets=red&rescale=7000,20000", None, "geotiff"),
             ("STAC [bbox/{w}x{h} ignores max_size]", "GET", f"/stac/bbox/-122.8,37.6,-122.5,37.9/64x64.png?url={stac_item}&assets=red&rescale=7000,20000&max_size=32", None, "png"),
+            # --- Sweep #5 parity regressions (M3, M6) ---
+            ("OGC /cog/map bbox-crs=EPSG:32610 native dims", "GET", f"/cog/map?url={sat}&bbox=540000,4170000,550000,4190000&bbox-crs=EPSG:32610&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "png"),
+            ("GET /cog/point?expression=b1;b2*2", "GET", f"/cog/point/-122.65,37.773?url={sat}&expression=b1;b2*2", None, "json_point"),
         ])
 
         print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks) ===")

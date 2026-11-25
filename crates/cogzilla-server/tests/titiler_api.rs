@@ -166,7 +166,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     )
     .await;
     assert_eq!(pt_expr["values"].as_array().unwrap().len(), 1);
-    assert_eq!(pt_expr["band_names"][0], "b1-b2");
+    assert_eq!(pt_expr["band_names"][0], "b1");
+    assert_eq!(pt_expr["band_descriptions"][0], "b1-b2");
 
     let pt_b2 = get_json(
         &client,
@@ -193,7 +194,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     )
     .await;
     assert_eq!(pt_multi["values"].as_array().unwrap().len(), 2);
-    assert_eq!(pt_multi["band_names"], serde_json::json!(["b1-b2", "b2-b3"]));
+    assert_eq!(pt_multi["band_names"], serde_json::json!(["b1", "b2"]));
+    assert_eq!(pt_multi["band_descriptions"], serde_json::json!(["b1-b2", "b2-b3"]));
 
     let tif_resp = client
         .get(format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1"))
@@ -880,10 +882,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(mj_info["quadkeys"].as_array().is_some_and(|a| !a.is_empty()));
             assert!(mj_info["crs"].as_str().is_some());
 
-            // Non-WebMercatorQuad TMS on /mosaicjson/tiles (WorldCRS84Quad)
+            // Non-WebMercatorQuad TMS on /mosaicjson/tiles (WorldCRS84Quad overlapping 12/655/1583)
             let mj_crs84 = client
                 .get(format!(
-                    "{base}/mosaicjson/tiles/WorldCRS84Quad/10/325/297.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"
+                    "{base}/mosaicjson/tiles/WorldCRS84Quad/10/327/297.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"
                 ))
                 .send()
                 .await
@@ -915,7 +917,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}&expression=b1*2"),
             )
             .await;
-            assert_eq!(mj_pt_expr["assets"][0]["band_names"][0], "b1*2");
+            assert_eq!(mj_pt_expr["assets"][0]["band_names"][0], "b1");
+            assert_eq!(mj_pt_expr["assets"][0]["band_descriptions"][0], "b1*2");
             let mj_stats = get_json(&client, format!("{base}/mosaicjson/statistics?url={mj_url}&max_size=128")).await;
             assert!(mj_stats["b1"]["mean"].is_number());
             let mj_bbox = client
@@ -927,7 +930,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
             assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
-            // Empty buffered /mosaicjson/tiles must honor ?buffer=8 -> 272x272 PNG
+            // Empty /mosaicjson/tiles returns 204 No Content (matching TiTiler 2.4 EmptyMosaicError)
             let mj_empty_buf = client
                 .get(format!(
                     "{base}/mosaicjson/tiles/WebMercatorQuad/12/0/0.png?url={mj_url}&buffer=8"
@@ -935,12 +938,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(mj_empty_buf.status(), 200);
-            let mj_eb_bytes = mj_empty_buf.bytes().await.unwrap();
-            assert_eq!(&mj_eb_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            let eb_w = u32::from_be_bytes([mj_eb_bytes[16], mj_eb_bytes[17], mj_eb_bytes[18], mj_eb_bytes[19]]);
-            let eb_h = u32::from_be_bytes([mj_eb_bytes[20], mj_eb_bytes[21], mj_eb_bytes[22], mj_eb_bytes[23]]);
-            assert_eq!((eb_w, eb_h), (272, 272));
+            assert_eq!(mj_empty_buf.status(), 204);
 
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
