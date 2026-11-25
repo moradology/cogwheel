@@ -1110,6 +1110,30 @@ fn reproject_wgs84_bounds(
     Ok([min_x, min_y, max_x, max_y])
 }
 
+/// Validate a target rendering bbox and unwrap antimeridian-crossing geographic bboxes (`w > e`)
+/// into `[w, s, e + 360, n]` so aspect ratio, `ModelPixelScale`, and pixel stepping are positive.
+fn normalize_render_bbox(
+    mut bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+) -> Result<[f64; 4], EngineError> {
+    if !bbox.iter().all(|v| v.is_finite()) || bbox[1] >= bbox[3] {
+        return Err(EngineError::BadRequest(format!(
+            "invalid bbox: [{}, {}, {}, {}]",
+            bbox[0], bbox[1], bbox[2], bbox[3]
+        )));
+    }
+    if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+        bbox[2] += 360.0;
+    }
+    if bbox[0] >= bbox[2] {
+        return Err(EngineError::BadRequest(format!(
+            "invalid bbox: [{}, {}, {}, {}]",
+            bbox[0], bbox[1], bbox[2], bbox[3]
+        )));
+    }
+    Ok(bbox)
+}
+
 /// Return the standard EPSG code for a COG's GeoKeys, or `None` for user-defined projected CRSes
 /// (`ProjectedCSTypeGeoKey == 32767` or `ModelType == 1` / `ProjCoordTrans` without a standard EPSG).
 fn cog_standard_epsg(gk: &cogzilla_tiff::GeoKeys) -> Option<u16> {
@@ -4640,7 +4664,7 @@ where
                     .clone()
                     .or_else(|| pq_stac.bounds_crs.clone())
                     .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
-                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let out_bbox = normalize_render_bbox(reproject_wgs84_bounds(wgs_bbox, &dst_crs)?, &dst_crs)?;
                 let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq_stac.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
@@ -5817,7 +5841,7 @@ where
                     .clone()
                     .or_else(|| pq.bounds_crs.clone())
                     .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
-                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let out_bbox = normalize_render_bbox(reproject_wgs84_bounds(wgs_bbox, &dst_crs)?, &dst_crs)?;
                 let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
@@ -6858,5 +6882,24 @@ mod tests {
             (fiji_b[2] - fiji_b[0]) < 1_000_000.0,
             "antimeridian bounds swept wrong hemisphere: {fiji_b:?}"
         );
+
+        // 12. normalize_render_bbox unwraps antimeridian Geographic bboxes & rejects inverted boxes
+        let fiji_geo = normalize_render_bbox(
+            [177.0, -20.0, -178.0, -16.0],
+            &cogzilla_proj::CrsModel::Geographic,
+        )
+        .unwrap();
+        assert_eq!(fiji_geo, [177.0, -20.0, 182.0, -16.0]);
+        assert_eq!(aspect_preserving_dims(fiji_geo, 512), (512, 410));
+        assert!(normalize_render_bbox(
+            [0.0, 10.0, 1.0, -10.0],
+            &cogzilla_proj::CrsModel::Geographic,
+        )
+        .is_err());
+        assert!(normalize_render_bbox(
+            [10.0, 0.0, 5.0, 1.0],
+            &cogzilla_proj::CrsModel::Epsg3857,
+        )
+        .is_err());
     }
 }

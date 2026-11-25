@@ -3721,7 +3721,7 @@ pub async fn render_mercator_bbox(
 async fn render_bbox_impl(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
-    bbox: [f64; 4],
+    mut bbox: [f64; 4],
     dst_crs: &cogzilla_proj::CrsModel,
     native_preview: bool,
     width: u32,
@@ -3741,6 +3741,25 @@ async fn render_bbox_impl(
             "render_bbox supports 1..=16 assets, got {}",
             cogs.len()
         )));
+    }
+    if !native_preview {
+        if !bbox.iter().all(|v| v.is_finite()) || bbox[1] >= bbox[3] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+        // RFC 7946 antimeridian-crossing geographic bboxes use w > e (e.g. [177, -20, -178, -16]);
+        // unwrap e into (180, 540] so dlx > 0 and clamp() never sees min > max.
+        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+            bbox[2] += 360.0;
+        }
+        if bbox[0] >= bbox[2] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
     }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
@@ -3763,7 +3782,10 @@ async fn render_bbox_impl(
         let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
             match dst_crs {
                 cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
-                cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
+                cogzilla_proj::CrsModel::Geographic => {
+                    let lon = if x > 180.0 { x - 360.0 } else { x };
+                    crs.from_lonlat_deg(lon, y)
+                }
                 other => {
                     let (lon, lat) = other.to_lonlat_deg(x, y);
                     if lon.is_finite() && lat.is_finite() {
@@ -3790,8 +3812,14 @@ async fn render_bbox_impl(
         if !target_rx.is_finite() || !target_ry.is_finite() {
             let full = primary.index.full_res();
             let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-            let (rcx_raw, rcy_raw) =
+            let (mut rcx_raw, rcy_raw) =
                 dst_crs.from_lonlat_deg(0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]));
+            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic)
+                && rcx_raw < bbox[0]
+                && rcx_raw + 360.0 <= bbox[2]
+            {
+                rcx_raw += 360.0;
+            }
             let rcx = rcx_raw.clamp(bbox[0], bbox[2]);
             let rcy = rcy_raw.clamp(bbox[1], bbox[3]);
             let probes = [
@@ -3872,7 +3900,10 @@ async fn render_bbox_impl(
             let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
                 let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
-                    cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
+                    cogzilla_proj::CrsModel::Geographic => {
+                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        crs.from_lonlat_deg(lon, y)
+                    }
                     other => {
                         let (lon, lat) = other.to_lonlat_deg(x, y);
                         if lon.is_finite() && lat.is_finite() {
@@ -3892,7 +3923,8 @@ async fn render_bbox_impl(
             };
             let to_wgs84 = |x: f64, y: f64| -> (f64, f64) {
                 if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) {
-                    (x, y)
+                    let lon = if x > 180.0 { x - 360.0 } else { x };
+                    (lon, y)
                 } else {
                     dst_crs.to_lonlat_deg(x, y)
                 }
