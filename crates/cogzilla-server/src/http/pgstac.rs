@@ -43,6 +43,8 @@ use crate::titiler::{
 const MAX_SCENES_PER_TILE: usize = 256;
 /// The engine composites one to three co-registered assets per scene.
 const MAX_ASSETS_PER_SCENE: usize = 3;
+/// The most assets of one item a tile or statistics will read, each on its own grid.
+const MAX_ASSETS_PER_ITEM: usize = 16;
 
 /// The parts of the request the routes need.
 pub(super) struct Ctx<'a> {
@@ -1529,27 +1531,25 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         Some(v) => parse_bool(v)
             .ok_or_else(|| invalid_param("query", "asset_as_band", "Input should be a valid boolean"))?,
     };
-    if assets.len() > MAX_ASSETS_PER_SCENE {
+    if assets.len() > MAX_ASSETS_PER_ITEM {
         return Err(detail(
             StatusCode::BAD_REQUEST,
-            format!("at most {MAX_ASSETS_PER_SCENE} assets per item are supported, got {}", assets.len()),
+            format!("at most {MAX_ASSETS_PER_ITEM} assets per item are supported, got {}", assets.len()),
         ));
     }
     let selection = match query_value(pairs, "pixel_selection") {
-        None | Some("first") => None,
-        Some(name @ ("lastbandlow" | "lastbandhigh")) => {
-            return Err(detail(
-                StatusCode::BAD_REQUEST,
-                format!("pixel_selection '{name}' is not supported yet"),
-            ));
-        }
-        Some(name) => Some(Selection::parse(name).ok_or_else(|| {
-            invalid_param(
-                "query",
-                "pixel_selection",
-                "Input should be 'first', 'highest', 'lowest', 'mean', 'median', 'stdev', 'lastbandlow', 'lastbandhigh' or 'count'",
-            )
-        })?),
+        None => None,
+        Some(name) => match Selection::parse(name) {
+            Some(Selection::First) => None,
+            Some(method) => Some(method),
+            None => {
+                return Err(invalid_param(
+                    "query",
+                    "pixel_selection",
+                    "Input should be 'first', 'highest', 'lowest', 'mean', 'median', 'stdev', 'lastbandlow', 'lastbandhigh' or 'count'",
+                ));
+            }
+        },
     };
     if query_value(pairs, "algorithm_params").is_some() {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
@@ -1581,24 +1581,250 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     })
 }
 
-/// Bring the assets and their options to what the tile and image renderer takes, and
-/// give back the asset names. The renderer reads either the bands of one raster or the
-/// first band of several, so it can honour `bidx` and band math on a single asset, and
-/// `bidx=1` on each of several; anything else is refused rather than drawn differently.
-fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>, Resp> {
-    let unsupported = |what: &str| {
-        detail(StatusCode::BAD_REQUEST, format!("{what} is not supported on tile and image routes yet"))
-    };
-    // TiTiler 2 takes band indexes per asset only; a bare `bidx` is passed over.
-    pq.bidx.clear();
+/// The asset names of a request, once its `expression` is known not to use them: band math
+/// is over `b1..bn`, never over asset names.
+fn expression_names(pq: &ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>, Resp> {
     let names: Vec<String> = query.assets.iter().map(|a| a.name.clone()).collect();
-    pq.assets = names.clone();
-    // Band math is over `b1..bn`, never over asset names.
     if let Some(expression) = &pq.expr_raw {
         let words = expression.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
         if let Some(name) = words.filter(|w| !w.is_empty()).find(|w| names.iter().any(|n| n == w)) {
             return Err(detail(StatusCode::BAD_REQUEST, format!("Invalid band/asset name '{name}'")));
         }
+    }
+    Ok(names)
+}
+
+/// Whether a tile has to be made from planes, each asset read on its own, rather than by
+/// the renderer's single pass over the bands of one raster or the first band of up to
+/// three on one grid. Assets on different grids are found out later, from the rasters.
+fn wants_planes(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
+    let math = pq.expr_raw.as_deref();
+    let plain = |a: &AssetSpec| a.expression.is_none() && a.indexes.as_ref().is_none_or(|i| i == &[1]);
+    query.selection.is_some_and(Selection::by_last_band)
+        || math.is_some_and(|e| e.contains(';'))
+        || match query.assets.as_slice() {
+            [one] => match (&one.expression, &one.indexes) {
+                (Some(own), _) => math.is_some() || own.contains(';'),
+                (None, Some(indexes)) => math.is_some() || !matches!(indexes.len(), 1 | 3),
+                (None, None) => false,
+            },
+            // Two bands are a picture of their own in TiTiler, not the first of them in grey.
+            several => {
+                several.len() > MAX_ASSETS_PER_SCENE
+                    || !several.iter().all(plain)
+                    || (several.len() == 2 && math.is_none())
+            }
+        }
+}
+
+/// A tile made from planes: what to read of each item and what to make of it.
+struct PlanesTile {
+    assets: Vec<AssetSpec>,
+    as_band: bool,
+    expression: Option<String>,
+    selection: Selection,
+    resampling: ResampleMode,
+    reproject: ResampleMode,
+    /// The tile, its size and `unscale`; the rest is set for each read.
+    request: crate::engine::TileRequest,
+}
+
+/// The bands one item brings to a tile.
+struct ItemBands {
+    bands: Vec<Vec<f32>>,
+    /// Whether they are the rasters' own whole numbers.
+    integer: bool,
+    sample_type: SampleType,
+}
+
+/// What one asset brings: its planes, its sample type, and whether they are its own numbers.
+type AssetRead = (Vec<Vec<f32>>, SampleType, bool);
+
+/// A read under way.
+type Reading<'a, T> = std::pin::Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
+
+/// Band math over whole planes, in double precision; a result that is not a number is no data.
+fn band_math(expression: &str, bands: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EngineError> {
+    let program = Program::parse(expression, bands.len()).map_err(EngineError::BadRequest)?;
+    let len = bands.first().map_or(0, Vec::len);
+    let mut out = vec![vec![f32::NAN; len]; program.len()];
+    let mut pixel = vec![0f64; bands.len()];
+    for i in 0..len {
+        for (value, band) in pixel.iter_mut().zip(bands) {
+            *value = f64::from(band[i]);
+        }
+        for (part, plane) in out.iter_mut().enumerate() {
+            let v = program.eval(part, &pixel);
+            if v.is_finite() {
+                plane[i] = v as f32;
+            }
+        }
+    }
+    Ok(out)
+}
+
+impl PlanesTile {
+    /// One asset's bands over the tile, read on its own grid, with its own options applied.
+    async fn asset(
+        &self,
+        engine: &TileEngine,
+        href: &str,
+        spec: &AssetSpec,
+    ) -> Result<AssetRead, EngineError> {
+        let wanted: &[u16] = match (&spec.expression, &spec.indexes) {
+            (None, Some(indexes)) => indexes,
+            _ => &[],
+        };
+        let (planes, sample_type) =
+            engine.raster_planes(href, wanted, &self.request, self.resampling, self.reproject).await?;
+        let planes = match &spec.expression {
+            Some(expression) => band_math(expression, &planes)?,
+            None => planes,
+        };
+        if self.as_band && planes.len() != 1 {
+            return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
+        }
+        Ok((planes, sample_type, spec.expression.is_none()))
+    }
+
+    /// One item's bands over the tile: its assets read together, stacked in the order asked
+    /// for, then the request's band math.
+    async fn item(&self, engine: &TileEngine, hrefs: &[String]) -> Result<ItemBands, EngineError> {
+        let mut reads: Vec<Reading<'_, AssetRead>> = Vec::with_capacity(hrefs.len());
+        for (href, spec) in hrefs.iter().zip(&self.assets) {
+            reads.push(Box::pin(self.asset(engine, href, spec)));
+        }
+        let parts = futures_util::future::try_join_all(reads).await?;
+        let sample_type = parts.first().map_or(SampleType::Uint8, |(_, st, _)| *st);
+        let integer = self.expression.is_none()
+            && !self.request.unscale
+            && parts.iter().all(|(_, st, own)| *own && !matches!(st, SampleType::Float32 | SampleType::Float64));
+        let mut bands: Vec<Vec<f32>> = parts.into_iter().flat_map(|(planes, _, _)| planes).collect();
+        if let Some(expression) = &self.expression {
+            bands = band_math(expression, &bands)?;
+        }
+        Ok(ItemBands { bands, integer, sample_type })
+    }
+
+    /// The mosaic of the items' bands, and the first raster's sample type. Items are read
+    /// up to eight at once and taken in order; only `first` stops before the last of them.
+    async fn mosaic(
+        &self,
+        engine: &TileEngine,
+        scenes: &[Vec<String>],
+    ) -> Result<Option<(Selected, SampleType)>, EngineError> {
+        use futures_util::StreamExt;
+        let pixels = (self.request.tile_size as usize).pow(2);
+        let mut reading: futures_util::stream::FuturesOrdered<Reading<'_, ItemBands>> =
+            futures_util::stream::FuturesOrdered::new();
+        let mut next = 0;
+        let mut fold: Option<(Fold, SampleType)> = None;
+        loop {
+            while reading.len() < MOSAIC_SCENES_AHEAD && next < scenes.len() {
+                reading.push_back(Box::pin(self.item(engine, &scenes[next])));
+                next += 1;
+            }
+            let Some(item) = reading.next().await else {
+                break;
+            };
+            let item = item?;
+            let (fold, _) = match &mut fold {
+                Some(fold) => fold,
+                None => {
+                    let bands = item.bands.len();
+                    if bands == 0 || (self.selection.by_last_band() && bands < 2) {
+                        return Err(EngineError::BadRequest(
+                            "pixel_selection by the last band needs at least two bands".into(),
+                        ));
+                    }
+                    if Fold::<f32>::held_bytes(self.selection, scenes.len(), bands, pixels) > MAX_HELD_BYTES {
+                        return Err(EngineError::BadRequest(format!(
+                            "{} items are too many for a median at this tile size; narrow the search or lower items_limit",
+                            scenes.len()
+                        )));
+                    }
+                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer), item.sample_type))
+                }
+            };
+            if item.bands.len() != fold.bands() {
+                return Err(EngineError::BadRequest(
+                    "the items under the tile do not have the same number of bands".into(),
+                ));
+            }
+            fold.add(item.bands.iter().flatten().copied());
+            if fold.is_done() {
+                break;
+            }
+        }
+        Ok(fold.and_then(|(fold, sample_type)| fold.finish().map(|selected| (selected, sample_type))))
+    }
+}
+
+/// Colours for the bands a mosaic of planes leaves, as TiTiler encodes them: one band
+/// through the colour map, three as red, green and blue, and two as red and green with
+/// the mask for blue (what GDAL makes of two bands and a mask). `Err` is a number of bands
+/// no image format holds.
+fn paint_bands(
+    selected: &Selected,
+    pixels: usize,
+    rescale: &[(f32, f32)],
+    default: (f32, f32),
+    colormap: ColormapName,
+) -> Result<Vec<u8>, usize> {
+    // One range is for every band; several are one each.
+    let range = |band: usize| match rescale {
+        [] => default,
+        [one] => *one,
+        several => several.get(band).copied().unwrap_or(several[0]),
+    };
+    match selected.bands {
+        1 => {
+            let (min, max) = range(0);
+            Ok(Paint::Gray { min, max, colormap }.rgba(selected, pixels))
+        }
+        3 => {
+            let (r, g, b) = (range(0), range(1), range(2));
+            Ok(Paint::Rgb { min: [r.0, g.0, b.0], max: [r.1, g.1, b.1] }.rgba(selected, pixels))
+        }
+        2 => {
+            let byte = |v: f32, (min, max): (f32, f32)| {
+                if v.is_nan() {
+                    0
+                } else {
+                    ((v - min) * (255.0 / cogzilla_kernel::safe_rescale_denom(min, max))).clamp(0.0, 255.0) as u8
+                }
+            };
+            let mut out = vec![255u8; pixels * 4];
+            for (i, px) in out.chunks_exact_mut(4).enumerate() {
+                let (a, b) = (selected.values[i], selected.values[pixels + i]);
+                px[0] = byte(a, range(0));
+                px[1] = byte(b, range(1));
+                px[2] = if a.is_nan() && b.is_nan() { 0 } else { 255 };
+            }
+            Ok(out)
+        }
+        other => Err(other),
+    }
+}
+
+/// Bring the assets and their options to what the tile and image renderer takes, and
+/// give back the asset names. The renderer reads either the bands of one raster or the
+/// first band of several, so it can honour `bidx` and band math on a single asset, and
+/// `bidx=1` on each of several. Anything else is refused rather than drawn differently:
+/// tiles do not come here with it ([`wants_planes`]), `bbox` and `feature` images do.
+fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>, Resp> {
+    let unsupported = |what: &str| {
+        detail(StatusCode::BAD_REQUEST, format!("{what} is not supported on bbox and feature images yet (tiles take it)"))
+    };
+    // TiTiler 2 takes band indexes per asset only; a bare `bidx` is passed over.
+    pq.bidx.clear();
+    let names = expression_names(pq, query)?;
+    pq.assets = names.clone();
+    if names.len() > MAX_ASSETS_PER_SCENE {
+        return Err(unsupported(&format!("more than {MAX_ASSETS_PER_SCENE} assets per item")));
+    }
+    if query.selection.is_some_and(Selection::by_last_band) {
+        return Err(unsupported("pixel_selection by the last band"));
     }
     match query.assets.as_slice() {
         [one] => {
@@ -2902,7 +3128,10 @@ async fn tile(
         Ok(q) => q,
         Err(r) => return r,
     };
-    let names = match renderer_assets(&mut pq, &query) {
+    // What the renderer cannot draw in one pass is made from planes instead.
+    let planes_wanted = wants_planes(&pq, &query);
+    let names = if planes_wanted { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
+    let names = match names {
         Ok(names) => names,
         Err(r) => return r,
     };
@@ -2941,6 +3170,7 @@ async fn tile(
     let return_mask = pq.return_mask;
     let jpeg_quality = pq.jpeg_quality;
     let engine = ctx.engine;
+    let specs = query.assets;
     let cache_key = format!("{}?{}", ctx.path, ctx.raw_query);
     let rendered = engine
         .tile_cache
@@ -2959,6 +3189,105 @@ async fn tile(
             let full = first.index.full_res();
             if asset_as_band && full.samples_per_pixel > 1 {
                 return Err(EngineError::BadRequest("Can't use `asset_as_band` for multibands asset".into()));
+            }
+            let formula = pq
+                .color_formula
+                .as_deref()
+                .map(cogzilla_kernel::ColorFormula::parse)
+                .transpose()
+                .map_err(EngineError::BadRequest)?;
+            // Assets that do not lie on one grid cannot be read as the bands of one image.
+            let mut one_grid = true;
+            if !planes_wanted && scenes[0].len() > 1 {
+                let mut cogs = vec![first.clone()];
+                for uri in &scenes[0][1..] {
+                    cogs.push(engine.store.open_uri(uri).await?);
+                }
+                one_grid = TileEngine::on_one_grid(&cogs);
+            }
+            if planes_wanted || !one_grid {
+                let dim = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
+                if dim != 256 && dim != 512 {
+                    return Err(EngineError::BadRequest(format!(
+                        "tilesize={dim} is not supported on mosaic routes (use 256 or 512)"
+                    )));
+                }
+                if pq.algorithm.is_some() {
+                    return Err(EngineError::BadRequest(
+                        "`algorithm` is not supported with these assets and options yet".into(),
+                    ));
+                }
+                let asked = if auto_format {
+                    None
+                } else {
+                    let (format, content_type) = parse_ext_format(&explicit, None, jpeg_quality)?;
+                    if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
+                        return Err(EngineError::BadRequest(
+                            "raw array formats are not supported with these assets and options yet".into(),
+                        ));
+                    }
+                    Some((format, if explicit == "jpg" { "image/jpg" } else { content_type }))
+                };
+                let job = PlanesTile {
+                    assets: specs.clone(),
+                    as_band: asset_as_band,
+                    expression: pq.expr_raw.clone(),
+                    selection: selection.unwrap_or(Selection::First),
+                    resampling,
+                    reproject,
+                    request: crate::engine::TileRequest {
+                        tile,
+                        tile_size: dim,
+                        bands: BandRequest::Single { band_1based: 1, rescale: (0.0, 255.0), colormap: ColormapName::Grayscale },
+                        resample: reproject,
+                        format: OutputFormat::RawF32,
+                        unscale: pq.unscale,
+                    },
+                };
+                let pixels = (dim as usize).pow(2);
+                let (rgba, bands) = match job.mosaic(engine, &scenes).await? {
+                    None => (vec![0u8; pixels * 4], 1),
+                    Some((selected, sample_type)) => {
+                        // Without `rescale`: the type's own range for a raster's numbers,
+                        // and the renderer's default for band math.
+                        let math = job.expression.is_some() || job.assets.iter().any(|a| a.expression.is_some());
+                        let default = if math {
+                            (-1.0, 1.0)
+                        } else {
+                            super::default_rescale_for_dtype(sample_type, selected.bands == 1)
+                        };
+                        let shape = |bands: usize, driver: &str| {
+                            EngineError::BadRequest(format!(
+                                "Could not encode array of shape ({bands},{dim},{dim}) and of datatype `uint8` using {driver} driver"
+                            ))
+                        };
+                        // The driver TiTiler would have tried: the one asked for, or JPEG
+                        // when every pixel is there and PNG when not.
+                        let driver = match asked {
+                            Some((OutputFormat::Jpeg { .. }, _)) => "JPEG",
+                            Some((OutputFormat::Webp { .. }, _)) => "WEBP",
+                            Some(_) => "PNG",
+                            None => {
+                                let per_band = selected.values.len() / selected.bands.max(1);
+                                let full = (0..per_band).all(|i| {
+                                    selected.values.iter().skip(i).step_by(per_band).any(|v| !v.is_nan())
+                                });
+                                if full { "JPEG" } else { "PNG" }
+                            }
+                        };
+                        let rgba = paint_bands(&selected, pixels, &pq.rescale, default, pq.colormap)
+                            .map_err(|bands| shape(bands, driver))?;
+                        (rgba, selected.bands)
+                    }
+                };
+                let picture = encode_picture(rgba, dim as usize, formula.as_ref(), asked, jpeg_quality, return_mask)?;
+                // Two bands and a mask are three bands to GDAL, and JPEG has no such picture.
+                if bands == 2 && picture.1.starts_with("image/jp") {
+                    return Err(EngineError::BadRequest(format!(
+                        "Could not encode array of shape (2,{dim},{dim}) and of datatype `uint8` using JPEG driver"
+                    )));
+                }
+                return Ok(picture);
             }
             let default_bands = if scenes[0].len() > 1 {
                 scenes[0].len() as u16
@@ -2988,18 +3317,12 @@ async fn tile(
                     treq.tile_size
                 )));
             }
-            let formula = pq
-                .color_formula
-                .as_deref()
-                .map(cogzilla_kernel::ColorFormula::parse)
-                .transpose()
-                .map_err(EngineError::BadRequest)?;
             let dim = treq.tile_size as usize;
             let raw_array = matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy);
             // TiTiler names the media type after the extension that was asked for.
             let content_type = if explicit == "jpg" { "image/jpg" } else { content_type };
             let asked = treq.format;
-            let mut rgba = if let Some(method) = selection {
+            let rgba = if let Some(method) = selection {
                 // Every scene's values, then rio-tiler's arithmetic over them, then colour.
                 let paint = Paint::of(&treq.bands).ok_or_else(|| {
                     EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
@@ -3035,23 +3358,38 @@ async fn tile(
                 treq.format = OutputFormat::RawRgba;
                 engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?.to_vec()
             };
-            if let Some(formula) = &formula {
-                formula.apply_buffer_in_place(&mut rgba, 4);
-            }
-            // With no format asked for, TiTiler sends JPEG when every pixel is there and PNG when not.
-            let (format, content_type) = if auto_format {
-                let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
-                parse_ext_format(if opaque { "jpg" } else { "png" }, None, jpeg_quality)?
-            } else {
-                (asked, content_type)
-            };
-            Ok((encode_rgba_output(dim, dim, &rgba, format, return_mask), content_type))
+            let asked = (!auto_format).then_some((asked, content_type));
+            encode_picture(rgba, dim, formula.as_ref(), asked, jpeg_quality, return_mask)
         })
         .await;
     match rendered {
         Ok(tile) => to_http_response_cached(engine, Ok(tile), ctx.if_none_match),
         Err(e) => engine_error(&e),
     }
+}
+
+/// A square RGBA picture as the response's bytes and media type: the colour formula, then
+/// the format asked for or, with none, TiTiler's choice of JPEG when every pixel is there
+/// and PNG when not.
+fn encode_picture(
+    mut rgba: Vec<u8>,
+    dim: usize,
+    formula: Option<&cogzilla_kernel::ColorFormula>,
+    asked: Option<(OutputFormat, &'static str)>,
+    jpeg_quality: u8,
+    return_mask: bool,
+) -> Result<(Bytes, &'static str), EngineError> {
+    if let Some(formula) = formula {
+        formula.apply_buffer_in_place(&mut rgba, 4);
+    }
+    let (format, content_type) = match asked {
+        Some(asked) => asked,
+        None => {
+            let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
+            parse_ext_format(if opaque { "jpg" } else { "png" }, None, jpeg_quality)?
+        }
+    };
+    Ok((encode_rgba_output(dim, dim, &rgba, format, return_mask), content_type))
 }
 
 /// What the router does with `/collections/{c}/items/{i}/...`.
@@ -4286,6 +4624,41 @@ mod tests {
     }
 
     #[test]
+    fn bands_are_painted_as_titiler_encodes_them() {
+        let nan = f32::NAN;
+        let ranges = [(0.0, 100.0), (0.0, 10.0), (0.0, 1.0)];
+        // One range is for every band, several are one each, none is the default.
+        let one = Selected { bands: 1, values: vec![50.0, nan] };
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale).unwrap(), [127, 127, 127, 255, 0, 0, 0, 0]);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale).unwrap()[..4], [255, 255, 255, 255]);
+        let three = Selected { bands: 3, values: vec![50.0, 5.0, 0.5] };
+        assert_eq!(paint_bands(&three, 1, &ranges, (0.0, 1.0), ColormapName::Grayscale).unwrap(), [127, 127, 127, 255]);
+        assert_eq!(paint_bands(&three, 1, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale).unwrap(), [127, 12, 1, 255]);
+        // Two bands: red and green, and the mask for blue; never transparent.
+        let two = Selected { bands: 2, values: vec![50.0, nan, nan, 5.0, 10.0, nan] };
+        assert_eq!(
+            paint_bands(&two, 3, &ranges[..2], (0.0, 1.0), ColormapName::Grayscale).unwrap(),
+            [127, 127, 255, 255, 0, 255, 255, 255, 0, 0, 0, 255]
+        );
+        // Four bands and more are no picture.
+        let four = Selected { bands: 4, values: vec![1.0; 4] };
+        assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale).unwrap_err(), 4);
+    }
+
+    #[test]
+    fn band_math_is_over_whole_planes() {
+        let bands = [vec![1.0f32, 2.0, f32::NAN, 4.0], vec![3.0, 0.0, 1.0, 4.0]];
+        let out = band_math("(b2-b1)/(b2+b1);b1/b2", &bands).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][0], 0.5);
+        assert_eq!(out[0][1], -1.0);
+        assert!(out[0][2].is_nan(), "no data in, no data out");
+        assert_eq!(out[0][3], 0.0);
+        assert!(out[1][1].is_nan(), "a division by zero is no data");
+        assert!(band_math("b3", &bands).is_err());
+    }
+
+    #[test]
     fn part_sizes_follow_rio_tiler() {
         // A 0.2 by 0.1 degree box over data whose resolution makes it 1802 by 901 pixels.
         let bbox = [8.4, 45.7, 8.6, 45.8];
@@ -4517,7 +4890,30 @@ mod tests {
         );
         // Band math is over b1..bn; asset names are refused as TiTiler refuses them.
         assert_eq!(run("assets=red&assets=nir&expression=nir-red").unwrap_err(), StatusCode::BAD_REQUEST);
-        // What the renderer cannot draw yet is refused, not drawn differently.
+        // What the renderer cannot draw is refused, not drawn differently. On tiles all of
+        // it is made from planes instead, and nothing else is.
+        let planes = |q: &str| {
+            let pq = super::super::parse_query(Some(q));
+            wants_planes(&pq, &check_mosaic_query(&pq, &query_pairs(q)).unwrap())
+        };
+        for q in [
+            "assets=visual",
+            "assets=visual%7Cbidx%3D3,2,1",
+            "assets=red%7Cexpression%3Db1*2",
+            "assets=red&assets=green&assets=blue",
+            "assets=red%7Cbidx%3D1&assets=nir&asset_as_band=true&expression=b2-b1",
+            "assets=visual&pixel_selection=median",
+        ] {
+            assert!(run(q).is_ok() && !planes(q), "{q}");
+        }
+        for q in [
+            "assets=red&assets=nir",
+            "assets=red&assets=green&assets=blue&assets=nir",
+            "assets=visual&pixel_selection=lastbandlow",
+            "assets=red&assets=nir&expression=b1;b2",
+        ] {
+            assert!(planes(q), "{q}");
+        }
         for q in [
             "assets=visual%7Cbidx%3D2&assets=nir",
             "assets=visual%7Cbidx%3D1,2",
@@ -4527,6 +4923,7 @@ mod tests {
             "assets=red%7Cexpression%3Db1*2&expression=b1%2B1",
         ] {
             assert_eq!(run(q).unwrap_err(), StatusCode::BAD_REQUEST, "{q}");
+            assert!(planes(q), "{q}");
         }
         assert_eq!(run("assets=red&asset_as_band=perhaps").unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
         // An `assets` that names nothing is a missing parameter.

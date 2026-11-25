@@ -1695,6 +1695,86 @@ impl TileEngine {
         }
     }
 
+    /// Whether rasters lie on one grid, pixel for pixel at every overview, so that they can
+    /// be read as the bands of one image.
+    pub fn on_one_grid(cogs: &[Arc<OpenedCog>]) -> bool {
+        let Some(first) = cogs.first() else {
+            return true;
+        };
+        cogs.iter().all(|c| c.index.ifds.len() == first.index.ifds.len())
+            && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
+    }
+
+    /// Bands of one raster over a tile, each a plane of `f32` on the tile's grid whatever
+    /// the raster's own, NaN where it has no data. An empty `bands_1based` asks for every
+    /// band. `req` gives the tile, its size and `unscale`; `resampling` is used for a raster
+    /// already in the tile's projection and `reproject` for one that has to be warped into
+    /// it. The raster's sample type comes back with the planes.
+    pub async fn raster_planes(
+        &self,
+        uri: &str,
+        bands_1based: &[u16],
+        req: &TileRequest,
+        resampling: ResampleMode,
+        reproject: ResampleMode,
+    ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
+        let cog = self.store.open_uri(uri).await?;
+        let full = cog.index.full_res();
+        let (count, sample_type) = (full.samples_per_pixel, full.sample_type);
+        let wanted: Vec<u16> =
+            if bands_1based.is_empty() { (1..=count).collect() } else { bands_1based.to_vec() };
+        if let Some(bad) = wanted.iter().find(|b| **b == 0 || **b > count) {
+            let known: Vec<String> = (1..=count).map(|b| b.to_string()).collect();
+            let tail = if count == 1 { "," } else { "" };
+            return Err(EngineError::BadRequest(format!(
+                "band index {bad} out of range (not in ({}{tail}))",
+                known.join(", ")
+            )));
+        }
+        let mut one = req.clone();
+        one.format = OutputFormat::RawF32;
+        one.resample = match self.get_or_build_crs(&cog)? {
+            CrsModel::Epsg3857 => resampling,
+            _ => reproject,
+        };
+        let pixels = (req.tile_size as usize).pow(2);
+        let mut planes = Vec::with_capacity(wanted.len());
+        // Three bands at a time where there are three, which is one pass over the raster.
+        for group in wanted.chunks(3) {
+            let requests: Vec<BandRequest> = match group {
+                [a, b, c] => vec![BandRequest::Rgb {
+                    bands_1based: [*a, *b, *c],
+                    rescale_min: [0.0; 3],
+                    rescale_max: [255.0; 3],
+                }],
+                few => few
+                    .iter()
+                    .map(|b| BandRequest::Single {
+                        band_1based: *b,
+                        rescale: (0.0, 255.0),
+                        colormap: ColormapName::Grayscale,
+                    })
+                    .collect(),
+            };
+            for bands in requests {
+                one.bands = bands;
+                let values = self.render_tile(&cog, &one).await?;
+                if values.len() % (pixels * 4) != 0 {
+                    return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
+                }
+                for plane in values.chunks_exact(pixels * 4) {
+                    planes.push(
+                        plane.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect(),
+                    );
+                }
+            }
+        }
+        if planes.len() != wanted.len() {
+            return Err(EngineError::BadRequest("unexpected number of planes from the renderer".into()));
+        }
+        Ok((planes, sample_type))
+    }
+
     /// How many bands of values a request's scenes hold: three for a colour composite, else one.
     pub fn value_bands(bands: &BandRequest) -> usize {
         match bands {
