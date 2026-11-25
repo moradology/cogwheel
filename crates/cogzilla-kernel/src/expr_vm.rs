@@ -8,15 +8,32 @@ pub enum Op {
     Sub,
     Mul,
     Div,
+    Mod,
     Pow,
+    BitAnd,
+    BitOr,
+    BitNot,
     Neg,
     Log10,
     Ln,
     Log2,
+    Log1p,
     Db,
     Exp,
+    Expm1,
     Sqrt,
     Abs,
+    Sign,
+    Sin,
+    Cos,
+    Tan,
+    Arcsin,
+    Arccos,
+    Arctan,
+    Arctan2,
+    Sinh,
+    Cosh,
+    Tanh,
     Min,
     Max,
     Clip,
@@ -96,7 +113,11 @@ impl ExprProgram {
                 | Op::Sub
                 | Op::Mul
                 | Op::Div
+                | Op::Mod
                 | Op::Pow
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::Arctan2
                 | Op::Min
                 | Op::Max
                 | Op::Lt
@@ -165,6 +186,17 @@ impl ExprProgram {
                         stack[sp - 1] / d
                     };
                 }
+                Op::Mod => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() || b.abs() < 1e-12 {
+                        f32::NAN
+                    } else {
+                        let r = a % b;
+                        if r != 0.0 && (r < 0.0) != (b < 0.0) { r + b } else { r }
+                    };
+                }
                 Op::Pow => {
                     sp -= 1;
                     let a = stack[sp - 1];
@@ -173,6 +205,36 @@ impl ExprProgram {
                         f32::NAN
                     } else {
                         a.powf(b)
+                    };
+                }
+                Op::BitAnd => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() {
+                        f32::NAN
+                    } else {
+                        ((a as i64) & (b as i64)) as f32
+                    };
+                }
+                Op::BitOr => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() {
+                        f32::NAN
+                    } else {
+                        ((a as i64) | (b as i64)) as f32
+                    };
+                }
+                Op::BitNot => {
+                    let x = stack[sp - 1];
+                    stack[sp - 1] = if x.is_nan() {
+                        f32::NAN
+                    } else if x == 0.0 {
+                        1.0
+                    } else {
+                        0.0
                     };
                 }
                 Op::Neg => {
@@ -190,11 +252,18 @@ impl ExprProgram {
                     let x = stack[sp - 1];
                     stack[sp - 1] = if x > 0.0 { x.log2() } else { f32::NAN };
                 }
+                Op::Log1p => {
+                    let x = stack[sp - 1];
+                    stack[sp - 1] = if x > -1.0 { x.ln_1p() } else { f32::NAN };
+                }
                 Op::Db => {
                     stack[sp - 1] = fast_db_from_power(stack[sp - 1]);
                 }
                 Op::Exp => {
                     stack[sp - 1] = stack[sp - 1].exp();
+                }
+                Op::Expm1 => {
+                    stack[sp - 1] = stack[sp - 1].exp_m1();
                 }
                 Op::Sqrt => {
                     let x = stack[sp - 1];
@@ -202,6 +271,53 @@ impl ExprProgram {
                 }
                 Op::Abs => {
                     stack[sp - 1] = stack[sp - 1].abs();
+                }
+                Op::Sign => {
+                    let x = stack[sp - 1];
+                    stack[sp - 1] = if x.is_nan() {
+                        f32::NAN
+                    } else if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                }
+                Op::Sin => {
+                    stack[sp - 1] = stack[sp - 1].sin();
+                }
+                Op::Cos => {
+                    stack[sp - 1] = stack[sp - 1].cos();
+                }
+                Op::Tan => {
+                    stack[sp - 1] = stack[sp - 1].tan();
+                }
+                Op::Arcsin => {
+                    let x = stack[sp - 1];
+                    stack[sp - 1] = if (-1.0..=1.0).contains(&x) { x.asin() } else { f32::NAN };
+                }
+                Op::Arccos => {
+                    let x = stack[sp - 1];
+                    stack[sp - 1] = if (-1.0..=1.0).contains(&x) { x.acos() } else { f32::NAN };
+                }
+                Op::Arctan => {
+                    stack[sp - 1] = stack[sp - 1].atan();
+                }
+                Op::Arctan2 => {
+                    sp -= 1;
+                    let a = stack[sp - 1];
+                    let b = stack[sp];
+                    stack[sp - 1] = if a.is_nan() || b.is_nan() { f32::NAN } else { a.atan2(b) };
+                }
+                Op::Sinh => {
+                    stack[sp - 1] = stack[sp - 1].sinh();
+                }
+                Op::Cosh => {
+                    stack[sp - 1] = stack[sp - 1].cosh();
+                }
+                Op::Tanh => {
+                    stack[sp - 1] = stack[sp - 1].tanh();
                 }
                 Op::Min => {
                     sp -= 1;
@@ -470,6 +586,22 @@ impl ExprProgram {
                         lhs[i] = if d.abs() < 1e-12 { f32::NAN } else { lhs[i] / d };
                     }
                 }
+                Op::Mod => {
+                    sp -= 1;
+                    let (lo, hi) = stack.split_at_mut(sp);
+                    let lhs = &mut lo[sp - 1];
+                    let rhs = &hi[0];
+                    for i in 0..N {
+                        let a = lhs[i];
+                        let b = rhs[i];
+                        lhs[i] = if a.is_nan() || b.is_nan() || b.abs() < 1e-12 {
+                            f32::NAN
+                        } else {
+                            let r = a % b;
+                            if r != 0.0 && (r < 0.0) != (b < 0.0) { r + b } else { r }
+                        };
+                    }
+                }
                 Op::Pow => {
                     sp -= 1;
                     let (lo, hi) = stack.split_at_mut(sp);
@@ -482,6 +614,49 @@ impl ExprProgram {
                             f32::NAN
                         } else {
                             a.powf(b)
+                        };
+                    }
+                }
+                Op::BitAnd => {
+                    sp -= 1;
+                    let (lo, hi) = stack.split_at_mut(sp);
+                    let lhs = &mut lo[sp - 1];
+                    let rhs = &hi[0];
+                    for i in 0..N {
+                        let a = lhs[i];
+                        let b = rhs[i];
+                        lhs[i] = if a.is_nan() || b.is_nan() {
+                            f32::NAN
+                        } else {
+                            ((a as i64) & (b as i64)) as f32
+                        };
+                    }
+                }
+                Op::BitOr => {
+                    sp -= 1;
+                    let (lo, hi) = stack.split_at_mut(sp);
+                    let lhs = &mut lo[sp - 1];
+                    let rhs = &hi[0];
+                    for i in 0..N {
+                        let a = lhs[i];
+                        let b = rhs[i];
+                        lhs[i] = if a.is_nan() || b.is_nan() {
+                            f32::NAN
+                        } else {
+                            ((a as i64) | (b as i64)) as f32
+                        };
+                    }
+                }
+                Op::BitNot => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        let x = s[i];
+                        s[i] = if x.is_nan() {
+                            f32::NAN
+                        } else if x == 0.0 {
+                            1.0
+                        } else {
+                            0.0
                         };
                     }
                 }
@@ -512,6 +687,13 @@ impl ExprProgram {
                         s[i] = if x > 0.0 { x.log2() } else { f32::NAN };
                     }
                 }
+                Op::Log1p => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        let x = s[i];
+                        s[i] = if x > -1.0 { x.ln_1p() } else { f32::NAN };
+                    }
+                }
                 Op::Db => {
                     let s = &mut stack[sp - 1];
                     for i in 0..N {
@@ -522,6 +704,12 @@ impl ExprProgram {
                     let s = &mut stack[sp - 1];
                     for i in 0..N {
                         s[i] = s[i].exp();
+                    }
+                }
+                Op::Expm1 => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].exp_m1();
                     }
                 }
                 Op::Sqrt => {
@@ -535,6 +723,88 @@ impl ExprProgram {
                     let s = &mut stack[sp - 1];
                     for i in 0..N {
                         s[i] = s[i].abs();
+                    }
+                }
+                Op::Sign => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        let x = s[i];
+                        s[i] = if x.is_nan() {
+                            f32::NAN
+                        } else if x > 0.0 {
+                            1.0
+                        } else if x < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+                Op::Sin => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].sin();
+                    }
+                }
+                Op::Cos => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].cos();
+                    }
+                }
+                Op::Tan => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].tan();
+                    }
+                }
+                Op::Arcsin => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        let x = s[i];
+                        s[i] = if (-1.0..=1.0).contains(&x) { x.asin() } else { f32::NAN };
+                    }
+                }
+                Op::Arccos => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        let x = s[i];
+                        s[i] = if (-1.0..=1.0).contains(&x) { x.acos() } else { f32::NAN };
+                    }
+                }
+                Op::Arctan => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].atan();
+                    }
+                }
+                Op::Arctan2 => {
+                    sp -= 1;
+                    let (lo, hi) = stack.split_at_mut(sp);
+                    let lhs = &mut lo[sp - 1];
+                    let rhs = &hi[0];
+                    for i in 0..N {
+                        let a = lhs[i];
+                        let b = rhs[i];
+                        lhs[i] = if a.is_nan() || b.is_nan() { f32::NAN } else { a.atan2(b) };
+                    }
+                }
+                Op::Sinh => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].sinh();
+                    }
+                }
+                Op::Cosh => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].cosh();
+                    }
+                }
+                Op::Tanh => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].tanh();
                     }
                 }
                 Op::Min => {
@@ -715,6 +985,10 @@ enum Tok {
     Minus,
     Star,
     Slash,
+    Percent,
+    Amp,
+    Pipe,
+    Tilde,
     Caret,
     LParen,
     RParen,
@@ -757,6 +1031,22 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             }
             '/' => {
                 out.push(Tok::Slash);
+                i += 1;
+            }
+            '%' => {
+                out.push(Tok::Percent);
+                i += 1;
+            }
+            '&' => {
+                out.push(Tok::Amp);
+                i += 1;
+            }
+            '|' => {
+                out.push(Tok::Pipe);
+                i += 1;
+            }
+            '~' => {
+                out.push(Tok::Tilde);
                 i += 1;
             }
             '^' => {
@@ -879,7 +1169,7 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) -> Result<(), String> {
         self.enter()?;
         let res = (|| {
-            self.parse_add_sub()?;
+            self.parse_bitor()?;
             while let Some(tok) = self.peek().cloned() {
                 let op = match tok {
                     Tok::Lt => Op::Lt,
@@ -891,13 +1181,33 @@ impl<'a> Parser<'a> {
                     _ => break,
                 };
                 self.pos += 1;
-                self.parse_add_sub()?;
+                self.parse_bitor()?;
                 self.ops.push(op);
             }
             Ok(())
         })();
         self.depth -= 1;
         res
+    }
+
+    fn parse_bitor(&mut self) -> Result<(), String> {
+        self.parse_bitand()?;
+        while matches!(self.peek(), Some(Tok::Pipe)) {
+            self.pos += 1;
+            self.parse_bitand()?;
+            self.ops.push(Op::BitOr);
+        }
+        Ok(())
+    }
+
+    fn parse_bitand(&mut self) -> Result<(), String> {
+        self.parse_add_sub()?;
+        while matches!(self.peek(), Some(Tok::Amp)) {
+            self.pos += 1;
+            self.parse_add_sub()?;
+            self.ops.push(Op::BitAnd);
+        }
+        Ok(())
     }
 
     fn parse_add_sub(&mut self) -> Result<(), String> {
@@ -934,6 +1244,11 @@ impl<'a> Parser<'a> {
                     self.parse_unary()?;
                     self.ops.push(Op::Div);
                 }
+                Tok::Percent => {
+                    self.pos += 1;
+                    self.parse_unary()?;
+                    self.ops.push(Op::Mod);
+                }
                 _ => break,
             }
         }
@@ -953,6 +1268,12 @@ impl<'a> Parser<'a> {
             Some(Tok::Plus) => {
                 self.pos += 1;
                 self.parse_unary()
+            }
+            Some(Tok::Tilde) => {
+                self.pos += 1;
+                self.parse_unary()?;
+                self.ops.push(Op::BitNot);
+                Ok(())
             }
             _ => self.parse_power(),
         };
@@ -1015,10 +1336,23 @@ impl<'a> Parser<'a> {
                         ("log10", 1) => Op::Log10,
                         ("ln" | "log", 1) => Op::Ln,
                         ("log2", 1) => Op::Log2,
+                        ("log1p", 1) => Op::Log1p,
                         ("db", 1) => Op::Db,
                         ("exp", 1) => Op::Exp,
+                        ("expm1", 1) => Op::Expm1,
                         ("sqrt", 1) => Op::Sqrt,
                         ("abs", 1) => Op::Abs,
+                        ("sign", 1) => Op::Sign,
+                        ("sin", 1) => Op::Sin,
+                        ("cos", 1) => Op::Cos,
+                        ("tan", 1) => Op::Tan,
+                        ("arcsin" | "asin", 1) => Op::Arcsin,
+                        ("arccos" | "acos", 1) => Op::Arccos,
+                        ("arctan" | "atan", 1) => Op::Arctan,
+                        ("arctan2" | "atan2", 2) => Op::Arctan2,
+                        ("sinh", 1) => Op::Sinh,
+                        ("cosh", 1) => Op::Cosh,
+                        ("tanh", 1) => Op::Tanh,
                         ("ceil", 1) => Op::Ceil,
                         ("floor", 1) => Op::Floor,
                         ("round", 1) => Op::Round,
@@ -1130,6 +1464,12 @@ mod tests {
             "std(b1, b2, b3)",
             "var(b1, b2, b3)",
             "std(b1)",
+            "sin(b1) + cos(b2) + tan(b3)",
+            "arcsin(clip(b1, -1, 1)) + arccos(clip(b2, -1, 1)) + arctan(b3)",
+            "arctan2(b1, b2) + sinh(b1) + cosh(b2) + tanh(b3)",
+            "log1p(b1) + expm1(b2) + sign(b1 - b2)",
+            "(b1 * 100) % 7",
+            "where((b1 > 0.5) & (b2 < 1.0), 1, ~(b3 == 0) | 0)",
         ];
         // Verify exact 4-band median (differs from mean!) and 1-band std NaN masking
         let med4 = ExprProgram::compile("median(b1, b2, b3, b4)").unwrap();
