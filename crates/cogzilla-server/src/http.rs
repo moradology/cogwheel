@@ -6382,6 +6382,10 @@ where
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
+            // titiler-pgstac has no viewer on an item.
+            (Method::GET, ["viewer"]) if stac_prefix != "stac" => {
+                Err(EngineError::NotFound("Not Found".into()))
+            }
             (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) | (Method::GET, ["viewer"]) => {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let tj_url =

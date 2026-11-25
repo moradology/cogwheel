@@ -2351,10 +2351,11 @@ impl PlanesTile {
                 // An array of rescaled values and nothing else: each band's bytes, however
                 // many bands there are.
                 if matches!(look.asked, Some((OutputFormat::Npy, _))) && !look.mapped && look.custom.is_none() && look.formula.is_none() {
+                    // One range for each band when there are as many; the first for all otherwise.
                     let range = |band: usize| match look.rescale {
                         [] => default,
-                        [one] => *one,
-                        several => several.get(band).copied().unwrap_or(several[0]),
+                        several if several.len() == selected.bands => several[band],
+                        several => several[0],
                     };
                     let values: Vec<f32> = selected
                         .values
@@ -2647,11 +2648,12 @@ fn paint_bands(
     custom: Option<&MosaicColormap>,
     before_map: Option<&cogzilla_kernel::ColorFormula>,
 ) -> Result<Vec<u8>, usize> {
-    // One range is for every band; several are one each.
+    // One range for each band when there are as many of them; the first for all
+    // otherwise, as TiTiler has it.
     let range = |band: usize| match rescale {
         [] => default,
-        [one] => *one,
-        several => several.get(band).copied().unwrap_or(several[0]),
+        several if several.len() == selected.bands => several[band],
+        several => several[0],
     };
     match selected.bands {
         1 => {
@@ -3128,6 +3130,11 @@ async fn part_image_of(
             }
             let default_bands =
                 if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+            // The renderer's bands are one or three: ranges that are not one each are the
+            // first for all, as TiTiler has it (the shared routes refuse two for one band).
+            if pq.rescale.len() > 1 && pq.rescale.len() != 3 {
+                pq.rescale.truncate(1);
+            }
             let mut bands = build_band_request(&pq, default_bands, full.sample_type)?;
             // Every scene is drawn the same way, and the first says how the picture is finished.
             let taken = match &formula {
@@ -4751,6 +4758,16 @@ async fn tile(
             } else {
                 full.samples_per_pixel
             };
+            // The renderer's bands are one or three: ranges that are not one each are the
+            // first for all, as TiTiler has it (the shared routes refuse two for one band).
+            let pq = if pq.rescale.len() > 1 && pq.rescale.len() != 3 {
+                let mut first = pq.clone();
+                first.rescale.truncate(1);
+                std::borrow::Cow::Owned(first)
+            } else {
+                std::borrow::Cow::Borrowed(&pq)
+            };
+            let pq: &ParsedQuery = &pq;
             let (mut treq, content_type) = build_tile_request(
                 Some(&engine),
                 tile,
@@ -4806,10 +4823,26 @@ async fn tile(
                 treq.format = OutputFormat::RawF32;
                 let raw = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
                 if raw.len() == bands * dim * dim * 4 {
-                    let read = raw.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
-                    // With `rescale` the array is of the bytes a picture would show, band by band.
+                    // Several assets read as bands: the type that holds them all.
+                    let mut kind = full.sample_type;
+                    for uri in scenes[0].iter().skip(1) {
+                        kind = wider_type(kind, engine.store.open_uri(uri).await?.index.full_res().sample_type);
+                    }
+                    let kind = if pq.unscale { SampleType::Float32 } else { kind };
+                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    // A whole-number raster's values between pixels are rounded to its type.
+                    let read = raw
+                        .chunks_exact(4)
+                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                        .map(|v| if whole { v.round() } else { v });
+                    // With `rescale` the array is of the bytes a picture would show, band by
+                    // band, in the ranges the picture's bands were given.
                     if !pq.rescale.is_empty() {
-                        let range = |band: usize| pq.rescale.get(band).copied().unwrap_or(pq.rescale[0]);
+                        let range = |band: usize| match &treq.bands {
+                            BandRequest::Rgb { rescale_min, rescale_max, .. } => (rescale_min[band.min(2)], rescale_max[band.min(2)]),
+                            BandRequest::Single { rescale, .. } => *rescale,
+                            _ => pq.rescale[0],
+                        };
                         let values: Vec<f32> = read
                             .enumerate()
                             .map(|(i, v)| {
@@ -4819,10 +4852,7 @@ async fn tile(
                             .collect();
                         return Ok((npy_array(&values, bands, dim, dim, SampleType::Uint8, return_mask, None), content_type));
                     }
-                    let kind = if pq.unscale { SampleType::Float32 } else { full.sample_type };
-                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
-                    // A whole-number raster's values between pixels are rounded to its type.
-                    let values: Vec<f32> = read.map(|v| if whole { v.round() } else { v }).collect();
+                    let values: Vec<f32> = read.collect();
                     return Ok((npy_array(&values, bands, dim, dim, kind, return_mask, None), content_type));
                 }
                 treq.format = OutputFormat::Npy;
