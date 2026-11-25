@@ -8,8 +8,8 @@ use crate::colormap::{ColormapLut, ColormapName};
 use crate::expr_vm::ExprProgram;
 use crate::jpeg_fast::{empty_black_jpeg, encode_jpeg_rgb, encode_jpeg_rgba};
 use crate::png_fast::{
-    empty_transparent_png, encode_filtered_png, encode_indexed_png, filter_sub_rgb_row,
-    filter_sub_rgba_row, filter_sub_u8_row,
+    empty_transparent_png, encode_filtered_png, encode_indexed_png, filter_sub_ga_row,
+    filter_sub_rgb_row, filter_sub_rgba_row, filter_sub_u8_row,
 };
 
 #[inline]
@@ -1396,7 +1396,11 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                                 }
                             }
                         }
-                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                            encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
+                        } else {
+                            encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        }
                     });
                 }
                 OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
@@ -1532,7 +1536,11 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                                 &mut sc.img_buf[py * stride..(py + 1) * stride],
                             );
                         }
-                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                            encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
+                        } else {
+                            encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        }
                     });
                 }
                 OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
@@ -1600,7 +1608,6 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                     sc.row_buf.resize(N, 0);
                 }
                 if CLEAN {
-                    let plte = build_plte_opaque(lut);
                     for py in 0..N {
                         let row_idx = &mut sc.row_buf[..N];
                         for_each_pixel_in_row(plan, py, |px, u, v| {
@@ -1609,7 +1616,40 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         });
                         filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                     }
-                    encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                    if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                        encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
+                    } else {
+                        let plte = build_plte_opaque(lut);
+                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                    }
+                } else if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
+                    }
+                    if sc.row_buf.len() < N * 2 {
+                        sc.row_buf.resize(N * 2, 0);
+                    }
+                    for py in 0..N {
+                        let row_ga = &mut sc.row_buf[..N * 2];
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let val = sample_val::<BILINEAR, false>(src, u, v);
+                            let off = px * 2;
+                            if val.is_nan() {
+                                row_ga[off] = 0;
+                                row_ga[off + 1] = 0;
+                            } else {
+                                row_ga[off] = rescale_u8(val, inv_range, min_val);
+                                row_ga[off + 1] = 255;
+                            }
+                        });
+                        filter_sub_ga_row(
+                            row_ga,
+                            &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride],
+                        );
+                    }
+                    encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
                 } else {
                     let plte = build_plte_nodata(lut);
                     let inv_range_254 = 254.0 / range;

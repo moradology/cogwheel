@@ -3535,17 +3535,57 @@ pub(crate) fn encode_rgba_output(
     const MAX_TLS_SCRATCH: usize = 4 * 1024 * 1024;
     match format {
         OutputFormat::Png => {
+            let pixels = w.saturating_mul(h);
+            let is_gray = rgba
+                .chunks_exact(4)
+                .take(pixels)
+                .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+            let all_opaque = return_mask
+                && rgba.chunks_exact(4).take(pixels).all(|p| p[3] == 255);
             PNG_SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
-                let (ref mut filtered, ref mut rgb_row) = *guard;
-                let out = if !return_mask {
-                    let stride = 1 + w * 3;
+                let (ref mut filtered, ref mut row_buf) = *guard;
+                let out = if is_gray && (!return_mask || all_opaque) {
+                    let stride = 1 + w;
                     filtered.resize(h * stride, 0);
-                    rgb_row.resize(w * 3, 0);
+                    row_buf.resize(w, 0);
+                    for py in 0..h {
+                        let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
+                        for (src, dst) in src_row.chunks_exact(4).zip(row_buf.iter_mut()) {
+                            *dst = if src[3] != 0 { src[0] } else { 0 };
+                        }
+                        cogzilla_kernel::png_fast::filter_sub_u8_row(
+                            row_buf,
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
+                    }
+                    encode_filtered_png(w as u32, h as u32, 0, filtered)
+                } else if is_gray {
+                    let stride = 1 + w * 2;
+                    filtered.resize(h * stride, 0);
+                    row_buf.resize(w * 2, 0);
                     for py in 0..h {
                         let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
                         for (src, dst) in
-                            src_row.chunks_exact(4).zip(rgb_row.chunks_exact_mut(3))
+                            src_row.chunks_exact(4).zip(row_buf.chunks_exact_mut(2))
+                        {
+                            dst[0] = if src[3] != 0 { src[0] } else { 0 };
+                            dst[1] = src[3];
+                        }
+                        cogzilla_kernel::png_fast::filter_sub_ga_row(
+                            row_buf,
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
+                    }
+                    encode_filtered_png(w as u32, h as u32, 4, filtered)
+                } else if !return_mask {
+                    let stride = 1 + w * 3;
+                    filtered.resize(h * stride, 0);
+                    row_buf.resize(w * 3, 0);
+                    for py in 0..h {
+                        let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
+                        for (src, dst) in
+                            src_row.chunks_exact(4).zip(row_buf.chunks_exact_mut(3))
                         {
                             if src[3] != 0 {
                                 dst[0] = src[0];
@@ -3558,7 +3598,7 @@ pub(crate) fn encode_rgba_output(
                             }
                         }
                         filter_sub_rgb_row(
-                            rgb_row,
+                            row_buf,
                             &mut filtered[py * stride..(py + 1) * stride],
                         );
                     }
@@ -3577,8 +3617,8 @@ pub(crate) fn encode_rgba_output(
                 if filtered.capacity() > MAX_TLS_SCRATCH {
                     *filtered = Vec::new();
                 }
-                if rgb_row.capacity() > MAX_TLS_SCRATCH {
-                    *rgb_row = Vec::new();
+                if row_buf.capacity() > MAX_TLS_SCRATCH {
+                    *row_buf = Vec::new();
                 }
                 out
             })
