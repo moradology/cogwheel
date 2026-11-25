@@ -1817,7 +1817,7 @@ impl Window {
                 // are, and a band then comes from other pixels than it does in the whole
                 // raster; a band is the same band here either way.
                 let read =
-                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted)
+                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted, true)
                         .await?;
                 let mut planes = Vec::with_capacity(wanted.len());
                 for band in &wanted {
@@ -1871,7 +1871,7 @@ impl Window {
                 )));
             }
             // One road whatever bands are asked for: see the tile's reading above.
-            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true, &[]).await {
+            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true, &[], true).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -2776,7 +2776,7 @@ fn gdal_overview_level(sizes: &[(u32, u32)], native: (u64, u64), out: (usize, us
 /// GDAL's approximate transformer along one output row: the exact source position at the
 /// two ends, a straight line between them when the middle is within an eighth of a pixel
 /// of it, otherwise the same on each half. `exact` gives the position for a column.
-fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)]) {
+fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)], tolerance: f64) {
     let mut todo = vec![(0usize, out.len())];
     while let Some((lo, hi)) = todo.pop() {
         let points = hi - lo;
@@ -2791,7 +2791,7 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)])
         let span = (points - 1) as f64;
         let (du, dv) = ((u1 - u0) / span, (v1 - v0) / span);
         let error = (u0 + du * middle as f64 - um).abs() + (v0 + dv * middle as f64 - vm).abs();
-        if error.is_finite() && error <= 0.125 {
+        if error.is_finite() && error <= tolerance {
             for (k, slot) in out[lo..hi].iter_mut().enumerate() {
                 *slot = (u0 + du * k as f64, v0 + dv * k as f64);
             }
@@ -2806,6 +2806,10 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)])
         }
     }
 }
+
+/// How far, in source pixels, a position drawn along a row of a picture may be from the
+/// exact one. Positions within twice this of a source pixel's edge are worked out exactly.
+const PICTURE_TOLERANCE: f64 = 1.0 / 128.0;
 
 /// How GDAL goes about a warped read, which decides the pixels it takes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2851,6 +2855,7 @@ async fn warp_nearest(
     unscale: bool,
     pool: bool,
     only: &[u16],
+    every_pixel: bool,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
     // The grid the warp is worked out on, and how wide a stretch of a row GDAL
@@ -2916,8 +2921,9 @@ async fn warp_nearest(
             ifd.crs_to_pixel.forward(x, y)
         };
         if grid_row != worked_row {
+            let tolerance = if every_pixel { PICTURE_TOLERANCE } else { 0.125 };
             for (n, stretch) in row_positions.chunks_mut(block.max(1)).enumerate() {
-                approx_scanline(&|i| exact(n * block + i), stretch);
+                approx_scanline(&|i| exact(n * block + i), stretch, tolerance);
             }
             worked_row = grid_row;
         }
@@ -2927,6 +2933,18 @@ async fn warp_nearest(
             // A position less than a pixel outside the raster is worked out again exactly.
             if !inside(u, v) && u > -1.0 && v > -1.0 && u < w + 1.0 && v < h + 1.0 {
                 (u, v) = exact(grid_col);
+            } else if every_pixel && u.is_finite() && v.is_finite() {
+                // A position drawn between two exact ones is off by no more than the
+                // tolerance, which only matters next to the edge of a source pixel: there
+                // it could name the neighbour. Those are worked out exactly, so the pixel
+                // taken is always the one the projection itself gives.
+                let near = |p: f64| {
+                    let part = p - p.floor();
+                    part < 2.0 * PICTURE_TOLERANCE || part > 1.0 - 2.0 * PICTURE_TOLERANCE
+                };
+                if near(u) || near(v) {
+                    (u, v) = exact(grid_col);
+                }
             }
             if u.is_finite() && v.is_finite() && inside(u, v) {
                 let col = ((u + 1e-10).floor() as i32).min(ifd.width as i32 - 1);
@@ -3236,7 +3254,7 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[]).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
