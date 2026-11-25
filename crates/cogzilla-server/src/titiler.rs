@@ -434,9 +434,9 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             "inputs": { "nbands": 1 },
             "outputs": { "nbands": 1, "dtype": "uint8", "min": null, "max": null },
             "parameters": {
-                "azimuth": { "default": 315.0, "maximum": 360.0, "minimum": 0.0, "title": "Azimuth", "type": "number" },
+                "azimuth": { "default": 45.0, "maximum": 360.0, "minimum": 0.0, "title": "Azimuth", "type": "number" },
                 "angle_altitude": { "default": 45.0, "maximum": 90.0, "minimum": -90.0, "title": "Angle Altitude", "type": "number" },
-                "buffer": { "default": 0, "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "buffer": { "default": 3, "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
                 "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
             }
         }),
