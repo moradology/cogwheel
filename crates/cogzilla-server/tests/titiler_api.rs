@@ -56,7 +56,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("unsupported reproject", format!("{tile}&reproject=bogus")),
         ("bad rescale", format!("{tile}&rescale=abc")),
         ("unknown colormap", format!("{tile}&bidx=1&colormap_name=nope")),
-        ("bad tilesize", format!("{tile}&tilesize=7")),
+        ("bad tilesize", format!("{tile}&tilesize=0")),
         ("unknown tms tile", format!("{base}/cog/tiles/FakeQuad/10/163/395.png?url={sat_url}")),
         ("unknown tms tilejson", format!("{base}/cog/FakeQuad/tilejson.json?url={sat_url}")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
@@ -1599,6 +1599,48 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let wmts_body = wmts_all.text().await.unwrap();
             assert_eq!(wmts_body.matches("<Layer>").count(), 13);
             assert_eq!(wmts_body.matches("<TileMatrixSet>").count(), 26); // 13 links + 13 definitions
+
+            // Sweep #9 J1-J6 regression checks
+            // J1: empty expression= is treated as absent
+            let j1 = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat_url}&expression="))
+                .send().await.unwrap();
+            assert_eq!(j1.status(), 200);
+            // J2 & J3: float-int params (bidx=1.0, tilesize=16.0, z=12.0) and tilesize < 64
+            let j23 = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12.0/652/1583.png?url={sat_url}&bidx=1.0&tilesize=16.0"))
+                .send().await.unwrap();
+            assert_eq!(j23.status(), 200);
+            // J4: space after comma in /point and /bbox path coordinates
+            let j4p = client
+                .get(format!("{base}/cog/point/-122.65,%2037.773?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(j4p.status(), 200);
+            let j4b = client
+                .get(format!("{base}/cog/bbox/-122.8,%2037.6,-122.5,37.9/32x32.png?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(j4b.status(), 200);
+            // J5: EPSG:4979, ESRI:102100, and PROJ string CRS forms
+            for crs in [
+                "EPSG:4979",
+                "ESRI:102100",
+                "+proj=longlat%20+datum=WGS84",
+            ] {
+                let r = client
+                    .get(format!("{base}/cog/preview/32x32.png?url={sat_url}&dst_crs={crs}"))
+                    .send().await.unwrap();
+                assert_eq!(r.status(), 200, "dst_crs={crs} should succeed");
+            }
+            // J6: /cog/preview/5000x5000.png error message states size exceeds limit
+            let j6 = client
+                .get(format!("{base}/cog/preview/5000x5000.png?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(j6.status(), 400);
+            let j6_body = j6.text().await.unwrap();
+            assert!(
+                j6_body.contains("4096") && j6_body.to_ascii_lowercase().contains("exceed"),
+                "expected size-limit message, got: {j6_body}"
+            );
         }
     }
 }
