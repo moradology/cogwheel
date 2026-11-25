@@ -126,6 +126,36 @@ fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
     Some((b, ext))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelSelection {
+    First,
+    Highest,
+    Lowest,
+    Mean,
+    Median,
+    Stdev,
+    Count,
+    LastBandLow,
+    LastBandHigh,
+}
+
+impl PixelSelection {
+    fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "first" => Some(Self::First),
+            "highest" => Some(Self::Highest),
+            "lowest" => Some(Self::Lowest),
+            "mean" => Some(Self::Mean),
+            "median" => Some(Self::Median),
+            "stdev" | "std" => Some(Self::Stdev),
+            "count" => Some(Self::Count),
+            "lastbandlow" => Some(Self::LastBandLow),
+            "lastbandhigh" => Some(Self::LastBandHigh),
+            _ => None,
+        }
+    }
+}
+
 struct ParsedQuery {
     urls: Vec<String>,
     assets: Vec<String>,
@@ -142,6 +172,7 @@ struct ParsedQuery {
     width: Option<u32>,
     height: Option<u32>,
     orientation_vertical: bool,
+    pixel_selection: PixelSelection,
     use_epsg: bool,
     percentiles: Vec<f64>,
     histogram_bins: Option<usize>,
@@ -204,6 +235,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         width: None,
         height: None,
         orientation_vertical: false,
+        pixel_selection: PixelSelection::First,
         use_epsg: false,
         percentiles: Vec::new(),
         histogram_bins: None,
@@ -740,6 +772,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     }
                 }
             }
+            "pixel_selection" => match PixelSelection::from_str_opt(&v) {
+                Some(ps) => pq.pixel_selection = ps,
+                None => pq_errors.push(format!(
+                    "unsupported pixel_selection '{v}' (expected first, highest, lowest, mean, median, stdev, count, lastbandlow, or lastbandhigh)"
+                )),
+            },
             "cover_scale" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
@@ -2419,6 +2457,372 @@ fn validate_mosaic_tile_params(_pq: &ParsedQuery, tile_size: u32) -> Result<(), 
     Ok(())
 }
 
+async fn render_mosaic_tile_pixel_selection(
+    engine: &TileEngine,
+    urls: &[String],
+    treq: TileRequest,
+    pq: &ParsedQuery,
+) -> Result<Bytes, EngineError> {
+    let urls = &urls[..urls.len().min(64)];
+    let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
+    let bbox_3857 = web_mercator_buffered_3857_bbox(
+        treq.tile.z,
+        treq.tile.x,
+        treq.tile.y,
+        pq.buffer,
+        treq.tile_size,
+    );
+    let n_px = (out_dim as usize) * (out_dim as usize);
+    let mut scene_planes: Vec<(usize, Vec<f32>)> = Vec::new();
+    let mut first_lut: Option<cogzilla_kernel::CustomColormap> = None;
+
+    for (scene_i, url) in urls.iter().enumerate() {
+        if scene_i > 0 {
+            tokio::task::consume_budget().await;
+        }
+        let Ok(cog) = engine.store.open_uri(url).await else {
+            continue;
+        };
+        let cogs = vec![cog];
+        let mut scene_bands = treq.bands.clone();
+        if pq.unscale {
+            apply_unscale_cogs(&mut scene_bands, &cogs);
+        }
+        if first_lut.is_none() {
+            first_lut = resolve_custom_lut(pq, &cogs[0], &scene_bands)?;
+        }
+        let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
+        let raw = render_mercator_bbox(
+            engine,
+            &cogs,
+            bbox_3857,
+            out_dim,
+            out_dim,
+            &scene_bands,
+            resample,
+            OutputFormat::RawF32,
+            pq.nodata,
+            None,
+            None,
+            pq.return_mask,
+            pq.unscale,
+        )
+        .await?;
+        if n_px == 0 || raw.len() % (n_px * 4) != 0 {
+            continue;
+        }
+        let nb = raw.len() / (n_px * 4);
+        if nb == 0 {
+            continue;
+        }
+        let vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        scene_planes.push((nb, vals));
+    }
+
+    let default_nb = match treq.bands {
+        BandRequest::Rgb { .. }
+        | BandRequest::SarRgb { .. }
+        | BandRequest::Terrain { .. }
+        | BandRequest::CustomExprRgb { .. } => 3,
+        _ => 1,
+    };
+    let nb = scene_planes
+        .first()
+        .map(|(b, _)| *b)
+        .unwrap_or(default_nb);
+    let out_nb = if pq.pixel_selection == PixelSelection::Count {
+        1
+    } else {
+        nb
+    };
+    let mut combined = vec![f32::NAN; out_nb * n_px];
+
+    if !scene_planes.is_empty() {
+        let matching: Vec<&[f32]> = scene_planes
+            .iter()
+            .filter(|(b, _)| *b == nb)
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        match pq.pixel_selection {
+            PixelSelection::Highest => {
+                for b in 0..nb {
+                    let b_off = b * n_px;
+                    for i in 0..n_px {
+                        let mut best = f32::NEG_INFINITY;
+                        let mut any = false;
+                        for s in &matching {
+                            let v = s[b_off + i];
+                            if v.is_finite() {
+                                if !any || v > best {
+                                    best = v;
+                                    any = true;
+                                }
+                            }
+                        }
+                        if any {
+                            combined[b_off + i] = best;
+                        }
+                    }
+                }
+            }
+            PixelSelection::Lowest => {
+                for b in 0..nb {
+                    let b_off = b * n_px;
+                    for i in 0..n_px {
+                        let mut best = f32::INFINITY;
+                        let mut any = false;
+                        for s in &matching {
+                            let v = s[b_off + i];
+                            if v.is_finite() {
+                                if !any || v < best {
+                                    best = v;
+                                    any = true;
+                                }
+                            }
+                        }
+                        if any {
+                            combined[b_off + i] = best;
+                        }
+                    }
+                }
+            }
+            PixelSelection::Mean => {
+                for b in 0..nb {
+                    let b_off = b * n_px;
+                    for i in 0..n_px {
+                        let mut sum = 0.0f64;
+                        let mut cnt = 0usize;
+                        for s in &matching {
+                            let v = s[b_off + i];
+                            if v.is_finite() {
+                                sum += v as f64;
+                                cnt += 1;
+                            }
+                        }
+                        if cnt > 0 {
+                            combined[b_off + i] = (sum / cnt as f64) as f32;
+                        }
+                    }
+                }
+            }
+            PixelSelection::Stdev => {
+                for b in 0..nb {
+                    let b_off = b * n_px;
+                    for i in 0..n_px {
+                        let mut sum = 0.0f64;
+                        let mut cnt = 0usize;
+                        for s in &matching {
+                            let v = s[b_off + i];
+                            if v.is_finite() {
+                                sum += v as f64;
+                                cnt += 1;
+                            }
+                        }
+                        if cnt > 0 {
+                            let mean = sum / cnt as f64;
+                            let mut sq = 0.0f64;
+                            for s in &matching {
+                                let v = s[b_off + i];
+                                if v.is_finite() {
+                                    let d = v as f64 - mean;
+                                    sq += d * d;
+                                }
+                            }
+                            combined[b_off + i] = (sq / cnt as f64).sqrt() as f32;
+                        }
+                    }
+                }
+            }
+            PixelSelection::Median => {
+                let mut scratch = Vec::with_capacity(matching.len());
+                for b in 0..nb {
+                    let b_off = b * n_px;
+                    for i in 0..n_px {
+                        scratch.clear();
+                        for s in &matching {
+                            let v = s[b_off + i];
+                            if v.is_finite() {
+                                scratch.push(v);
+                            }
+                        }
+                        let k = scratch.len();
+                        if k > 0 {
+                            scratch.sort_unstable_by(|a, b| a.total_cmp(b));
+                            combined[b_off + i] = if k % 2 == 1 {
+                                scratch[k / 2]
+                            } else {
+                                0.5 * (scratch[k / 2 - 1] + scratch[k / 2])
+                            };
+                        }
+                    }
+                }
+            }
+            PixelSelection::Count => {
+                for i in 0..n_px {
+                    let mut cnt = 0u32;
+                    for s in &matching {
+                        if s[i].is_finite() {
+                            cnt += 1;
+                        }
+                    }
+                    if cnt > 0 {
+                        combined[i] = cnt as f32;
+                    }
+                }
+            }
+            PixelSelection::LastBandLow | PixelSelection::LastBandHigh => {
+                let want_high = pq.pixel_selection == PixelSelection::LastBandHigh;
+                let last_off = (nb - 1) * n_px;
+                for i in 0..n_px {
+                    let mut best_scene: Option<usize> = None;
+                    let mut best_key = if want_high { f32::NEG_INFINITY } else { f32::INFINITY };
+                    for (si, s) in matching.iter().enumerate() {
+                        let kv = s[last_off + i];
+                        if kv.is_finite()
+                            && (best_scene.is_none()
+                                || (want_high && kv > best_key)
+                                || (!want_high && kv < best_key))
+                        {
+                            best_key = kv;
+                            best_scene = Some(si);
+                        }
+                    }
+                    if let Some(si) = best_scene {
+                        let s = matching[si];
+                        for b in 0..nb {
+                            combined[b * n_px + i] = s[b * n_px + i];
+                        }
+                    }
+                }
+            }
+            PixelSelection::First => unreachable!(),
+        }
+    }
+
+    if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+        let mut out = bytes::BytesMut::with_capacity(combined.len() * 4);
+        for v in combined {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let raw = out.freeze();
+        if matches!(treq.format, OutputFormat::Npy) {
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                raw,
+                out_nb,
+                out_dim,
+                out_dim,
+                pq.return_mask,
+            ));
+        }
+        return Ok(raw);
+    }
+
+    let cf = pq
+        .color_formula
+        .as_deref()
+        .map(ColorFormula::parse)
+        .transpose()
+        .map_err(EngineError::BadRequest)?;
+    let mut rgba = vec![0u8; n_px * 4];
+    if out_nb >= 3 {
+        let (rmin, rmax) = match &treq.bands {
+            BandRequest::Rgb {
+                rescale_min,
+                rescale_max,
+                ..
+            }
+            | BandRequest::SarRgb {
+                rescale_min,
+                rescale_max,
+                ..
+            }
+            | BandRequest::CustomExprRgb {
+                rescale_min,
+                rescale_max,
+                ..
+            } => (*rescale_min, *rescale_max),
+            _ => ([0.0, 0.0, 0.0], [255.0, 255.0, 255.0]),
+        };
+        let inv = [
+            255.0 / cogzilla_kernel::safe_rescale_denom(rmin[0], rmax[0]),
+            255.0 / cogzilla_kernel::safe_rescale_denom(rmin[1], rmax[1]),
+            255.0 / cogzilla_kernel::safe_rescale_denom(rmin[2], rmax[2]),
+        ];
+        for i in 0..n_px {
+            let r = combined[i];
+            let g = combined[n_px + i];
+            let b = combined[2 * n_px + i];
+            if r.is_finite() && g.is_finite() && b.is_finite() {
+                rgba[i * 4] = ((r - rmin[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                rgba[i * 4 + 1] = ((g - rmin[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                rgba[i * 4 + 2] = ((b - rmin[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                rgba[i * 4 + 3] = 255;
+            }
+        }
+        if let Some(ref cf) = cf {
+            cf.apply_buffer_in_place(&mut rgba, 4);
+        }
+    } else {
+        let (rescale, cmap) = match &treq.bands {
+            BandRequest::Single {
+                rescale, colormap, ..
+            }
+            | BandRequest::Dem {
+                rescale, colormap, ..
+            }
+            | BandRequest::CustomExpr {
+                rescale, colormap, ..
+            }
+            | BandRequest::Spectral1 {
+                rescale, colormap, ..
+            }
+            | BandRequest::Spectral2 {
+                rescale, colormap, ..
+            }
+            | BandRequest::Spectral3 {
+                rescale, colormap, ..
+            } => (*rescale, *colormap),
+            _ => ((0.0, 255.0), pq.colormap),
+        };
+        let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
+        let cf_lut = cf.as_ref().map(|c| {
+            let mut t = [0u8; 256];
+            for i in 0..256 {
+                let mut px = [i as u8, i as u8, i as u8, 255];
+                c.apply_buffer_in_place(&mut px, 4);
+                t[i] = px[0];
+            }
+            t
+        });
+        let lut = cmap.lut();
+        for i in 0..n_px {
+            let v = combined[i];
+            if v.is_finite() {
+                let px = if let Some(ref custom) = first_lut {
+                    custom.lookup(v, rescale.0, inv)
+                } else {
+                    let mut idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
+                    if let Some(ref cl) = cf_lut {
+                        idx = cl[idx] as usize;
+                    }
+                    lut.rgba_u32[idx].to_le_bytes()
+                };
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&px);
+            }
+        }
+    }
+    Ok(encode_rgba_output(
+        out_dim as usize,
+        out_dim as usize,
+        &rgba,
+        treq.format,
+        pq.return_mask,
+    ))
+}
+
 async fn render_mosaic_tile_styled(
     engine: &TileEngine,
     urls: &[String],
@@ -2426,6 +2830,9 @@ async fn render_mosaic_tile_styled(
     pq: &ParsedQuery,
     first_has_colormap: bool,
 ) -> Result<Bytes, EngineError> {
+    if pq.pixel_selection != PixelSelection::First {
+        return render_mosaic_tile_pixel_selection(engine, urls, treq, pq).await;
+    }
     let mut needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0.0
@@ -2535,14 +2942,21 @@ async fn render_mosaic_tile_styled(
                 _ => 1,
             };
             let (nb, acc) = acc_f32.unwrap_or_else(|| (default_nb, vec![f32::NAN; default_nb * n_px]));
-            let mut out = bytes::BytesMut::with_capacity(128 + acc.len() * 4);
-            if matches!(treq.format, OutputFormat::Npy) {
-                out.extend_from_slice(&cogzilla_kernel::encode_npy_f32_header(nb, out_dim, out_dim));
-            }
+            let mut out = bytes::BytesMut::with_capacity(acc.len() * 4);
             for v in acc {
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            return Ok(out.freeze());
+            let raw = out.freeze();
+            if matches!(treq.format, OutputFormat::Npy) {
+                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    nb,
+                    out_dim,
+                    out_dim,
+                    pq.return_mask,
+                ));
+            }
+            return Ok(raw);
         }
         let cf = pq
             .color_formula
@@ -3853,6 +4267,17 @@ where
                 Ok((data, ct))
             }
             .await,
+            ["mosaicjson", "bbox", bbox_seg, "assets"] => async {
+                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                    return Err(EngineError::BadRequest("invalid bbox".into()));
+                };
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
+                Ok((Bytes::from(serde_json::json!(urls).to_string()), "application/json"))
+            }
+            .await,
             ["mosaicjson", "bbox", bbox_seg, dims_ext] => async {
                 let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
@@ -4016,6 +4441,61 @@ where
                     format!("{forwarded_prefix}/mosaicjson/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
+            ["mosaicjson", "point", coord, "assets"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let Some((lons, lats)) = coord.split_once(',') else {
+                    return Err(EngineError::BadRequest("expected /mosaicjson/point/{lon},{lat}/assets".into()));
+                };
+                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
+                    return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
+                };
+                let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
+                let (mx, my) = lonlat_deg_to_mercator(lon, lat);
+                let eps = 1e-6;
+                let urls = mj.query_bbox_3857(mx - eps, my - eps, mx + eps, my + eps);
+                Ok((Bytes::from(serde_json::json!(urls).to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "tiles", tms, zs, xs, ys, "assets"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let (Ok(z), Ok(x), Ok(y)) = (zs.parse::<u8>(), xs.parse::<u32>(), ys.parse::<u32>()) else {
+                    return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                };
+                if z > 30 {
+                    return Err(EngineError::BadRequest(format!("invalid zoom level z={z} (expected 0..=30)")));
+                }
+                let urls = if *tms == "WebMercatorQuad" {
+                    let b = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, 256);
+                    mj.query_bbox_3857(b[0], b[1], b[2], b[3])
+                } else if let Some(tms_def) = crate::tms::lookup_tms(tms)
+                    && let Some(tb) = tms_def.tile_bounds(z, x, y, pq.buffer, 256)
+                {
+                    let dst_crs = tms_def.crs_model()?;
+                    let wgs = bbox_to_wgs84(tb, Some(&dst_crs))?;
+                    query_mosaicjson_wgs84_bbox(&mj, wgs)
+                } else {
+                    return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
+                };
+                Ok((Bytes::from(serde_json::json!(urls).to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "tiles", zs, xs, ys, "assets"]
+            | ["mosaicjson", zs, xs, ys, "assets"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let (Ok(z), Ok(x), Ok(y)) = (zs.parse::<u8>(), xs.parse::<u32>(), ys.parse::<u32>()) else {
+                    return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                };
+                if z > 30 {
+                    return Err(EngineError::BadRequest(format!("invalid zoom level z={z} (expected 0..=30)")));
+                }
+                let b = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, 256);
+                let urls = mj.query_bbox_3857(b[0], b[1], b[2], b[3]);
+                Ok((Bytes::from(serde_json::json!(urls).to_string()), "application/json"))
+            }
+            .await,
             ["mosaicjson", "tiles", "WebMercatorQuad", zs, xs, ys]
             | ["mosaicjson", "tiles", zs, xs, ys] => {
                 let cache_key = format!("{path}?{raw_query}");
