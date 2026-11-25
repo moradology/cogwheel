@@ -876,6 +876,21 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_info = get_json(&client, format!("{base}/mosaicjson/info?url={mj_url}")).await;
             assert_eq!(mj_info["quadkey_zoom"], 12);
             assert_eq!(mj_info["tiles_count"], 1);
+            assert_eq!(mj_info["mosaic_tilematrixset"], "WebMercatorQuad");
+            assert!(mj_info["quadkeys"].as_array().is_some_and(|a| !a.is_empty()));
+            assert!(mj_info["crs"].as_str().is_some());
+
+            // Non-WebMercatorQuad TMS on /mosaicjson/tiles (WorldCRS84Quad)
+            let mj_crs84 = client
+                .get(format!(
+                    "{base}/mosaicjson/tiles/WorldCRS84Quad/10/325/297.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_crs84.status(), 200);
+            let crs84_bytes = mj_crs84.bytes().await.unwrap();
+            assert_eq!(&crs84_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
             let mj_tile = client
                 .get(format!(
@@ -900,7 +915,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}&expression=b1*2"),
             )
             .await;
-            assert_eq!(mj_pt_expr["assets"][0][2][0], "b1*2");
+            assert_eq!(mj_pt_expr["assets"][0]["band_names"][0], "b1*2");
             let mj_stats = get_json(&client, format!("{base}/mosaicjson/statistics?url={mj_url}&max_size=128")).await;
             assert!(mj_stats["b1"]["mean"].is_number());
             let mj_bbox = client
