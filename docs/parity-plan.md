@@ -249,6 +249,8 @@ Every route and documented parameter of titiler-pgstac 3.2.2 was sent to both se
 - A LineString, Point or GeometryCollection posted to statistics or feature is a `400` (12).
 - `f=html` on the tileset routes (12), `tile_format=tif` and `pngraw` in WMTS (6).
 - No `Content-Crs` or `Content-Bbox` headers on item pictures. A one-band PNG or JPEG is RGB where titiler-pgstac writes grey, when the renderer draws it (item routes, and mosaics with a resampling other than nearest).
+- `color_formula`: gamma rounds where rio-tiler truncates (one level on about 16% of pixels), and with a colour map the formula is applied after the map where rio-tiler applies it to the band before.
+- `colormap=<name>` is taken where titiler-pgstac answers `400`; `.jp2` is a `400`; JPEG `quality` is honoured where titiler-pgstac passes it over.
 - Tile matrix sets other than WebMercatorQuad (48), left out with projections.
 
 **Shared**
