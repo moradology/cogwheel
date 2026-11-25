@@ -130,9 +130,18 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("cog tile geotiff", format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1")),
         ("cog preview geotiff", format!("{base}/cog/preview/64x64.tif?url={sat_url}&rescale=0,1")),
         ("cog tile 3-band rgb expr", format!("{tile}&expression=b3*1.0;b2*1.0;b1*1.0&rescale=0,1")),
+        ("ogc conformance", format!("{base}/conformance")),
+        ("cog map", format!("{base}/cog/map?url={sat_url}&width=64&height=64&rescale=0,1")),
+        ("cog map with bbox and crs", format!("{base}/cog/map?url={sat_url}&bbox=-122.8,37.6,-122.5,37.8&width=64&height=64&crs=epsg:3857&rescale=0,1")),
+        ("color_formula numeric channels 123", format!("{tile}&rescale=0,1&color_formula=Gamma%20123%201.5")),
+        ("trailing slash normalized", format!("{base}/cog/info/?url={sat_url}")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{what} should be accepted: {url}");
+        assert!(
+            resp.headers().get("server-timing").is_some(),
+            "{what} should include Server-Timing header"
+        );
     }
     let st_custom = get_json(
         &client,
