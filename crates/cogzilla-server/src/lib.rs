@@ -4,6 +4,7 @@ pub mod http;
 pub mod stac;
 pub mod tile_cache;
 pub mod titiler;
+pub mod tms;
 
 pub use catalog::{
     InMemoryCatalog, MosaicJsonCatalog, SceneCatalog, SceneEntry, load_catalog_json_file,

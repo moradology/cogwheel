@@ -630,59 +630,43 @@ pub fn build_wmts_capabilities(
     let title_esc = xml_escape(title);
     let tile_px = 256u32 * tile_scale.clamp(1, 4);
 
-    let (crs_urn, max_tms_z) = if tms == "WorldCRS84Quad" {
-        let crs = if use_epsg {
-            "urn:ogc:def:crs:EPSG::4326"
-        } else {
-            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-        };
-        (crs, 23u8)
+    let tms_def = crate::tms::lookup_tms(tms)
+        .unwrap_or_else(|| crate::tms::lookup_tms("WebMercatorQuad").unwrap());
+    let crs_urn = if use_epsg {
+        format!("urn:ogc:def:crs:EPSG::{}", tms_def.epsg)
     } else {
-        let crs = if use_epsg {
-            "urn:ogc:def:crs:EPSG::3857"
-        } else {
-            "http://www.opengis.net/def/crs/EPSG/0/3857"
-        };
-        (crs, 24u8)
+        tms_def.crs_uri.to_string()
     };
 
-    let z0 = minzoom.min(max_tms_z);
-    let z1 = maxzoom.max(z0).min(max_tms_z);
     let mut matrices_xml = String::new();
-    for z in z0..=z1 {
-        if tms == "WorldCRS84Quad" {
-            let rows = 1u64 << z;
-            let cols = 2u64 << z;
-            let deg_per_px = 180.0 / ((rows as f64) * 256.0);
-            let scale_denom = (deg_per_px * 111_319.490_793_273_58) / 0.00028;
+    for m in tms_def.matrices {
+        if let Ok(z) = m.id.parse::<u8>()
+            && (minzoom..=maxzoom).contains(&z)
+        {
+            let (tl0, tl1) = if tms_def.invert_axis {
+                (m.origin_y, m.origin_x)
+            } else {
+                (m.origin_x, m.origin_y)
+            };
+            let scale = tile_scale.clamp(1, 4);
+            let tw = m.tile_width * scale;
+            let th = m.tile_height * scale;
+            let scale_denom = m.scale_denominator / (scale as f64);
             matrices_xml.push_str(&format!(
                 "            <TileMatrix>\n\
-                 \x20               <ows:Identifier>{z}</ows:Identifier>\n\
+                 \x20               <ows:Identifier>{}</ows:Identifier>\n\
                  \x20               <ScaleDenominator>{scale_denom:.6}</ScaleDenominator>\n\
-                 \x20               <TopLeftCorner>-180.0 90.0</TopLeftCorner>\n\
-                 \x20               <TileWidth>{tile_px}</TileWidth>\n\
-                 \x20               <TileHeight>{tile_px}</TileHeight>\n\
-                 \x20               <MatrixWidth>{cols}</MatrixWidth>\n\
-                 \x20               <MatrixHeight>{rows}</MatrixHeight>\n\
-                 \x20           </TileMatrix>\n"
-            ));
-        } else {
-            let n = 1u64 << z;
-            let res = (2.0 * cogzilla_proj::ORIGIN_SHIFT) / ((n as f64) * 256.0);
-            let scale_denom = res / 0.00028;
-            matrices_xml.push_str(&format!(
-                "            <TileMatrix>\n\
-                 \x20               <ows:Identifier>{z}</ows:Identifier>\n\
-                 \x20               <ScaleDenominator>{scale_denom:.6}</ScaleDenominator>\n\
-                 \x20               <TopLeftCorner>-20037508.342789244 20037508.342789244</TopLeftCorner>\n\
-                 \x20               <TileWidth>{tile_px}</TileWidth>\n\
-                 \x20               <TileHeight>{tile_px}</TileHeight>\n\
-                 \x20               <MatrixWidth>{n}</MatrixWidth>\n\
-                 \x20               <MatrixHeight>{n}</MatrixHeight>\n\
-                 \x20           </TileMatrix>\n"
+                 \x20               <TopLeftCorner>{tl0} {tl1}</TopLeftCorner>\n\
+                 \x20               <TileWidth>{tw}</TileWidth>\n\
+                 \x20               <TileHeight>{th}</TileHeight>\n\
+                 \x20               <MatrixWidth>{}</MatrixWidth>\n\
+                 \x20               <MatrixHeight>{}</MatrixHeight>\n\
+                 \x20           </TileMatrix>\n",
+                m.id, m.matrix_width, m.matrix_height
             ));
         }
     }
+    let _ = tile_px;
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -769,7 +753,9 @@ pub fn build_tilejson(
     let coarsest = cog.index.ifds.last().unwrap();
     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
         .max(full.height as f64 / coarsest.height.max(1) as f64);
-    let (minzoom, maxzoom) = if tms == "WorldCRS84Quad" {
+    let (minzoom, maxzoom) = if let Some(def) = crate::tms::lookup_tms(tms) {
+        def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
+    } else if tms == "WorldCRS84Quad" {
         crs.world_crs84_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
     } else {
         crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
@@ -3128,7 +3114,7 @@ pub async fn render_native_preview(
         engine,
         cogs,
         bbox_wgs84,
-        false,
+        &cogzilla_proj::CrsModel::Geographic,
         true,
         width,
         height,
@@ -3168,7 +3154,47 @@ pub async fn render_wgs84_bbox(
         engine,
         cogs,
         bbox,
+        &cogzilla_proj::CrsModel::Geographic,
         false,
+        width,
+        height,
+        poly_mask,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+        unscale,
+    )
+    .await
+}
+
+/// Arbitrary-CRS bounding-box renderer backing `?dst_crs=` and all 13 OGC TileMatrixSets.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_crs_bbox(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&CustomColormap>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    render_bbox_impl(
+        engine,
+        cogs,
+        bbox,
+        dst_crs,
         false,
         width,
         height,
@@ -3207,7 +3233,7 @@ pub async fn render_mercator_bbox(
         engine,
         cogs,
         bbox_3857,
-        true,
+        &cogzilla_proj::CrsModel::Epsg3857,
         false,
         width,
         height,
@@ -3229,7 +3255,7 @@ async fn render_bbox_impl(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
     bbox: [f64; 4],
-    bbox_is_3857: bool,
+    dst_crs: &cogzilla_proj::CrsModel,
     native_preview: bool,
     width: u32,
     height: u32,
@@ -3268,10 +3294,17 @@ async fn render_bbox_impl(
         primary.index.select_ifd(target_rx, target_ry)
     } else {
         let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
-            if bbox_is_3857 {
-                crs.from_3857(x, y)
-            } else {
-                crs.from_lonlat_deg(x, y)
+            match dst_crs {
+                cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
+                other => {
+                    let (lon, lat) = other.to_lonlat_deg(x, y);
+                    if lon.is_finite() && lat.is_finite() {
+                        crs.from_lonlat_deg(lon, lat)
+                    } else {
+                        (f64::NAN, f64::NAN)
+                    }
+                }
             }
         };
 
@@ -3290,14 +3323,8 @@ async fn render_bbox_impl(
         if !target_rx.is_finite() || !target_ry.is_finite() {
             let full = primary.index.full_res();
             let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-            let (rcx_raw, rcy_raw) = if bbox_is_3857 {
-                let lat_rad = (0.5 * (rb[1] + rb[3])).clamp(-85.05112878, 85.05112878).to_radians();
-                let lon_rad = (0.5 * (rb[0] + rb[2])).to_radians();
-                const R: f64 = 6_378_137.0;
-                (R * lon_rad, R * (std::f64::consts::FRAC_PI_4 + 0.5 * lat_rad).tan().ln())
-            } else {
-                (0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]))
-            };
+            let (rcx_raw, rcy_raw) =
+                dst_crs.from_lonlat_deg(0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]));
             let rcx = rcx_raw.clamp(bbox[0], bbox[2]);
             let rcy = rcy_raw.clamp(bbox[1], bbox[3]);
             let probes = [
@@ -3345,16 +3372,31 @@ async fn render_bbox_impl(
     } else {
         let build_uv_maps = {
         let crs = crs.clone();
+        let dst_crs = dst_crs.clone();
         let crs_to_pixel = ifd.crs_to_pixel;
         let ifd_width = ifd.width;
         let ifd_height = ifd.height;
         let poly_mask = poly_mask.cloned();
         move || {
             let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
-                if bbox_is_3857 {
-                    crs.from_3857(x, y)
+                match &dst_crs {
+                    cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                    cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
+                    other => {
+                        let (lon, lat) = other.to_lonlat_deg(x, y);
+                        if lon.is_finite() && lat.is_finite() {
+                            crs.from_lonlat_deg(lon, lat)
+                        } else {
+                            (f64::NAN, f64::NAN)
+                        }
+                    }
+                }
+            };
+            let to_wgs84 = |x: f64, y: f64| -> (f64, f64) {
+                if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) {
+                    (x, y)
                 } else {
-                    crs.from_lonlat_deg(x, y)
+                    dst_crs.to_lonlat_deg(x, y)
                 }
             };
             let mut u_map = vec![f32::NAN; w * h];
@@ -3476,8 +3518,9 @@ async fn render_bbox_impl(
                             let mut v_cur = vl + 0.5 * dv;
                             if let Some(ref pm) = poly_mask {
                                 for px in x0..x1 {
-                                    let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                                    if pm.contains(lon, lat) {
+                                    let x_c = bbox[0] + (px as f64 + 0.5) * dlx;
+                                    let (plon, plat) = to_wgs84(x_c, lat);
+                                    if pm.contains(plon, plat) {
                                         let uu = u_cur as f32;
                                         let vv = v_cur as f32;
                                         if uu >= -1.0
@@ -3520,7 +3563,8 @@ async fn render_bbox_impl(
                             for px in x0..x1 {
                                 let lon = bbox[0] + (px as f64 + 0.5) * dlx;
                                 if let Some(ref pm) = poly_mask {
-                                    if !pm.contains(lon, lat) {
+                                    let (plon, plat) = to_wgs84(lon, lat);
+                                    if !pm.contains(plon, plat) {
                                         continue;
                                     }
                                 }
@@ -3745,6 +3789,8 @@ async fn render_bbox_impl(
             .collect()
     };
 
+    let dst_is_3857 = matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857);
+    let dst_is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
     let render_cpu = move |u_map: Vec<f32>,
                            v_map: Vec<f32>,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
@@ -3969,19 +4015,21 @@ async fn render_bbox_impl(
         };
 
         let dem_inv_8dxy = || -> (f32, f32) {
-            let (dx_m, dy_m) = if bbox_is_3857 {
+            let (dx_m, dy_m) = if dst_is_3857 {
                 let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
                 let cos_lat = center_lat.to_radians().cos().max(0.05);
                 (
                     (dlx.abs() * cos_lat).max(1e-3) as f32,
                     (dly.abs() * cos_lat).max(1e-3) as f32,
                 )
-            } else {
+            } else if dst_is_geo {
                 let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
                 (
                     (dlx.abs() * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
                     (dly.abs() * 111_320.0).max(1e-3) as f32,
                 )
+            } else {
+                (dlx.abs().max(1e-3) as f32, dly.abs().max(1e-3) as f32)
             };
             (1.0 / (8.0 * dx_m), 1.0 / (8.0 * dy_m))
         };

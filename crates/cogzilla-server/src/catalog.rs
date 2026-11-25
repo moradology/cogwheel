@@ -487,8 +487,8 @@ impl SceneCatalog for MosaicJsonCatalog {
             || !min_y.is_finite()
             || !max_x.is_finite()
             || !max_y.is_finite()
-            || min_x >= max_x
-            || min_y >= max_y
+            || min_x > max_x
+            || min_y > max_y
         {
             return Vec::new();
         }
@@ -496,9 +496,13 @@ impl SceneCatalog for MosaicJsonCatalog {
         let n = (1u64 << qz) as f64;
         let tile_span = WORLD_SPAN / n;
         // Shrink slightly inward so adjacent-tile shared edges don't pull neighboring quadkeys,
-        // while never inverting min/max on very small bboxes.
+        // while still allowing degenerate point queries (`min_x == max_x && min_y == max_y`).
         let min_span = (max_x - min_x).min(max_y - min_y);
-        let eps = (min_span * 1e-6).max(1e-6).min(min_span * 0.25);
+        let eps = if min_span > 0.0 {
+            (min_span * 1e-6).max(1e-6).min(min_span * 0.25)
+        } else {
+            0.0
+        };
         let x0 = (((min_x + eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
         let x1 = (((max_x - eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
         // WebMercator Y increases northwards while XYZ tile y increases southwards.

@@ -52,21 +52,19 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     for (what, url) in [
         ("unknown algorithm", format!("{tile}&algorithm=contours")),
         ("unsupported resampling", format!("{tile}&resampling=average")),
-        ("padding", format!("{tile}&padding=4")),
+        ("excessive padding", format!("{tile}&padding=999")),
         ("unsupported reproject", format!("{tile}&reproject=average")),
         ("bad rescale", format!("{tile}&rescale=abc")),
         ("unknown colormap", format!("{tile}&bidx=1&colormap_name=nope")),
         ("bad tilesize", format!("{tile}&tilesize=7")),
-        ("unknown tms tile", format!("{base}/cog/tiles/UTM31WGS84Quad/10/163/395.png?url={sat_url}")),
-        ("unknown tms tilejson", format!("{base}/cog/UTM31WGS84Quad/tilejson.json?url={sat_url}")),
+        ("unknown tms tile", format!("{base}/cog/tiles/FakeQuad/10/163/395.png?url={sat_url}")),
+        ("unknown tms tilejson", format!("{base}/cog/FakeQuad/tilejson.json?url={sat_url}")),
         ("statistics algorithm", format!("{base}/cog/statistics?url={sat_url}&algorithm=hillshade")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
         ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
         ("point unsupported coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:4267")),
-        ("preview dst_crs", format!("{base}/cog/preview.png?url={sat_url}&dst_crs=epsg:4326")),
         ("preview explicit dims width", format!("{base}/cog/preview/256x256.png?url={sat_url}&width=300")),
         ("bbox explicit dims max_size", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8/256x256.png?url={sat_url}&max_size=2000")),
-        ("info.geojson crs", format!("{base}/cog/info.geojson?url={sat_url}&crs=epsg:32610")),
         ("non-colormap orientation", format!("{base}/cog/info?url={sat_url}&orientation=vertical")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
@@ -81,12 +79,22 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("cubic_spline", format!("{tile}&resampling=cubic_spline&rescale=0,1")),
         ("reproject=bilinear", format!("{tile}&reproject=bilinear&rescale=0,1")),
         ("padding=0", format!("{tile}&padding=0&rescale=0,1")),
+        ("padding=4", format!("{tile}&padding=4&rescale=0,1")),
         ("unrelated parameter", format!("{tile}&rescale=0,1&_cachebust=1&access_token=x")),
         ("hillshade", format!("{tile}&bidx=1&algorithm=hillshade")),
         ("WorldCRS84Quad", format!("{base}/cog/WorldCRS84Quad/tilejson.json?url={sat_url}")),
+        ("UTM31WGS84Quad tilejson", format!("{base}/cog/UTM31WGS84Quad/tilejson.json?url={sat_url}")),
+        ("WorldMercatorWGS84Quad tilejson", format!("{base}/cog/WorldMercatorWGS84Quad/tilejson.json?url={sat_url}")),
+        ("WGS1984Quad tile", format!("{base}/cog/tiles/WGS1984Quad/2/1/1.png?url={sat_url}&rescale=0,1")),
         ("point coord_crs 4326", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&coord_crs=epsg:4326")),
         ("point coord_crs 32610 UTM", format!("{base}/cog/point/535280,4172640?url={sat_url}&coord_crs=epsg:32610")),
         ("preview width query", format!("{base}/cog/preview.png?url={sat_url}&width=300")),
+        ("preview dst_crs 4326", format!("{base}/cog/preview/64x64.png?url={sat_url}&dst_crs=epsg:4326")),
+        ("preview dst_crs 3857", format!("{base}/cog/preview/64x64.tif?url={sat_url}&dst_crs=epsg:3857")),
+        ("info.geojson crs 32610", format!("{base}/cog/info.geojson?url={sat_url}&crs=epsg:32610")),
+        ("bounds crs 3857", format!("{base}/cog/bounds?url={sat_url}&crs=epsg:3857")),
+        ("bbox geotiff without dims", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8.tif?url={sat_url}&max_size=64&rescale=0,1")),
+        ("preview max_size=0", format!("{base}/cog/preview.png?url={sat_url}&max_size=0&rescale=0,1")),
         ("colormap vertical orientation", format!("{base}/colorMaps/viridis?f=png&orientation=vertical")),
         ("algorithms list", format!("{base}/algorithms")),
         ("algorithm hillshade", format!("{base}/algorithms/hillshade")),
@@ -395,8 +403,76 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     )
     .unwrap();
     let tms_arr = tms_list["tileMatrixSets"].as_array().unwrap();
+    assert_eq!(tms_arr.len(), 13, "expected all 13 morecantile TileMatrixSets");
     assert!(tms_arr.iter().any(|t| t["id"] == "WebMercatorQuad"));
     assert!(tms_arr.iter().any(|t| t["id"] == "WorldCRS84Quad"));
+    assert!(tms_arr.iter().any(|t| t["id"] == "UTM31WGS84Quad"));
+    assert!(tms_arr.iter().any(|t| t["id"] == "WorldMercatorWGS84Quad"));
+
+    // Verify GeoTIFF wrapping on /mosaic/tiles and native EPSG on /cog/preview.tif
+    let mosaic_tif = client
+        .get(format!("{base}/mosaic/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mosaic_tif.status().as_u16(), 200);
+    let mosaic_tif_bytes = mosaic_tif.bytes().await.unwrap();
+    assert_eq!(&mosaic_tif_bytes[0..4], b"II\x2a\x00", "/mosaic/tiles .tif must be a valid GeoTIFF");
+
+    let preview_tif = client
+        .get(format!("{base}/cog/preview/64x64.tif?url={sat_url}&rescale=0,1"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let parsed_preview = cogzilla_tiff::parse_cog(&preview_tif).expect("valid preview GeoTIFF");
+    assert_eq!(
+        parsed_preview.geo_keys.projected_cs_type,
+        Some(32610),
+        "native preview GeoTIFF should preserve source UTM EPSG:32610"
+    );
+
+    // Verify .npy Content-Type matches TiTiler (application/x-binary)
+    let npy_resp = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.npy?url={sat_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(npy_resp.status().as_u16(), 200);
+    assert_eq!(
+        npy_resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/x-binary"
+    );
+
+    // Verify WMTSCapabilities ScaleDenominator scales inversely with tile_scale
+    let wmts_1x = client
+        .get(format!("{base}/cog/WebMercatorQuad/WMTSCapabilities.xml?url={sat_url}&tile_scale=1"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let wmts_2x = client
+        .get(format!("{base}/cog/WebMercatorQuad/WMTSCapabilities.xml?url={sat_url}&tile_scale=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let first_sd = |xml: &str| -> f64 {
+        let s = xml.split("<ScaleDenominator>").nth(1).unwrap();
+        s.split("</ScaleDenominator>").next().unwrap().parse::<f64>().unwrap()
+    };
+    let sd1 = first_sd(&wmts_1x);
+    let sd2 = first_sd(&wmts_2x);
+    assert!(
+        ((sd1 / sd2) - 2.0).abs() < 1e-6,
+        "WMTS ScaleDenominator should halve for tile_scale=2 (got {sd1} vs {sd2})"
+    );
 
     let tms_wm: serde_json::Value = serde_json::from_str(
         &client

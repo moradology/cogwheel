@@ -135,9 +135,6 @@ impl ExprProgram {
                 }
                 Op::LoadBand(slot) => {
                     let v = bands.get(slot as usize).copied().unwrap_or(f32::NAN);
-                    if v.is_nan() {
-                        return f32::NAN;
-                    }
                     stack[sp] = v;
                     sp += 1;
                 }
