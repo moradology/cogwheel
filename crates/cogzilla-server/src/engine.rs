@@ -1774,26 +1774,33 @@ impl TileEngine {
                 {
                     return Err(err);
                 }
+                if req.format == OutputFormat::Npy {
+                    let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
+                    return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                        raw,
+                        f32_bands,
+                        req.tile_size,
+                        req.tile_size,
+                        true,
+                    ));
+                }
                 return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
             }
-            let hdr = if req.format == OutputFormat::Npy {
-                Some(cogzilla_kernel::encode_npy_f32_header(
-                    f32_bands,
-                    req.tile_size,
-                    req.tile_size,
-                ))
-            } else {
-                None
-            };
-            let hdr_len = hdr.as_ref().map_or(0, |h| h.len());
-            let mut out = bytes::BytesMut::with_capacity(hdr_len + f32_bands * total_pixels * 4);
-            if let Some(h) = hdr {
-                out.extend_from_slice(&h);
-            }
+            let mut out = bytes::BytesMut::with_capacity(f32_bands * total_pixels * 4);
             for v in canvas {
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            return Ok(out.freeze());
+            let raw = out.freeze();
+            if req.format == OutputFormat::Npy {
+                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    f32_bands,
+                    req.tile_size,
+                    req.tile_size,
+                    true,
+                ));
+            }
+            return Ok(raw);
         }
 
         let mut canvas = vec![0u8; total_pixels * 4];

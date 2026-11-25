@@ -2201,6 +2201,14 @@ fn build_tile_request_for_tms(
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, sample_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
+    if matches!(bands, BandRequest::MultiBand { .. })
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+    {
+        return Err(EngineError::BadRequest(
+            "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
+                .into(),
+        ));
+    }
     let has_explicit_tile_size = pq
         .keys
         .iter()
@@ -2452,6 +2460,24 @@ fn validate_mosaic_tile_params(_pq: &ParsedQuery, tile_size: u32) -> Result<(), 
     Ok(())
 }
 
+fn default_raw_band_count(bands: &BandRequest, pixel_selection: PixelSelection) -> usize {
+    if pixel_selection == PixelSelection::Count {
+        return 1;
+    }
+    match bands {
+        BandRequest::Rgb { .. }
+        | BandRequest::SarRgb { .. }
+        | BandRequest::Terrain { .. }
+        | BandRequest::CustomExprRgb { .. } => 3,
+        BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+        _ => 1,
+    }
+}
+
+/// Hard memory budget (64 MiB) for `pixel_selection=median`, which must buffer
+/// per-scene planes in order to compute exact per-pixel medians.
+const MAX_MEDIAN_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
 async fn render_mosaic_tile_pixel_selection(
     engine: &TileEngine,
     urls: &[String],
@@ -2468,8 +2494,21 @@ async fn render_mosaic_tile_pixel_selection(
         treq.tile_size,
     );
     let n_px = (out_dim as usize) * (out_dim as usize);
-    let mut scene_planes: Vec<(usize, Vec<f32>)> = Vec::new();
     let mut first_lut: Option<cogzilla_kernel::CustomColormap> = None;
+
+    // O(1)-in-scenes streaming accumulator for all non-Median modes; bounded
+    // Vec<Vec<f32>> only for Median.
+    enum PixelAcc {
+        Highest { nb: usize, best: Vec<f32> },
+        Lowest { nb: usize, best: Vec<f32> },
+        Mean { nb: usize, sum: Vec<f64>, cnt: Vec<u32> },
+        Stdev { nb: usize, mean: Vec<f64>, m2: Vec<f64>, cnt: Vec<u32> },
+        Count { nb: usize, cnt: Vec<u32> },
+        LastBand { nb: usize, want_high: bool, best_key: Vec<f32>, best_vals: Vec<f32> },
+        Median { nb: usize, scenes: Vec<Vec<f32>> },
+    }
+
+    let mut acc: Option<PixelAcc> = None;
 
     for (scene_i, url) in urls.iter().enumerate() {
         if scene_i > 0 {
@@ -2510,192 +2549,190 @@ async fn render_mosaic_tile_pixel_selection(
         if nb == 0 {
             continue;
         }
-        let vals: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        scene_planes.push((nb, vals));
-    }
+        let total = nb * n_px;
+        let read_f32 = |idx: usize| -> f32 {
+            let off = idx * 4;
+            f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]])
+        };
 
-    let default_nb = match treq.bands {
-        BandRequest::Rgb { .. }
-        | BandRequest::SarRgb { .. }
-        | BandRequest::Terrain { .. }
-        | BandRequest::CustomExprRgb { .. } => 3,
-        _ => 1,
-    };
-    let nb = scene_planes
-        .first()
-        .map(|(b, _)| *b)
-        .unwrap_or(default_nb);
-    let out_nb = if pq.pixel_selection == PixelSelection::Count {
-        1
-    } else {
-        nb
-    };
-    let mut combined = vec![f32::NAN; out_nb * n_px];
+        let state = acc.get_or_insert_with(|| match pq.pixel_selection {
+            PixelSelection::Highest => PixelAcc::Highest { nb, best: vec![f32::NAN; total] },
+            PixelSelection::Lowest => PixelAcc::Lowest { nb, best: vec![f32::NAN; total] },
+            PixelSelection::Mean => PixelAcc::Mean {
+                nb,
+                sum: vec![0.0f64; total],
+                cnt: vec![0u32; total],
+            },
+            PixelSelection::Stdev => PixelAcc::Stdev {
+                nb,
+                mean: vec![0.0f64; total],
+                m2: vec![0.0f64; total],
+                cnt: vec![0u32; total],
+            },
+            PixelSelection::Count => PixelAcc::Count { nb, cnt: vec![0u32; n_px] },
+            PixelSelection::LastBandLow | PixelSelection::LastBandHigh => PixelAcc::LastBand {
+                nb,
+                want_high: pq.pixel_selection == PixelSelection::LastBandHigh,
+                best_key: vec![f32::NAN; n_px],
+                best_vals: vec![f32::NAN; total],
+            },
+            PixelSelection::Median => PixelAcc::Median { nb, scenes: Vec::new() },
+            PixelSelection::First => unreachable!(),
+        });
 
-    if !scene_planes.is_empty() {
-        let matching: Vec<&[f32]> = scene_planes
-            .iter()
-            .filter(|(b, _)| *b == nb)
-            .map(|(_, v)| v.as_slice())
-            .collect();
-        match pq.pixel_selection {
-            PixelSelection::Highest => {
-                for b in 0..nb {
-                    let b_off = b * n_px;
-                    for i in 0..n_px {
-                        let mut best = f32::NEG_INFINITY;
-                        let mut any = false;
-                        for s in &matching {
-                            let v = s[b_off + i];
-                            if v.is_finite() {
-                                if !any || v > best {
-                                    best = v;
-                                    any = true;
-                                }
-                            }
-                        }
-                        if any {
-                            combined[b_off + i] = best;
-                        }
+        match state {
+            PixelAcc::Highest { nb: acc_nb, best } if *acc_nb == nb => {
+                for (idx, dst) in best.iter_mut().enumerate() {
+                    let v = read_f32(idx);
+                    if v.is_finite() && (dst.is_nan() || v > *dst) {
+                        *dst = v;
                     }
                 }
             }
-            PixelSelection::Lowest => {
-                for b in 0..nb {
-                    let b_off = b * n_px;
-                    for i in 0..n_px {
-                        let mut best = f32::INFINITY;
-                        let mut any = false;
-                        for s in &matching {
-                            let v = s[b_off + i];
-                            if v.is_finite() {
-                                if !any || v < best {
-                                    best = v;
-                                    any = true;
-                                }
-                            }
-                        }
-                        if any {
-                            combined[b_off + i] = best;
-                        }
+            PixelAcc::Lowest { nb: acc_nb, best } if *acc_nb == nb => {
+                for (idx, dst) in best.iter_mut().enumerate() {
+                    let v = read_f32(idx);
+                    if v.is_finite() && (dst.is_nan() || v < *dst) {
+                        *dst = v;
                     }
                 }
             }
-            PixelSelection::Mean => {
-                for b in 0..nb {
-                    let b_off = b * n_px;
-                    for i in 0..n_px {
-                        let mut sum = 0.0f64;
-                        let mut cnt = 0usize;
-                        for s in &matching {
-                            let v = s[b_off + i];
-                            if v.is_finite() {
-                                sum += v as f64;
-                                cnt += 1;
-                            }
-                        }
-                        if cnt > 0 {
-                            combined[b_off + i] = (sum / cnt as f64) as f32;
-                        }
+            PixelAcc::Mean { nb: acc_nb, sum, cnt } if *acc_nb == nb => {
+                for idx in 0..total {
+                    let v = read_f32(idx);
+                    if v.is_finite() {
+                        sum[idx] += v as f64;
+                        cnt[idx] += 1;
                     }
                 }
             }
-            PixelSelection::Stdev => {
-                for b in 0..nb {
-                    let b_off = b * n_px;
-                    for i in 0..n_px {
-                        let mut sum = 0.0f64;
-                        let mut cnt = 0usize;
-                        for s in &matching {
-                            let v = s[b_off + i];
-                            if v.is_finite() {
-                                sum += v as f64;
-                                cnt += 1;
-                            }
-                        }
-                        if cnt > 0 {
-                            let mean = sum / cnt as f64;
-                            let mut sq = 0.0f64;
-                            for s in &matching {
-                                let v = s[b_off + i];
-                                if v.is_finite() {
-                                    let d = v as f64 - mean;
-                                    sq += d * d;
-                                }
-                            }
-                            combined[b_off + i] = (sq / cnt as f64).sqrt() as f32;
-                        }
+            PixelAcc::Stdev { nb: acc_nb, mean, m2, cnt } if *acc_nb == nb => {
+                for idx in 0..total {
+                    let v = read_f32(idx);
+                    if v.is_finite() {
+                        let c = cnt[idx] + 1;
+                        cnt[idx] = c;
+                        let vf = v as f64;
+                        let delta = vf - mean[idx];
+                        let new_mean = mean[idx] + delta / (c as f64);
+                        mean[idx] = new_mean;
+                        let delta2 = vf - new_mean;
+                        m2[idx] += delta * delta2;
                     }
                 }
             }
-            PixelSelection::Median => {
-                let mut scratch = Vec::with_capacity(matching.len());
-                for b in 0..nb {
-                    let b_off = b * n_px;
-                    for i in 0..n_px {
-                        scratch.clear();
-                        for s in &matching {
-                            let v = s[b_off + i];
-                            if v.is_finite() {
-                                scratch.push(v);
-                            }
-                        }
-                        let k = scratch.len();
-                        if k > 0 {
-                            scratch.sort_unstable_by(|a, b| a.total_cmp(b));
-                            combined[b_off + i] = if k % 2 == 1 {
-                                scratch[k / 2]
-                            } else {
-                                0.5 * (scratch[k / 2 - 1] + scratch[k / 2])
-                            };
-                        }
+            PixelAcc::Count { nb: acc_nb, cnt } if *acc_nb == nb => {
+                for (i, c) in cnt.iter_mut().enumerate() {
+                    if read_f32(i).is_finite() {
+                        *c += 1;
                     }
                 }
             }
-            PixelSelection::Count => {
-                for i in 0..n_px {
-                    let mut cnt = 0u32;
-                    for s in &matching {
-                        if s[i].is_finite() {
-                            cnt += 1;
-                        }
-                    }
-                    if cnt > 0 {
-                        combined[i] = cnt as f32;
-                    }
-                }
-            }
-            PixelSelection::LastBandLow | PixelSelection::LastBandHigh => {
-                let want_high = pq.pixel_selection == PixelSelection::LastBandHigh;
+            PixelAcc::LastBand {
+                nb: acc_nb,
+                want_high,
+                best_key,
+                best_vals,
+            } if *acc_nb == nb => {
                 let last_off = (nb - 1) * n_px;
                 for i in 0..n_px {
-                    let mut best_scene: Option<usize> = None;
-                    let mut best_key = if want_high { f32::NEG_INFINITY } else { f32::INFINITY };
-                    for (si, s) in matching.iter().enumerate() {
-                        let kv = s[last_off + i];
-                        if kv.is_finite()
-                            && (best_scene.is_none()
-                                || (want_high && kv > best_key)
-                                || (!want_high && kv < best_key))
-                        {
-                            best_key = kv;
-                            best_scene = Some(si);
-                        }
-                    }
-                    if let Some(si) = best_scene {
-                        let s = matching[si];
+                    let kv = read_f32(last_off + i);
+                    let cur = best_key[i];
+                    if kv.is_finite()
+                        && (cur.is_nan()
+                            || (*want_high && kv > cur)
+                            || (!*want_high && kv < cur))
+                    {
+                        best_key[i] = kv;
                         for b in 0..nb {
-                            combined[b * n_px + i] = s[b * n_px + i];
+                            best_vals[b * n_px + i] = read_f32(b * n_px + i);
                         }
                     }
                 }
             }
-            PixelSelection::First => unreachable!(),
+            PixelAcc::Median { nb: acc_nb, scenes } if *acc_nb == nb => {
+                let next_bytes = (scenes.len() + 1)
+                    .saturating_mul(total)
+                    .saturating_mul(4);
+                if next_bytes > MAX_MEDIAN_BUFFER_BYTES {
+                    return Err(EngineError::BadRequest(format!(
+                        "pixel_selection=median exceeds memory budget ({} MiB limit); reduce tile_size, buffer, or band count",
+                        MAX_MEDIAN_BUFFER_BYTES / (1024 * 1024)
+                    )));
+                }
+                let vals: Vec<f32> = raw
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                scenes.push(vals);
+            }
+            _ => {}
         }
     }
+
+    let (out_nb, combined): (usize, Vec<f32>) = match acc {
+        None => {
+            let out_nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
+            (out_nb, vec![f32::NAN; out_nb * n_px])
+        }
+        Some(PixelAcc::Highest { nb, best }) | Some(PixelAcc::Lowest { nb, best }) => (nb, best),
+        Some(PixelAcc::Mean { nb, sum, cnt }) => {
+            let out = sum
+                .into_iter()
+                .zip(cnt)
+                .map(|(s, c)| if c > 0 { (s / c as f64) as f32 } else { f32::NAN })
+                .collect();
+            (nb, out)
+        }
+        Some(PixelAcc::Stdev { nb, m2, cnt, .. }) => {
+            let out = m2
+                .into_iter()
+                .zip(cnt)
+                .map(|(s2, c)| {
+                    if c > 0 {
+                        (s2 / c as f64).max(0.0).sqrt() as f32
+                    } else {
+                        f32::NAN
+                    }
+                })
+                .collect();
+            (nb, out)
+        }
+        Some(PixelAcc::Count { cnt, .. }) => {
+            let out = cnt
+                .into_iter()
+                .map(|c| if c > 0 { c as f32 } else { f32::NAN })
+                .collect();
+            (1, out)
+        }
+        Some(PixelAcc::LastBand { nb, best_vals, .. }) => (nb, best_vals),
+        Some(PixelAcc::Median { nb, scenes }) => {
+            let mut out = vec![f32::NAN; nb * n_px];
+            let mut scratch = Vec::with_capacity(scenes.len());
+            for b in 0..nb {
+                let b_off = b * n_px;
+                for i in 0..n_px {
+                    scratch.clear();
+                    for s in &scenes {
+                        let v = s[b_off + i];
+                        if v.is_finite() {
+                            scratch.push(v);
+                        }
+                    }
+                    let k = scratch.len();
+                    if k > 0 {
+                        scratch.sort_unstable_by(|a, b| a.total_cmp(b));
+                        out[b_off + i] = if k % 2 == 1 {
+                            scratch[k / 2]
+                        } else {
+                            0.5 * (scratch[k / 2 - 1] + scratch[k / 2])
+                        };
+                    }
+                }
+            }
+            (nb, out)
+        }
+    };
 
     if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
         let mut out = bytes::BytesMut::with_capacity(combined.len() * 4);
@@ -2831,6 +2868,7 @@ async fn render_mosaic_tile_styled(
     let mut needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0.0
+        || matches!(treq.format, OutputFormat::Npy)
         || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
     if !needs_bbox_mosaic
@@ -2929,13 +2967,7 @@ async fn render_mosaic_tile_styled(
                     break;
                 }
             }
-            let default_nb = match treq.bands {
-                BandRequest::Rgb { .. }
-                | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. }
-                | BandRequest::CustomExprRgb { .. } => 3,
-                _ => 1,
-            };
+            let default_nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
             let (nb, acc) = acc_f32.unwrap_or_else(|| (default_nb, vec![f32::NAN; default_nb * n_px]));
             let mut out = bytes::BytesMut::with_capacity(acc.len() * 4);
             for v in acc {
@@ -4462,16 +4494,26 @@ where
                     return Err(EngineError::BadRequest(format!("invalid zoom level z={z} (expected 0..=30)")));
                 }
                 let urls = if *tms == "WebMercatorQuad" {
+                    let max_xy = 1u64 << (z as u32);
+                    if (x as u64) >= max_xy || (y as u64) >= max_xy {
+                        return Err(EngineError::BadRequest(format!(
+                            "tile coordinate ({x}, {y}) out of range for WebMercatorQuad z={z} (expected x, y < {max_xy})"
+                        )));
+                    }
                     let b = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, 256);
                     mj.query_bbox_3857(b[0], b[1], b[2], b[3])
-                } else if let Some(tms_def) = crate::tms::lookup_tms(tms)
-                    && let Some(tb) = tms_def.tile_bounds(z, x, y, pq.buffer, 256)
-                {
+                } else {
+                    let Some(tms_def) = crate::tms::lookup_tms(tms) else {
+                        return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
+                    };
+                    let Some(tb) = tms_def.tile_bounds(z, x, y, pq.buffer, 256) else {
+                        return Err(EngineError::BadRequest(format!(
+                            "tile coordinate ({z}/{x}/{y}) out of range for TileMatrixSet '{tms}'"
+                        )));
+                    };
                     let dst_crs = tms_def.crs_model()?;
                     let wgs = bbox_to_wgs84(tb, Some(&dst_crs))?;
                     query_mosaicjson_wgs84_bbox(&mj, wgs)
-                } else {
-                    return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                 };
                 Ok((Bytes::from(serde_json::json!(urls).to_string()), "application/json"))
             }
@@ -4485,6 +4527,12 @@ where
                 };
                 if z > 30 {
                     return Err(EngineError::BadRequest(format!("invalid zoom level z={z} (expected 0..=30)")));
+                }
+                let max_xy = 1u64 << (z as u32);
+                if (x as u64) >= max_xy || (y as u64) >= max_xy {
+                    return Err(EngineError::BadRequest(format!(
+                        "tile coordinate ({x}, {y}) out of range for WebMercatorQuad z={z} (expected x, y < {max_xy})"
+                    )));
                 }
                 let b = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, 256);
                 let urls = mj.query_bbox_3857(b[0], b[1], b[2], b[3]);
@@ -4541,14 +4589,23 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
-                            let nb = match treq.bands {
-                                BandRequest::Rgb { .. }
-                                | BandRequest::SarRgb { .. }
-                                | BandRequest::Terrain { .. }
-                                | BandRequest::CustomExprRgb { .. } => 3,
-                                _ => 1,
+                            let nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
+                            let b = if treq.format == OutputFormat::Npy {
+                                let raw = cogzilla_kernel::empty_tile_bytes(
+                                    out_dim,
+                                    OutputFormat::RawF32,
+                                    nb,
+                                );
+                                cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                                    raw,
+                                    nb,
+                                    out_dim,
+                                    out_dim,
+                                    pq.return_mask,
+                                )
+                            } else {
+                                cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb)
                             };
-                            let b = cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb);
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
@@ -4759,14 +4816,23 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
-                            let nb = match treq.bands {
-                                BandRequest::Rgb { .. }
-                                | BandRequest::SarRgb { .. }
-                                | BandRequest::Terrain { .. }
-                                | BandRequest::CustomExprRgb { .. } => 3,
-                                _ => 1,
+                            let nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
+                            let b = if treq.format == OutputFormat::Npy {
+                                let raw = cogzilla_kernel::empty_tile_bytes(
+                                    out_dim,
+                                    OutputFormat::RawF32,
+                                    nb,
+                                );
+                                cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                                    raw,
+                                    nb,
+                                    out_dim,
+                                    out_dim,
+                                    pq.return_mask,
+                                )
+                            } else {
+                                cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb)
                             };
-                            let b = cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb);
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
