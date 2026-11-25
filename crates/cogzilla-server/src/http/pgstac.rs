@@ -4365,7 +4365,9 @@ async fn tile(
                 engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?.to_vec()
             };
             let asked = (!auto_format).then_some((asked, content_type));
-            let grey = selection.is_some() && !pq.colormap_explicit && TileEngine::value_bands(&treq.bands) == 1;
+            // A count is one band whatever was counted.
+            let grey = selection.is_some_and(|method| method == Selection::Count || TileEngine::value_bands(&treq.bands) == 1)
+                && !pq.colormap_explicit;
             encode_picture(rgba, dim, dim, formula.as_ref(), asked, jpeg_quality, return_mask, grey)
                 .map(|made| as_geotiff(made, dim, dim, lies, 3857, return_mask))
         })
