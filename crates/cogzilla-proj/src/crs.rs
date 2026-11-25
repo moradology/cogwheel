@@ -522,6 +522,19 @@ impl CrsModel {
         (norm_lon, lat)
     }
 
+    /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
+    /// (e.g. global NOAA/ERA5/climate grids with `min_lon >= -1e-6` and `max_lon > 180.0 + 1e-6`).
+    pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
+        if !matches!(self, CrsModel::Geographic) {
+            return false;
+        }
+        let (x0, _) = pixel_to_crs.forward(0.0, 0.0);
+        let (x1, _) = pixel_to_crs.forward(width as f64, 0.0);
+        let lo = x0.min(x1);
+        let hi = x0.max(x1);
+        lo >= -1e-6 && hi > 180.0 + 1e-6
+    }
+
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
     /// 32 points along the 4 edges of the raster plus checking whether either pole lies inside.
     pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
@@ -613,6 +626,15 @@ impl CrsModel {
         }
         if !min_lon.is_finite() || !min_lat.is_finite() {
             return [-180.0, -85.05112878, 180.0, 85.05112878];
+        }
+        if self.is_geographic_0_360(pixel_to_crs, width) {
+            if max_lon - min_lon >= 359.0 {
+                return [-180.0, min_lat, 180.0, max_lat];
+            } else if min_lon >= 180.0 {
+                return [min_lon - 360.0, min_lat, max_lon - 360.0, max_lat];
+            } else if max_lon > 180.0 {
+                return [min_lon, min_lat, max_lon - 360.0, max_lat];
+            }
         }
 
         [min_lon, min_lat, max_lon, max_lat]
@@ -1004,9 +1026,19 @@ impl<const N: usize> CoordPlan<N> {
                     }
                 }
                 CrsModel::Geographic => {
+                    let wrap_360 = if crs_to_pixel.a.abs() > 1e-18 {
+                        let x0 = -crs_to_pixel.c / crs_to_pixel.a;
+                        let x1 = (ifd_w as f64 - crs_to_pixel.c) / crs_to_pixel.a;
+                        x0.min(x1) >= -1e-6 && x0.max(x1) > 180.0 + 1e-6
+                    } else {
+                        false
+                    };
                     for px in 0..N {
                         let mx = min_x + (px as f64 + 0.5) * step_x;
-                        let (lon, _) = mercator_to_lonlat_deg(mx, 0.0);
+                        let (mut lon, _) = mercator_to_lonlat_deg(mx, 0.0);
+                        if wrap_360 && lon < 0.0 {
+                            lon += 360.0;
+                        }
                         let uu = (crs_to_pixel.a * lon + crs_to_pixel.c - 0.5) as f32;
                         u[px] = uu;
                         min_u = min_u.min(uu);
@@ -1898,5 +1930,33 @@ mod tests {
             zooms(&CrsModel::Epsg3857, 4_096, 2_048, [500_000.0, 5_300_000.0, 622_304.0, 5_361_152.0]),
             (9, 12)
         );
+    }
+
+    #[test]
+    fn geographic_0_360_wraps_western_hemisphere() {
+        // Global 0..360° × -90..90° 1° grid (360x180)
+        let p2c = Affine2D {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+            e: -1.0,
+            f: 90.0,
+        };
+        let c2p = p2c.invert().unwrap();
+        assert!(CrsModel::Geographic.is_geographic_0_360(&p2c, 360));
+        let wb = CrsModel::Geographic.wgs84_bounds(&p2c, 360, 180);
+        assert_eq!(wb, [-180.0, -90.0, 180.0, 90.0]);
+        // Western Hemisphere WebMercator tile (z=2, x=0, y=1 covers lon -180..-90, lat 0..66.5)
+        let plan = CoordPlan::<256>::build(
+            &CrsModel::Geographic,
+            &c2p,
+            360,
+            180,
+            TileCoord { z: 2, x: 0, y: 1 },
+        )
+        .expect("0..360 geographic grid should intersect Western Hemisphere tile");
+        let (c0, c1, _, _) = plan.src_pixel_bounds();
+        assert!(c0 >= 178 && c1 <= 272, "expected wrapped cols in [178..272], got {c0}..{c1}");
     }
 }

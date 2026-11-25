@@ -152,7 +152,7 @@ struct ParsedQuery {
     strict: bool,
     return_mask: bool,
     shape_mask: bool,
-    buffer: u32,
+    buffer: f32,
     coord_crs_3857: bool,
     coord_crs: Option<cogzilla_proj::CrsModel>,
     dst_crs: Option<(cogzilla_proj::CrsModel, u16)>,
@@ -167,6 +167,7 @@ struct ParsedQuery {
     altitude: f32,
     z_factor: f32,
     threshold: f32,
+    cast_dtype: Option<String>,
     colormap_explicit: bool,
     colormap_name_set: bool,
     /// Parameter names present in the query, for per-route validation.
@@ -205,7 +206,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         strict: false,
         return_mask: true,
         shape_mask: true,
-        buffer: 0,
+        buffer: 0.0,
         coord_crs_3857: false,
         coord_crs: None,
         dst_crs: None,
@@ -220,6 +221,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         altitude: 45.0,
         z_factor: 1.0,
         threshold: 128.0,
+        cast_dtype: None,
         colormap_explicit: false,
         colormap_name_set: false,
         keys: Vec::new(),
@@ -323,6 +325,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             match val.as_f64().map(|t| t as f32) {
                                 Some(t) if t.is_finite() => pq.threshold = t,
                                 _ => bad("threshold must be a finite number"),
+                            }
+                        }
+                        if let Some(val) = obj.get("dtype") {
+                            match val.as_str() {
+                                Some(dt) => pq.cast_dtype = Some(dt.to_ascii_lowercase()),
+                                None => bad("dtype must be a string"),
                             }
                         }
                     }
@@ -437,7 +445,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if let Ok(buf) = v.parse::<f32>()
                     && buf.is_finite()
                 {
-                    pq.buffer = buf.round().clamp(0.0, 256.0) as u32;
+                    pq.buffer = buf.clamp(0.0, 256.0);
                 } else {
                     bad("expected a finite number");
                 }
@@ -1043,7 +1051,7 @@ fn tile_intersects_cog(
     cog: &cogzilla_io::OpenedCog,
     tms: &str,
     tile: TileCoord,
-    buffer: u32,
+    buffer: f32,
     tile_size: u32,
 ) -> Result<bool, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
@@ -1291,18 +1299,57 @@ fn build_band_request(
                             (-1.0, 1.0),
                         )
                     }
-                    "cast" => (
-                        format!("b{}", bands[0]),
-                        default_rescale_for_dtype(sample_type, true),
-                    ),
-                    "ceil" => (
-                        format!("ceil(b{})", bands[0]),
-                        default_rescale_for_dtype(sample_type, true),
-                    ),
-                    "floor" => (
-                        format!("floor(b{})", bands[0]),
-                        default_rescale_for_dtype(sample_type, true),
-                    ),
+                    "cast" => {
+                        let cast_one = |b: u16| -> (String, (f32, f32)) {
+                            match pq.cast_dtype.as_deref() {
+                                Some("uint8") => (format!("clip(floor(b{b}), 0, 255)"), (0.0, 255.0)),
+                                Some("int8") => (format!("clip(floor(b{b}), -128, 127)"), (-128.0, 127.0)),
+                                Some("uint16") => (format!("clip(floor(b{b}), 0, 65535)"), (0.0, 65535.0)),
+                                Some("int16") => (format!("clip(floor(b{b}), -32768, 32767)"), (-32768.0, 32767.0)),
+                                Some("uint32") => (format!("max(floor(b{b}), 0)"), (0.0, 4_294_967_295.0)),
+                                Some("int32") => (format!("floor(b{b})"), (-2_147_483_648.0, 2_147_483_647.0)),
+                                _ => (format!("b{b}"), default_rescale_for_dtype(sample_type, true)),
+                            }
+                        };
+                        if bands.len() >= 3 {
+                            let (e0, dr) = cast_one(bands[0]);
+                            let (e1, _) = cast_one(bands[1]);
+                            let (e2, _) = cast_one(bands[2]);
+                            let progs = [
+                                ExprProgram::compile(&e0).map_err(EngineError::BadRequest)?,
+                                ExprProgram::compile(&e1).map_err(EngineError::BadRequest)?,
+                                ExprProgram::compile(&e2).map_err(EngineError::BadRequest)?,
+                            ];
+                            let r0 = pq.rescale.first().copied().unwrap_or(dr);
+                            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
+                            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
+                            return Ok(BandRequest::CustomExprRgb {
+                                progs,
+                                rescale_min: [r0.0, r1.0, r2.0],
+                                rescale_max: [r0.1, r1.1, r2.1],
+                            });
+                        }
+                        cast_one(bands[0])
+                    }
+                    "ceil" | "floor" => {
+                        let dr = default_rescale_for_dtype(sample_type, bands.len() < 3);
+                        if bands.len() >= 3 {
+                            let progs = [
+                                ExprProgram::compile(&format!("{alg}(b{})", bands[0])).map_err(EngineError::BadRequest)?,
+                                ExprProgram::compile(&format!("{alg}(b{})", bands[1])).map_err(EngineError::BadRequest)?,
+                                ExprProgram::compile(&format!("{alg}(b{})", bands[2])).map_err(EngineError::BadRequest)?,
+                            ];
+                            let r0 = pq.rescale.first().copied().unwrap_or(dr);
+                            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
+                            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
+                            return Ok(BandRequest::CustomExprRgb {
+                                progs,
+                                rescale_min: [r0.0, r1.0, r2.0],
+                                rescale_max: [r0.1, r1.1, r2.1],
+                            });
+                        }
+                        (format!("{alg}(b{})", bands[0]), dr)
+                    }
                     "min" => {
                         let mut acc = format!("b{}", bands[0]);
                         for &b in &bands[1..] {
@@ -1338,49 +1385,20 @@ fn build_band_request(
                         )
                     }
                     "var" | "std" => {
-                        let expr = if bands.len() <= 1 {
-                            "0".to_string()
-                        } else {
-                            let n = bands.len();
-                            let mean_s = format!(
-                                "({}) / {n}",
-                                bands
-                                    .iter()
-                                    .map(|b| format!("b{b}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" + ")
-                            );
-                            let sq_s = bands
-                                .iter()
-                                .map(|b| format!("(b{b} - ({mean_s}))^2"))
-                                .collect::<Vec<_>>()
-                                .join(" + ");
-                            if alg == "std" {
-                                format!("sqrt(({sq_s}) / {n})")
-                            } else {
-                                format!("({sq_s}) / {n}")
-                            }
-                        };
-                        (expr, default_rescale_for_dtype(sample_type, true))
+                        let args = bands
+                            .iter()
+                            .map(|b| format!("b{b}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        (format!("{alg}({args})"), default_rescale_for_dtype(sample_type, true))
                     }
                     "median" => {
-                        let expr = match bands.len() {
-                            1 => format!("b{}", bands[0]),
-                            2 => format!("(b{} + b{}) / 2", bands[0], bands[1]),
-                            3 => format!(
-                                "b{0} + b{1} + b{2} - min(b{0}, min(b{1}, b{2})) - max(b{0}, max(b{1}, b{2}))",
-                                bands[0], bands[1], bands[2]
-                            ),
-                            _ => {
-                                let sum_s = bands
-                                    .iter()
-                                    .map(|b| format!("b{b}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" + ");
-                                format!("({sum_s}) / {}", bands.len())
-                            }
-                        };
-                        (expr, default_rescale_for_dtype(sample_type, true))
+                        let args = bands
+                            .iter()
+                            .map(|b| format!("b{b}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        (format!("median({args})"), default_rescale_for_dtype(sample_type, true))
                     }
                     "grayscale" => {
                         let expr = if bands.len() >= 3 {
@@ -1796,7 +1814,7 @@ async fn render_mosaic_tile_styled(
 ) -> Result<Bytes, EngineError> {
     let needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
-        || pq.buffer > 0
+        || pq.buffer > 0.0
         || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
 
@@ -1813,7 +1831,7 @@ async fn render_mosaic_tile_styled(
             .map(ColorFormula::parse)
             .transpose()
             .map_err(EngineError::BadRequest)?;
-        let out_dim = treq.tile_size + 2 * pq.buffer;
+        let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
         let bbox_3857 = web_mercator_buffered_3857_bbox(
             treq.tile.z,
             treq.tile.x,
@@ -1901,11 +1919,43 @@ async fn render_mosaic_tile_styled(
     }
 }
 
-fn web_mercator_buffered_3857_bbox(z: u8, x: u32, y: u32, buffer: u32, tile_size: u32) -> [f64; 4] {
+fn web_mercator_buffered_3857_bbox(z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> [f64; 4] {
     let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
     let pad_x = (max_x - min_x) * (buffer as f64 / tile_size as f64);
     let pad_y = (max_y - min_y) * (buffer as f64 / tile_size as f64);
     [min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y]
+}
+
+fn resolve_custom_lut(
+    pq: &ParsedQuery,
+    cog: &cogzilla_io::OpenedCog,
+    bands: &BandRequest,
+) -> Result<Option<CustomColormap>, EngineError> {
+    if let Some(ref j) = pq.custom_colormap_json {
+        return CustomColormap::from_json_str(j, !pq.rescale.is_empty())
+            .map(Some)
+            .map_err(EngineError::BadRequest);
+    }
+    if !pq.colormap_explicit
+        && pq.rescale.is_empty()
+        && matches!(bands, BandRequest::Single { .. })
+        && let Some(ref pal) = cog.index.color_map
+    {
+        return Ok(Some(CustomColormap::from_rgba_palette(pal)));
+    }
+    Ok(None)
+}
+
+fn has_embedded_palette(
+    pq: &ParsedQuery,
+    cog: &cogzilla_io::OpenedCog,
+    bands: &BandRequest,
+) -> bool {
+    pq.custom_colormap_json.is_none()
+        && !pq.colormap_explicit
+        && pq.rescale.is_empty()
+        && matches!(bands, BandRequest::Single { .. })
+        && cog.index.color_map.is_some()
 }
 
 fn plain_resp(
@@ -2871,23 +2921,19 @@ where
                             }
                             let needs_general_path = pq.nodata.is_some()
                                 || pq.custom_colormap_json.is_some()
-                                || pq.buffer > 0
+                                || pq.buffer > 0.0
                                 || (treq.tile_size != 256 && treq.tile_size != 512)
-                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. });
+                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
+                                || has_embedded_palette(&pq, &cogs[0], &treq.bands);
                             if needs_general_path {
-                                let custom_lut = pq
-                                    .custom_colormap_json
-                                    .as_deref()
-                                    .map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty()))
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
+                                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
                                 let cf = pq
                                     .color_formula
                                     .as_deref()
                                     .map(ColorFormula::parse)
                                     .transpose()
                                     .map_err(EngineError::BadRequest)?;
-                                let out_dim = treq.tile_size + 2 * pq.buffer;
+                                let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                                 let bbox_3857 = web_mercator_buffered_3857_bbox(
                                     z,
                                     x,
@@ -3501,25 +3547,21 @@ where
                             )));
                         }
                         let needs_general = tms != "WebMercatorQuad"
-                            || pq_stac.buffer > 0
+                            || pq_stac.buffer > 0.0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some()
                             || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
-                            || (treq.tile_size != 256 && treq.tile_size != 512);
+                            || (treq.tile_size != 256 && treq.tile_size != 512)
+                            || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands);
                         if needs_general {
-                            let custom_lut = pq_stac
-                                .custom_colormap_json
-                                .as_deref()
-                                .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
                             let cf = pq_stac
                                 .color_formula
                                 .as_deref()
                                 .map(ColorFormula::parse)
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
-                            let out_dim = treq.tile_size + 2 * pq_stac.buffer;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq_stac.buffer).round() as u32;
                             let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
                                 let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
                                     EngineError::BadRequest(format!("unsupported TMS '{tms}'"))
@@ -3599,12 +3641,12 @@ where
                             } else {
                                 encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
                             };
-                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                             Ok((data, ct))
                         }
@@ -3687,12 +3729,7 @@ where
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq_stac
-                    .custom_colormap_json
-                    .as_deref()
-                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac
                     .color_formula
                     .as_deref()
@@ -3742,12 +3779,7 @@ where
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq_stac
-                    .custom_colormap_json
-                    .as_deref()
-                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac
                     .color_formula
                     .as_deref()
@@ -3799,12 +3831,7 @@ where
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq_stac
-                    .custom_colormap_json
-                    .as_deref()
-                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac
                     .color_formula
                     .as_deref()
@@ -3866,12 +3893,7 @@ where
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq_stac
-                    .custom_colormap_json
-                    .as_deref()
-                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac
                     .color_formula
                     .as_deref()
@@ -3934,12 +3956,7 @@ where
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq_stac
-                    .custom_colormap_json
-                    .as_deref()
-                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac
                     .color_formula
                     .as_deref()
@@ -3991,12 +4008,7 @@ where
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq_stac
-                    .custom_colormap_json
-                    .as_deref()
-                    .map(|j| CustomColormap::from_json_str(j, !pq_stac.rescale.is_empty()))
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac
                     .color_formula
                     .as_deref()
@@ -4280,26 +4292,22 @@ where
                             )));
                         }
                         let needs_general_path = tms != "WebMercatorQuad"
-                            || pq.buffer > 0
+                            || pq.buffer > 0.0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some()
                             || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
-                            || (treq.tile_size != 256 && treq.tile_size != 512);
+                            || (treq.tile_size != 256 && treq.tile_size != 512)
+                            || has_embedded_palette(&pq, &cogs[0], &treq.bands);
 
                         if needs_general_path {
-                            let custom_lut = pq
-                                .custom_colormap_json
-                                .as_deref()
-                                .map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty()))
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
                             let cf = pq
                                 .color_formula
                                 .as_deref()
                                 .map(ColorFormula::parse)
                                 .transpose()
                                 .map_err(EngineError::BadRequest)?;
-                            let out_dim = treq.tile_size + 2 * pq.buffer;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                             let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
                                 let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
                                     EngineError::BadRequest(format!("unsupported TMS '{tms}'"))
@@ -4379,12 +4387,12 @@ where
                             } else {
                                 encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
                             };
-                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0, treq.tile_size);
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                             Ok((data, ct))
                         }
@@ -4496,7 +4504,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
@@ -4536,7 +4544,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
@@ -4579,7 +4587,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
@@ -4632,7 +4640,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
@@ -4686,7 +4694,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
@@ -4730,7 +4738,7 @@ where
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
-                let custom_lut = pq.custom_colormap_json.as_deref().map(|j| CustomColormap::from_json_str(j, !pq.rescale.is_empty())).transpose().map_err(EngineError::BadRequest)?;
+                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), true);
                 let mask_opt = pq.shape_mask.then_some(&mask);

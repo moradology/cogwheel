@@ -2799,12 +2799,7 @@ pub fn render_terrain_tile<const N: usize>(
     format: OutputFormat,
 ) -> Bytes {
     if src.all_nodata {
-        let nb = if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
-            1
-        } else {
-            3
-        };
-        return empty_tile_bytes(N as u32, format, nb);
+        return empty_tile_bytes(N as u32, format, 3);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
@@ -2918,13 +2913,27 @@ pub fn render_terrain_tile<const N: usize>(
             }
         }),
         OutputFormat::RawF32 | OutputFormat::Npy => {
-            let mut out = BytesMut::with_capacity(N * N * 4);
+            let mut r_plane = BytesMut::with_capacity(N * N * 4);
+            let mut g_plane = Vec::with_capacity(N * N * 4);
+            let mut b_plane = Vec::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
-                    out.put_slice(&sample_px(u, v).to_le_bytes());
+                    let elev = sample_px(u, v);
+                    if elev.is_nan() {
+                        r_plane.put_slice(&f32::NAN.to_le_bytes());
+                        g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
+                        b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
+                    } else {
+                        let [r, g, b] = encode_px(elev);
+                        r_plane.put_slice(&(r as f32).to_le_bytes());
+                        g_plane.extend_from_slice(&(g as f32).to_le_bytes());
+                        b_plane.extend_from_slice(&(b as f32).to_le_bytes());
+                    }
                 });
             }
-            out.freeze()
+            r_plane.put_slice(&g_plane);
+            r_plane.put_slice(&b_plane);
+            r_plane.freeze()
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } if clean => {
             SCRATCH.with(|cell| {

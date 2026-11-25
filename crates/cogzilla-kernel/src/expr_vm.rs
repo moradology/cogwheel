@@ -30,6 +30,9 @@ pub enum Op {
     Ceil,
     Floor,
     Round,
+    Median(u8),
+    Std(u8),
+    Var(u8),
 }
 
 /// Compiled flat bytecode for any TiTiler-style band-math expression (e.g. `(b1-b2)/(b1+b2)`).
@@ -106,6 +109,9 @@ impl ExprProgram {
                 }
                 Op::Clip | Op::Where => {
                     depth = depth.saturating_sub(2);
+                }
+                Op::Median(n) | Op::Std(n) | Op::Var(n) => {
+                    depth = depth.saturating_sub((n as usize).saturating_sub(1));
                 }
                 _ => {}
             }
@@ -286,6 +292,65 @@ impl ExprProgram {
                 }
                 Op::Round => {
                     stack[sp - 1] = stack[sp - 1].round();
+                }
+                Op::Median(n) => {
+                    let k = n as usize;
+                    let base = sp - k;
+                    let mut tmp = [0.0f32; MAX_EXPR_BANDS];
+                    let mut has_nan = false;
+                    for i in 0..k {
+                        let v = stack[base + i];
+                        if v.is_nan() {
+                            has_nan = true;
+                            break;
+                        }
+                        tmp[i] = v;
+                    }
+                    sp = base + 1;
+                    stack[base] = if has_nan || k == 0 {
+                        f32::NAN
+                    } else {
+                        let slice = &mut tmp[..k];
+                        slice.sort_unstable_by(f32::total_cmp);
+                        if k % 2 == 1 {
+                            slice[k / 2]
+                        } else {
+                            0.5 * (slice[k / 2 - 1] + slice[k / 2])
+                        }
+                    };
+                }
+                Op::Var(n) | Op::Std(n) => {
+                    let k = n as usize;
+                    let base = sp - k;
+                    let mut sum = 0.0f64;
+                    let mut has_nan = false;
+                    for i in 0..k {
+                        let v = stack[base + i];
+                        if v.is_nan() {
+                            has_nan = true;
+                            break;
+                        }
+                        sum += v as f64;
+                    }
+                    sp = base + 1;
+                    stack[base] = if has_nan || k == 0 {
+                        f32::NAN
+                    } else if k == 1 {
+                        0.0
+                    } else {
+                        let mean = sum / (k as f64);
+                        let mut sq = 0.0f64;
+                        for i in 0..k {
+                            let d = stack[base + i] as f64 - mean;
+                            sq += d * d;
+                        }
+                        let var = sq / (k as f64);
+                        if matches!(op, Op::Std(_)) {
+                            var.sqrt() as f32
+                        } else {
+                            var as f32
+                        }
+                    };
                 }
             }
         }
@@ -570,6 +635,66 @@ impl ExprProgram {
                     for i in 0..N {
                         s[i] = s[i].round();
                     }
+                }
+                Op::Median(n) => {
+                    let k = n as usize;
+                    let base = sp - k;
+                    let mut tmp = [0.0f32; MAX_EXPR_BANDS];
+                    for i in 0..N {
+                        let mut has_nan = false;
+                        for j in 0..k {
+                            let v = stack[base + j][i];
+                            if v.is_nan() {
+                                has_nan = true;
+                                break;
+                            }
+                            tmp[j] = v;
+                        }
+                        stack[base][i] = if has_nan || k == 0 {
+                            f32::NAN
+                        } else {
+                            let slice = &mut tmp[..k];
+                            slice.sort_unstable_by(f32::total_cmp);
+                            if k % 2 == 1 {
+                                slice[k / 2]
+                            } else {
+                                0.5 * (slice[k / 2 - 1] + slice[k / 2])
+                            }
+                        };
+                    }
+                    sp = base + 1;
+                }
+                Op::Var(n) | Op::Std(n) => {
+                    let k = n as usize;
+                    let base = sp - k;
+                    let is_std = matches!(op, Op::Std(_));
+                    for i in 0..N {
+                        let mut sum = 0.0f64;
+                        let mut has_nan = false;
+                        for j in 0..k {
+                            let v = stack[base + j][i];
+                            if v.is_nan() {
+                                has_nan = true;
+                                break;
+                            }
+                            sum += v as f64;
+                        }
+                        stack[base][i] = if has_nan || k == 0 {
+                            f32::NAN
+                        } else if k == 1 {
+                            0.0
+                        } else {
+                            let mean = sum / (k as f64);
+                            let mut sq = 0.0f64;
+                            for j in 0..k {
+                                let d = stack[base + j][i] as f64 - mean;
+                                sq += d * d;
+                            }
+                            let var = sq / (k as f64);
+                            if is_std { var.sqrt() as f32 } else { var as f32 }
+                        };
+                    }
+                    sp = base + 1;
                 }
             }
         }
@@ -901,6 +1026,9 @@ impl<'a> Parser<'a> {
                         ("max" | "maximum", 2) => Op::Max,
                         ("clip", 3) => Op::Clip,
                         ("where", 3) => Op::Where,
+                        ("median", n) if (1..=MAX_EXPR_BANDS).contains(&n) => Op::Median(n as u8),
+                        ("std", n) if (1..=MAX_EXPR_BANDS).contains(&n) => Op::Std(n as u8),
+                        ("var", n) if (1..=MAX_EXPR_BANDS).contains(&n) => Op::Var(n as u8),
                         _ => return Err(format!("unknown function '{name}' with {argc} args")),
                     };
                     self.ops.push(op);
@@ -998,7 +1126,18 @@ mod tests {
             "2.5 * (b1 - b2) / (b1 + 6 * b2 - 7.5 * b3 + 1)",
             "clip(db(b1) - min(b2, max(b3, 0.1)), -30, 10)",
             "sqrt(abs(b1 - b2)) + exp(-b3)",
+            "median(b1, b2, b3, b1 + b2)",
+            "std(b1, b2, b3)",
+            "var(b1, b2, b3)",
+            "std(b1)",
         ];
+        // Verify exact 4-band median (differs from mean!) and 1-band std NaN masking
+        let med4 = ExprProgram::compile("median(b1, b2, b3, b4)").unwrap();
+        assert!((med4.eval(&[1.0, 2.0, 3.0, 100.0]) - 2.5).abs() < 1e-6);
+        assert!(med4.eval(&[1.0, f32::NAN, 3.0, 4.0]).is_nan());
+        let std1 = ExprProgram::compile("std(b1)").unwrap();
+        assert_eq!(std1.eval(&[42.0]), 0.0);
+        assert!(std1.eval(&[f32::NAN]).is_nan());
         let mut rows = [[0.0f32; 256]; 3];
         for i in 0..256 {
             rows[0][i] = if i % 17 == 0 { f32::NAN } else if i == 5 { 0.0 } else { (i as f32 + 1.0) * 0.01 };

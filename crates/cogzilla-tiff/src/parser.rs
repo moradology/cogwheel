@@ -20,6 +20,7 @@ const TAG_ROWS_PER_STRIP: u16 = 278;
 const TAG_STRIP_BYTE_COUNTS: u16 = 279;
 const TAG_PLANAR_CONFIG: u16 = 284;
 const TAG_PREDICTOR: u16 = 317;
+const TAG_COLOR_MAP: u16 = 320;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_TILE_LENGTH: u16 = 323;
 const TAG_TILE_OFFSETS: u16 = 324;
@@ -446,6 +447,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     let mut geo_keys = GeoKeys::default();
     let mut nodata: Option<f32> = None;
     let mut gdal_metadata_xml: Option<String> = None;
+    let mut color_map: Option<Vec<[u8; 4]>> = None;
     let mut base_affine: Option<Affine2D> = None;
     let mut base_dims: Option<(u32, u32)> = None;
 
@@ -532,6 +534,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     | TAG_STRIP_BYTE_COUNTS
                     | TAG_PLANAR_CONFIG
                     | TAG_PREDICTOR
+                    | TAG_COLOR_MAP
                     | TAG_TILE_WIDTH
                     | TAG_TILE_LENGTH
                     | TAG_TILE_OFFSETS
@@ -574,6 +577,23 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     };
                 }
                 TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
+                TAG_COLOR_MAP => {
+                    if color_map.is_none() && entry.count > 0 && entry.count % 3 == 0 && entry.count <= 3 * 65_536 {
+                        charge_tag(entry.count, 2)?;
+                        let vals = entry.read_u16_vec(&r)?;
+                        let n = vals.len() / 3;
+                        let mut lut = Vec::with_capacity(n.min(256));
+                        for i in 0..n.min(256) {
+                            let r_c = (vals[i] >> 8) as u8;
+                            let g_c = (vals[n + i] >> 8) as u8;
+                            let b_c = (vals[2 * n + i] >> 8) as u8;
+                            lut.push([r_c, g_c, b_c, 255]);
+                        }
+                        if !lut.is_empty() {
+                            color_map = Some(lut);
+                        }
+                    }
+                }
                 TAG_STRIP_OFFSETS => {
                     charge_tag(entry.count, 8)?;
                     strip_offsets = Some(entry.read_u64_vec(&r)?);
@@ -993,6 +1013,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         offsets,
         band_metadata,
         band_descriptions,
+        color_map,
         geo_keys,
         ifds,
     })

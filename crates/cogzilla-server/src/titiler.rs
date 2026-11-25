@@ -799,7 +799,12 @@ pub async fn query_point(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
-    let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+    let q_lon = if crs.is_geographic_0_360(&ifd.pixel_to_crs, ifd.width) && lon < 0.0 {
+        lon + 360.0
+    } else {
+        lon
+    };
+    let (sx, sy) = crs.from_lonlat_deg(q_lon, lat);
     let (col_f, row_f) = ifd.crs_to_pixel.forward(sx, sy);
     let col = col_f.floor() as i64;
     let row = row_f.floor() as i64;
@@ -3373,13 +3378,14 @@ async fn render_bbox_impl(
         let build_uv_maps = {
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
+        let wrap_360 = crs.is_geographic_0_360(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
         let ifd_width = ifd.width;
         let ifd_height = ifd.height;
         let poly_mask = poly_mask.cloned();
         move || {
             let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
-                match &dst_crs {
+                let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
                     cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
                     other => {
@@ -3390,7 +3396,11 @@ async fn render_bbox_impl(
                             (f64::NAN, f64::NAN)
                         }
                     }
+                };
+                if wrap_360 && sx.is_finite() && sx < 0.0 {
+                    sx += 360.0;
                 }
+                (sx, sy)
             };
             let to_wgs84 = |x: f64, y: f64| -> (f64, f64) {
                 if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) {
@@ -4071,13 +4081,43 @@ async fn render_bbox_impl(
                         }
                     }
                 }
-                BandRequest::Single { band_1based, .. }
-                | BandRequest::Terrain { band_1based, .. } => {
+                BandRequest::Single { band_1based, .. } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
                     for i in 0..(w * h) {
                         out.put_slice(&sample(&src, u_map[i], v_map[i]).to_le_bytes());
                     }
+                }
+                BandRequest::Terrain {
+                    band_1based,
+                    encoding,
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let mut g_plane = Vec::with_capacity(w * h * 4);
+                    let mut b_plane = Vec::with_capacity(w * h * 4);
+                    for i in 0..(w * h) {
+                        let elev = sample(&src, u_map[i], v_map[i]);
+                        if elev.is_nan() {
+                            out.put_slice(&f32::NAN.to_le_bytes());
+                            g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
+                            b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
+                        } else {
+                            let [r, g, b] = match encoding {
+                                cogzilla_kernel::TerrainEncoding::Terrarium => {
+                                    cogzilla_kernel::encode_terrarium_rgb(elev)
+                                }
+                                cogzilla_kernel::TerrainEncoding::TerrainRgb => {
+                                    cogzilla_kernel::encode_terrain_rgb(elev)
+                                }
+                            };
+                            out.put_slice(&(r as f32).to_le_bytes());
+                            g_plane.extend_from_slice(&(g as f32).to_le_bytes());
+                            b_plane.extend_from_slice(&(b as f32).to_le_bytes());
+                        }
+                    }
+                    out.put_slice(&g_plane);
+                    out.put_slice(&b_plane);
                 }
                 BandRequest::CustomExpr { prog, .. } => {
                     let ref_vecs: Vec<_> = prog
@@ -4193,7 +4233,8 @@ async fn render_bbox_impl(
                 let nb = match bands {
                     BandRequest::Rgb { .. }
                     | BandRequest::SarRgb { .. }
-                    | BandRequest::CustomExprRgb { .. } => 3,
+                    | BandRequest::CustomExprRgb { .. }
+                    | BandRequest::Terrain { .. } => 3,
                     _ => 1,
                 };
                 return cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32);

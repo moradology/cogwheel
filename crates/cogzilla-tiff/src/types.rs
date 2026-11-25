@@ -345,6 +345,8 @@ pub struct CogIndex {
     pub band_metadata: Vec<Vec<(String, String)>>,
     /// Optional per-band descriptions parsed from `GDAL_METADATA` (`name="DESCRIPTION"`).
     pub band_descriptions: Vec<String>,
+    /// Optional embedded TIFF palette (Tag 320 `ColorMap`) as RGBA entries `[r, g, b, 255]`.
+    pub color_map: Option<Vec<[u8; 4]>>,
     pub geo_keys: GeoKeys,
     /// IFDs sorted from highest resolution (index 0) to lowest resolution overview.
     pub ifds: Vec<IfdMeta>,
