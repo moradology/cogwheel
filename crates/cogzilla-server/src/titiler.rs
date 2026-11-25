@@ -633,6 +633,7 @@ pub fn build_wmts_capabilities(
     let media_type = match tile_format {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
+        "tif" | "tiff" => "image/tiff; application=geotiff",
         "npy" => "application/x-binary",
         "f32" | "bin" | "raw" => "application/octet-stream",
         _ => "image/png",

@@ -613,7 +613,26 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     || lower.contains("%28+")
                     || lower.contains("+%29")
                     || lower.contains("%29+")
-                    || lower.contains("%2c+");
+                    || lower.contains("%2c+")
+                    || lower.contains("+%3c")
+                    || lower.contains("%3c+")
+                    || lower.contains("+%3e")
+                    || lower.contains("%3e+")
+                    || lower.contains("+%3d")
+                    || lower.contains("%3d+")
+                    || lower.contains("+%21")
+                    || lower.contains("%21+")
+                    || lower.contains("+%3b")
+                    || lower.contains("%3b+")
+                    || lower.contains("+<")
+                    || lower.contains("<+")
+                    || lower.contains("+>")
+                    || lower.contains(">+")
+                    || lower.contains("+=")
+                    || lower.contains("=+")
+                    || lower.contains("+!")
+                    || lower.contains("+;")
+                    || lower.contains(";+");
                 pq.expr_raw = Some(percent_decode_opts(v, plus_is_space));
             }
             "padding" => match v.parse::<u32>() {
@@ -825,19 +844,21 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
                 .get(1)
                 .is_some_and(|s| *s == name || s.starts_with(&format!("{name}.")))
     };
+    let is_ogc_map =
+        matches!(segs[0], "cog" | "stac" | "mosaicjson") && segs.get(1) == Some(&"map");
     if family != "colorMaps" {
         if let Some(k) = has(&["orientation"]) {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
     }
-    if !(route("preview") || route("bbox") || route("feature") || route("map")) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map) {
         if let Some(k) = has(&["width", "height", "dst_crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, and map routes"
             ));
         }
     }
-    if !(route("bounds") || route("info") || route("map")) {
+    if !(route("bounds") || route("info") || is_ogc_map) {
         if let Some(k) = has(&["crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on bounds, info, and map routes"
@@ -970,12 +991,7 @@ fn apply_tilejson_overrides(
     tj["tiles"] = serde_json::json!([tile_url]);
     let cur_min = tj.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let cur_max = tj.get("maxzoom").and_then(|v| v.as_u64()).unwrap_or(22) as u8;
-    let (new_min, new_max) = match (pq.minzoom, pq.maxzoom) {
-        (Some(mn), Some(mx)) => (mn, mx.max(mn)),
-        (Some(mn), None) => (mn, cur_max.max(mn)),
-        (None, Some(mx)) => (cur_min.min(mx), mx),
-        (None, None) => (cur_min, cur_max),
-    };
+    let (new_min, new_max) = resolve_zoom_range(cur_min, cur_max, pq.minzoom, pq.maxzoom);
     tj["minzoom"] = serde_json::json!(new_min);
     tj["maxzoom"] = serde_json::json!(new_max);
     if let Some(center) = tj.get_mut("center").and_then(|v| v.as_array_mut())
@@ -983,6 +999,35 @@ fn apply_tilejson_overrides(
     {
         center[2] = serde_json::json!(new_min);
     }
+}
+
+fn resolve_zoom_range(
+    def_min: u8,
+    def_max: u8,
+    req_min: Option<u8>,
+    req_max: Option<u8>,
+) -> (u8, u8) {
+    match (req_min, req_max) {
+        (Some(mn), Some(mx)) => (mn, mx.max(mn)),
+        (Some(mn), None) => (mn, def_max.max(mn)),
+        (None, Some(mx)) => (def_min.min(mx), mx),
+        (None, None) => (def_min, def_max),
+    }
+}
+
+fn apply_info_bounds_crs(
+    info: &mut serde_json::Value,
+    wgs84_bounds: [f64; 4],
+    bounds_crs: Option<&(cogzilla_proj::CrsModel, u16)>,
+) -> Result<(), EngineError> {
+    if let Some((dst_crs, dst_epsg)) = bounds_crs {
+        let proj_bounds = reproject_wgs84_bounds(wgs84_bounds, dst_crs)?;
+        info["bounds"] = serde_json::json!(proj_bounds);
+        info["crs"] = serde_json::json!(format!(
+            "http://www.opengis.net/def/crs/EPSG/0/{dst_epsg}"
+        ));
+    }
+    Ok(())
 }
 
 const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
@@ -1911,24 +1956,25 @@ fn build_tile_request_for_tms(
     tms_id: &str,
     source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
-    let (cols, rows, target_epsg) = if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
-        let Some(m) = tms_def.matrix(tile.z) else {
-            return Err(EngineError::BadRequest(format!(
-                "zoom level z={} is not defined for tile matrix set '{}'",
-                tile.z, tms_id
-            )));
+    let (cols, rows, target_epsg, base_tile_size) =
+        if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
+            let Some(m) = tms_def.matrix(tile.z) else {
+                return Err(EngineError::BadRequest(format!(
+                    "zoom level z={} is not defined for tile matrix set '{}'",
+                    tile.z, tms_id
+                )));
+            };
+            (m.matrix_width, m.matrix_height, tms_def.epsg, m.tile_width)
+        } else {
+            if tile.z > 30 {
+                return Err(EngineError::BadRequest(format!(
+                    "zoom level z={} exceeds maximum supported zoom (30)",
+                    tile.z
+                )));
+            }
+            let rows = 1u64 << (tile.z as u32);
+            (rows, rows, 3857u16, 256u32)
         };
-        (m.matrix_width, m.matrix_height, tms_def.epsg)
-    } else {
-        if tile.z > 30 {
-            return Err(EngineError::BadRequest(format!(
-                "zoom level z={} exceeds maximum supported zoom (30)",
-                tile.z
-            )));
-        }
-        let rows = 1u64 << (tile.z as u32);
-        (rows, rows, 3857u16)
-    };
     if (tile.x as u64) >= cols || (tile.y as u64) >= rows {
         return Err(EngineError::BadRequest(format!(
             "tile coordinate ({}, {}) out of range for {tms_id} z={} (expected x < {cols}, y < {rows})",
@@ -1939,14 +1985,32 @@ fn build_tile_request_for_tms(
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, sample_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
+    let has_explicit_tile_size = pq
+        .keys
+        .iter()
+        .any(|k| matches!(k.as_str(), "tile_size" | "tilesize" | "size" | "scale"));
     let tile_size = match scale_opt {
-        Some(sc) if (1..=4).contains(&sc) => sc * 256,
+        Some(sc) if (1..=4).contains(&sc) => {
+            let sz = sc.saturating_mul(base_tile_size);
+            if sz > 4096 {
+                return Err(EngineError::BadRequest(format!(
+                    "scaled tile size {sz} exceeds maximum (4096) for {tms_id}"
+                )));
+            }
+            sz
+        }
         Some(other) => {
             return Err(EngineError::BadRequest(format!(
                 "invalid tile scale @{other}x (expected 1..=4)"
             )));
         }
-        None => pq.tile_size,
+        None => {
+            if has_explicit_tile_size {
+                pq.tile_size
+            } else {
+                base_tile_size
+            }
+        }
     };
     Ok((
         TileRequest {
@@ -3327,12 +3391,16 @@ where
             ["mosaicjson", "info"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
+                let mut info = mj.info_json();
+                apply_info_bounds_crs(&mut info, mj.bounds, pq.bounds_crs.as_ref())?;
+                Ok((Bytes::from(info.to_string()), "application/json"))
             }
             .await,
             ["mosaicjson", "info.geojson"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
+                let mut props = mj.info_json();
+                apply_info_bounds_crs(&mut props, mj.bounds, pq.bounds_crs.as_ref())?;
                 let [w, s, e, n] = mj.bounds;
                 let feat = serde_json::json!({
                     "type": "Feature",
@@ -3341,7 +3409,7 @@ where
                         "type": "Polygon",
                         "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]
                     },
-                    "properties": mj.info_json()
+                    "properties": props
                 });
                 Ok((Bytes::from(feat.to_string()), "application/geo+json"))
             }
@@ -3545,8 +3613,8 @@ where
                     }
                     let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                     let mj = load_mosaicjson(&engine, &u).await?;
-                    let minz = pq.minzoom.unwrap_or(mj.minzoom);
-                    let maxz = pq.maxzoom.unwrap_or(mj.maxzoom).max(minz);
+                    let (minz, maxz) =
+                        resolve_zoom_range(mj.minzoom, mj.maxzoom, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
@@ -4208,7 +4276,14 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut map = serde_json::Map::new();
                 for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
-                    map.insert(name, build_cog_info(&engine, &cog)?);
+                    let mut info = build_cog_info(&engine, &cog)?;
+                    if pq.bounds_crs.is_some() {
+                        let crs = engine.get_or_build_crs(&cog)?;
+                        let full = cog.index.full_res();
+                        let wgs84 = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                        apply_info_bounds_crs(&mut info, wgs84, pq.bounds_crs.as_ref())?;
+                    }
+                    map.insert(name, info);
                 }
                 Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"))
             }
@@ -4222,7 +4297,14 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut props = serde_json::Map::new();
                 for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
-                    props.insert(name, build_cog_info(&engine, &cog)?);
+                    let mut info = build_cog_info(&engine, &cog)?;
+                    if pq.bounds_crs.is_some() {
+                        let crs = engine.get_or_build_crs(&cog)?;
+                        let full = cog.index.full_res();
+                        let wgs84 = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                        apply_info_bounds_crs(&mut info, wgs84, pq.bounds_crs.as_ref())?;
+                    }
+                    props.insert(name, info);
                 }
                 let geom = item.geometry.clone().unwrap_or_else(|| {
                     let b = item.bbox.unwrap_or([-180.0, -90.0, 180.0, 90.0]);
@@ -4603,8 +4685,8 @@ where
                     } else {
                         crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
                     };
-                    let minz = pq.minzoom.unwrap_or(def_min);
-                    let maxz = pq.maxzoom.unwrap_or(def_max).max(minz);
+                    let (minz, maxz) =
+                        resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
@@ -5774,8 +5856,8 @@ where
                     } else {
                         crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
                     };
-                    let minz = pq.minzoom.unwrap_or(def_min);
-                    let maxz = pq.maxzoom.unwrap_or(def_max).max(minz);
+                    let (minz, maxz) =
+                        resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
@@ -6732,5 +6814,34 @@ mod tests {
         // 7. resolve_bbox_dst_crs defaults to coord_crs when dst_crs is omitted
         let pq_utm = parse_query(Some("url=a.tif&coord_crs=EPSG:32610"));
         assert_eq!(resolve_bbox_dst_crs(&pq_utm).map(|(_, e)| e), Some(32610));
+
+        // 8. Form-encoded comparison & semicolon expressions decode `+` as space
+        let pq_cmp = parse_query(Some("expression=b1+%3E+100"));
+        assert_eq!(pq_cmp.expr_raw.as_deref(), Some("b1 > 100"));
+        let pq_semi = parse_query(Some("expression=b1%3B+b2%3B+b3"));
+        assert_eq!(pq_semi.expr_raw.as_deref(), Some("b1; b2; b3"));
+
+        // 9. resolve_zoom_range honors ?maxzoom < def_min and WMTS tif MIME type
+        assert_eq!(resolve_zoom_range(10, 15, None, Some(5)), (5, 5));
+        let tif_xml = build_wmts_capabilities(
+            "http://localhost:8080",
+            "cog",
+            "WebMercatorQuad",
+            "Test",
+            [-122.7, 37.7, -122.5, 37.8],
+            5,
+            5,
+            "tif",
+            1,
+            "url=a.tif",
+            "url=a.tif&tile_format=tif",
+            false,
+        );
+        assert!(tif_xml.contains("<Format>image/tiff; application=geotiff</Format>"));
+
+        // 10. /{family}/map.html must reject OGC Maps-only width/dst_crs params
+        let pq_map_html = parse_query(Some("url=a.tif&width=256"));
+        assert!(validate_query(&["cog", "map.html"], &pq_map_html).is_err());
+        assert!(validate_query(&["cog", "map"], &pq_map_html).is_ok());
     }
 }
