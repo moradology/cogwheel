@@ -694,6 +694,37 @@ def main() -> int:
         o.check("tile, asset_as_band and an expression", "image", f"{base12}.png?assets=red&assets=nir&expression={ndvi}&rescale=-1,1&asset_as_band=true")
         o.check("tile, a bare bidx is passed over", "image", f"{base12}.png?assets=visual&bidx=1")
         o.check("tile, asset names in an expression", "json", f"{base12}.png?assets=red&assets=nir&expression={opt('(nir-red)/(nir+red)')}&rescale=-1,1")
+        # Every scene under the tile, so the methods have something to choose between.
+        every = "&skipcovered=false&exitwhenfull=false&items_limit=6"
+        for method, q in [
+            ("first", "assets=visual"),
+            ("highest", "assets=visual"),
+            ("highest", "assets=red&rescale=0,20000"),
+            ("lowest", "assets=red&rescale=0,3000&colormap_name=viridis"),
+            ("mean", "assets=red&rescale=0,12000"),
+            ("mean", "assets=red&assets=green&assets=blue&asset_as_band=true&rescale=0,12000"),
+            ("mean", "assets=red&unscale=true&rescale=0,1.2"),
+            ("median", "assets=visual"),
+            ("median", f"assets=red&expression={opt('b1/2')}&rescale=0,4000"),
+            ("stdev", "assets=red&rescale=0,8000"),
+            ("stdev", "assets=visual&rescale=0,120"),
+            ("count", "assets=visual&rescale=0,8"),
+        ]:
+            o.check(f"tile, pixel_selection={method}, {q.split('&')[0][7:]}{' and more' if q.count('&') > 1 else ''}", "image",
+                    f"{base12}.png?{q}&pixel_selection={method}{every}")
+        o.check("tile, pixel_selection with the search's own limits", "image", f"{base12}.png?assets=visual&pixel_selection=median")
+        o.check("tile, pixel_selection and a colour formula", "image",
+                f"{base12}.png?assets=visual&pixel_selection=mean&color_formula={opt('gamma rgb 1.8')}{every}")
+        o.check("tile, a colour formula", "image", f"{base12}.png?assets=visual&color_formula={opt('gamma rgb 1.8')}")
+        o.check("tile, a colour formula, format chosen from the pixels", "image",
+                f"{base12}?assets=visual&color_formula={opt('sigmoidal rgb 6 0.4')}")
+        o.check("tile, no mask", "image", f"{base12}.png?assets=visual&return_mask=false")
+        o.check("tile, a pixel_selection nobody has", "status", f"{base12}.png?assets=visual&pixel_selection=nope")
+        o.check("tile, pixel_selection=lastbandhigh", "status",
+                f"{base12}.png?assets=red&assets=nir&asset_as_band=true&rescale=0,4000&pixel_selection=lastbandhigh{every}",
+                known="lastbandlow and lastbandhigh are not there yet")
+        o.check("bbox, pixel_selection=mean", "status", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=64&pixel_selection=mean{every}",
+                known="bbox and feature images take pixel_selection=first only so far")
         o.check("tile, one band of three", "image", f"{base12}.png?assets={opt('visual|bidx=1')}",
                 known="GDAL reads a subset of an RGB raster's bands from other pixels than all of them (rio-tiler tile(indexes=(1,)) differs from tile(indexes=(1,2,3))[0] in 43% of pixels); cogzilla reads the same pixels either way")
         o.check("bbox, bidx=1 on a one-band asset", "image", f"/searches/{sid}/bbox/{part}.png?assets={opt('red|bidx=1')}&rescale=0,3000&max_size=256")

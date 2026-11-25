@@ -1800,6 +1800,44 @@ impl TileEngine {
         }
     }
 
+    /// How many bands of values a request's scenes hold: three for a colour composite, else one.
+    pub fn value_bands(bands: &BandRequest) -> usize {
+        match bands {
+            BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+            _ => 1,
+        }
+    }
+
+    /// Every scene of a mosaic as the values its bands hold over the tile, before any
+    /// rescaling or colour, handed to `each` in the mosaic's order: band after band
+    /// ([`Self::value_bands`] of them) of little-endian `f32`, NaN where the scene has no
+    /// data. A scene that does not reach the tile is not handed over. This is what a mosaic
+    /// that has to look at every scene is made from; one that takes the first value it finds
+    /// should use [`Self::render_mosaic_scenes_ahead`], which stops when the tile is full.
+    pub async fn mosaic_scene_values(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        mut each: impl FnMut(&[u8]),
+    ) -> Result<(), EngineError> {
+        if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one asset per scene".into(),
+            ));
+        }
+        let len = Self::value_bands(&req.bands) * (req.tile_size as usize).pow(2) * 4;
+        let mut scene_req = req.clone();
+        scene_req.format = OutputFormat::RawF32;
+        let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, MOSAIC_SCENES_AHEAD);
+        while let Some(scene) = reading.next().await {
+            let scene = scene?;
+            if scene.len() == len {
+                each(&scene);
+            }
+        }
+        Ok(())
+    }
+
     /// The mosaic behind [`Self::render_mosaic_tile`], over scenes that are each one asset or
     /// two to three co-registered single-band assets (rendered as one multi-asset composite).
     /// The caller bounds how many scenes it passes.

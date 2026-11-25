@@ -21,6 +21,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
 mod pgstac;
+mod pixel_selection;
 mod cql2_text;
 mod point_expr;
 mod zonal;

@@ -19,6 +19,7 @@ use cogzilla_pgstac::{
 };
 use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{CrsModel, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
+use cogzilla_tiff::SampleType;
 use http_body_util::Full;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
@@ -29,6 +30,7 @@ use super::{
     parse_ext_format, parse_wxh_ext, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
+use super::pixel_selection::{Fold, Selected, Selection};
 use super::point_expr::Program;
 use super::zonal::{self, Bins, StatsOptions};
 use crate::engine::{BandRequest, EngineError, MOSAIC_SCENES_AHEAD, TileEngine};
@@ -1420,6 +1422,81 @@ struct MosaicQuery {
     reproject: ResampleMode,
     /// Which lookup lists the items (`item_lookup`).
     lookup: Lookup,
+    /// `pixel_selection`, when it is not `first`.
+    selection: Option<Selection>,
+}
+
+/// The routes that draw one image from many rasters at once take `first` only so far.
+fn first_only(query: &MosaicQuery, route: &str) -> Result<(), Resp> {
+    match query.selection {
+        None => Ok(()),
+        Some(_) => Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("pixel_selection other than 'first' is not supported on {route} routes yet (tiles take it)"),
+        )),
+    }
+}
+
+/// How the values a pixel selection leaves become colours: the request's own rescaling
+/// and colour map, applied as the renderer applies them to a single scene.
+enum Paint {
+    Gray { min: f32, max: f32, colormap: ColormapName },
+    Rgb { min: [f32; 3], max: [f32; 3] },
+}
+
+impl Paint {
+    /// `None` for a request whose pixels are not values put through a rescale (a terrain encoding).
+    fn of(bands: &BandRequest) -> Option<Self> {
+        Some(match bands {
+            BandRequest::Single { rescale, colormap, .. }
+            | BandRequest::Spectral1 { rescale, colormap, .. }
+            | BandRequest::Spectral2 { rescale, colormap, .. }
+            | BandRequest::Spectral3 { rescale, colormap, .. }
+            | BandRequest::CustomExpr { rescale, colormap, .. }
+            | BandRequest::Dem { rescale, colormap, .. } => Self::Gray { min: rescale.0, max: rescale.1, colormap: *colormap },
+            BandRequest::Rgb { rescale_min, rescale_max, .. }
+            | BandRequest::SarRgb { rescale_min, rescale_max, .. } => Self::Rgb { min: *rescale_min, max: *rescale_max },
+            BandRequest::Terrain { .. } => return None,
+        })
+    }
+
+    /// RGBA for `pixels` pixels. A pixel is transparent when no band of it has a value.
+    fn rgba(&self, selected: &Selected, pixels: usize) -> Vec<u8> {
+        // The renderer's own arithmetic, which is also rio-tiler's: scale, clamp, drop the fraction.
+        let byte = |v: f32, min: f32, max: f32| {
+            ((v - min) * (255.0 / cogzilla_kernel::safe_rescale_denom(min, max))).clamp(0.0, 255.0) as u8
+        };
+        let mut out = vec![0u8; pixels * 4];
+        match (self, selected.bands) {
+            (Self::Rgb { min, max }, 3) => {
+                for (i, px) in out.chunks_exact_mut(4).enumerate() {
+                    let v = [selected.values[i], selected.values[pixels + i], selected.values[2 * pixels + i]];
+                    if v.iter().all(|v| v.is_nan()) {
+                        continue;
+                    }
+                    for k in 0..3 {
+                        px[k] = if v[k].is_nan() { 0 } else { byte(v[k], min[k], max[k]) };
+                    }
+                    px[3] = 255;
+                }
+            }
+            _ => {
+                // One band: the request's colour map, or grey for the count of an RGB request.
+                let (min, max, colormap) = match self {
+                    Self::Gray { min, max, colormap } => (*min, *max, *colormap),
+                    Self::Rgb { min, max } => (min[0], max[0], ColormapName::Grayscale),
+                };
+                let lut = colormap.lut();
+                for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
+                    if !v.is_nan() {
+                        px[..3].copy_from_slice(&lut.rgb[usize::from(byte(*v, min, max))]);
+                        px[3] = 255;
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// TiTiler's two resampling parameters. Both default to nearest neighbour.
@@ -1458,15 +1535,22 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
             format!("at most {MAX_ASSETS_PER_SCENE} assets per item are supported, got {}", assets.len()),
         ));
     }
-    match query_value(pairs, "pixel_selection") {
-        None | Some("first") => {}
-        Some(other) => {
+    let selection = match query_value(pairs, "pixel_selection") {
+        None | Some("first") => None,
+        Some(name @ ("lastbandlow" | "lastbandhigh")) => {
             return Err(detail(
                 StatusCode::BAD_REQUEST,
-                format!("pixel_selection '{other}' is not supported yet (use first)"),
+                format!("pixel_selection '{name}' is not supported yet"),
             ));
         }
-    }
+        Some(name) => Some(Selection::parse(name).ok_or_else(|| {
+            invalid_param(
+                "query",
+                "pixel_selection",
+                "Input should be 'first', 'highest', 'lowest', 'mean', 'median', 'stdev', 'lastbandlow', 'lastbandhigh' or 'count'",
+            )
+        })?),
+    };
     if query_value(pairs, "algorithm_params").is_some() {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
     }
@@ -1487,6 +1571,7 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         ));
     }
     Ok(MosaicQuery {
+        selection,
         lookup: parse_lookup(pairs)?,
         assets,
         asset_as_band,
@@ -1671,7 +1756,7 @@ async fn part_image(
 ) -> Resp {
     // `width` and `height` are read here; the shared parser does not know them.
     pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'"));
-    let query = match check_mosaic_query(&pq, pairs) {
+    let query = match check_mosaic_query(&pq, pairs).and_then(|q| first_only(&q, "bbox and feature").map(|()| q)) {
         Ok(q) => q,
         Err(r) => return r,
     };
@@ -2461,7 +2546,7 @@ async fn mosaic_statistics(
         "'histogram_range'", "'cover_scale'",
     ];
     pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)));
-    let query = match check_mosaic_query(&pq, pairs) {
+    let query = match check_mosaic_query(&pq, pairs).and_then(|q| first_only(&q, "statistics").map(|()| q)) {
         Ok(q) => q,
         Err(r) => return r,
     };
@@ -2752,6 +2837,7 @@ async fn tile(
     let auto_format = explicit.is_empty();
     let (resampling, reproject) = (query.resampling, query.reproject);
     let asset_as_band = query.asset_as_band;
+    let selection = query.selection;
     let return_mask = pq.return_mask;
     let jpeg_quality = pq.jpeg_quality;
     let engine = ctx.engine;
@@ -2794,19 +2880,65 @@ async fn tile(
                     treq.tile_size
                 )));
             }
-            if !auto_format {
-                // TiTiler names the media type after the extension that was asked for.
-                let content_type = if explicit == "jpg" { "image/jpg" } else { content_type };
-                return Ok((engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?, content_type));
-            }
-            treq.format = OutputFormat::RawRgba;
-            let rgba = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
+            let formula = pq
+                .color_formula
+                .as_deref()
+                .map(cogzilla_kernel::ColorFormula::parse)
+                .transpose()
+                .map_err(EngineError::BadRequest)?;
             let dim = treq.tile_size as usize;
-            let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
-            let (format, content_type) = if opaque {
-                parse_ext_format("jpg", None, jpeg_quality)?
+            let raw_array = matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy);
+            // TiTiler names the media type after the extension that was asked for.
+            let content_type = if explicit == "jpg" { "image/jpg" } else { content_type };
+            let asked = treq.format;
+            let mut rgba = if let Some(method) = selection {
+                // Every scene's values, then rio-tiler's arithmetic over them, then colour.
+                let paint = Paint::of(&treq.bands).ok_or_else(|| {
+                    EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
+                })?;
+                if raw_array {
+                    return Err(EngineError::BadRequest(
+                        "raw array formats are not supported with pixel_selection other than 'first' yet".into(),
+                    ));
+                }
+                // `mean` and `median` are cast back to the source's type, which only loses
+                // anything when the values are the raster's own whole numbers.
+                let integer = !pq.unscale
+                    && matches!(treq.bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
+                    && !matches!(full.sample_type, SampleType::Float32 | SampleType::Float64);
+                let bands = TileEngine::value_bands(&treq.bands);
+                // The median has to hold every scene, so it is refused before anything is
+                // read when that would be too much.
+                const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
+                if Fold::held_bytes(method, scenes.len(), bands, dim * dim) > MAX_HELD_BYTES {
+                    return Err(EngineError::BadRequest(format!(
+                        "{} items are too many for a median at this tile size; narrow the search or lower items_limit",
+                        scenes.len()
+                    )));
+                }
+                let mut fold = Fold::new(method, bands, dim * dim, integer);
+                engine.mosaic_scene_values(&scenes, &treq, |scene| fold.add(scene)).await?;
+                match fold.finish() {
+                    Some(selected) => paint.rgba(&selected, dim * dim),
+                    None => vec![0u8; dim * dim * 4],
+                }
             } else {
-                parse_ext_format("png", None, jpeg_quality)?
+                // Nothing to do to the pixels after the mosaic: the renderer encodes them itself.
+                if !auto_format && (raw_array || (formula.is_none() && return_mask)) {
+                    return Ok((engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?, content_type));
+                }
+                treq.format = OutputFormat::RawRgba;
+                engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?.to_vec()
+            };
+            if let Some(formula) = &formula {
+                formula.apply_buffer_in_place(&mut rgba, 4);
+            }
+            // With no format asked for, TiTiler sends JPEG when every pixel is there and PNG when not.
+            let (format, content_type) = if auto_format {
+                let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
+                parse_ext_format(if opaque { "jpg" } else { "png" }, None, jpeg_quality)?
+            } else {
+                (asked, content_type)
             };
             Ok((encode_rgba_output(dim, dim, &rgba, format, return_mask), content_type))
         })
@@ -4022,6 +4154,30 @@ mod tests {
         assert_eq!(status("use_epsg=maybe"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("zooms=WebMercatorQuad"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status(""), StatusCode::OK);
+    }
+
+    #[test]
+    fn selected_values_are_painted_with_the_requests_own_rescale() {
+        let nan = f32::NAN;
+        // One band through a colour map: 0 to 100 onto 0 to 255, the fraction dropped.
+        let gray = Paint::of(&BandRequest::Single { band_1based: 1, rescale: (0.0, 100.0), colormap: ColormapName::Grayscale }).unwrap();
+        let rgba = gray.rgba(&Selected { bands: 1, values: vec![0.0, 50.0, 100.0, 250.0, -5.0, nan] }, 6);
+        assert_eq!(rgba, [0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 0]);
+        let viridis = Paint::of(&BandRequest::Single { band_1based: 1, rescale: (0.0, 255.0), colormap: ColormapName::Viridis }).unwrap();
+        let rgba = viridis.rgba(&Selected { bands: 1, values: vec![0.0, 255.0] }, 2);
+        assert_eq!(rgba[..4], [ColormapName::Viridis.lut().rgb[0][0], ColormapName::Viridis.lut().rgb[0][1], ColormapName::Viridis.lut().rgb[0][2], 255]);
+        assert_eq!(rgba[4..7], ColormapName::Viridis.lut().rgb[255]);
+
+        // Three bands, each with its own range. A pixel is there when any band of it is.
+        let rgb = Paint::of(&BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0, 0.0, 0.0], rescale_max: [255.0, 100.0, 10.0] }).unwrap();
+        let selected = Selected { bands: 3, values: vec![255.0, nan, nan, 50.0, 50.0, nan, 5.0, nan, nan] };
+        assert_eq!(rgb.rgba(&selected, 3), [255, 127, 127, 255, 0, 127, 0, 255, 0, 0, 0, 0]);
+        // A count is one band whatever was asked for: grey on the first band's range.
+        let count = Selected { bands: 1, values: vec![0.0, 255.0] };
+        assert_eq!(rgb.rgba(&count, 2), [0, 0, 0, 255, 255, 255, 255, 255]);
+
+        let terrain = BandRequest::Terrain { band_1based: 1, encoding: cogzilla_kernel::TerrainEncoding::Terrarium };
+        assert!(Paint::of(&terrain).is_none());
     }
 
     #[test]
