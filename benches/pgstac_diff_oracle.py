@@ -738,6 +738,11 @@ def main() -> int:
         o.check("tile as an array, a mean", "image", f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3")
         o.check("tile as an array, bilinear", "image", f"{base12}.npy?assets=red&resampling=bilinear&reproject=bilinear")
         o.check("tile as an array, bilinear, three bands", "image", f"{base12}.npy?assets=visual&resampling=bilinear&reproject=bilinear")
+        each = "&skipcovered=false&exitwhenfull=false"
+        o.check("tile as an array, bilinear, a mean", "image",
+                f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3&resampling=bilinear&reproject=bilinear{each}")
+        o.check("tile as an array, bilinear, a count", "image",
+                f"{base12}.npy?assets=visual&pixel_selection=count&items_limit=3&resampling=bilinear&reproject=bilinear{each}")
         o.check("tile as an array, bilinear, rescaled", "image",
                 f"{base12}.npy?assets=red&rescale=0,3000&resampling=bilinear&reproject=bilinear")
         o.check("box as an array, band math in doubles", "image",
