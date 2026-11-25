@@ -45,7 +45,6 @@ Resources:
           AllowMethods:
             - GET
             - POST
-            - OPTIONS
       Environment:
         Variables:
           COGZILLA_CACHE_MB: !Ref CacheMb
