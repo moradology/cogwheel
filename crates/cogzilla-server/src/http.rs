@@ -1158,6 +1158,26 @@ fn tile_intersects_cog(
                 Err(_) => Ok(true),
             };
         }
+        if matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857) {
+            let (lon0, lat0) = mercator_to_lonlat_deg(tb[0], tb[1]);
+            let (lon1, lat1) = mercator_to_lonlat_deg(tb[2], tb[3]);
+            let (ts, tn) = (lat0.min(lat1), lat0.max(lat1));
+            if tn < cs || ts > cn {
+                return Ok(false);
+            }
+            let (raw_w, raw_e) = (lon0.min(lon1), lon0.max(lon1));
+            let overlaps = |w: f64, e: f64| -> bool {
+                if cw <= ce {
+                    e >= cw && w <= ce
+                } else {
+                    e >= cw || w <= ce
+                }
+            };
+            let primary = overlaps(raw_w.max(-180.0), raw_e.min(180.0));
+            let wrap_west = raw_w < -180.0 && overlaps((raw_w + 360.0).max(-180.0), 180.0);
+            let wrap_east = raw_e > 180.0 && overlaps(-180.0, (raw_e - 360.0).min(180.0));
+            return Ok(primary || wrap_west || wrap_east);
+        }
         match bbox_to_wgs84(tb, Some(&dst_crs)) {
             Ok(w) => w,
             Err(_) => return Ok(true),
@@ -2057,6 +2077,7 @@ async fn render_mosaic_tile_styled(
     }
 
     if needs_bbox_mosaic {
+        let urls = &urls[..urls.len().min(64)];
         let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
         let bbox_3857 = web_mercator_buffered_3857_bbox(
             treq.tile.z,
@@ -2069,7 +2090,10 @@ async fn render_mosaic_tile_styled(
         if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
             let mut acc_f32: Option<(usize, Vec<f32>)> = None;
             let mut filled = 0usize;
-            for url in urls {
+            for (scene_i, url) in urls.iter().enumerate() {
+                if scene_i > 0 {
+                    tokio::task::consume_budget().await;
+                }
                 let Ok(cog) = engine.store.open_uri(url).await else {
                     continue;
                 };
@@ -2166,7 +2190,10 @@ async fn render_mosaic_tile_styled(
         let mut comp = vec![0u8; n_px * 4];
         let mut filled = 0usize;
 
-        for url in urls {
+        for (scene_i, url) in urls.iter().enumerate() {
+            if scene_i > 0 {
+                tokio::task::consume_budget().await;
+            }
             let Ok(cog) = engine.store.open_uri(url).await else {
                 continue;
             };
@@ -4049,7 +4076,24 @@ where
     if segs.first() == Some(&"stac") {
         let sub = &segs[1..];
         let stac_url = pq.urls.first().cloned();
-        let stac_x_assets = pq.assets.clone();
+        let stac_url_hdr = stac_url.clone();
+        let stac_req_assets = pq.assets.clone();
+        let stac_req_expr = pq.expr_raw.clone();
+        let attach_resolved_stac_assets = |resp: &mut Response<Full<Bytes>>| {
+            if !resp.status().is_success() {
+                return;
+            }
+            if let Some(ref u) = stac_url_hdr
+                && let Some(item) = engine.stac_cache.get(u)
+                && let Ok(names) = crate::stac::select_stac_asset_names(
+                    &item,
+                    &stac_req_assets,
+                    stac_req_expr.as_deref(),
+                )
+            {
+                attach_x_assets(resp, &names);
+            }
+        };
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // GET /stac/assets?url=item.json
             (Method::GET, ["assets"]) => async {
@@ -4676,7 +4720,7 @@ where
                     })
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
-                attach_x_assets(&mut resp, &stac_x_assets);
+                attach_resolved_stac_assets(&mut resp);
                 return Ok(resp);
             }
 
@@ -5103,7 +5147,12 @@ where
             _ => Err(EngineError::NotFound(path.clone())),
         };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
-        attach_x_assets(&mut resp, &stac_x_assets);
+        if !matches!(
+            sub,
+            ["assets"] | ["tiles"] | ["tiles", _] | [_, "map.html"] | ["map.html"]
+        ) {
+            attach_resolved_stac_assets(&mut resp);
+        }
         return Ok(resp);
     }
 

@@ -175,15 +175,13 @@ pub async fn load_stac_item(
     Ok(item)
 }
 
-/// Resolve requested STAC asset names (or extract them from a STAC `?expression=`) and open all
-/// referenced COGs concurrently via `CogStore`.
-/// Also rewrites asset-name identifiers in `expr_raw` (e.g. `(red-green)/(red+green)` -> `(b1-b2)/(b1+b2)`).
-pub async fn resolve_stac_assets(
-    engine: &TileEngine,
+/// Resolve requested STAC asset names (expanding `:all:`, extracting asset names referenced in
+/// `?expression=`, or defaulting to up to 3 raster assets) without opening COGs.
+pub fn select_stac_asset_names(
     item: &StacItem,
     requested_assets: &[String],
     expr_raw: Option<&str>,
-) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
+) -> Result<Vec<String>, EngineError> {
     let mut names: Vec<String> = if requested_assets.iter().any(|a| a == ":all:") {
         item.assets.keys().take(16).cloned().collect()
     } else {
@@ -271,6 +269,19 @@ pub async fn resolve_stac_assets(
             names.len()
         )));
     }
+    Ok(names)
+}
+
+/// Resolve requested STAC asset names (or extract them from a STAC `?expression=`) and open all
+/// referenced COGs concurrently via `CogStore`.
+/// Also rewrites asset-name identifiers in `expr_raw` (e.g. `(red-green)/(red+green)` -> `(b1-b2)/(b1+b2)`).
+pub async fn resolve_stac_assets(
+    engine: &TileEngine,
+    item: &StacItem,
+    requested_assets: &[String],
+    expr_raw: Option<&str>,
+) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
+    let names = select_stac_asset_names(item, requested_assets, expr_raw)?;
 
     let mut hrefs = Vec::with_capacity(names.len());
     for name in &names {
