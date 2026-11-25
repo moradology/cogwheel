@@ -4773,16 +4773,48 @@ pub(super) async fn item_route(
             if_none_match: ctx.if_none_match,
             only: Some(&only),
         };
-        let own = super::parse_query((!ctx.raw_query.is_empty()).then_some(ctx.raw_query));
+        // A tile the grid does not have is outside the item like any other.
+        if let ["tiles", _, zs, xs, ys] = rest
+            && let (Ok(z), Ok(x), Some((y, _, _))) = (zs.parse::<u32>(), xs.parse::<u64>(), super::parse_y_scale_ext(ys))
+            && (z > 30 || x >= (1u64 << z) || u64::from(y) >= (1u64 << z))
+        {
+            return Done(detail(StatusCode::NOT_FOUND, format!("Tile(x={x}, y={y}, z={z}) is outside bounds")));
+        }
+        // What only a search reads means nothing to an item, and titiler-pgstac passes it
+        // over there: the search routes are not shown it.
+        let query = without_search_options(ctx.raw_query);
+        let (own, pairs) = (super::parse_query((!query.is_empty()).then_some(query.as_str())), query_pairs(&query));
         return Done(mosaic_route(&ctx, pg, &base, &rec, rest, None, own, &pairs).await);
     }
     ItemRoute::Stac(item, extent)
 }
 
+/// A query string without the parameters only a search's routes read: how its items are
+/// chosen among and how many are looked for.
+fn without_search_options(raw_query: &str) -> String {
+    let algorithm = raw_query.split('&').any(|part| part.starts_with("algorithm="));
+    let kept: Vec<&str> = raw_query
+        .split('&')
+        .filter(|part| {
+            let name = part.split('=').next().unwrap_or(part);
+            !matches!(name, "pixel_selection" | "items_limit" | "scan_limit" | "time_limit" | "exitwhenfull" | "skipcovered")
+                && (algorithm || name != "algorithm_params")
+        })
+        .collect();
+    kept.join("&")
+}
+
 /// Whether an item request is for a tile or a box whose assets carry band math, or bands
-/// of their own on more than one of them.
+/// of their own on more than one of them. A box is one with a format in its path, as
+/// titiler-pgstac's item routes have it.
 fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
-    if !matches!(rest, ["tiles", "WebMercatorQuad", _, _, _] | ["bbox", _] | ["bbox", _, _]) || rest.last() == Some(&"assets") {
+    let picture = match rest {
+        ["tiles", "WebMercatorQuad", _, _, _] => true,
+        ["bbox", seg] => matches!(super::parse_bbox4(seg), Some((_, Some(_)))),
+        ["bbox", _, dims] => matches!(super::parse_wxh_ext(dims), Some((_, _, Some(_)))),
+        _ => false,
+    };
+    if !picture {
         return false;
     }
     let Ok(specs) = parse_assets(pairs) else { return false };
@@ -5930,6 +5962,15 @@ mod tests {
         assert!(!by_asset(&["tiles", "WGS1984Quad", "11", "1059", "746.png"], "assets=red%7Cexpression=b1*2"));
         // Options that cannot be read are answered for by the route they were sent to.
         assert!(!by_asset(&tile, "assets=red%7Cbidx=x&assets=green"));
+        // A box without a format in its path is not one of an item's routes.
+        assert!(!by_asset(&["bbox", "6,43,7,44"], "assets=red%7Cexpression=b1*2"));
+        assert!(!by_asset(&["bbox", "6,43,7,44", "64x64"], "assets=red%7Cexpression=b1*2"));
+        // What only a search reads is not shown to the search routes.
+        assert_eq!(
+            without_search_options("assets=red%7Cexpression=b1*2&pixel_selection=count&items_limit=many&rescale=0,9&scan_limit=-1&algorithm_params={}"),
+            "assets=red%7Cexpression=b1*2&rescale=0,9"
+        );
+        assert_eq!(without_search_options("algorithm=hillshade&algorithm_params={}"), "algorithm=hillshade&algorithm_params={}");
     }
 
     #[test]

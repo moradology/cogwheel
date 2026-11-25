@@ -913,6 +913,9 @@ def main() -> int:
         o.check("item bbox, band math on one asset", "image", f"{it}/bbox/{ibox}/256x256.png?assets=red%7Cexpression=b1*2&rescale=0,6000")
         o.check("item bbox, bands chosen on two assets", "image",
                 f"{it}/bbox/{ibox}.png?assets=visual%7Cbidx=1&assets=red%7Cbidx=1&rescale=0,3000")
+        o.check("item tile off the grid, band math on one asset", "json", f"{it}/tiles/WebMercatorQuad/1/5/5.png?assets=red%7Cexpression=b1*2")
+        o.check("item tile, band math on one asset, a search's options passed over", "image",
+                f"{itile}.png?assets=red%7Cexpression=b1*2&rescale=0,6000&pixel_selection=count&items_limit=many&scan_limit=-1")
         o.check("item preview, band math on one asset", "image", f"{it}/preview.png?assets=red%7Cexpression=b1*2&rescale=0,6000",
                 known="a preview is read on the raster's own grid, which only the /stac routes do, and they do no band math on one asset; cogzilla answers 400")
         o.check("item point", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual")
