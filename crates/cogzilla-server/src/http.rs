@@ -4255,9 +4255,7 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let mut opts_c = stats_opts.clone();
-                    if opts_c.bidx.is_none()
-                        && let Some(sel) = stac_asset_selected_bands(&pq, &names[idx])
-                    {
+                    if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
                         opts_c.bidx = Some(sel.to_vec());
                     }
                     set.spawn(async move {
@@ -4309,9 +4307,7 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let mut opts_c = stats_opts.clone();
-                    if opts_c.bidx.is_none()
-                        && let Some(sel) = stac_asset_selected_bands(&pq, &names[idx])
-                    {
+                    if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
                         opts_c.bidx = Some(sel.to_vec());
                     }
                     set.spawn(async move {
@@ -4381,9 +4377,8 @@ where
                             let eng_c = eng.clone();
                             let mask_c = mask.clone();
                             let mut opts_c = stats_opts.clone();
-                            if opts_c.bidx.is_none()
-                                && let Some((_, sel)) =
-                                    asset_bidx_c.iter().find(|(n, _)| n == &names_c[idx])
+                            if let Some((_, sel)) =
+                                asset_bidx_c.iter().find(|(n, _)| n == &names_c[idx])
                             {
                                 opts_c.bidx = Some(sel.to_vec());
                             }
@@ -4833,20 +4828,29 @@ where
                 }
                 let mut all_vals = Vec::new();
                 let mut all_names = Vec::new();
+                let single_asset_expr = names.len() == 1 && rewritten_expr.is_some();
                 let single_band_per_asset = names.len() > 1 && rewritten_expr.is_some();
+                let mut used_asset_bidx = false;
                 for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
-                        if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
+                        if !single_asset_expr
+                            && let Some(sel) = stac_asset_selected_bands(&pq, &name)
+                        {
+                            used_asset_bidx = true;
                             let iter_sel = if single_band_per_asset {
                                 &sel[..sel.len().min(1)]
                             } else {
                                 sel
                             };
                             for &b in iter_sel {
-                                if let Some(v) = vs.get((b as usize).saturating_sub(1)) {
-                                    all_vals.push(v.clone());
-                                    all_names.push(format!("{name}_b{b}"));
+                                if b == 0 || (b as usize) > vs.len() {
+                                    return Err(EngineError::BadRequest(format!(
+                                        "band {b} out of range for asset '{name}' (dataset has {} bands)",
+                                        vs.len()
+                                    )));
                                 }
+                                all_vals.push(vs[(b as usize) - 1].clone());
+                                all_names.push(format!("{name}_b{b}"));
                             }
                         } else if single_band_per_asset {
                             if let Some(v) = vs.first() {
@@ -4867,7 +4871,12 @@ where
                     "band_names": all_names,
                     "band_descriptions": all_names,
                 });
-                apply_point_filters(&mut pt_json, rewritten_expr.as_deref(), &pq.bidx)?;
+                let point_bidx: &[u16] = if used_asset_bidx && rewritten_expr.is_none() {
+                    &[]
+                } else {
+                    &pq.bidx
+                };
+                apply_point_filters(&mut pt_json, rewritten_expr.as_deref(), point_bidx)?;
                 Ok((Bytes::from(pt_json.to_string()), "application/json"))
             }
             .await,

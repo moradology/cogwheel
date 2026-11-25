@@ -1127,8 +1127,8 @@ impl<const N: usize> CoordPlan<N> {
                 _ => None,
             };
             let straddles_branch_cut = branch_lon0.is_some_and(|lon0| {
-                let (lon_w, _) = mercator_to_lonlat_rad(min_x, max_y);
-                let (lon_e, _) = mercator_to_lonlat_rad(max_x, max_y);
+                let (lon_w, _) = mercator_to_lonlat_rad(min_x + 0.5 * step_x, max_y);
+                let (lon_e, _) = mercator_to_lonlat_rad(max_x + 0.5 * step_x, max_y);
                 let wrap = |d: f64| (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
                 wrap(lon_w - lon0) > 0.0 && wrap(lon_e - lon0) < 0.0
             });
