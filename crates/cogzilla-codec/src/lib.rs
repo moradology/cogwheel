@@ -11,6 +11,37 @@ use thiserror::Error;
 
 pub use slab::{AlignedF32Slab, BandData, BlockStats, DecodedBand, DecodedTile};
 
+/// Decode TIFF PackBits (compression code 32773) RLE stream into `dst`.
+fn decode_packbits(src: &[u8], dst: &mut [u8]) -> Result<usize, CodecError> {
+    let mut si = 0usize;
+    let mut di = 0usize;
+    while si < src.len() && di < dst.len() {
+        let hdr = src[si] as i8;
+        si += 1;
+        if hdr >= 0 {
+            let count = (hdr as usize) + 1;
+            if si + count > src.len() {
+                return Err(CodecError::Deflate("truncated PackBits literal run".into()));
+            }
+            let copy = count.min(dst.len() - di);
+            dst[di..di + copy].copy_from_slice(&src[si..si + copy]);
+            si += count;
+            di += copy;
+        } else if hdr != -128 {
+            let count = (1i16 - hdr as i16) as usize;
+            if si >= src.len() {
+                return Err(CodecError::Deflate("truncated PackBits repeat run".into()));
+            }
+            let byte = src[si];
+            si += 1;
+            let copy = count.min(dst.len() - di);
+            dst[di..di + copy].fill(byte);
+            di += copy;
+        }
+    }
+    Ok(di)
+}
+
 /// Decompress a gzip-encoded buffer using `libdeflater` with an upper bound on decompressed size
 /// to guard against decompression bombs.
 pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {
@@ -269,6 +300,19 @@ pub fn decode_tile_rows(
                     }
                 } else {
                     raw_slice.copy_from_slice(&compressed[..expected_bytes]);
+                }
+            }
+            Compression::PackBits => {
+                let written = decode_packbits(compressed, raw_slice)?;
+                if written < expected_bytes {
+                    if ifd.is_stripped {
+                        raw_slice[written..].fill(0);
+                    } else {
+                        return Err(CodecError::SizeMismatch {
+                            expected: expected_bytes,
+                            got: written,
+                        });
+                    }
                 }
             }
             Compression::Deflate => {
@@ -842,6 +886,7 @@ pub fn decode_mask_tile_rows(
                 code
             }
             Compression::Lzw => st.lzw.decode(compressed, dst)?,
+            Compression::PackBits => decode_packbits(compressed, dst)?,
             _ => {
                 return Err(CodecError::Deflate(
                     "unsupported compression in internal mask IFD".into(),

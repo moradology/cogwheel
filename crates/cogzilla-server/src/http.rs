@@ -2302,6 +2302,16 @@ fn resolve_resample(
     if same_crs { pq.resample } else { pq.reproject }
 }
 
+fn data_band_count(ifd: &cogzilla_tiff::IfdMeta) -> u16 {
+    if cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples)
+        .is_some()
+    {
+        ifd.samples_per_pixel.saturating_sub(1).max(1)
+    } else {
+        ifd.samples_per_pixel
+    }
+}
+
 fn effective_bbox_max_size(pq: &ParsedQuery) -> u32 {
     if pq.keys.iter().any(|k| k == "max_size") {
         pq.max_size
@@ -2421,7 +2431,13 @@ fn build_tile_request_for_tms(
     }
     let eff_ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
-    let bands = build_band_request_for_output(pq, default_bands, sample_type, format, content_type)?;
+    let eff_default_bands = match source_cog {
+        Some(c) if default_bands == c.index.full_res().samples_per_pixel => {
+            data_band_count(c.index.full_res())
+        }
+        _ => default_bands,
+    };
+    let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
     if matches!(bands, BandRequest::MultiBand { .. })
         && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -5893,10 +5909,10 @@ where
                     let full = cogs[0].index.full_res();
                     let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                     let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
-                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
-                    let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                    let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                     let mut bands = build_band_request(&pq, db, full.sample_type)?;
                     if pq.unscale {
                         apply_unscale_cogs(&mut bands, &cogs);
@@ -5985,8 +6001,8 @@ where
                     let full = cogs[0].index.full_res();
                     let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                     let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
-                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let stats_opts = build_stats_options(&pq, false)?;
                     let mut map = serde_json::Map::new();
@@ -6438,7 +6454,7 @@ where
                 };
                 let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq_stac.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = pq_stac.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let mut bands =
@@ -6882,7 +6898,7 @@ where
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -6916,8 +6932,8 @@ where
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
                     let scale = (pq_stac.max_size as f64) / (full.width.max(full.height) as f64);
-                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
                     let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
@@ -6968,7 +6984,7 @@ where
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -7456,8 +7472,8 @@ where
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                     let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
-                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let mut bands = build_band_request(&pq, db, full.sample_type)?;
                     if pq.unscale {
@@ -7936,8 +7952,8 @@ where
                         .map(|i| {
                             let mut b = serde_json::Map::new();
                             b.insert("data_type".into(), serde_json::json!(full.sample_type.gdal_name()));
-                            b.insert("scale".into(), serde_json::json!(cog.index.scales.get(i).copied().unwrap_or(1.0)));
-                            b.insert("offset".into(), serde_json::json!(cog.index.offsets.get(i).copied().unwrap_or(0.0)));
+                            b.insert("scale".into(), serde_json::json!(cog.index.scales_f64.get(i).copied().unwrap_or(1.0)));
+                            b.insert("offset".into(), serde_json::json!(cog.index.offsets_f64.get(i).copied().unwrap_or(0.0)));
                             if let Some(nd) = cog.index.nodata {
                                 if nd.is_nan() {
                                     b.insert("nodata".into(), serde_json::json!("nan"));
@@ -8058,7 +8074,7 @@ where
                     )
                 };
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = pq.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let mut bands = build_band_request_for_output(&pq, db, full.sample_type, fmt, ct)?;
@@ -8152,7 +8168,7 @@ where
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
@@ -8180,8 +8196,8 @@ where
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
                     let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
-                    let def_w = ((full.width as f64 * scale.min(1.0)).round() as u32).max(1);
-                    let def_h = ((full.height as f64 * scale.min(1.0)).round() as u32).max(1);
+                    let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
+                    let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
                     let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
@@ -8227,7 +8243,7 @@ where
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -8294,7 +8310,7 @@ where
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(
                     ext_opt.or(pq.format_param.as_deref()).unwrap_or("png"),
                     pq.webp_quality,
@@ -8379,7 +8395,7 @@ where
                 };
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -8455,7 +8471,7 @@ where
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
@@ -8509,7 +8525,7 @@ where
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
