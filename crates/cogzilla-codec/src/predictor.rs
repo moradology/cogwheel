@@ -1794,14 +1794,55 @@ pub fn reconstruct_u16(
         }];
     }
 
+    // Fast path: 1-band Little-Endian Predictor 1 (`!horizontal_diff`) with integer min/max.
+    if bands_in_tile == 1 && !horizontal_diff && matches!(byte_order, ByteOrder::Little) {
+        let mut data = vec![0u16; pixels].into_boxed_slice();
+        let mut any_valid = false;
+        let mut any_nodata = false;
+        let mut min_u = u16::MAX;
+        let mut max_u = u16::MIN;
+        if let Some(nd) = nd_u16 {
+            for (dst, chunk) in data.iter_mut().zip(raw.chunks_exact(2)) {
+                let v = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *dst = v;
+                if v == nd {
+                    any_nodata = true;
+                } else {
+                    any_valid = true;
+                    if v < min_u { min_u = v; }
+                    if v > max_u { max_u = v; }
+                }
+            }
+        } else {
+            for (dst, chunk) in data.iter_mut().zip(raw.chunks_exact(2)) {
+                let v = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *dst = v;
+                if v < min_u { min_u = v; }
+                if v > max_u { max_u = v; }
+            }
+            any_valid = pixels > 0;
+        }
+        return vec![DecodedBand {
+            data: BandData::U16 { data, nodata: nd_u16 },
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(
+                any_valid,
+                any_nodata,
+                if any_valid { min_u as f32 } else { f32::INFINITY },
+                if any_valid { max_u as f32 } else { f32::NEG_INFINITY },
+            ),
+        }];
+    }
+
     // General path (Predictor 1, Big-Endian, or multi-band chunky u16) -> compact U16
     let mut slabs: Vec<Box<[u16]>> = (0..bands_in_tile)
         .map(|_| vec![0u16; pixels].into_boxed_slice())
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_u = vec![u16::MAX; bands_in_tile];
+    let mut max_u = vec![u16::MIN; bands_in_tile];
     let mut acc = vec![0u16; bands_in_tile];
 
     for y in 0..h {
@@ -1827,9 +1868,8 @@ pub fn reconstruct_u16(
                     any_nodata[b] = true;
                 } else {
                     any_valid[b] = true;
-                    let v = val_u16 as f32;
-                    if v < min_val[b] { min_val[b] = v; }
-                    if v > max_val[b] { max_val[b] = v; }
+                    if val_u16 < min_u[b] { min_u[b] = val_u16; }
+                    if val_u16 > max_u[b] { max_u[b] = val_u16; }
                 }
             }
         }
@@ -1842,7 +1882,12 @@ pub fn reconstruct_u16(
             data: BandData::U16 { data, nodata: nd_u16 },
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                if any_valid[b] { min_u[b] as f32 } else { f32::INFINITY },
+                if any_valid[b] { max_u[b] as f32 } else { f32::NEG_INFINITY },
+            ),
         })
         .collect()
 }
@@ -2311,13 +2356,81 @@ pub fn reconstruct_u8(
             .collect();
     }
 
+    // Fast path: 1-band u8 (Predictor 1 & 2) using memcpy + SIMD prefix-sum + integer min/max.
+    if bands_in_tile == 1 {
+        let mut data: Box<[u8]> = Box::from(&raw[..pixels]);
+        if horizontal_diff {
+            for y in 0..h {
+                let row = &mut data[y * w..(y + 1) * w];
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    prefix_sum_stride1_neon(row);
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if is_x86_feature_detected!("avx2") {
+                        unsafe {
+                            prefix_sum_stride1_avx2(row);
+                        }
+                    } else {
+                        let mut acc = 0u8;
+                        for v in row.iter_mut() {
+                            acc = acc.wrapping_add(*v);
+                            *v = acc;
+                        }
+                    }
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                {
+                    let mut acc = 0u8;
+                    for v in row.iter_mut() {
+                        acc = acc.wrapping_add(*v);
+                        *v = acc;
+                    }
+                }
+            }
+        }
+        let mut any_valid = false;
+        let mut any_nodata = false;
+        let mut min_u = u8::MAX;
+        let mut max_u = u8::MIN;
+        if let Some(nd) = nd_u8 {
+            for &v in data.iter() {
+                if v == nd {
+                    any_nodata = true;
+                } else {
+                    any_valid = true;
+                    if v < min_u { min_u = v; }
+                    if v > max_u { max_u = v; }
+                }
+            }
+        } else {
+            for &v in data.iter() {
+                if v < min_u { min_u = v; }
+                if v > max_u { max_u = v; }
+            }
+            any_valid = pixels > 0;
+        }
+        return vec![DecodedBand {
+            data: BandData::U8 { data, nodata: nd_u8 },
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(
+                any_valid,
+                any_nodata,
+                if any_valid { min_u as f32 } else { f32::INFINITY },
+                if any_valid { max_u as f32 } else { f32::NEG_INFINITY },
+            ),
+        }];
+    }
+
     let mut slabs: Vec<Box<[u8]>> = (0..bands_in_tile)
         .map(|_| vec![0u8; pixels].into_boxed_slice())
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_u = vec![u8::MAX; bands_in_tile];
+    let mut max_u = vec![u8::MIN; bands_in_tile];
     let mut acc = vec![0u8; bands_in_tile];
 
     for y in 0..h {
@@ -2340,9 +2453,8 @@ pub fn reconstruct_u8(
                     any_nodata[b] = true;
                 } else {
                     any_valid[b] = true;
-                    let v = val_u8 as f32;
-                    if v < min_val[b] { min_val[b] = v; }
-                    if v > max_val[b] { max_val[b] = v; }
+                    if val_u8 < min_u[b] { min_u[b] = val_u8; }
+                    if val_u8 > max_u[b] { max_u[b] = val_u8; }
                 }
             }
         }
@@ -2355,7 +2467,12 @@ pub fn reconstruct_u8(
             data: BandData::U8 { data, nodata: nd_u8 },
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                if any_valid[b] { min_u[b] as f32 } else { f32::INFINITY },
+                if any_valid[b] { max_u[b] as f32 } else { f32::NEG_INFINITY },
+            ),
         })
         .collect()
 }

@@ -37,7 +37,8 @@ pub(super) fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, 
             let across = (pair[0].0 * s).clamp(0.0, fw as f64) - (pair[1].0 * s).clamp(0.0, fw as f64);
             let down = (pair[0].1 * s).clamp(0.0, fh as f64) - (pair[1].1 * s).clamp(0.0, fh as f64);
             // Not a number clamps to itself and counts as nothing; such a segment burns nothing.
-            let cells = across.abs() + down.abs() + 2.0;
+            // The walk can burn two cells in a row it crosses, so rows count twice.
+            let cells = across.abs() + 2.0 * down.abs() + 2.0;
             burned = burned.saturating_add(if cells.is_finite() { cells as u64 } else { 0 });
         }
     }

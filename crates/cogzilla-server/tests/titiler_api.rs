@@ -145,14 +145,21 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     }
     let st_custom = get_json(
         &client,
-        format!("{base}/cog/statistics?url={sat_url}&bidx=1&p=5&p=95&histogram_bins=20&categorical=true"),
+        format!("{base}/cog/statistics?url={sat_url}&bidx=1&p=5&p=95&histogram_bins=20"),
     )
     .await;
     assert_eq!(st_custom.as_object().unwrap().len(), 1);
     assert!(st_custom["b1"]["percentile_5"].is_number());
     assert!(st_custom["b1"]["percentile_95"].is_number());
     assert_eq!(st_custom["b1"]["histogram"][0].as_array().unwrap().len(), 20);
-    assert!(st_custom["b1"]["categories"].is_object());
+    let st_cat = get_json(
+        &client,
+        format!("{base}/cog/statistics?url={sat_url}&bidx=1&max_size=64&categorical=true&c=0&c=1"),
+    )
+    .await;
+    assert_eq!(st_cat["b1"]["histogram"][0].as_array().unwrap().len(), 2);
+    assert_eq!(st_cat["b1"]["histogram"][1], serde_json::json!([0, 1]));
+    assert!(st_cat["b1"]["categories"].is_object());
 
     let pt_expr = get_json(
         &client,
@@ -176,8 +183,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         format!("{base}/cog/statistics?url={sat_url}&expression=b1-b2;b2-b3"),
     )
     .await;
-    assert!(st_expr["b1-b2"]["mean"].is_number());
-    assert!(st_expr["b2-b3"]["mean"].is_number());
+    assert!(st_expr["b1"]["mean"].is_number());
+    assert_eq!(st_expr["b1"]["description"], "b1-b2");
+    assert!(st_expr["b2"]["mean"].is_number());
+    assert_eq!(st_expr["b2"]["description"], "b2-b3");
 
     let pt_multi = get_json(
         &client,
@@ -887,6 +896,12 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(mj_assets.as_array().unwrap().len(), 2);
             let mj_pt = get_json(&client, format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}")).await;
             assert!(!mj_pt["assets"].as_array().unwrap().is_empty());
+            let mj_pt_expr = get_json(
+                &client,
+                format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}&expression=b1*2"),
+            )
+            .await;
+            assert_eq!(mj_pt_expr["assets"][0][2][0], "b1*2");
             let mj_stats = get_json(&client, format!("{base}/mosaicjson/statistics?url={mj_url}&max_size=128")).await;
             assert!(mj_stats["b1"]["mean"].is_number());
             let mj_bbox = client
@@ -897,6 +912,21 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(mj_bbox.status(), 200);
             let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
             assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // Empty buffered /mosaicjson/tiles must honor ?buffer=8 -> 272x272 PNG
+            let mj_empty_buf = client
+                .get(format!(
+                    "{base}/mosaicjson/tiles/WebMercatorQuad/12/0/0.png?url={mj_url}&buffer=8"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_empty_buf.status(), 200);
+            let mj_eb_bytes = mj_empty_buf.bytes().await.unwrap();
+            assert_eq!(&mj_eb_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            let eb_w = u32::from_be_bytes([mj_eb_bytes[16], mj_eb_bytes[17], mj_eb_bytes[18], mj_eb_bytes[19]]);
+            let eb_h = u32::from_be_bytes([mj_eb_bytes[20], mj_eb_bytes[21], mj_eb_bytes[22], mj_eb_bytes[23]]);
+            assert_eq!((eb_w, eb_h), (272, 272));
 
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
@@ -941,7 +971,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             // Opaque RGB PNG (color_type=2) for clean DEM tile
             assert_eq!(bytes[25], 2, "expected RGB PNG for algorithm={alg}");
 
-            // Terrain NPY must emit 3-band RGB (3, 256, 256), not raw 1-band elevation
+            // Terrain NPY must emit 3-band RGB + mask (4, 256, 256), not raw 1-band elevation
             let npy_resp = client
                 .get(format!(
                     "{base}/cog/tiles/WebMercatorQuad/12/655/1583.npy?url={merc_url}&algorithm={alg}"
@@ -953,8 +983,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let npy_bytes = npy_resp.bytes().await.unwrap();
             let hdr_str = std::str::from_utf8(&npy_bytes[10..128]).unwrap_or("");
             assert!(
-                hdr_str.contains("(3, 256, 256)"),
-                "expected 3-band RGB NPY for algorithm={alg}, got header: {hdr_str}"
+                hdr_str.contains("(4, 256, 256)"),
+                "expected 3-band RGB + mask NPY for algorithm={alg}, got header: {hdr_str}"
             );
         }
 
@@ -1056,11 +1086,263 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let parsed_styled = cogzilla_tiff::parse_cog(&styled_tif_resp.bytes().await.unwrap()).unwrap();
             assert_eq!(parsed_styled.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
 
+            // Audit c42 regression checks:
+            // Unstyled float32 DEM .tif on /mosaic/tiles must emit Float32 GeoTIFF (not corrupt RGBA8)
+            let mosaic_f32_tif = client
+                .get(format!(
+                    "{base}/mosaic/tiles/WebMercatorQuad/12/655/1583.tif?url={merc_url}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mosaic_f32_tif.status(), 200);
+            let parsed_mosaic_f32 = cogzilla_tiff::parse_cog(&mosaic_f32_tif.bytes().await.unwrap()).unwrap();
+            assert_eq!(parsed_mosaic_f32.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+
+            // ?algorithm=contours .tif must emit 8-bit visual GeoTIFF (not Float32)
+            let contours_tif = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.tif?url={merc_url}&algorithm=contours"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(contours_tif.status(), 200);
+            let parsed_contours = cogzilla_tiff::parse_cog(&contours_tif.bytes().await.unwrap()).unwrap();
+            assert_eq!(parsed_contours.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
+
+            // Audit c45 regression check: unknown/malformed TMS on WMTSCapabilities.xml must return 404/422 (never 200 XML)
+            let bad_wmts = client
+                .get(format!("{base}/cog/a&b/WMTSCapabilities.xml?url={merc_url}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                bad_wmts.status() == 404 || bad_wmts.status() == 422,
+                "unknown WMTS TMS should be rejected, got {}",
+                bad_wmts.status()
+            );
+
+            // Audit c47 regression check: buffered WebMercatorQuad x=0 tile must not false-404
+            let buf_x0 = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/1/0/0.png?url={sat_url}&buffer=2&rescale=0,1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(buf_x0.status(), 200, "buffered x=0 WebMercatorQuad tile must not false-404");
+
+            // Audit c48 regression check: constant & where() expression statistics
+            let const_stats = get_json(
+                &client,
+                format!("{base}/cog/statistics?url={merc_url}&expression=42&max_size=64"),
+            )
+            .await;
+            assert!((const_stats["b1"]["mean"].as_f64().unwrap() - 42.0).abs() < 1e-4);
+            assert_eq!(const_stats["b1"]["description"], "42");
+
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];
             pal[299] = [200, 150, 100, 255];
             let cmap = cogzilla_kernel::CustomColormap::from_rgba_palette(&pal);
             assert_eq!(cmap.lookup(299.0, 0.0, 1.0), [200, 150, 100, 255]);
+
+            // Audit c69 regression check: antimeridian (w > e) and inverted (s > n) STAC Item
+            // bboxes on /stac/map must not panic in render_bbox_impl and must preserve 5:4 aspect.
+            let am_stac_path = std::env::temp_dir().join(format!(
+                "cogzilla_stac_antimeridian_{}.json",
+                std::process::id()
+            ));
+            let am_stac = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "fiji-antimeridian",
+                "bbox": [177.0, -20.0, -178.0, -16.0],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "b1": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                }
+            });
+            std::fs::write(&am_stac_path, am_stac.to_string()).unwrap();
+            let am_stac_url = am_stac_path.to_str().unwrap();
+            let am_resp = client
+                .get(format!(
+                    "{base}/stac/map?url={am_stac_url}&assets=b1&max_size=128&rescale=0,1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(am_resp.status(), 200, "antimeridian /stac/map must not panic");
+            let am_bytes = am_resp.bytes().await.unwrap();
+            assert_eq!(&am_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            let am_w = u32::from_be_bytes([am_bytes[16], am_bytes[17], am_bytes[18], am_bytes[19]]);
+            let am_h = u32::from_be_bytes([am_bytes[20], am_bytes[21], am_bytes[22], am_bytes[23]]);
+            assert_eq!((am_w, am_h), (128, 102));
+
+            let inv_stac = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "inverted-bbox",
+                "bbox": [0.0, 10.0, 1.0, -10.0],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "b1": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                }
+            });
+            let inv_stac_path = std::env::temp_dir().join(format!(
+                "cogzilla_stac_inverted_{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&inv_stac_path, inv_stac.to_string()).unwrap();
+            let inv_stac_url = inv_stac_path.to_str().unwrap();
+            let inv_resp = client
+                .get(format!(
+                    "{base}/stac/map?url={inv_stac_url}&assets=b1&rescale=0,1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(inv_resp.status(), 400, "inverted s > n STAC bbox must return 400");
+            let _ = std::fs::remove_file(&am_stac_path);
+            let _ = std::fs::remove_file(&inv_stac_path);
+
+            // Audit c75 regression checks:
+            // 1. GeometryCollection accepted in PolygonMask::from_geojson + constant expression
+            //    respects shape_mask (outside-polygon pixels must be NaN, not 1.0).
+            let gc_poly = serde_json::json!({
+                "type": "GeometryCollection",
+                "geometries": [{
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-122.65, 37.76],
+                        [-122.60, 37.76],
+                        [-122.65, 37.80],
+                        [-122.65, 37.76]
+                    ]]
+                }]
+            });
+            let gc_resp = client
+                .post(format!("{base}/cog/feature/32x32.f32?url={sat_url}&expression=1"))
+                .header("content-type", "application/json")
+                .body(gc_poly.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(gc_resp.status(), 200, "GeometryCollection /cog/feature must succeed");
+            let gc_bytes = gc_resp.bytes().await.unwrap();
+            assert_eq!(gc_bytes.len(), 32 * 32 * 4);
+            // Top-right pixel (row 0, col 31) is outside the lower-left triangle -> must be NaN
+            let tr_val = f32::from_le_bytes([
+                gc_bytes[31 * 4],
+                gc_bytes[31 * 4 + 1],
+                gc_bytes[31 * 4 + 2],
+                gc_bytes[31 * 4 + 3],
+            ]);
+            assert!(tr_val.is_nan(), "outside-polygon pixel for constant expression must be NaN, got {tr_val}");
+            // Bottom-left pixel (row 30, col 1) is inside the triangle -> must be 1.0
+            let bl_off = (30 * 32 + 1) * 4;
+            let bl_val = f32::from_le_bytes([
+                gc_bytes[bl_off],
+                gc_bytes[bl_off + 1],
+                gc_bytes[bl_off + 2],
+                gc_bytes[bl_off + 3],
+            ]);
+            assert_eq!(bl_val, 1.0, "inside-polygon pixel for expression=1 must be 1.0");
+
+            // 2. 2-vertex degenerate ring must be rejected with 400
+            let two_vtx = serde_json::json!({
+                "type": "Polygon",
+                "coordinates": [[[-122.65, 37.76], [-122.60, 37.80]]]
+            });
+            let two_resp = client
+                .post(format!("{base}/cog/feature/32x32.png?url={merc_url}&rescale=0,2500"))
+                .header("content-type", "application/json")
+                .body(two_vtx.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(two_resp.status(), 400, "2-vertex GeoJSON ring must return 400");
+
+            // Audit c77 regression check: mixed-grid multi-COG /cog/feature with constant expr
+            // must still mask outside-polygon pixels to NaN.
+            let mg_resp = client
+                .post(format!(
+                    "{base}/cog/feature/32x32.f32?url={sat_url}&url={merc_url}&expression=1"
+                ))
+                .header("content-type", "application/json")
+                .body(gc_poly.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mg_resp.status(), 200);
+            let mg_bytes = mg_resp.bytes().await.unwrap();
+            assert_eq!(mg_bytes.len(), 32 * 32 * 4);
+            let mg_tr = f32::from_le_bytes(mg_bytes[31 * 4..32 * 4].try_into().unwrap());
+            let mg_bl = f32::from_le_bytes(mg_bytes[bl_off..bl_off + 4].try_into().unwrap());
+            assert!(mg_tr.is_nan(), "mixed-grid outside-polygon pixel must be NaN, got {mg_tr}");
+            assert_eq!(mg_bl, 1.0, "mixed-grid inside-polygon pixel must be 1.0");
+
+            // Audit c78 regression checks:
+            // 1. Mixed-grid where(b2>=0,b2,0) must NOT clip b2 (sat_url) to cogs[0] (merc_url)'s footprint
+            let mg_b2 = client
+                .post(format!(
+                    "{base}/cog/feature/32x32.f32?url={merc_url}&url={sat_url}&expression=where(b2%3E=0,b2,0)"
+                ))
+                .header("content-type", "application/json")
+                .body(gc_poly.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mg_b2.status(), 200);
+            let mg_b2_bytes = mg_b2.bytes().await.unwrap();
+            let mg_b2_tr = f32::from_le_bytes(mg_b2_bytes[31 * 4..32 * 4].try_into().unwrap());
+            let mg_b2_bl = f32::from_le_bytes(mg_b2_bytes[bl_off..bl_off + 4].try_into().unwrap());
+            assert!(mg_b2_tr.is_nan(), "outside-polygon pixel must remain NaN, got {mg_b2_tr}");
+            assert!(mg_b2_bl.is_finite(), "b2 pixel inside sat_url must not be clipped to cogs[0], got {mg_b2_bl}");
+
+            // 2. /mosaic/tiles must skip an unreadable urls[0] and render urls[1]
+            let resil_resp = client
+                .get(format!(
+                    "{base}/mosaic/tiles/WebMercatorQuad/12/655/1583.png?url=/nonexistent_cogzilla_scene_0.tif&url={merc_url}&rescale=0,2500"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resil_resp.status(), 200, "mosaic tile must skip unreadable urls[0]");
+            let resil_bytes = resil_resp.bytes().await.unwrap();
+            assert_eq!(&resil_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // 3. GET /stac/statistics must preserve ?bidx=3,1 order
+            let bidx_stac_path = std::env::temp_dir().join(format!(
+                "cogzilla_stac_bidx_order_{}.json",
+                std::process::id()
+            ));
+            let bidx_stac = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "bidx-order",
+                "bbox": [-122.8, 37.6, -122.5, 37.9],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "visual": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                }
+            });
+            std::fs::write(&bidx_stac_path, bidx_stac.to_string()).unwrap();
+            let bidx_stats = get_json(
+                &client,
+                format!(
+                    "{base}/stac/statistics?url={}&assets=visual&bidx=3&bidx=1&max_size=64",
+                    bidx_stac_path.to_str().unwrap()
+                ),
+            )
+            .await;
+            assert_eq!(bidx_stats["b1"]["description"].as_str(), Some("visual_b3"));
+            assert_eq!(bidx_stats["b2"]["description"].as_str(), Some("visual_b1"));
+            let _ = std::fs::remove_file(&bidx_stac_path);
         }
     }
 }

@@ -46,7 +46,7 @@ pub fn wgs84_bbox_to_3857(bbox: [f64; 4]) -> [f64; 4] {
         ((std::f64::consts::FRAC_PI_4 + clamped * 0.5).tan().ln() * WEB_MERCATOR_R)
             .clamp(-ORIGIN_SHIFT, ORIGIN_SHIFT)
     };
-    let (min_x, max_x) = if bbox[0] > bbox[2] {
+    let (min_x, max_x) = if bbox[0] > bbox[2] || bbox[0] < -180.0 || bbox[2] > 180.0 {
         // Antimeridian-crossing bbox: cover full WebMercator X span conservatively.
         (-ORIGIN_SHIFT, ORIGIN_SHIFT)
     } else {
@@ -313,15 +313,12 @@ impl SceneCatalog for InMemoryCatalog {
 
 fn parse_bbox4_val(v: &serde_json::Value) -> Option<[f64; 4]> {
     let arr = v.as_array()?;
-    if arr.len() < 4 {
-        return None;
-    }
-    Some([
-        arr[0].as_f64()?,
-        arr[1].as_f64()?,
-        arr[2].as_f64()?,
-        arr[3].as_f64()?,
-    ])
+    let coords = match arr.len() {
+        4 => [arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?, arr[3].as_f64()?],
+        6 => [arr[0].as_f64()?, arr[1].as_f64()?, arr[3].as_f64()?, arr[4].as_f64()?],
+        _ => return None,
+    };
+    coords.iter().all(|x| x.is_finite()).then_some(coords)
 }
 
 fn parse_entry_bbox(obj: &serde_json::Value) -> Option<[f64; 4]> {

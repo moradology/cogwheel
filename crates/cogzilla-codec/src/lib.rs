@@ -775,28 +775,26 @@ pub fn decode_mask_tile_rows(
             got: compressed.len(),
         })?;
 
-    let raw: Vec<u8> = CODEC_STATE.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        let st = &mut *guard;
-        let mut buf = vec![0u8; expected];
-        match mask.compression {
+    let decompress_into = |st: &mut ThreadCodecState, dst: &mut [u8]| -> Result<(), CodecError> {
+        let written = match mask.compression {
             Compression::None => {
-                let n = compressed.len().min(expected);
-                buf[..n].copy_from_slice(&compressed[..n]);
+                let n = compressed.len().min(dst.len());
+                dst[..n].copy_from_slice(&compressed[..n]);
+                n
             }
-            Compression::Deflate => {
-                if let Err(e1) = st.deflate.zlib_decompress(compressed, &mut buf) {
-                    st.deflate
-                        .deflate_decompress(compressed, &mut buf)
-                        .map_err(|_| CodecError::Deflate(format!("{e1:?}")))?;
-                }
-            }
+            Compression::Deflate => match st.deflate.zlib_decompress(compressed, dst) {
+                Ok(n) => n,
+                Err(e1) => st
+                    .deflate
+                    .deflate_decompress(compressed, dst)
+                    .map_err(|_| CodecError::Deflate(format!("{e1:?}")))?,
+            },
             Compression::Zstd => {
                 let code = unsafe {
                     zstd_sys::ZSTD_decompressDCtx(
                         st.zstd_dctx,
-                        buf.as_mut_ptr() as *mut std::ffi::c_void,
-                        expected,
+                        dst.as_mut_ptr() as *mut std::ffi::c_void,
+                        dst.len(),
                         compressed.as_ptr() as *const std::ffi::c_void,
                         compressed.len(),
                     )
@@ -804,35 +802,59 @@ pub fn decode_mask_tile_rows(
                 if unsafe { zstd_sys::ZSTD_isError(code) } != 0 {
                     return Err(CodecError::Zstd(code));
                 }
+                code
             }
-            Compression::Lzw => {
-                let written = st.lzw.decode(compressed, &mut buf)?;
-                if written < expected {
-                    buf[written..].fill(0);
-                }
-            }
+            Compression::Lzw => st.lzw.decode(compressed, dst)?,
             _ => {
                 return Err(CodecError::Deflate(
                     "unsupported compression in internal mask IFD".into(),
                 ));
             }
+        };
+        if written < dst.len() {
+            dst[written..].fill(0);
         }
-        Ok(buf)
-    })?;
+        Ok(())
+    };
 
     if mask.bits_per_sample == 1 {
-        let mut out = vec![0u8; w * h];
-        for r in 0..h {
-            let src_row = &raw[r * row_bytes..(r + 1) * row_bytes];
-            let dst_row = &mut out[r * w..(r + 1) * w];
-            for c in 0..w {
-                let bit = (src_row[c >> 3] >> (7 - (c & 7))) & 1;
-                dst_row[c] = if bit != 0 { 255 } else { 0 };
+        CODEC_STATE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let st = &mut *guard;
+            if st.scratch.len() < expected {
+                st.scratch.resize(expected, 0);
             }
-        }
-        Ok(out)
+            let mut tmp_scratch = std::mem::take(&mut st.scratch);
+            let res = decompress_into(st, &mut tmp_scratch[..expected]);
+            let unpacked = res.map(|()| {
+                let packed = &tmp_scratch[..expected];
+                if w.is_multiple_of(8) && packed.iter().all(|&b| b == 0xFF) {
+                    return vec![255u8; w * h];
+                }
+                let mut out = vec![0u8; w * h];
+                for r in 0..h {
+                    let src_row = &packed[r * row_bytes..(r + 1) * row_bytes];
+                    let dst_row = &mut out[r * w..(r + 1) * w];
+                    for c in 0..w {
+                        let bit = (src_row[c >> 3] >> (7 - (c & 7))) & 1;
+                        dst_row[c] = if bit != 0 { 255 } else { 0 };
+                    }
+                }
+                out
+            });
+            st.scratch = if tmp_scratch.capacity() > 4 * 1024 * 1024 {
+                Vec::with_capacity(512 * 512 * 4)
+            } else {
+                tmp_scratch
+            };
+            unpacked
+        })
     } else {
-        let mut out = raw;
+        let mut out = vec![0u8; expected];
+        CODEC_STATE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            decompress_into(&mut guard, &mut out)
+        })?;
         if mask.predictor == Predictor::HorizontalInt {
             for r in 0..h {
                 let row = &mut out[r * w..(r + 1) * w];

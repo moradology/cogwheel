@@ -4626,7 +4626,7 @@ fn encode_picture(
             OutputFormat::Png => return Ok((grey_png(&rgba, width, height, alpha), content_type)),
             OutputFormat::Jpeg { quality } => {
                 let luma: Vec<u8> = rgba.chunks_exact(4).map(|p| if p[3] == 0 { 0 } else { p[0] }).collect();
-                return Ok((cogzilla_kernel::jpeg_fast::encode_jpeg_luma(width as u32, height as u32, &luma, quality), content_type));
+                return Ok((cogzilla_kernel::jpeg_fast::encode_jpeg_gray(width as u32, height as u32, &luma, quality), content_type));
             }
             _ => {}
         }

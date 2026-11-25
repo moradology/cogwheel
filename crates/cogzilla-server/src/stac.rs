@@ -46,6 +46,78 @@ fn is_raster_asset(key: &str, asset: &serde_json::Value) -> bool {
         || (!key.contains("thumbnail") && !key.contains("metadata") && lower_href.contains(".tif"))
 }
 
+/// Split a remote URI (including GDAL `/vsicurl/`, `/vsis3/`, `/vsigs/`, `/vsiaz/`)
+/// into `(origin_prefix, path_part)` with query/fragment stripped from `item_uri`.
+/// Returns `None` for local filesystem paths.
+fn split_remote_origin_and_path(item_uri: &str) -> Option<(&str, &str)> {
+    let path_only = item_uri.split(['?', '#']).next().unwrap_or(item_uri);
+    if let Some(rest) = path_only.strip_prefix("/vsicurl/") {
+        let scheme_end = rest.find("://")?;
+        let after_scheme = "/vsicurl/".len() + scheme_end + 3;
+        let origin_end = path_only[after_scheme..]
+            .find('/')
+            .map(|p| after_scheme + p)
+            .unwrap_or(path_only.len());
+        return Some((&path_only[..origin_end], &path_only[origin_end..]));
+    }
+    for vsi in ["/vsis3/", "/vsigs/", "/vsiaz/"] {
+        if let Some(rest) = path_only.strip_prefix(vsi) {
+            let bucket_end = vsi.len() + rest.find('/').unwrap_or(rest.len());
+            return Some((&path_only[..bucket_end], &path_only[bucket_end..]));
+        }
+    }
+    if path_only.starts_with("http://")
+        || path_only.starts_with("https://")
+        || path_only.starts_with("s3://")
+        || path_only.starts_with("gs://")
+        || path_only.starts_with("az://")
+        || path_only.starts_with("abfs://")
+        || path_only.starts_with("abfss://")
+    {
+        let scheme_end = path_only.find("://")?;
+        let after_scheme = scheme_end + 3;
+        let origin_end = path_only[after_scheme..]
+            .find('/')
+            .map(|p| after_scheme + p)
+            .unwrap_or(path_only.len());
+        return Some((&path_only[..origin_end], &path_only[origin_end..]));
+    }
+    None
+}
+
+/// Normalize `.` and `..` segments in a remote URI path, clamped at the origin/bucket root,
+/// while preserving any `?query` or `#fragment` suffix on `href`.
+fn normalize_remote_path(base_dir: &str, href: &str) -> String {
+    let (href_path, suffix) = match href.find(['?', '#']) {
+        Some(idx) => (&href[..idx], &href[idx..]),
+        None => (href, ""),
+    };
+    let mut segs: Vec<&str> = Vec::new();
+    let iter = if href_path.starts_with('/') {
+        itertools_none_or_chain("", href_path)
+    } else {
+        itertools_none_or_chain(base_dir, href_path)
+    };
+    for seg in iter {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    if segs.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("/{}{suffix}", segs.join("/"))
+    }
+}
+
+fn itertools_none_or_chain<'a>(a: &'a str, b: &'a str) -> impl Iterator<Item = &'a str> {
+    a.split('/').chain(b.split('/'))
+}
+
 pub(crate) fn resolve_href(item_uri: &str, href: &str) -> String {
     if href.starts_with("http://")
         || href.starts_with("https://")
@@ -62,31 +134,13 @@ pub(crate) fn resolve_href(item_uri: &str, href: &str) -> String {
     {
         return href.to_string();
     }
-    let is_remote_item = item_uri.starts_with("http://")
-        || item_uri.starts_with("https://")
-        || item_uri.starts_with("s3://")
-        || item_uri.starts_with("gs://")
-        || item_uri.starts_with("az://")
-        || item_uri.starts_with("abfs://")
-        || item_uri.starts_with("abfss://");
-    if is_remote_item {
-        let path_only = item_uri.split(['?', '#']).next().unwrap_or(item_uri);
-        if href.starts_with('/') {
-            // Root-relative href against remote scheme://authority origin
-            if let Some(scheme_end) = path_only.find("://") {
-                let after_scheme = scheme_end + 3;
-                let origin_end = path_only[after_scheme..]
-                    .find('/')
-                    .map(|p| after_scheme + p)
-                    .unwrap_or(path_only.len());
-                return format!("{}{}", &path_only[..origin_end], href);
-            }
-        }
-        let base = match path_only.rfind('/') {
-            Some(idx) => &path_only[..=idx],
-            None => path_only,
+    if let Some((origin, item_path)) = split_remote_origin_and_path(item_uri) {
+        let base_dir = match item_path.rfind('/') {
+            Some(idx) => &item_path[..=idx],
+            None => "/",
         };
-        format!("{base}{}", href.trim_start_matches("./"))
+        let norm = normalize_remote_path(base_dir, href);
+        format!("{origin}{norm}")
     } else if href.starts_with('/') {
         href.to_string()
     } else {
@@ -113,7 +167,8 @@ pub fn stac_item_from_json(val: &serde_json::Value, item_uri: &str) -> StacItem 
             6 => (3, 4),
             _ => return None,
         };
-        Some([a[0].as_f64()?, a[1].as_f64()?, a[east].as_f64()?, a[north].as_f64()?])
+        let coords = [a[0].as_f64()?, a[1].as_f64()?, a[east].as_f64()?, a[north].as_f64()?];
+        coords.iter().all(|x| x.is_finite()).then_some(coords)
     });
     let geometry = val.get("geometry").cloned();
 
@@ -200,15 +255,13 @@ pub async fn load_stac_item(
     Ok(item)
 }
 
-/// Resolve requested STAC asset names (or extract them from a STAC `?expression=`) and open all
-/// referenced COGs concurrently via `CogStore`.
-/// Also rewrites asset-name identifiers in `expr_raw` (e.g. `(red-green)/(red+green)` -> `(b1-b2)/(b1+b2)`).
-pub async fn resolve_stac_assets(
-    engine: &TileEngine,
+/// Resolve requested STAC asset names (expanding `:all:`, extracting asset names referenced in
+/// `?expression=`, or defaulting to up to 3 raster assets) without opening COGs.
+pub fn select_stac_asset_names(
     item: &StacItem,
     requested_assets: &[String],
     expr_raw: Option<&str>,
-) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
+) -> Result<Vec<String>, EngineError> {
     let mut names: Vec<String> = if requested_assets.iter().any(|a| a == ":all:") {
         item.assets.keys().take(16).cloned().collect()
     } else {
@@ -282,7 +335,9 @@ pub async fn resolve_stac_assets(
             }
         }
         if names.is_empty() {
-            names = item.assets.keys().take(3).cloned().collect();
+            return Err(EngineError::BadRequest(
+                "missing ?assets= (or asset names in ?expression=)".into(),
+            ));
         }
     }
     if names.is_empty() {
@@ -296,6 +351,19 @@ pub async fn resolve_stac_assets(
             names.len()
         )));
     }
+    Ok(names)
+}
+
+/// Resolve requested STAC asset names (or extract them from a STAC `?expression=`) and open all
+/// referenced COGs concurrently via `CogStore`.
+/// Also rewrites asset-name identifiers in `expr_raw` (e.g. `(red-green)/(red+green)` -> `(b1-b2)/(b1+b2)`).
+pub async fn resolve_stac_assets(
+    engine: &TileEngine,
+    item: &StacItem,
+    requested_assets: &[String],
+    expr_raw: Option<&str>,
+) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
+    let names = select_stac_asset_names(item, requested_assets, expr_raw)?;
 
     let mut hrefs = Vec::with_capacity(names.len());
     for name in &names {
@@ -328,7 +396,9 @@ pub async fn resolve_stac_assets(
 
     // Single-pass identifier-boundary rewrite (e.g. `(B4-B3)/(B4+B3)` -> `(b1-b2)/(b1+b2)`),
     // preventing sequential double-replacement bugs when asset names overlap (`?assets=b2,b1`).
-    let rewritten_expr = expr_raw.map(|expr| rewrite_stac_expr(expr, &names));
+    let rewritten_expr = expr_raw
+        .map(|expr| rewrite_stac_expr(expr, &names))
+        .transpose()?;
 
     Ok((names, cogs, rewritten_expr))
 }
@@ -336,7 +406,7 @@ pub async fn resolve_stac_assets(
 /// Single-pass longest-prefix identifier-boundary replacement of STAC asset names with
 /// `b1`, `b2`, ... (handles TiTiler's default `{asset}_b{i}` syntax, bare `{asset}` when
 /// `asset_as_band=true`, unspaced subtraction `nir-red`, and hyphenated names `SR-B5-SR-B4`).
-pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
+pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, EngineError> {
     let mut ordered: Vec<(usize, &str)> = names
         .iter()
         .enumerate()
@@ -371,6 +441,11 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
                             .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
                     {
                         if let Ok(band_k) = expr[after + 2..j].parse::<usize>() {
+                            if !single_asset && band_k != 1 {
+                                return Err(EngineError::BadRequest(format!(
+                                    "multi-asset STAC expression '{name}_b{band_k}' with band != 1 is not supported; use band 1 ({name}_b1) or a single multi-band asset"
+                                )));
+                            }
                             let target_band = if single_asset { band_k } else { asset_1based };
                             matched_band_suffix = Some((target_band, j - i));
                             break;
@@ -402,7 +477,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> String {
         out.push(ch);
         i += ch.len_utf8();
     }
-    out
+    Ok(out)
 }
 
 // ============================================================================
@@ -457,17 +532,26 @@ pub fn get_colormap_json(id: &str) -> Result<serde_json::Value, EngineError> {
     Ok(serde_json::Value::Object(map))
 }
 
-pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> {
+pub fn get_colormap_png(
+    id: &str,
+    vertical: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Bytes, EngineError> {
     let cm = ColormapName::from_str_opt(id)
         .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
     let lut = cm.lut();
-    let (w, h) = if vertical { (20usize, 256usize) } else { (256usize, 20usize) };
+    let (def_w, def_h) = if vertical { (20u32, 256u32) } else { (256u32, 20u32) };
+    let w = width.unwrap_or(def_w).clamp(1, 4096) as usize;
+    let h = height.unwrap_or(def_h).clamp(1, 4096) as usize;
     let stride = 1 + w * 3;
     let mut filtered = vec![0u8; h * stride];
     let mut row = vec![0u8; w * 3];
     if vertical {
+        let denom = (h.saturating_sub(1)).max(1);
         for y in 0..h {
-            let c = lut.rgb[y];
+            let idx = ((y * 255 + denom / 2) / denom).min(255);
+            let c = lut.rgb[idx];
             for x in 0..w {
                 row[x * 3] = c[0];
                 row[x * 3 + 1] = c[1];
@@ -476,8 +560,10 @@ pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> 
             filter_sub_rgb_row(&row, &mut filtered[y * stride..(y + 1) * stride]);
         }
     } else {
+        let denom = (w.saturating_sub(1)).max(1);
         for x in 0..w {
-            let c = lut.rgb[x];
+            let idx = ((x * 255 + denom / 2) / denom).min(255);
+            let c = lut.rgb[idx];
             row[x * 3] = c[0];
             row[x * 3 + 1] = c[1];
             row[x * 3 + 2] = c[2];
@@ -489,24 +575,34 @@ pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> 
     Ok(encode_filtered_png(w as u32, h as u32, 2, &filtered))
 }
 
-/// Render a 256×20 (horizontal) or 20×256 (vertical) colormap colorbar in PNG, JPEG, or WebP.
+/// Render a colormap colorbar in PNG, JPEG, or WebP with optional custom width/height.
 pub fn get_colormap_image(
     id: &str,
     format: cogzilla_kernel::OutputFormat,
     vertical: bool,
+    width: Option<u32>,
+    height: Option<u32>,
 ) -> Result<Bytes, EngineError> {
     if matches!(format, cogzilla_kernel::OutputFormat::Png) {
-        return get_colormap_png(id, vertical);
+        return get_colormap_png(id, vertical, width, height);
     }
     let cm = ColormapName::from_str_opt(id)
         .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
     let lut = cm.lut();
-    let (w, h) = if vertical { (20usize, 256usize) } else { (256usize, 20usize) };
+    let (def_w, def_h) = if vertical { (20u32, 256u32) } else { (256u32, 20u32) };
+    let w = width.unwrap_or(def_w).clamp(1, 4096) as usize;
+    let h = height.unwrap_or(def_h).clamp(1, 4096) as usize;
     let mut rgba = vec![0u8; w * h * 4];
+    let denom = if vertical {
+        (h.saturating_sub(1)).max(1)
+    } else {
+        (w.saturating_sub(1)).max(1)
+    };
     for y in 0..h {
         let row_off = y * w * 4;
         for x in 0..w {
-            let idx = if vertical { y } else { x };
+            let pos = if vertical { y } else { x };
+            let idx = ((pos * 255 + denom / 2) / denom).min(255);
             let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
             let o = row_off + x * 4;
             rgba[o] = r;
@@ -538,35 +634,43 @@ mod tests {
     fn stac_expr_rewriter_is_single_pass_and_respects_boundaries() {
         // Overlapping asset names (`b2`, `b1`) must NOT double-replace and collapse!
         let names = vec!["b2".to_string(), "b1".to_string()];
-        assert_eq!(rewrite_stac_expr("(b2-b1)/(b2+b1)", &names), "(b1-b2)/(b1+b2)");
+        assert_eq!(
+            rewrite_stac_expr("(b2-b1)/(b2+b1)", &names).unwrap(),
+            "(b1-b2)/(b1+b2)"
+        );
 
         // Short asset names (`r`, `g`, `b`) must NOT clobber function names (`abs`, `sqrt`)
         let rgb = vec!["r".to_string(), "g".to_string(), "b".to_string()];
         assert_eq!(
-            rewrite_stac_expr("sqrt(abs(r - b)) + g", &rgb),
+            rewrite_stac_expr("sqrt(abs(r - b)) + g", &rgb).unwrap(),
             "sqrt(abs(b1 - b3)) + b2"
         );
 
         // Unspaced subtraction with hyphenated asset names (`SR-B5-SR-B4`) must rewrite cleanly
         let hyphenated = vec!["SR-B5".to_string(), "SR-B4".to_string()];
         assert_eq!(
-            rewrite_stac_expr("(SR-B5-SR-B4)/(SR-B5+SR-B4)", &hyphenated),
+            rewrite_stac_expr("(SR-B5-SR-B4)/(SR-B5+SR-B4)", &hyphenated).unwrap(),
             "(b1-b2)/(b1+b2)"
         );
 
         // TiTiler default `{asset}_b{i}` syntax for both multi-asset and single multi-band assets
         let nir_red = vec!["nir".to_string(), "red".to_string()];
         assert_eq!(
-            rewrite_stac_expr("(nir_b1-red_b1)/(nir_b1+red_b1)", &nir_red),
+            rewrite_stac_expr("(nir_b1-red_b1)/(nir_b1+red_b1)", &nir_red).unwrap(),
             "(b1-b2)/(b1+b2)"
         );
+        // Multi-asset `{asset}_b{k}` with k != 1 must fail loud instead of silently mapping to band 1
+        assert!(rewrite_stac_expr("(nir_b2-red_b1)/(nir_b2+red_b1)", &nir_red).is_err());
+        assert!(rewrite_stac_expr("nir_b0 + red_b1", &nir_red).is_err());
+
         let visual = vec!["visual".to_string()];
         assert_eq!(
-            rewrite_stac_expr("(visual_b3-visual_b1)/(visual_b3+visual_b1)", &visual),
+            rewrite_stac_expr("(visual_b3-visual_b1)/(visual_b3+visual_b1)", &visual).unwrap(),
             "(b3-b1)/(b3+b1)"
         );
 
-        // resolve_href must ignore slashes inside signed query strings and resolve root-relative hrefs
+        // resolve_href must ignore slashes inside signed query strings, handle /vsi* prefixes
+        // without escaping to local disk, and normalize `..` segments clamped at origin/bucket root
         assert_eq!(
             resolve_href(
                 "https://host.example/items/scene.json?sig=a/b/c",
@@ -577,6 +681,36 @@ mod tests {
         assert_eq!(
             resolve_href("https://host.example/stac/items/scene.json", "/data/B10.tif"),
             "https://host.example/data/B10.tif"
+        );
+        assert_eq!(
+            resolve_href("s3://bucket/stac/items/scene.json", "../cogs/B04.tif"),
+            "s3://bucket/stac/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href("s3://bucket/stac/scene.json", "../../../../cogs/B04.tif"),
+            "s3://bucket/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href(
+                "/vsicurl/https://host.example/stac/item.json?sig=a/b",
+                "/etc/passwd"
+            ),
+            "/vsicurl/https://host.example/etc/passwd"
+        );
+        assert_eq!(
+            resolve_href(
+                "/vsicurl/https://host.example/stac/items/item.json?sig=a/b",
+                "../cogs/B04.tif"
+            ),
+            "/vsicurl/https://host.example/stac/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href("/vsis3/mybucket/stac/items/item.json", "/etc/passwd"),
+            "/vsis3/mybucket/etc/passwd"
+        );
+        assert_eq!(
+            resolve_href("/vsis3/mybucket/stac/items/item.json", "../cogs/B04.tif"),
+            "/vsis3/mybucket/stac/cogs/B04.tif"
         );
     }
 }

@@ -37,11 +37,27 @@ struct ScenesInOrder<'a> {
 }
 
 /// One scene of a mosaic on its way.
-type SceneRead<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, EngineError>> + Send + 'a>>;
+type SceneRead<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, SceneFailure>> + Send + 'a>>;
+
+/// Why a scene of a mosaic gave no pixels: it could not be opened, or it was open and
+/// could not be read. A mosaic of a list of URLs passes over the first and goes on to
+/// the next scene; one whose scenes were chosen for the tile fails on either.
+enum SceneFailure {
+    Unopened(EngineError),
+    Unread(EngineError),
+}
+
+impl SceneFailure {
+    fn into_error(self) -> EngineError {
+        match self {
+            Self::Unopened(e) | Self::Unread(e) => e,
+        }
+    }
+}
 
 impl<'a> ScenesInOrder<'a> {
     /// The next scene in order, or `None` after the last.
-    async fn next(&mut self) -> Option<Result<Bytes, EngineError>> {
+    async fn next(&mut self) -> Option<Result<Bytes, SceneFailure>> {
         while self.reading.len() < self.window && self.next < self.scenes.len() {
             let scene = &self.scenes[self.next];
             self.reading.push_back(Box::pin(self.engine.render_mosaic_scene(scene, self.base, self.unscale)));
@@ -183,7 +199,10 @@ fn geo_keys_match(a: &cogzilla_tiff::GeoKeys, b: &cogzilla_tiff::GeoKeys) -> boo
     {
         return false;
     }
-    if a.projected_cs_type == Some(32767) || a.geographic_type == Some(32767) {
+    if a.projected_cs_type.is_none()
+        || a.projected_cs_type == Some(32767)
+        || a.geographic_type == Some(32767)
+    {
         return a == b;
     }
     true
@@ -391,14 +410,16 @@ impl TileEngine {
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. } => 3,
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                 raw,
                 nb,
                 req.tile_size,
                 req.tile_size,
+                true,
             ));
         }
         match req.tile_size {
@@ -544,20 +565,9 @@ impl TileEngine {
                         band_1based, ifd.samples_per_pixel
                     )));
                 }
-                // Pad source block range by 2 source pixels so the 1-px DEM border stencil never
-                // misses an adjacent COG internal block at tile boundaries.
-                let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-                let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
-                let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
-                    .min(ifd.tiles_across.saturating_sub(1));
-                let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
-                let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
-                    .min(ifd.tiles_down.saturating_sub(1));
-                let d_gw = d_tx1 - d_tx0 + 1;
-                let d_gh = d_ty1 - d_ty0 + 1;
-                let mut indices = Vec::with_capacity((d_gw * d_gh) as usize);
-                for ty in d_ty0..=d_ty1 {
-                    for tx in d_tx0..=d_tx1 {
+                let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
                         let idx = ifd.tile_index(tx, ty, band0) as u32;
                         indices.push(Some(idx));
                     }
@@ -584,10 +594,10 @@ impl TileEngine {
                     ifd.height,
                     ifd.tile_width,
                     ifd.tile_height,
-                    d_tx0,
-                    d_ty0,
-                    d_gw,
-                    d_gh,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
                     &block_refs,
                 )
                 .with_scale_offset(sc, off);
@@ -615,20 +625,9 @@ impl TileEngine {
                         band_1based, ifd.samples_per_pixel
                     )));
                 }
-                // Pad source block range by 2 source pixels so the 1-px DEM border stencil never
-                // misses an adjacent COG internal block at tile boundaries.
-                let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-                let d_tx0 = (c0.saturating_sub(2).max(0) as u32) / ifd.tile_width;
-                let d_tx1 = ((c1.saturating_add(2).max(0) as u32) / ifd.tile_width)
-                    .min(ifd.tiles_across.saturating_sub(1));
-                let d_ty0 = (r0.saturating_sub(2).max(0) as u32) / ifd.tile_height;
-                let d_ty1 = ((r1.saturating_add(2).max(0) as u32) / ifd.tile_height)
-                    .min(ifd.tiles_down.saturating_sub(1));
-                let d_gw = d_tx1 - d_tx0 + 1;
-                let d_gh = d_ty1 - d_ty0 + 1;
-                let mut indices = Vec::with_capacity((d_gw * d_gh) as usize);
-                for ty in d_ty0..=d_ty1 {
-                    for tx in d_tx0..=d_tx1 {
+                let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
                         let idx = ifd.tile_index(tx, ty, band0) as u32;
                         indices.push(Some(idx));
                     }
@@ -655,10 +654,10 @@ impl TileEngine {
                     ifd.height,
                     ifd.tile_width,
                     ifd.tile_height,
-                    d_tx0,
-                    d_ty0,
-                    d_gw,
-                    d_gh,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
                     &block_refs,
                 )
                 .with_scale_offset(sc, off);
@@ -1253,6 +1252,15 @@ impl TileEngine {
                         )));
                     }
                 }
+                if nb == 0 {
+                    return Ok(render_expr_vm::<N>(
+                        &plan,
+                        &[],
+                        prog,
+                        &style,
+                        (ifd.width, ifd.height),
+                    ));
+                }
                 match ifd.planar_config {
                     PlanarConfig::Chunky => {
                         let mut indices = Vec::with_capacity(grid_len);
@@ -1293,7 +1301,7 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * nb);
@@ -1336,7 +1344,7 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style))
+                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
                     }
                 }
             }
@@ -1369,14 +1377,16 @@ impl TileEngine {
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. } => 3,
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                 raw,
                 nb,
                 req.tile_size,
                 req.tile_size,
+                true,
             ));
         }
         match req.tile_size {
@@ -1672,7 +1682,7 @@ impl TileEngine {
                 for &b in &prog.used_bands {
                     ordered.push(make_src(b)?);
                 }
-                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style))
+                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height)))
             }
         }
     }
@@ -1730,8 +1740,8 @@ impl TileEngine {
         scene: &[String],
         base: &TileRequest,
         unscale: bool,
-    ) -> Result<Bytes, EngineError> {
-        let cogs = self.open_scene(scene).await?;
+    ) -> Result<Bytes, SceneFailure> {
+        let cogs = self.open_scene(scene).await.map_err(SceneFailure::Unopened)?;
         let cog = &cogs[0];
         // Fold each scene's own GDAL scale/offset into Single/Rgb rescale bounds when
         // `?unscale=true` so heterogeneous mosaic scenes unscale accurately at zero per-pixel cost.
@@ -1778,7 +1788,7 @@ impl TileEngine {
         } else {
             base.clone()
         };
-        self.render_multi_cog_tile(&cogs, &scene_req).await
+        self.render_multi_cog_tile(&cogs, &scene_req).await.map_err(SceneFailure::Unread)
     }
 
     /// The scenes of a mosaic rendered in order, up to a growing number of them at once.
@@ -1927,7 +1937,7 @@ impl TileEngine {
             scene.chunks_exact(4).all(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]).is_nan())
         };
         while let Some(scene) = reading.next().await {
-            let scene = scene?;
+            let scene = scene.map_err(SceneFailure::into_error)?;
             if scene.len() == len && !nothing(&scene) {
                 each(&scene);
             }
@@ -1943,7 +1953,7 @@ impl TileEngine {
         scenes: &[Vec<String>],
         req: &TileRequest,
     ) -> Result<Bytes, EngineError> {
-        self.render_mosaic_scenes_ahead(scenes, req, 1).await
+        self.render_mosaic(scenes, req, 1, true).await
     }
 
     /// [`Self::render_mosaic_scenes`], reading up to `ahead` scenes at once from the start.
@@ -1960,6 +1970,20 @@ impl TileEngine {
         scenes: &[Vec<String>],
         req: &TileRequest,
         ahead: usize,
+    ) -> Result<Bytes, EngineError> {
+        self.render_mosaic(scenes, req, ahead, false).await
+    }
+
+    /// The mosaic itself. With `skip_unopened`, a scene that cannot be opened is passed
+    /// over, and its error is the answer only when no scene could be opened at all: a
+    /// list of URLs may hold a dead one. Without, it fails the tile, as any scene that
+    /// cannot be read does.
+    async fn render_mosaic(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        ahead: usize,
+        skip_unopened: bool,
     ) -> Result<Bytes, EngineError> {
         if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
             return Err(EngineError::BadRequest(
@@ -2039,12 +2063,24 @@ impl TileEngine {
             scene_req.format = OutputFormat::RawF32;
             let empty_f32_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
 
+            let mut opened_any = false;
+            let mut last_open_err: Option<EngineError> = None;
             let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, ahead);
             while filled < total_pixels {
                 let Some(src) = reading.next().await else {
                     break;
                 };
-                let src = src?;
+                let src = match src {
+                    Ok(src) => {
+                        opened_any = true;
+                        src
+                    }
+                    Err(SceneFailure::Unopened(e)) if skip_unopened => {
+                        last_open_err = Some(e);
+                        continue;
+                    }
+                    Err(failure) => return Err(failure.into_error()),
+                };
                 if src.len() != f32_bands * total_pixels * 4
                     || src.as_ptr() == empty_f32_sentinel.as_ptr()
                 {
@@ -2080,6 +2116,11 @@ impl TileEngine {
             }
 
             if filled == 0 {
+                if !opened_any
+                    && let Some(err) = last_open_err
+                {
+                    return Err(err);
+                }
                 return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
             }
             let hdr = if req.format == OutputFormat::Npy {
@@ -2109,12 +2150,24 @@ impl TileEngine {
         base_scene_req.format = OutputFormat::RawRgba;
         let empty_rgba_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawRgba, 1);
 
+        let mut opened_any = false;
+        let mut last_open_err: Option<EngineError> = None;
         let mut reading = self.mosaic_scenes_in_order(scenes, &base_scene_req, req.unscale, ahead);
         while filled < total_pixels {
             let Some(src) = reading.next().await else {
                 break;
             };
-            let src = src?;
+            let src = match src {
+                Ok(src) => {
+                    opened_any = true;
+                    src
+                }
+                Err(SceneFailure::Unopened(e)) if skip_unopened => {
+                    last_open_err = Some(e);
+                    continue;
+                }
+                Err(failure) => return Err(failure.into_error()),
+            };
             if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
                 continue;
             }
@@ -2133,6 +2186,11 @@ impl TileEngine {
         }
 
         if filled == 0 && canvas.chunks_exact(4).all(|p| p[3] == 0) {
+            if !opened_any
+                && let Some(err) = last_open_err
+            {
+                return Err(err);
+            }
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
         Ok(encode_rgba_tile(
