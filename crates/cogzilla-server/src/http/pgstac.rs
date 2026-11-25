@@ -2963,7 +2963,7 @@ async fn feature_image(
     if geojson.get("type").and_then(Value::as_str) != Some("Feature") || !geojson["geometry"].is_object() {
         return not_a_feature();
     }
-    let (mask, bbox) = match PolygonMask::from_geojson(&polygons_of_collection(&geojson)) {
+    let (mask, bbox) = match polygons_of_collection(&geojson).and_then(|shape| PolygonMask::from_geojson(&shape)) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
     };
@@ -2973,8 +2973,9 @@ async fn feature_image(
 
 /// A feature whose geometry is a GeometryCollection of polygons, as the one MultiPolygon
 /// the mask reads: GDAL burns every member, which is their union. Any other feature is
-/// returned as it is, a collection with a line or a point in it among them.
-fn polygons_of_collection(feature: &Value) -> std::borrow::Cow<'_, Value> {
+/// returned as it is. A collection with a line or a point in it, or with nothing, is
+/// refused: lines and points are not burned here.
+fn polygons_of_collection(feature: &Value) -> Result<std::borrow::Cow<'_, Value>, EngineError> {
     fn gather<'a>(geometry: &'a Value, into: &mut Vec<&'a Value>, depth: usize) -> bool {
         match geometry.get("type").and_then(Value::as_str) {
             Some("Polygon") => {
@@ -2985,7 +2986,7 @@ fn polygons_of_collection(feature: &Value) -> std::borrow::Cow<'_, Value> {
                 into.extend(polygons);
                 true
             }),
-            Some("GeometryCollection") if depth < 4 => geometry["geometries"]
+            Some("GeometryCollection") if depth < 16 => geometry["geometries"]
                 .as_array()
                 .is_some_and(|members| members.iter().all(|member| gather(member, into, depth + 1))),
             _ => false,
@@ -2993,15 +2994,17 @@ fn polygons_of_collection(feature: &Value) -> std::borrow::Cow<'_, Value> {
     }
     let geometry = &feature["geometry"];
     if geometry.get("type").and_then(Value::as_str) != Some("GeometryCollection") {
-        return std::borrow::Cow::Borrowed(feature);
+        return Ok(std::borrow::Cow::Borrowed(feature));
     }
     let mut polygons = Vec::new();
     if !gather(geometry, &mut polygons, 0) || polygons.is_empty() {
-        return std::borrow::Cow::Borrowed(feature);
+        return Err(EngineError::BadRequest(
+            "a GeometryCollection is taken when every member is a Polygon or a MultiPolygon, and it has one".into(),
+        ));
     }
-    let mut feature = feature.clone();
-    feature["geometry"] = json!({ "type": "MultiPolygon", "coordinates": polygons });
-    std::borrow::Cow::Owned(feature)
+    // The geometry alone, which the mask reads as it reads a feature: one copy of the
+    // coordinates, checked against the mask's own limits as any other shape is.
+    Ok(std::borrow::Cow::Owned(json!({ "type": "MultiPolygon", "coordinates": polygons })))
 }
 
 /// GDAL's default grid for a raster warped to WGS84: where it starts and its pixel size.
@@ -3609,7 +3612,9 @@ async fn feature_statistics(
     feature: &Value,
     req: &StatsRequest<'_>,
 ) -> Result<Option<(Value, Vec<String>)>, Resp> {
-    let (mask, bbox) = PolygonMask::from_geojson(&polygons_of_collection(feature)).map_err(|e| engine_error(&e))?;
+    let (mask, bbox) = polygons_of_collection(feature)
+        .and_then(|shape| PolygonMask::from_geojson(&shape))
+        .map_err(|e| engine_error(&e))?;
     // As in titiler-pgstac, the items are those of the feature's bounding box. Each raster
     // is read on a grid of its own, which no one set of sample points stands for, so the
     // numbers come from pgSTAC's list unless the request asks for the lean one.

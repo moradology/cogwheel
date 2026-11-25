@@ -84,7 +84,7 @@ Tiles and images with nearest-neighbour resampling, which is the default, are re
 GDAL is followed where it decides what the picture is, and not where it is only inconsistent:
 
 - One band of several is read from the same pixels as all of them. GDAL takes another road for a partial selection and returns other pixels.
-- A `feature`'s polygon takes every pixel it touches, as rio-tiler burns it: on the shapes compared the pixels inside are titiler-pgstac's to within two. A GeometryCollection of polygons is their union.
+- A `feature`'s polygon takes every pixel it touches, as rio-tiler burns it, when the pixels are read with nearest-neighbour resampling: the pixels inside are then titiler-pgstac's, except where an edge runs exactly along a pixel boundary or through pixel corners (a box of round coordinates at a size that divides them), where a row or column can differ. With another resampling, `algorithm` or an alpha band the renderer draws, and it keeps the pixels whose centre is inside. A GeometryCollection of polygons is their union.
 - Four bands are refused as JPEG; TiTiler sends them as CMYK.
 - The projection along a row is not approximated to an eighth of a pixel as GDAL does: each pixel is the one the projection gives.
 - Still as GDAL has it, though it need not be: an overview up to a fifth coarser than asked is preferred to the next finer one.
