@@ -4787,6 +4787,46 @@ async fn tile(
                 Some(formula) if pq.colormap_explicit && !raw_array => MapAfterFormula::take(formula, &mut treq.bands),
                 _ => None,
             };
+            // An array of a raster's own bands, read with another resampling than nearest: the
+            // renderer's values, written in the raster's type with the mask as a band, as
+            // an array from planes is. What makes a picture's bytes of them, band math and
+            // `algorithm` are still the renderer's own float32.
+            let own_bands = matches!(treq.bands, BandRequest::Single { .. } | BandRequest::Rgb { .. });
+            if matches!(treq.format, OutputFormat::Npy)
+                && own_bands
+                && selection.is_none()
+                && !pq.colormap_explicit
+                && formula.is_none()
+                && pq.expr_raw.is_none()
+                && pq.algorithm.is_none()
+                && full.extra_samples.is_empty()
+                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+            {
+                let bands = TileEngine::value_bands(&treq.bands);
+                treq.format = OutputFormat::RawF32;
+                let raw = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
+                if raw.len() == bands * dim * dim * 4 {
+                    let read = raw.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+                    // With `rescale` the array is of the bytes a picture would show, band by band.
+                    if !pq.rescale.is_empty() {
+                        let range = |band: usize| pq.rescale.get(band).copied().unwrap_or(pq.rescale[0]);
+                        let values: Vec<f32> = read
+                            .enumerate()
+                            .map(|(i, v)| {
+                                let (min, max) = range(i / (dim * dim));
+                                if v.is_nan() { v } else { f32::from(rescale_byte(v, min, max)) }
+                            })
+                            .collect();
+                        return Ok((npy_array(&values, bands, dim, dim, SampleType::Uint8, return_mask, None), content_type));
+                    }
+                    let kind = if pq.unscale { SampleType::Float32 } else { full.sample_type };
+                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    // A whole-number raster's values between pixels are rounded to its type.
+                    let values: Vec<f32> = read.map(|v| if whole { v.round() } else { v }).collect();
+                    return Ok((npy_array(&values, bands, dim, dim, kind, return_mask, None), content_type));
+                }
+                treq.format = OutputFormat::Npy;
+            }
             // A formula on one band works on the band's byte, made here from the values.
             let exact = formula.is_some()
                 && !raw_array
