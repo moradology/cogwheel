@@ -718,6 +718,9 @@ def main() -> int:
         o.check("statistics, categories and percentiles", "zonal",
                 f"{st}?assets=scl&max_size=128&categorical=true&c=4&c=5&c=6&c=99&p=5&p=50&p=95", "POST", five)
         o.check("statistics, categorical without categories", "zonal", f"{st}?assets=scl&max_size=64&categorical=true", "POST", five)
+        o.check("statistics, nodata named", "zonal", f"{st}?assets=red&max_size=128&nodata=1000", "POST", five)
+        o.check("statistics, nodata named, three bands and a mean", "zonal",
+                f"{st}?assets=visual&max_size=128&nodata=40&pixel_selection=mean&items_limit=3", "POST", holed)
         o.check("statistics, bin count and range", "zonal",
                 f"{st}?assets=red&max_size=64&histogram_bins=4&histogram_range=0,2000", "POST", five)
         o.check("statistics over several items", "zonal", f"{st}?assets=red&max_size=512", "POST", large)

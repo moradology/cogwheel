@@ -3601,6 +3601,8 @@ struct StatsRequest<'a> {
     cover_scale: usize,
     expression: Option<&'a str>,
     unscale: bool,
+    /// A no-data value of the request's own, in the place of each raster's.
+    nodata: Option<f32>,
 }
 
 /// The statistics of one feature and the items they were read from, or `None` when the
@@ -3700,7 +3702,9 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, None).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, req.nodata).await
+                } else if req.nodata.is_some() {
+                    Err(EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into()))
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
@@ -3910,9 +3914,6 @@ async fn mosaic_statistics(
     const OWN: [&str; 8] =
         ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
     pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
-    if pq.nodata.is_some() {
-        return detail(StatusCode::BAD_REQUEST, "parameter 'nodata' is not supported on mosaic statistics yet");
-    }
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3951,6 +3952,7 @@ async fn mosaic_statistics(
         cover_scale,
         expression: query_value(pairs, "expression"),
         unscale: pq.unscale,
+        nodata: pq.nodata,
     };
     let mut out = Vec::with_capacity(features.len());
     for feature in &features {
