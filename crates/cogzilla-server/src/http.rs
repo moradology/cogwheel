@@ -2840,7 +2840,7 @@ where
                 only: None,
             };
             match pgstac::item_route(&ctx, &method, c, i, rest, &pq).await {
-                pgstac::ItemRoute::Done(resp) => return Ok(resp),
+                pgstac::ItemRoute::Done(resp) => return Ok(pgstac_cacheable(resp, &method)),
                 pgstac::ItemRoute::Stac(item, extent) => {
                     pgstac_item = Some(item);
                     pgstac_item_extent = extent;
@@ -2906,7 +2906,10 @@ where
             if_none_match: if_none_match.as_deref(),
             only: None,
         };
-        return Ok(pgstac::handle(ctx, &method, &segs, pq, req).await);
+        let list = matches!(segs[..], ["searches"] | ["searches", "" | "list"]);
+        let cacheable = method == Method::GET && !list;
+        let resp = pgstac::handle(ctx, &method, &segs, pq, req).await;
+        return Ok(if cacheable { pgstac_cacheable(resp, &Method::GET) } else { resp });
     }
 
     // ------------------------------------------------------------------------
@@ -5041,7 +5044,7 @@ where
                         Ok(fixed) => {
                             let mut resp = to_http_response(&engine, Ok(fixed), if_none_match.as_deref());
                             attach_x_assets(&mut resp, &stac_x_assets);
-                            resp
+                            pgstac_cacheable(resp, &method)
                         }
                         Err(resp) => resp,
                     }
@@ -5840,6 +5843,16 @@ where
     }
 
     Ok(json_error_resp(StatusCode::NOT_FOUND, &path))
+}
+
+/// A pgSTAC route's answer with the `Cache-Control` the tiles carry, as titiler-pgstac
+/// puts one on what it serves: on what a `GET` found, never on an error, and not where
+/// one is already set.
+fn pgstac_cacheable(mut resp: Response<Full<Bytes>>, method: &Method) -> Response<Full<Bytes>> {
+    if *method == Method::GET && resp.status().is_success() && !resp.headers().contains_key(CACHE_CONTROL) {
+        resp.headers_mut().insert(CACHE_CONTROL, cache_control_header().clone());
+    }
+    resp
 }
 
 fn cache_control_header() -> &'static HeaderValue {
