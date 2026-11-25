@@ -2837,6 +2837,7 @@ where
                 path: &path,
                 raw_query: &raw_query,
                 if_none_match: if_none_match.as_deref(),
+                only: None,
             };
             match pgstac::item_route(&ctx, &method, c, i, rest, &pq).await {
                 pgstac::ItemRoute::Done(resp) => return Ok(resp),
@@ -2903,6 +2904,7 @@ where
             path: &path,
             raw_query: &raw_query,
             if_none_match: if_none_match.as_deref(),
+            only: None,
         };
         return Ok(pgstac::handle(ctx, &method, &segs, pq, req).await);
     }
