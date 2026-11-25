@@ -232,7 +232,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         azimuth: 315.0,
         altitude: 45.0,
         z_factor: 1.0,
-        threshold: 128.0,
+        threshold: 127.0,
         contour_increment: 35.0,
         contour_thickness: 1,
         contour_minz: -12000.0,
@@ -1666,22 +1666,14 @@ fn build_band_request(
                 });
             }
             "contours" => {
-                let rescale = pq.rescale.first().copied().unwrap_or((0.0, 255.0));
-                let colormap = if pq.colormap_explicit {
-                    pq.colormap
-                } else {
-                    ColormapName::from_str_opt("gray").unwrap_or(ColormapName::Viridis)
-                };
-                return Ok(BandRequest::Dem {
+                return Ok(BandRequest::Terrain {
                     band_1based,
-                    algorithm: DemAlgorithm::Contours {
-                        increment: pq.contour_increment,
-                        thickness: pq.contour_thickness,
-                        minz: pq.contour_minz,
-                        maxz: pq.contour_maxz,
+                    encoding: TerrainEncoding::Contours {
+                        increment: pq.contour_increment.round() as i32,
+                        thickness: pq.contour_thickness.min(255) as u8,
+                        minz: pq.contour_minz.round() as i32,
+                        maxz: pq.contour_maxz.round() as i32,
                     },
-                    rescale,
-                    colormap,
                 });
             }
             "normalizedindex" | "cast" | "ceil" | "floor" | "min" | "max" | "median" | "mean"
@@ -1710,12 +1702,24 @@ fn build_band_request(
                     "cast" => {
                         let cast_one = |b: u16| -> (String, (f32, f32)) {
                             match pq.cast_dtype.as_deref() {
-                                Some("uint8") => (format!("clip(floor(b{b}), 0, 255)"), (0.0, 255.0)),
-                                Some("int8") => (format!("clip(floor(b{b}), -128, 127)"), (-128.0, 127.0)),
-                                Some("uint16") => (format!("clip(floor(b{b}), 0, 65535)"), (0.0, 65535.0)),
-                                Some("int16") => (format!("clip(floor(b{b}), -32768, 32767)"), (-32768.0, 32767.0)),
-                                Some("uint32") => (format!("max(floor(b{b}), 0)"), (0.0, 4_294_967_295.0)),
-                                Some("int32") => (format!("floor(b{b})"), (-2_147_483_648.0, 2_147_483_647.0)),
+                                None | Some("uint8") => {
+                                    (format!("clip(floor(b{b}), 0, 255)"), (0.0, 255.0))
+                                }
+                                Some("int8") => {
+                                    (format!("clip(floor(b{b}), -128, 127)"), (-128.0, 127.0))
+                                }
+                                Some("uint16") => {
+                                    (format!("clip(floor(b{b}), 0, 65535)"), (0.0, 65535.0))
+                                }
+                                Some("int16") => {
+                                    (format!("clip(floor(b{b}), -32768, 32767)"), (-32768.0, 32767.0))
+                                }
+                                Some("uint32") => {
+                                    (format!("max(floor(b{b}), 0)"), (0.0, 4_294_967_295.0))
+                                }
+                                Some("int32") => {
+                                    (format!("floor(b{b})"), (-2_147_483_648.0, 2_147_483_647.0))
+                                }
                                 _ => (format!("b{b}"), default_rescale_for_dtype(sample_type, true)),
                             }
                         };
@@ -1740,7 +1744,7 @@ fn build_band_request(
                         cast_one(bands[0])
                     }
                     "ceil" | "floor" => {
-                        let dr = default_rescale_for_dtype(sample_type, bands.len() < 3);
+                        let dr = (0.0, 255.0);
                         if bands.len() >= 3 {
                             let progs = [
                                 ExprProgram::compile(&format!("{alg}(b{})", bands[0])).map_err(EngineError::BadRequest)?,
@@ -1819,10 +1823,20 @@ fn build_band_request(
                         };
                         (expr, default_rescale_for_dtype(sample_type, true))
                     }
-                    "bitonal" => (
-                        format!("where(b{} >= {}, 1, 0)", bands[0], pq.threshold),
-                        (0.0, 1.0),
-                    ),
+                    "bitonal" => {
+                        let src_expr = if bands.len() >= 3 {
+                            format!(
+                                "(0.299 * b{} + 0.587 * b{} + 0.114 * b{})",
+                                bands[0], bands[1], bands[2]
+                            )
+                        } else {
+                            format!("b{}", bands[0])
+                        };
+                        (
+                            format!("where({src_expr} > {}, 255, 0)", pq.threshold),
+                            (0.0, 255.0),
+                        )
+                    }
                     _ => unreachable!(),
                 };
                 let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
@@ -7062,9 +7076,9 @@ mod tests {
         assert_eq!(hs["title"], "Hillshade");
         assert_eq!(hs["inputs"]["nbands"], 1);
         assert_eq!(hs["outputs"]["dtype"], "uint8");
-        assert_eq!(get_algorithm_json("normalizedIndex").unwrap()["title"], "Normalized Index");
-        assert_eq!(get_algorithm_json("grayscale").unwrap()["title"], "Grayscale");
-        assert_eq!(get_algorithm_json("bitonal").unwrap()["title"], "Bitonal");
+        assert_eq!(get_algorithm_json("normalizedIndex").unwrap()["title"], "Normalized Difference Index");
+        assert_eq!(get_algorithm_json("grayscale").unwrap()["title"], "Transform a RGB Image to Grayscale");
+        assert_eq!(get_algorithm_json("bitonal").unwrap()["title"], "Transform an Image to Bitonal");
         assert!(matches!(
             get_algorithm_json("nonexistent"),
             Err(EngineError::NotFound(_))
