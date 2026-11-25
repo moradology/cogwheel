@@ -1064,6 +1064,9 @@ fn reproject_wgs84_bounds(
         return Ok(wgs84);
     }
     let [w, s, e, n] = wgs84;
+    let antimeridian = e < w;
+    let lon_span = if antimeridian { (e + 360.0) - w } else { e - w };
+    let wrap_lon = |lo: f64| if lo > 180.0 { lo - 360.0 } else { lo };
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
@@ -1080,18 +1083,22 @@ fn reproject_wgs84_bounds(
     const SAMPLES: usize = 16;
     for i in 0..=SAMPLES {
         let t = i as f64 / SAMPLES as f64;
-        let lon = w + (e - w) * t;
+        let lon = wrap_lon(w + lon_span * t);
         let lat = s + (n - s) * t;
         accum(lon, s);
         accum(lon, n);
         accum(w, lat);
         accum(e, lat);
+        if antimeridian {
+            accum(180.0, lat);
+            accum(-180.0, lat);
+        }
     }
     const INTERIOR: usize = 8;
     for iy in 1..INTERIOR {
         let lat = s + (n - s) * (iy as f64 / INTERIOR as f64);
         for ix in 1..INTERIOR {
-            let lon = w + (e - w) * (ix as f64 / INTERIOR as f64);
+            let lon = wrap_lon(w + lon_span * (ix as f64 / INTERIOR as f64));
             accum(lon, lat);
         }
     }
@@ -3417,15 +3424,12 @@ where
             ["mosaicjson", "assets"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let assets: Vec<String> = if let Some([w, s, e, n]) = pq.bbox_param {
-                    let (mx0, my0) = lonlat_deg_to_mercator(w, s);
-                    let (mx1, my1) = lonlat_deg_to_mercator(e, n);
-                    mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1))
+                let assets: Vec<String> = if let Some(b) = pq.bbox_param {
+                    let [mx0, my0, mx1, my1] = crate::catalog::wgs84_bbox_to_3857(b);
+                    mj.query_bbox_3857(mx0, my0, mx1, my1)
                 } else {
-                    let [w, s, e, n] = mj.bounds;
-                    let (mx0, my0) = lonlat_deg_to_mercator(w, s);
-                    let (mx1, my1) = lonlat_deg_to_mercator(e, n);
-                    mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1))
+                    let [mx0, my0, mx1, my1] = crate::catalog::wgs84_bbox_to_3857(mj.bounds);
+                    mj.query_bbox_3857(mx0, my0, mx1, my1)
                 };
                 Ok((Bytes::from(serde_json::json!(assets).to_string()), "application/json"))
             }
@@ -3445,10 +3449,8 @@ where
             ["mosaicjson", "statistics"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let [w, s, e, n] = mj.bounds;
-                let (mx0, my0) = lonlat_deg_to_mercator(w, s);
-                let (mx1, my1) = lonlat_deg_to_mercator(e, n);
-                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let [mx0, my0, mx1, my1] = crate::catalog::wgs84_bbox_to_3857(mj.bounds);
+                let urls = mj.query_bbox_3857(mx0, my0, mx1, my1);
                 let stats_opts = build_stats_options(&pq, false)?;
                 let mut last_err: Option<EngineError> = None;
                 for cand in urls.iter().take(16) {
@@ -6843,5 +6845,18 @@ mod tests {
         let pq_map_html = parse_query(Some("url=a.tif&width=256"));
         assert!(validate_query(&["cog", "map.html"], &pq_map_html).is_err());
         assert!(validate_query(&["cog", "map"], &pq_map_html).is_ok());
+
+        // 11. Antimeridian-crossing WGS84 bbox (w > e, Fiji) projects across 180°, not 0°
+        let utm01s = cogzilla_proj::CrsModel::from_epsg(32701).unwrap();
+        let fiji_b = reproject_wgs84_bounds([177.0, -20.0, -178.0, -16.0], &utm01s).unwrap();
+        let (fiji_x, fiji_y) = utm01s.from_lonlat_deg(179.5, -18.0);
+        assert!(
+            fiji_x >= fiji_b[0] && fiji_x <= fiji_b[2] && fiji_y >= fiji_b[1] && fiji_y <= fiji_b[3],
+            "Fiji ({fiji_x}, {fiji_y}) outside antimeridian projected bounds {fiji_b:?}"
+        );
+        assert!(
+            (fiji_b[2] - fiji_b[0]) < 1_000_000.0,
+            "antimeridian bounds swept wrong hemisphere: {fiji_b:?}"
+        );
     }
 }
