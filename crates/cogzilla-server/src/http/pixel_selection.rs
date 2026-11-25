@@ -1,32 +1,42 @@
-//! rio-tiler's pixel selection methods, other than `first`.
+//! rio-tiler's pixel selection methods.
 //!
 //! A mosaic is made from every scene's values for the tile. `first` needs no arithmetic
-//! and stops when the tile is full, so it stays on the renderer's fast path; the methods
-//! here read all the scenes and decide each value of each band on its own, as rio-tiler
-//! does on masked arrays (`rio_tiler/mosaic/methods/defaults.py`):
+//! and stops when the tile is full, so where the renderer can composite colours itself it
+//! stays on that fast path; here it is one method among the others, which read all the
+//! scenes. Each value of each band is decided on its own, as rio-tiler does on masked
+//! arrays (`rio_tiler/mosaic/methods/defaults.py`):
 //!
+//! - `first` keeps the first valid value;
 //! - `highest` and `lowest` keep the largest or smallest valid value;
 //! - `mean`, `median` and `stdev` are numpy's over the valid values, the first two cast
 //!   back to the source's type, which for integers drops the fraction;
-//! - `count` is how many scenes had a value, as one band that is valid everywhere.
+//! - `count` is how many scenes had a value, as one band that is valid everywhere;
+//! - `lastbandlow` and `lastbandhigh` take a scene's values where its last band is below
+//!   or above the one kept, and leave that band out of the result.
 //!
 //! A value is not valid when the scene has no data there, which the renderer writes as NaN.
 
-/// A pixel selection method that is not `first`.
+/// A pixel selection method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Selection {
+    First,
     Highest,
     Lowest,
     Mean,
     Median,
     Stdev,
     Count,
+    LastBandLow,
+    LastBandHigh,
 }
 
 impl Selection {
-    /// The methods by TiTiler's names. `lastbandlow` and `lastbandhigh` are not here yet.
+    /// The methods by TiTiler's names.
     pub(super) fn parse(name: &str) -> Option<Self> {
         Some(match name {
+            "first" => Self::First,
+            "lastbandlow" => Self::LastBandLow,
+            "lastbandhigh" => Self::LastBandHigh,
             "highest" => Self::Highest,
             "lowest" => Self::Lowest,
             "mean" => Self::Mean,
@@ -35,6 +45,11 @@ impl Selection {
             "count" => Self::Count,
             _ => return None,
         })
+    }
+
+    /// Whether the method decides by the last band, which it then leaves out.
+    pub(super) fn by_last_band(self) -> bool {
+        matches!(self, Self::LastBandLow | Self::LastBandHigh)
     }
 }
 
@@ -96,8 +111,8 @@ pub(super) struct Fold<T = f32> {
 }
 
 enum State<T> {
-    /// `highest` and `lowest`: the value kept so far.
-    Extreme(Vec<T>),
+    /// `first`, `highest`, `lowest` and the last-band methods: the value kept so far.
+    Kept(Vec<T>),
     /// `mean` and `stdev`: the sum, the sum of squares and how many values went into them.
     Moments { sum: Vec<f64>, squares: Vec<f64>, count: Vec<u32> },
     /// `median`: every scene's values, scene after scene.
@@ -120,7 +135,11 @@ impl<T: Sample> Fold<T> {
     pub(super) fn new(method: Selection, bands: usize, pixels: usize, integer: bool) -> Self {
         let len = bands * pixels;
         let state = match method {
-            Selection::Highest | Selection::Lowest => State::Extreme(vec![T::NAN; len]),
+            Selection::First
+            | Selection::Highest
+            | Selection::Lowest
+            | Selection::LastBandLow
+            | Selection::LastBandHigh => State::Kept(vec![T::NAN; len]),
             Selection::Mean | Selection::Stdev => {
                 State::Moments { sum: vec![0.0; len], squares: vec![0.0; len], count: vec![0; len] }
             }
@@ -128,6 +147,11 @@ impl<T: Sample> Fold<T> {
             Selection::Count => State::Count(vec![T::ZERO; pixels]),
         };
         Self { method, bands, pixels, integer, scenes: 0, state }
+    }
+
+    /// How many bands each scene must bring.
+    pub(super) fn bands(&self) -> usize {
+        self.bands
     }
 
     /// The bytes `scenes` scenes would be held in, for the method that holds them.
@@ -142,12 +166,38 @@ impl<T: Sample> Fold<T> {
     pub(super) fn add(&mut self, scene: impl Iterator<Item = T>) {
         self.scenes += 1;
         match &mut self.state {
-            State::Extreme(kept) => {
-                let highest = self.method == Selection::Highest;
+            State::Kept(kept) if self.method.by_last_band() => {
+                // rio-tiler compares the last bands as stored, masked or not; a value that
+                // is not there is taken as the zero that stands for it in most rasters.
+                let stored = |v: T| if v.is_nan() { T::ZERO } else { v };
+                let high = self.method == Selection::LastBandHigh;
+                let (pixels, last) = (self.pixels, (self.bands - 1) * self.pixels);
+                let scene: Vec<T> = scene.take(kept.len()).collect();
+                if scene.len() != kept.len() {
+                    return;
+                }
+                // The last band is decided last, so every band sees the one kept before.
+                for band in 0..self.bands {
+                    for i in 0..pixels {
+                        let (new, old) = (stored(scene[last + i]), stored(kept[last + i]));
+                        let beyond = if high { new > old } else { new < old };
+                        let at = band * pixels + i;
+                        if (beyond && !scene[at].is_nan()) || kept[at].is_nan() {
+                            kept[at] = scene[at];
+                        }
+                    }
+                }
+            }
+            State::Kept(kept) => {
+                let method = self.method;
                 for (kept, v) in kept.iter_mut().zip(scene) {
                     // Take the scene's value where nothing is kept yet, or where it is a
                     // valid value beyond the one kept.
-                    let beyond = if highest { v > *kept } else { v < *kept };
+                    let beyond = match method {
+                        Selection::Highest => v > *kept,
+                        Selection::Lowest => v < *kept,
+                        _ => false,
+                    };
                     if kept.is_nan() || beyond {
                         *kept = v;
                     }
@@ -180,6 +230,15 @@ impl<T: Sample> Fold<T> {
         }
     }
 
+    /// Whether nothing a later scene holds could change the result: with `first`, once
+    /// every value is there. rio-tiler stops reading then.
+    pub(super) fn is_done(&self) -> bool {
+        match (&self.state, self.method) {
+            (State::Kept(kept), Selection::First) => self.scenes > 0 && kept.iter().all(|v| !v.is_nan()),
+            _ => false,
+        }
+    }
+
     /// The values the method leaves. `None` when no scene was taken.
     pub(super) fn finish(self) -> Option<Selected<T>> {
         if self.scenes == 0 {
@@ -190,7 +249,13 @@ impl<T: Sample> Fold<T> {
         // As `astype` does for an integer type: toward zero.
         let cast = |v: f64| T::from_f64(if integer { v.trunc() } else { v });
         let values = match self.state {
-            State::Extreme(kept) => kept,
+            State::Kept(mut kept) => {
+                if self.method.by_last_band() {
+                    kept.truncate(len - self.pixels);
+                    return Some(Selected { bands: self.bands - 1, values: kept });
+                }
+                kept
+            }
             State::Moments { sum, squares, count } => {
                 let mut values = vec![T::NAN; len];
                 for i in 0..len {
@@ -276,7 +341,10 @@ mod tests {
         ] {
             assert_eq!(Selection::parse(name), Some(method));
         }
-        for name in ["first", "lastbandlow", "lastbandhigh", "sum", "Highest", ""] {
+        assert_eq!(Selection::parse("first"), Some(Selection::First));
+        assert_eq!(Selection::parse("lastbandlow"), Some(Selection::LastBandLow));
+        assert_eq!(Selection::parse("lastbandhigh"), Some(Selection::LastBandHigh));
+        for name in ["sum", "Highest", ""] {
             assert_eq!(Selection::parse(name), None, "{name}");
         }
     }
@@ -339,6 +407,39 @@ mod tests {
     fn no_scenes_is_no_picture() {
         assert_eq!(select(Selection::Mean, &[], 1, 4, true), None);
         assert_eq!(select(Selection::Count, &[], 1, 4, true), None);
+    }
+
+    #[test]
+    fn first_keeps_the_first_value_and_knows_when_it_is_done() {
+        let mut fold = Fold::<f32>::new(Selection::First, 1, 4, true);
+        assert!(!fold.is_done());
+        fold.add_le_bytes(&scene(&[3.0, N, 7.0, N]));
+        assert!(!fold.is_done());
+        fold.add_le_bytes(&scene(&[5.0, 2.0, N, N]));
+        assert!(!fold.is_done());
+        fold.add_le_bytes(&scene(&[4.0, 9.0, 8.0, 1.0]));
+        assert!(fold.is_done());
+        assert_eq!(fold.finish().unwrap(), Selected { bands: 1, values: vec![3.0, 2.0, 7.0, 1.0] });
+        // The other methods are never done before the scenes are.
+        let mut fold = Fold::<f32>::new(Selection::Highest, 1, 1, true);
+        fold.add_le_bytes(&scene(&[3.0]));
+        assert!(!fold.is_done());
+    }
+
+    #[test]
+    fn the_last_band_decides_and_is_left_out() {
+        // Two bands of three pixels: values, then the band that decides.
+        let scenes = [
+            scene(&[10.0, 20.0, N, /* decides */ 5.0, 5.0, N]),
+            scene(&[11.0, 21.0, 31.0, /* decides */ 9.0, 1.0, 4.0]),
+            scene(&[N, 22.0, 32.0, /* decides */ 99.0, 3.0, 2.0]),
+        ];
+        let got = select(Selection::LastBandHigh, &scenes, 2, 3, true).unwrap();
+        // Pixel one: 9 beats 5; 99 would beat 9, but that scene has no value there.
+        assert_eq!(got, Selected { bands: 1, values: vec![11.0, 20.0, 31.0] });
+        let got = select(Selection::LastBandLow, &scenes, 2, 3, true).unwrap();
+        // Pixel three: nothing kept, so the first value there; then 2 is below 4.
+        assert_eq!(got, Selected { bands: 1, values: vec![10.0, 21.0, 32.0] });
     }
 
     #[test]
