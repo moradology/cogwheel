@@ -148,7 +148,10 @@ fn geo_keys_match(a: &cogzilla_tiff::GeoKeys, b: &cogzilla_tiff::GeoKeys) -> boo
     {
         return false;
     }
-    if a.projected_cs_type == Some(32767) || a.geographic_type == Some(32767) {
+    if a.projected_cs_type.is_none()
+        || a.projected_cs_type == Some(32767)
+        || a.geographic_type == Some(32767)
+    {
         return a == b;
     }
     true

@@ -62,6 +62,21 @@ impl CrsModel {
         })
     }
 
+    /// Linear unit conversion factor to metres (`1.0` for metre-based and geographic CRSes;
+    /// `0.3048` / `1200/3937` for international/US survey foot projected CRSes).
+    #[inline]
+    pub fn linear_unit_metres(&self) -> f64 {
+        match self {
+            Self::TransverseMercator(p) => p.unit,
+            Self::Albers(p) => p.unit,
+            Self::LambertConformalConic(p) => p.unit,
+            Self::PolarStereographic(p) => p.unit,
+            Self::Laea(p) => p.unit,
+            Self::Sinusoidal(p) => p.unit,
+            Self::Epsg3857 | Self::WorldMercator | Self::Geographic => 1.0,
+        }
+    }
+
     /// Anything this crate cannot place correctly is an error. Coordinates are
     /// treated as WGS84 with no datum shift, so a CRS is only accepted when its
     /// datum is WGS84 or one that agrees with it to about two metres (NAD83,

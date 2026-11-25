@@ -2313,12 +2313,32 @@ async fn render_mosaic_tile_styled(
     }
 }
 
-fn apply_stac_asset_bidx(pq: &mut ParsedQuery, names: &[String]) {
+fn apply_stac_asset_bidx(pq: &mut ParsedQuery, names: &[String]) -> Result<(), EngineError> {
     if pq.bidx.is_empty() && names.len() == 1 {
         if let Some((_, bands)) = pq.asset_bidx.iter().find(|(n, _)| n == &names[0]) {
             pq.bidx = bands.clone();
         }
+    } else if names.len() > 1 {
+        for name in names {
+            if let Some((_, bands)) = pq.asset_bidx.iter().find(|(n, _)| n == name)
+                && bands.as_slice() != [1]
+            {
+                return Err(EngineError::BadRequest(format!(
+                    "per-asset band selection ({name}|{bands:?}) across multiple STAC assets is not supported on tile/image rendering routes"
+                )));
+            }
+        }
     }
+    Ok(())
+}
+
+/// Resolve the effective output `(CrsModel, epsg)` for `/{cog,stac,mosaicjson}/bbox` routes:
+/// explicit `?dst_crs=` wins, otherwise default to `?coord_crs=` (matching TiTiler 2.4 / `rio-tiler`),
+/// falling back to `EPSG:4326`.
+fn resolve_bbox_dst_crs(pq: &ParsedQuery) -> Option<(cogzilla_proj::CrsModel, u16)> {
+    pq.dst_crs
+        .clone()
+        .or_else(|| pq.coord_crs.clone().zip(pq.coord_crs_epsg))
 }
 
 fn stac_asset_selected_bands<'a>(pq: &'a ParsedQuery, asset_name: &str) -> Option<&'a [u16]> {
@@ -3392,7 +3412,7 @@ where
                 let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = pq.dst_crs.clone().unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -3428,7 +3448,7 @@ where
                 let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = pq.dst_crs.clone().unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -4530,7 +4550,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let wgs_bbox = pq_stac.bbox_param.unwrap_or_else(|| {
@@ -4640,7 +4660,7 @@ where
                         };
                         let mut pq_stac = pq;
                         pq_stac.expr_raw = rewritten_expr;
-                        apply_stac_asset_bidx(&mut pq_stac, &names);
+                        apply_stac_asset_bidx(&mut pq_stac, &names)?;
                         let db = if cogs.len() > 1 {
                             cogs.len() as u16
                         } else {
@@ -4861,7 +4881,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -4897,6 +4917,9 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
+                    let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
+                        && full.pixel_to_crs.a > 0.0
+                        && full.pixel_to_crs.e < 0.0;
                     if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
@@ -4906,6 +4929,15 @@ where
                         )
                         .await?;
                         (d, bbox, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
+                        let epsg = nat_epsg.unwrap_or(4326);
+                        let d = render_crs_bbox(
+                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            pq_stac.resample, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq_stac.return_mask, pq_stac.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, epsg)
                     } else {
                         let d = render_native_preview(
                             &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
@@ -4929,7 +4961,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -4961,6 +4993,9 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
+                    let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
+                        && full.pixel_to_crs.a > 0.0
+                        && full.pixel_to_crs.e < 0.0;
                     if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
@@ -4970,6 +5005,15 @@ where
                         )
                         .await?;
                         (d, bbox, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
+                        let epsg = nat_epsg.unwrap_or(4326);
+                        let d = render_crs_bbox(
+                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            pq_stac.resample, fmt, pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq_stac.return_mask, pq_stac.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, epsg)
                     } else {
                         let d = render_native_preview(
                             &engine, &cogs, bbox, out_w, out_h, &bands, pq_stac.resample, fmt,
@@ -4995,7 +5039,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(
                     ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
@@ -5015,7 +5059,23 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (data, out_bbox, out_w, out_h, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
+                let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
+                    let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, &dst_crs)?
+                    };
+                    let (def_w, def_h) = aspect_preserving_dims(dst_bbox, pq_stac.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
+                    let d = render_crs_bbox(
+                        &engine, &cogs, dst_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
+                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                    )
+                    .await?;
+                    (d, dst_bbox, out_w, out_h, dst_epsg)
+                } else if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
                         bbox
                     } else {
@@ -5070,7 +5130,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -5087,7 +5147,21 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
+                let (data, out_bbox, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
+                    let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, &dst_crs)?
+                    };
+                    let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
+                    let d = render_crs_bbox(
+                        &engine, &cogs, dst_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
+                        pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
+                    )
+                    .await?;
+                    (d, dst_bbox, dst_epsg)
+                } else if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
                         bbox
                     } else {
@@ -5139,7 +5213,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -5194,7 +5268,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
-                apply_stac_asset_bidx(&mut pq_stac, &names);
+                apply_stac_asset_bidx(&mut pq_stac, &names)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -5211,26 +5285,28 @@ where
                     .map(ColorFormula::parse)
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
-                let (def_w, def_h) = aspect_preserving_dims(bbox, s);
-                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                 let target_epsg = pq_stac.dst_crs.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq_stac.shape_mask.then_some(&mask);
-                let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
+                let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let (def_w, def_h) = aspect_preserving_dims(dst_bbox, s);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, mask_opt, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
-                    (d, dst_bbox, dst_epsg)
+                    (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
+                    let (def_w, def_h) = aspect_preserving_dims(bbox, s);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
                         pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                     )
                     .await?;
-                    (d, bbox, 4326u16)
+                    (d, bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
@@ -5769,6 +5845,9 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
+                    let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
+                        && full.pixel_to_crs.a > 0.0
+                        && full.pixel_to_crs.e < 0.0;
                     if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
@@ -5778,6 +5857,15 @@ where
                         )
                         .await?;
                         (d, bbox, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
+                        let epsg = nat_epsg.unwrap_or(4326);
+                        let d = render_crs_bbox(
+                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, epsg)
                     } else {
                         let d = render_native_preview(
                             &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
@@ -5822,6 +5910,9 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
+                    let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
+                        && full.pixel_to_crs.a > 0.0
+                        && full.pixel_to_crs.e < 0.0;
                     if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
@@ -5831,6 +5922,15 @@ where
                         )
                         .await?;
                         (d, bbox, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
+                        let epsg = nat_epsg.unwrap_or(4326);
+                        let d = render_crs_bbox(
+                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
+                            pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, nat_bbox, epsg)
                     } else {
                         let d = render_native_preview(
                             &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
@@ -5866,7 +5966,23 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (data, out_bbox, out_w, out_h, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
+                let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
+                    let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, &dst_crs)?
+                    };
+                    let (def_w, def_h) = aspect_preserving_dims(dst_bbox, pq.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
+                    let d = render_crs_bbox(
+                        &engine, &cogs, dst_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
+                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                    )
+                    .await?;
+                    (d, dst_bbox, out_w, out_h, dst_epsg)
+                } else if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
                         bbox
                     } else {
@@ -5928,7 +6044,21 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (data, out_bbox, epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
+                let (data, out_bbox, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
+                    let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                        bbox
+                    } else {
+                        let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                        reproject_wgs84_bounds(wgs_bbox, &dst_crs)?
+                    };
+                    let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
+                    let d = render_crs_bbox(
+                        &engine, &cogs, dst_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
+                        pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                    )
+                    .await?;
+                    (d, dst_bbox, dst_epsg)
+                } else if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
                         bbox
                     } else {
@@ -5987,26 +6117,28 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
-                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let target_epsg = pq.dst_crs.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq.shape_mask.then_some(&mask);
-                let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
+                let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let (def_w, def_h) = aspect_preserving_dims(dst_bbox, pq.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, mask_opt, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?;
-                    (d, dst_bbox, dst_epsg)
+                    (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
+                    let (def_w, def_h) = aspect_preserving_dims(bbox, pq.max_size);
+                    let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                     )
                     .await?;
-                    (d, bbox, 4326u16)
+                    (d, bbox, out_w, out_h, 4326u16)
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
@@ -6575,9 +6707,21 @@ mod tests {
         assert!(pm.check_work_budget(64 * 64).is_ok());
 
         // 5. ?assets=visual|bidx=2&assets=nir stores per-asset bidx without leaking into global bidx
-        let pq_ab = parse_query(Some("assets=visual|bidx=2&assets=nir"));
+        let mut pq_ab = parse_query(Some("assets=visual|bidx=2&assets=nir"));
         assert_eq!(pq_ab.assets, vec!["visual", "nir"]);
         assert!(pq_ab.bidx.is_empty());
         assert_eq!(pq_ab.asset_bidx, vec![("visual".to_string(), vec![2])]);
+        // Fail loud on multi-asset non-[1] band selection on rendering routes
+        assert!(apply_stac_asset_bidx(&mut pq_ab, &["visual".into(), "nir".into()]).is_err());
+
+        // 6. CrsModel::linear_unit_metres returns US survey foot for EPSG:2227 and 1.0 for EPSG:32610
+        let ca_ft = cogzilla_proj::CrsModel::from_epsg(2227).unwrap();
+        assert!((ca_ft.linear_unit_metres() - 1200.0 / 3937.0).abs() < 1e-6);
+        let utm10 = cogzilla_proj::CrsModel::from_epsg(32610).unwrap();
+        assert!((utm10.linear_unit_metres() - 1.0).abs() < 1e-9);
+
+        // 7. resolve_bbox_dst_crs defaults to coord_crs when dst_crs is omitted
+        let pq_utm = parse_query(Some("url=a.tif&coord_crs=EPSG:32610"));
+        assert_eq!(resolve_bbox_dst_crs(&pq_utm).map(|(_, e)| e), Some(32610));
     }
 }
