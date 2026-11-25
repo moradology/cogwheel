@@ -212,6 +212,7 @@ struct ParsedQuery {
     cast_dtype: Option<String>,
     colormap_explicit: bool,
     colormap_name_set: bool,
+    colormap_type_linear: bool,
     /// Parameter names present in the query, for per-route validation.
     keys: Vec<String>,
     /// Values that could not be parsed or name something unsupported.
@@ -275,6 +276,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         cast_dtype: None,
         colormap_explicit: false,
         colormap_name_set: false,
+        colormap_type_linear: false,
         keys: Vec::new(),
         errors: Vec::new(),
     };
@@ -778,6 +780,14 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     "unsupported pixel_selection '{v}' (expected first, highest, lowest, mean, median, stdev, count, lastbandlow, or lastbandhigh)"
                 )),
             },
+            "colormap_type" => {
+                let dec = percent_decode(v);
+                match dec.to_ascii_lowercase().as_str() {
+                    "linear" => pq.colormap_type_linear = true,
+                    "explicit" | "discrete" | "" => pq.colormap_type_linear = false,
+                    _ => bad("expected colormap_type=explicit or linear"),
+                }
+            }
             "cover_scale" => {
                 pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
@@ -1998,6 +2008,11 @@ fn build_band_request(
             .filter(|s| !s.is_empty())
             .collect();
         if parts.len() == 3 {
+            if pq.colormap_explicit || pq.custom_colormap_json.is_some() {
+                return Err(EngineError::BadRequest(
+                    "colormap cannot be applied to 3-band RGB output".into(),
+                ));
+            }
             let p0 = ExprProgram::compile(parts[0]).map_err(EngineError::BadRequest)?;
             let p1 = ExprProgram::compile(parts[1]).map_err(EngineError::BadRequest)?;
             let p2 = ExprProgram::compile(parts[2]).map_err(EngineError::BadRequest)?;
@@ -2050,6 +2065,11 @@ fn build_band_request(
     }
 
     if pq.bidx.len() == 3 || (pq.bidx.is_empty() && default_bands >= 3) {
+        if pq.colormap_explicit || pq.custom_colormap_json.is_some() {
+            return Err(EngineError::BadRequest(
+                "colormap cannot be applied to 3-band RGB output".into(),
+            ));
+        }
         let bs = if pq.bidx.len() == 3 {
             [pq.bidx[0], pq.bidx[1], pq.bidx[2]]
         } else {
@@ -3352,9 +3372,13 @@ fn resolve_custom_lut(
     bands: &BandRequest,
 ) -> Result<Option<CustomColormap>, EngineError> {
     if let Some(ref j) = pq.custom_colormap_json {
-        return CustomColormap::from_json_str(j, !pq.rescale.is_empty())
-            .map(Some)
-            .map_err(EngineError::BadRequest);
+        return CustomColormap::from_json_str_with_type(
+            j,
+            !pq.rescale.is_empty(),
+            pq.colormap_type_linear,
+        )
+        .map(Some)
+        .map_err(EngineError::BadRequest);
     }
     if !pq.colormap_explicit
         && pq.rescale.is_empty()
@@ -4576,13 +4600,20 @@ where
                             buf_bbox[3],
                         );
                         if urls.is_empty() {
+                            let empty_default_bands = if pq.bidx.is_empty()
+                                && (pq.colormap_explicit || pq.custom_colormap_json.is_some())
+                            {
+                                1
+                            } else {
+                                3
+                            };
                             let (treq, ct) = build_tile_request(
                                 Some(&engine),
                                 tile,
                                 sc,
                                 ext,
                                 &pq,
-                                3,
+                                empty_default_bands,
                                 cogzilla_tiff::SampleType::Uint8,
                                 false,
                                 None,
@@ -4803,13 +4834,20 @@ where
                             buf_bbox[3],
                         );
                         if urls.is_empty() {
+                            let empty_default_bands = if pq.bidx.is_empty()
+                                && (pq.colormap_explicit || pq.custom_colormap_json.is_some())
+                            {
+                                1
+                            } else {
+                                3
+                            };
                             let (treq, ct) = build_tile_request(
                                 Some(&engine),
                                 tile,
                                 sc,
                                 ext,
                                 &pq,
-                                3,
+                                empty_default_bands,
                                 cogzilla_tiff::SampleType::Uint8,
                                 false,
                                 None,

@@ -166,6 +166,13 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
     if let Some(nv) = nodata_value {
         info["nodata_value"] = nv;
     }
+    if let Some(ref pal) = cog.index.color_map {
+        let mut cmap = serde_json::Map::with_capacity(pal.len());
+        for (i, &[r, g, b, a]) in pal.iter().enumerate() {
+            cmap.insert(i.to_string(), serde_json::json!([r, g, b, a]));
+        }
+        info["colormap"] = serde_json::Value::Object(cmap);
+    }
     Ok(info)
 }
 
