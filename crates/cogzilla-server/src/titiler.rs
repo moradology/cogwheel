@@ -3382,6 +3382,13 @@ pub struct PolygonMask {
 
 impl PolygonMask {
     pub fn from_geojson(val: &serde_json::Value) -> Result<(Self, [f64; 4]), EngineError> {
+        Self::from_geojson_in_crs(val, None)
+    }
+
+    pub fn from_geojson_in_crs(
+        val: &serde_json::Value,
+        coord_crs: Option<&cogzilla_proj::CrsModel>,
+    ) -> Result<(Self, [f64; 4]), EngineError> {
         let mut geometries: Vec<&serde_json::Value> = Vec::new();
         match val.get("type").and_then(|v| v.as_str()) {
             Some("FeatureCollection") => {
@@ -3496,16 +3503,27 @@ impl PolygonMask {
                 if p.len() < 2 {
                     return Err(EngineError::BadRequest("coord needs [lon, lat]".into()));
                 }
-                let (Some(lon), Some(lat)) = (p[0].as_f64(), p[1].as_f64()) else {
+                let (Some(x), Some(y)) = (p[0].as_f64(), p[1].as_f64()) else {
                     return Err(EngineError::BadRequest(
                         "GeoJSON coordinates must be numeric".into(),
                     ));
                 };
-                if !lon.is_finite() || !lat.is_finite() {
+                if !x.is_finite() || !y.is_finite() {
                     return Err(EngineError::BadRequest(
                         "GeoJSON coordinates must be finite".into(),
                     ));
                 }
+                let (lon, lat) = if let Some(crs) = coord_crs {
+                    let (lo, la) = crs.to_lonlat_deg(x, y);
+                    if !lo.is_finite() || !la.is_finite() {
+                        return Err(EngineError::BadRequest(
+                            "reprojected GeoJSON coordinates are non-finite".into(),
+                        ));
+                    }
+                    (lo, la)
+                } else {
+                    (x, y)
+                };
                 ring.push((lon, lat));
             }
             Ok(ring)
@@ -4235,6 +4253,7 @@ async fn render_bbox_impl(
             color_formula,
             return_mask,
             unscale,
+            None,
         )
         .await;
     }
@@ -5632,6 +5651,55 @@ pub fn build_map_html(tilejson_url: &str) -> String {
 /// Fallback multi-COG / STAC renderer when assets have mixed resolutions, tile grids, overview
 /// counts, or CRSes (e.g. Sentinel-2 10m + 20m bands). Samples each needed asset independently
 /// into a `(w * h)` f32 plane in the target CRS, then evaluates the band math / styling / encoding.
+/// Render a multi-asset request where each slot in `cogs` selects a specific 1-based band
+/// from `asset_bands` (for multi-asset STAC `?asset_bidx=a|2&asset_bidx=b|1`).
+#[allow(clippy::too_many_arguments)]
+pub async fn render_multi_asset_bbox(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    asset_bands: &[u16],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    native_preview: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&CustomColormap>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    let w = (width as usize).clamp(1, 4096);
+    let h = (height as usize).clamp(1, 4096);
+    if let Some(pm) = poly_mask {
+        pm.check_work_budget(w.saturating_mul(h))?;
+    }
+    render_mixed_grid_bbox(
+        engine,
+        cogs,
+        bbox,
+        dst_crs,
+        native_preview,
+        w,
+        h,
+        poly_mask,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+        unscale,
+        Some(asset_bands),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_mixed_grid_bbox(
     engine: &TileEngine,
@@ -5650,6 +5718,7 @@ async fn render_mixed_grid_bbox(
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
+    asset_bands: Option<&[u16]>,
 ) -> Result<Bytes, EngineError> {
     let max_b = cogs.len() as u16;
     // DEM algorithms (hillshade, slope, aspect, contours) operate on a single band using a 3x3
@@ -5668,8 +5737,11 @@ async fn render_mixed_grid_bbox(
             )));
         }
         let single_cog = [cogs[(*band_1based - 1) as usize].clone()];
+        let src_band = asset_bands
+            .and_then(|ab| ab.get((*band_1based - 1) as usize).copied())
+            .unwrap_or(1);
         let single_dem = BandRequest::Dem {
-            band_1based: 1,
+            band_1based: src_band,
             algorithm: *algorithm,
             rescale: *rescale,
             colormap: *colormap,
@@ -5770,8 +5842,11 @@ async fn render_mixed_grid_bbox(
     let mut planes: Vec<(u16, Vec<f32>)> = Vec::with_capacity(needed.len());
     for &b1 in &needed {
         let single_cog = [cogs[(b1 - 1) as usize].clone()];
+        let src_band = asset_bands
+            .and_then(|ab| ab.get((b1 - 1) as usize).copied())
+            .unwrap_or(1);
         let single_band = BandRequest::Single {
-            band_1based: 1,
+            band_1based: src_band,
             rescale: (0.0, 1.0),
             colormap: ColormapName::Grayscale,
         };
