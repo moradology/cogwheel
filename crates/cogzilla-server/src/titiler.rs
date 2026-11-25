@@ -4286,8 +4286,20 @@ async fn render_bbox_impl(
         }
     }
 
+    // Skip block I/O completely for 0-band constant expressions (u_map/v_map already enforce
+    // raster footprint + polygon bounds).
+    let zero_band_expr = match bands {
+        BandRequest::CustomExpr { prog, .. } => prog.used_bands.is_empty(),
+        BandRequest::CustomExprRgb { progs, .. } => {
+            progs.iter().all(|p| p.used_bands.is_empty())
+        }
+        _ => false,
+    };
+
     // Fetch needed bands (single COG chunky/planar or multi-COG)
-    let cog_tiles = if cogs.len() == 1 {
+    let cog_tiles = if zero_band_expr {
+        vec![Vec::new(); cogs.len()]
+    } else if cogs.len() == 1 {
         if is_single_planar {
             let mut indices = Vec::with_capacity(grid_len * planar_bands.len().max(1));
             for &band in &planar_bands {
@@ -5427,53 +5439,126 @@ async fn render_mixed_grid_bbox(
         planes.push((b1, vals));
     }
 
-    // For constant or where() expressions in mixed-grid mode, build a polygon + primary-footprint
-    // validity mask so outside-polygon and out-of-bounds pixels stay NaN/transparent.
-    let needs_expr_mask = match bands {
-        BandRequest::CustomExpr { prog, .. } => {
-            prog.used_bands.is_empty() || prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where)
+    // For constant or where() expressions in mixed-grid mode, build per-channel polygon +
+    // referenced-asset footprint validity masks (logical OR across the channel's referenced COGs,
+    // falling back to cogs[0] only when the channel references no bands) so non-primary assets
+    // are never clipped to cogs[0]'s footprint.
+    let prog_needs_mask = |p: &cogzilla_kernel::ExprProgram| {
+        p.used_bands.is_empty() || p.ops.contains(&cogzilla_kernel::expr_vm::Op::Where)
+    };
+    let mut single_cog_masks: Vec<(usize, Vec<bool>)> = Vec::new();
+    let one_prog = cogzilla_kernel::ExprProgram::compile("1").map_err(EngineError::BadRequest)?;
+    let mask_band = BandRequest::CustomExpr {
+        prog: one_prog,
+        rescale: (0.0, 1.0),
+        colormap: ColormapName::Grayscale,
+    };
+    let mut expr_valid_mask: Option<Vec<bool>> = None;
+    let mut expr_rgb_masks: [Option<Vec<bool>>; 3] = [None, None, None];
+    match bands {
+        BandRequest::CustomExpr { prog, .. } if prog_needs_mask(prog) => {
+            let slots: Vec<usize> = if prog.used_bands.is_empty() {
+                vec![0]
+            } else {
+                let mut s = Vec::new();
+                for &b in &prog.used_bands {
+                    let idx = (b - 1) as usize;
+                    if !s.contains(&idx) {
+                        s.push(idx);
+                    }
+                }
+                s
+            };
+            let mut combined = vec![false; w * h];
+            for slot in slots {
+                let single_cog = [cogs[slot].clone()];
+                let raw = Box::pin(render_bbox_impl(
+                    engine,
+                    &single_cog,
+                    eff_bbox,
+                    eff_crs,
+                    false,
+                    w as u32,
+                    h as u32,
+                    poly_mask,
+                    &mask_band,
+                    ResampleMode::Nearest,
+                    OutputFormat::RawF32,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                ))
+                .await?;
+                for (i, c) in raw.chunks_exact(4).take(w * h).enumerate() {
+                    if !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan() {
+                        combined[i] = true;
+                    }
+                }
+            }
+            expr_valid_mask = Some(combined);
         }
-        BandRequest::CustomExprRgb { progs, .. } => progs.iter().any(|p| {
-            p.used_bands.is_empty() || p.ops.contains(&cogzilla_kernel::expr_vm::Op::Where)
-        }),
-        _ => false,
-    };
-    let expr_valid_mask: Option<Vec<bool>> = if needs_expr_mask {
-        let one_prog = cogzilla_kernel::ExprProgram::compile("1").map_err(EngineError::BadRequest)?;
-        let mask_band = BandRequest::CustomExpr {
-            prog: one_prog,
-            rescale: (0.0, 1.0),
-            colormap: ColormapName::Grayscale,
-        };
-        let single_cog = [cogs[0].clone()];
-        let raw = Box::pin(render_bbox_impl(
-            engine,
-            &single_cog,
-            eff_bbox,
-            eff_crs,
-            false,
-            w as u32,
-            h as u32,
-            poly_mask,
-            &mask_band,
-            ResampleMode::Nearest,
-            OutputFormat::RawF32,
-            None,
-            None,
-            None,
-            false,
-            false,
-        ))
-        .await?;
-        Some(
-            raw.chunks_exact(4)
-                .take(w * h)
-                .map(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan())
-                .collect(),
-        )
-    } else {
-        None
-    };
+        BandRequest::CustomExprRgb { progs, .. } => {
+            for c_idx in 0..3 {
+                if !prog_needs_mask(&progs[c_idx]) {
+                    continue;
+                }
+                let slots: Vec<usize> = if progs[c_idx].used_bands.is_empty() {
+                    vec![0]
+                } else {
+                    let mut s = Vec::new();
+                    for &b in &progs[c_idx].used_bands {
+                        let idx = (b - 1) as usize;
+                        if !s.contains(&idx) {
+                            s.push(idx);
+                        }
+                    }
+                    s
+                };
+                let mut combined = vec![false; w * h];
+                for slot in slots {
+                    if let Some((_, cached)) = single_cog_masks.iter().find(|(k, _)| *k == slot) {
+                        for (dst, &v) in combined.iter_mut().zip(cached.iter()) {
+                            *dst |= v;
+                        }
+                        continue;
+                    }
+                    let single_cog = [cogs[slot].clone()];
+                    let raw = Box::pin(render_bbox_impl(
+                        engine,
+                        &single_cog,
+                        eff_bbox,
+                        eff_crs,
+                        false,
+                        w as u32,
+                        h as u32,
+                        poly_mask,
+                        &mask_band,
+                        ResampleMode::Nearest,
+                        OutputFormat::RawF32,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                    ))
+                    .await?;
+                    let mask_vec: Vec<bool> = raw
+                        .chunks_exact(4)
+                        .take(w * h)
+                        .map(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan())
+                        .collect();
+                    for (dst, &v) in combined.iter_mut().zip(mask_vec.iter()) {
+                        *dst |= v;
+                    }
+                    single_cog_masks.push((slot, mask_vec));
+                }
+                expr_rgb_masks[c_idx] = Some(combined);
+            }
+        }
+        _ => {}
+    }
 
     let get_plane = |b1: u16| -> &[f32] {
         planes
@@ -5593,13 +5678,13 @@ async fn render_mixed_grid_bbox(
                 1
             }
             BandRequest::CustomExprRgb { progs, .. } => {
-                for prog in progs {
+                for (c_idx, prog) in progs.iter().enumerate() {
                     let p_refs: Vec<&[f32]> =
                         prog.used_bands.iter().map(|&b| get_plane(b)).collect();
                     let mut vals = [0.0f32; 16];
                     let k = p_refs.len().min(16);
                     for i in 0..npix {
-                        if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                        if expr_rgb_masks[c_idx].as_ref().is_some_and(|m| !m[i]) {
                             out.put_slice(&f32::NAN.to_le_bytes());
                             continue;
                         }
@@ -5800,11 +5885,12 @@ async fn render_mixed_grid_bbox(
             ];
             let mut vals = [0.0f32; 16];
             for i in 0..npix {
-                if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
-                    continue;
-                }
                 let mut ch = [f32::NAN; 3];
                 for c in 0..3 {
+                    if expr_rgb_masks[c].as_ref().is_some_and(|m| !m[i]) {
+                        ch[c] = f32::NAN;
+                        break;
+                    }
                     let k = p_refs[c].len().min(16);
                     for j in 0..k {
                         vals[j] = p_refs[c][j][i];

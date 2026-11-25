@@ -1274,6 +1274,65 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mg_bl = f32::from_le_bytes(mg_bytes[bl_off..bl_off + 4].try_into().unwrap());
             assert!(mg_tr.is_nan(), "mixed-grid outside-polygon pixel must be NaN, got {mg_tr}");
             assert_eq!(mg_bl, 1.0, "mixed-grid inside-polygon pixel must be 1.0");
+
+            // Audit c78 regression checks:
+            // 1. Mixed-grid where(b2>=0,b2,0) must NOT clip b2 (sat_url) to cogs[0] (merc_url)'s footprint
+            let mg_b2 = client
+                .post(format!(
+                    "{base}/cog/feature/32x32.f32?url={merc_url}&url={sat_url}&expression=where(b2%3E=0,b2,0)"
+                ))
+                .header("content-type", "application/json")
+                .body(gc_poly.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mg_b2.status(), 200);
+            let mg_b2_bytes = mg_b2.bytes().await.unwrap();
+            let mg_b2_tr = f32::from_le_bytes(mg_b2_bytes[31 * 4..32 * 4].try_into().unwrap());
+            let mg_b2_bl = f32::from_le_bytes(mg_b2_bytes[bl_off..bl_off + 4].try_into().unwrap());
+            assert!(mg_b2_tr.is_nan(), "outside-polygon pixel must remain NaN, got {mg_b2_tr}");
+            assert!(mg_b2_bl.is_finite(), "b2 pixel inside sat_url must not be clipped to cogs[0], got {mg_b2_bl}");
+
+            // 2. /mosaic/tiles must skip an unreadable urls[0] and render urls[1]
+            let resil_resp = client
+                .get(format!(
+                    "{base}/mosaic/tiles/WebMercatorQuad/12/655/1583.png?url=/nonexistent_cogzilla_scene_0.tif&url={merc_url}&rescale=0,2500"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resil_resp.status(), 200, "mosaic tile must skip unreadable urls[0]");
+            let resil_bytes = resil_resp.bytes().await.unwrap();
+            assert_eq!(&resil_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // 3. GET /stac/statistics must preserve ?bidx=3,1 order
+            let bidx_stac_path = std::env::temp_dir().join(format!(
+                "cogzilla_stac_bidx_order_{}.json",
+                std::process::id()
+            ));
+            let bidx_stac = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "bidx-order",
+                "bbox": [-122.8, 37.6, -122.5, 37.9],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "visual": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                }
+            });
+            std::fs::write(&bidx_stac_path, bidx_stac.to_string()).unwrap();
+            let bidx_stats = get_json(
+                &client,
+                format!(
+                    "{base}/stac/statistics?url={}&assets=visual&bidx=3&bidx=1&max_size=64",
+                    bidx_stac_path.to_str().unwrap()
+                ),
+            )
+            .await;
+            assert_eq!(bidx_stats["b1"]["description"].as_str(), Some("visual_b3"));
+            assert_eq!(bidx_stats["b2"]["description"].as_str(), Some("visual_b1"));
+            let _ = std::fs::remove_file(&bidx_stac_path);
         }
     }
 }

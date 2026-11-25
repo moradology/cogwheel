@@ -2776,6 +2776,24 @@ where
     Ok(out.freeze())
 }
 
+/// Open the first readable scene in a mosaic candidate list so a single missing/corrupt scene at
+/// index 0 does not fail the entire mosaic tile when subsequent scenes are valid.
+async fn open_first_mosaic_cog(
+    engine: &TileEngine,
+    urls: &[String],
+) -> Result<Arc<cogzilla_io::OpenedCog>, EngineError> {
+    let mut last_err: Option<EngineError> = None;
+    for u in urls.iter().take(16) {
+        match engine.store.open_uri(u).await {
+            Ok(c) => return Ok(c),
+            Err(e) => last_err = Some(e.into()),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        EngineError::NotFound("mosaic contains no readable scenes".into())
+    }))
+}
+
 async fn open_query_urls(
     engine: &TileEngine,
     urls: &[String],
@@ -3808,7 +3826,7 @@ where
                             );
                             Ok((b, ct))
                         } else {
-                            let first_cog = engine.store.open_uri(&urls[0]).await?;
+                            let first_cog = open_first_mosaic_cog(&engine, &urls).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
@@ -3887,7 +3905,7 @@ where
                     let cached = engine
                         .tile_cache
                         .get_or_render(cache_key, || async {
-                            let first_cog = engine.store.open_uri(&pq.urls[0]).await?;
+                            let first_cog = open_first_mosaic_cog(&engine, &pq.urls).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
@@ -4000,7 +4018,7 @@ where
                             );
                             Ok((b, ct))
                         } else {
-                            let first_cog = engine.store.open_uri(&urls[0]).await?;
+                            let first_cog = open_first_mosaic_cog(&engine, &urls).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
                             let (treq, ct) = build_tile_request(
@@ -4486,6 +4504,9 @@ where
                     if let Some(obj) = st.as_object() {
                         let bands_iter: Vec<usize> = match stac_asset_selected_bands(&pq, name) {
                             Some(sel) => sel.iter().map(|&b| b as usize).collect(),
+                            None if !pq.bidx.is_empty() => {
+                                pq.bidx.iter().map(|&b| b as usize).collect()
+                            }
                             None => (1..=nb).collect(),
                         };
                         for i in bands_iter {
@@ -4525,6 +4546,7 @@ where
                     let nodata = pq.nodata;
                     let stats_opts = stats_opts_post.clone();
                     let asset_bidx_c = pq.asset_bidx.clone();
+                    let pq_bidx_c = pq.bidx.clone();
                     let n = names_c.len();
                     async move {
                         let mut set = tokio::task::JoinSet::new();
@@ -4569,6 +4591,9 @@ where
                                     .find(|(n, _)| n == name)
                                 {
                                     Some((_, sel)) => sel.iter().map(|&b| b as usize).collect(),
+                                    None if !pq_bidx_c.is_empty() => {
+                                        pq_bidx_c.iter().map(|&b| b as usize).collect()
+                                    }
                                     None => (1..=nb).collect(),
                                 };
                                 for b in bands_iter {

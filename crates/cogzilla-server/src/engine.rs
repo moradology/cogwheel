@@ -1703,6 +1703,8 @@ impl TileEngine {
             scene_req.format = OutputFormat::RawF32;
             let empty_f32_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
 
+            let mut opened_any = false;
+            let mut last_open_err: Option<EngineError> = None;
             for (scene_i, url) in urls.iter().enumerate() {
                 if filled >= total_pixels {
                     break;
@@ -1710,7 +1712,16 @@ impl TileEngine {
                 if scene_i > 0 {
                     tokio::task::consume_budget().await;
                 }
-                let cog = self.store.open_uri(url).await?;
+                let cog = match self.store.open_uri(url).await {
+                    Ok(c) => {
+                        opened_any = true;
+                        c
+                    }
+                    Err(e) => {
+                        last_open_err = Some(e.into());
+                        continue;
+                    }
+                };
                 let src = self.render_tile(&cog, &scene_req).await?;
                 if src.len() != f32_bands * total_pixels * 4
                     || src.as_ptr() == empty_f32_sentinel.as_ptr()
@@ -1747,6 +1758,11 @@ impl TileEngine {
             }
 
             if filled == 0 {
+                if !opened_any
+                    && let Some(err) = last_open_err
+                {
+                    return Err(err);
+                }
                 return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
             }
             let hdr = if req.format == OutputFormat::Npy {
@@ -1776,6 +1792,8 @@ impl TileEngine {
         base_scene_req.format = OutputFormat::RawRgba;
         let empty_rgba_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawRgba, 1);
 
+        let mut opened_any = false;
+        let mut last_open_err: Option<EngineError> = None;
         for (scene_i, url) in urls.iter().enumerate() {
             if filled >= total_pixels {
                 break;
@@ -1783,7 +1801,16 @@ impl TileEngine {
             if scene_i > 0 {
                 tokio::task::consume_budget().await;
             }
-            let cog = self.store.open_uri(url).await?;
+            let cog = match self.store.open_uri(url).await {
+                Ok(c) => {
+                    opened_any = true;
+                    c
+                }
+                Err(e) => {
+                    last_open_err = Some(e.into());
+                    continue;
+                }
+            };
             let scene_req = fold_scene_unscale(&cog, &base_scene_req);
             let src = self.render_tile(&cog, &scene_req).await?;
             if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
@@ -1804,6 +1831,11 @@ impl TileEngine {
         }
 
         if filled == 0 && canvas.chunks_exact(4).all(|p| p[3] == 0) {
+            if !opened_any
+                && let Some(err) = last_open_err
+            {
+                return Err(err);
+            }
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
         Ok(encode_rgba_tile(
