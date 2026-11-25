@@ -633,6 +633,15 @@ def main() -> int:
             [lon - 0.1, lat - 0.05], [lon + 0.1, lat - 0.05], [lon, lat + 0.05], [lon - 0.1, lat - 0.05]]]}}
         o.check("bbox, max_size", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=256")
         o.check("bbox, exact size", "image", f"/searches/{sid}/bbox/{part}/300x200.png?assets=visual")
+        # In Web Mercator: drawn in it, given in it, and given in it but drawn in degrees.
+        (west, south), (east, north) = [mercantile.xy(lon + dx, lat + dy) for dx, dy in ((-0.1, -0.05), (0.1, 0.05))]
+        metres = f"{west:.1f},{south:.1f},{east:.1f},{north:.1f}"
+        o.check("bbox drawn in Web Mercator", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=256&dst_crs=epsg:3857")
+        o.check("bbox given in Web Mercator", "image", f"/searches/{sid}/bbox/{metres}.png?assets=visual&max_size=256&coord_crs=epsg:3857")
+        o.check("bbox given in Web Mercator, drawn in degrees", "image",
+                f"/searches/{sid}/bbox/{metres}/300x200.png?assets=visual&coord_crs=epsg:3857&dst_crs=epsg:4326")
+        o.check("bbox drawn in a system that is not supported", "status", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=64&dst_crs=epsg:32632",
+                known="projections other than degrees and Web Mercator are left out for now; cogzilla answers 400")
         o.check("bbox, tif", "image", f"/searches/{sid}/bbox/{part}/300x200.tif?assets=visual")
         o.check("bbox, width only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&width=300")
         o.check("bbox, height only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&height=90")

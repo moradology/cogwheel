@@ -300,7 +300,17 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("bbox/6,44,8,46.png", 422),
         ("bbox/6,44,8,46?assets=visual", 422),
         ("bbox/6,44,8,46.png?assets=visual&width=wide", 422),
-        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:3857", 400),
+        // Web Mercator is drawn, given or both; another system is not, nor Web Mercator
+        // with a resampling other than nearest.
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:3857", 204),
+        ("bbox/667916,5465442,890555,5780349.png?assets=visual&coord_crs=epsg:3857", 204),
+        ("bbox/667916,5465442,890555,5780349.png?assets=visual&coord_crs=epsg:3857&dst_crs=epsg:4326", 204),
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=urn:ogc:def:crs:EPSG::3857", 204),
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=EPSG:4326", 204),
+        ("bbox/6,80,8,88.png?assets=visual&dst_crs=epsg:3857", 400),
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:32632", 400),
+        ("bbox/6,44,8,46.png?assets=visual&coord_crs=epsg:32632", 400),
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:3857&resampling=bilinear", 400),
         ("bbox/6,44,8,46.npy?assets=visual", 400),
         ("bbox/6,44,8.png?assets=visual", 404),
         ("feature.png?assets=visual", 405),
