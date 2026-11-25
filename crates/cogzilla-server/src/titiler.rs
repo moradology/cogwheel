@@ -4732,6 +4732,23 @@ async fn render_bbox_impl(
             (rx, ry)
         };
         let (mut target_rx, mut target_ry) = probe_res(cx, cy);
+        if let cogzilla_proj::CrsModel::PolarStereographic(ps) = &crs {
+            let pole_py = if ps.south {
+                bbox[1] + 0.01 * (bbox[3] - bbox[1])
+            } else {
+                bbox[1] + 0.99 * (bbox[3] - bbox[1])
+            };
+            let (prx, pry) = probe_res(cx, pole_py);
+            if prx.is_finite() && pry.is_finite() && prx > 0.0 && pry > 0.0 {
+                if target_rx.is_finite() && target_ry.is_finite() && target_rx > 0.0 && target_ry > 0.0 {
+                    target_rx = target_rx.min(prx);
+                    target_ry = target_ry.min(pry);
+                } else {
+                    target_rx = prx;
+                    target_ry = pry;
+                }
+            }
+        }
         if !target_rx.is_finite() || !target_ry.is_finite() {
             let full = primary.index.full_res();
             let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
