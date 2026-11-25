@@ -3596,6 +3596,164 @@ impl PolygonMask {
         }
         false
     }
+
+    /// Rasterize the polygon onto a `(w, h)` grid covering `bbox` in `dst_crs` using GDAL's
+    /// `ALL_TOUCHED=TRUE` semantics: a pixel is `true` if its center is inside the polygon OR
+    /// any polygon ring edge intersects the pixel cell `[px, px+1] x [py, py+1]`.
+    pub fn rasterize_all_touched(
+        &self,
+        w: usize,
+        h: usize,
+        bbox: [f64; 4],
+        dst_crs: &cogzilla_proj::CrsModel,
+    ) -> Vec<bool> {
+        let mut mask = vec![false; w * h];
+        let dlx = (bbox[2] - bbox[0]) / (w.max(1) as f64);
+        let dly = (bbox[3] - bbox[1]) / (h.max(1) as f64);
+        if dlx <= 0.0 || dly <= 0.0 {
+            return mask;
+        }
+        for py in 0..h {
+            let y = bbox[3] - (py as f64 + 0.5) * dly;
+            let row_off = py * w;
+            for px in 0..w {
+                let x = bbox[0] + (px as f64 + 0.5) * dlx;
+                let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
+                if lon.is_finite() && lat.is_finite() && self.contains(lon, lat) {
+                    mask[row_off + px] = true;
+                }
+            }
+        }
+        let mut mark_segment = |ax: f64, ay: f64, bx: f64, by: f64| {
+            let x0 = (ax - bbox[0]) / dlx;
+            let y0 = (bbox[3] - ay) / dly;
+            let x1 = (bx - bbox[0]) / dlx;
+            let y1 = (bbox[3] - by) / dly;
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                return;
+            }
+            let dx = x1 - x0;
+            let dy = y1 - y0;
+            let mut t0 = 0.0f64;
+            let mut t1 = 1.0f64;
+            for (p, q) in [
+                (-dx, x0),
+                (dx, w as f64 - x0),
+                (-dy, y0),
+                (dy, h as f64 - y0),
+            ] {
+                if p.abs() < 1e-15 {
+                    if q < 0.0 {
+                        return;
+                    }
+                } else {
+                    let r = q / p;
+                    if p < 0.0 {
+                        if r > t1 {
+                            return;
+                        }
+                        if r > t0 {
+                            t0 = r;
+                        }
+                    } else {
+                        if r < t0 {
+                            return;
+                        }
+                        if r < t1 {
+                            t1 = r;
+                        }
+                    }
+                }
+            }
+            let sx = x0 + t0 * dx;
+            let sy = y0 + t0 * dy;
+            let ex = x0 + t1 * dx;
+            let ey = y0 + t1 * dy;
+            let mut ix = (sx.floor() as isize).clamp(0, w as isize - 1);
+            let mut iy = (sy.floor() as isize).clamp(0, h as isize - 1);
+            let end_x = (ex.floor() as isize).clamp(0, w as isize - 1);
+            let end_y = (ey.floor() as isize).clamp(0, h as isize - 1);
+            mask[iy as usize * w + ix as usize] = true;
+            let sdx = ex - sx;
+            let sdy = ey - sy;
+            let step_x: isize = if sdx > 0.0 {
+                1
+            } else if sdx < 0.0 {
+                -1
+            } else {
+                0
+            };
+            let step_y: isize = if sdy > 0.0 {
+                1
+            } else if sdy < 0.0 {
+                -1
+            } else {
+                0
+            };
+            let mut t_max_x = if step_x > 0 {
+                ((ix + 1) as f64 - sx) / sdx
+            } else if step_x < 0 {
+                (ix as f64 - sx) / sdx
+            } else {
+                f64::INFINITY
+            };
+            let mut t_max_y = if step_y > 0 {
+                ((iy + 1) as f64 - sy) / sdy
+            } else if step_y < 0 {
+                (iy as f64 - sy) / sdy
+            } else {
+                f64::INFINITY
+            };
+            let t_delta_x = if step_x != 0 {
+                (1.0 / sdx).abs()
+            } else {
+                f64::INFINITY
+            };
+            let t_delta_y = if step_y != 0 {
+                (1.0 / sdy).abs()
+            } else {
+                f64::INFINITY
+            };
+            let max_steps = (w + h) * 2 + 4;
+            for _ in 0..max_steps {
+                if ix == end_x && iy == end_y {
+                    break;
+                }
+                if t_max_x < t_max_y {
+                    ix += step_x;
+                    t_max_x += t_delta_x;
+                } else if t_max_y < t_max_x {
+                    iy += step_y;
+                    t_max_y += t_delta_y;
+                } else {
+                    ix += step_x;
+                    iy += step_y;
+                    t_max_x += t_delta_x;
+                    t_max_y += t_delta_y;
+                }
+                if ix < 0 || ix >= w as isize || iy < 0 || iy >= h as isize {
+                    break;
+                }
+                mask[iy as usize * w + ix as usize] = true;
+            }
+        };
+        for poly in &self.polygons {
+            for ring in poly {
+                let n = ring.len();
+                if n < 2 {
+                    continue;
+                }
+                for i in 0..n {
+                    let (lon0, lat0) = ring[i];
+                    let (lon1, lat1) = ring[(i + 1) % n];
+                    let (ax, ay) = dst_crs.from_lonlat_deg(lon0, lat0);
+                    let (bx, by) = dst_crs.from_lonlat_deg(lon1, lat1);
+                    mark_segment(ax, ay, bx, by);
+                }
+            }
+        }
+        mask
+    }
 }
 
 /// Encode an RGBA8 buffer to the requested `OutputFormat`, optionally stripping the alpha mask.
@@ -4062,6 +4220,9 @@ async fn render_bbox_impl(
         let ifd_height = ifd.height;
         let poly_mask = poly_mask.cloned();
         move || {
+            let touched_mask: Option<Vec<bool>> = poly_mask
+                .as_ref()
+                .map(|pm| pm.rasterize_all_touched(w, h, bbox, &dst_crs));
             let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
                 let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
@@ -4085,14 +4246,6 @@ async fn render_bbox_impl(
                     sx += 360.0;
                 }
                 (sx, sy)
-            };
-            let to_wgs84 = |x: f64, y: f64| -> (f64, f64) {
-                if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) {
-                    let lon = if x > 180.0 { x - 360.0 } else { x };
-                    (lon, y)
-                } else {
-                    dst_crs.to_lonlat_deg(x, y)
-                }
             };
             let mut u_map = vec![f32::NAN; w * h];
             let mut v_map = vec![f32::NAN; w * h];
@@ -4211,11 +4364,9 @@ async fn render_bbox_impl(
                             let dv = (vr - vl) * inv_dx;
                             let mut u_cur = ul + 0.5 * du;
                             let mut v_cur = vl + 0.5 * dv;
-                            if let Some(ref pm) = poly_mask {
+                            if let Some(ref tm) = touched_mask {
                                 for px in x0..x1 {
-                                    let x_c = bbox[0] + (px as f64 + 0.5) * dlx;
-                                    let (plon, plat) = to_wgs84(x_c, lat);
-                                    if pm.contains(plon, plat) {
+                                    if tm[row_off + px] {
                                         let uu = u_cur as f32;
                                         let vv = v_cur as f32;
                                         if uu >= -1.0
@@ -4257,9 +4408,8 @@ async fn render_bbox_impl(
                         } else {
                             for px in x0..x1 {
                                 let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                                if let Some(ref pm) = poly_mask {
-                                    let (plon, plat) = to_wgs84(lon, lat);
-                                    if !pm.contains(plon, plat) {
+                                if let Some(ref tm) = touched_mask {
+                                    if !tm[row_off + px] {
                                         continue;
                                     }
                                 }
@@ -4984,11 +5134,35 @@ async fn render_bbox_impl(
             return raw;
         }
 
+        let cf_single_lut: Option<[u8; 256]> = if matches!(
+            bands,
+            BandRequest::Single { .. }
+                | BandRequest::Dem { .. }
+                | BandRequest::CustomExpr { .. }
+                | BandRequest::Spectral1 { .. }
+                | BandRequest::Spectral2 { .. }
+                | BandRequest::Spectral3 { .. }
+        ) {
+            color_formula.map(|cf| {
+                let mut t = [0u8; 256];
+                for i in 0..256 {
+                    let mut px = [i as u8, i as u8, i as u8, 255];
+                    cf.apply_buffer_in_place(&mut px, 4);
+                    t[i] = px[0];
+                }
+                t
+            })
+        } else {
+            None
+        };
         let map_color = |v: f32, rmin: f32, inv: f32, default_cmap: ColormapName| -> [u8; 4] {
             if let Some(cmap) = custom_lut {
                 cmap.lookup(v, rmin, inv)
             } else {
-                let idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+                let mut idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+                if let Some(ref cf_lut) = cf_single_lut {
+                    idx = cf_lut[idx] as usize;
+                }
                 default_cmap.lut().rgba_u32[idx].to_le_bytes()
             }
         };
@@ -5292,7 +5466,9 @@ async fn render_bbox_impl(
             }
         }
 
-        if let Some(cf) = color_formula {
+        if cf_single_lut.is_none()
+            && let Some(cf) = color_formula
+        {
             cf.apply_buffer_in_place(&mut rgba, 4);
         }
 
@@ -5801,11 +5977,35 @@ async fn render_mixed_grid_bbox(
         return Ok(raw);
     }
 
+    let cf_single_lut: Option<[u8; 256]> = if matches!(
+        bands,
+        BandRequest::Single { .. }
+            | BandRequest::Dem { .. }
+            | BandRequest::CustomExpr { .. }
+            | BandRequest::Spectral1 { .. }
+            | BandRequest::Spectral2 { .. }
+            | BandRequest::Spectral3 { .. }
+    ) {
+        color_formula.map(|cf| {
+            let mut t = [0u8; 256];
+            for i in 0..256 {
+                let mut px = [i as u8, i as u8, i as u8, 255];
+                cf.apply_buffer_in_place(&mut px, 4);
+                t[i] = px[0];
+            }
+            t
+        })
+    } else {
+        None
+    };
     let map_color = |v: f32, rmin: f32, inv: f32, default_cmap: ColormapName| -> [u8; 4] {
         if let Some(cmap) = custom_lut {
             cmap.lookup(v, rmin, inv)
         } else {
-            let idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+            let mut idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+            if let Some(ref cf_lut) = cf_single_lut {
+                idx = cf_lut[idx] as usize;
+            }
             let [r, g, b] = default_cmap.lut().rgb[idx];
             [r, g, b, 255]
         }
@@ -5996,7 +6196,9 @@ async fn render_mixed_grid_bbox(
             }
         }
     }
-    if let Some(cf) = color_formula {
+    if cf_single_lut.is_none()
+        && let Some(cf) = color_formula
+    {
         cf.apply_buffer_in_place(&mut rgba, 4);
     }
     Ok(encode_rgba_output(w, h, &rgba, format, return_mask))
