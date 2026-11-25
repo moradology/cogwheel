@@ -571,6 +571,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                         5 => Compression::Lzw,
                         7 => Compression::Jpeg,
                         8 | 32946 => Compression::Deflate,
+                        32773 => Compression::PackBits,
                         50000 => Compression::Zstd,
                         50001 => Compression::Webp,
                         other => return Err(TiffError::UnsupportedCompression(other)),
@@ -998,19 +999,21 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
     }
 
     let n_bands = ifds[0].samples_per_pixel as usize;
-    let mut scales = vec![1.0f32; n_bands];
-    let mut offsets = vec![0.0f32; n_bands];
+    let mut scales_f64 = vec![1.0f64; n_bands];
+    let mut offsets_f64 = vec![0.0f64; n_bands];
     let mut band_metadata: Vec<Vec<(String, String)>> = vec![Vec::new(); n_bands];
     let mut band_descriptions: Vec<String> = vec![String::new(); n_bands];
     if let Some(xml) = &gdal_metadata_xml {
         parse_gdal_metadata(
             xml,
-            &mut scales,
-            &mut offsets,
+            &mut scales_f64,
+            &mut offsets_f64,
             &mut band_metadata,
             &mut band_descriptions,
         );
     }
+    let scales: Vec<f32> = scales_f64.iter().map(|&v| v as f32).collect();
+    let offsets: Vec<f32> = offsets_f64.iter().map(|&v| v as f32).collect();
 
     Ok(CogIndex {
         byte_order: bo,
@@ -1018,6 +1021,8 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         nodata,
         scales,
         offsets,
+        scales_f64,
+        offsets_f64,
         band_metadata,
         band_descriptions,
         color_map,
@@ -1030,8 +1035,8 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
 /// inside TIFF tag 42112 (`GDAL_METADATA`).
 fn parse_gdal_metadata(
     xml: &str,
-    scales: &mut [f32],
-    offsets: &mut [f32],
+    scales: &mut [f64],
+    offsets: &mut [f64],
     band_metadata: &mut [Vec<(String, String)>],
     band_descriptions: &mut [String],
 ) {
@@ -1078,7 +1083,7 @@ fn parse_gdal_metadata(
         let is_scale = name.eq_ignore_ascii_case("SCALE");
         let is_offset = name.eq_ignore_ascii_case("OFFSET");
         if is_scale || is_offset {
-            if let Ok(v) = val_str.parse::<f32>()
+            if let Ok(v) = val_str.parse::<f64>()
                 && v.is_finite()
                 && (!is_scale || v != 0.0)
             {
@@ -1126,7 +1131,7 @@ fn parse_gdal_metadata(
 }
 
 #[cfg(test)]
-fn parse_gdal_scale_offset(xml: &str, scales: &mut [f32], offsets: &mut [f32]) {
+fn parse_gdal_scale_offset(xml: &str, scales: &mut [f64], offsets: &mut [f64]) {
     let mut meta = vec![Vec::new(); scales.len()];
     let mut desc = vec![String::new(); scales.len()];
     parse_gdal_metadata(xml, scales, offsets, &mut meta, &mut desc);
@@ -1145,8 +1150,8 @@ mod tests {
             <Item name="SCALE" sample="0" domain="xml:ESRI">999.0</Item>
             <Item name="SCALE" sample="1">0.0</Item>
         </GDALMetadata>"#;
-        let mut scales = [1.0f32; 2];
-        let mut offsets = [0.0f32; 2];
+        let mut scales = [1.0f64; 2];
+        let mut offsets = [0.0f64; 2];
         parse_gdal_scale_offset(xml, &mut scales, &mut offsets);
         assert!((scales[0] - 0.0001).abs() < 1e-7);
         assert!((offsets[0] + 0.2).abs() < 1e-6);
