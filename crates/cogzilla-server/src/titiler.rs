@@ -2893,17 +2893,23 @@ pub async fn compute_statistics_with_options(
     }
     let crs = engine.get_or_build_crs(cog)?;
     let max_size = max_size.max(1);
-    let (ifd_idx, step, sample_dims, total_pixels) = if let Some(pm) = poly_mask {
+    let (ifd_idx, step, sample_dims, total_pixels, poly_win_pixels) = if let Some(pm) = poly_mask {
         let mut idx = cog.index.ifds.len() - 1;
-        let mut win_max_dim = cog.index.ifds[idx].width.max(cog.index.ifds[idx].height);
+        let mut win_w = cog.index.ifds[idx].width;
+        let mut win_h = cog.index.ifds[idx].height;
+        let mut win_max_dim = win_w.max(win_h);
         for (i, ifd) in cog.index.ifds.iter().enumerate() {
             let (ww, wh) = polygon_window_dims(ifd, &crs, pm.bbox);
             let dim = ww.max(wh);
             if dim <= max_size {
                 idx = i;
+                win_w = ww;
+                win_h = wh;
                 win_max_dim = dim;
                 break;
             }
+            win_w = ww;
+            win_h = wh;
             win_max_dim = dim;
         }
         let ifd = &cog.index.ifds[idx];
@@ -2913,7 +2919,9 @@ pub async fn compute_statistics_with_options(
         } else {
             (ifd.width as usize) * (ifd.height as usize)
         };
-        (idx, step, None, total)
+        let est_w = (win_w.saturating_add(ifd.tile_width).min(ifd.width) as usize).div_ceil(step);
+        let est_h = (win_h.saturating_add(ifd.tile_height).min(ifd.height) as usize).div_ceil(step);
+        (idx, step, None, total, est_w.saturating_mul(est_h))
     } else {
         // Unmasked full-image statistics: match rio-tiler's exact `max_size` target dimensions
         // and select the coarsest IFD that is >= target dimensions (falling back to IFD 0).
@@ -2943,7 +2951,7 @@ pub async fn compute_statistics_with_options(
         } else {
             Some((out_w, out_h))
         };
-        (idx, 1usize, dims, out_w * out_h)
+        (idx, 1usize, dims, out_w * out_h, 0usize)
     };
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
@@ -2992,7 +3000,7 @@ pub async fn compute_statistics_with_options(
 
     let (tile_masks, mask_total_pixels): (Option<Vec<Option<Vec<u8>>>>, usize) =
         if let Some(pm) = poly_mask {
-            pm.check_work_budget(total_pixels)?;
+            pm.check_work_budget(poly_win_pixels)?;
             if n_tiles > MAX_STATS_MASK_TILES {
                 return Err(EngineError::BadRequest(format!(
                     "statistics IFD tile count ({n_tiles}) exceeds polygon mask limit ({MAX_STATS_MASK_TILES})"
@@ -3006,6 +3014,7 @@ pub async fn compute_statistics_with_options(
                     let mut masks = Vec::with_capacity(n_tiles);
                     let mut inside_total = 0usize;
                     let mut active_blocks = 0usize;
+                    let mut tested_pixels = 0usize;
                     for ty in 0..ifd.tiles_down {
                         for tx in 0..ifd.tiles_across {
                             let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
@@ -3041,6 +3050,13 @@ pub async fn compute_statistics_with_options(
                                         "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
                                     )));
                                 }
+                                let tile_px = if step > 1 {
+                                    x_max.div_ceil(step).saturating_mul(y_max.div_ceil(step))
+                                } else {
+                                    x_max.saturating_mul(y_max)
+                                };
+                                tested_pixels = tested_pixels.saturating_add(tile_px);
+                                pm.check_work_budget(tested_pixels)?;
                                 inside_total += inside;
                                 masks.push(Some(bits));
                             } else {
