@@ -375,6 +375,24 @@ def main():
             ("GET /cog/point?expression=where(b1>b2,1,0)", "GET", f"/cog/point/-122.65,37.773?url={sat}&expression=where(b1>b2,1,0)", None, "json_point"),
             ("GET /cog/statistics?max_size=512", "GET", f"/cog/statistics?url={sat}&max_size=512", None, "json_stats"),
             ("GET /cog/statistics?p=10&p=90&histogram_bins=10", "GET", f"/cog/statistics?url={sat}&max_size=256&p=10&p=90&histogram_bins=10", None, "json_stats_ext"),
+            ("GET /cog/statistics?histogram_bins=0,50,100,150,256", "GET", f"/cog/statistics?url={u8_path}&histogram_bins=0,50,100,150,256", None, "json_stats_hist"),
+            ("POST /cog/statistics?width=64&height=64", "POST", f"/cog/statistics?url={sat}&width=64&height=64", poly_feature, "json_post_stats"),
+            ("POST /cog/statistics (LineString)", "POST", f"/cog/statistics?url={sat}", {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-122.75, 37.65], [-122.55, 37.85]]
+                },
+                "properties": {}
+            }, "json_post_stats"),
+            ("POST /cog/statistics (Point)", "POST", f"/cog/statistics?url={sat}", {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [-122.65, 37.773]
+                },
+                "properties": {}
+            }, "json_post_stats"),
             ("GET /cog/statistics?bidx=3&bidx=1", "GET", f"/cog/statistics?url={sat}&max_size=256&bidx=3&bidx=1", None, "json_stats_keys"),
             ("GET /cog/statistics?categorical=true (uint8)", "GET", f"/cog/statistics?url={u8_path}&max_size=64&categorical=true", None, "json_stats_cat"),
             ("GET /cog/statistics?categorical=true&c=10&c=20", "GET", f"/cog/statistics?url={u8_path}&max_size=64&categorical=true&c=10&c=20", None, "json_stats_cat"),
@@ -578,6 +596,16 @@ def main():
                         bins_ok = len(j_cw["histogram"][0]) == len(j_tt["histogram"][0]) == 10
                         ok = bins_ok and p10_err < 0.05 and p90_err < 0.05
                         parity = f"p10_err={p10_err:.4f} p90_err={p90_err:.4f} bins={len(j_cw['histogram'][0])}"
+                    elif kind == "json_stats_hist":
+                        j_cw, j_tt = r_cw.json()["b1"], r_tt.json()["b1"]
+                        edges_cw, edges_tt = j_cw["histogram"][1], j_tt["histogram"][1]
+                        counts_cw, counts_tt = j_cw["histogram"][0], j_tt["histogram"][0]
+                        ok = (
+                            len(edges_cw) == len(edges_tt)
+                            and all(abs(a - b) < 1e-6 for a, b in zip(edges_cw, edges_tt))
+                            and counts_cw == counts_tt
+                        )
+                        parity = f"edges={edges_cw} counts cw={counts_cw} vs tt={counts_tt}"
                     elif kind == "json_stats_keys":
                         j_cw, j_tt = r_cw.json(), r_tt.json()
                         ok = set(j_cw.keys()) == set(j_tt.keys())
