@@ -15,10 +15,44 @@ use cogzilla_proj::{
 };
 use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
 use dashmap::DashMap;
+use futures_util::stream::{FuturesOrdered, StreamExt};
 use thiserror::Error;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog};
 use crate::tile_cache::TileCache;
+
+/// The most scenes of a mosaic that are read at once.
+pub const MOSAIC_SCENES_AHEAD: usize = 8;
+
+/// A mosaic's scenes, rendered in order with some read ahead of the one being waited for.
+/// Dropping it drops the scenes still being read.
+struct ScenesInOrder<'a> {
+    engine: &'a TileEngine,
+    scenes: &'a [Vec<String>],
+    base: &'a TileRequest,
+    unscale: bool,
+    next: usize,
+    window: usize,
+    reading: FuturesOrdered<SceneRead<'a>>,
+}
+
+/// One scene of a mosaic on its way.
+type SceneRead<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, EngineError>> + Send + 'a>>;
+
+impl<'a> ScenesInOrder<'a> {
+    /// The next scene in order, or `None` after the last.
+    async fn next(&mut self) -> Option<Result<Bytes, EngineError>> {
+        while self.reading.len() < self.window && self.next < self.scenes.len() {
+            let scene = &self.scenes[self.next];
+            self.reading.push_back(Box::pin(self.engine.render_mosaic_scene(scene, self.base, self.unscale)));
+            self.next += 1;
+        }
+        let scene = self.reading.next().await;
+        // Being asked again means the tile is not full yet: read twice as many at once.
+        self.window = (self.window * 2).min(MOSAIC_SCENES_AHEAD);
+        scene
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -1645,8 +1679,10 @@ impl TileEngine {
 
     /// Render a dynamic front-to-back mosaic across `urls` with **early-exit pixel coverage**:
     /// walks scenes in priority order, composites only into unfilled (`alpha == 0`) pixels, and
-    /// stops immediately once all `tile_size * tile_size` pixels are opaque — never opening,
-    /// fetching, or decoding remaining background scenes!
+    /// stops once all `tile_size * tile_size` pixels are opaque. The first scene is read
+    /// alone, so a tile it fills opens nothing else; after it, scenes are read a few at a
+    /// time (see [`Self::render_mosaic_scenes_ahead`]), so at most that few are opened beyond
+    /// the one that fills the tile.
     pub async fn render_mosaic_tile(
         &self,
         urls: &[String],
@@ -1688,6 +1724,82 @@ impl TileEngine {
         Ok(slots.into_iter().flatten().collect())
     }
 
+    /// One scene of a mosaic, as the tile `base` asks for.
+    async fn render_mosaic_scene(
+        &self,
+        scene: &[String],
+        base: &TileRequest,
+        unscale: bool,
+    ) -> Result<Bytes, EngineError> {
+        let cogs = self.open_scene(scene).await?;
+        let cog = &cogs[0];
+        // Fold each scene's own GDAL scale/offset into Single/Rgb rescale bounds when
+        // `?unscale=true` so heterogeneous mosaic scenes unscale accurately at zero per-pixel cost.
+        // Band indices address one file, so this applies to single-asset scenes only.
+        let scene_req = if unscale
+            && cogs.len() == 1
+            && matches!(
+                base.bands,
+                BandRequest::Single { .. } | BandRequest::Rgb { .. }
+            ) {
+            let mut sr = base.clone();
+            let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+                let i = b1.saturating_sub(1) as usize;
+                let sc = cog.index.scales.get(i).copied().unwrap_or(1.0);
+                let off = cog.index.offsets.get(i).copied().unwrap_or(0.0);
+                if ((sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9) || sc.abs() < 1e-12 {
+                    (mn, mx)
+                } else {
+                    ((mn - off) / sc, (mx - off) / sc)
+                }
+            };
+            match &mut sr.bands {
+                BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    ..
+                } => {
+                    *rescale = adj(*band_1based, rescale.0, rescale.1);
+                }
+                BandRequest::Rgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } => {
+                    for k in 0..3 {
+                        let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                        rescale_min[k] = mn;
+                        rescale_max[k] = mx;
+                    }
+                }
+                _ => {}
+            }
+            sr
+        } else {
+            base.clone()
+        };
+        self.render_multi_cog_tile(&cogs, &scene_req).await
+    }
+
+    /// The scenes of a mosaic rendered in order, up to a growing number of them at once.
+    fn mosaic_scenes_in_order<'a>(
+        &'a self,
+        scenes: &'a [Vec<String>],
+        base: &'a TileRequest,
+        unscale: bool,
+        ahead: usize,
+    ) -> ScenesInOrder<'a> {
+        ScenesInOrder {
+            engine: self,
+            scenes,
+            base,
+            unscale,
+            next: 0,
+            window: ahead.clamp(1, MOSAIC_SCENES_AHEAD),
+            reading: FuturesOrdered::new(),
+        }
+    }
+
     /// The mosaic behind [`Self::render_mosaic_tile`], over scenes that are each one asset or
     /// two to three co-registered single-band assets (rendered as one multi-asset composite).
     /// The caller bounds how many scenes it passes.
@@ -1695,6 +1807,24 @@ impl TileEngine {
         &self,
         scenes: &[Vec<String>],
         req: &TileRequest,
+    ) -> Result<Bytes, EngineError> {
+        self.render_mosaic_scenes_ahead(scenes, req, 1).await
+    }
+
+    /// [`Self::render_mosaic_scenes`], reading up to `ahead` scenes at once from the start.
+    ///
+    /// Scenes are always composited in order, and a tile's answer does not depend on
+    /// `ahead`. What it changes is the wait: a scene is mostly time spent on its storage,
+    /// and scenes read one after another add those waits up. With `ahead` of one, the first
+    /// scene is read alone, so a tile it fills opens nothing else, and each scene that
+    /// does not fill the tile doubles how many are read at once, up to
+    /// [`MOSAIC_SCENES_AHEAD`]. A caller whose list is already only the scenes that add to
+    /// the tile (pgSTAC's, chosen by footprint) passes the limit and reads them together.
+    pub async fn render_mosaic_scenes_ahead(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        ahead: usize,
     ) -> Result<Bytes, EngineError> {
         if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
             return Err(EngineError::BadRequest(
@@ -1774,15 +1904,12 @@ impl TileEngine {
             scene_req.format = OutputFormat::RawF32;
             let empty_f32_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
 
-            for (scene_i, url) in urls.iter().enumerate() {
-                if filled >= total_pixels {
+            let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, ahead);
+            while filled < total_pixels {
+                let Some(src) = reading.next().await else {
                     break;
-                }
-                if scene_i > 0 {
-                    tokio::task::consume_budget().await;
-                }
-                let cog = self.store.open_uri(url).await?;
-                let src = self.render_tile(&cog, &scene_req).await?;
+                };
+                let src = src?;
                 if src.len() != f32_bands * total_pixels * 4
                     || src.as_ptr() == empty_f32_sentinel.as_ptr()
                 {
@@ -1847,16 +1974,12 @@ impl TileEngine {
         base_scene_req.format = OutputFormat::RawRgba;
         let empty_rgba_sentinel = empty_tile_bytes(req.tile_size, OutputFormat::RawRgba, 1);
 
-        for (scene_i, url) in urls.iter().enumerate() {
-            if filled >= total_pixels {
+        let mut reading = self.mosaic_scenes_in_order(scenes, &base_scene_req, req.unscale, ahead);
+        while filled < total_pixels {
+            let Some(src) = reading.next().await else {
                 break;
-            }
-            if scene_i > 0 {
-                tokio::task::consume_budget().await;
-            }
-            let cog = self.store.open_uri(url).await?;
-            let scene_req = fold_scene_unscale(&cog, &base_scene_req);
-            let src = self.render_tile(&cog, &scene_req).await?;
+            };
+            let src = src?;
             if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
                 continue;
             }
