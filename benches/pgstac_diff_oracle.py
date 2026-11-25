@@ -714,6 +714,9 @@ def main() -> int:
         o.check("collection bbox", "image", f"/collections/{collection}/bbox/{part}.png?assets=visual&max_size=256")
         o.check("feature, max_size", "image", f"/searches/{sid}/feature.png?assets=visual&max_size=256", "POST", triangle)
         o.check("feature, exact size", "image", f"/searches/{sid}/feature/200x100.png?assets=visual", "POST", triangle)
+        dot = {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": triangle["geometry"]["coordinates"][0][0]}}
+        o.check("feature, a point", "status", f"/searches/{sid}/feature.png?assets=visual&max_size=64", "POST", dot)
+        o.check("feature, a point, exact size", "status", f"/searches/{sid}/feature/64x64.png?assets=visual", "POST", dot)
         # Arrays keep the data's type and carry the mask as a band of their own.
         o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)
         o.check("feature as an array, 16-bit", "image", f"/searches/{sid}/feature/120x80.npy?assets=red", "POST", triangle)
@@ -859,6 +862,8 @@ def main() -> int:
         o.check("tile, pixel_selection and a colour formula", "image",
                 f"{base12}.png?assets=visual&pixel_selection=mean&color_formula={opt('gamma rgb 1.8')}{every}")
         o.check("tile, a colour formula", "image", f"{base12}.png?assets=visual&color_formula={opt('gamma rgb 1.8')}")
+        o.check("tile, a colour map's name where a map goes", "status", f"{base12}.png?assets=red&rescale=0,3000&colormap=viridis")
+        o.check("tile, a colour map nobody has", "status", f"{base12}.png?assets=red&rescale=0,3000&colormap_name=nope")
         # One band: the formula is on the band's byte, and the colour map is looked up after.
         o.check("tile, a colour formula under a colour map", "image",
                 f"{base12}.png?assets=red&rescale=0,3000&colormap_name=viridis&color_formula={opt('gamma R 1.5')}")

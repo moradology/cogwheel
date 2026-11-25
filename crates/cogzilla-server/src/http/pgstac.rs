@@ -1628,6 +1628,25 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.assets.is_empty() {
         return Err(missing_query_param("assets"));
     }
+    // `colormap` is a map written out, never a name; a name nobody has is FastAPI's to refuse.
+    if let Some(map) = query_value(pairs, "colormap")
+        && !map.trim_start().starts_with(['{', '['])
+    {
+        return Err(detail(StatusCode::BAD_REQUEST, "Could not parse the colormap value."));
+    }
+    if let Some(name) = query_value(pairs, "colormap_name")
+        && ColormapName::from_str_opt(name).is_none()
+    {
+        return Err(json_resp(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({ "detail": [{
+                "type": "literal_error",
+                "loc": ["query", "colormap_name"],
+                "msg": "Input should be the name of a colour map (see /colorMaps)",
+                "input": name,
+            }] }),
+        ));
+    }
     if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
     }
@@ -2984,6 +3003,10 @@ async fn part_image_of(
         (false, _) => in_degrees,
     };
     if bbox.iter().any(|c| !c.is_finite()) || bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
+        // A posted point covers no pixel: nothing to draw, as titiler-pgstac answers it.
+        if mask.is_some() && bbox[0] == bbox[2] && bbox[1] == bbox[3] {
+            return no_content();
+        }
         return detail(StatusCode::BAD_REQUEST, "the box has no area in the coordinate system asked for");
     }
     let own_geometry = given_in_metres.then(|| bbox_polygon(in_degrees));
