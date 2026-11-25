@@ -2196,6 +2196,7 @@ async fn render_mosaic_tile_styled(
     urls: &[String],
     mut treq: TileRequest,
     pq: &ParsedQuery,
+    first_has_colormap: bool,
 ) -> Result<Bytes, EngineError> {
     let mut needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
@@ -2205,9 +2206,7 @@ async fn render_mosaic_tile_styled(
     if !needs_bbox_mosaic
         && !pq.colormap_explicit
         && pq.custom_colormap_json.is_none()
-        && let Some(u0) = urls.first()
-        && let Ok(c0) = engine.store.open_uri(u0).await
-        && c0.index.color_map.is_some()
+        && first_has_colormap
     {
         needs_bbox_mosaic = true;
     }
@@ -3845,7 +3844,14 @@ where
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
-                            let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
+                            let b = render_mosaic_tile_styled(
+                                &engine,
+                                &urls,
+                                treq,
+                                &pq,
+                                first_cog.index.color_map.is_some(),
+                            )
+                            .await?;
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
@@ -3924,7 +3930,14 @@ where
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
-                            let b = render_mosaic_tile_styled(&engine, &pq.urls, treq, &pq).await?;
+                            let b = render_mosaic_tile_styled(
+                                &engine,
+                                &pq.urls,
+                                treq,
+                                &pq,
+                                first_cog.index.color_map.is_some(),
+                            )
+                            .await?;
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
@@ -4037,7 +4050,14 @@ where
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
-                            let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
+                            let b = render_mosaic_tile_styled(
+                                &engine,
+                                &urls,
+                                treq,
+                                &pq,
+                                first_cog.index.color_map.is_some(),
+                            )
+                            .await?;
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
