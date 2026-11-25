@@ -1452,6 +1452,16 @@ fn whole_numbers(unscale: bool, bands: &BandRequest, sample_type: SampleType) ->
         && !matches!(sample_type, SampleType::Float32 | SampleType::Float64)
 }
 
+/// A value as a byte, by rio-tiler's `linear_rescale` step for step and in its double
+/// precision: clip to the range, take the share of it, scale to 255, drop the fraction.
+/// Done in another order or in single precision, a value on a boundary lands a level off.
+fn rescale_byte(v: f32, min: f32, max: f32) -> u8 {
+    let (v, min, max) = (f64::from(v), f64::from(min), f64::from(max));
+    let span = if (max - min).abs() < 1e-12 { 1e-12 } else { max - min };
+    let share = (v.max(min).min(max) - min) / span;
+    (share * 255.0).clamp(0.0, 255.0) as u8
+}
+
 /// How the values a pixel selection leaves become colours: the request's own rescaling
 /// and colour map, applied as the renderer applies them to a single scene.
 enum Paint {
@@ -1477,10 +1487,7 @@ impl Paint {
 
     /// RGBA for `pixels` pixels. A pixel is transparent when no band of it has a value.
     fn rgba(&self, selected: &Selected, pixels: usize) -> Vec<u8> {
-        // The renderer's own arithmetic, which is also rio-tiler's: scale, clamp, drop the fraction.
-        let byte = |v: f32, min: f32, max: f32| {
-            ((v - min) * (255.0 / cogzilla_kernel::safe_rescale_denom(min, max))).clamp(0.0, 255.0) as u8
-        };
+        let byte = rescale_byte;
         let mut out = vec![0u8; pixels * 4];
         match (self, selected.bands) {
             (Self::Rgb { min, max }, 3) => {
@@ -1501,10 +1508,16 @@ impl Paint {
                     Self::Gray { min, max, colormap } => (*min, *max, *colormap),
                     Self::Rgb { min, max } => (min[0], max[0], ColormapName::Grayscale),
                 };
-                let lut = colormap.lut();
+                // Without a colour map the byte is the grey, as in TiTiler. The kernel's grey
+                // table is not that: some of its entries are a level below their index.
+                let lut = (colormap != ColormapName::Grayscale).then(|| colormap.lut());
                 for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
                     if !v.is_nan() {
-                        px[..3].copy_from_slice(&lut.rgb[usize::from(byte(*v, min, max))]);
+                        let level = byte(*v, min, max);
+                        match lut {
+                            Some(lut) => px[..3].copy_from_slice(&lut.rgb[usize::from(level)]),
+                            None => px[..3].fill(level),
+                        }
                         px[3] = 255;
                     }
                 }
@@ -1636,6 +1649,13 @@ const MAX_PLANE_VALUES: usize = 64 * 1024 * 1024;
 /// The most bands the assets of one item may stack up to on a tile.
 const MAX_BANDS_PER_ITEM: usize = 32;
 
+/// Whether band math over planes reads every expression of a request. The renderer's own
+/// engine knows names and functions it does not (`ndvi`, `^`, `max(a, b)`).
+fn planes_read_all(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
+    let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok();
+    pq.expr_raw.as_ref().is_none_or(reads) && query.assets.iter().all(|a| a.expression.as_ref().is_none_or(reads))
+}
+
 /// A tile made from planes: what to read of each item and what to make of it.
 struct PlanesTile {
     assets: Vec<AssetSpec>,
@@ -1645,6 +1665,9 @@ struct PlanesTile {
     resampling: ResampleMode,
     reproject: ResampleMode,
     window: Window,
+    /// Whether the per-pixel work goes to the pool for heavy work: when there is more
+    /// than one raster to work out, or a picture larger than a tile.
+    pool: bool,
 }
 
 /// A polygon an image is cut to, and which of the picture's pixels are inside it once
@@ -1677,6 +1700,7 @@ impl Window {
 
     /// Bands of one raster over the window, each a plane of `f32` on the window's grid
     /// whatever the raster's own, NaN where it has no data; none asked for is all of them.
+    #[allow(clippy::too_many_arguments)]
     async fn read(
         &self,
         engine: &TileEngine,
@@ -1685,10 +1709,36 @@ impl Window {
         resampling: ResampleMode,
         reproject: ResampleMode,
         max_values: usize,
+        pool: bool,
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
         let (bbox, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
-                return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
+                let cog = engine.store.open_uri(href).await?;
+                let crs = engine.get_or_build_crs(&cog)?;
+                let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
+                let Some(res) = mercator_resolution(&crs, &cog).filter(|_| resample == ResampleMode::Nearest) else {
+                    return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
+                };
+                // The way GDAL's warp reads a tile: from the overview it would pick for
+                // the tile's span at the raster's own resolution.
+                let full = cog.index.full_res();
+                let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
+                let (w, s, e, n) = tile_bounds_3857(request.tile);
+                let side = request.tile_size as usize;
+                let own = |span: f64| ((span / res).round() as u64).max(1);
+                // One road whatever bands are asked for. GDAL takes another when only some
+                // are, and a band then comes from other pixels than it does in the whole
+                // raster; a band is the same band here either way.
+                let read =
+                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool)
+                        .await?;
+                let mut planes = Vec::with_capacity(wanted.len());
+                for band in &wanted {
+                    planes.push(read.get(usize::from(*band) - 1).cloned().ok_or_else(|| {
+                        EngineError::BadRequest("unexpected number of planes from the reader".into())
+                    })?);
+                }
+                return Ok((planes, full.sample_type));
             }
             Window::Part { bbox, width, height, size, mask, unscale } => (*bbox, *width, *height, *size, mask, *unscale),
         };
@@ -1733,9 +1783,8 @@ impl Window {
                     own.0, own.1
                 )));
             }
-            // GDAL takes another road when only some of a raster's bands are read.
-            let path = if wanted.len() == all { WarpPath::Direct } else { WarpPath::Blocks };
-            let read = match warp_nearest(engine, &cog, &crs, bbox, own, native, path, unscale).await {
+            // One road whatever bands are asked for: see the tile's reading above.
+            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -1861,7 +1910,7 @@ impl PlanesTile {
         // Each asset may take its share of what an item may hold.
         let (planes, sample_type) =
             self.window
-                .read(engine, href, wanted, self.resampling, self.reproject, MAX_PLANE_VALUES / self.assets.len().max(1))
+                .read(engine, href, wanted, self.resampling, self.reproject, MAX_PLANE_VALUES / self.assets.len().max(1), self.pool)
                 .await?;
         let planes = match &spec.expression {
             Some(expression) => band_math(expression, &planes)?,
@@ -2069,11 +2118,7 @@ fn paint_bands(
         }
         2 => {
             let byte = |v: f32, (min, max): (f32, f32)| {
-                if v.is_nan() {
-                    0
-                } else {
-                    ((v - min) * (255.0 / cogzilla_kernel::safe_rescale_denom(min, max))).clamp(0.0, 255.0) as u8
-                }
+                if v.is_nan() { 0 } else { rescale_byte(v, min, max) }
             };
             let mut out = vec![255u8; pixels * 4];
             for (i, px) in out.chunks_exact_mut(4).enumerate() {
@@ -2273,9 +2318,7 @@ async fn part_image(
     let nearest = query.resampling == ResampleMode::Nearest && query.reproject == ResampleMode::Nearest;
     // The renderer's band math knows names and functions that band math over planes does
     // not (`ndvi`, `^`, `max(a, b)`); what only it can read, it draws.
-    let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok();
-    let planes_can = pq.expr_raw.as_ref().is_none_or(reads)
-        && query.assets.iter().all(|a| a.expression.as_ref().is_none_or(reads));
+    let planes_can = planes_read_all(&pq, &query);
     let planes_needed = wants_planes(&pq, &query);
     let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
     // The request's own band math, before an asset's is put in its place for the renderer.
@@ -2375,6 +2418,7 @@ async fn part_image(
                 resampling: query.resampling,
                 reproject: query.reproject,
                 window: Window::Part { bbox, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
+                pool: true,
             };
             let look = Look {
                 rescale: &pq.rescale,
@@ -2684,7 +2728,22 @@ enum WarpPath {
     Blocks,
 }
 
-/// Every band of one raster on a WGS84 grid, read the way GDAL's nearest-neighbour warp
+/// The resolution GDAL gives a raster warped to Web Mercator, in metres: as
+/// [`wgs84_resolution`], the diagonal there over the diagonal in pixels.
+fn mercator_resolution(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<f64> {
+    let full = cog.index.full_res();
+    let (w, h) = (f64::from(full.width), f64::from(full.height));
+    let corner = |col: f64, row: f64| {
+        let (x, y) = full.pixel_to_crs.forward(col, row);
+        let (lon, lat) = crs.to_lonlat_deg(x, y);
+        lonlat_deg_to_mercator(lon, lat)
+    };
+    let (ul, lr) = (corner(0.0, 0.0), corner(w, h));
+    let res = (lr.0 - ul.0).hypot(lr.1 - ul.1) / w.hypot(h);
+    (res.is_finite() && res > 0.0).then_some(res)
+}
+
+/// Every band of one raster on a WGS84 grid, or with `mercator` on a Web Mercator one, read the way GDAL's nearest-neighbour warp
 /// reads it: from the overview GDAL would pick, each output pixel taking the source pixel
 /// its centre falls in. A pixel outside the raster, or without data, is NaN. `native` is
 /// the size of the grid at the raster's own resolution.
@@ -2694,10 +2753,12 @@ async fn warp_nearest(
     cog: &Arc<cogzilla_io::OpenedCog>,
     crs: &CrsModel,
     bounds: [f64; 4],
+    mercator: bool,
     (width, height): (usize, usize),
     native: (u64, u64),
     path: WarpPath,
     unscale: bool,
+    pool: bool,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
     // The grid the warp is worked out on, and how wide a stretch of a row GDAL
@@ -2731,7 +2792,14 @@ async fn warp_nearest(
     let bands = ifd.samples_per_pixel as usize;
     let (dx, dy) = ((bounds[2] - bounds[0]) / grid_w as f64, (bounds[3] - bounds[1]) / grid_h as f64);
 
-    // Where each output pixel reads from, as (column, row) of the level.
+    // Where each output pixel reads from, as (column, row) of the level. With `pool`
+    // this and the sampling below are worked out on the pool for heavy work, so that the
+    // rasters of a mosaic are worked out side by side and not on the workers that serve
+    // requests; one raster of a tile is quicker done here than handed over.
+    let (cog_for_cells, crs_for_cells) = (cog.clone(), crs.clone());
+    let work = move || {
+    let (cog, crs) = (cog_for_cells, crs_for_cells);
+    let ifd = &cog.index.ifds[level];
     let mut cells: Vec<(i32, i32)> = Vec::with_capacity(width * height);
     let mut row_positions = vec![(0f64, 0f64); grid_w];
     let (mut c0, mut c1, mut r0, mut r1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
@@ -2744,7 +2812,10 @@ async fn warp_nearest(
         let grid_row = if grid_h == height { j } else { ((2 * j + 1) * grid_h / (2 * height)).min(grid_h - 1) };
         let lat = bounds[3] - (grid_row as f64 + 0.5) * dy;
         let exact = |i: usize| {
-            let (x, y) = crs.from_lonlat_deg(bounds[0] + (i as f64 + 0.5) * dx, lat);
+            let across = bounds[0] + (i as f64 + 0.5) * dx;
+            // The grid is in degrees, or in Web Mercator metres for a map tile.
+            let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, lat) } else { (across, lat) };
+            let (x, y) = crs.from_lonlat_deg(lon, lat);
             ifd.crs_to_pixel.forward(x, y)
         };
         if grid_row != worked_row {
@@ -2770,6 +2841,9 @@ async fn warp_nearest(
             }
         }
     }
+    (cells, c0, c1, r0, r1)
+    };
+    let (cells, c0, c1, r0, r1) = if pool { engine.store.run_heavy_cpu(work).await? } else { work() };
     if c0 > c1 {
         return Ok(vec![vec![f32::NAN; width * height]; bands]);
     }
@@ -2790,6 +2864,10 @@ async fn warp_nearest(
         tiles.push(engine.store.get_blocks(cog, level, &indices).await?);
     }
 
+    let cog_for_planes = cog.clone();
+    let work = move || {
+    let cog = cog_for_planes;
+    let ifd = &cog.index.ifds[level];
     let mut planes = Vec::with_capacity(bands);
     for band in 0..bands {
         let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = if planar {
@@ -2813,9 +2891,11 @@ async fn warp_nearest(
             let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
             source = source.with_scale_offset(scale, offset);
         }
-        planes.push(cells.iter().map(|&(col, row)| source.sample_checked(col, row)).collect());
+        planes.push(cells.iter().map(|&(col, row)| source.sample_checked(col, row)).collect::<Vec<f32>>());
     }
-    Ok(planes)
+    planes
+    };
+    Ok(if pool { engine.store.run_heavy_cpu(work).await? } else { work() })
 }
 
 /// Every band of one raster on a WGS84 grid through the shared renderer, for the
@@ -3039,7 +3119,7 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, size, native, path, req.unscale).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
@@ -3490,8 +3570,17 @@ async fn tile(
         Ok(q) => q,
         Err(r) => return r,
     };
-    // What the renderer cannot draw in one pass is made from planes instead.
+    // What the renderer cannot draw in one pass is made from planes instead. So is a tile
+    // with nearest-neighbour resampling, whose planes are read the way GDAL's warp reads
+    // and are TiTiler's pixels; the renderer draws the other methods, the algorithms, and
+    // band math only its own engine reads.
     let planes_wanted = wants_planes(&pq, &query);
+    let planes_preferred = planes_read_all(&pq, &query)
+        && query.resampling == ResampleMode::Nearest
+        && query.reproject == ResampleMode::Nearest
+        && pq.algorithm.is_none();
+    // The request's own band math, before an asset's is put in its place for the renderer.
+    let expression = pq.expr_raw.clone();
     let names = if planes_wanted { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
     let names = match names {
         Ok(names) => names,
@@ -3564,8 +3653,15 @@ async fn tile(
                 }
                 one_grid = TileEngine::on_one_grid(&cogs);
             }
-            if planes_wanted || !one_grid {
-                let dim = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
+            // Left to the renderer: a raster with an alpha band, which it reads as the mask,
+            // raw arrays, and tile sizes it alone takes.
+            let dim = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
+            let raw = matches!(explicit.as_str(), "npy" | "bin" | "raw" | "f32");
+            let preferred = planes_preferred
+                && !raw
+                && matches!(dim, 256 | 512)
+                && full.extra_samples.is_empty();
+            if planes_wanted || !one_grid || preferred {
                 if dim != 256 && dim != 512 {
                     return Err(EngineError::BadRequest(format!(
                         "tilesize={dim} is not supported on mosaic routes (use 256 or 512)"
@@ -3590,7 +3686,7 @@ async fn tile(
                 let job = PlanesTile {
                     assets: specs.clone(),
                     as_band: asset_as_band,
-                    expression: pq.expr_raw.clone(),
+                    expression: expression.clone(),
                     selection: selection.unwrap_or(Selection::First),
                     resampling,
                     reproject,
@@ -3602,6 +3698,7 @@ async fn tile(
                         format: OutputFormat::RawF32,
                         unscale: pq.unscale,
                     }),
+                    pool: scenes.len() * specs.len() > 1,
                 };
                 let look = Look {
                     rescale: &pq.rescale,
@@ -3718,7 +3815,11 @@ fn encode_picture(
             parse_ext_format(if opaque { "jpg" } else { "png" }, None, jpeg_quality)?
         }
     };
-    Ok((encode_rgba_output(width, height, &rgba, format, return_mask), content_type))
+    // A PNG whose every pixel is there needs no alpha: the same picture, and smaller and
+    // quicker to write, which is what the renderer does for its own tiles.
+    let alpha = return_mask
+        && !(matches!(format, OutputFormat::Png) && rgba.chunks_exact(4).all(|p| p[3] == 255));
+    Ok((encode_rgba_output(width, height, &rgba, format, alpha), content_type))
 }
 
 /// What the router does with `/collections/{c}/items/{i}/...`.
@@ -4990,6 +5091,27 @@ mod tests {
         let chain = format!("b1{}", "+b1".repeat(500));
         assert_eq!(band_math(&chain, &bands).unwrap()[0][0], 501.0);
         assert_eq!(band_math("((((b1+1)*2)-3)/(b1+1))**2", &bands).unwrap()[0][0], 0.25);
+    }
+
+    #[test]
+    fn bytes_are_rio_tilers_to_the_level() {
+        // Values on a boundary are where another order of arithmetic lands a level off:
+        // 1600 of 4000 is 102 exactly, 51 of 255 is 51.
+        assert_eq!(rescale_byte(1600.0, 0.0, 4000.0), 102);
+        assert_eq!(rescale_byte(51.0, 0.0, 255.0), 51);
+        assert_eq!(rescale_byte(1168.0, 0.0, 4000.0), 74);
+        assert_eq!(rescale_byte(-5.0, 0.0, 100.0), 0);
+        assert_eq!(rescale_byte(500.0, 0.0, 100.0), 255);
+        // A range of nothing, or one that runs backwards, is not a panic.
+        assert_eq!(rescale_byte(3.0, 3.0, 3.0), 0);
+        let _ = rescale_byte(3.0, 10.0, 0.0);
+        // Grey is the byte itself, for every level.
+        let grey = Paint::Gray { min: 0.0, max: 255.0, colormap: ColormapName::Grayscale };
+        let all: Vec<f32> = (0..=255).map(|v| v as f32).collect();
+        let rgba = grey.rgba(&Selected { bands: 1, values: all }, 256);
+        for (level, px) in rgba.chunks_exact(4).enumerate() {
+            assert_eq!(px, [level as u8, level as u8, level as u8, 255]);
+        }
     }
 
     #[test]

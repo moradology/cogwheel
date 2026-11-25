@@ -24,7 +24,7 @@
 
 ## pgSTAC
 
-With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind a tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, or from the [lean lookup](#the-lean-item-lookup), which lists the same items in the same order without the items a picture cannot show. `benches/pgstac_diff_oracle.py` sends 378 requests to both servers on one database and compares status codes, JSON bodies, item lists, WMTS documents, statistics and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 370 agreed and 8 were known differences, listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; the 120 agreeing pairs had a median of 41.4 dB (25.8 upwards, 35 of them identical).
+With a [pgSTAC database configured](configuration.md#pgstac-database), `cogzilla` serves the search, collection and item routes of titiler-pgstac 3.2. The items behind a tile come from pgSTAC's own `geojsonsearch`, called with the arguments titiler-pgstac passes, or from the [lean lookup](#the-lean-item-lookup), which lists the same items in the same order without the items a picture cannot show. `benches/pgstac_diff_oracle.py` sends 378 requests to both servers on one database and compares status codes, JSON bodies, item lists, WMTS documents, statistics and rendered images. When last run, at v0.5.29 against titiler-pgstac 3.2.2 and pgSTAC 0.10.2, 370 agreed and 8 were known differences, listed below. Agreement on images means the same valid pixels and a PSNR of at least 25 dB; of the 120 agreeing pairs 83 were identical, and the rest were 25.8 dB and up.
 
 - `POST /searches/register` with a STAC search body (`collections`, `ids`, `bbox`, `intersects`, `datetime`, `query`, `filter`, `sortby`) and optional `metadata`. The returned `id` is pgSTAC's hash, the same one titiler-pgstac returns for the same body.
 - `GET /searches/` and `/searches/list` (with `limit`, `offset`, and `sortby` on `lastused` or `usecount`), `GET /searches/{id}/info`.
@@ -75,6 +75,21 @@ What a request can make the server hold is bounded: an expression is at most 409
 
 Warm, the oracle's 21 such tiles took a median of 8 ms. Cold from S3 over a home connection, a tile of six items and three assets each took 2.5 to 5.7 s over six tiles, against 1.5 to 5.0 s for titiler-pgstac on the same tiles: slower in five of the six, by 10 to 70%. Most of that time is the line, not the reading: one such tile was 48 range requests and 58 MB, because a 20 m band is read at full resolution in blocks of 1024 pixels, and it arrived at about 10 MB a second. One raster on its own, cold, took a median of 317 ms here against 866 ms over twelve different granules.
 
+### How pictures are read
+
+Tiles and images with nearest-neighbour resampling, which is the default, are read the way GDAL's warp reads: from the overview GDAL would take for the size asked, each output pixel taking the source pixel its centre falls in, with GDAL's own approximation of the projection along each row. That is what makes them TiTiler's pictures and not merely close to them: of the oracle's 101 PNG pictures of mosaics, 83 are identical to titiler-pgstac's to the last bit, 48 of the 62 tiles among them. The ones that are not are bilinear or cubic requests, which the shared renderer draws (29 to 37 dB); colour formulas, whose arithmetic is shared and a level off (51 dB); band math in single precision (66 dB and up); two bands under a polygon; and the partial band selections below.
+
+GDAL is followed where it decides what the picture is, and not where it is only inconsistent:
+
+- One band of several is read from the same pixels as all of them. GDAL takes another road for a partial selection and returns other pixels.
+- The edge of a `feature`'s polygon is where pixel centres fall inside it; GDAL cuts in the source raster's pixels. 99.0 to 99.6% of pixels agree.
+- Four bands are refused as JPEG; TiTiler sends them as CMYK.
+- Still as GDAL has it, though it need not be: the projection along a row is interpolated between a few exact points, to within an eighth of a pixel, where it could be worked out for every pixel; and an overview up to a fifth coarser than asked is preferred to the next finer one.
+
+Warm, a tile costs what it cost through the renderer: 1.2 ms for one band (1.1), 2.2 ms for `visual` (2.4), 4.7 ms for three assets over six items (4.5), where titiler-pgstac takes 33 to 530 ms. The per-pixel work of a mosaic's rasters is done side by side on the pool for heavy work; one raster of a tile is done in place.
+
+The renderer still draws: the other resampling methods, `algorithm`, raw arrays, rasters with an alpha band, tile sizes other than 256 and 512, and band math only its own engine reads (`ndvi`, `^`, `max(a, b)`).
+
 ### Images
 
 A `bbox` or `feature` image is made from planes as well, whatever it asks for, as long as `resampling` and `reproject` are left at nearest and there is no `algorithm`. Each raster is read the way GDAL's nearest-neighbour warp reads it (the reader `statistics` uses): at the size its own resolution gives for what was asked, from the overview GDAL would take, each pixel from the source pixel its centre falls in, and then brought to the picture's size. That is what rio-tiler does, and the pixels are TiTiler's: of the oracle's 39 PNG images of mosaics, 31 are identical to titiler-pgstac's to the last bit, six differ by a level here and there (band math and colour formulas, 51 dB and up), one is the bilinear case the shared renderer draws (29 dB), and one is two bands under a polygon (28 dB), where the mask is the third band and its edge is not GDAL's cutline: a pixel is inside when its centre is, which agrees for 99.0 to 99.6% of pixels.
@@ -110,7 +125,7 @@ Each of these is answered with a `400` or `404` rather than a different picture:
 - In CQL2 text filters: WKT coordinates written with an exponent, and the handful of malformed geometries and calls titiler-pgstac's converter lets through as function calls (pgSTAC then rejects them with a `500`; here they are a `422`).
 - `coord_crs` other than `epsg:4326` on the `bbox` and `point` routes, and `f=html` on the tileset routes.
 - In the tileset list, the twelve tile matrix sets other than `WebMercatorQuad` that titiler-pgstac also lists.
-- A tile or image of one or two bands out of a three-band raster reads other pixels than TiTiler: GDAL warps a partial band selection in blocks through its overview grid, and the tile renderer reads the same pixels whatever the selection. `statistics` follows GDAL there. Bad band indexes and `asset_as_band` on a multi-band asset are a `400` where TiTiler answers `500`.
+- A tile or image of one or two bands out of a three-band raster reads other pixels than TiTiler, on purpose: GDAL warps a partial band selection in blocks through its overview grid, so that a band on its own is not the band it is in the whole raster (43% of pixels differ on the reference data). Here a band is the same band however it is asked for. `statistics` still follows GDAL there, to give TiTiler's numbers. Bad band indexes and `asset_as_band` on a multi-band asset are a `400` where TiTiler answers `500`.
 - On tiles and images made from planes (see above): `algorithm`, raw array formats, and four bands as JPEG, which TiTiler sends as CMYK. Any `pixel_selection` other than `first` with a terrain encoding or a raw array format.
 - `buffer`, `nodata` and a JSON `colormap`.
 - Tile matrix sets other than `WebMercatorQuad`.
