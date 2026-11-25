@@ -192,7 +192,8 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     assert_eq!(unsupported_tms.status().as_u16(), 400);
 
     for (what, query) in [
-        ("pixel selection", "assets=visual&pixel_selection=mean"),
+        ("a pixel selection that is not there yet", "assets=visual&pixel_selection=lastbandlow"),
+        ("a pixel selection nobody has", "assets=visual&pixel_selection=nope"),
         ("an asset option without a value", "assets=visual%7Cbidx"),
         ("options on several assets", "assets=visual%7Cbidx%3D2&assets=nir"),
         ("asset names in an expression", "assets=red&assets=nir&expression=nir-red"),
@@ -203,6 +204,23 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         let resp = client.get(format!("{tile}.png?{query}")).send().await.unwrap();
         assert!(matches!(resp.status().as_u16(), 400 | 422), "{what}: {}", resp.status());
     }
+
+    // The other pixel selections are taken on tiles (here over nothing, so nothing comes
+    // back) and refused, for now, where one image is drawn from many rasters at once.
+    let unknown = client.get(format!("{tile}.png?assets=visual&pixel_selection=nope")).send().await.unwrap();
+    assert_eq!(unknown.status().as_u16(), 422);
+    assert_eq!(body_json(unknown).await["detail"][0]["loc"], json!(["query", "pixel_selection"]));
+    for method in ["first", "highest", "lowest", "mean", "median", "stdev", "count"] {
+        let resp = client.get(format!("{tile}.png?assets=visual&pixel_selection={method}")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 204, "{method}");
+    }
+    let image = client
+        .get(format!("{base}/searches/{id}/bbox/6,44,7,45.png?assets=visual&pixel_selection=mean"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(image.status().as_u16(), 400);
+    assert!(body_json(image).await["detail"].as_str().unwrap().contains("pixel_selection"));
 
     let both = json!({ "bbox": [0, 0, 1, 1], "intersects": { "type": "Point", "coordinates": [0, 0] } });
     let resp = post_json(&client, format!("{base}/searches/register"), &both).await;
