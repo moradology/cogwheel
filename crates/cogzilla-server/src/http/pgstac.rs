@@ -1531,8 +1531,10 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.assets.is_empty() {
         return Err(missing_query_param("assets"));
     }
-    // `reproject` is handled here; the shared parser does not know it.
-    if let Some(e) = pq.errors.iter().find(|e| !e.contains("'reproject'")) {
+    // `reproject`, `asset_as_band`, and `histogram_bins` are handled here with pgstac's own 422s.
+    if let Some(e) = pq.errors.iter().find(|e| {
+        !e.contains("'reproject'") && !e.contains("asset_as_band") && !e.contains("histogram_bins")
+    }) {
         return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
     }
     let assets = parse_assets(pairs)?;
