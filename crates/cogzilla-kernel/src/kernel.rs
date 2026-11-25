@@ -4113,6 +4113,50 @@ pub enum TerrainEncoding {
     Terrarium,
     /// Mapbox Terrain-RGB: `elev = -10000 + ((R * 65536 + G * 256 + B) * 0.1)` (0.1 m precision).
     TerrainRgb,
+    /// TiTiler DEM Contours: `linear_rescale(elev, (minz, maxz), (1, 255))` -> `terrain` colormap,
+    /// with black (`[0, 0, 0]`) contour lines where `elev.rem_euclid(increment) < thickness`.
+    Contours {
+        increment: i32,
+        thickness: u8,
+        minz: i32,
+        maxz: i32,
+    },
+}
+
+impl TerrainEncoding {
+    #[inline(always)]
+    pub fn encode_rgb(self, elev_m: f32) -> [u8; 3] {
+        match self {
+            TerrainEncoding::Terrarium => encode_terrarium_rgb(elev_m),
+            TerrainEncoding::TerrainRgb => encode_terrain_rgb(elev_m),
+            TerrainEncoding::Contours {
+                increment,
+                thickness,
+                minz,
+                maxz,
+            } => encode_contours_rgb(elev_m, increment, thickness, minz, maxz),
+        }
+    }
+}
+
+#[inline(always)]
+pub fn encode_contours_rgb(
+    elev_m: f32,
+    increment: i32,
+    thickness: u8,
+    minz: i32,
+    maxz: i32,
+) -> [u8; 3] {
+    let data = elev_m as f64;
+    if increment > 0 && thickness > 0 && data.rem_euclid(increment as f64) < thickness as f64 {
+        return [0, 0, 0];
+    }
+    let lo = minz as f64;
+    let hi = maxz as f64;
+    let denom = if (hi - lo).abs() < 1e-12 { 1.0 } else { hi - lo };
+    let idx = (((data - lo) / denom) * 254.0 + 1.0).clamp(1.0, 255.0) as u8;
+    let lut = crate::colormap::ColormapName::Terrain.lut();
+    lut.rgb[idx as usize]
 }
 
 #[inline(always)]
@@ -4150,12 +4194,7 @@ pub fn render_terrain_tile<const N: usize>(
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
-    let encode_px = |v: f32| -> [u8; 3] {
-        match encoding {
-            TerrainEncoding::Terrarium => encode_terrarium_rgb(v),
-            TerrainEncoding::TerrainRgb => encode_terrain_rgb(v),
-        }
-    };
+    let encode_px = |v: f32| -> [u8; 3] { encoding.encode_rgb(v) };
 
     let sample_px = |u: f32, v: f32| -> f32 {
         match (resample, clean) {

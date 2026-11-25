@@ -474,108 +474,106 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             }
         }),
         "normalizedIndex" | "normalizedindex" => serde_json::json!({
-            "title": "Normalized Index",
-            "description": "Calculate normalized difference index (b1 - b2) / (b1 + b2).",
+            "title": "Normalized Difference Index",
+            "description": "Compute normalized difference index from two bands.",
             "inputs": { "nbands": 2 },
             "outputs": { "nbands": 1, "dtype": "float32", "min": [-1.0], "max": [1.0] },
             "parameters": {}
         }),
         "cast" => serde_json::json!({
-            "title": "Cast",
-            "description": "Cast data to a target numeric type.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Cast data to Integer",
+            "description": "Cast data to Integer.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": null, "dtype": "uint8", "min": [0], "max": [255] },
             "parameters": {}
         }),
         "ceil" => serde_json::json!({
-            "title": "Ceil",
-            "description": "Return the ceiling of the input, element-wise.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Round data to the smallest integer",
+            "description": "Round data to the smallest integer.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": null, "dtype": "uint8", "min": [0], "max": [255] },
             "parameters": {}
         }),
         "floor" => serde_json::json!({
-            "title": "Floor",
-            "description": "Return the floor of the input, element-wise.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Round data to the largest integer",
+            "description": "Round data to the largest integer.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": null, "dtype": "uint8", "min": [0], "max": [255] },
             "parameters": {}
         }),
         "min" => serde_json::json!({
-            "title": "Min",
-            "description": "Calculate pixel-wise minimum across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Minimum",
+            "description": "Return the Minimum along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "max" => serde_json::json!({
-            "title": "Max",
-            "description": "Calculate pixel-wise maximum across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Maximum",
+            "description": "Return the Maximum along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "median" => serde_json::json!({
             "title": "Median",
-            "description": "Calculate pixel-wise median across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "description": "Return the Median along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "mean" => serde_json::json!({
             "title": "Mean",
-            "description": "Calculate pixel-wise mean across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "description": "Return the Mean along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "std" => serde_json::json!({
-            "title": "Std",
-            "description": "Calculate pixel-wise standard deviation across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Standard deviation",
+            "description": "Return the Standard Deviation along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "var" => serde_json::json!({
-            "title": "Var",
-            "description": "Calculate pixel-wise variance across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Variance",
+            "description": "Return Variance along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "sum" => serde_json::json!({
             "title": "Sum",
-            "description": "Calculate pixel-wise sum across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "description": "Return the Sum along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "grayscale" => serde_json::json!({
-            "title": "Grayscale",
-            "description": "Convert RGB bands to grayscale using ITU-R BT.601 luma weights.",
-            "inputs": { "nbands": 3 },
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Transform a RGB Image to Grayscale",
+            "description": "Transform a RGB Image to Grayscale using the ITU-R 601-2 luma.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "bitonal" => serde_json::json!({
-            "title": "Bitonal",
-            "description": "Threshold single-band data into binary 0/1 output.",
-            "inputs": { "nbands": 1 },
-            "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [1] },
-            "parameters": {
-                "threshold": { "default": 128.0, "title": "Threshold", "type": "number" }
-            }
+            "title": "Transform an Image to Bitonal",
+            "description": "All values larger than 127 are set to 255 (white), all other values to 0 (black).",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "uint8", "min": null, "max": null },
+            "parameters": {}
         }),
         "contours" => serde_json::json!({
             "title": "Contours",
-            "description": "Overlay elevation contour lines at regular elevation intervals.",
+            "description": "Create contours from DEM dataset.",
             "inputs": { "nbands": 1 },
-            "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [255] },
+            "outputs": { "nbands": 3, "dtype": "uint8", "min": null, "max": null },
             "parameters": {
-                "increment": { "default": 35.0, "title": "Increment", "type": "number" },
-                "thickness": { "default": 1, "title": "Thickness", "type": "integer" },
-                "minz": { "default": -12000.0, "title": "Minz", "type": "number" },
-                "maxz": { "default": 8000.0, "title": "Maxz", "type": "number" }
+                "increment": { "default": 35, "maximum": 999, "minimum": 0, "title": "Increment", "type": "integer" },
+                "thickness": { "default": 1, "maximum": 10, "minimum": 0, "title": "Thickness", "type": "integer" },
+                "minz": { "default": -12000, "maximum": 99999, "minimum": -99999, "title": "Minz", "type": "integer" },
+                "maxz": { "default": 8000, "maximum": 99999, "minimum": -99999, "title": "Maxz", "type": "integer" }
             }
         }),
         _ => {
@@ -4766,14 +4764,7 @@ async fn render_bbox_impl(
                             g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                             b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                         } else {
-                            let [r, g, b] = match encoding {
-                                cogzilla_kernel::TerrainEncoding::Terrarium => {
-                                    cogzilla_kernel::encode_terrarium_rgb(elev)
-                                }
-                                cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                                    cogzilla_kernel::encode_terrain_rgb(elev)
-                                }
-                            };
+                            let [r, g, b] = encoding.encode_rgb(elev);
                             out.put_slice(&(r as f32).to_le_bytes());
                             g_plane.extend_from_slice(&(g as f32).to_le_bytes());
                             b_plane.extend_from_slice(&(b as f32).to_le_bytes());
@@ -4952,14 +4943,7 @@ async fn render_bbox_impl(
                 for i in 0..(w * h) {
                     let v = sample(&src, u_map[i], v_map[i]);
                     if !v.is_nan() {
-                        let [r, g, b] = match encoding {
-                            cogzilla_kernel::TerrainEncoding::Terrarium => {
-                                cogzilla_kernel::encode_terrarium_rgb(v)
-                            }
-                            cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                                cogzilla_kernel::encode_terrain_rgb(v)
-                            }
-                        };
+                        let [r, g, b] = encoding.encode_rgb(v);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -5631,14 +5615,7 @@ async fn render_mixed_grid_bbox(
                         g_p.extend_from_slice(&f32::NAN.to_le_bytes());
                         b_p.extend_from_slice(&f32::NAN.to_le_bytes());
                     } else {
-                        let [r, g, b] = match encoding {
-                            cogzilla_kernel::TerrainEncoding::Terrarium => {
-                                cogzilla_kernel::encode_terrarium_rgb(elev)
-                            }
-                            cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                                cogzilla_kernel::encode_terrain_rgb(elev)
-                            }
-                        };
+                        let [r, g, b] = encoding.encode_rgb(elev);
                         out.put_slice(&(r as f32).to_le_bytes());
                         g_p.extend_from_slice(&(g as f32).to_le_bytes());
                         b_p.extend_from_slice(&(b as f32).to_le_bytes());
@@ -5804,14 +5781,7 @@ async fn render_mixed_grid_bbox(
         } => {
             for (i, &v) in get_plane(*band_1based).iter().enumerate() {
                 if !v.is_nan() {
-                    let [r, g, b] = match encoding {
-                        cogzilla_kernel::TerrainEncoding::Terrarium => {
-                            cogzilla_kernel::encode_terrarium_rgb(v)
-                        }
-                        cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                            cogzilla_kernel::encode_terrain_rgb(v)
-                        }
-                    };
+                    let [r, g, b] = encoding.encode_rgb(v);
                     rgba[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, 255]);
                 }
             }

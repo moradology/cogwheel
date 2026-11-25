@@ -344,7 +344,7 @@ impl ExprProgram {
                             let d = stack[base + i] as f64 - mean;
                             sq += d * d;
                         }
-                        let var = sq / (k as f64);
+                        let var = sq / ((k - 1) as f64);
                         if matches!(op, Op::Std(_)) {
                             var.sqrt() as f32
                         } else {
@@ -690,7 +690,7 @@ impl ExprProgram {
                                 let d = stack[base + j][i] as f64 - mean;
                                 sq += d * d;
                             }
-                            let var = sq / (k as f64);
+                            let var = sq / ((k - 1) as f64);
                             if is_std { var.sqrt() as f32 } else { var as f32 }
                         };
                     }

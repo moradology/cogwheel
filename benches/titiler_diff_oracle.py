@@ -344,6 +344,17 @@ def main():
             ("GET /cog/tiles/...?algorithm=terrainrgb", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=terrainrgb", None, "png"),
             ("GET /cog/tiles/...?algorithm=ceil (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=ceil&rescale=0,255", None, "png"),
             ("GET /cog/tiles/...?algorithm=floor (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=floor&rescale=0,255", None, "png"),
+            ("GET /cog/tiles/...?algorithm=cast (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=cast", None, "png"),
+            ("GET /cog/tiles/...?algorithm=contours", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=contours", None, "png"),
+            ("GET /cog/tiles/...?algorithm=bitonal (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=bitonal", None, "png"),
+            ("GET /cog/tiles/...?algorithm=grayscale (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=grayscale&rescale=0,0.35&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=mean (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=mean&rescale=0,0.35&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=median (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=median&rescale=0,0.35&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=min (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=min&rescale=0,0.35&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=max (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=max&rescale=0,0.35&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=sum (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=sum&rescale=0,1.0&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=std (3-band ddof=1)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=std&rescale=0,0.15&reproject=bilinear", None, "png"),
+            ("GET /cog/tiles/...?algorithm=var (3-band ddof=1)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=var&rescale=0,0.02&reproject=bilinear", None, "png"),
 
             # --- /cog point, statistics, preview, bbox, feature, map ---
             ("GET /cog/point/-122.65,37.773", "GET", f"/cog/point/-122.65,37.773?url={sat}", None, "json_point"),
@@ -395,6 +406,12 @@ def main():
             ("GET /algorithms", "GET", "/algorithms", None, "json_algs"),
             ("GET /algorithms/hillshade", "GET", "/algorithms/hillshade", None, "json_alg_one"),
             ("GET /algorithms/terrarium", "GET", "/algorithms/terrarium", None, "json_alg_one"),
+            ("GET /algorithms/contours", "GET", "/algorithms/contours", None, "json_alg_schema"),
+            ("GET /algorithms/bitonal", "GET", "/algorithms/bitonal", None, "json_alg_schema"),
+            ("GET /algorithms/grayscale", "GET", "/algorithms/grayscale", None, "json_alg_schema"),
+            ("GET /algorithms/std", "GET", "/algorithms/std", None, "json_alg_schema"),
+            ("GET /algorithms/var", "GET", "/algorithms/var", None, "json_alg_schema"),
+            ("GET /algorithms/normalizedIndex", "GET", "/algorithms/normalizedIndex", None, "json_alg_schema"),
             ("GET /colorMaps", "GET", "/colorMaps", None, "json_cmaps"),
             ("GET /colorMaps/viridis (256-entry exact LUT)", "GET", "/colorMaps/viridis", None, "json_cmap_lut"),
             ("GET /colorMaps/viridis?f=png", "GET", "/colorMaps/viridis?f=png", None, "png"),
@@ -539,6 +556,15 @@ def main():
                         j_cw, j_tt = r_cw.json(), r_tt.json()
                         ok = "title" in j_cw and "title" in j_tt
                         parity = f"title cw={j_cw.get('title')!r} tt={j_tt.get('title')!r}"
+                    elif kind == "json_alg_schema":
+                        j_cw, j_tt = r_cw.json(), r_tt.json()
+                        ok = (
+                            j_cw.get("title") == j_tt.get("title")
+                            and j_cw.get("inputs") == j_tt.get("inputs")
+                            and j_cw.get("outputs") == j_tt.get("outputs")
+                            and set(j_cw.get("parameters", {}).keys()) == set(j_tt.get("parameters", {}).keys())
+                        )
+                        parity = f"title={j_cw.get('title')!r} out={j_cw.get('outputs')} params={sorted(j_cw.get('parameters', {}).keys())}"
                     elif kind == "json_cmaps":
                         j_cw = {c["id"] for c in r_cw.json()["colormaps"]}
                         j_tt = {c["id"] for c in r_tt.json()["colormaps"]}
