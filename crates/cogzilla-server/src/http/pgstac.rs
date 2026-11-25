@@ -1431,6 +1431,19 @@ struct MosaicQuery {
 /// The most a `median` may hold of its scenes at once.
 const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
 
+/// The most a pixel selection may work in, beside the scenes it reads.
+const MAX_WORKING_BYTES: usize = 512 * 1024 * 1024;
+
+/// Refuse a pixel selection over more bands and pixels than it may work in.
+fn check_working_bytes(bytes: usize) -> Result<(), EngineError> {
+    if bytes > MAX_WORKING_BYTES {
+        return Err(EngineError::BadRequest(
+            "the image is too large for this pixel_selection; pass max_size, or width and height".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a request's values are the raster's own whole numbers, which `mean` and `median`
 /// are cast back to; only then does the cast lose anything.
 fn whole_numbers(unscale: bool, bands: &BandRequest, sample_type: SampleType) -> bool {
@@ -1617,6 +1630,9 @@ fn wants_planes(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
         }
 }
 
+/// The most values, bands times pixels, one item's assets may be read into for an image.
+const MAX_PLANE_VALUES: usize = 64 * 1024 * 1024;
+
 /// The most bands the assets of one item may stack up to on a tile.
 const MAX_BANDS_PER_ITEM: usize = 32;
 
@@ -1628,13 +1644,177 @@ struct PlanesTile {
     selection: Selection,
     resampling: ResampleMode,
     reproject: ResampleMode,
-    /// The tile, its size and `unscale`; the rest is set for each read.
-    request: crate::engine::TileRequest,
+    window: Window,
+}
+
+/// A polygon an image is cut to, and which of the picture's pixels are inside it once
+/// that has been worked out.
+type PartMask = (Arc<PolygonMask>, tokio::sync::OnceCell<Vec<bool>>);
+
+/// What a mosaic of planes is read over.
+enum Window {
+    /// A map tile: the tile, its size and `unscale`; the rest is set for each read.
+    Tile(crate::engine::TileRequest),
+    /// A box in WGS84 at a size in pixels, optionally cut to a polygon. `size` is what was
+    /// asked for, from which each raster's own size follows.
+    Part { bbox: [f64; 4], width: u32, height: u32, size: PartSize, mask: Option<PartMask>, unscale: bool },
+}
+
+impl Window {
+    fn pixels(&self) -> usize {
+        match self {
+            Window::Tile(request) => (request.tile_size as usize).pow(2),
+            Window::Part { width, height, .. } => *width as usize * *height as usize,
+        }
+    }
+
+    fn unscale(&self) -> bool {
+        match self {
+            Window::Tile(request) => request.unscale,
+            Window::Part { unscale, .. } => *unscale,
+        }
+    }
+
+    /// Bands of one raster over the window, each a plane of `f32` on the window's grid
+    /// whatever the raster's own, NaN where it has no data; none asked for is all of them.
+    async fn read(
+        &self,
+        engine: &TileEngine,
+        href: &str,
+        bands_1based: &[u16],
+        resampling: ResampleMode,
+        reproject: ResampleMode,
+        max_values: usize,
+    ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
+        let (bbox, width, height, size, mask, unscale) = match self {
+            Window::Tile(request) => {
+                return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
+            }
+            Window::Part { bbox, width, height, size, mask, unscale } => (*bbox, *width, *height, *size, mask, *unscale),
+        };
+        let cog = engine.store.open_uri(href).await?;
+        let full = cog.index.full_res();
+        let sample_type = full.sample_type;
+        let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
+        let pixels = self.pixels();
+        // Known from the header alone, so nothing is read of an image too large to hold.
+        if wanted.len() * pixels > max_values {
+            return Err(EngineError::BadRequest(format!(
+                "{} bands of an asset at {width}x{height} pixels are too many to hold; pass max_size, or width and height",
+                wanted.len()
+            )));
+        }
+        // As on tiles: `resampling` for a source already in the output's projection,
+        // `reproject` for one that has to be warped into it.
+        let resample = match engine.get_or_build_crs(&cog)? {
+            CrsModel::Geographic => resampling,
+            _ => reproject,
+        };
+        if resample == ResampleMode::Nearest {
+            // As rio-tiler does: the raster is read at the size its own resolution gives
+            // for what was asked, the way GDAL's warp reads it, and brought to the
+            // picture's size afterwards.
+            let crs = engine.get_or_build_crs(&cog)?;
+            let res = wgs84_resolution(&crs, &cog)
+                .ok_or_else(|| EngineError::BadRequest("cannot place an asset in WGS84".into()))?;
+            let native = part_dims(PartSize::Query { max_size: None, width: None, height: None }, bbox, res);
+            let (w, h) = part_dims(size, bbox, res);
+            let all = usize::from(full.samples_per_pixel);
+            // A raster finer than the first item's, which set the picture's size, would be
+            // read larger than an image may be: it is read at the picture's size instead.
+            let own = if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) || all as u64 * w * h > max_values as u64 {
+                (width as usize, height as usize)
+            } else {
+                (w as usize, h as usize)
+            };
+            if all * own.0 * own.1 > max_values {
+                return Err(EngineError::BadRequest(format!(
+                    "{all} bands of an asset at {}x{} pixels are too many to hold; pass max_size, or width and height",
+                    own.0, own.1
+                )));
+            }
+            // GDAL takes another road when only some of a raster's bands are read.
+            let path = if wanted.len() == all { WarpPath::Direct } else { WarpPath::Blocks };
+            let read = match warp_nearest(engine, &cog, &crs, bbox, own, native, path, unscale).await {
+                Ok(read) => read,
+                // The item's footprint meets the box but this raster does not.
+                Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
+                Err(e) => return Err(e),
+            };
+            let out = (width as usize, height as usize);
+            let mut planes: Vec<Vec<f32>> = Vec::with_capacity(wanted.len());
+            for band in &wanted {
+                let plane = read.get(usize::from(*band) - 1).cloned().ok_or_else(|| {
+                    EngineError::BadRequest("unexpected number of planes from the reader".into())
+                })?;
+                planes.push(resize_nearest(plane, own, out));
+            }
+            if let Some((mask, inside)) = mask {
+                // Worked out once for the picture, and not on the workers that serve requests.
+                let inside = inside
+                    .get_or_try_init(|| async {
+                        let mask = mask.clone();
+                        engine
+                            .store
+                            .run_heavy_cpu(move || {
+                                // A pixel is inside the polygon when its centre is.
+                                let (dx, dy) =
+                                    ((bbox[2] - bbox[0]) / f64::from(width), (bbox[3] - bbox[1]) / f64::from(height));
+                                let mut inside = Vec::with_capacity(out.0 * out.1);
+                                for row in 0..out.1 {
+                                    let lat = bbox[3] - (row as f64 + 0.5) * dy;
+                                    inside.extend((0..out.0).map(|col| mask.contains(bbox[0] + (col as f64 + 0.5) * dx, lat)));
+                                }
+                                inside
+                            })
+                            .await
+                    })
+                    .await?;
+                for plane in &mut planes {
+                    for (v, inside) in plane.iter_mut().zip(inside) {
+                        if !inside {
+                            *v = f32::NAN;
+                        }
+                    }
+                }
+            }
+            return Ok((planes, sample_type));
+        }
+        let cogs = [cog];
+        let mut planes = Vec::with_capacity(wanted.len());
+        for band in wanted {
+            let bands = BandRequest::Single { band_1based: band, rescale: (0.0, 255.0), colormap: ColormapName::Grayscale };
+            let values = render_wgs84_bbox(
+                engine,
+                &cogs,
+                bbox,
+                width,
+                height,
+                mask.as_ref().map(|(mask, _)| mask.as_ref()),
+                &bands,
+                resample,
+                OutputFormat::RawF32,
+                None,
+                None,
+                None,
+                true,
+                unscale,
+            )
+            .await?;
+            if values.len() != pixels * 4 {
+                return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
+            }
+            planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
+        }
+        Ok((planes, sample_type))
+    }
 }
 
 /// The bands one item brings to a tile.
 struct ItemBands {
     bands: Vec<Vec<f32>>,
+    /// How many bands were read to make them.
+    stacked: usize,
     /// Whether they are the rasters' own whole numbers.
     integer: bool,
     sample_type: SampleType,
@@ -1678,8 +1858,11 @@ impl PlanesTile {
             (None, Some(indexes)) => indexes,
             _ => &[],
         };
+        // Each asset may take its share of what an item may hold.
         let (planes, sample_type) =
-            engine.raster_planes(href, wanted, &self.request, self.resampling, self.reproject).await?;
+            self.window
+                .read(engine, href, wanted, self.resampling, self.reproject, MAX_PLANE_VALUES / self.assets.len().max(1))
+                .await?;
         let planes = match &spec.expression {
             Some(expression) => band_math(expression, &planes)?,
             None => planes,
@@ -1700,7 +1883,7 @@ impl PlanesTile {
         let parts = futures_util::future::try_join_all(reads).await?;
         let sample_type = parts.first().map_or(SampleType::Uint8, |(_, st, _)| *st);
         let integer = self.expression.is_none()
-            && !self.request.unscale
+            && !self.window.unscale()
             && parts.iter().all(|(_, st, own)| *own && !matches!(st, SampleType::Float32 | SampleType::Float64));
         let stacked: usize = parts.iter().map(|(planes, _, _)| planes.len()).sum();
         if stacked > MAX_BANDS_PER_ITEM {
@@ -1712,7 +1895,7 @@ impl PlanesTile {
         if let Some(expression) = &self.expression {
             bands = band_math(expression, &bands)?;
         }
-        Ok(ItemBands { bands, integer, sample_type })
+        Ok(ItemBands { bands, stacked, integer, sample_type })
     }
 
     /// The mosaic of the items' bands, and the first raster's sample type. Items are read
@@ -1723,13 +1906,20 @@ impl PlanesTile {
         scenes: &[Vec<String>],
     ) -> Result<Option<(Selected, SampleType)>, EngineError> {
         use futures_util::StreamExt;
-        let pixels = (self.request.tile_size as usize).pow(2);
+        let pixels = self.window.pixels();
         let mut reading: futures_util::stream::FuturesOrdered<Reading<'_, ItemBands>> =
             futures_util::stream::FuturesOrdered::new();
         let mut next = 0;
         let mut fold: Option<(Fold, SampleType)> = None;
+        // A tile's planes are small, and its items are read eight at once from the start.
+        // An image's can be large: its first item is read alone, and how many follow at
+        // once is set by what that one took.
+        let mut ahead = match self.window {
+            Window::Tile(_) => MOSAIC_SCENES_AHEAD,
+            Window::Part { .. } => 1,
+        };
         loop {
-            while reading.len() < MOSAIC_SCENES_AHEAD && next < scenes.len() {
+            while reading.len() < ahead && next < scenes.len() {
                 reading.push_back(Box::pin(self.item(engine, &scenes[next])));
                 next += 1;
             }
@@ -1737,6 +1927,10 @@ impl PlanesTile {
                 break;
             };
             let item = item?;
+            if matches!(self.window, Window::Part { .. }) {
+                ahead = (2 * MAX_PLANE_VALUES / (item.stacked.max(item.bands.len()).max(1) * pixels).max(1))
+                    .clamp(1, MOSAIC_SCENES_AHEAD);
+            }
             let (fold, _) = match &mut fold {
                 Some(fold) => fold,
                 None => {
@@ -1752,6 +1946,7 @@ impl PlanesTile {
                             scenes.len()
                         )));
                     }
+                    check_working_bytes(Fold::<f32>::working_bytes(self.selection, bands, pixels))?;
                     fold.insert((Fold::new(self.selection, bands, pixels, item.integer), item.sample_type))
                 }
             };
@@ -1773,6 +1968,76 @@ impl PlanesTile {
             }
         }
         Ok(fold.and_then(|(fold, sample_type)| fold.finish().map(|selected| (selected, sample_type))))
+    }
+}
+
+/// How the bands a mosaic of planes leaves are to be shown.
+struct Look<'a> {
+    rescale: &'a [(f32, f32)],
+    colormap: ColormapName,
+    formula: Option<&'a cogzilla_kernel::ColorFormula>,
+    /// The format asked for and its media type; `None` leaves it to the mask.
+    asked: Option<(OutputFormat, &'static str)>,
+    jpeg_quality: u8,
+    return_mask: bool,
+}
+
+impl PlanesTile {
+    /// The mosaic as a picture of `width` by `height`, which is the window's size.
+    async fn picture(
+        &self,
+        engine: &TileEngine,
+        scenes: &[Vec<String>],
+        width: usize,
+        height: usize,
+        look: &Look<'_>,
+    ) -> Result<(Bytes, &'static str), EngineError> {
+        let pixels = width * height;
+        let (rgba, bands, full) = match self.mosaic(engine, scenes).await? {
+            None => (vec![0u8; pixels * 4], 1, false),
+            Some((selected, sample_type)) => {
+                // Without `rescale`: the type's own range for a raster's numbers, and the
+                // renderer's default for band math.
+                let math = self.expression.is_some() || self.assets.iter().any(|a| a.expression.is_some());
+                let default = if math {
+                    (-1.0, 1.0)
+                } else {
+                    super::default_rescale_for_dtype(sample_type, selected.bands == 1)
+                };
+                // A pixel is there when any band of it is.
+                let per_band = selected.values.len() / selected.bands.max(1);
+                let full =
+                    (0..per_band).all(|i| selected.values.iter().skip(i).step_by(per_band).any(|v| !v.is_nan()));
+                // The driver TiTiler would have tried: the one asked for, or JPEG when
+                // every pixel is there and PNG when not.
+                let driver = match look.asked {
+                    Some((OutputFormat::Jpeg { .. }, _)) => "JPEG",
+                    Some((OutputFormat::Webp { .. }, _)) => "WEBP",
+                    Some(_) => "PNG",
+                    None if full => "JPEG",
+                    None => "PNG",
+                };
+                let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap).map_err(|bands| {
+                    EngineError::BadRequest(format!(
+                        "Could not encode array of shape ({bands},{height},{width}) and of datatype `uint8` using {driver} driver"
+                    ))
+                })?;
+                (rgba, selected.bands, full)
+            }
+        };
+        // With no format asked for, the mask decides it. Two bands carry theirs as a third,
+        // so their picture is never transparent and cannot say.
+        let asked = match look.asked {
+            Some(asked) => asked,
+            None => parse_ext_format(if full { "jpg" } else { "png" }, None, look.jpeg_quality)?,
+        };
+        // Two bands and a mask are three bands to GDAL, and JPEG has no such picture.
+        if bands == 2 && matches!(asked.0, OutputFormat::Jpeg { .. }) {
+            return Err(EngineError::BadRequest(format!(
+                "Could not encode array of shape (2,{height},{width}) and of datatype `uint8` using JPEG driver"
+            )));
+        }
+        encode_picture(rgba, width, height, look.formula, Some(asked), look.jpeg_quality, look.return_mask)
     }
 }
 
@@ -1826,11 +2091,11 @@ fn paint_bands(
 /// Bring the assets and their options to what the tile and image renderer takes, and
 /// give back the asset names. The renderer reads either the bands of one raster or the
 /// first band of several, so it can honour `bidx` and band math on a single asset, and
-/// `bidx=1` on each of several. Anything else is refused rather than drawn differently:
-/// tiles do not come here with it ([`wants_planes`]), `bbox` and `feature` images do.
+/// `bidx=1` on each of several. Anything else is refused rather than drawn differently,
+/// and does not come here: it is made from planes ([`wants_planes`]).
 fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<String>, Resp> {
     let unsupported = |what: &str| {
-        detail(StatusCode::BAD_REQUEST, format!("{what} is not supported on bbox and feature images yet (tiles take it)"))
+        detail(StatusCode::BAD_REQUEST, format!("{what} is not supported by the renderer"))
     };
     // TiTiler 2 takes band indexes per asset only; a bare `bidx` is passed over.
     pq.bidx.clear();
@@ -2002,7 +2267,21 @@ async fn part_image(
         Ok(q) => q,
         Err(r) => return r,
     };
-    let names = match renderer_assets(&mut pq, &query) {
+    // An image is made from planes, each raster read the way GDAL's nearest-neighbour warp
+    // reads it, which is what TiTiler's pixels are. The shared renderer draws the rest:
+    // the other resampling methods and the algorithms, where it can.
+    let nearest = query.resampling == ResampleMode::Nearest && query.reproject == ResampleMode::Nearest;
+    // The renderer's band math knows names and functions that band math over planes does
+    // not (`ndvi`, `^`, `max(a, b)`); what only it can read, it draws.
+    let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok();
+    let planes_can = pq.expr_raw.as_ref().is_none_or(reads)
+        && query.assets.iter().all(|a| a.expression.as_ref().is_none_or(reads));
+    let planes_needed = wants_planes(&pq, &query);
+    let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
+    // The request's own band math, before an asset's is put in its place for the renderer.
+    let expression = pq.expr_raw.clone();
+    let names = if planes_needed { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
+    let names = match names {
         Ok(names) => names,
         Err(r) => return r,
     };
@@ -2027,8 +2306,10 @@ async fn part_image(
             "raw array formats are not supported on pgSTAC bbox and feature routes yet",
         );
     }
-    // A JPEG has no mask to carry the polygon, and TiTiler then writes the whole box.
-    let mask = if matches!(format, Some((OutputFormat::Jpeg { .. }, _))) { None } else { mask };
+    // A JPEG has no mask to carry the polygon, and TiTiler then writes the whole box as it
+    // was read. With `rescale` it does not: rescaling leaves zero wherever the mask is.
+    let whole_box = matches!(format, Some((OutputFormat::Jpeg { .. }, _))) && pq.rescale.is_empty();
+    let mask = if whole_box { None } else { mask };
 
     let grid = part_grid(size, bbox);
     let items = match pg.items_for_pixels(geometry, hash, query.limits, &names, grid, query.lookup).await {
@@ -2058,6 +2339,53 @@ async fn part_image(
             .map(cogzilla_kernel::ColorFormula::parse)
             .transpose()
             .map_err(EngineError::BadRequest)?;
+        // Assets that do not lie on one grid cannot be read as the bands of one image.
+        let mut first = Vec::with_capacity(scenes[0].len());
+        for href in &scenes[0] {
+            first.push(engine.store.open_uri(href).await?);
+        }
+        // A raster with an alpha band is the renderer's too: it reads the alpha as the mask.
+        let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty());
+        if planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
+            if pq.algorithm.is_some() {
+                return Err(EngineError::BadRequest(
+                    "`algorithm` is not supported with these assets and options yet".into(),
+                ));
+            }
+            // The first item sets the size, by the finest of its rasters: rio-tiler reads
+            // each asset at its own and brings them all to the largest.
+            let mut res = f64::INFINITY;
+            for cog in &first {
+                let crs = engine.get_or_build_crs(cog)?;
+                res = res.min(wgs84_resolution(&crs, cog).ok_or_else(|| {
+                    EngineError::BadRequest("cannot place the first item in WGS84".into())
+                })?);
+            }
+            let (w, h) = part_dims(size, bbox, res);
+            if w > u64::from(MAX_PART_SIDE) || h > u64::from(MAX_PART_SIDE) {
+                return Err(EngineError::BadRequest(format!(
+                    "the image would be {w}x{h} pixels; the limit is {MAX_PART_SIDE} per side (pass max_size, or width and height)"
+                )));
+            }
+            let job = PlanesTile {
+                assets: query.assets.clone(),
+                as_band: query.asset_as_band,
+                expression: expression.clone(),
+                selection: query.selection.unwrap_or(Selection::First),
+                resampling: query.resampling,
+                reproject: query.reproject,
+                window: Window::Part { bbox, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
+            };
+            let look = Look {
+                rescale: &pq.rescale,
+                colormap: pq.colormap,
+                formula: formula.as_ref(),
+                asked: format.map(|(f, ct)| (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct })),
+                jpeg_quality: pq.jpeg_quality,
+                return_mask: pq.return_mask,
+            };
+            return job.picture(engine, &scenes, w as usize, h as usize, &look).await;
+        }
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
         // With a pixel selection other than `first`: every scene's values, and how to colour them.
@@ -2108,6 +2436,7 @@ async fn part_image(
                             scenes.len()
                         )));
                     }
+                    check_working_bytes(Fold::<f32>::working_bytes(method, count, width * height))?;
                     let integer = whole_numbers(pq.unscale, &bands, full.sample_type);
                     selecting = Some((Fold::new(method, count, width * height, integer), paint));
                 }
@@ -2388,7 +2717,14 @@ async fn warp_nearest(
                 .collect();
             let level = gdal_overview_level(&reduced, native, (width, height));
             let grid = if level == 0 { (native.0 as usize, native.1 as usize) } else { (reduced[level].0 as usize, reduced[level].1 as usize) };
-            (level, grid, grid.0.min(512))
+            // Each output row is worked out along a whole row of that grid. A box far
+            // larger than what is asked of it makes the grid enormous; past what a
+            // picture's own rows cost many times over, the direct road is taken.
+            if grid.0 > 16 * width.max(MAX_PART_SIDE as usize) {
+                (gdal_overview_level(&sizes, native, (width, height)), (width, height), width)
+            } else {
+                (level, grid, grid.0.min(512))
+            }
         }
     };
     let ifd = &cog.index.ifds[level];
@@ -2754,6 +3090,7 @@ async fn feature_statistics(
                         && !req.unscale
                         && assets.iter().all(|a| a.expression.is_none())
                         && !matches!(cogs[0].index.full_res().sample_type, SampleType::Float32 | SampleType::Float64);
+                    check_working_bytes(Fold::<f64>::working_bytes(method, canvas.len(), width * height))?;
                     fold = Some(Fold::new(method, canvas.len(), width * height, integer));
                 }
             }
@@ -3257,61 +3594,24 @@ async fn tile(
                     selection: selection.unwrap_or(Selection::First),
                     resampling,
                     reproject,
-                    request: crate::engine::TileRequest {
+                    window: Window::Tile(crate::engine::TileRequest {
                         tile,
                         tile_size: dim,
                         bands: BandRequest::Single { band_1based: 1, rescale: (0.0, 255.0), colormap: ColormapName::Grayscale },
                         resample: reproject,
                         format: OutputFormat::RawF32,
                         unscale: pq.unscale,
-                    },
+                    }),
                 };
-                let pixels = (dim as usize).pow(2);
-                let (rgba, bands, full) = match job.mosaic(engine, &scenes).await? {
-                    None => (vec![0u8; pixels * 4], 1, false),
-                    Some((selected, sample_type)) => {
-                        // Without `rescale`: the type's own range for a raster's numbers,
-                        // and the renderer's default for band math.
-                        let math = job.expression.is_some() || job.assets.iter().any(|a| a.expression.is_some());
-                        let default = if math {
-                            (-1.0, 1.0)
-                        } else {
-                            super::default_rescale_for_dtype(sample_type, selected.bands == 1)
-                        };
-                        // A pixel is there when any band of it is.
-                        let per_band = selected.values.len() / selected.bands.max(1);
-                        let full = (0..per_band)
-                            .all(|i| selected.values.iter().skip(i).step_by(per_band).any(|v| !v.is_nan()));
-                        // The driver TiTiler would have tried: the one asked for, or JPEG
-                        // when every pixel is there and PNG when not.
-                        let driver = match asked {
-                            Some((OutputFormat::Jpeg { .. }, _)) => "JPEG",
-                            Some((OutputFormat::Webp { .. }, _)) => "WEBP",
-                            Some(_) => "PNG",
-                            None if full => "JPEG",
-                            None => "PNG",
-                        };
-                        let rgba = paint_bands(&selected, pixels, &pq.rescale, default, pq.colormap).map_err(|bands| {
-                            EngineError::BadRequest(format!(
-                                "Could not encode array of shape ({bands},{dim},{dim}) and of datatype `uint8` using {driver} driver"
-                            ))
-                        })?;
-                        (rgba, selected.bands, full)
-                    }
+                let look = Look {
+                    rescale: &pq.rescale,
+                    colormap: pq.colormap,
+                    formula: formula.as_ref(),
+                    asked,
+                    jpeg_quality,
+                    return_mask,
                 };
-                // With no format asked for, the mask decides it. Two bands carry theirs as
-                // a third, so their picture is never transparent and cannot say.
-                let asked = match asked {
-                    Some(asked) => asked,
-                    None => parse_ext_format(if full { "jpg" } else { "png" }, None, jpeg_quality)?,
-                };
-                // Two bands and a mask are three bands to GDAL, and JPEG has no such picture.
-                if bands == 2 && matches!(asked.0, OutputFormat::Jpeg { .. }) {
-                    return Err(EngineError::BadRequest(format!(
-                        "Could not encode array of shape (2,{dim},{dim}) and of datatype `uint8` using JPEG driver"
-                    )));
-                }
-                return encode_picture(rgba, dim as usize, formula.as_ref(), Some(asked), jpeg_quality, return_mask);
+                return job.picture(engine, &scenes, dim as usize, dim as usize, &look).await;
             }
             // On planes the bands are counted after an asset's own options; here they are the raster's.
             if asset_as_band && full.samples_per_pixel > 1 {
@@ -3387,7 +3687,7 @@ async fn tile(
                 engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?.to_vec()
             };
             let asked = (!auto_format).then_some((asked, content_type));
-            encode_picture(rgba, dim, formula.as_ref(), asked, jpeg_quality, return_mask)
+            encode_picture(rgba, dim, dim, formula.as_ref(), asked, jpeg_quality, return_mask)
         })
         .await;
     match rendered {
@@ -3396,12 +3696,13 @@ async fn tile(
     }
 }
 
-/// A square RGBA picture as the response's bytes and media type: the colour formula, then
+/// An RGBA picture as the response's bytes and media type: the colour formula, then
 /// the format asked for or, with none, TiTiler's choice of JPEG when every pixel is there
 /// and PNG when not.
 fn encode_picture(
     mut rgba: Vec<u8>,
-    dim: usize,
+    width: usize,
+    height: usize,
     formula: Option<&cogzilla_kernel::ColorFormula>,
     asked: Option<(OutputFormat, &'static str)>,
     jpeg_quality: u8,
@@ -3413,11 +3714,11 @@ fn encode_picture(
     let (format, content_type) = match asked {
         Some(asked) => asked,
         None => {
-            let opaque = rgba.len() == dim * dim * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
+            let opaque = rgba.len() == width * height * 4 && rgba.chunks_exact(4).all(|p| p[3] == 255);
             parse_ext_format(if opaque { "jpg" } else { "png" }, None, jpeg_quality)?
         }
     };
-    Ok((encode_rgba_output(dim, dim, &rgba, format, return_mask), content_type))
+    Ok((encode_rgba_output(width, height, &rgba, format, return_mask), content_type))
 }
 
 /// What the router does with `/collections/{c}/items/{i}/...`.
