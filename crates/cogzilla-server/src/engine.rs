@@ -82,6 +82,8 @@ pub enum EngineError {
     NotFound(String),
     #[error("no content")]
     NoContent,
+    #[error("method not allowed")]
+    MethodNotAllowed(&'static str),
     #[error("{0}")]
     Shared(Arc<EngineError>),
 }
