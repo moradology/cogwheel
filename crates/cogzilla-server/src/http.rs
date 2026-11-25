@@ -1131,6 +1131,19 @@ fn tile_intersects_cog(
         let Ok(dst_crs) = tms_def.crs_model() else {
             return Ok(true);
         };
+        if !matches!(
+            dst_crs,
+            cogzilla_proj::CrsModel::Geographic | cogzilla_proj::CrsModel::Epsg3857
+        ) {
+            // Check intersection directly in the TMS's native projected CRS so polar
+            // (UPSArctic/Antarctic) and antimeridian (LINZ/NZTM) tiles never falsely 404.
+            return match reproject_wgs84_bounds([cw, cs, ce, cn], &dst_crs) {
+                Ok([cx0, cy0, cx1, cy1]) => {
+                    Ok(tb[2] >= cx0 && tb[0] <= cx1 && tb[3] >= cy0 && tb[1] <= cy1)
+                }
+                Err(_) => Ok(true),
+            };
+        }
         match bbox_to_wgs84(tb, Some(&dst_crs)) {
             Ok(w) => w,
             Err(_) => return Ok(true),
@@ -1715,17 +1728,57 @@ fn build_tile_request(
     is_crs84: bool,
     source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
-    if tile.z > 30 {
-        return Err(EngineError::BadRequest(format!(
-            "zoom level z={} exceeds maximum supported zoom (30)",
-            tile.z
-        )));
-    }
-    let rows = 1u64 << (tile.z as u32);
-    let cols = if is_crs84 { rows << 1 } else { rows };
+    let tms_id = if is_crs84 {
+        "WorldCRS84Quad"
+    } else {
+        "WebMercatorQuad"
+    };
+    build_tile_request_for_tms(
+        engine,
+        tile,
+        scale_opt,
+        ext_opt,
+        pq,
+        default_bands,
+        sample_type,
+        tms_id,
+        source_cog,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tile_request_for_tms(
+    engine: Option<&TileEngine>,
+    tile: TileCoord,
+    scale_opt: Option<u32>,
+    ext_opt: Option<&str>,
+    pq: &ParsedQuery,
+    default_bands: u16,
+    sample_type: cogzilla_tiff::SampleType,
+    tms_id: &str,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+) -> Result<(TileRequest, &'static str), EngineError> {
+    let (cols, rows, target_is_4326) = if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
+        let Some(m) = tms_def.matrix(tile.z) else {
+            return Err(EngineError::BadRequest(format!(
+                "zoom level z={} is not defined for tile matrix set '{}'",
+                tile.z, tms_id
+            )));
+        };
+        (m.matrix_width, m.matrix_height, tms_def.epsg == 4326)
+    } else {
+        if tile.z > 30 {
+            return Err(EngineError::BadRequest(format!(
+                "zoom level z={} exceeds maximum supported zoom (30)",
+                tile.z
+            )));
+        }
+        let rows = 1u64 << (tile.z as u32);
+        (rows, rows, false)
+    };
     if (tile.x as u64) >= cols || (tile.y as u64) >= rows {
         return Err(EngineError::BadRequest(format!(
-            "tile coordinate ({}, {}) out of range for z={} (expected x < {cols}, y < {rows})",
+            "tile coordinate ({}, {}) out of range for {tms_id} z={} (expected x < {cols}, y < {rows})",
             tile.x, tile.y, tile.z
         )));
     }
@@ -1746,7 +1799,7 @@ fn build_tile_request(
             tile,
             tile_size,
             bands,
-            resample: resolve_resample(engine, pq, source_cog, is_crs84),
+            resample: resolve_resample(engine, pq, source_cog, target_is_4326),
             format,
             unscale: pq.unscale,
         },
@@ -2822,13 +2875,15 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
+                            let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
+                            let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
                             let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             let b = wrap_geotiff(
                                 b,
                                 ct,
-                                ts,
-                                ts,
-                                [min_x, min_y, max_x, max_y],
+                                out_dim,
+                                out_dim,
+                                buf_bbox,
                                 3857,
                                 pq.return_mask,
                             );
@@ -2897,14 +2952,15 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
-                            let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
+                            let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
+                            let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
                             let b = render_mosaic_tile_styled(&engine, &pq.urls, treq, &pq).await?;
                             let b = wrap_geotiff(
                                 b,
                                 ct,
-                                ts,
-                                ts,
-                                [min_x, min_y, max_x, max_y],
+                                out_dim,
+                                out_dim,
+                                buf_bbox,
                                 3857,
                                 pq.return_mask,
                             );
@@ -2992,13 +3048,15 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
+                            let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
+                            let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
                             let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
                             let b = wrap_geotiff(
                                 b,
                                 ct,
-                                ts,
-                                ts,
-                                [min_x, min_y, max_x, max_y],
+                                out_dim,
+                                out_dim,
+                                buf_bbox,
                                 3857,
                                 pq.return_mask,
                             );
@@ -3713,7 +3771,7 @@ where
                             cogs[0].index.full_res().samples_per_pixel
                         };
                         let st = cogs[0].index.full_res().sample_type;
-                        let (mut treq, ct) = build_tile_request(
+                        let (mut treq, ct) = build_tile_request_for_tms(
                             Some(&engine),
                             TileCoord { z, x, y },
                             sc,
@@ -3721,7 +3779,7 @@ where
                             &pq_stac,
                             db,
                             st,
-                            tms == "WorldCRS84Quad",
+                            tms,
                             Some(&cogs[0]),
                         )?;
                         if pq_stac.unscale {
@@ -4242,12 +4300,13 @@ where
             (Method::GET, ["info"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let mut json = build_cog_info(&engine, &cogs[0])?;
-                if let Some((ref dst, _)) = pq.bounds_crs {
+                if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
                     let wgs = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                     let rep = reproject_wgs84_bounds(wgs, dst)?;
                     json["bounds"] = serde_json::json!(rep);
+                    json["crs"] = serde_json::json!(format!("http://www.opengis.net/def/crs/EPSG/0/{dst_epsg}"));
                 }
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
@@ -4257,12 +4316,13 @@ where
             (Method::GET, ["info.geojson"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let mut json = build_cog_info_geojson(&engine, &cogs[0])?;
-                if let Some((ref dst, _)) = pq.bounds_crs {
+                if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
                     let wgs = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                     let rep = reproject_wgs84_bounds(wgs, dst)?;
                     json["properties"]["bounds"] = serde_json::json!(rep);
+                    json["properties"]["crs"] = serde_json::json!(format!("http://www.opengis.net/def/crs/EPSG/0/{dst_epsg}"));
                 }
                 Ok((Bytes::from(json.to_string()), "application/geo+json"))
             }
@@ -4458,7 +4518,7 @@ where
                             cogs[0].index.full_res().samples_per_pixel
                         };
                         let st = cogs[0].index.full_res().sample_type;
-                        let (mut treq, ct) = build_tile_request(
+                        let (mut treq, ct) = build_tile_request_for_tms(
                             Some(&engine),
                             TileCoord { z, x, y },
                             sc,
@@ -4466,7 +4526,7 @@ where
                             &pq,
                             db,
                             st,
-                            tms == "WorldCRS84Quad",
+                            tms,
                             Some(&cogs[0]),
                         )?;
                         if pq.unscale {
@@ -5091,7 +5151,7 @@ fn to_http_response(
         Ok((bytes, content_type)) => {
             let is_binary_tile = content_type.starts_with("image/")
                 || content_type == "application/octet-stream"
-                || content_type == "application/x-npy";
+                || content_type == "application/x-binary";
             let etag = is_binary_tile.then(|| crate::tile_cache::compute_tile_etag(&bytes));
             binary_or_plain_response(engine, bytes, content_type, etag, if_none_match)
         }

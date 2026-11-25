@@ -523,7 +523,7 @@ impl CrsModel {
     }
 
     /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
-    /// (e.g. global NOAA/ERA5/climate grids with `min_lon >= -1e-6` and `max_lon > 180.0 + 1e-6`).
+    /// (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western overhang).
     pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
         if !matches!(self, CrsModel::Geographic) {
             return false;
@@ -532,7 +532,8 @@ impl CrsModel {
         let (x1, _) = pixel_to_crs.forward(width as f64, 0.0);
         let lo = x0.min(x1);
         let hi = x0.max(x1);
-        lo >= -1e-6 && hi > 180.0 + 1e-6
+        let px_w = ((hi - lo) / (width.max(1) as f64)).max(1e-6);
+        lo >= -px_w && hi > 180.0 + 1e-6
     }
 
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
@@ -591,7 +592,7 @@ impl CrsModel {
 
         // Check whether North or South Pole lies inside the raster footprint (polar CRSes).
         // Skip for Web Mercator (clamps ±90° to ±85.0511°) and Geographic (rectangular lon/lat).
-        if !matches!(self, Self::Epsg3857 | Self::Geographic) {
+        if !matches!(self, Self::Epsg3857 | Self::Geographic | Self::WorldMercator) {
             if let Some(crs_to_pixel) = pixel_to_crs.invert() {
                 for &pole_lat in &[90.0_f64, -90.0_f64] {
                     let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
@@ -1029,7 +1030,10 @@ impl<const N: usize> CoordPlan<N> {
                     let wrap_360 = if crs_to_pixel.a.abs() > 1e-18 {
                         let x0 = -crs_to_pixel.c / crs_to_pixel.a;
                         let x1 = (ifd_w as f64 - crs_to_pixel.c) / crs_to_pixel.a;
-                        x0.min(x1) >= -1e-6 && x0.max(x1) > 180.0 + 1e-6
+                        let lo = x0.min(x1);
+                        let hi = x0.max(x1);
+                        let px_w = ((hi - lo) / (ifd_w.max(1) as f64)).max(1e-6);
+                        lo >= -px_w && hi > 180.0 + 1e-6
                     } else {
                         false
                     };
@@ -1515,7 +1519,7 @@ fn world_mercator_inverse(x: f64, y: f64) -> (f64, f64) {
     for _ in 0..8 {
         let con = E * phi.sin();
         let next = std::f64::consts::FRAC_PI_2
-            - 2.0 * (ts * ((1.0 - con) / (1.0 + con)).powf(-0.5 * E)).atan();
+            - 2.0 * (ts * ((1.0 - con) / (1.0 + con)).powf(0.5 * E)).atan();
         if (next - phi).abs() < 1e-13 {
             phi = next;
             break;
@@ -1958,5 +1962,15 @@ mod tests {
         .expect("0..360 geographic grid should intersect Western Hemisphere tile");
         let (c0, c1, _, _) = plan.src_pixel_bounds();
         assert!(c0 >= 178 && c1 <= 272, "expected wrapped cols in [178..272], got {c0}..{c1}");
+
+        // Verify EPSG:3395 World Mercator forward/inverse round-trip accuracy (< 1e-9 deg)
+        for (lon, lat) in [(10.0, 45.0), (-122.4194, 37.7749), (140.0, -35.0), (0.0, 0.0)] {
+            let (mx, my) = world_mercator_forward(lon, lat);
+            let (rlon, rlat) = world_mercator_inverse(mx, my);
+            assert!(
+                (rlon - lon).abs() < 1e-9 && (rlat - lat).abs() < 1e-9,
+                "EPSG:3395 round-trip failed for ({lon}, {lat}) -> ({rlon}, {rlat})"
+            );
+        }
     }
 }

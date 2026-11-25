@@ -129,16 +129,34 @@ pub struct TileEngine {
     pub stats: Arc<EngineStats>,
 }
 
+fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
+    let close = |x: f64, y: f64| (x - y).abs() <= 1e-6 * (1.0 + x.abs().max(y.abs()));
+    close(a.a, b.a)
+        && close(a.b, b.b)
+        && close(a.c, b.c)
+        && close(a.d, b.d)
+        && close(a.e, b.e)
+        && close(a.f, b.f)
+}
+
 /// Fast check whether all COGs in a multi-COG / STAC composite share the exact same base
-/// dimensions, tile grid, and overview count (allowing the zero-copy single-grid fast path).
+/// dimensions, tile grid, overview count, CRS, and geotransform (allowing the single-grid fast path).
 pub(crate) fn cogs_share_base_grid(cogs: &[Arc<OpenedCog>]) -> bool {
     if cogs.len() <= 1 {
         return true;
     }
     let p = cogs[0].index.full_res();
+    let p_gk = &cogs[0].index.geo_keys;
     let n_ifds = cogs[0].index.ifds.len();
     cogs.iter().skip(1).all(|c| {
         if c.index.ifds.len() != n_ifds {
+            return false;
+        }
+        let o_gk = &c.index.geo_keys;
+        if o_gk.projected_cs_type != p_gk.projected_cs_type
+            || o_gk.geographic_type != p_gk.geographic_type
+            || o_gk.model_type != p_gk.model_type
+        {
             return false;
         }
         let o = c.index.full_res();
@@ -148,6 +166,7 @@ pub(crate) fn cogs_share_base_grid(cogs: &[Arc<OpenedCog>]) -> bool {
             && o.tile_height == p.tile_height
             && o.tiles_across == p.tiles_across
             && o.tiles_down == p.tiles_down
+            && affines_match(&o.pixel_to_crs, &p.pixel_to_crs)
     })
 }
 
@@ -1577,7 +1596,10 @@ impl TileEngine {
         let n = req.tile_size as usize;
         let total_pixels = n * n;
         let f32_bands: usize = match req.bands {
-            BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+            BandRequest::Rgb { .. }
+            | BandRequest::SarRgb { .. }
+            | BandRequest::Terrain { .. }
+            | BandRequest::CustomExprRgb { .. } => 3,
             _ => 1,
         };
 

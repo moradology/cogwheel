@@ -6,7 +6,7 @@ variable "function_name" {
 
 variable "cogzilla_version" {
   type        = string
-  default     = "v0.5.49"
+  default     = "v0.5.50"
   description = "Release tag to download from GitHub Releases (ignored when zip_path is set)."
 }
 
