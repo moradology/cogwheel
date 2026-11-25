@@ -113,6 +113,80 @@ async fn slow_storage(body: Arc<Vec<u8>>, seen: Arc<Seen>) -> String {
     format!("http://{addr}")
 }
 
+/// The pixels of an 8-bit PNG as RGBA. One scene alone may be written with a palette where a
+/// mosaic is written as RGBA, so pictures are compared by their pixels, not their bytes.
+fn rgba(png: &[u8]) -> Vec<u8> {
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    let (mut at, mut header, mut palette, mut clear, mut packed) = (8, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    while at + 8 <= png.len() {
+        let length = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        let body = &png[at + 8..at + 8 + length];
+        match &png[at + 4..at + 8] {
+            b"IHDR" => header = body.to_vec(),
+            b"PLTE" => palette = body.to_vec(),
+            b"tRNS" => clear = body.to_vec(),
+            b"IDAT" => packed.extend_from_slice(body),
+            _ => {}
+        }
+        at += 12 + length;
+    }
+    let width = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
+    let height = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+    assert_eq!((header[8], header[12]), (8, 0), "eight bits a sample, not interlaced");
+    let kind = header[9];
+    let samples = match kind {
+        0 | 3 => 1,
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        other => panic!("colour type {other}"),
+    };
+    let stride = width * samples;
+    let mut lines = vec![0u8; height * (stride + 1)];
+    let wrote = libdeflater::Decompressor::new().zlib_decompress(&packed, &mut lines).unwrap();
+    assert_eq!(wrote, lines.len());
+    let mut flat = vec![0u8; height * stride];
+    for row in 0..height {
+        let filter = lines[row * (stride + 1)];
+        for i in 0..stride {
+            let left = if i >= samples { flat[row * stride + i - samples] as i32 } else { 0 };
+            let up = if row > 0 { flat[(row - 1) * stride + i] as i32 } else { 0 };
+            let corner = if row > 0 && i >= samples { flat[(row - 1) * stride + i - samples] as i32 } else { 0 };
+            let predicted = match filter {
+                0 => 0,
+                1 => left,
+                2 => up,
+                3 => (left + up) / 2,
+                4 => {
+                    let p = left + up - corner;
+                    let (a, b, c) = ((p - left).abs(), (p - up).abs(), (p - corner).abs());
+                    if a <= b && a <= c {
+                        left
+                    } else if b <= c {
+                        up
+                    } else {
+                        corner
+                    }
+                }
+                other => panic!("filter {other}"),
+            };
+            flat[row * stride + i] = lines[row * (stride + 1) + 1 + i].wrapping_add(predicted as u8);
+        }
+    }
+    flat.chunks_exact(samples)
+        .flat_map(|px| match kind {
+            0 => [px[0], px[0], px[0], 255],
+            2 => [px[0], px[1], px[2], 255],
+            3 => {
+                let i = px[0] as usize;
+                [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2], clear.get(i).copied().unwrap_or(255)]
+            }
+            4 => [px[0], px[0], px[0], px[1]],
+            _ => [px[0], px[1], px[2], px[3]],
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benches/fixtures/mercator_4k_zstd_p3.tif");
@@ -161,8 +235,15 @@ async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     assert_eq!(paths.len(), 6);
     assert_eq!(peak_ramped, 3, "the ramp reads one scene, then two, then the three that are left");
     assert_eq!(together, ramped, "how many scenes are read at once must not change the tile");
-    // Every scene is the same picture, so six of them composite to what one gives.
-    assert_eq!(together, single);
+    // Every scene is the same picture, so six of them composite to what one gives: the same
+    // pixels covered, and the same colours to within a step of the colour map, which is how
+    // far the palette one scene is written with can sit from the mosaic's RGBA.
+    let (six, one) = (rgba(&together), rgba(&single));
+    assert_eq!(six.len(), one.len());
+    for (at, (a, b)) in six.chunks_exact(4).zip(one.chunks_exact(4)).enumerate() {
+        let near = a[3] == b[3] && a.iter().zip(b).all(|(p, q)| p.abs_diff(*q) <= 3);
+        assert!(near, "pixel {},{}: six scenes drew {a:?}, one drew {b:?}", at % 256, at / 256);
+    }
 
     eprintln!("one scene {one_scene:?}; six together {all_at_once:?}; six ramped {ramp:?}");
     // Generous bounds: read one after another, six scenes would take six times one.
@@ -187,7 +268,7 @@ async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     .await
     .expect("scenes dropped mid-read must be readable afterwards")
     .unwrap();
-    assert_eq!(again, single);
+    assert_eq!(again, together);
     // And many tiles at once, each dropping scenes as it fills, all come back.
     let engine = Arc::new(engine);
     let mut tiles = tokio::task::JoinSet::new();
@@ -201,6 +282,6 @@ async fn mosaic_scenes_are_read_together_and_composited_in_order() {
     let all = tokio::time::timeout(Duration::from_secs(60), tiles.join_all()).await.expect("no tile may hang");
     for result in all {
         let (kind, bytes) = result.unwrap();
-        assert_eq!(bytes, if kind == 0 { full.clone() } else { single.clone() });
+        assert_eq!(bytes, if kind == 0 { full.clone() } else { together.clone() });
     }
 }

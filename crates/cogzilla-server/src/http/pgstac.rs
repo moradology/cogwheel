@@ -1531,10 +1531,7 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.assets.is_empty() {
         return Err(missing_query_param("assets"));
     }
-    // `reproject`, `asset_as_band`, and `histogram_bins` are handled here with pgstac's own 422s.
-    if let Some(e) = pq.errors.iter().find(|e| {
-        !e.contains("'reproject'") && !e.contains("asset_as_band") && !e.contains("histogram_bins")
-    }) {
+    if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
     }
     let assets = parse_assets(pairs)?;
@@ -1594,6 +1591,19 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         resampling: parse_resample(pairs, "resampling")?,
         reproject: parse_resample(pairs, "reproject")?,
     })
+}
+
+/// Whether the shared parser's complaint is about something these routes read for
+/// themselves and answer as titiler-pgstac does, with a 422: `reproject`, which the shared
+/// parser does not know, `asset_as_band`, `histogram_bins` and the options of `assets`.
+fn own_error(e: &str) -> bool {
+    e.contains("'reproject'") || e.contains("asset_as_band") || e.contains("histogram_bins") || e.contains("in |bidx=")
+}
+
+/// Whether the shared parser's complaint is about a `width` or `height` it could not read.
+/// Routes that take those answer for them themselves, with a 422.
+fn own_size_error(e: &str) -> bool {
+    e.starts_with("invalid width=") || e.starts_with("invalid height=")
 }
 
 /// The asset names of a request, once its `expression` is known not to use them: band math
@@ -2264,7 +2274,7 @@ async fn part_image(
     pairs: &[(String, String)],
 ) -> Resp {
     // `width` and `height` are read here; the shared parser does not know them.
-    pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'"));
+    pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'") && !own_size_error(e));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3235,7 +3245,7 @@ async fn mosaic_statistics(
         "'width'", "'height'", "'categorical'", "'c'", "'p'", "'histogram_bins'",
         "'histogram_range'", "'cover_scale'",
     ];
-    pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)));
+    pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)) && !own_size_error(e));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3350,7 +3360,7 @@ async fn point_values(
     if pq.assets.is_empty() {
         return missing_query_param("assets");
     }
-    if let Some(e) = pq.errors.iter().find(|e| !e.contains("'reproject'")) {
+    if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return detail(StatusCode::BAD_REQUEST, e.clone());
     }
     let specs = match parse_assets(pairs) {
