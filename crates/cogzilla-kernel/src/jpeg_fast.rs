@@ -21,6 +21,19 @@ pub fn encode_jpeg_rgb(width: u32, height: u32, rgb: &[u8], quality: u8) -> Byte
     Bytes::from(out)
 }
 
+/// Encode an 8-bit grey buffer to a one-component JPEG.
+pub fn encode_jpeg_luma(width: u32, height: u32, luma: &[u8], quality: u8) -> Bytes {
+    let (Ok(w), Ok(h)) = (u16::try_from(width), u16::try_from(height)) else {
+        return Bytes::new();
+    };
+    let mut out = Vec::with_capacity(luma.len() / 4);
+    let enc = Encoder::new(&mut out, quality.clamp(1, 100));
+    if enc.encode(luma, w, h, ColorType::Luma).is_err() {
+        return Bytes::new();
+    }
+    Bytes::from(out)
+}
+
 /// Encode an RGBA8 buffer to JPEG (stripping alpha onto black background, matching TiTiler).
 /// Reuses a thread-local RGB scratch buffer to avoid per-tile heap allocations.
 pub fn encode_jpeg_rgba(width: u32, height: u32, rgba: &[u8], quality: u8) -> Bytes {
