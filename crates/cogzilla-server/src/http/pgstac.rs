@@ -2811,6 +2811,13 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)],
 /// exact one. Positions within twice this of a source pixel's edge are worked out exactly.
 const PICTURE_TOLERANCE: f64 = 1.0 / 128.0;
 
+/// Whether a position drawn along a picture's row is close enough to the edge of a source
+/// pixel that the exact position could be in the pixel next to it.
+fn near_pixel_edge(p: f64) -> bool {
+    let part = p - p.floor();
+    !(2.0 * PICTURE_TOLERANCE..=1.0 - 2.0 * PICTURE_TOLERANCE).contains(&part)
+}
+
 /// How GDAL goes about a warped read, which decides the pixels it takes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WarpPath {
@@ -2938,11 +2945,7 @@ async fn warp_nearest(
                 // tolerance, which only matters next to the edge of a source pixel: there
                 // it could name the neighbour. Those are worked out exactly, so the pixel
                 // taken is always the one the projection itself gives.
-                let near = |p: f64| {
-                    let part = p - p.floor();
-                    part < 2.0 * PICTURE_TOLERANCE || part > 1.0 - 2.0 * PICTURE_TOLERANCE
-                };
-                if near(u) || near(v) {
+                if near_pixel_edge(u) || near_pixel_edge(v) {
                     (u, v) = exact(grid_col);
                 }
             }
@@ -5463,31 +5466,47 @@ mod tests {
     fn scanlines_are_approximated_like_gdal() {
         // A straight row is its two ends joined, whatever lies between.
         let mut out = vec![(0.0, 0.0); 100];
-        approx_scanline(&|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01), &mut out);
+        approx_scanline(&|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01), &mut out, 0.125);
         assert!((out[50].0 - 101.0).abs() < 1e-9 && (out[50].1 - 6.5).abs() < 1e-9);
 
         // A gently curved row is still one straight line: the middle is 0.1 off, under
         // the eighth of a pixel GDAL allows.
         let bend = |i: usize| (i as f64, 0.4 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
-        approx_scanline(&bend, &mut out);
+        approx_scanline(&bend, &mut out, 0.125);
         assert_eq!(out[49].1, 0.0);
         assert!((bend(49).1 - 0.1).abs() < 0.001);
 
         // A sharper curve is split until every piece is within the allowance.
         let curve = |i: usize| (i as f64, 40.0 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
-        approx_scanline(&curve, &mut out);
+        approx_scanline(&curve, &mut out, 0.125);
         for (i, got) in out.iter().enumerate() {
             assert!((got.1 - curve(i).1).abs() <= 0.125, "column {i}: {} vs {}", got.1, curve(i).1);
         }
         // Five points or fewer are worked out one by one, and so is a row that leaves
         // the projection.
         let mut short = vec![(0.0, 0.0); 5];
-        approx_scanline(&curve, &mut short);
+        approx_scanline(&curve, &mut short, 0.125);
         assert_eq!(short[2], curve(2));
         let broken = |i: usize| if i < 30 { (f64::NAN, f64::NAN) } else { (i as f64, 1.0) };
-        approx_scanline(&broken, &mut out);
+        approx_scanline(&broken, &mut out, 0.125);
         assert!(out[10].0.is_nan());
         assert_eq!(out[60], (60.0, 1.0));
+
+        // A picture's rows are held to a tolerance at which, with the positions near a
+        // source pixel's edge worked out again, every pixel is the projection's own.
+        let wave = |i: usize| (i as f64 * 0.37, 300.0 * ((i as f64) / 255.0).powi(2) + (i as f64 * 0.05).sin());
+        let mut row = vec![(0.0, 0.0); 256];
+        approx_scanline(&wave, &mut row, PICTURE_TOLERANCE);
+        for (i, drawn) in row.iter().enumerate() {
+            let exact = wave(i);
+            let off = (drawn.0 - exact.0).abs().max((drawn.1 - exact.1).abs());
+            assert!(off <= 2.0 * PICTURE_TOLERANCE, "column {i} is {off} off");
+            // So a drawn position names another pixel than the exact one only near an edge.
+            if (drawn.0.floor(), drawn.1.floor()) != (exact.0.floor(), exact.1.floor()) {
+                assert!(near_pixel_edge(drawn.0) || near_pixel_edge(drawn.1), "column {i}");
+            }
+        }
+        assert!(near_pixel_edge(7.01) && near_pixel_edge(7.99) && !near_pixel_edge(7.5));
     }
 
     #[test]
