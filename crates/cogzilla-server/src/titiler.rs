@@ -29,8 +29,8 @@ fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta) -> Vec<&'static str> {
             .collect(),
         // Palette (3)
         3 => vec!["palette"; count],
-        // MinIsWhite (0) or MinIsBlack (1) with an explicit alpha channel (e.g. gray+alpha)
-        0 | 1 if alpha_idx.is_some() => (0..count)
+        // MinIsWhite (0) or MinIsBlack (1)
+        0 | 1 => (0..count)
             .map(|i| {
                 if Some(i) == alpha_idx {
                     "alpha"
@@ -96,7 +96,7 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
 
     let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
     let (nodata_type, nodata_value) = match cog.index.nodata {
-        Some(v) if v.is_nan() => ("Nodata", Some(serde_json::json!("nan"))),
+        Some(v) if v.is_nan() => ("Nodata", Some(serde_json::Value::Null)),
         Some(v) => ("Nodata", Some(serde_json::json!(v))),
         None if has_alpha => ("Alpha", None),
         None if full.mask_ifd.is_some() => ("Mask", None),
@@ -2647,19 +2647,38 @@ pub fn encode_geotiff_rgba(
 ) -> Bytes {
     let width = width.clamp(1, 4096);
     let height = height.clamp(1, 4096);
-    let spp: u16 = if return_mask { 4 } else { 3 };
     let n_px = (width as usize) * (height as usize);
+    let mut has_opaque = false;
+    let mut all_gray = true;
+    for px in rgba.chunks_exact(4).take(n_px) {
+        if px[3] > 0 {
+            has_opaque = true;
+            if px[0] != px[1] || px[1] != px[2] {
+                all_gray = false;
+                break;
+            }
+        }
+    }
+    let is_gray = has_opaque && all_gray;
+    let spp: u16 = if is_gray {
+        if return_mask { 2 } else { 1 }
+    } else if return_mask {
+        4
+    } else {
+        3
+    };
     let pixel_bytes = n_px * (spp as usize);
     let n_entries: u16 = if return_mask { 14 } else { 13 };
 
     // Layout:
     // 0..8                     : TIFF header ("II", 42, ifd_offset=8)
     // 8..8+2+12*n_entries+4    : IFD
-    // out_off..                : BitsPerSample (spp*2), ModelPixelScale (24), ModelTiepoint (48), GeoKeyDir (32)
+    // out_off..                : BitsPerSample (spp*2 if spp>2), ModelPixelScale (24), ModelTiepoint (48), GeoKeyDir (32)
     // pixel_off..              : Raw strip pixel data
     let ifd_size = 2 + 12 * (n_entries as usize) + 4;
+    let bps_bytes: u32 = if spp > 2 { (spp as u32) * 2 } else { 0 };
     let bps_off = (8 + ifd_size) as u32;
-    let scale_off = bps_off + (spp as u32) * 2;
+    let scale_off = bps_off + bps_bytes;
     let tie_off = scale_off + 24;
     let gkd_off = tie_off + 48;
     let pixel_off = gkd_off + 32;
@@ -2684,9 +2703,13 @@ pub fn encode_geotiff_rgba(
 
     put_entry(256, LONG, 1, width);
     put_entry(257, LONG, 1, height);
-    put_entry(258, SHORT, spp as u32, bps_off);
+    match spp {
+        1 => put_entry(258, SHORT, 1, 8),
+        2 => put_entry(258, SHORT, 2, 8 | (8 << 16)),
+        _ => put_entry(258, SHORT, spp as u32, bps_off),
+    }
     put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, 2); // Photometric = RGB
+    put_entry(262, SHORT, 1, if is_gray { 1 } else { 2 }); // Photometric = MinIsBlack (1) or RGB (2)
     put_entry(273, LONG, 1, pixel_off); // StripOffsets
     put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
     put_entry(278, LONG, 1, height); // RowsPerStrip
@@ -2700,9 +2723,11 @@ pub fn encode_geotiff_rgba(
     put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
     buf.put_u32_le(0); // Next IFD = 0
 
-    // BitsPerSample
-    for _ in 0..spp {
-        buf.put_u16_le(8);
+    // BitsPerSample (only out-of-line when spp > 2)
+    if spp > 2 {
+        for _ in 0..spp {
+            buf.put_u16_le(8);
+        }
     }
     // ModelPixelScaleTag: [dx, dy, 0.0]
     let dx = ((bbox[2] - bbox[0]).abs() / (width.max(1) as f64)).max(1e-12);
@@ -2738,7 +2763,22 @@ pub fn encode_geotiff_rgba(
     }
 
     // Pixel data
-    if return_mask {
+    if is_gray {
+        if return_mask {
+            for px in rgba.chunks_exact(4).take(n_px) {
+                buf.put_u8(px[0]);
+                buf.put_u8(px[3]);
+            }
+        } else {
+            for px in rgba.chunks_exact(4).take(n_px) {
+                buf.put_u8(px[0]);
+            }
+        }
+        let target_len = (pixel_off as usize) + pixel_bytes;
+        if buf.len() < target_len {
+            buf.resize(target_len, 0);
+        }
+    } else if return_mask {
         let take = pixel_bytes.min(rgba.len());
         buf.put_slice(&rgba[..take]);
         if take < pixel_bytes {

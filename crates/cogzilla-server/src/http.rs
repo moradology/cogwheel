@@ -975,6 +975,9 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     };
     let is_ogc_map =
         matches!(segs[0], "cog" | "stac" | "mosaicjson") && segs.get(1) == Some(&"map");
+    let is_tileset_meta = matches!(segs[0], "cog" | "stac" | "mosaicjson")
+        && segs.get(1) == Some(&"tiles")
+        && segs.len() <= 3;
     if family != "colorMaps" {
         if let Some(k) = has(&["orientation"]) {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
@@ -987,17 +990,17 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             ));
         }
     }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics")) {
         if let Some(k) = has(&["dst_crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on preview, bbox, feature, and map routes"
+                "parameter '{k}' is only supported on preview, bbox, feature, map, and statistics routes"
             ));
         }
     }
-    if !(route("bounds") || route("info") || is_ogc_map) {
+    if !(route("bounds") || route("info") || is_ogc_map || is_tileset_meta) {
         if let Some(k) = has(&["crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on bounds, info, and map routes"
+                "parameter '{k}' is only supported on bounds, info, tiles, and map routes"
             ));
         }
     }
@@ -1029,7 +1032,7 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         }
     }
     if route("bbox") && segs.len() >= 4 {
-        if let Some(k) = has(&["max_size", "width", "height"]) {
+        if let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
     }
@@ -1039,10 +1042,10 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         }
     }
     let last_seg = segs.last().copied().unwrap_or("");
-    if !matches!(last_seg, "tilejson.json" | "map.html" | "WMTSCapabilities.xml") {
+    if !matches!(last_seg, "tilejson.json" | "map.html" | "WMTSCapabilities.xml") && !is_tileset_meta {
         if let Some(k) = has(&["minzoom", "maxzoom", "tile_format", "tile_scale"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on tilejson.json, map.html, and WMTSCapabilities.xml routes"
+                "parameter '{k}' is only supported on tilejson.json, map.html, tiles, and WMTSCapabilities.xml routes"
             ));
         }
     } else if let (Some(minz), Some(maxz)) = (pq.minzoom, pq.maxzoom)
@@ -1175,7 +1178,12 @@ const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
 /// Parse a TiTiler CRS string (`EPSG:32610`, `EPSG:900913`, `CRS84`, `http://.../EPSG/0/32610`,
 /// `urn:ogc:def:crs:EPSG::32610`, etc.) into `(CrsModel, epsg_code)` using our 3,260+ EPSG table.
 fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16), String> {
-    let trimmed = raw.trim();
+    let raw_trimmed = raw.trim();
+    let trimmed = raw_trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw_trimmed)
+        .trim();
     let lower = trimmed.to_ascii_lowercase();
     if lower == "crs84" || lower.ends_with(":crs84") || lower.ends_with("/crs84") {
         return Ok((cogzilla_proj::CrsModel::Geographic, 4326));
@@ -1202,6 +1210,40 @@ fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16)
     let model = cogzilla_proj::CrsModel::from_epsg(code)
         .map_err(|e| format!("unsupported CRS '{raw}': {e}"))?;
     Ok((model, code))
+}
+
+fn dataset_native_crs_and_bounds(
+    engine: &TileEngine,
+    cog: &cogzilla_io::OpenedCog,
+) -> Result<(cogzilla_proj::CrsModel, u16, [f64; 4]), EngineError> {
+    let crs = engine.get_or_build_crs(cog)?;
+    let full = cog.index.full_res();
+    let gk = &cog.index.geo_keys;
+    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+    let is_user_defined_projected = std_proj_epsg.is_none()
+        && (gk.model_type == Some(1)
+            || gk.projected_cs_type == Some(32767)
+            || gk.proj_coord_trans.is_some());
+    let native_epsg = if let Some(epsg) = std_proj_epsg {
+        epsg
+    } else if !is_user_defined_projected
+        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
+    {
+        epsg
+    } else {
+        4326
+    };
+    let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
+    let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
+    let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
+    let (x11, y11) = full.pixel_to_crs.forward(full.width as f64, full.height as f64);
+    let native_bounds = [
+        x00.min(x10).min(x01).min(x11),
+        y00.min(y10).min(y01).min(y11),
+        x00.max(x10).max(x01).max(x11),
+        y00.max(y10).max(y01).max(y11),
+    ];
+    Ok((crs, native_epsg, native_bounds))
 }
 
 /// Transform a WGS84 `[min_lon, min_lat, max_lon, max_lat]` bbox into `dst` CRS by densifying
@@ -7810,17 +7852,25 @@ where
             // GET /cog/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let crs = engine.get_or_build_crs(&cogs[0])?;
+                let (native_crs, native_epsg, native_bounds) =
+                    dataset_native_crs_and_bounds(&engine, &cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let wgs_bbox = pq.bbox_param.unwrap_or_else(|| {
-                    crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
-                });
-                let (dst_crs, dst_epsg) = pq
-                    .dst_crs
-                    .clone()
-                    .or_else(|| pq.bounds_crs.clone())
-                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
-                let out_bbox = normalize_render_bbox(reproject_wgs84_bounds(wgs_bbox, &dst_crs)?, &dst_crs)?;
+                let explicit_crs = pq.dst_crs.clone().or_else(|| pq.bounds_crs.clone());
+                let (dst_crs, dst_epsg, out_bbox) = if let Some((dc, de)) = explicit_crs {
+                    let wgs_bbox = pq.bbox_param.unwrap_or_else(|| {
+                        native_crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                    });
+                    let ob = normalize_render_bbox(reproject_wgs84_bounds(wgs_bbox, &dc)?, &dc)?;
+                    (dc, de, ob)
+                } else if let Some(wgs_bbox) = pq.bbox_param {
+                    let ob = normalize_render_bbox(
+                        reproject_wgs84_bounds(wgs_bbox, &native_crs)?,
+                        &native_crs,
+                    )?;
+                    (native_crs, native_epsg, ob)
+                } else {
+                    (native_crs, native_epsg, native_bounds)
+                };
                 let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };

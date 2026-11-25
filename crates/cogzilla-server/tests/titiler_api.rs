@@ -63,7 +63,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
         ("point unsupported coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:4267")),
         ("preview explicit dims width", format!("{base}/cog/preview/256x256.png?url={sat_url}&width=300")),
-        ("bbox explicit dims max_size", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8/256x256.png?url={sat_url}&max_size=2000")),
+        ("bbox explicit dims width", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8/256x256.png?url={sat_url}&width=300")),
         ("non-colormap orientation", format!("{base}/cog/info?url={sat_url}&orientation=vertical")),
     ] {
         let resp = client.get(&url).send().await.unwrap();
