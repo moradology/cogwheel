@@ -1817,7 +1817,7 @@ impl Window {
                 // are, and a band then comes from other pixels than it does in the whole
                 // raster; a band is the same band here either way.
                 let read =
-                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted)
+                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted, true)
                         .await?;
                 let mut planes = Vec::with_capacity(wanted.len());
                 for band in &wanted {
@@ -1871,7 +1871,7 @@ impl Window {
                 )));
             }
             // One road whatever bands are asked for: see the tile's reading above.
-            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true, &[]).await {
+            let read = match warp_nearest(engine, &cog, &crs, bbox, false, own, native, WarpPath::Direct, unscale, true, &[], true).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -2776,7 +2776,7 @@ fn gdal_overview_level(sizes: &[(u32, u32)], native: (u64, u64), out: (usize, us
 /// GDAL's approximate transformer along one output row: the exact source position at the
 /// two ends, a straight line between them when the middle is within an eighth of a pixel
 /// of it, otherwise the same on each half. `exact` gives the position for a column.
-fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)]) {
+fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)], tolerance: f64) {
     let mut todo = vec![(0usize, out.len())];
     while let Some((lo, hi)) = todo.pop() {
         let points = hi - lo;
@@ -2791,7 +2791,7 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)])
         let span = (points - 1) as f64;
         let (du, dv) = ((u1 - u0) / span, (v1 - v0) / span);
         let error = (u0 + du * middle as f64 - um).abs() + (v0 + dv * middle as f64 - vm).abs();
-        if error.is_finite() && error <= 0.125 {
+        if error.is_finite() && error <= tolerance {
             for (k, slot) in out[lo..hi].iter_mut().enumerate() {
                 *slot = (u0 + du * k as f64, v0 + dv * k as f64);
             }
@@ -2805,6 +2805,17 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)])
             }
         }
     }
+}
+
+/// How far, in source pixels, a position drawn along a row of a picture may be from the
+/// exact one. Positions within twice this of a source pixel's edge are worked out exactly.
+const PICTURE_TOLERANCE: f64 = 1.0 / 128.0;
+
+/// Whether a position drawn along a picture's row is close enough to the edge of a source
+/// pixel that the exact position could be in the pixel next to it.
+fn near_pixel_edge(p: f64) -> bool {
+    let part = p - p.floor();
+    !(2.0 * PICTURE_TOLERANCE..=1.0 - 2.0 * PICTURE_TOLERANCE).contains(&part)
 }
 
 /// How GDAL goes about a warped read, which decides the pixels it takes.
@@ -2851,6 +2862,7 @@ async fn warp_nearest(
     unscale: bool,
     pool: bool,
     only: &[u16],
+    every_pixel: bool,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
     // The grid the warp is worked out on, and how wide a stretch of a row GDAL
@@ -2916,8 +2928,9 @@ async fn warp_nearest(
             ifd.crs_to_pixel.forward(x, y)
         };
         if grid_row != worked_row {
+            let tolerance = if every_pixel { PICTURE_TOLERANCE } else { 0.125 };
             for (n, stretch) in row_positions.chunks_mut(block.max(1)).enumerate() {
-                approx_scanline(&|i| exact(n * block + i), stretch);
+                approx_scanline(&|i| exact(n * block + i), stretch, tolerance);
             }
             worked_row = grid_row;
         }
@@ -2927,6 +2940,14 @@ async fn warp_nearest(
             // A position less than a pixel outside the raster is worked out again exactly.
             if !inside(u, v) && u > -1.0 && v > -1.0 && u < w + 1.0 && v < h + 1.0 {
                 (u, v) = exact(grid_col);
+            } else if every_pixel && u.is_finite() && v.is_finite() {
+                // A position drawn between two exact ones is off by no more than the
+                // tolerance, which only matters next to the edge of a source pixel: there
+                // it could name the neighbour. Those are worked out exactly, so the pixel
+                // taken is always the one the projection itself gives.
+                if near_pixel_edge(u) || near_pixel_edge(v) {
+                    (u, v) = exact(grid_col);
+                }
             }
             if u.is_finite() && v.is_finite() && inside(u, v) {
                 let col = ((u + 1e-10).floor() as i32).min(ifd.width as i32 - 1);
@@ -3236,7 +3257,7 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[]).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
@@ -5445,31 +5466,47 @@ mod tests {
     fn scanlines_are_approximated_like_gdal() {
         // A straight row is its two ends joined, whatever lies between.
         let mut out = vec![(0.0, 0.0); 100];
-        approx_scanline(&|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01), &mut out);
+        approx_scanline(&|i| (i as f64 * 2.0 + 1.0, 7.0 - i as f64 * 0.01), &mut out, 0.125);
         assert!((out[50].0 - 101.0).abs() < 1e-9 && (out[50].1 - 6.5).abs() < 1e-9);
 
         // A gently curved row is still one straight line: the middle is 0.1 off, under
         // the eighth of a pixel GDAL allows.
         let bend = |i: usize| (i as f64, 0.4 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
-        approx_scanline(&bend, &mut out);
+        approx_scanline(&bend, &mut out, 0.125);
         assert_eq!(out[49].1, 0.0);
         assert!((bend(49).1 - 0.1).abs() < 0.001);
 
         // A sharper curve is split until every piece is within the allowance.
         let curve = |i: usize| (i as f64, 40.0 * (i as f64 / 99.0) * (1.0 - i as f64 / 99.0));
-        approx_scanline(&curve, &mut out);
+        approx_scanline(&curve, &mut out, 0.125);
         for (i, got) in out.iter().enumerate() {
             assert!((got.1 - curve(i).1).abs() <= 0.125, "column {i}: {} vs {}", got.1, curve(i).1);
         }
         // Five points or fewer are worked out one by one, and so is a row that leaves
         // the projection.
         let mut short = vec![(0.0, 0.0); 5];
-        approx_scanline(&curve, &mut short);
+        approx_scanline(&curve, &mut short, 0.125);
         assert_eq!(short[2], curve(2));
         let broken = |i: usize| if i < 30 { (f64::NAN, f64::NAN) } else { (i as f64, 1.0) };
-        approx_scanline(&broken, &mut out);
+        approx_scanline(&broken, &mut out, 0.125);
         assert!(out[10].0.is_nan());
         assert_eq!(out[60], (60.0, 1.0));
+
+        // A picture's rows are held to a tolerance at which, with the positions near a
+        // source pixel's edge worked out again, every pixel is the projection's own.
+        let wave = |i: usize| (i as f64 * 0.37, 300.0 * ((i as f64) / 255.0).powi(2) + (i as f64 * 0.05).sin());
+        let mut row = vec![(0.0, 0.0); 256];
+        approx_scanline(&wave, &mut row, PICTURE_TOLERANCE);
+        for (i, drawn) in row.iter().enumerate() {
+            let exact = wave(i);
+            let off = (drawn.0 - exact.0).abs().max((drawn.1 - exact.1).abs());
+            assert!(off <= 2.0 * PICTURE_TOLERANCE, "column {i} is {off} off");
+            // So a drawn position names another pixel than the exact one only near an edge.
+            if (drawn.0.floor(), drawn.1.floor()) != (exact.0.floor(), exact.1.floor()) {
+                assert!(near_pixel_edge(drawn.0) || near_pixel_edge(drawn.1), "column {i}");
+            }
+        }
+        assert!(near_pixel_edge(7.01) && near_pixel_edge(7.99) && !near_pixel_edge(7.5));
     }
 
     #[test]
