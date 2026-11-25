@@ -51,6 +51,9 @@ pub(crate) enum Aside {
     Footprint,
     /// An item kept has no href for an asset asked for.
     Asset,
+    /// The scan limit was reached in a walk whose newest chunk was thought empty: which
+    /// chunk a row came from then decides the list, and that is not known here.
+    Limit,
 }
 
 pub(crate) enum Outcome {
@@ -177,12 +180,20 @@ impl Plan {
         // costs one small query, and one that never fills costs a handful, not one per chunk.
         let mut runs = Runs { plan: self, next: 0, span: 1 };
         let mut step = Step::On;
+        // pgSTAC gives its first chunk the whole scan limit and every later one what its
+        // counter, which starts at one, leaves of it: one fewer. A first run that opens
+        // with a chunk no partition has rows in takes its rows from a later chunk.
+        // That chunk is known empty only as of when the plan was made. If a row has come
+        // to it since, pgSTAC gives it the whole limit; the difference shows only when the
+        // walk reads as many rows as it was allowed, and then the reference path answers.
+        let opens_empty = runs.chunks().first().is_some_and(|c| !c.2);
+        let first_limit = walk.scan_limit - i64::from(opens_empty);
         if let Some((start, end)) = runs.next()
-            && walk.scan_limit > 0
+            && first_limit > 0
         {
             // The first query stands alone, with no transaction around it, and asks for a
             // page with hrefs: most walks end here.
-            let (page, offset, with_hrefs) = (FIRST_PAGE.min(walk.scan_limit), 0i64, true);
+            let (page, offset, with_hrefs) = (FIRST_PAGE.min(first_limit), 0i64, true);
             let params: [(&(dyn ToSql + Sync), Type); 7] = [
                 (&geometry_text, Type::TEXT),
                 (&page, Type::INT8),
@@ -197,14 +208,14 @@ impl Plan {
             walk.in_queries += asked.elapsed();
             walk.queries += 1;
             step = walk.take(&rows)?;
-            let more_in_run = rows.len() as i64 == page && page < walk.scan_limit;
+            let more_in_run = rows.len() as i64 == page && page < first_limit;
             if matches!(step, Step::On) && (more_in_run || runs.more()) {
                 // The rest is read as pgSTAC reads it, through cursors: a page at a time,
                 // nothing run twice, and no more held in memory than a page.
                 let tx = client.transaction().await?;
                 let query = (geometry_text.as_str(), asset_keys.as_slice());
                 if more_in_run {
-                    let rest = walk.scan_limit - page;
+                    let rest = first_limit - page;
                     step = self.read(&tx, &mut walk, query, (start, end), page, rest).await?;
                 }
                 while matches!(step, Step::On) {
@@ -220,6 +231,9 @@ impl Plan {
         }
         if let Step::Aside(why) = step {
             return Ok(Outcome::Aside(why));
+        }
+        if opens_empty && walk.scanned >= first_limit {
+            return Ok(Outcome::Aside(Aside::Limit));
         }
         if !walk.owed.is_empty() {
             let asked = Instant::now();

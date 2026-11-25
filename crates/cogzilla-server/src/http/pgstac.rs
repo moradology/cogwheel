@@ -206,11 +206,15 @@ fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
     let mut limits = SearchLimits::default();
     let int = |name: &str, slot: &mut i32| -> Result<(), Resp> {
         if let Some(v) = query_value(pairs, name) {
-            *slot = v
+            let given = v
                 .parse::<i32>()
                 .ok()
                 .filter(|n| *n >= 0)
                 .ok_or_else(|| invalid_param("query", name, "Input should be a valid integer"))?;
+            // Zero is no limit given, as in titiler-pgstac: the default stands.
+            if given > 0 {
+                *slot = given;
+            }
         }
         Ok(())
     };
@@ -1213,6 +1217,15 @@ fn check_coord_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
             format!("coord_crs '{other}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
         )),
     }
+}
+
+/// A position given in the request's `coord_crs`, in degrees: Web Mercator metres are
+/// turned into them, and any other system is refused.
+fn in_degrees(pq: &ParsedQuery, pairs: &[(String, String)], x: f64, y: f64) -> Result<(f64, f64), Resp> {
+    if pq.coord_crs_3857 {
+        return Ok(mercator_to_lonlat_deg(x, y));
+    }
+    check_coord_crs(pairs).map(|()| (x, y))
 }
 
 fn check_dst_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
@@ -5074,9 +5087,10 @@ async fn mosaic_route(
             let Some(([w, s, e, n], None)) = parse_bbox4(bbox) else {
                 return not_found();
             };
-            let limits = match (check_coord_crs(pairs), parse_limits(pairs)) {
+            let corners = in_degrees(&pq, pairs, w, s).and_then(|low| Ok((low, in_degrees(&pq, pairs, e, n)?)));
+            let (((w, s), (e, n)), limits) = match (corners, parse_limits(pairs)) {
                 (Err(r), _) | (_, Err(r)) => return r,
-                (Ok(()), Ok(l)) => l,
+                (Ok(corners), Ok(l)) => (corners, l),
             };
             let polygon = json!({
                 "type": "Polygon",
@@ -5114,9 +5128,9 @@ async fn mosaic_route(
             let Some((lon, lat)) = coords else {
                 return not_found();
             };
-            let mut limits = match (check_coord_crs(pairs), parse_limits(pairs)) {
+            let ((lon, lat), mut limits) = match (in_degrees(&pq, pairs, lon, lat), parse_limits(pairs)) {
                 (Err(r), _) | (_, Err(r)) => return r,
-                (Ok(()), Ok(l)) => l,
+                (Ok(at), Ok(l)) => (at, l),
             };
             // A point is never "covered", so every item under it is wanted.
             limits.exitwhenfull = false;

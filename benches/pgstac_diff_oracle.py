@@ -411,6 +411,15 @@ def main() -> int:
         base12 = f"/searches/{sid}/tiles/WebMercatorQuad/12/{t12.x}/{t12.y}"
         o.check("items with a filter", "ids",
                 f"/searches/{sid_meta}/tiles/WebMercatorQuad/10/{tiles[10].x}/{tiles[10].y}/assets")
+        o.check("items with limits of zero, which is none given", "ids",
+                f"/searches/{sid}/tiles/WebMercatorQuad/8/{tiles[8].x}/{tiles[8].y}/assets?items_limit=0&scan_limit=0&time_limit=0")
+        # pgSTAC gives a scan limit whole to its first chunk of time and one fewer to the rest.
+        for limit in (1, 2, 3):
+            o.check(f"tile with scan_limit={limit}", "status", f"{base12}.png?assets=visual&scan_limit={limit}")
+        o.check("items in a box given in Web Mercator", "ids",
+                f"/searches/{sid}/bbox/930000,5700000,990000,5760000/assets?coord_crs=epsg:3857")
+        o.check("items at a point given in Web Mercator", "ids",
+                f"/searches/{sid}/point/946187,5740000/assets?coord_crs=epsg:3857")
         o.check("items with limits", "ids",
                 f"/searches/{sid}/tiles/WebMercatorQuad/8/{tiles[8].x}/{tiles[8].y}/assets"
                 "?items_limit=3&exitwhenfull=false&skipcovered=false")
