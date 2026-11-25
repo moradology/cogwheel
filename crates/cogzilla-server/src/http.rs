@@ -261,11 +261,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if dec.contains('|') {
                     // TiTiler `assets=name|bidx=1,2,3` or `assets=name|indexes=1,2,3`
                     let mut parts = dec.split('|');
-                    if let Some(name) = parts.next()
-                        && !name.is_empty()
-                    {
-                        pq.assets.push(name.to_string());
+                    let asset_name = parts.next().map(str::trim).unwrap_or("");
+                    if !asset_name.is_empty() {
+                        pq.assets.push(asset_name.to_string());
                     }
+                    let mut parsed = Vec::new();
                     for opt in parts {
                         if let Some(bidx_str) = opt
                             .strip_prefix("bidx=")
@@ -273,10 +273,19 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                         {
                             for tok in bidx_str.split(',') {
                                 match tok.trim().parse::<u16>() {
-                                    Ok(b) if b >= 1 => pq.bidx.push(b),
+                                    Ok(b) if b >= 1 => parsed.push(b),
                                     _ => bad("expected positive integer band indices in |bidx="),
                                 }
                             }
+                        }
+                    }
+                    if !asset_name.is_empty() && !parsed.is_empty() {
+                        if let Some((_, existing)) =
+                            pq.asset_bidx.iter_mut().find(|(n, _)| n == asset_name)
+                        {
+                            existing.extend(parsed);
+                        } else {
+                            pq.asset_bidx.push((asset_name.to_string(), parsed));
                         }
                     }
                 } else {
@@ -4225,7 +4234,12 @@ where
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    let opts_c = stats_opts.clone();
+                    let mut opts_c = stats_opts.clone();
+                    if opts_c.bidx.is_none()
+                        && let Some(sel) = stac_asset_selected_bands(&pq, &names[idx])
+                    {
+                        opts_c.bidx = Some(sel.to_vec());
+                    }
                     set.spawn(async move {
                         let st = compute_statistics_with_options(
                             &eng, &cog, max_size, None, unscale, nodata, &opts_c,
@@ -4274,7 +4288,12 @@ where
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    let opts_c = stats_opts.clone();
+                    let mut opts_c = stats_opts.clone();
+                    if opts_c.bidx.is_none()
+                        && let Some(sel) = stac_asset_selected_bands(&pq, &names[idx])
+                    {
+                        opts_c.bidx = Some(sel.to_vec());
+                    }
                     set.spawn(async move {
                         let nb = cog.index.full_res().samples_per_pixel as usize;
                         let st = compute_statistics_with_options(
@@ -4341,7 +4360,13 @@ where
                         for (idx, cog) in cogs_c.into_iter().enumerate() {
                             let eng_c = eng.clone();
                             let mask_c = mask.clone();
-                            let opts_c = stats_opts.clone();
+                            let mut opts_c = stats_opts.clone();
+                            if opts_c.bidx.is_none()
+                                && let Some((_, sel)) =
+                                    asset_bidx_c.iter().find(|(n, _)| n == &names_c[idx])
+                            {
+                                opts_c.bidx = Some(sel.to_vec());
+                            }
                             let nb = cog.index.full_res().samples_per_pixel as usize;
                             set.spawn(async move {
                                 let st = compute_statistics_with_options(
@@ -6548,5 +6573,11 @@ mod tests {
         let (pm, _) = PolygonMask::from_geojson(&poly_json).unwrap();
         assert!(pm.check_work_budget(256 * 256).is_err());
         assert!(pm.check_work_budget(64 * 64).is_ok());
+
+        // 5. ?assets=visual|bidx=2&assets=nir stores per-asset bidx without leaking into global bidx
+        let pq_ab = parse_query(Some("assets=visual|bidx=2&assets=nir"));
+        assert_eq!(pq_ab.assets, vec!["visual", "nir"]);
+        assert!(pq_ab.bidx.is_empty());
+        assert_eq!(pq_ab.asset_bidx, vec![("visual".to_string(), vec![2])]);
     }
 }
