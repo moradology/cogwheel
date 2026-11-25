@@ -2807,9 +2807,56 @@ fn approx_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)],
     }
 }
 
+/// A row of a picture: the exact source position at the two ends and the middle of a
+/// stretch, and a curve through the three for the columns between. The curve is checked
+/// against the exact position a quarter and three quarters of the way along, and the
+/// stretch is halved until both are within `tolerance`. A straight line through the ends,
+/// which is what GDAL draws, is off by the row's whole bend; the curve is off only by how
+/// that bend changes along the row, which for a map projection is next to nothing, so a
+/// row costs a handful of projections and still lands within a thousandth of a pixel.
+fn curved_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)], tolerance: f64) {
+    let mut todo = vec![(0usize, out.len())];
+    while let Some((lo, hi)) = todo.pop() {
+        let points = hi - lo;
+        if points <= 9 {
+            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+                *slot = exact(lo + k);
+            }
+            continue;
+        }
+        let (last, middle) = (points - 1, (points - 1) / 2);
+        let (p0, pm, p1) = (exact(lo), exact(lo + middle), exact(hi - 1));
+        // The curve through the three, by Lagrange's formula, at column `k` of the stretch.
+        let (m, n) = (middle as f64, last as f64);
+        let at = |k: usize| {
+            let x = k as f64;
+            let (a, b, c) = ((x - m) * (x - n) / (m * n), x * (x - n) / (m * (m - n)), x * (x - m) / (n * (n - m)));
+            (a * p0.0 + b * pm.0 + c * p1.0, a * p0.1 + b * pm.1 + c * p1.1)
+        };
+        let off = |k: usize| {
+            let (drawn, real) = (at(k), exact(lo + k));
+            (drawn.0 - real.0).abs().max((drawn.1 - real.1).abs())
+        };
+        let error = off(middle / 2).max(off(middle + (last - middle) / 2));
+        if error.is_finite() && error <= tolerance {
+            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+                *slot = at(k);
+            }
+        } else if error.is_finite() {
+            todo.push((lo, lo + middle));
+            todo.push((lo + middle, hi));
+        } else {
+            // Part of the row is outside the projection: no curve to draw.
+            for (k, slot) in out[lo..hi].iter_mut().enumerate() {
+                *slot = exact(lo + k);
+            }
+        }
+    }
+}
+
 /// How far, in source pixels, a position drawn along a row of a picture may be from the
 /// exact one. Positions within twice this of a source pixel's edge are worked out exactly.
-const PICTURE_TOLERANCE: f64 = 1.0 / 128.0;
+const PICTURE_TOLERANCE: f64 = 1.0 / 1024.0;
 
 /// Whether a position drawn along a picture's row is close enough to the edge of a source
 /// pixel that the exact position could be in the pixel next to it.
@@ -2928,9 +2975,12 @@ async fn warp_nearest(
             ifd.crs_to_pixel.forward(x, y)
         };
         if grid_row != worked_row {
-            let tolerance = if every_pixel { PICTURE_TOLERANCE } else { 0.125 };
             for (n, stretch) in row_positions.chunks_mut(block.max(1)).enumerate() {
-                approx_scanline(&|i| exact(n * block + i), stretch, tolerance);
+                if every_pixel {
+                    curved_scanline(&|i| exact(n * block + i), stretch, PICTURE_TOLERANCE);
+                } else {
+                    approx_scanline(&|i| exact(n * block + i), stretch, 0.125);
+                }
             }
             worked_row = grid_row;
         }
@@ -5496,7 +5546,7 @@ mod tests {
         // source pixel's edge worked out again, every pixel is the projection's own.
         let wave = |i: usize| (i as f64 * 0.37, 300.0 * ((i as f64) / 255.0).powi(2) + (i as f64 * 0.05).sin());
         let mut row = vec![(0.0, 0.0); 256];
-        approx_scanline(&wave, &mut row, PICTURE_TOLERANCE);
+        curved_scanline(&wave, &mut row, PICTURE_TOLERANCE);
         for (i, drawn) in row.iter().enumerate() {
             let exact = wave(i);
             let off = (drawn.0 - exact.0).abs().max((drawn.1 - exact.1).abs());
@@ -5506,7 +5556,22 @@ mod tests {
                 assert!(near_pixel_edge(drawn.0) || near_pixel_edge(drawn.1), "column {i}");
             }
         }
-        assert!(near_pixel_edge(7.01) && near_pixel_edge(7.99) && !near_pixel_edge(7.5));
+        assert!(near_pixel_edge(7.001) && near_pixel_edge(7.999) && !near_pixel_edge(7.5) && !near_pixel_edge(7.01));
+
+        // A row that bends evenly is one curve: three positions and the two it is checked at.
+        let asked = std::cell::Cell::new(0);
+        let bow = |i: usize| {
+            asked.set(asked.get() + 1);
+            (i as f64 * 0.9, 50.0 * (i as f64 / 255.0).powi(2))
+        };
+        curved_scanline(&bow, &mut row, PICTURE_TOLERANCE);
+        assert_eq!(asked.get(), 5);
+        assert!((row[100].1 - 50.0 * (100.0f64 / 255.0).powi(2)).abs() < 1e-9);
+        // One that leaves the projection is worked out column by column.
+        let broken = |i: usize| if i < 30 { (f64::NAN, f64::NAN) } else { (i as f64, 1.0) };
+        curved_scanline(&broken, &mut row, PICTURE_TOLERANCE);
+        assert!(row[10].0.is_nan());
+        assert_eq!(row[60], (60.0, 1.0));
     }
 
     #[test]
