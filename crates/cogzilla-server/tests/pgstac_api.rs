@@ -205,8 +205,8 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         assert!(matches!(resp.status().as_u16(), 400 | 422), "{what}: {}", resp.status());
     }
 
-    // The other pixel selections are taken on tiles (here over nothing, so nothing comes
-    // back) and refused, for now, where one image is drawn from many rasters at once.
+    // The other pixel selections are taken wherever `first` is (here over nothing, so
+    // nothing comes back); the two that are not there yet are refused.
     let unknown = client.get(format!("{tile}.png?assets=visual&pixel_selection=nope")).send().await.unwrap();
     assert_eq!(unknown.status().as_u16(), 422);
     assert_eq!(body_json(unknown).await["detail"][0]["loc"], json!(["query", "pixel_selection"]));
@@ -214,13 +214,17 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         let resp = client.get(format!("{tile}.png?assets=visual&pixel_selection={method}")).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 204, "{method}");
     }
-    let image = client
-        .get(format!("{base}/searches/{id}/bbox/6,44,7,45.png?assets=visual&pixel_selection=mean"))
-        .send()
-        .await
-        .unwrap();
+    let bbox = format!("{base}/searches/{id}/bbox/6,44,7,45.png?assets=visual&max_size=64");
+    let plain = client.get(&bbox).send().await.unwrap().status().as_u16();
+    for method in ["highest", "lowest", "mean", "median", "stdev", "count"] {
+        let image = client.get(format!("{bbox}&pixel_selection={method}")).send().await.unwrap();
+        assert_eq!(image.status().as_u16(), plain, "{method}");
+    }
+    let image = client.get(format!("{bbox}&pixel_selection=lastbandlow")).send().await.unwrap();
     assert_eq!(image.status().as_u16(), 400);
-    assert!(body_json(image).await["detail"].as_str().unwrap().contains("pixel_selection"));
+    assert!(body_json(image).await["detail"].as_str().unwrap().contains("lastbandlow"));
+    let image = client.get(format!("{bbox}&pixel_selection=nope")).send().await.unwrap();
+    assert_eq!(image.status().as_u16(), 422);
 
     let both = json!({ "bbox": [0, 0, 1, 1], "intersects": { "type": "Point", "coordinates": [0, 0] } });
     let resp = post_json(&client, format!("{base}/searches/register"), &both).await;
@@ -316,7 +320,9 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("statistics?assets=visual&width=wide", &triangle, 422),
         ("statistics?assets=visual&dst_crs=epsg:3857", &triangle, 400),
         ("statistics?assets=visual&algorithm=hillshade", &triangle, 400),
-        ("statistics?assets=visual&pixel_selection=mean", &triangle, 400),
+        ("statistics?assets=visual&pixel_selection=mean", &triangle, 204),
+        ("statistics?assets=visual&pixel_selection=lastbandhigh", &triangle, 400),
+        ("statistics?assets=visual&pixel_selection=nope", &triangle, 422),
         ("statistics/extra?assets=visual", &triangle, 404),
     ] {
         let resp = post_json(&client, format!("{base}/searches/{id}/{path}"), body).await;

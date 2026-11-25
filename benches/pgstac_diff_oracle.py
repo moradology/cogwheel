@@ -703,7 +703,8 @@ def main() -> int:
             ("lowest", "assets=red&rescale=0,3000&colormap_name=viridis"),
             ("mean", "assets=red&rescale=0,12000"),
             ("mean", "assets=red&assets=green&assets=blue&asset_as_band=true&rescale=0,12000"),
-            ("mean", "assets=red&unscale=true&rescale=0,1.2"),
+            # These rasters carry no scale or offset, so this only shows `unscale` does no harm.
+            ("mean", "assets=red&unscale=true&rescale=0,12000"),
             ("median", "assets=visual"),
             ("median", f"assets=red&expression={opt('b1/2')}&rescale=0,4000"),
             ("stdev", "assets=red&rescale=0,8000"),
@@ -723,8 +724,40 @@ def main() -> int:
         o.check("tile, pixel_selection=lastbandhigh", "status",
                 f"{base12}.png?assets=red&assets=nir&asset_as_band=true&rescale=0,4000&pixel_selection=lastbandhigh{every}",
                 known="lastbandlow and lastbandhigh are not there yet")
-        o.check("bbox, pixel_selection=mean", "status", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=64&pixel_selection=mean{every}",
-                known="bbox and feature images take pixel_selection=first only so far")
+        for method, q in [
+            ("highest", "assets=visual"),
+            ("lowest", "assets=red&rescale=0,3000&colormap_name=viridis"),
+            ("mean", "assets=red&assets=green&assets=blue&asset_as_band=true&rescale=0,12000"),
+            ("median", f"assets=red&expression={opt('b1/2')}&rescale=0,4000"),
+            ("stdev", "assets=red&rescale=0,8000"),
+            ("count", "assets=visual&rescale=0,8"),
+        ]:
+            o.check(f"bbox, pixel_selection={method}", "image",
+                    f"/searches/{sid}/bbox/{part}.png?{q}&max_size=256&pixel_selection={method}{every}")
+        o.check("bbox, pixel_selection and a colour formula", "image",
+                f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=256&pixel_selection=median&color_formula={opt('gamma rgb 1.8')}{every}")
+        o.check("feature, pixel_selection=mean", "image",
+                f"/searches/{sid}/feature.png?assets=visual&max_size=256&pixel_selection=mean{every}", "POST", triangle)
+        o.check("collection bbox, pixel_selection=highest", "image",
+                f"/collections/{collection}/bbox/{part}.png?assets=visual&max_size=256&pixel_selection=highest{every}")
+        for method, q in [
+            ("highest", "assets=red"),
+            ("lowest", "assets=red"),
+            ("mean", "assets=red"),
+            ("mean", "assets=visual"),
+            ("mean", f"assets=red&assets=nir&asset_as_band=true&expression={opt('(b2-b1)/(b2+b1)')}"),
+            ("median", "assets=red"),
+            ("median", "assets=red&assets=nir&asset_as_band=true"),
+            ("stdev", "assets=red"),
+            ("count", "assets=red"),
+            ("count", "assets=visual"),
+        ]:
+            o.check(f"statistics, pixel_selection={method}, {q.split('&')[0][7:]}{' and more' if q.count('&') else ''}", "zonal",
+                    f"{st}?{q}&max_size=64&pixel_selection={method}{every}", "POST", five)
+        o.check("statistics, pixel_selection with the search's own limits", "zonal", f"{st}?assets=red&max_size=64&pixel_selection=median", "POST", five)
+        o.check("statistics, pixel_selection over many features", "zonal", f"{st}?assets=red&max_size=64&pixel_selection=mean{every}", "POST",
+                {"type": "FeatureCollection", "features": [five, holed]})
+        o.check("statistics, a pixel_selection nobody has", "status", f"{st}?assets=red&pixel_selection=nope", "POST", five)
         o.check("tile, one band of three", "image", f"{base12}.png?assets={opt('visual|bidx=1')}",
                 known="GDAL reads a subset of an RGB raster's bands from other pixels than all of them (rio-tiler tile(indexes=(1,)) differs from tile(indexes=(1,2,3))[0] in 43% of pixels); cogzilla reads the same pixels either way")
         o.check("bbox, bidx=1 on a one-band asset", "image", f"/searches/{sid}/bbox/{part}.png?assets={opt('red|bidx=1')}&rescale=0,3000&max_size=256")
