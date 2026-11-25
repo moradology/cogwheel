@@ -1056,6 +1056,31 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let parsed_styled = cogzilla_tiff::parse_cog(&styled_tif_resp.bytes().await.unwrap()).unwrap();
             assert_eq!(parsed_styled.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
 
+            // Audit c42 regression checks:
+            // Unstyled float32 DEM .tif on /mosaic/tiles must emit Float32 GeoTIFF (not corrupt RGBA8)
+            let mosaic_f32_tif = client
+                .get(format!(
+                    "{base}/mosaic/tiles/WebMercatorQuad/12/655/1583.tif?url={merc_url}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mosaic_f32_tif.status(), 200);
+            let parsed_mosaic_f32 = cogzilla_tiff::parse_cog(&mosaic_f32_tif.bytes().await.unwrap()).unwrap();
+            assert_eq!(parsed_mosaic_f32.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+
+            // ?algorithm=contours .tif must emit 8-bit visual GeoTIFF (not Float32)
+            let contours_tif = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/12/655/1583.tif?url={merc_url}&algorithm=contours"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(contours_tif.status(), 200);
+            let parsed_contours = cogzilla_tiff::parse_cog(&contours_tif.bytes().await.unwrap()).unwrap();
+            assert_eq!(parsed_contours.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
+
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];
             pal[299] = [200, 150, 100, 255];

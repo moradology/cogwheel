@@ -2512,7 +2512,9 @@ pub fn encode_geotiff_f32(
         1
     };
     let pixel_bytes = n_px * (spp as usize) * 4;
-    let n_entries: u16 = 15;
+    let photometric: u32 = if spp == 3 { 2 } else { 1 }; // RGB for 3-band, MinIsBlack otherwise
+    let extra_samples_count: u16 = if spp == 2 || spp > 3 { spp - 1 } else { 0 };
+    let n_entries: u16 = if extra_samples_count > 0 { 16 } else { 15 };
 
     let ifd_size = 2 + 12 * (n_entries as usize) + 4;
     let mut extra_off = (8 + ifd_size) as u32;
@@ -2524,6 +2526,13 @@ pub fn encode_geotiff_f32(
         let off = extra_off;
         extra_off += (spp as u32) * 2;
         off
+    };
+    let extra_samples_val = if extra_samples_count >= 3 {
+        let off = extra_off;
+        extra_off += (extra_samples_count as u32) * 2;
+        off
+    } else {
+        0u32 // inline zeros (0 = Unspecified) for count 1 or 2
     };
     let sf_val = if spp == 1 {
         3u32
@@ -2562,12 +2571,15 @@ pub fn encode_geotiff_f32(
     put_entry(257, LONG, 1, height);
     put_entry(258, SHORT, spp as u32, bps_val); // BitsPerSample = 32
     put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, 1); // Photometric = MinIsBlack
+    put_entry(262, SHORT, 1, photometric); // Photometric = RGB (2) or MinIsBlack (1)
     put_entry(273, LONG, 1, pixel_off); // StripOffsets
     put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
     put_entry(278, LONG, 1, height); // RowsPerStrip
     put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
     put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
+    if extra_samples_count > 0 {
+        put_entry(338, SHORT, extra_samples_count as u32, extra_samples_val); // ExtraSamples = Unspecified (0)
+    }
     put_entry(339, SHORT, spp as u32, sf_val); // SampleFormat = IEEEFloat (3)
     put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
     put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
@@ -2579,6 +2591,13 @@ pub fn encode_geotiff_f32(
         for _ in 0..spp {
             buf.put_u16_le(32);
         }
+    }
+    if extra_samples_count >= 3 {
+        for _ in 0..extra_samples_count {
+            buf.put_u16_le(0);
+        }
+    }
+    if spp >= 3 {
         for _ in 0..spp {
             buf.put_u16_le(3);
         }
@@ -2618,7 +2637,7 @@ pub fn encode_geotiff_f32(
 
     // Pixel data: interleave CHW f32 planes into Chunky f32
     if spp == 1 {
-        let take = pixel_bytes.min(raw_f32_chw.len());
+        let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
         buf.put_slice(&raw_f32_chw[..take]);
         if take < pixel_bytes {
             let rem_f32 = (pixel_bytes - take) / 4;

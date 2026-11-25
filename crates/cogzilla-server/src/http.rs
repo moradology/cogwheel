@@ -1205,9 +1205,11 @@ fn wants_f32_geotiff(
     }
     match bands {
         BandRequest::Terrain { .. } => false,
-        BandRequest::Dem { algorithm, .. } => {
-            !matches!(algorithm, cogzilla_kernel::DemAlgorithm::Hillshade { .. })
-        }
+        BandRequest::Dem { algorithm, .. } => !matches!(
+            algorithm,
+            cogzilla_kernel::DemAlgorithm::Hillshade { .. }
+                | cogzilla_kernel::DemAlgorithm::Contours { .. }
+        ),
         BandRequest::Rgb { .. } | BandRequest::Single { .. } => {
             !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
         }
@@ -1264,18 +1266,6 @@ fn attach_x_assets(resp: &mut Response<Full<Bytes>>, assets: &[String]) {
     if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
         resp.headers_mut().insert("x-assets", hv);
     }
-}
-
-fn wrap_geotiff(
-    data: Bytes,
-    ct: &'static str,
-    w: u32,
-    h: u32,
-    bbox: [f64; 4],
-    epsg: u16,
-    return_mask: bool,
-) -> Bytes {
-    wrap_geotiff_fmt(data, ct, OutputFormat::RawRgba, w, h, bbox, epsg, return_mask)
 }
 
 fn parse_ext_format(
@@ -2066,13 +2056,7 @@ async fn render_mosaic_tile_styled(
         needs_bbox_mosaic = true;
     }
 
-    if needs_bbox_mosaic && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+    if needs_bbox_mosaic {
         let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
         let bbox_3857 = web_mercator_buffered_3857_bbox(
             treq.tile.z,
@@ -2082,6 +2066,103 @@ async fn render_mosaic_tile_styled(
             treq.tile_size,
         );
         let n_px = (out_dim as usize) * (out_dim as usize);
+        if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+            let mut acc_f32: Option<(usize, Vec<f32>)> = None;
+            let mut filled = 0usize;
+            for url in urls {
+                let Ok(cog) = engine.store.open_uri(url).await else {
+                    continue;
+                };
+                let cogs = vec![cog];
+                let mut scene_bands = treq.bands.clone();
+                if pq.unscale {
+                    apply_unscale_cogs(&mut scene_bands, &cogs);
+                }
+                let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
+                let raw = render_mercator_bbox(
+                    engine,
+                    &cogs,
+                    bbox_3857,
+                    out_dim,
+                    out_dim,
+                    &scene_bands,
+                    resample,
+                    OutputFormat::RawF32,
+                    pq.nodata,
+                    None,
+                    None,
+                    pq.return_mask,
+                    pq.unscale,
+                )
+                .await?;
+                if n_px == 0 || raw.len() % (n_px * 4) != 0 {
+                    continue;
+                }
+                let nb = raw.len() / (n_px * 4);
+                if nb == 0 {
+                    continue;
+                }
+                let (acc_nb, acc) = acc_f32.get_or_insert_with(|| (nb, vec![f32::NAN; nb * n_px]));
+                if *acc_nb != nb {
+                    continue;
+                }
+                for i in 0..n_px {
+                    if acc[i].is_nan() {
+                        let mut all_valid = true;
+                        for b in 0..nb {
+                            let boff = (b * n_px + i) * 4;
+                            let v = f32::from_le_bytes([
+                                raw[boff],
+                                raw[boff + 1],
+                                raw[boff + 2],
+                                raw[boff + 3],
+                            ]);
+                            if v.is_nan() {
+                                all_valid = false;
+                                break;
+                            }
+                        }
+                        if all_valid {
+                            for b in 0..nb {
+                                let boff = (b * n_px + i) * 4;
+                                acc[b * n_px + i] = f32::from_le_bytes([
+                                    raw[boff],
+                                    raw[boff + 1],
+                                    raw[boff + 2],
+                                    raw[boff + 3],
+                                ]);
+                            }
+                            filled += 1;
+                        }
+                    }
+                }
+                if filled >= n_px {
+                    break;
+                }
+            }
+            let default_nb = match treq.bands {
+                BandRequest::Rgb { .. }
+                | BandRequest::SarRgb { .. }
+                | BandRequest::Terrain { .. }
+                | BandRequest::CustomExprRgb { .. } => 3,
+                _ => 1,
+            };
+            let (nb, acc) = acc_f32.unwrap_or_else(|| (default_nb, vec![f32::NAN; default_nb * n_px]));
+            let mut out = bytes::BytesMut::with_capacity(128 + acc.len() * 4);
+            if matches!(treq.format, OutputFormat::Npy) {
+                out.extend_from_slice(&cogzilla_kernel::encode_npy_f32_header(nb, out_dim, out_dim));
+            }
+            for v in acc {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            return Ok(out.freeze());
+        }
+        let cf = pq
+            .color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
         let mut comp = vec![0u8; n_px * 4];
         let mut filled = 0usize;
 
@@ -2201,7 +2282,7 @@ async fn render_mosaic_bbox_composite(
     let out_w = out_w.clamp(1, 4096);
     let out_h = out_h.clamp(1, 4096);
     let urls = &urls[..urls.len().min(16)];
-    let is_f32_out = matches!(fmt, OutputFormat::RawF32 | OutputFormat::Npy);
+    let mut eff_fmt: Option<OutputFormat> = None;
     let mut acc_rgba: Option<Vec<u8>> = None;
     let mut acc_f32: Option<(usize, Vec<f32>)> = None;
     let total_px = (out_w as usize).saturating_mul(out_h as usize);
@@ -2220,6 +2301,10 @@ async fn render_mosaic_bbox_composite(
         let cogs = [cog];
         let full = cogs[0].index.full_res();
         let mut bands = build_band_request(pq, full.samples_per_pixel, full.sample_type)?;
+        let scene_fmt = *eff_fmt.get_or_insert_with(|| {
+            geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, full.sample_type)
+        });
+        let is_f32_out = matches!(scene_fmt, OutputFormat::RawF32 | OutputFormat::Npy);
         if pq.unscale {
             apply_unscale_cogs(&mut bands, &cogs);
         }
@@ -2242,7 +2327,7 @@ async fn render_mosaic_bbox_composite(
                 poly_mask,
                 &bands,
                 resample,
-                fmt,
+                scene_fmt,
                 pq.nodata,
                 custom_lut.as_ref(),
                 cf.as_ref(),
@@ -2250,7 +2335,16 @@ async fn render_mosaic_bbox_composite(
                 pq.unscale,
             )
             .await?;
-            return Ok(wrap_geotiff(d, ct, out_w, out_h, bbox, epsg, pq.return_mask));
+            return Ok(wrap_geotiff_fmt(
+                d,
+                ct,
+                scene_fmt,
+                out_w,
+                out_h,
+                bbox,
+                epsg,
+                pq.return_mask,
+            ));
         }
         if is_f32_out {
             let raw = render_crs_bbox(
@@ -2285,16 +2379,22 @@ async fn render_mosaic_bbox_composite(
             }
             for i in 0..total_px {
                 if acc[i].is_nan() {
-                    let b0_off = i * 4;
-                    let v0 = f32::from_le_bytes([
-                        raw[b0_off],
-                        raw[b0_off + 1],
-                        raw[b0_off + 2],
-                        raw[b0_off + 3],
-                    ]);
-                    if !v0.is_nan() {
-                        acc[i] = v0;
-                        for b in 1..nb {
+                    let mut all_valid = true;
+                    for b in 0..nb {
+                        let boff = (b * total_px + i) * 4;
+                        let v = f32::from_le_bytes([
+                            raw[boff],
+                            raw[boff + 1],
+                            raw[boff + 2],
+                            raw[boff + 3],
+                        ]);
+                        if v.is_nan() {
+                            all_valid = false;
+                            break;
+                        }
+                    }
+                    if all_valid {
+                        for b in 0..nb {
                             let boff = (b * total_px + i) * 4;
                             acc[b * total_px + i] = f32::from_le_bytes([
                                 raw[boff],
@@ -2353,20 +2453,39 @@ async fn render_mosaic_bbox_composite(
             EngineError::NotFound("no readable mosaic scenes intersect requested bounds".into())
         }));
     }
-    if is_f32_out {
+    let final_fmt = eff_fmt.unwrap_or(fmt);
+    if matches!(final_fmt, OutputFormat::RawF32 | OutputFormat::Npy) {
         let (nb, acc) = acc_f32.unwrap_or_else(|| (1, vec![f32::NAN; total_px]));
         let mut out = bytes::BytesMut::with_capacity(128 + acc.len() * 4);
-        if matches!(fmt, OutputFormat::Npy) {
+        if matches!(final_fmt, OutputFormat::Npy) {
             out.extend_from_slice(&cogzilla_kernel::encode_npy_f32_header(nb, out_h, out_w));
         }
         for v in acc {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        return Ok(out.freeze());
+        return Ok(wrap_geotiff_fmt(
+            out.freeze(),
+            ct,
+            final_fmt,
+            out_w,
+            out_h,
+            bbox,
+            epsg,
+            pq.return_mask,
+        ));
     }
     let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
-    let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, fmt, pq.return_mask);
-    Ok(wrap_geotiff(data, ct, out_w, out_h, bbox, epsg, pq.return_mask))
+    let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask);
+    Ok(wrap_geotiff_fmt(
+        data,
+        ct,
+        final_fmt,
+        out_w,
+        out_h,
+        bbox,
+        epsg,
+        pq.return_mask,
+    ))
 }
 
 fn web_mercator_buffered_3857_bbox(z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> [f64; 4] {
@@ -3433,9 +3552,10 @@ where
                                 _ => 1,
                             };
                             let b = cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb);
-                            let b = wrap_geotiff(
+                            let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
+                                treq.format,
                                 treq.tile_size,
                                 treq.tile_size,
                                 [min_x, min_y, max_x, max_y],
@@ -3460,12 +3580,14 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
+                            let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
                             let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
-                            let b = wrap_geotiff(
+                            let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
+                                fmt,
                                 out_dim,
                                 out_dim,
                                 buf_bbox,
@@ -3537,12 +3659,14 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
+                            let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
                             let b = render_mosaic_tile_styled(&engine, &pq.urls, treq, &pq).await?;
-                            let b = wrap_geotiff(
+                            let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
+                                fmt,
                                 out_dim,
                                 out_dim,
                                 buf_bbox,
@@ -3609,9 +3733,10 @@ where
                                 _ => 1,
                             };
                             let b = cogzilla_kernel::empty_tile_bytes(treq.tile_size, treq.format, nb);
-                            let b = wrap_geotiff(
+                            let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
+                                treq.format,
                                 treq.tile_size,
                                 treq.tile_size,
                                 [min_x, min_y, max_x, max_y],
@@ -3636,12 +3761,14 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
+                            let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
                             let b = render_mosaic_tile_styled(&engine, &urls, treq, &pq).await?;
-                            let b = wrap_geotiff(
+                            let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
+                                fmt,
                                 out_dim,
                                 out_dim,
                                 buf_bbox,
@@ -3749,9 +3876,10 @@ where
                                     pq.unscale,
                                 )
                                 .await?;
-                                let data = wrap_geotiff(
+                                let data = wrap_geotiff_fmt(
                                     data,
                                     ct,
+                                    treq.format,
                                     out_dim,
                                     out_dim,
                                     bbox_3857,
@@ -3780,9 +3908,10 @@ where
                                     encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
                                 };
                                 let (min_x, min_y, max_x, max_y) = tile_bounds_3857(treq.tile);
-                                let data = wrap_geotiff(
+                                let data = wrap_geotiff_fmt(
                                     data,
                                     ct,
+                                    orig_format,
                                     treq.tile_size,
                                     treq.tile_size,
                                     [min_x, min_y, max_x, max_y],
@@ -3793,9 +3922,10 @@ where
                             } else {
                                 let (min_x, min_y, max_x, max_y) = tile_bounds_3857(treq.tile);
                                 let b = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                                let b = wrap_geotiff(
+                                let b = wrap_geotiff_fmt(
                                     b,
                                     ct,
+                                    treq.format,
                                     treq.tile_size,
                                     treq.tile_size,
                                     [min_x, min_y, max_x, max_y],
