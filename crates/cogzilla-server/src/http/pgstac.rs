@@ -1426,15 +1426,15 @@ struct MosaicQuery {
     selection: Option<Selection>,
 }
 
-/// The routes that draw one image from many rasters at once take `first` only so far.
-fn first_only(query: &MosaicQuery, route: &str) -> Result<(), Resp> {
-    match query.selection {
-        None => Ok(()),
-        Some(_) => Err(detail(
-            StatusCode::BAD_REQUEST,
-            format!("pixel_selection other than 'first' is not supported on {route} routes yet (tiles take it)"),
-        )),
-    }
+/// The most a `median` may hold of its scenes at once.
+const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Whether a request's values are the raster's own whole numbers, which `mean` and `median`
+/// are cast back to; only then does the cast lose anything.
+fn whole_numbers(unscale: bool, bands: &BandRequest, sample_type: SampleType) -> bool {
+    !unscale
+        && matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
+        && !matches!(sample_type, SampleType::Float32 | SampleType::Float64)
 }
 
 /// How the values a pixel selection leaves become colours: the request's own rescaling
@@ -1756,7 +1756,7 @@ async fn part_image(
 ) -> Resp {
     // `width` and `height` are read here; the shared parser does not know them.
     pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'"));
-    let query = match check_mosaic_query(&pq, pairs).and_then(|q| first_only(&q, "bbox and feature").map(|()| q)) {
+    let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
     };
@@ -1818,6 +1818,8 @@ async fn part_image(
             .map_err(EngineError::BadRequest)?;
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
+        // With a pixel selection other than `first`: every scene's values, and how to colour them.
+        let mut selecting: Option<(Fold, Paint)> = None;
         for (n, scene) in scenes.iter().enumerate() {
             let mut cogs = Vec::with_capacity(scene.len());
             for href in scene {
@@ -1845,15 +1847,55 @@ async fn part_image(
             let default_bands =
                 if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
             let mut bands = build_band_request(&pq, default_bands, full.sample_type)?;
-            if pq.unscale {
-                apply_unscale_cogs(&mut bands, &cogs);
-            }
             // As on tiles: `resampling` for a source already in the output's projection,
             // `reproject` for one that has to be warped into it.
             let resample = match crs {
                 CrsModel::Geographic => query.resampling,
                 _ => query.reproject,
             };
+            if let Some(method) = query.selection {
+                // The scene's values rather than its colours; nothing stops the reading early.
+                let count = TileEngine::value_bands(&bands);
+                if n == 0 {
+                    let paint = Paint::of(&bands).ok_or_else(|| {
+                        EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
+                    })?;
+                    if Fold::<f32>::held_bytes(method, scenes.len(), count, width * height) > MAX_HELD_BYTES {
+                        return Err(EngineError::BadRequest(format!(
+                            "{} items are too many for a median at this size; narrow the search, lower items_limit or pass max_size",
+                            scenes.len()
+                        )));
+                    }
+                    let integer = whole_numbers(pq.unscale, &bands, full.sample_type);
+                    selecting = Some((Fold::new(method, count, width * height, integer), paint));
+                }
+                let values = render_wgs84_bbox(
+                    engine,
+                    &cogs,
+                    bbox,
+                    width as u32,
+                    height as u32,
+                    mask,
+                    &bands,
+                    resample,
+                    OutputFormat::RawF32,
+                    None,
+                    None,
+                    None,
+                    true,
+                    pq.unscale,
+                )
+                .await?;
+                if let Some((fold, _)) = &mut selecting
+                    && values.len() == count * width * height * 4
+                {
+                    fold.add_le_bytes(&values);
+                }
+                continue;
+            }
+            if pq.unscale {
+                apply_unscale_cogs(&mut bands, &cogs);
+            }
             let rgba = render_wgs84_bbox(
                 engine,
                 &cogs,
@@ -1887,6 +1929,11 @@ async fn part_image(
             if empty == 0 {
                 break;
             }
+        }
+        if let Some((fold, paint)) = selecting
+            && let Some(selected) = fold.finish()
+        {
+            canvas = paint.rgba(&selected, width * height);
         }
         if let Some(formula) = formula {
             formula.apply_buffer_in_place(&mut canvas, 4);
@@ -2365,6 +2412,10 @@ async fn feature_statistics(
         let mut program: Option<Program> = None;
         let mut used: Vec<String> = Vec::new();
         let (mut width, mut height, mut bounds) = (0usize, 0usize, bbox);
+        // With a pixel selection other than `first`, every scene's bands go through this
+        // and nothing stops the reading early.
+        let mut fold: Option<Fold<f64>> = None;
+        let scene_count = scenes.len();
         for (name, hrefs) in scenes {
             let mut cogs = Vec::with_capacity(hrefs.len());
             for href in &hrefs {
@@ -2441,6 +2492,50 @@ async fn feature_statistics(
                     descriptions = names;
                 }
                 canvas = vec![vec![f64::NAN; width * height]; descriptions.len()];
+                if let Some(method) = req.query.selection {
+                    if Fold::<f64>::held_bytes(method, scene_count, canvas.len(), width * height) > MAX_HELD_BYTES {
+                        return Err(EngineError::BadRequest(format!(
+                            "{scene_count} items are too many for a median at this size; narrow the search, lower items_limit or pass max_size"
+                        )));
+                    }
+                    // Whole numbers only when the values are the first raster's own.
+                    let integer = program.is_none()
+                        && !req.unscale
+                        && assets.iter().all(|a| a.expression.is_none())
+                        && !matches!(cogs[0].index.full_res().sample_type, SampleType::Float32 | SampleType::Float64);
+                    fold = Some(Fold::new(method, canvas.len(), width * height, integer));
+                }
+            }
+            if let Some(fold) = &mut fold {
+                let bands: Vec<Vec<f64>> = match &program {
+                    Some(program) => {
+                        let mut bands = vec![vec![f64::NAN; width * height]; canvas.len()];
+                        let mut pixel = vec![0f64; planes.len()];
+                        for i in 0..width * height {
+                            for (value, plane) in pixel.iter_mut().zip(&planes) {
+                                *value = plane[i];
+                            }
+                            for (part, band) in bands.iter_mut().enumerate() {
+                                let v = program.eval(part, &pixel);
+                                if v.is_finite() {
+                                    band[i] = v;
+                                }
+                            }
+                        }
+                        bands
+                    }
+                    None => {
+                        if planes.len() != canvas.len() {
+                            return Err(EngineError::BadRequest(
+                                "the items under the feature do not have the same number of bands".into(),
+                            ));
+                        }
+                        planes
+                    }
+                };
+                fold.add(bands.iter().flatten().map(|v| if v.is_finite() { *v } else { f64::NAN }));
+                used.push(name);
+                continue;
             }
             match &program {
                 Some(program) => {
@@ -2484,6 +2579,11 @@ async fn feature_statistics(
         }
         if canvas.is_empty() {
             return Ok(None);
+        }
+        if let Some(selected) = fold.and_then(Fold::finish) {
+            // `count` leaves one band, described as the first.
+            canvas = selected.values.chunks(width * height).map(<[f64]>::to_vec).collect();
+            descriptions.truncate(selected.bands);
         }
 
         // The polygon on the image's grid: once for the mask, once finer for the coverage.
@@ -2546,7 +2646,7 @@ async fn mosaic_statistics(
         "'histogram_range'", "'cover_scale'",
     ];
     pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)));
-    let query = match check_mosaic_query(&pq, pairs).and_then(|q| first_only(&q, "statistics").map(|()| q)) {
+    let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
     };
@@ -2911,21 +3011,18 @@ async fn tile(
                 }
                 // `mean` and `median` are cast back to the source's type, which only loses
                 // anything when the values are the raster's own whole numbers.
-                let integer = !pq.unscale
-                    && matches!(treq.bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
-                    && !matches!(full.sample_type, SampleType::Float32 | SampleType::Float64);
+                let integer = whole_numbers(pq.unscale, &treq.bands, full.sample_type);
                 let bands = TileEngine::value_bands(&treq.bands);
                 // The median has to hold every scene, so it is refused before anything is
                 // read when that would be too much.
-                const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
-                if Fold::held_bytes(method, scenes.len(), bands, dim * dim) > MAX_HELD_BYTES {
+                if Fold::<f32>::held_bytes(method, scenes.len(), bands, dim * dim) > MAX_HELD_BYTES {
                     return Err(EngineError::BadRequest(format!(
                         "{} items are too many for a median at this tile size; narrow the search or lower items_limit",
                         scenes.len()
                     )));
                 }
                 let mut fold = Fold::new(method, bands, dim * dim, integer);
-                engine.mosaic_scene_values(&scenes, &treq, |scene| fold.add(scene)).await?;
+                engine.mosaic_scene_values(&scenes, &treq, |scene| fold.add_le_bytes(scene)).await?;
                 match fold.finish() {
                     Some(selected) => paint.rgba(&selected, dim * dim),
                     None => vec![0u8; dim * dim * 4],
