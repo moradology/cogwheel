@@ -1827,6 +1827,9 @@ struct PlanesTile {
     /// The value that stands for no data, when the request names one: it is then that
     /// value and not the raster's own, as GDAL has it.
     nodata: Option<f32>,
+    /// Whether a NumPy array is asked for, which holds any number of bands where a
+    /// picture holds three.
+    array: bool,
     /// Whether the per-pixel work goes to the pool for heavy work: when there is more
     /// than one raster to work out, or a picture larger than a tile.
     pool: bool,
@@ -2077,6 +2080,8 @@ struct ItemBands {
     /// Whether they are the rasters' own whole numbers.
     integer: bool,
     sample_type: SampleType,
+    /// The type that holds the numbers of every asset read; `sample_type` is the first's.
+    widest: SampleType,
 }
 
 /// What one asset brings: its planes, its sample type, and whether they are its own numbers.
@@ -2148,6 +2153,8 @@ impl PlanesTile {
         }
         let parts = futures_util::future::try_join_all(reads).await?;
         let sample_type = parts.first().map_or(SampleType::Uint8, |(_, st, _)| *st);
+        // The one type that holds every asset's numbers, as numpy stacks them.
+        let widest = parts.iter().map(|(_, st, _)| *st).reduce(wider_type).unwrap_or(sample_type);
         let integer = self.expression.is_none()
             && !self.window.unscale()
             && parts.iter().all(|(_, st, own)| *own && !matches!(st, SampleType::Float32 | SampleType::Float64));
@@ -2161,7 +2168,7 @@ impl PlanesTile {
         if let Some(expression) = &self.expression {
             bands = band_math(expression, &bands)?;
         }
-        Ok(ItemBands { bands, stacked, integer, sample_type })
+        Ok(ItemBands { bands, stacked, integer, sample_type, widest })
     }
 
     /// The mosaic of the items' bands, and the first raster's sample type. Items are read
@@ -2170,13 +2177,13 @@ impl PlanesTile {
         &self,
         engine: &TileEngine,
         scenes: &[Vec<String>],
-    ) -> Result<Option<(Selected, SampleType)>, EngineError> {
+    ) -> Result<Option<(Selected, SampleType, SampleType)>, EngineError> {
         use futures_util::StreamExt;
         let pixels = self.window.pixels();
         let mut reading: futures_util::stream::FuturesOrdered<Reading<'_, ItemBands>> =
             futures_util::stream::FuturesOrdered::new();
         let mut next = 0;
-        let mut fold: Option<(Fold, SampleType)> = None;
+        let mut fold: Option<(Fold, SampleType, SampleType)> = None;
         // A tile's planes are small, and its items are read eight at once from the start.
         // An image's can be large: its first item is read alone, and how many follow at
         // once is set by what that one took.
@@ -2196,7 +2203,7 @@ impl PlanesTile {
                 ahead = (2 * MAX_PLANE_VALUES / (item.stacked.max(item.bands.len()).max(1) * pixels).max(1))
                     .clamp(1, MOSAIC_SCENES_AHEAD);
             }
-            let (fold, _) = match &mut fold {
+            let (fold, _, _) = match &mut fold {
                 Some(fold) => fold,
                 None => {
                     let bands = item.bands.len();
@@ -2212,7 +2219,7 @@ impl PlanesTile {
                         )));
                     }
                     check_working_bytes(Fold::<f32>::working_bytes(self.selection, bands, pixels))?;
-                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer).absent_as(self.nodata.unwrap_or(0.0)), item.sample_type))
+                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer).absent_as(self.nodata.unwrap_or(0.0)), item.sample_type, item.widest))
                 }
             };
             if item.bands.len() != fold.bands() {
@@ -2228,11 +2235,11 @@ impl PlanesTile {
                 method if method.by_last_band() => fold.bands() - 1,
                 _ => fold.bands(),
             };
-            if fold.is_done() || left > 3 {
+            if fold.is_done() || (left > 3 && !self.array) {
                 break;
             }
         }
-        Ok(fold.and_then(|(fold, sample_type)| fold.finish().map(|selected| (selected, sample_type))))
+        Ok(fold.and_then(|(fold, sample_type, widest)| fold.finish().map(|selected| (selected, sample_type, widest))))
     }
 }
 
@@ -2264,7 +2271,7 @@ impl PlanesTile {
         let pixels = width * height;
         let (rgba, bands, full) = match self.mosaic(engine, scenes).await? {
             None => (vec![0u8; pixels * 4], 1, false),
-            Some((selected, sample_type)) => {
+            Some((selected, sample_type, widest)) => {
                 // Without `rescale`: the type's own range for a raster's numbers, and the
                 // renderer's default for band math.
                 let math = self.expression.is_some() || self.assets.iter().any(|a| a.expression.is_some());
@@ -2288,6 +2295,73 @@ impl PlanesTile {
                 };
                 if look.custom.is_some() && selected.bands != 1 {
                     return Err(EngineError::BadRequest("Source data must be 1 band".into()));
+                }
+                // An array of the values as they are, when nothing was asked that turns
+                // them into a picture's bytes.
+                let shown = !look.rescale.is_empty() || look.mapped || look.custom.is_some() || look.formula.is_some();
+                if let (Some((OutputFormat::Npy, content_type)), false) = (look.asked, shown) {
+                    // Band math comes out in numexpr's types: whole numbers of up to 16
+                    // bits stay whole, as 32-bit ones, through sums, differences and
+                    // products, and 32-bit floats stay so; a division, a function or a fraction
+                    // makes doubles.
+                    let whole = |e: &String| {
+                        let mut rest = e.as_str();
+                        while let Some(at) = rest.find('b') {
+                            let digits = rest[at + 1..].bytes().take_while(u8::is_ascii_digit).count();
+                            if digits == 0 {
+                                return false;
+                            }
+                            rest = &rest[at + 1 + digits..];
+                        }
+                        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
+                    };
+                    let math_of = || self.expression.iter().chain(self.assets.iter().filter_map(|a| a.expression.as_ref()));
+                    let whole_math = math_of().all(whole);
+                    // float32 stays float32 through operations and functions alike; a literal
+                    // with a fraction or an exponent is a double and makes the result one.
+                    let plain_math = math_of().all(|e| {
+                        let e = e.as_bytes();
+                        !e.contains(&b'.') && !e.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
+                    });
+                    // What the bands are before any math: floats once unscaled.
+                    let read = if self.window.unscale() { SampleType::Float32 } else { widest };
+                    let kind = if matches!(self.selection, Selection::Stdev) {
+                        SampleType::Float64
+                    } else if matches!(self.selection, Selection::Count) {
+                        SampleType::Uint8
+                    } else if !math {
+                        read
+                    } else if read == SampleType::Float32 && plain_math {
+                        SampleType::Float32
+                    } else if !whole_math {
+                        SampleType::Float64
+                    } else {
+                        match read {
+                            SampleType::Uint8 | SampleType::Int8 | SampleType::Uint16 | SampleType::Int16 => SampleType::Int32,
+                            _ => SampleType::Float64,
+                        }
+                    };
+                    return Ok((npy_array(&selected.values, selected.bands, width, height, kind, look.return_mask, self.nodata), content_type));
+                }
+                // An array of rescaled values and nothing else: each band's bytes, however
+                // many bands there are.
+                if matches!(look.asked, Some((OutputFormat::Npy, _))) && !look.mapped && look.custom.is_none() && look.formula.is_none() {
+                    let range = |band: usize| match look.rescale {
+                        [] => default,
+                        [one] => *one,
+                        several => several.get(band).copied().unwrap_or(several[0]),
+                    };
+                    let values: Vec<f32> = selected
+                        .values
+                        .chunks(per_band.max(1))
+                        .enumerate()
+                        .flat_map(|(band, plane)| {
+                            let (min, max) = range(band);
+                            plane.iter().map(move |v| if v.is_nan() { f32::NAN } else { f32::from(rescale_byte(*v, min, max)) })
+                        })
+                        .collect();
+                    let content_type = look.asked.map_or("application/x-binary", |(_, ct)| ct);
+                    return Ok((npy_array(&values, selected.bands, width, height, SampleType::Uint8, look.return_mask, None), content_type));
                 }
                 let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap, look.custom).map_err(|bands| {
                     EngineError::BadRequest(format!(
@@ -2313,8 +2387,115 @@ impl PlanesTile {
             )));
         }
         let grey = bands == 1 && !look.mapped && look.custom.is_none();
+        // An array of a picture: its bytes, band by band, and the mask as a band of its own.
+        if let (OutputFormat::Npy, content_type) = asked {
+            let mut rgba = rgba;
+            if let Some(formula) = look.formula {
+                formula.apply_buffer_in_place(&mut rgba, 4);
+            }
+            let shown = if grey { 1 } else { 3 };
+            let mut values = Vec::with_capacity(shown * pixels);
+            for band in 0..shown {
+                values.extend(rgba.chunks_exact(4).map(|p| if p[3] == 0 { f32::NAN } else { f32::from(p[band]) }));
+            }
+            return Ok((npy_array(&values, shown, width, height, SampleType::Uint8, look.return_mask, None), content_type));
+        }
         encode_picture(rgba, width, height, look.formula, Some(asked), look.jpeg_quality, look.return_mask, grey)
     }
+}
+
+/// The type that holds the numbers of both, as numpy promotes them when it stacks bands.
+fn wider_type(a: SampleType, b: SampleType) -> SampleType {
+    use SampleType as T;
+    if a == b {
+        return a;
+    }
+    let float = |t| matches!(t, T::Float32 | T::Float64);
+    let signed = |t| matches!(t, T::Int8 | T::Int16 | T::Int32);
+    let bits = |t| match t {
+        T::Uint8 | T::Int8 => 8u32,
+        T::Uint16 | T::Int16 => 16,
+        T::Uint32 | T::Int32 | T::Float32 => 32,
+        T::Float64 => 64,
+    };
+    if float(a) || float(b) {
+        // float32 holds whole numbers of 16 bits and no more.
+        let narrow = |t| if float(t) { bits(t) == 32 } else { bits(t) <= 16 };
+        return if narrow(a) && narrow(b) { T::Float32 } else { T::Float64 };
+    }
+    let sized = |kinds: [SampleType; 3], width: u32| kinds[match width { 8 => 0, 16 => 1, _ => 2 }];
+    match (signed(a), signed(b)) {
+        (false, false) => sized([T::Uint8, T::Uint16, T::Uint32], bits(a).max(bits(b))),
+        (true, true) => sized([T::Int8, T::Int16, T::Int32], bits(a).max(bits(b))),
+        // A signed type one size up from the unsigned one, or the signed one's own if larger.
+        _ => {
+            let (own, unsigned) = if signed(a) { (bits(a), bits(b)) } else { (bits(b), bits(a)) };
+            match (unsigned * 2).max(own) {
+                16 => T::Int16,
+                32 => T::Int32,
+                _ => T::Float64,
+            }
+        }
+    }
+}
+
+/// A NumPy array of `bands` planes of `width` by `height`, as TiTiler writes one: in the
+/// type `kind`, a value that is not there as `absent` (the no-data value the request
+/// named) or zero, and after the bands, with `mask`, one
+/// more that holds the type's largest number where any band has a value and zero elsewhere.
+fn npy_array(
+    values: &[f32],
+    bands: usize,
+    width: usize,
+    height: usize,
+    kind: SampleType,
+    mask: bool,
+    absent: Option<f32>,
+) -> Bytes {
+    let pixels = width * height;
+    let (descr, size) = match kind {
+        SampleType::Uint8 => ("|u1", 1),
+        SampleType::Int8 => ("|i1", 1),
+        SampleType::Uint16 => ("<u2", 2),
+        SampleType::Int16 => ("<i2", 2),
+        SampleType::Uint32 => ("<u4", 4),
+        SampleType::Int32 => ("<i4", 4),
+        SampleType::Float32 => ("<f4", 4),
+        SampleType::Float64 => ("<f8", 8),
+    };
+    let planes = bands + usize::from(mask);
+    let mut dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({planes}, {height}, {width}), }}");
+    // The header ends on a multiple of 64 bytes, in spaces and a newline.
+    let pad = (64 - (10 + dict.len() + 1) % 64) % 64;
+    dict.extend(std::iter::repeat_n(' ', pad));
+    dict.push('\n');
+    let mut out = Vec::with_capacity(10 + dict.len() + planes * pixels * size);
+    out.extend_from_slice(b"\x93NUMPY\x01\x00");
+    out.extend_from_slice(&(dict.len() as u16).to_le_bytes());
+    out.extend_from_slice(dict.as_bytes());
+    // One value in the array's type; `top` is the type's largest, which marks the mask.
+    let mut put = |v: f64, top: bool| match kind {
+        SampleType::Uint8 => out.push(if top { u8::MAX } else { v as u8 }),
+        SampleType::Int8 => out.push((if top { i8::MAX } else { v as i8 }) as u8),
+        SampleType::Uint16 => out.extend_from_slice(&(if top { u16::MAX } else { v as u16 }).to_le_bytes()),
+        SampleType::Int16 => out.extend_from_slice(&(if top { i16::MAX } else { v as i16 }).to_le_bytes()),
+        SampleType::Uint32 => out.extend_from_slice(&(if top { u32::MAX } else { v as u32 }).to_le_bytes()),
+        SampleType::Int32 => out.extend_from_slice(&(if top { i32::MAX } else { v as i32 }).to_le_bytes()),
+        // Band math's largest number is an infinity once it has been through a plane of f32.
+        SampleType::Float32 => out.extend_from_slice(&(if top { f32::MAX } else { (v as f32).clamp(f32::MIN, f32::MAX) }).to_le_bytes()),
+        SampleType::Float64 => out.extend_from_slice(&(if top { f64::MAX } else { v.clamp(f64::MIN, f64::MAX) }).to_le_bytes()),
+    };
+    let absent = f64::from(absent.unwrap_or(0.0));
+    for v in values.iter().take(bands * pixels) {
+        put(if v.is_nan() { absent } else { f64::from(*v) }, false);
+    }
+    if mask {
+        for i in 0..pixels {
+            let there = (0..bands).any(|band| values.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+            put(0.0, there);
+        }
+    }
+    Bytes::from(out)
 }
 
 /// A colour map given in the request as JSON, read the way rio-tiler applies one.
@@ -2642,7 +2823,9 @@ async fn part_image_of(
         Err(e) => return detail(StatusCode::BAD_REQUEST, e),
     };
     // So is a `nodata` of the request's own: the renderer on this road reads the raster's.
-    let planes_needed = wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some();
+    // And a NumPy array, which is written from planes in the data's own type.
+    let array = matches!(ext.or(pq.format_param.as_deref()), Some("npy"));
+    let planes_needed = wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some() || array;
     let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
@@ -2709,11 +2892,10 @@ async fn part_image_of(
             Err(e) => return engine_error(&e),
         },
     };
-    if matches!(format, Some((OutputFormat::RawF32 | OutputFormat::Npy, _))) {
-        return detail(
-            StatusCode::BAD_REQUEST,
-            "raw array formats are not supported on pgSTAC bbox and feature routes yet",
-        );
+    // A NumPy array is written from planes, in the data's own type and with its mask; the
+    // renderer's is float32 without one, and bare bytes say nothing of either.
+    if matches!(format, Some((OutputFormat::RawF32, _))) {
+        return detail(StatusCode::BAD_REQUEST, "bare arrays are not written on pgSTAC bbox and feature routes; ask for `.npy`");
     }
     // A JPEG has no mask to carry the polygon, and TiTiler then writes the whole box as it
     // was read. With `rescale` it does not: rescaling leaves zero wherever the mask is.
@@ -2796,6 +2978,7 @@ async fn part_image_of(
                 resampling: query.resampling,
                 reproject: query.reproject,
                 nodata: pq.nodata,
+                array,
                 window: Window::Part { bbox, mercator, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
                 pool: true,
             };
@@ -4213,7 +4396,7 @@ async fn tile(
         pq.buffer = 0.0;
         // What the renderer draws of a tile, it draws without a `buffer`: said here, in a
         // tile's words, sooner than further on in a box's.
-        let raw = matches!(ext, "npy" | "bin" | "raw" | "f32") || matches!(query_value(pairs, "format"), Some("npy" | "bin" | "raw" | "f32"));
+        let raw = matches!(ext, "bin" | "raw" | "f32") || matches!(query_value(pairs, "format"), Some("bin" | "raw" | "f32"));
         match check_mosaic_query(&pq, pairs) {
             Ok(q)
                 if q.resampling != ResampleMode::Nearest
@@ -4224,7 +4407,7 @@ async fn tile(
             {
                 return detail(
                     StatusCode::BAD_REQUEST,
-                    "a tile with a `buffer` is drawn with nearest-neighbour resampling, as a picture, and without `algorithm` or band math only the renderer reads",
+                    "a tile with a `buffer` is drawn with nearest-neighbour resampling, as a picture or `.npy`, and without `algorithm` or band math only the renderer reads",
                 );
             }
             Ok(_) => {}
@@ -4397,6 +4580,7 @@ async fn tile(
                     resampling,
                     reproject,
                     nodata,
+                    array: false,
                     window: Window::Tile(crate::engine::TileRequest {
                         tile,
                         tile_size: dim,
@@ -6847,6 +7031,40 @@ mod tests {
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
+    }
+
+    #[test]
+    fn arrays_are_written_in_the_datas_type_with_a_mask() {
+        let values = [1.0f32, f32::NAN, 300.0, 4.0];
+        let made = npy_array(&values, 2, 2, 1, SampleType::Uint16, true, None);
+        assert_eq!(&made[..8], b"\x93NUMPY\x01\x00");
+        let header = usize::from(u16::from_le_bytes([made[8], made[9]]));
+        assert_eq!((10 + header) % 64, 0);
+        let dict = std::str::from_utf8(&made[10..10 + header]).unwrap();
+        assert!(dict.starts_with("{'descr': '<u2', 'fortran_order': False, 'shape': (3, 1, 2), }") && dict.ends_with('\n'));
+        let words: Vec<u16> = made[10 + header..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+        // Two bands, then the mask: a pixel is there when any band of it is.
+        assert_eq!(words, [1, 0, 300, 4, u16::MAX, u16::MAX]);
+        // Without the mask, and a missing value as the number the request named.
+        let bare = npy_array(&values, 2, 2, 1, SampleType::Uint8, false, Some(9.0));
+        assert_eq!(&bare[bare.len() - 4..], [1, 9, 255, 4]);
+        let doubles = npy_array(&[f32::NAN, 0.5], 1, 2, 1, SampleType::Float64, true, None);
+        assert_eq!(&doubles[doubles.len() - 16..doubles.len() - 8], 0f64.to_le_bytes());
+        assert_eq!(&doubles[doubles.len() - 8..], f64::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn stacked_bands_take_the_type_that_holds_them_all() {
+        use SampleType as T;
+        for (a, b, both) in [
+            (T::Uint8, T::Uint16, T::Uint16), (T::Uint16, T::Int16, T::Int32), (T::Uint8, T::Int8, T::Int16),
+            (T::Uint8, T::Int16, T::Int16), (T::Uint8, T::Int32, T::Int32), (T::Int8, T::Int16, T::Int16),
+            (T::Uint16, T::Float32, T::Float32), (T::Uint32, T::Float32, T::Float64), (T::Float32, T::Float64, T::Float64),
+            (T::Uint32, T::Int32, T::Float64), (T::Uint8, T::Uint8, T::Uint8), (T::Uint16, T::Uint32, T::Uint32),
+        ] {
+            assert_eq!(wider_type(a, b), both, "{a:?} with {b:?}");
+            assert_eq!(wider_type(b, a), both, "{b:?} with {a:?}");
+        }
     }
 
 }
