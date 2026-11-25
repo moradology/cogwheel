@@ -1032,7 +1032,7 @@ fn apply_info_bounds_crs(
 
 const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
 
-/// Parse a TiTiler CRS string (`EPSG:32610`, `CRS84`, `http://.../EPSG/0/32610`,
+/// Parse a TiTiler CRS string (`EPSG:32610`, `EPSG:900913`, `CRS84`, `http://.../EPSG/0/32610`,
 /// `urn:ogc:def:crs:EPSG::32610`, etc.) into `(CrsModel, epsg_code)` using our 3,260+ EPSG table.
 fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16), String> {
     let trimmed = raw.trim();
@@ -1040,11 +1040,22 @@ fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16)
     if lower == "crs84" || lower.ends_with(":crs84") || lower.ends_with("/crs84") {
         return Ok((cogzilla_proj::CrsModel::Geographic, 4326));
     }
-    let digits = lower
-        .rsplit([':', '/'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let digits = if let Some(rest) = lower.strip_prefix("epsg:") {
+        rest.trim()
+    } else if let Some(pos) = lower.find("epsg:") {
+        // e.g. urn:ogc:def:crs:epsg::32610 or urn:ogc:def:crs:epsg:6.3:32610
+        lower[pos + 5..].rsplit(':').next().unwrap_or("").trim()
+    } else if let Some(pos) = lower.find("/epsg/") {
+        // e.g. http://www.opengis.net/def/crs/EPSG/0/32610
+        lower[pos + 6..].rsplit('/').next().unwrap_or("").trim()
+    } else {
+        return Err(format!(
+            "unsupported CRS '{raw}' (expected EPSG:<code> or CRS84)"
+        ));
+    };
+    if digits == "900913" {
+        return Ok((cogzilla_proj::CrsModel::Epsg3857, 3857));
+    }
     let Ok(code) = digits.parse::<u16>() else {
         return Err(format!("unsupported CRS '{raw}' (expected EPSG:<code> or CRS84)"));
     };
@@ -1686,10 +1697,11 @@ fn build_band_request(
                                 "algorithm 'normalizedIndex' requires at least 2 bands".into(),
                             ));
                         }
+                        // Match TiTiler's NormalizedIndex: (b2 - b1) / (b2 + b1)
                         (
                             format!(
                                 "(b{} - b{}) / (b{} + b{})",
-                                bands[0], bands[1], bands[0], bands[1]
+                                bands[1], bands[0], bands[1], bands[0]
                             ),
                             (-1.0, 1.0),
                         )

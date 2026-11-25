@@ -309,7 +309,9 @@ pub fn select_stac_asset_names(
             }
         }
         if names.is_empty() {
-            names = item.assets.keys().take(3).cloned().collect();
+            return Err(EngineError::BadRequest(
+                "missing ?assets= (or asset names in ?expression=)".into(),
+            ));
         }
     }
     if names.is_empty() {

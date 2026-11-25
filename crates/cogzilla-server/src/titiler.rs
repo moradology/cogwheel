@@ -1512,7 +1512,7 @@ impl BandStatsAcc {
         obj.insert("majority".into(), serde_json::json!(maj_val));
         obj.insert("minority".into(), serde_json::json!(min_val));
         obj.insert("unique".into(), serde_json::json!(unique));
-        obj.insert("valid_percent".into(), serde_json::json!(valid_pct));
+        obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
         obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
         obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
         for (&p, &pv) in opts.percentiles.iter().zip(p_vals.iter()) {
@@ -1668,7 +1668,7 @@ impl BandStatsAcc {
                 obj.insert("majority".into(), serde_json::json!(maj_val));
                 obj.insert("minority".into(), serde_json::json!(min_val));
                 obj.insert("unique".into(), serde_json::json!(unique));
-                obj.insert("valid_percent".into(), serde_json::json!(valid_pct));
+                obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
                 obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
                 obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
                 for &p in &opts.percentiles {
