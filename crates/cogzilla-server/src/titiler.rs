@@ -3307,6 +3307,48 @@ impl PolygonMask {
 
         const MAX_GEOJSON_VERTICES: usize = 65_536;
         const MAX_GEOJSON_RINGS: usize = 4_096;
+        const MAX_GEOM_COLLECTION_DEPTH: usize = 8;
+        const MAX_LEAF_GEOMETRIES: usize = 64;
+
+        // Iteratively flatten any GeometryCollection nodes with bounded depth and leaf count.
+        let mut flat_geoms: Vec<&serde_json::Value> = Vec::with_capacity(geometries.len());
+        let mut stack: Vec<(&serde_json::Value, usize)> =
+            geometries.into_iter().rev().map(|g| (g, 0)).collect();
+        while let Some((g, depth)) = stack.pop() {
+            if g.get("type").and_then(|v| v.as_str()) == Some("GeometryCollection") {
+                if depth >= MAX_GEOM_COLLECTION_DEPTH {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON GeometryCollection exceeds max nesting depth {MAX_GEOM_COLLECTION_DEPTH}"
+                    )));
+                }
+                let children = g
+                    .get("geometries")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        EngineError::BadRequest(
+                            "GeoJSON GeometryCollection missing geometries array".into(),
+                        )
+                    })?;
+                if children.len().saturating_add(stack.len()).saturating_add(flat_geoms.len())
+                    > MAX_LEAF_GEOMETRIES
+                {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON exceeds max {MAX_LEAF_GEOMETRIES} geometries"
+                    )));
+                }
+                for child in children.iter().rev() {
+                    stack.push((child, depth + 1));
+                }
+            } else {
+                flat_geoms.push(g);
+                if flat_geoms.len() > MAX_LEAF_GEOMETRIES {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON exceeds max {MAX_LEAF_GEOMETRIES} geometries"
+                    )));
+                }
+            }
+        }
+
         let mut total_vertices = 0usize;
         let mut total_rings = 0usize;
 
@@ -3314,6 +3356,11 @@ impl PolygonMask {
             let list = arr
                 .as_array()
                 .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON ring".into()))?;
+            if list.len() < 3 {
+                return Err(EngineError::BadRequest(
+                    "GeoJSON polygon ring must have at least 3 vertices".into(),
+                ));
+            }
             total_rings += 1;
             if total_rings > MAX_GEOJSON_RINGS {
                 return Err(EngineError::BadRequest(format!(
@@ -3350,7 +3397,7 @@ impl PolygonMask {
         };
 
         let mut polygons = Vec::new();
-        for geom in geometries {
+        for geom in flat_geoms {
             let gtype = geom
                 .get("type")
                 .and_then(|v| v.as_str())
@@ -4693,6 +4740,10 @@ async fn render_bbox_impl(
                     let mut vals = [0.0f32; 16];
                     let nb = srcs.len().min(16);
                     for i in 0..(w * h) {
+                        if u_map[i].is_nan() {
+                            out.put_slice(&f32::NAN.to_le_bytes());
+                            continue;
+                        }
                         for k in 0..nb {
                             vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
                         }
@@ -4710,6 +4761,10 @@ async fn render_bbox_impl(
                         let mut vals = [0.0f32; 16];
                         let nb = srcs.len().min(16);
                         for i in 0..(w * h) {
+                            if u_map[i].is_nan() {
+                                out.put_slice(&f32::NAN.to_le_bytes());
+                                continue;
+                            }
                             for k in 0..nb {
                                 vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
                             }
@@ -4971,6 +5026,9 @@ async fn render_bbox_impl(
                 let mut vals = [0.0f32; 16];
                 let nb = srcs.len().min(16);
                 for i in 0..(w * h) {
+                    if u_map[i].is_nan() {
+                        continue;
+                    }
                     for k in 0..nb {
                         vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
                     }
@@ -5009,6 +5067,9 @@ async fn render_bbox_impl(
                 ];
                 let mut vals = [0.0f32; 16];
                 for i in 0..(w * h) {
+                    if u_map[i].is_nan() {
+                        continue;
+                    }
                     let mut rgb = [0.0f32; 3];
                     let mut ok = true;
                     for c in 0..3 {

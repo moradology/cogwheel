@@ -1198,6 +1198,63 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(inv_resp.status(), 400, "inverted s > n STAC bbox must return 400");
             let _ = std::fs::remove_file(&am_stac_path);
             let _ = std::fs::remove_file(&inv_stac_path);
+
+            // Audit c75 regression checks:
+            // 1. GeometryCollection accepted in PolygonMask::from_geojson + constant expression
+            //    respects shape_mask (outside-polygon pixels must be NaN, not 1.0).
+            let gc_poly = serde_json::json!({
+                "type": "GeometryCollection",
+                "geometries": [{
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-122.65, 37.76],
+                        [-122.60, 37.76],
+                        [-122.65, 37.80],
+                        [-122.65, 37.76]
+                    ]]
+                }]
+            });
+            let gc_resp = client
+                .post(format!("{base}/cog/feature/32x32.f32?url={sat_url}&expression=1"))
+                .header("content-type", "application/json")
+                .body(gc_poly.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(gc_resp.status(), 200, "GeometryCollection /cog/feature must succeed");
+            let gc_bytes = gc_resp.bytes().await.unwrap();
+            assert_eq!(gc_bytes.len(), 32 * 32 * 4);
+            // Top-right pixel (row 0, col 31) is outside the lower-left triangle -> must be NaN
+            let tr_val = f32::from_le_bytes([
+                gc_bytes[31 * 4],
+                gc_bytes[31 * 4 + 1],
+                gc_bytes[31 * 4 + 2],
+                gc_bytes[31 * 4 + 3],
+            ]);
+            assert!(tr_val.is_nan(), "outside-polygon pixel for constant expression must be NaN, got {tr_val}");
+            // Bottom-left pixel (row 30, col 1) is inside the triangle -> must be 1.0
+            let bl_off = (30 * 32 + 1) * 4;
+            let bl_val = f32::from_le_bytes([
+                gc_bytes[bl_off],
+                gc_bytes[bl_off + 1],
+                gc_bytes[bl_off + 2],
+                gc_bytes[bl_off + 3],
+            ]);
+            assert_eq!(bl_val, 1.0, "inside-polygon pixel for expression=1 must be 1.0");
+
+            // 2. 2-vertex degenerate ring must be rejected with 400
+            let two_vtx = serde_json::json!({
+                "type": "Polygon",
+                "coordinates": [[[-122.65, 37.76], [-122.60, 37.80]]]
+            });
+            let two_resp = client
+                .post(format!("{base}/cog/feature/32x32.png?url={merc_url}&rescale=0,2500"))
+                .header("content-type", "application/json")
+                .body(two_vtx.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(two_resp.status(), 400, "2-vertex GeoJSON ring must return 400");
         }
     }
 }

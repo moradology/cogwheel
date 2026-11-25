@@ -3273,10 +3273,11 @@ where
                             my0.max(my1),
                         );
                         let mut last_err: Option<EngineError> = None;
+                        let mut first_empty: Option<serde_json::Value> = None;
                         for cand in urls.iter().take(16) {
                             match eng.store.open_uri(cand).await {
                                 Ok(cog) => {
-                                    return compute_statistics_with_options(
+                                    match compute_statistics_with_options(
                                         &eng,
                                         &cog,
                                         max_size,
@@ -3285,10 +3286,34 @@ where
                                         nodata,
                                         &opts,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        Ok(stats) => {
+                                            let has_valid = stats
+                                                .as_object()
+                                                .is_some_and(|obj| {
+                                                    obj.values().any(|b| {
+                                                        b.get("valid_pixels")
+                                                            .and_then(|v| v.as_u64())
+                                                            .unwrap_or(0)
+                                                            > 0
+                                                    })
+                                                });
+                                            if has_valid {
+                                                return Ok(stats);
+                                            }
+                                            if first_empty.is_none() {
+                                                first_empty = Some(stats);
+                                            }
+                                        }
+                                        Err(e) => last_err = Some(e),
+                                    }
                                 }
                                 Err(e) => last_err = Some(e.into()),
                             }
+                        }
+                        if let Some(empty) = first_empty {
+                            return Ok(empty);
                         }
                         Err(last_err.unwrap_or_else(|| {
                             EngineError::NotFound(
