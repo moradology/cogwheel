@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod engine;
 pub mod http;
+pub mod openapi;
 pub mod stac;
 pub mod tile_cache;
 pub mod titiler;

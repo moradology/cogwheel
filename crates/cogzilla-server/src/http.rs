@@ -4432,50 +4432,16 @@ where
     }
 
     if method == Method::GET && (path == "/openapi.json" || path == "/api") {
-        let spec = serde_json::json!({
-            "openapi": "3.1.0",
-            "info": {
-                "title": "cogzilla",
-                "version": env!("CARGO_PKG_VERSION"),
-                "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG & STAC tile server"
-            },
-            "paths": {
-                "/": { "get": { "summary": "Landing page with live demo maps" } },
-                "/healthz": { "get": { "summary": "Health check" } },
-                "/cog/info": { "get": { "summary": "COG metadata" } },
-                "/cog/info.geojson": { "get": { "summary": "COG GeoJSON metadata" } },
-                "/cog/bounds": { "get": { "summary": "COG WGS84 bounds" } },
-                "/cog/validate": { "get": { "summary": "Validate COG structure and layout" } },
-                "/cog/statistics": { "get": { "summary": "COG statistics" }, "post": { "summary": "Polygon-clipped COG statistics" } },
-                "/cog/tiles": { "get": { "summary": "List COG tilesets" } },
-                "/cog/tiles/{tileMatrixSetId}": { "get": { "summary": "COG tileset metadata" } },
-                "/cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render COG map tile" } },
-                "/cog/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "COG TileJSON 3.0" } },
-                "/cog/{tileMatrixSetId}/map.html": { "get": { "summary": "Interactive Leaflet map viewer" } },
-                "/cog/point/{lon},{lat}": { "get": { "summary": "Sample pixel values at point" } },
-                "/cog/preview.{format}": { "get": { "summary": "Render COG preview" } },
-                "/cog/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}": { "get": { "summary": "Render COG bbox crop" } },
-                "/cog/feature/{width}x{height}.{format}": { "post": { "summary": "Render GeoJSON feature crop" } },
-                "/stac/assets": { "get": { "summary": "List STAC Item raster assets" } },
-                "/stac/bounds": { "get": { "summary": "STAC Item WGS84 bounds" } },
-                "/stac/info": { "get": { "summary": "STAC assets metadata" } },
-                "/stac/info.geojson": { "get": { "summary": "STAC GeoJSON metadata" } },
-                "/stac/asset_statistics": { "get": { "summary": "Per-asset STAC statistics" } },
-                "/stac/statistics": { "get": { "summary": "Merged STAC statistics" }, "post": { "summary": "Polygon-clipped STAC statistics" } },
-                "/stac/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render STAC multi-asset tile" } },
-                "/stac/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "STAC TileJSON 3.0" } },
-                "/stac/point/{lon},{lat}": { "get": { "summary": "Sample STAC asset values at point" } },
-                "/stac/preview/{width}x{height}.{format}": { "get": { "summary": "Render STAC preview" } },
-                "/algorithms": { "get": { "summary": "List available raster algorithms" } },
-                "/algorithms/{algorithmId}": { "get": { "summary": "Get algorithm metadata and parameters" } },
-                "/colorMaps": { "get": { "summary": "List all 211 rio-tiler colormaps" } },
-                "/colorMaps/{colorMapId}": { "get": { "summary": "Get colormap RGBA LUT JSON or ?f=png colorbar" } },
-                "/tileMatrixSets": { "get": { "summary": "List OGC TileMatrixSets" } },
-                "/tileMatrixSets/{tileMatrixSetId}": { "get": { "summary": "Get OGC TileMatrixSet 2.0 definition" } }
-            }
-        })
-        .to_string();
-        return Ok(plain_resp(StatusCode::OK, Bytes::from(spec), "application/json"));
+        let ct = if path == "/api" {
+            "application/vnd.oai.openapi+json;version=3.1"
+        } else {
+            "application/json"
+        };
+        return Ok(plain_resp(
+            StatusCode::OK,
+            crate::openapi::openapi_json_bytes(),
+            ct,
+        ));
     }
 
     if method == Method::GET && (path == "/docs" || path == "/api.html") {
