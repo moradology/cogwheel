@@ -60,8 +60,9 @@ VOLATILE = {"lastused", "usecount"}
 def dsn_from_env() -> str:
     if os.environ.get("DATABASE_URL"):
         return os.environ["DATABASE_URL"]
-    user = os.environ.get("PGUSER", "username")
-    password = os.environ.get("PGPASSWORD", "password")
+    # A name or a password may hold `/` or `@`, which a URL would read as its own.
+    user = quote(os.environ.get("PGUSER", "username"), safe="")
+    password = quote(os.environ.get("PGPASSWORD", "password"), safe="")
     host = os.environ.get("PGHOST", "127.0.0.1")
     port = os.environ.get("PGPORT", os.environ.get("PGSTAC_PORT", "5439"))
     db = os.environ.get("PGDATABASE", "postgis")

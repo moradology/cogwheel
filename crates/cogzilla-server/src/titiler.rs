@@ -103,18 +103,16 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         None => ("None", None),
     };
 
-    let crs_uri = if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .projected_cs_type
-        .filter(|&c| c > 0 && c != 32767)
-    {
+    let gk = &cog.index.geo_keys;
+    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+    let is_user_defined_projected = std_proj_epsg.is_none()
+        && (gk.model_type == Some(1)
+            || gk.projected_cs_type == Some(32767)
+            || gk.proj_coord_trans.is_some());
+    let crs_uri = if let Some(epsg) = std_proj_epsg {
         format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
-    } else if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .geographic_type
-        .filter(|&c| c > 0 && c != 32767)
+    } else if !is_user_defined_projected
+        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
     {
         format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
     } else {
@@ -140,9 +138,14 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         x00.max(x10).max(x01).max(x11),
         y00.max(y10).max(y01).max(y11),
     ];
+    let reported_bounds = if is_user_defined_projected {
+        bounds
+    } else {
+        native_bounds
+    };
 
     let mut info = serde_json::json!({
-        "bounds": native_bounds,
+        "bounds": reported_bounds,
         "crs": crs_uri,
         "wgs84_bounds": bounds,
         "minzoom": minzoom,
@@ -269,18 +272,16 @@ pub fn build_cog_validate(
         None => serde_json::Value::Null,
     };
 
-    let crs_str = if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .projected_cs_type
-        .filter(|&c| c > 0 && c != 32767)
-    {
+    let gk = &cog.index.geo_keys;
+    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+    let is_user_defined_projected = std_proj_epsg.is_none()
+        && (gk.model_type == Some(1)
+            || gk.projected_cs_type == Some(32767)
+            || gk.proj_coord_trans.is_some());
+    let crs_str = if let Some(epsg) = std_proj_epsg {
         format!("EPSG:{epsg}")
-    } else if let Some(epsg) = cog
-        .index
-        .geo_keys
-        .geographic_type
-        .filter(|&c| c > 0 && c != 32767)
+    } else if !is_user_defined_projected
+        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
     {
         format!("EPSG:{epsg}")
     } else {
@@ -293,12 +294,23 @@ pub fn build_cog_validate(
     let (x11, y11) = full
         .pixel_to_crs
         .forward(full.width as f64, full.height as f64);
-    let native_bounds = [
-        x00.min(x10).min(x01).min(x11),
-        y00.min(y10).min(y01).min(y11),
-        x00.max(x10).max(x01).max(x11),
-        y00.max(y10).max(y01).max(y11),
-    ];
+    let native_bounds = if is_user_defined_projected {
+        cogzilla_proj::CrsModel::from_geo_keys(gk)
+            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+            .unwrap_or([
+                x00.min(x10).min(x01).min(x11),
+                y00.min(y10).min(y01).min(y11),
+                x00.max(x10).max(x01).max(x11),
+                y00.max(y10).max(y01).max(y11),
+            ])
+    } else {
+        [
+            x00.min(x10).min(x01).min(x11),
+            y00.min(y10).min(y01).min(y11),
+            x00.max(x10).max(x01).max(x11),
+            y00.max(y10).max(y01).max(y11),
+        ]
+    };
     let (res_x, res_y) = full.pixel_resolution();
 
     let ifds: Vec<serde_json::Value> = cog
@@ -462,108 +474,106 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             }
         }),
         "normalizedIndex" | "normalizedindex" => serde_json::json!({
-            "title": "Normalized Index",
-            "description": "Calculate normalized difference index (b1 - b2) / (b1 + b2).",
+            "title": "Normalized Difference Index",
+            "description": "Compute normalized difference index from two bands.",
             "inputs": { "nbands": 2 },
             "outputs": { "nbands": 1, "dtype": "float32", "min": [-1.0], "max": [1.0] },
             "parameters": {}
         }),
         "cast" => serde_json::json!({
-            "title": "Cast",
-            "description": "Cast data to a target numeric type.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Cast data to Integer",
+            "description": "Cast data to Integer.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": null, "dtype": "uint8", "min": [0], "max": [255] },
             "parameters": {}
         }),
         "ceil" => serde_json::json!({
-            "title": "Ceil",
-            "description": "Return the ceiling of the input, element-wise.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Round data to the smallest integer",
+            "description": "Round data to the smallest integer.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": null, "dtype": "uint8", "min": [0], "max": [255] },
             "parameters": {}
         }),
         "floor" => serde_json::json!({
-            "title": "Floor",
-            "description": "Return the floor of the input, element-wise.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Round data to the largest integer",
+            "description": "Round data to the largest integer.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": null, "dtype": "uint8", "min": [0], "max": [255] },
             "parameters": {}
         }),
         "min" => serde_json::json!({
-            "title": "Min",
-            "description": "Calculate pixel-wise minimum across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Minimum",
+            "description": "Return the Minimum along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "max" => serde_json::json!({
-            "title": "Max",
-            "description": "Calculate pixel-wise maximum across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Maximum",
+            "description": "Return the Maximum along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "median" => serde_json::json!({
             "title": "Median",
-            "description": "Calculate pixel-wise median across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "description": "Return the Median along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "mean" => serde_json::json!({
             "title": "Mean",
-            "description": "Calculate pixel-wise mean across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "description": "Return the Mean along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "std" => serde_json::json!({
-            "title": "Std",
-            "description": "Calculate pixel-wise standard deviation across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Standard deviation",
+            "description": "Return the Standard Deviation along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "var" => serde_json::json!({
-            "title": "Var",
-            "description": "Calculate pixel-wise variance across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Variance",
+            "description": "Return Variance along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "float64", "min": null, "max": null },
             "parameters": {}
         }),
         "sum" => serde_json::json!({
             "title": "Sum",
-            "description": "Calculate pixel-wise sum across bands.",
-            "inputs": {},
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "description": "Return the Sum along the `bands` axis.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "grayscale" => serde_json::json!({
-            "title": "Grayscale",
-            "description": "Convert RGB bands to grayscale using ITU-R BT.601 luma weights.",
-            "inputs": { "nbands": 3 },
-            "outputs": { "nbands": 1, "dtype": "float32", "min": null, "max": null },
+            "title": "Transform a RGB Image to Grayscale",
+            "description": "Transform a RGB Image to Grayscale using the ITU-R 601-2 luma.",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": null, "min": null, "max": null },
             "parameters": {}
         }),
         "bitonal" => serde_json::json!({
-            "title": "Bitonal",
-            "description": "Threshold single-band data into binary 0/1 output.",
-            "inputs": { "nbands": 1 },
-            "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [1] },
-            "parameters": {
-                "threshold": { "default": 128.0, "title": "Threshold", "type": "number" }
-            }
+            "title": "Transform an Image to Bitonal",
+            "description": "All values larger than 127 are set to 255 (white), all other values to 0 (black).",
+            "inputs": { "nbands": null },
+            "outputs": { "nbands": 1, "dtype": "uint8", "min": null, "max": null },
+            "parameters": {}
         }),
         "contours" => serde_json::json!({
             "title": "Contours",
-            "description": "Overlay elevation contour lines at regular elevation intervals.",
+            "description": "Create contours from DEM dataset.",
             "inputs": { "nbands": 1 },
-            "outputs": { "nbands": 1, "dtype": "uint8", "min": [0], "max": [255] },
+            "outputs": { "nbands": 3, "dtype": "uint8", "min": null, "max": null },
             "parameters": {
-                "increment": { "default": 35.0, "title": "Increment", "type": "number" },
-                "thickness": { "default": 1, "title": "Thickness", "type": "integer" },
-                "minz": { "default": -12000.0, "title": "Minz", "type": "number" },
-                "maxz": { "default": 8000.0, "title": "Maxz", "type": "number" }
+                "increment": { "default": 35, "maximum": 999, "minimum": 0, "title": "Increment", "type": "integer" },
+                "thickness": { "default": 1, "maximum": 10, "minimum": 0, "title": "Thickness", "type": "integer" },
+                "minz": { "default": -12000, "maximum": 99999, "minimum": -99999, "title": "Minz", "type": "integer" },
+                "maxz": { "default": 8000, "maximum": 99999, "minimum": -99999, "title": "Maxz", "type": "integer" }
             }
         }),
         _ => {
@@ -621,6 +631,7 @@ pub fn build_wmts_capabilities(
     let media_type = match tile_format {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
+        "tif" | "tiff" => "image/tiff; application=geotiff",
         "npy" => "application/x-binary",
         "f32" | "bin" | "raw" => "application/octet-stream",
         _ => "image/png",
@@ -643,6 +654,7 @@ pub fn build_wmts_capabilities(
     ));
     let tile_base = xml_escape(&format!("{origin}/{family}/tiles/{tms}"));
     let title_esc = xml_escape(title);
+    let tms_esc = xml_escape(tms);
     let tile_px = 256u32 * tile_scale.clamp(1, 4);
 
     let tms_def = crate::tms::lookup_tms(tms)
@@ -753,13 +765,13 @@ pub fn build_wmts_capabilities(
             </Style>
             <Format>{media_type}</Format>
             <TileMatrixSetLink>
-                <TileMatrixSet>{tms}</TileMatrixSet>
+                <TileMatrixSet>{tms_esc}</TileMatrixSet>
             </TileMatrixSetLink>
             <ResourceURL format="{media_type}" resourceType="tile" template="{tile_template}"/>
         </Layer>
         <TileMatrixSet>
-            <ows:Title>{tms}</ows:Title>
-            <ows:Identifier>{tms}</ows:Identifier>
+            <ows:Title>{tms_esc}</ows:Title>
+            <ows:Identifier>{tms_esc}</ows:Identifier>
             <ows:SupportedCRS>{crs_urn}</ows:SupportedCRS>
 {matrices_xml}        </TileMatrixSet>
     </Contents>
@@ -829,7 +841,9 @@ pub async fn query_point(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
-    let q_lon = if crs.is_geographic_0_360(&ifd.pixel_to_crs, ifd.width) && lon < 0.0 {
+    let q_lon = if let Some(lo) = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width)
+        && lon < lo
+    {
         lon + 360.0
     } else {
         lon
@@ -1300,6 +1314,8 @@ pub struct StatsOptions {
     pub categories: Option<Vec<f64>>,
     pub bidx: Option<Vec<u16>>,
     pub expressions: Option<Vec<(String, cogzilla_kernel::ExprProgram)>>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 impl Default for StatsOptions {
@@ -1312,8 +1328,52 @@ impl Default for StatsOptions {
             categories: None,
             bidx: None,
             expressions: None,
+            width: None,
+            height: None,
         }
     }
+}
+
+fn build_categorical_histogram(
+    observed: &[(f64, u64)],
+    req_cats: &Option<Vec<f64>>,
+) -> serde_json::Value {
+    let val_json = |v: f64| -> serde_json::Value {
+        if v.fract() == 0.0 && v >= (i64::MIN as f64) && v <= (i64::MAX as f64) {
+            serde_json::json!(v as i64)
+        } else {
+            serde_json::json!(v)
+        }
+    };
+    if let Some(req) = req_cats {
+        let mut counts = Vec::with_capacity(req.len());
+        let mut vals = Vec::with_capacity(req.len());
+        for &c in req {
+            let cnt = observed
+                .iter()
+                .find(|(v, _)| (v - c).abs() <= 1e-6)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            counts.push(cnt);
+            vals.push(val_json(c));
+        }
+        serde_json::json!([counts, vals])
+    } else {
+        let counts: Vec<u64> = observed.iter().map(|(_, n)| *n).collect();
+        let vals: Vec<serde_json::Value> = observed.iter().map(|(v, _)| val_json(*v)).collect();
+        serde_json::json!([counts, vals])
+    }
+}
+
+/// Compute TiTiler-compatible band statistics from a dense `f32` slice where `NaN` marks masked pixels.
+pub fn compute_f32_band_stats(
+    pixels: &[f32],
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let denom = pixels.len();
+    let valid: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
+    BandStatsAcc::Floats(valid).finalize(denom, false, 1.0, 0.0, None, description, opts)
 }
 
 fn percentile_key(p: f64) -> String {
@@ -1420,6 +1480,7 @@ impl BandStatsAcc {
         } else {
             None
         };
+        let mut cat_observed: Vec<(f64, u64)> = Vec::new();
 
         let n = hist.len();
         for step in 0..n {
@@ -1432,6 +1493,7 @@ impl BandStatsAcc {
             let v = to_val(k);
             if let Some(ref mut cats) = categories {
                 let vf = v as f64;
+                cat_observed.push((vf, c as u64));
                 if matches_category_filter(vf, &opts.categories) {
                     cats.insert(format_category_key(vf), serde_json::json!(c));
                 }
@@ -1496,15 +1558,20 @@ impl BandStatsAcc {
         obj.insert("majority".into(), serde_json::json!(maj_val));
         obj.insert("minority".into(), serde_json::json!(min_val));
         obj.insert("unique".into(), serde_json::json!(unique));
-        obj.insert("valid_percent".into(), serde_json::json!(valid_pct));
+        obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
         obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
         obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
         for (&p, &pv) in opts.percentiles.iter().zip(p_vals.iter()) {
             obj.insert(percentile_key(p), serde_json::json!(pv));
         }
-        obj.insert("histogram".into(), serde_json::json!([counts, edges]));
         if let Some(cats) = categories {
+            obj.insert(
+                "histogram".into(),
+                build_categorical_histogram(&cat_observed, &opts.categories),
+            );
             obj.insert("categories".into(), serde_json::Value::Object(cats));
+        } else {
+            obj.insert("histogram".into(), serde_json::json!([counts, edges]));
         }
         obj.insert("description".into(), serde_json::json!(description));
         serde_json::Value::Object(obj)
@@ -1580,6 +1647,7 @@ impl BandStatsAcc {
                 } else {
                     None
                 };
+                let mut cat_observed: Vec<(f64, u64)> = Vec::new();
                 for &v in &vals {
                     sum += v as f64;
                     if v == run_val {
@@ -1588,6 +1656,7 @@ impl BandStatsAcc {
                         unique += 1;
                         if let Some(ref mut cats) = categories {
                             let vf = run_val as f64;
+                            cat_observed.push((vf, run_cnt as u64));
                             if matches_category_filter(vf, &opts.categories) {
                                 cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
                             }
@@ -1607,6 +1676,7 @@ impl BandStatsAcc {
                 unique += 1;
                 if let Some(ref mut cats) = categories {
                     let vf = run_val as f64;
+                    cat_observed.push((vf, run_cnt as u64));
                     if matches_category_filter(vf, &opts.categories) {
                         cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
                     }
@@ -1652,7 +1722,7 @@ impl BandStatsAcc {
                 obj.insert("majority".into(), serde_json::json!(maj_val));
                 obj.insert("minority".into(), serde_json::json!(min_val));
                 obj.insert("unique".into(), serde_json::json!(unique));
-                obj.insert("valid_percent".into(), serde_json::json!(valid_pct));
+                obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
                 obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
                 obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
                 for &p in &opts.percentiles {
@@ -1660,15 +1730,85 @@ impl BandStatsAcc {
                         .min(valid_px - 1);
                     obj.insert(percentile_key(p), serde_json::json!(vals[idx]));
                 }
-                obj.insert("histogram".into(), serde_json::json!([counts, edges]));
                 if let Some(cats) = categories {
+                    obj.insert(
+                        "histogram".into(),
+                        build_categorical_histogram(&cat_observed, &opts.categories),
+                    );
                     obj.insert("categories".into(), serde_json::Value::Object(cats));
+                } else {
+                    obj.insert("histogram".into(), serde_json::json!([counts, edges]));
                 }
                 obj.insert("description".into(), serde_json::json!(description));
                 serde_json::Value::Object(obj)
             }
         }
     }
+}
+
+/// Zero-allocation 4×3 probe fast-reject before allocating per-tile polygon grids/masks.
+/// Cuts OOB/small-polygon tile rejection from ~1,089 projections + heap Vecs down to 12 projections,
+/// while sampling thirds in X so odd-width global 0..360 tiles never miss the Western Hemisphere.
+fn tile_probe_outside_polygon(
+    ifd: &cogzilla_tiff::IfdMeta,
+    crs: &cogzilla_proj::CrsModel,
+    pm: &PolygonMask,
+    tx: u32,
+    ty: u32,
+    x_max: usize,
+    y_max: usize,
+) -> bool {
+    let base_col = (tx * ifd.tile_width) as usize;
+    let base_row = (ty * ifd.tile_height) as usize;
+    let cols = [0usize, x_max / 3, (2 * x_max) / 3, x_max];
+    let rows = [0usize, y_max / 2, y_max];
+    let mut p_min_lon = f64::INFINITY;
+    let mut p_max_lon = f64::NEG_INFINITY;
+    let mut p_min_lat = f64::INFINITY;
+    let mut p_max_lat = f64::NEG_INFINITY;
+    let mut non_finite = false;
+    let mut probe_antimeridian = false;
+    for &ry in &rows {
+        let row_f = (base_row + ry) as f64;
+        let mut prev_lon: Option<f64> = None;
+        for &cx in &cols {
+            let col_f = (base_col + cx) as f64;
+            let (sx, sy) = ifd.pixel_to_crs.forward(col_f, row_f);
+            let (lon, lat) = crs.to_lonlat_deg(sx, sy);
+            if !lon.is_finite() || !lat.is_finite() {
+                non_finite = true;
+                break;
+            }
+            if let Some(pl) = prev_lon
+                && (lon - pl).abs() > 180.0
+            {
+                probe_antimeridian = true;
+            }
+            prev_lon = Some(lon);
+            p_min_lon = p_min_lon.min(lon);
+            p_max_lon = p_max_lon.max(lon);
+            p_min_lat = p_min_lat.min(lat);
+            p_max_lat = p_max_lat.max(lat);
+        }
+        if non_finite {
+            break;
+        }
+    }
+    if !non_finite && p_min_lat > -85.0 && p_max_lat < 85.0 {
+        let lon_span = p_max_lon - p_min_lon;
+        let lat_span = p_max_lat - p_min_lat;
+        let lat_pad = (lat_span * 0.15).max(1e-4);
+        if p_max_lat + lat_pad < pm.bbox[1] || p_min_lat - lat_pad > pm.bbox[3] {
+            return true;
+        }
+        if !probe_antimeridian && lon_span < 120.0 {
+            let lon_pad = (lon_span * 0.15).max(1e-4);
+            if p_max_lon + lon_pad < pm.bbox[0] || p_min_lon - lon_pad > pm.bbox[2] {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Build a 1-byte/px polygon mask for a single source tile using a coarse 16-px inverse CRS grid.
@@ -1683,10 +1823,15 @@ fn build_tile_polygon_mask(
     y_max: usize,
 ) -> Option<(Vec<u8>, usize)> {
     const STEP: usize = 16;
-    let gw = x_max.div_ceil(STEP) + 1;
-    let gh = y_max.div_ceil(STEP) + 1;
     let base_col = (tx * ifd.tile_width) as usize;
     let base_row = (ty * ifd.tile_height) as usize;
+
+    if tile_probe_outside_polygon(ifd, crs, pm, tx, ty, x_max, y_max) {
+        return None;
+    }
+
+    let gw = x_max.div_ceil(STEP) + 1;
+    let gh = y_max.div_ceil(STEP) + 1;
 
     let mut grid_lon = vec![0.0f64; gw * gh];
     let mut grid_lat = vec![0.0f64; gw * gh];
@@ -1694,6 +1839,8 @@ fn build_tile_polygon_mask(
     let mut t_max_lon = f64::NEG_INFINITY;
     let mut t_min_lat = f64::INFINITY;
     let mut t_max_lat = f64::NEG_INFINITY;
+    let mut has_non_finite = false;
+    let mut crosses_antimeridian = false;
 
     for gy in 0..gh {
         let row_f = (base_row + (gy * STEP).min(y_max)) as f64;
@@ -1703,20 +1850,40 @@ fn build_tile_polygon_mask(
             let (lon, lat) = crs.to_lonlat_deg(sx, sy);
             grid_lon[gy * gw + gx] = lon;
             grid_lat[gy * gw + gx] = lat;
+            if !lon.is_finite() || !lat.is_finite() {
+                has_non_finite = true;
+                continue;
+            }
+            if gx > 0 {
+                let prev = grid_lon[gy * gw + gx - 1];
+                if prev.is_finite() && (lon - prev).abs() > 180.0 {
+                    crosses_antimeridian = true;
+                }
+            }
+            if gy > 0 {
+                let above = grid_lon[(gy - 1) * gw + gx];
+                if above.is_finite() && (lon - above).abs() > 180.0 {
+                    crosses_antimeridian = true;
+                }
+            }
             t_min_lon = t_min_lon.min(lon);
             t_max_lon = t_max_lon.max(lon);
             t_min_lat = t_min_lat.min(lat);
             t_max_lat = t_max_lat.max(lat);
         }
     }
+    if t_max_lon - t_min_lon > 180.0 {
+        crosses_antimeridian = true;
+    }
 
-    // Fast tile-level reject against polygon bbox
-    if t_max_lon < pm.bbox[0]
-        || t_min_lon > pm.bbox[2]
-        || t_max_lat < pm.bbox[1]
-        || t_min_lat > pm.bbox[3]
-    {
-        return None;
+    // Fast tile-level reject against polygon bbox (skip lon reject across antimeridian jumps).
+    if !has_non_finite {
+        if t_max_lat < pm.bbox[1] || t_min_lat > pm.bbox[3] {
+            return None;
+        }
+        if !crosses_antimeridian && (t_max_lon < pm.bbox[0] || t_min_lon > pm.bbox[2]) {
+            return None;
+        }
     }
 
     let mut bits = vec![0u8; x_max * y_max];
@@ -1832,6 +1999,9 @@ fn build_tile_polygon_mask_strided(
     ly0: usize,
     step: usize,
 ) -> Option<(Vec<u8>, usize)> {
+    if tile_probe_outside_polygon(ifd, crs, pm, tx, ty, x_max, y_max) {
+        return None;
+    }
     let nx = (x_max - lx0).div_ceil(step);
     let ny = (y_max - ly0).div_ceil(step);
     let base_x = (tx * ifd.tile_width) as f64;
@@ -2235,24 +2405,44 @@ fn compute_expression_statistics_cpu(
         StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
     };
 
+    let has_where: Vec<bool> = exprs
+        .iter()
+        .map(|(_, prog)| prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where))
+        .collect();
+    let has_const_expr = exprs.iter().any(|(_, prog)| prog.used_bands.is_empty());
+    let needs_empty_tiles = has_const_expr || has_where.iter().any(|&w| w);
+
     let mut eval_px = |bands: &[Option<&cogzilla_codec::BandData>], idx: usize| {
         let mut slot_vals = [0.0f32; 16];
         for (ei, (_, prog)) in exprs.iter().enumerate() {
+            let allow_nan = has_where[ei];
             let mut valid = true;
             for (si, &b1) in prog.used_bands.iter().enumerate() {
                 let bi = (b1.saturating_sub(1)) as usize;
                 let Some(Some(bd)) = bands.get(bi) else {
+                    if allow_nan {
+                        slot_vals[si] = f32::NAN;
+                        continue;
+                    }
                     valid = false;
                     break;
                 };
                 let raw = bd.get_f32(idx);
                 if !raw.is_finite() {
+                    if allow_nan {
+                        slot_vals[si] = f32::NAN;
+                        continue;
+                    }
                     valid = false;
                     break;
                 }
                 if let Some(nd) = nodata_override
                     && raw == nd
                 {
+                    if allow_nan {
+                        slot_vals[si] = f32::NAN;
+                        continue;
+                    }
                     valid = false;
                     break;
                 }
@@ -2279,10 +2469,19 @@ fn compute_expression_statistics_cpu(
         let mut any_band = false;
         match &fetched {
             StatsTiles::Chunky { tiles, .. } => {
-                let Some(tile) = &tiles[ti] else { continue };
-                for (b, slot) in band_ptrs.iter_mut().enumerate().take(count) {
-                    *slot = tile.bands.get(b).filter(|tb| !tb.stats.all_nodata).map(|tb| &tb.data);
-                    any_band |= slot.is_some();
+                if let Some(tile) = &tiles[ti] {
+                    for (b, slot) in band_ptrs.iter_mut().enumerate().take(count) {
+                        *slot = tile
+                            .bands
+                            .get(b)
+                            .filter(|tb| !tb.stats.all_nodata)
+                            .map(|tb| &tb.data);
+                        any_band |= slot.is_some();
+                    }
+                } else if needs_empty_tiles {
+                    band_ptrs.fill(None);
+                } else {
+                    continue;
                 }
             }
             StatsTiles::Planar { band_tiles, .. } => {
@@ -2297,7 +2496,7 @@ fn compute_expression_statistics_cpu(
                 }
             }
         }
-        if !any_band {
+        if !any_band && !needs_empty_tiles {
             continue;
         }
         let tx = (ti as u32) % ifd.tiles_across;
@@ -2364,10 +2563,10 @@ fn compute_expression_statistics_cpu(
     }
 
     let mut out = serde_json::Map::new();
-    for ((expr_str, _), vals) in exprs.iter().zip(accs.into_iter()) {
+    for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs.into_iter()).enumerate() {
         let acc = BandStatsAcc::Floats(vals);
         let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts);
-        out.insert(expr_str.clone(), val);
+        out.insert(format!("b{}", i + 1), val);
     }
     serde_json::Value::Object(out)
 }
@@ -2495,24 +2694,30 @@ pub fn encode_geotiff_rgba(
 }
 
 /// Encode a CHW `f32` little-endian buffer as a spec-compliant uncompressed Classic IEEE Float32
-/// GeoTIFF (`SampleFormat=3`, `BitsPerSample=32`, `GDAL_NODATA="nan"`).
+/// GeoTIFF (`SampleFormat=3`, `BitsPerSample=32`, `GDAL_NODATA="nan"`). When `return_mask` is
+/// `true`, appends an extra float32 validity mask band (`255.0` valid / `0.0` nodata) matching
+/// TiTiler / `rio-tiler` GeoTIFF output.
 pub fn encode_geotiff_f32(
     width: u32,
     height: u32,
     raw_f32_chw: &[u8],
     bbox: [f64; 4],
     epsg: u16,
+    return_mask: bool,
 ) -> Bytes {
     let width = width.clamp(1, 4096);
     let height = height.clamp(1, 4096);
     let n_px = (width as usize) * (height as usize);
-    let spp: u16 = if n_px > 0 && raw_f32_chw.len() >= n_px * 4 {
-        (raw_f32_chw.len() / (n_px * 4)).clamp(1, 16) as u16
+    let data_spp: u16 = if n_px > 0 && raw_f32_chw.len() >= n_px * 4 {
+        (raw_f32_chw.len() / (n_px * 4)).clamp(1, 15) as u16
     } else {
         1
     };
+    let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
     let pixel_bytes = n_px * (spp as usize) * 4;
-    let n_entries: u16 = 15;
+    let photometric: u32 = if spp == 3 { 2 } else { 1 }; // RGB for 3-band, MinIsBlack otherwise
+    let extra_samples_count: u16 = if spp == 2 || spp > 3 { spp - 1 } else { 0 };
+    let n_entries: u16 = if extra_samples_count > 0 { 16 } else { 15 };
 
     let ifd_size = 2 + 12 * (n_entries as usize) + 4;
     let mut extra_off = (8 + ifd_size) as u32;
@@ -2524,6 +2729,13 @@ pub fn encode_geotiff_f32(
         let off = extra_off;
         extra_off += (spp as u32) * 2;
         off
+    };
+    let extra_samples_val = if extra_samples_count >= 3 {
+        let off = extra_off;
+        extra_off += (extra_samples_count as u32) * 2;
+        off
+    } else {
+        0u32 // inline zeros (0 = Unspecified) for count 1 or 2
     };
     let sf_val = if spp == 1 {
         3u32
@@ -2562,12 +2774,15 @@ pub fn encode_geotiff_f32(
     put_entry(257, LONG, 1, height);
     put_entry(258, SHORT, spp as u32, bps_val); // BitsPerSample = 32
     put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, 1); // Photometric = MinIsBlack
+    put_entry(262, SHORT, 1, photometric); // Photometric = RGB (2) or MinIsBlack (1)
     put_entry(273, LONG, 1, pixel_off); // StripOffsets
     put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
     put_entry(278, LONG, 1, height); // RowsPerStrip
     put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
     put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
+    if extra_samples_count > 0 {
+        put_entry(338, SHORT, extra_samples_count as u32, extra_samples_val); // ExtraSamples = Unspecified (0)
+    }
     put_entry(339, SHORT, spp as u32, sf_val); // SampleFormat = IEEEFloat (3)
     put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
     put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
@@ -2579,6 +2794,13 @@ pub fn encode_geotiff_f32(
         for _ in 0..spp {
             buf.put_u16_le(32);
         }
+    }
+    if extra_samples_count >= 3 {
+        for _ in 0..extra_samples_count {
+            buf.put_u16_le(0);
+        }
+    }
+    if spp >= 3 {
         for _ in 0..spp {
             buf.put_u16_le(3);
         }
@@ -2616,9 +2838,9 @@ pub fn encode_geotiff_f32(
         buf.put_u16_le(k);
     }
 
-    // Pixel data: interleave CHW f32 planes into Chunky f32
-    if spp == 1 {
-        let take = pixel_bytes.min(raw_f32_chw.len());
+    // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
+    if spp == 1 && !return_mask {
+        let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
         buf.put_slice(&raw_f32_chw[..take]);
         if take < pixel_bytes {
             let rem_f32 = (pixel_bytes - take) / 4;
@@ -2627,29 +2849,42 @@ pub fn encode_geotiff_f32(
             }
         }
     } else {
-        let spp_us = spp as usize;
+        let data_spp_us = data_spp as usize;
         let plane_bytes = n_px * 4;
+        let valid_le = 255.0f32.to_le_bytes();
+        let zero_le = 0.0f32.to_le_bytes();
         for px in 0..n_px {
             let px_off = px * 4;
-            for b in 0..spp_us {
+            let mut any_valid = false;
+            for b in 0..data_spp_us {
                 let off = b * plane_bytes + px_off;
                 if off + 4 <= raw_f32_chw.len() {
-                    buf.put_slice(&raw_f32_chw[off..off + 4]);
+                    let sl = &raw_f32_chw[off..off + 4];
+                    if return_mask
+                        && !any_valid
+                        && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
+                    {
+                        any_valid = true;
+                    }
+                    buf.put_slice(sl);
                 } else {
                     buf.put_f32_le(f32::NAN);
                 }
+            }
+            if return_mask {
+                buf.put_slice(if any_valid { &valid_le } else { &zero_le });
             }
         }
     }
     buf.freeze()
 }
 
-/// Project a WGS84 polygon bbox into an IFD's pixel space and return its clipped `(win_w, win_h)`.
+/// Project a WGS84 polygon bbox into an IFD's pixel space and return `(win_w, win_h, intersects)`.
 fn polygon_window_dims(
     ifd: &cogzilla_tiff::IfdMeta,
     crs: &cogzilla_proj::CrsModel,
     bbox: [f64; 4],
-) -> (u32, u32) {
+) -> (u32, u32, bool) {
     let [w, s, e, n] = bbox;
     let mx = 0.5 * (w + e);
     let my = 0.5 * (s + n);
@@ -2667,7 +2902,13 @@ fn polygon_window_dims(
     let mut cmax = f64::NEG_INFINITY;
     let mut rmin = f64::INFINITY;
     let mut rmax = f64::NEG_INFINITY;
-    for (lon, lat) in pts {
+    let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+    for (mut lon, lat) in pts {
+        if let Some(lo) = wrap_lo
+            && lon < lo
+        {
+            lon += 360.0;
+        }
         let (sx, sy) = crs.from_lonlat_deg(lon, lat);
         if sx.is_finite() && sy.is_finite() {
             let (col, row) = ifd.crs_to_pixel.forward(sx, sy);
@@ -2680,13 +2921,14 @@ fn polygon_window_dims(
         }
     }
     if !cmin.is_finite() {
-        return (ifd.width, ifd.height);
+        return (ifd.width, ifd.height, true);
     }
     let c0 = cmin.floor().clamp(0.0, ifd.width as f64);
     let c1 = cmax.ceil().clamp(0.0, ifd.width as f64);
     let r0 = rmin.floor().clamp(0.0, ifd.height as f64);
     let r1 = rmax.ceil().clamp(0.0, ifd.height as f64);
-    (((c1 - c0).max(1.0)) as u32, ((r1 - r0).max(1.0)) as u32)
+    let intersects = c1 > c0 && r1 > r0;
+    (((c1 - c0).max(1.0)) as u32, ((r1 - r0).max(1.0)) as u32, intersects)
 }
 
 /// TiTiler-compatible `/cog/statistics` computed from the finest overview whose target window
@@ -2745,19 +2987,28 @@ pub async fn compute_statistics_with_options(
             }
         }
     }
+    const MAX_STATS_BLOCKS: usize = 512;
+    const MAX_STATS_MASK_TILES: usize = 65_536;
     let crs = engine.get_or_build_crs(cog)?;
     let max_size = max_size.max(1);
-    let (ifd_idx, step, sample_dims, total_pixels) = if let Some(pm) = poly_mask {
+    let (ifd_idx, step, sample_dims, total_pixels, poly_win_pixels) = if let Some(pm) = poly_mask {
         let mut idx = cog.index.ifds.len() - 1;
-        let mut win_max_dim = cog.index.ifds[idx].width.max(cog.index.ifds[idx].height);
+        let mut win_w = cog.index.ifds[idx].width;
+        let mut win_h = cog.index.ifds[idx].height;
+        let mut win_max_dim = win_w.max(win_h);
         for (i, ifd) in cog.index.ifds.iter().enumerate() {
-            let (ww, wh) = polygon_window_dims(ifd, &crs, pm.bbox);
+            let (ww, wh, intersects) = polygon_window_dims(ifd, &crs, pm.bbox);
             let dim = ww.max(wh);
-            if dim <= max_size {
+            let ifd_tiles = (ifd.tiles_across as usize).saturating_mul(ifd.tiles_down as usize);
+            if intersects && dim <= max_size && ifd_tiles <= MAX_STATS_MASK_TILES {
                 idx = i;
+                win_w = ww;
+                win_h = wh;
                 win_max_dim = dim;
                 break;
             }
+            win_w = ww;
+            win_h = wh;
             win_max_dim = dim;
         }
         let ifd = &cog.index.ifds[idx];
@@ -2767,23 +3018,44 @@ pub async fn compute_statistics_with_options(
         } else {
             (ifd.width as usize) * (ifd.height as usize)
         };
-        (idx, step, None, total)
+        let est_w = (win_w.saturating_add(ifd.tile_width).min(ifd.width) as usize).div_ceil(step);
+        let est_h = (win_h.saturating_add(ifd.tile_height).min(ifd.height) as usize).div_ceil(step);
+        (idx, step, None, total, est_w.saturating_mul(est_h))
     } else {
         // Unmasked full-image statistics: match rio-tiler's exact `max_size` target dimensions
         // and select the coarsest IFD that is >= target dimensions (falling back to IFD 0).
         let full = cog.index.full_res();
-        let (out_w, out_h) = if full.width.max(full.height) <= max_size {
-            (full.width as usize, full.height as usize)
-        } else if full.width >= full.height {
-            let h = ((full.height as f64 / full.width as f64) * max_size as f64)
-                .round()
-                .max(1.0) as usize;
-            (max_size as usize, h)
-        } else {
-            let w = ((full.width as f64 / full.height as f64) * max_size as f64)
-                .round()
-                .max(1.0) as usize;
-            (w, max_size as usize)
+        let (out_w, out_h) = match (opts.width, opts.height) {
+            (Some(w), Some(h)) => (w.clamp(1, 4096) as usize, h.clamp(1, 4096) as usize),
+            (Some(w), None) => {
+                let w = w.clamp(1, 4096) as usize;
+                let h = ((full.height as f64 / full.width.max(1) as f64) * w as f64)
+                    .round()
+                    .clamp(1.0, 4096.0) as usize;
+                (w, h)
+            }
+            (None, Some(h)) => {
+                let h = h.clamp(1, 4096) as usize;
+                let w = ((full.width as f64 / full.height.max(1) as f64) * h as f64)
+                    .round()
+                    .clamp(1.0, 4096.0) as usize;
+                (w, h)
+            }
+            (None, None) => {
+                if full.width.max(full.height) <= max_size {
+                    (full.width as usize, full.height as usize)
+                } else if full.width >= full.height {
+                    let h = ((full.height as f64 / full.width as f64) * max_size as f64)
+                        .round()
+                        .max(1.0) as usize;
+                    (max_size as usize, h)
+                } else {
+                    let w = ((full.width as f64 / full.height as f64) * max_size as f64)
+                        .round()
+                        .max(1.0) as usize;
+                    (w, max_size as usize)
+                }
+            }
         };
         let mut idx = 0usize;
         for (i, ifd) in cog.index.ifds.iter().enumerate() {
@@ -2797,31 +3069,40 @@ pub async fn compute_statistics_with_options(
         } else {
             Some((out_w, out_h))
         };
-        (idx, 1usize, dims, out_w * out_h)
+        (idx, 1usize, dims, out_w * out_h, 0usize)
     };
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
 
-    let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
-    let tile_has_strided_sample = |tx: u32, ty: u32, x_max: usize, y_max: usize| -> bool {
+    let n_tiles = (ifd.tiles_across as usize).saturating_mul(ifd.tiles_down as usize);
+    let (sample_has_tx, sample_has_ty): (Option<Vec<bool>>, Option<Vec<bool>>) =
         if let Some((ow, oh)) = sample_dims {
-            let x0 = tx * ifd.tile_width;
-            let x1 = x0 + x_max as u32;
-            let y0 = ty * ifd.tile_height;
-            let y1 = y0 + y_max as u32;
-            let has_x = (0..ow).any(|px| {
+            let mut has_tx = vec![false; ifd.tiles_across as usize];
+            let mut has_ty = vec![false; ifd.tiles_down as usize];
+            for px in 0..ow {
                 let col = (((px as f64 + 0.5) * (ifd.width as f64) / (ow as f64)).floor() as u32)
                     .min(ifd.width - 1);
-                col >= x0 && col < x1
-            });
-            if !has_x {
-                return false;
+                let tx = (col / ifd.tile_width) as usize;
+                if let Some(slot) = has_tx.get_mut(tx) {
+                    *slot = true;
+                }
             }
-            return (0..oh).any(|py| {
+            for py in 0..oh {
                 let row = (((py as f64 + 0.5) * (ifd.height as f64) / (oh as f64)).floor() as u32)
                     .min(ifd.height - 1);
-                row >= y0 && row < y1
-            });
+                let ty = (row / ifd.tile_height) as usize;
+                if let Some(slot) = has_ty.get_mut(ty) {
+                    *slot = true;
+                }
+            }
+            (Some(has_tx), Some(has_ty))
+        } else {
+            (None, None)
+        };
+    let tile_has_strided_sample = |tx: u32, ty: u32, x_max: usize, y_max: usize| -> bool {
+        if let (Some(has_tx), Some(has_ty)) = (&sample_has_tx, &sample_has_ty) {
+            return has_tx.get(tx as usize).copied().unwrap_or(false)
+                && has_ty.get(ty as usize).copied().unwrap_or(false);
         }
         if step == 1 {
             return true;
@@ -2835,13 +3116,21 @@ pub async fn compute_statistics_with_options(
 
     let (tile_masks, mask_total_pixels): (Option<Vec<Option<Vec<u8>>>>, usize) =
         if let Some(pm) = poly_mask {
+            pm.check_work_budget(poly_win_pixels)?;
+            if n_tiles > MAX_STATS_MASK_TILES {
+                return Err(EngineError::BadRequest(format!(
+                    "statistics IFD tile count ({n_tiles}) exceeds polygon mask limit ({MAX_STATS_MASK_TILES})"
+                )));
+            }
             let build_masks = {
                 let ifd = ifd.clone();
                 let crs = crs.clone();
                 let pm = pm.clone();
-                move || {
+                move || -> Result<(Option<Vec<Option<Vec<u8>>>>, usize), EngineError> {
                     let mut masks = Vec::with_capacity(n_tiles);
                     let mut inside_total = 0usize;
+                    let mut active_blocks = 0usize;
+                    let mut tested_pixels = 0usize;
                     for ty in 0..ifd.tiles_down {
                         for tx in 0..ifd.tiles_across {
                             let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
@@ -2855,10 +3144,19 @@ pub async fn compute_statistics_with_options(
                                 let ly0 = (step - (y0_tile % step)) % step;
                                 lx0 < x_max && ly0 < y_max
                             };
-                            if !has_sample {
+                            if !has_sample
+                                || tile_probe_outside_polygon(&ifd, &crs, &pm, tx, ty, x_max, y_max)
+                            {
                                 masks.push(None);
                                 continue;
                             }
+                            let tile_px = if step > 1 {
+                                x_max.div_ceil(step).saturating_mul(y_max.div_ceil(step))
+                            } else {
+                                x_max.saturating_mul(y_max)
+                            };
+                            tested_pixels = tested_pixels.saturating_add(tile_px);
+                            pm.check_work_budget(tested_pixels)?;
                             let built = if step > 1 {
                                 let x0_tile = (tx * ifd.tile_width) as usize;
                                 let y0_tile = (ty * ifd.tile_height) as usize;
@@ -2871,6 +3169,12 @@ pub async fn compute_statistics_with_options(
                                 build_tile_polygon_mask(&ifd, &crs, &pm, tx, ty, x_max, y_max)
                             };
                             if let Some((bits, inside)) = built {
+                                active_blocks += 1;
+                                if active_blocks > MAX_STATS_BLOCKS {
+                                    return Err(EngineError::BadRequest(format!(
+                                        "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
+                                    )));
+                                }
                                 inside_total += inside;
                                 masks.push(Some(bits));
                             } else {
@@ -2878,16 +3182,16 @@ pub async fn compute_statistics_with_options(
                             }
                         }
                     }
-                    (Some(masks), inside_total)
+                    Ok((Some(masks), inside_total))
                 }
             };
             if n_tiles >= 4 || total_pixels >= 65_536 {
                 engine
                     .store
                     .run_heavy_cpu(build_masks)
-                    .await?
+                    .await??
             } else {
-                build_masks()
+                build_masks()?
             }
         } else {
             (None, 0)
@@ -2895,7 +3199,8 @@ pub async fn compute_statistics_with_options(
 
     let fetched = match ifd.planar_config {
         PlanarConfig::Chunky => {
-            let mut indices = Vec::with_capacity(n_tiles);
+            let mut indices = Vec::with_capacity(n_tiles.min(MAX_STATS_MASK_TILES));
+            let mut active_blocks = 0usize;
             for ty in 0..ifd.tiles_down {
                 for tx in 0..ifd.tiles_across {
                     let ti = (ty * ifd.tiles_across + tx) as usize;
@@ -2911,6 +3216,12 @@ pub async fn compute_statistics_with_options(
                             continue;
                         }
                     }
+                    active_blocks += 1;
+                    if active_blocks > MAX_STATS_BLOCKS {
+                        return Err(EngineError::BadRequest(format!(
+                            "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
+                        )));
+                    }
                     indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
                 }
             }
@@ -2922,10 +3233,43 @@ pub async fn compute_statistics_with_options(
             }
         }
         PlanarConfig::Planar => {
+            // Only fetch and decode bands actually referenced by `?expression=` or `?bidx=`.
+            let needed_bands: Vec<bool> = if let Some(ref exprs) = opts.expressions
+                && !exprs.is_empty()
+            {
+                let mut mask = vec![false; count];
+                for (_, prog) in exprs {
+                    for &b1 in &prog.used_bands {
+                        if let Some(slot) = mask.get_mut((b1.saturating_sub(1)) as usize) {
+                            *slot = true;
+                        }
+                    }
+                }
+                mask
+            } else if let Some(ref bidx) = opts.bidx
+                && !bidx.is_empty()
+            {
+                let mut mask = vec![false; count];
+                for &b1 in bidx {
+                    if let Some(slot) = mask.get_mut((b1.saturating_sub(1)) as usize) {
+                        *slot = true;
+                    }
+                }
+                mask
+            } else {
+                vec![true; count]
+            };
+
             // Coalesce all `count * n_tiles` band-plane block indices into one concurrent
             // `get_blocks` batch instead of `count` sequential remote round trips.
-            let mut all_indices = Vec::with_capacity(count * n_tiles);
-            for b in 0..count {
+            let mut all_indices =
+                Vec::with_capacity(count.saturating_mul(n_tiles).min(MAX_STATS_MASK_TILES));
+            let mut active_blocks = 0usize;
+            for (b, &need_b) in needed_bands.iter().enumerate().take(count) {
+                if !need_b {
+                    all_indices.resize(all_indices.len() + n_tiles, None);
+                    continue;
+                }
                 for ty in 0..ifd.tiles_down {
                     for tx in 0..ifd.tiles_across {
                         let ti = (ty * ifd.tiles_across + tx) as usize;
@@ -2941,6 +3285,12 @@ pub async fn compute_statistics_with_options(
                                 all_indices.push(None);
                                 continue;
                             }
+                        }
+                        active_blocks += 1;
+                        if active_blocks > MAX_STATS_BLOCKS {
+                            return Err(EngineError::BadRequest(format!(
+                                "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
+                            )));
                         }
                         all_indices.push(Some(ifd.tile_index(tx, ty, b as u16) as u32));
                     }
@@ -3052,6 +3402,48 @@ impl PolygonMask {
 
         const MAX_GEOJSON_VERTICES: usize = 65_536;
         const MAX_GEOJSON_RINGS: usize = 4_096;
+        const MAX_GEOM_COLLECTION_DEPTH: usize = 8;
+        const MAX_LEAF_GEOMETRIES: usize = 64;
+
+        // Iteratively flatten any GeometryCollection nodes with bounded depth and leaf count.
+        let mut flat_geoms: Vec<&serde_json::Value> = Vec::with_capacity(geometries.len());
+        let mut stack: Vec<(&serde_json::Value, usize)> =
+            geometries.into_iter().rev().map(|g| (g, 0)).collect();
+        while let Some((g, depth)) = stack.pop() {
+            if g.get("type").and_then(|v| v.as_str()) == Some("GeometryCollection") {
+                if depth >= MAX_GEOM_COLLECTION_DEPTH {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON GeometryCollection exceeds max nesting depth {MAX_GEOM_COLLECTION_DEPTH}"
+                    )));
+                }
+                let children = g
+                    .get("geometries")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        EngineError::BadRequest(
+                            "GeoJSON GeometryCollection missing geometries array".into(),
+                        )
+                    })?;
+                if children.len().saturating_add(stack.len()).saturating_add(flat_geoms.len())
+                    > MAX_LEAF_GEOMETRIES
+                {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON exceeds max {MAX_LEAF_GEOMETRIES} geometries"
+                    )));
+                }
+                for child in children.iter().rev() {
+                    stack.push((child, depth + 1));
+                }
+            } else {
+                flat_geoms.push(g);
+                if flat_geoms.len() > MAX_LEAF_GEOMETRIES {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON exceeds max {MAX_LEAF_GEOMETRIES} geometries"
+                    )));
+                }
+            }
+        }
+
         let mut total_vertices = 0usize;
         let mut total_rings = 0usize;
 
@@ -3059,6 +3451,11 @@ impl PolygonMask {
             let list = arr
                 .as_array()
                 .ok_or_else(|| EngineError::BadRequest("invalid GeoJSON ring".into()))?;
+            if list.len() < 3 {
+                return Err(EngineError::BadRequest(
+                    "GeoJSON polygon ring must have at least 3 vertices".into(),
+                ));
+            }
             total_rings += 1;
             if total_rings > MAX_GEOJSON_RINGS {
                 return Err(EngineError::BadRequest(format!(
@@ -3095,7 +3492,7 @@ impl PolygonMask {
         };
 
         let mut polygons = Vec::new();
-        for geom in geometries {
+        for geom in flat_geoms {
             let gtype = geom
                 .get("type")
                 .and_then(|v| v.as_str())
@@ -3178,6 +3575,27 @@ impl PolygonMask {
         inside
     }
 
+    /// Total number of polygon vertices across all outer rings and holes.
+    pub fn vertex_count(&self) -> usize {
+        self.polygons
+            .iter()
+            .flat_map(|rings| rings.iter())
+            .map(|ring| ring.len())
+            .sum()
+    }
+
+    /// Guard against `O(pixels * vertices)` point-in-polygon CPU exhaustion.
+    pub fn check_work_budget(&self, pixels: usize) -> Result<(), EngineError> {
+        const MAX_POLYGON_WORK: usize = 256_000_000;
+        let verts = self.vertex_count();
+        if pixels.saturating_mul(verts) > MAX_POLYGON_WORK {
+            return Err(EngineError::BadRequest(format!(
+                "polygon complexity ({verts} vertices x {pixels} pixels) exceeds work budget ({MAX_POLYGON_WORK})"
+            )));
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub fn contains(&self, lon: f64, lat: f64) -> bool {
         if lon < self.bbox[0] || lon > self.bbox[2] || lat < self.bbox[1] || lat > self.bbox[3] {
@@ -3194,6 +3612,164 @@ impl PolygonMask {
             }
         }
         false
+    }
+
+    /// Rasterize the polygon onto a `(w, h)` grid covering `bbox` in `dst_crs` using GDAL's
+    /// `ALL_TOUCHED=TRUE` semantics: a pixel is `true` if its center is inside the polygon OR
+    /// any polygon ring edge intersects the pixel cell `[px, px+1] x [py, py+1]`.
+    pub fn rasterize_all_touched(
+        &self,
+        w: usize,
+        h: usize,
+        bbox: [f64; 4],
+        dst_crs: &cogzilla_proj::CrsModel,
+    ) -> Vec<bool> {
+        let mut mask = vec![false; w * h];
+        let dlx = (bbox[2] - bbox[0]) / (w.max(1) as f64);
+        let dly = (bbox[3] - bbox[1]) / (h.max(1) as f64);
+        if dlx <= 0.0 || dly <= 0.0 {
+            return mask;
+        }
+        for py in 0..h {
+            let y = bbox[3] - (py as f64 + 0.5) * dly;
+            let row_off = py * w;
+            for px in 0..w {
+                let x = bbox[0] + (px as f64 + 0.5) * dlx;
+                let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
+                if lon.is_finite() && lat.is_finite() && self.contains(lon, lat) {
+                    mask[row_off + px] = true;
+                }
+            }
+        }
+        let mut mark_segment = |ax: f64, ay: f64, bx: f64, by: f64| {
+            let x0 = (ax - bbox[0]) / dlx;
+            let y0 = (bbox[3] - ay) / dly;
+            let x1 = (bx - bbox[0]) / dlx;
+            let y1 = (bbox[3] - by) / dly;
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                return;
+            }
+            let dx = x1 - x0;
+            let dy = y1 - y0;
+            let mut t0 = 0.0f64;
+            let mut t1 = 1.0f64;
+            for (p, q) in [
+                (-dx, x0),
+                (dx, w as f64 - x0),
+                (-dy, y0),
+                (dy, h as f64 - y0),
+            ] {
+                if p.abs() < 1e-15 {
+                    if q < 0.0 {
+                        return;
+                    }
+                } else {
+                    let r = q / p;
+                    if p < 0.0 {
+                        if r > t1 {
+                            return;
+                        }
+                        if r > t0 {
+                            t0 = r;
+                        }
+                    } else {
+                        if r < t0 {
+                            return;
+                        }
+                        if r < t1 {
+                            t1 = r;
+                        }
+                    }
+                }
+            }
+            let sx = x0 + t0 * dx;
+            let sy = y0 + t0 * dy;
+            let ex = x0 + t1 * dx;
+            let ey = y0 + t1 * dy;
+            let mut ix = (sx.floor() as isize).clamp(0, w as isize - 1);
+            let mut iy = (sy.floor() as isize).clamp(0, h as isize - 1);
+            let end_x = (ex.floor() as isize).clamp(0, w as isize - 1);
+            let end_y = (ey.floor() as isize).clamp(0, h as isize - 1);
+            mask[iy as usize * w + ix as usize] = true;
+            let sdx = ex - sx;
+            let sdy = ey - sy;
+            let step_x: isize = if sdx > 0.0 {
+                1
+            } else if sdx < 0.0 {
+                -1
+            } else {
+                0
+            };
+            let step_y: isize = if sdy > 0.0 {
+                1
+            } else if sdy < 0.0 {
+                -1
+            } else {
+                0
+            };
+            let mut t_max_x = if step_x > 0 {
+                ((ix + 1) as f64 - sx) / sdx
+            } else if step_x < 0 {
+                (ix as f64 - sx) / sdx
+            } else {
+                f64::INFINITY
+            };
+            let mut t_max_y = if step_y > 0 {
+                ((iy + 1) as f64 - sy) / sdy
+            } else if step_y < 0 {
+                (iy as f64 - sy) / sdy
+            } else {
+                f64::INFINITY
+            };
+            let t_delta_x = if step_x != 0 {
+                (1.0 / sdx).abs()
+            } else {
+                f64::INFINITY
+            };
+            let t_delta_y = if step_y != 0 {
+                (1.0 / sdy).abs()
+            } else {
+                f64::INFINITY
+            };
+            let max_steps = (w + h) * 2 + 4;
+            for _ in 0..max_steps {
+                if ix == end_x && iy == end_y {
+                    break;
+                }
+                if t_max_x < t_max_y {
+                    ix += step_x;
+                    t_max_x += t_delta_x;
+                } else if t_max_y < t_max_x {
+                    iy += step_y;
+                    t_max_y += t_delta_y;
+                } else {
+                    ix += step_x;
+                    iy += step_y;
+                    t_max_x += t_delta_x;
+                    t_max_y += t_delta_y;
+                }
+                if ix < 0 || ix >= w as isize || iy < 0 || iy >= h as isize {
+                    break;
+                }
+                mask[iy as usize * w + ix as usize] = true;
+            }
+        };
+        for poly in &self.polygons {
+            for ring in poly {
+                let n = ring.len();
+                if n < 2 {
+                    continue;
+                }
+                for i in 0..n {
+                    let (lon0, lat0) = ring[i];
+                    let (lon1, lat1) = ring[(i + 1) % n];
+                    let (ax, ay) = dst_crs.from_lonlat_deg(lon0, lat0);
+                    let (bx, by) = dst_crs.from_lonlat_deg(lon1, lat1);
+                    mark_segment(ax, ay, bx, by);
+                }
+            }
+        }
+        mask
     }
 }
 
@@ -3212,17 +3788,57 @@ pub(crate) fn encode_rgba_output(
     const MAX_TLS_SCRATCH: usize = 4 * 1024 * 1024;
     match format {
         OutputFormat::Png => {
+            let pixels = w.saturating_mul(h);
+            let is_gray = rgba
+                .chunks_exact(4)
+                .take(pixels)
+                .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+            let all_opaque = return_mask
+                && rgba.chunks_exact(4).take(pixels).all(|p| p[3] == 255);
             PNG_SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
-                let (ref mut filtered, ref mut rgb_row) = *guard;
-                let out = if !return_mask {
-                    let stride = 1 + w * 3;
+                let (ref mut filtered, ref mut row_buf) = *guard;
+                let out = if is_gray && (!return_mask || all_opaque) {
+                    let stride = 1 + w;
                     filtered.resize(h * stride, 0);
-                    rgb_row.resize(w * 3, 0);
+                    row_buf.resize(w, 0);
+                    for py in 0..h {
+                        let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
+                        for (src, dst) in src_row.chunks_exact(4).zip(row_buf.iter_mut()) {
+                            *dst = if src[3] != 0 { src[0] } else { 0 };
+                        }
+                        cogzilla_kernel::png_fast::filter_sub_u8_row(
+                            row_buf,
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
+                    }
+                    encode_filtered_png(w as u32, h as u32, 0, filtered)
+                } else if is_gray {
+                    let stride = 1 + w * 2;
+                    filtered.resize(h * stride, 0);
+                    row_buf.resize(w * 2, 0);
                     for py in 0..h {
                         let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
                         for (src, dst) in
-                            src_row.chunks_exact(4).zip(rgb_row.chunks_exact_mut(3))
+                            src_row.chunks_exact(4).zip(row_buf.chunks_exact_mut(2))
+                        {
+                            dst[0] = if src[3] != 0 { src[0] } else { 0 };
+                            dst[1] = src[3];
+                        }
+                        cogzilla_kernel::png_fast::filter_sub_ga_row(
+                            row_buf,
+                            &mut filtered[py * stride..(py + 1) * stride],
+                        );
+                    }
+                    encode_filtered_png(w as u32, h as u32, 4, filtered)
+                } else if !return_mask {
+                    let stride = 1 + w * 3;
+                    filtered.resize(h * stride, 0);
+                    row_buf.resize(w * 3, 0);
+                    for py in 0..h {
+                        let src_row = &rgba[py * w * 4..(py + 1) * w * 4];
+                        for (src, dst) in
+                            src_row.chunks_exact(4).zip(row_buf.chunks_exact_mut(3))
                         {
                             if src[3] != 0 {
                                 dst[0] = src[0];
@@ -3235,7 +3851,7 @@ pub(crate) fn encode_rgba_output(
                             }
                         }
                         filter_sub_rgb_row(
-                            rgb_row,
+                            row_buf,
                             &mut filtered[py * stride..(py + 1) * stride],
                         );
                     }
@@ -3254,8 +3870,8 @@ pub(crate) fn encode_rgba_output(
                 if filtered.capacity() > MAX_TLS_SCRATCH {
                     *filtered = Vec::new();
                 }
-                if rgb_row.capacity() > MAX_TLS_SCRATCH {
-                    *rgb_row = Vec::new();
+                if row_buf.capacity() > MAX_TLS_SCRATCH {
+                    *row_buf = Vec::new();
                 }
                 out
             })
@@ -3445,7 +4061,7 @@ pub async fn render_mercator_bbox(
 async fn render_bbox_impl(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
-    bbox: [f64; 4],
+    mut bbox: [f64; 4],
     dst_crs: &cogzilla_proj::CrsModel,
     native_preview: bool,
     width: u32,
@@ -3465,6 +4081,25 @@ async fn render_bbox_impl(
             "render_bbox supports 1..=16 assets, got {}",
             cogs.len()
         )));
+    }
+    if !native_preview {
+        if !bbox.iter().all(|v| v.is_finite()) || bbox[1] >= bbox[3] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+        // RFC 7946 antimeridian-crossing geographic bboxes use w > e (e.g. [177, -20, -178, -16]);
+        // unwrap e into (180, 540] so dlx > 0 and clamp() never sees min > max.
+        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+            bbox[2] += 360.0;
+        }
+        if bbox[0] >= bbox[2] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
     }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
@@ -3487,7 +4122,10 @@ async fn render_bbox_impl(
         let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
             match dst_crs {
                 cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
-                cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
+                cogzilla_proj::CrsModel::Geographic => {
+                    let lon = if x > 180.0 { x - 360.0 } else { x };
+                    crs.from_lonlat_deg(lon, y)
+                }
                 other => {
                     let (lon, lat) = other.to_lonlat_deg(x, y);
                     if lon.is_finite() && lat.is_finite() {
@@ -3514,8 +4152,14 @@ async fn render_bbox_impl(
         if !target_rx.is_finite() || !target_ry.is_finite() {
             let full = primary.index.full_res();
             let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-            let (rcx_raw, rcy_raw) =
+            let (mut rcx_raw, rcy_raw) =
                 dst_crs.from_lonlat_deg(0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]));
+            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic)
+                && rcx_raw < bbox[0]
+                && rcx_raw + 360.0 <= bbox[2]
+            {
+                rcx_raw += 360.0;
+            }
             let rcx = rcx_raw.clamp(bbox[0], bbox[2]);
             let rcy = rcy_raw.clamp(bbox[1], bbox[3]);
             let probes = [
@@ -3536,6 +4180,9 @@ async fn render_bbox_impl(
         }
         primary.index.select_ifd(target_rx, target_ry)
     };
+    if let Some(pm) = poly_mask {
+        pm.check_work_budget(w.saturating_mul(h))?;
+    }
     if cogs.len() > 1 && crate::engine::validate_multi_cog_grid(cogs, ifd_idx).is_err() {
         return render_mixed_grid_bbox(
             engine,
@@ -3584,16 +4231,22 @@ async fn render_bbox_impl(
         let build_uv_maps = {
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
-        let wrap_360 = crs.is_geographic_0_360(&ifd.pixel_to_crs, ifd.width);
+        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
         let ifd_width = ifd.width;
         let ifd_height = ifd.height;
         let poly_mask = poly_mask.cloned();
         move || {
+            let touched_mask: Option<Vec<bool>> = poly_mask
+                .as_ref()
+                .map(|pm| pm.rasterize_all_touched(w, h, bbox, &dst_crs));
             let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
                 let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
-                    cogzilla_proj::CrsModel::Geographic => crs.from_lonlat_deg(x, y),
+                    cogzilla_proj::CrsModel::Geographic => {
+                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        crs.from_lonlat_deg(lon, y)
+                    }
                     other => {
                         let (lon, lat) = other.to_lonlat_deg(x, y);
                         if lon.is_finite() && lat.is_finite() {
@@ -3603,17 +4256,13 @@ async fn render_bbox_impl(
                         }
                     }
                 };
-                if wrap_360 && sx.is_finite() && sx < 0.0 {
+                if let Some(lo) = wrap_lo
+                    && sx.is_finite()
+                    && sx < lo
+                {
                     sx += 360.0;
                 }
                 (sx, sy)
-            };
-            let to_wgs84 = |x: f64, y: f64| -> (f64, f64) {
-                if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) {
-                    (x, y)
-                } else {
-                    dst_crs.to_lonlat_deg(x, y)
-                }
             };
             let mut u_map = vec![f32::NAN; w * h];
             let mut v_map = vec![f32::NAN; w * h];
@@ -3732,11 +4381,9 @@ async fn render_bbox_impl(
                             let dv = (vr - vl) * inv_dx;
                             let mut u_cur = ul + 0.5 * du;
                             let mut v_cur = vl + 0.5 * dv;
-                            if let Some(ref pm) = poly_mask {
+                            if let Some(ref tm) = touched_mask {
                                 for px in x0..x1 {
-                                    let x_c = bbox[0] + (px as f64 + 0.5) * dlx;
-                                    let (plon, plat) = to_wgs84(x_c, lat);
-                                    if pm.contains(plon, plat) {
+                                    if tm[row_off + px] {
                                         let uu = u_cur as f32;
                                         let vv = v_cur as f32;
                                         if uu >= -1.0
@@ -3778,9 +4425,8 @@ async fn render_bbox_impl(
                         } else {
                             for px in x0..x1 {
                                 let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                                if let Some(ref pm) = poly_mask {
-                                    let (plon, plat) = to_wgs84(lon, lat);
-                                    if !pm.contains(plon, plat) {
+                                if let Some(ref tm) = touched_mask {
+                                    if !tm[row_off + px] {
                                         continue;
                                     }
                                 }
@@ -3925,8 +4571,20 @@ async fn render_bbox_impl(
         }
     }
 
+    // Skip block I/O completely for 0-band constant expressions (u_map/v_map already enforce
+    // raster footprint + polygon bounds).
+    let zero_band_expr = match bands {
+        BandRequest::CustomExpr { prog, .. } => prog.used_bands.is_empty(),
+        BandRequest::CustomExprRgb { progs, .. } => {
+            progs.iter().all(|p| p.used_bands.is_empty())
+        }
+        _ => false,
+    };
+
     // Fetch needed bands (single COG chunky/planar or multi-COG)
-    let cog_tiles = if cogs.len() == 1 {
+    let cog_tiles = if zero_band_expr {
+        vec![Vec::new(); cogs.len()]
+    } else if cogs.len() == 1 {
         if is_single_planar {
             let mut indices = Vec::with_capacity(grid_len * planar_bands.len().max(1));
             for &band in &planar_bands {
@@ -4003,8 +4661,49 @@ async fn render_bbox_impl(
             .collect()
     };
 
-    let dst_is_3857 = matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857);
+    let dst_is_merc = matches!(
+        dst_crs,
+        cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator
+    );
     let dst_is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
+    let dst_unit_m = dst_crs.linear_unit_metres();
+    let dst_center_lat = if dst_is_merc {
+        dst_crs.to_lonlat_deg(cx, cy).1
+    } else {
+        0.5 * (bbox[1] + bbox[3])
+    };
+    let native_dem_dxy: Option<(f32, f32)> = if native_preview {
+        let full = primary.index.full_res();
+        let rx = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d) * (full.width as f64) / (w as f64);
+        let ry = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e) * (full.height as f64) / (h as f64);
+        let (dx_m, dy_m) = match &crs {
+            cogzilla_proj::CrsModel::Geographic => {
+                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                (
+                    (rx * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
+                    (ry * 111_320.0).max(1e-3) as f32,
+                )
+            }
+            cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator => {
+                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                let cos_lat = lat_rad.cos().max(0.05);
+                (
+                    (rx * cos_lat).max(1e-3) as f32,
+                    (ry * cos_lat).max(1e-3) as f32,
+                )
+            }
+            other => {
+                let unit_m = other.linear_unit_metres();
+                (
+                    (rx * unit_m).max(1e-3) as f32,
+                    (ry * unit_m).max(1e-3) as f32,
+                )
+            }
+        };
+        Some((dx_m, dy_m))
+    } else {
+        None
+    };
     let render_cpu = move |u_map: Vec<f32>,
                            v_map: Vec<f32>,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
@@ -4230,21 +4929,25 @@ async fn render_bbox_impl(
         };
 
         let dem_inv_8dxy = || -> (f32, f32) {
-            let (dx_m, dy_m) = if dst_is_3857 {
-                let (_, center_lat) = cogzilla_proj::mercator_to_lonlat_deg(cx, cy);
-                let cos_lat = center_lat.to_radians().cos().max(0.05);
+            let (dx_m, dy_m) = if let Some(dxy) = native_dem_dxy {
+                dxy
+            } else if dst_is_merc {
+                let cos_lat = dst_center_lat.to_radians().cos().max(0.05);
                 (
                     (dlx.abs() * cos_lat).max(1e-3) as f32,
                     (dly.abs() * cos_lat).max(1e-3) as f32,
                 )
             } else if dst_is_geo {
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
+                let lat_rad = dst_center_lat.to_radians();
                 (
                     (dlx.abs() * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
                     (dly.abs() * 111_320.0).max(1e-3) as f32,
                 )
             } else {
-                (dlx.abs().max(1e-3) as f32, dly.abs().max(1e-3) as f32)
+                (
+                    (dlx.abs() * dst_unit_m).max(1e-3) as f32,
+                    (dly.abs() * dst_unit_m).max(1e-3) as f32,
+                )
             };
             (1.0 / (8.0 * dx_m), 1.0 / (8.0 * dy_m))
         };
@@ -4308,14 +5011,7 @@ async fn render_bbox_impl(
                             g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                             b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                         } else {
-                            let [r, g, b] = match encoding {
-                                cogzilla_kernel::TerrainEncoding::Terrarium => {
-                                    cogzilla_kernel::encode_terrarium_rgb(elev)
-                                }
-                                cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                                    cogzilla_kernel::encode_terrain_rgb(elev)
-                                }
-                            };
+                            let [r, g, b] = encoding.encode_rgb(elev);
                             out.put_slice(&(r as f32).to_le_bytes());
                             g_plane.extend_from_slice(&(g as f32).to_le_bytes());
                             b_plane.extend_from_slice(&(b as f32).to_le_bytes());
@@ -4334,6 +5030,10 @@ async fn render_bbox_impl(
                     let mut vals = [0.0f32; 16];
                     let nb = srcs.len().min(16);
                     for i in 0..(w * h) {
+                        if u_map[i].is_nan() {
+                            out.put_slice(&f32::NAN.to_le_bytes());
+                            continue;
+                        }
                         for k in 0..nb {
                             vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
                         }
@@ -4351,6 +5051,10 @@ async fn render_bbox_impl(
                         let mut vals = [0.0f32; 16];
                         let nb = srcs.len().min(16);
                         for i in 0..(w * h) {
+                            if u_map[i].is_nan() {
+                                out.put_slice(&f32::NAN.to_le_bytes());
+                                continue;
+                            }
                             for k in 0..nb {
                                 vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
                             }
@@ -4442,16 +5146,46 @@ async fn render_bbox_impl(
                     | BandRequest::Terrain { .. } => 3,
                     _ => 1,
                 };
-                return cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32);
+                return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    nb,
+                    h as u32,
+                    w as u32,
+                    return_mask,
+                );
             }
             return raw;
         }
 
+        let cf_single_lut: Option<[u8; 256]> = if matches!(
+            bands,
+            BandRequest::Single { .. }
+                | BandRequest::Dem { .. }
+                | BandRequest::CustomExpr { .. }
+                | BandRequest::Spectral1 { .. }
+                | BandRequest::Spectral2 { .. }
+                | BandRequest::Spectral3 { .. }
+        ) {
+            color_formula.map(|cf| {
+                let mut t = [0u8; 256];
+                for i in 0..256 {
+                    let mut px = [i as u8, i as u8, i as u8, 255];
+                    cf.apply_buffer_in_place(&mut px, 4);
+                    t[i] = px[0];
+                }
+                t
+            })
+        } else {
+            None
+        };
         let map_color = |v: f32, rmin: f32, inv: f32, default_cmap: ColormapName| -> [u8; 4] {
             if let Some(cmap) = custom_lut {
                 cmap.lookup(v, rmin, inv)
             } else {
-                let idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+                let mut idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+                if let Some(ref cf_lut) = cf_single_lut {
+                    idx = cf_lut[idx] as usize;
+                }
                 default_cmap.lut().rgba_u32[idx].to_le_bytes()
             }
         };
@@ -4486,14 +5220,7 @@ async fn render_bbox_impl(
                 for i in 0..(w * h) {
                     let v = sample(&src, u_map[i], v_map[i]);
                     if !v.is_nan() {
-                        let [r, g, b] = match encoding {
-                            cogzilla_kernel::TerrainEncoding::Terrarium => {
-                                cogzilla_kernel::encode_terrarium_rgb(v)
-                            }
-                            cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                                cogzilla_kernel::encode_terrain_rgb(v)
-                            }
-                        };
+                        let [r, g, b] = encoding.encode_rgb(v);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -4612,6 +5339,9 @@ async fn render_bbox_impl(
                 let mut vals = [0.0f32; 16];
                 let nb = srcs.len().min(16);
                 for i in 0..(w * h) {
+                    if u_map[i].is_nan() {
+                        continue;
+                    }
                     for k in 0..nb {
                         vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
                     }
@@ -4650,6 +5380,9 @@ async fn render_bbox_impl(
                 ];
                 let mut vals = [0.0f32; 16];
                 for i in 0..(w * h) {
+                    if u_map[i].is_nan() {
+                        continue;
+                    }
                     let mut rgb = [0.0f32; 3];
                     let mut ok = true;
                     for c in 0..3 {
@@ -4756,7 +5489,9 @@ async fn render_bbox_impl(
             }
         }
 
-        if let Some(cf) = color_formula {
+        if cf_single_lut.is_none()
+            && let Some(cf) = color_formula
+        {
             cf.apply_buffer_in_place(&mut rgba, 4);
         }
 
@@ -4972,9 +5707,7 @@ async fn render_mixed_grid_bbox(
     // Avoid double-unscaling when Single/Rgb already folded GDAL scale/offset into rescale bounds.
     let sub_unscale = unscale
         && (crate::engine::needs_source_unscale(bands, format)
-            || custom_lut.is_some_and(|c| {
-                matches!(c, CustomColormap::Discrete { direct_lookup: true, .. })
-            }));
+            || custom_lut.is_some_and(CustomColormap::uses_direct_lookup));
     let mut planes: Vec<(u16, Vec<f32>)> = Vec::with_capacity(needed.len());
     for &b1 in &needed {
         let single_cog = [cogs[(b1 - 1) as usize].clone()];
@@ -5009,6 +5742,127 @@ async fn render_mixed_grid_bbox(
         planes.push((b1, vals));
     }
 
+    // For constant or where() expressions in mixed-grid mode, build per-channel polygon +
+    // referenced-asset footprint validity masks (logical OR across the channel's referenced COGs,
+    // falling back to cogs[0] only when the channel references no bands) so non-primary assets
+    // are never clipped to cogs[0]'s footprint.
+    let prog_needs_mask = |p: &cogzilla_kernel::ExprProgram| {
+        p.used_bands.is_empty() || p.ops.contains(&cogzilla_kernel::expr_vm::Op::Where)
+    };
+    let mut single_cog_masks: Vec<(usize, Vec<bool>)> = Vec::new();
+    let one_prog = cogzilla_kernel::ExprProgram::compile("1").map_err(EngineError::BadRequest)?;
+    let mask_band = BandRequest::CustomExpr {
+        prog: one_prog,
+        rescale: (0.0, 1.0),
+        colormap: ColormapName::Grayscale,
+    };
+    let mut expr_valid_mask: Option<Vec<bool>> = None;
+    let mut expr_rgb_masks: [Option<Vec<bool>>; 3] = [None, None, None];
+    match bands {
+        BandRequest::CustomExpr { prog, .. } if prog_needs_mask(prog) => {
+            let slots: Vec<usize> = if prog.used_bands.is_empty() {
+                vec![0]
+            } else {
+                let mut s = Vec::new();
+                for &b in &prog.used_bands {
+                    let idx = (b - 1) as usize;
+                    if !s.contains(&idx) {
+                        s.push(idx);
+                    }
+                }
+                s
+            };
+            let mut combined = vec![false; w * h];
+            for slot in slots {
+                let single_cog = [cogs[slot].clone()];
+                let raw = Box::pin(render_bbox_impl(
+                    engine,
+                    &single_cog,
+                    eff_bbox,
+                    eff_crs,
+                    false,
+                    w as u32,
+                    h as u32,
+                    poly_mask,
+                    &mask_band,
+                    ResampleMode::Nearest,
+                    OutputFormat::RawF32,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                ))
+                .await?;
+                for (i, c) in raw.chunks_exact(4).take(w * h).enumerate() {
+                    if !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan() {
+                        combined[i] = true;
+                    }
+                }
+            }
+            expr_valid_mask = Some(combined);
+        }
+        BandRequest::CustomExprRgb { progs, .. } => {
+            for c_idx in 0..3 {
+                if !prog_needs_mask(&progs[c_idx]) {
+                    continue;
+                }
+                let slots: Vec<usize> = if progs[c_idx].used_bands.is_empty() {
+                    vec![0]
+                } else {
+                    let mut s = Vec::new();
+                    for &b in &progs[c_idx].used_bands {
+                        let idx = (b - 1) as usize;
+                        if !s.contains(&idx) {
+                            s.push(idx);
+                        }
+                    }
+                    s
+                };
+                let mut combined = vec![false; w * h];
+                for slot in slots {
+                    if let Some((_, cached)) = single_cog_masks.iter().find(|(k, _)| *k == slot) {
+                        for (dst, &v) in combined.iter_mut().zip(cached.iter()) {
+                            *dst |= v;
+                        }
+                        continue;
+                    }
+                    let single_cog = [cogs[slot].clone()];
+                    let raw = Box::pin(render_bbox_impl(
+                        engine,
+                        &single_cog,
+                        eff_bbox,
+                        eff_crs,
+                        false,
+                        w as u32,
+                        h as u32,
+                        poly_mask,
+                        &mask_band,
+                        ResampleMode::Nearest,
+                        OutputFormat::RawF32,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                    ))
+                    .await?;
+                    let mask_vec: Vec<bool> = raw
+                        .chunks_exact(4)
+                        .take(w * h)
+                        .map(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan())
+                        .collect();
+                    for (dst, &v) in combined.iter_mut().zip(mask_vec.iter()) {
+                        *dst |= v;
+                    }
+                    single_cog_masks.push((slot, mask_vec));
+                }
+                expr_rgb_masks[c_idx] = Some(combined);
+            }
+        }
+        _ => {}
+    }
+
     let get_plane = |b1: u16| -> &[f32] {
         planes
             .iter()
@@ -5040,14 +5894,7 @@ async fn render_mixed_grid_bbox(
                         g_p.extend_from_slice(&f32::NAN.to_le_bytes());
                         b_p.extend_from_slice(&f32::NAN.to_le_bytes());
                     } else {
-                        let [r, g, b] = match encoding {
-                            cogzilla_kernel::TerrainEncoding::Terrarium => {
-                                cogzilla_kernel::encode_terrarium_rgb(elev)
-                            }
-                            cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                                cogzilla_kernel::encode_terrain_rgb(elev)
-                            }
-                        };
+                        let [r, g, b] = encoding.encode_rgb(elev);
                         out.put_slice(&(r as f32).to_le_bytes());
                         g_p.extend_from_slice(&(g as f32).to_le_bytes());
                         b_p.extend_from_slice(&(b as f32).to_le_bytes());
@@ -5115,6 +5962,10 @@ async fn render_mixed_grid_bbox(
                 let mut vals = [0.0f32; 16];
                 let k = p_refs.len().min(16);
                 for i in 0..npix {
+                    if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                        out.put_slice(&f32::NAN.to_le_bytes());
+                        continue;
+                    }
                     for j in 0..k {
                         vals[j] = p_refs[j][i];
                     }
@@ -5123,12 +5974,16 @@ async fn render_mixed_grid_bbox(
                 1
             }
             BandRequest::CustomExprRgb { progs, .. } => {
-                for prog in progs {
+                for (c_idx, prog) in progs.iter().enumerate() {
                     let p_refs: Vec<&[f32]> =
                         prog.used_bands.iter().map(|&b| get_plane(b)).collect();
                     let mut vals = [0.0f32; 16];
                     let k = p_refs.len().min(16);
                     for i in 0..npix {
+                        if expr_rgb_masks[c_idx].as_ref().is_some_and(|m| !m[i]) {
+                            out.put_slice(&f32::NAN.to_le_bytes());
+                            continue;
+                        }
                         for j in 0..k {
                             vals[j] = p_refs[j][i];
                         }
@@ -5140,16 +5995,46 @@ async fn render_mixed_grid_bbox(
         };
         let raw = out.freeze();
         if format == OutputFormat::Npy {
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32));
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                raw,
+                nb,
+                h as u32,
+                w as u32,
+                return_mask,
+            ));
         }
         return Ok(raw);
     }
 
+    let cf_single_lut: Option<[u8; 256]> = if matches!(
+        bands,
+        BandRequest::Single { .. }
+            | BandRequest::Dem { .. }
+            | BandRequest::CustomExpr { .. }
+            | BandRequest::Spectral1 { .. }
+            | BandRequest::Spectral2 { .. }
+            | BandRequest::Spectral3 { .. }
+    ) {
+        color_formula.map(|cf| {
+            let mut t = [0u8; 256];
+            for i in 0..256 {
+                let mut px = [i as u8, i as u8, i as u8, 255];
+                cf.apply_buffer_in_place(&mut px, 4);
+                t[i] = px[0];
+            }
+            t
+        })
+    } else {
+        None
+    };
     let map_color = |v: f32, rmin: f32, inv: f32, default_cmap: ColormapName| -> [u8; 4] {
         if let Some(cmap) = custom_lut {
             cmap.lookup(v, rmin, inv)
         } else {
-            let idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+            let mut idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+            if let Some(ref cf_lut) = cf_single_lut {
+                idx = cf_lut[idx] as usize;
+            }
             let [r, g, b] = default_cmap.lut().rgb[idx];
             [r, g, b, 255]
         }
@@ -5205,14 +6090,7 @@ async fn render_mixed_grid_bbox(
         } => {
             for (i, &v) in get_plane(*band_1based).iter().enumerate() {
                 if !v.is_nan() {
-                    let [r, g, b] = match encoding {
-                        cogzilla_kernel::TerrainEncoding::Terrarium => {
-                            cogzilla_kernel::encode_terrarium_rgb(v)
-                        }
-                        cogzilla_kernel::TerrainEncoding::TerrainRgb => {
-                            cogzilla_kernel::encode_terrain_rgb(v)
-                        }
-                    };
+                    let [r, g, b] = encoding.encode_rgb(v);
                     rgba[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, 255]);
                 }
             }
@@ -5297,6 +6175,9 @@ async fn render_mixed_grid_bbox(
             let mut vals = [0.0f32; 16];
             let k = p_refs.len().min(16);
             for i in 0..npix {
+                if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                    continue;
+                }
                 for j in 0..k {
                     vals[j] = p_refs[j][i];
                 }
@@ -5325,6 +6206,10 @@ async fn render_mixed_grid_bbox(
             for i in 0..npix {
                 let mut ch = [f32::NAN; 3];
                 for c in 0..3 {
+                    if expr_rgb_masks[c].as_ref().is_some_and(|m| !m[i]) {
+                        ch[c] = f32::NAN;
+                        break;
+                    }
                     let k = p_refs[c].len().min(16);
                     for j in 0..k {
                         vals[j] = p_refs[c][j][i];
@@ -5340,7 +6225,9 @@ async fn render_mixed_grid_bbox(
             }
         }
     }
-    if let Some(cf) = color_formula {
+    if cf_single_lut.is_none()
+        && let Some(cf) = color_formula
+    {
         cf.apply_buffer_in_place(&mut rgba, 4);
     }
     Ok(encode_rgba_output(w, h, &rgba, format, return_mask))

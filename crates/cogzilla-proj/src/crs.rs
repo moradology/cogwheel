@@ -62,6 +62,21 @@ impl CrsModel {
         })
     }
 
+    /// Linear unit conversion factor to metres (`1.0` for metre-based and geographic CRSes;
+    /// `0.3048` / `1200/3937` for international/US survey foot projected CRSes).
+    #[inline]
+    pub fn linear_unit_metres(&self) -> f64 {
+        match self {
+            Self::TransverseMercator(p) => p.unit,
+            Self::Albers(p) => p.unit,
+            Self::LambertConformalConic(p) => p.unit,
+            Self::PolarStereographic(p) => p.unit,
+            Self::Laea(p) => p.unit,
+            Self::Sinusoidal(p) => p.unit,
+            Self::Epsg3857 | Self::WorldMercator | Self::Geographic => 1.0,
+        }
+    }
+
     /// Anything this crate cannot place correctly is an error. Coordinates are
     /// treated as WGS84 with no datum shift, so a CRS is only accepted when its
     /// datum is WGS84 or one that agrees with it to about two metres (NAD83,
@@ -522,18 +537,26 @@ impl CrsModel {
         (norm_lon, lat)
     }
 
-    /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
-    /// (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western overhang).
-    pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
+    /// Returns `Some(min_lon)` when this is a Geographic CRS whose raster extent uses `0..360`
+    /// longitudes (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western
+    /// overhang), so longitudes `< min_lon` should be wrapped by `+360.0` while longitudes in
+    /// `[min_lon, 0.0)` remain directly in column 0.
+    pub fn geographic_0_360_min_lon(&self, pixel_to_crs: &Affine2D, width: u32) -> Option<f64> {
         if !matches!(self, CrsModel::Geographic) {
-            return false;
+            return None;
         }
         let (x0, _) = pixel_to_crs.forward(0.0, 0.0);
         let (x1, _) = pixel_to_crs.forward(width as f64, 0.0);
         let lo = x0.min(x1);
         let hi = x0.max(x1);
         let px_w = ((hi - lo) / (width.max(1) as f64)).max(1e-6);
-        lo >= -px_w && hi > 180.0 + 1e-6
+        (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo)
+    }
+
+    /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
+    /// (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western overhang).
+    pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
+        self.geographic_0_360_min_lon(pixel_to_crs, width).is_some()
     }
 
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
@@ -1027,20 +1050,22 @@ impl<const N: usize> CoordPlan<N> {
                     }
                 }
                 CrsModel::Geographic => {
-                    let wrap_360 = if crs_to_pixel.a.abs() > 1e-18 {
+                    let wrap_lo = if crs_to_pixel.a.abs() > 1e-18 {
                         let x0 = -crs_to_pixel.c / crs_to_pixel.a;
                         let x1 = (ifd_w as f64 - crs_to_pixel.c) / crs_to_pixel.a;
                         let lo = x0.min(x1);
                         let hi = x0.max(x1);
                         let px_w = ((hi - lo) / (ifd_w.max(1) as f64)).max(1e-6);
-                        lo >= -px_w && hi > 180.0 + 1e-6
+                        (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo)
                     } else {
-                        false
+                        None
                     };
                     for px in 0..N {
                         let mx = min_x + (px as f64 + 0.5) * step_x;
                         let (mut lon, _) = mercator_to_lonlat_deg(mx, 0.0);
-                        if wrap_360 && lon < 0.0 {
+                        if let Some(lo) = wrap_lo
+                            && lon < lo
+                        {
                             lon += 360.0;
                         }
                         let uu = (crs_to_pixel.a * lon + crs_to_pixel.c - 0.5) as f32;
@@ -1102,14 +1127,22 @@ impl<const N: usize> CoordPlan<N> {
                 _ => None,
             };
             let straddles_branch_cut = branch_lon0.is_some_and(|lon0| {
-                let (lon_w, _) = mercator_to_lonlat_rad(min_x, max_y);
-                let (lon_e, _) = mercator_to_lonlat_rad(max_x, max_y);
+                let (lon_w, _) = mercator_to_lonlat_rad(min_x + 0.5 * step_x, max_y);
+                let (lon_e, _) = mercator_to_lonlat_rad(max_x + 0.5 * step_x, max_y);
                 let wrap = |d: f64| (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
                 wrap(lon_w - lon0) > 0.0 && wrap(lon_e - lon0) < 0.0
             });
+            let near_laea_antipode = matches!(crs, CrsModel::Laea(p) if p.pole == 0 && {
+                let (lon_c, lat_c) =
+                    mercator_to_lonlat_rad(0.5 * (min_x + max_x), 0.5 * (min_y + max_y));
+                let cos_dist = p.lat0.sin() * lat_c.sin()
+                    + p.lat0.cos() * lat_c.cos() * (lon_c - p.lon0).cos();
+                1.0 + cos_dist < 0.02
+            });
             let try_grid_2d = tile.z > 8
                 && ((tile.x as u64) + 1 < (1u64 << tile.z.min(30)))
-                && !straddles_branch_cut;
+                && !straddles_branch_cut
+                && !near_laea_antipode;
             if try_grid_2d {
                 let mut grid_u = [0.0f32; GRID_DIM * GRID_DIM];
                 let mut grid_v = [0.0f32; GRID_DIM * GRID_DIM];
@@ -1970,6 +2003,32 @@ mod tests {
             assert!(
                 (rlon - lon).abs() < 1e-9 && (rlat - lat).abs() < 1e-9,
                 "EPSG:3395 round-trip failed for ({lon}, {lat}) -> ({rlon}, {rlat})"
+            );
+        }
+    }
+
+    #[test]
+    fn laea_antipode_tile_does_not_interpolate_ghost_pixels() {
+        // EPSG:3035 (Europe LAEA: lat0=52°N, lon0=10°E, FE=4321000, FN=3210000)
+        // Antipode is (-170°W, -52°S), inside WebMercator tile z=9/14/342 and z=12/113/2743.
+        let crs = CrsModel::from_epsg(3035).unwrap();
+        let p2c = Affine2D {
+            a: 1000.0,
+            b: 0.0,
+            c: 2_321_000.0,
+            d: 0.0,
+            e: -1000.0,
+            f: 5_210_000.0,
+        };
+        let c2p = p2c.invert().unwrap();
+        for tile in [
+            TileCoord { z: 9, x: 14, y: 342 },
+            TileCoord { z: 12, x: 113, y: 2743 },
+        ] {
+            let plan = CoordPlan::<256>::build(&crs, &c2p, 4000, 4000, tile);
+            assert!(
+                plan.is_none(),
+                "antipode tile {tile:?} in South Pacific must not intersect Europe EPSG:3035 COG"
             );
         }
     }
