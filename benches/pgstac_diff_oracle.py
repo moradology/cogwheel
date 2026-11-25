@@ -448,6 +448,10 @@ def main() -> int:
         o.check("webp", "image", f"{base12}.webp?assets=visual")
         o.check("tilesize=512", "image", f"{base12}.png?assets=visual&tilesize=512")
         o.check("tilesize=128", "image", f"{base12}.png?assets=visual&tilesize=128")
+        # A buffered tile: more pixels on every side, from the items of the tile itself.
+        o.check("buffer=10", "image", f"{base12}.png?assets=visual&buffer=10")
+        o.check("buffer=0.5, one band", "image", f"{base12}.png?assets=red&rescale=0,3000&buffer=0.5")
+        o.check("buffer=64 at a low zoom", "image", f"/searches/{sid}/tiles/WebMercatorQuad/8/134/91.png?assets=visual&buffer=64")
         o.check("tilesize=300, one band", "image", f"{base12}.png?assets=red&rescale=0,3000&tilesize=300")
         o.check("tilesize=1024, three assets", "image", f"{base12}.png?assets=red&assets=green&assets=blue&rescale=0,3000&tilesize=1024")
         o.check("resampling=bilinear on a reprojected source", "image", f"{base12}.png?assets=visual&resampling=bilinear")
