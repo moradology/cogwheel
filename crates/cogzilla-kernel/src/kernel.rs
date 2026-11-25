@@ -349,6 +349,350 @@ fn bilinear_row_flat_dispatch<const N: usize>(
     }
 }
 
+/// ARM NEON 4-wide bilinear row sampler for single-block `U16`/`U8` (`Separable1D + CleanFastPath`).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn bilinear_row_typed_neon<T: Copy, F: Fn(T) -> f32, const N: usize>(
+    u_coords: &[f32; N],
+    base_col: u32,
+    row0_ptr: *const T,
+    row1_ptr: *const T,
+    max_x: i32,
+    fy: f32,
+    out_row: &mut [f32],
+    to_f32: &F,
+) {
+    use std::arch::aarch64::*;
+    let (v_fy, v_base, v_zero, v_max_x) = unsafe {
+        (
+            vdupq_n_f32(fy),
+            vdupq_n_f32(base_col as f32),
+            vdupq_n_s32(0),
+            vdupq_n_s32(max_x),
+        )
+    };
+    let mut idxs = [0i32; 4];
+    let mut px = 0usize;
+    while px + 4 <= N {
+        unsafe {
+            let u = vsubq_f32(vld1q_f32(u_coords.as_ptr().add(px)), v_base);
+            let x0_f = vrndmq_f32(u);
+            let fx = vsubq_f32(u, x0_f);
+            let idx = vminq_s32(vmaxq_s32(vcvtq_s32_f32(x0_f), v_zero), v_max_x);
+            vst1q_s32(idxs.as_mut_ptr(), idx);
+
+            let c0 = idxs[0] as usize;
+            let c1 = idxs[1] as usize;
+            let c2 = idxs[2] as usize;
+            let c3 = idxs[3] as usize;
+
+            let a00 = [
+                to_f32(*row0_ptr.add(c0)),
+                to_f32(*row0_ptr.add(c1)),
+                to_f32(*row0_ptr.add(c2)),
+                to_f32(*row0_ptr.add(c3)),
+            ];
+            let a10 = [
+                to_f32(*row0_ptr.add(c0 + 1)),
+                to_f32(*row0_ptr.add(c1 + 1)),
+                to_f32(*row0_ptr.add(c2 + 1)),
+                to_f32(*row0_ptr.add(c3 + 1)),
+            ];
+            let a01 = [
+                to_f32(*row1_ptr.add(c0)),
+                to_f32(*row1_ptr.add(c1)),
+                to_f32(*row1_ptr.add(c2)),
+                to_f32(*row1_ptr.add(c3)),
+            ];
+            let a11 = [
+                to_f32(*row1_ptr.add(c0 + 1)),
+                to_f32(*row1_ptr.add(c1 + 1)),
+                to_f32(*row1_ptr.add(c2 + 1)),
+                to_f32(*row1_ptr.add(c3 + 1)),
+            ];
+
+            let v00 = vld1q_f32(a00.as_ptr());
+            let v10 = vld1q_f32(a10.as_ptr());
+            let v01 = vld1q_f32(a01.as_ptr());
+            let v11 = vld1q_f32(a11.as_ptr());
+
+            let top = vfmaq_f32(v00, vsubq_f32(v10, v00), fx);
+            let bot = vfmaq_f32(v01, vsubq_f32(v11, v01), fx);
+            let res = vfmaq_f32(top, vsubq_f32(bot, top), v_fy);
+            vst1q_f32(out_row.as_mut_ptr().add(px), res);
+        }
+        px += 4;
+    }
+    let bc_f = base_col as f32;
+    while px < N {
+        let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc_f);
+        let c = x0_raw.clamp(0, max_x) as usize;
+        unsafe {
+            let v00 = to_f32(*row0_ptr.add(c));
+            let v10 = to_f32(*row0_ptr.add(c + 1));
+            let v01 = to_f32(*row1_ptr.add(c));
+            let v11 = to_f32(*row1_ptr.add(c + 1));
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        }
+        px += 1;
+    }
+}
+
+/// x86_64 AVX2+FMA 8-wide bilinear row sampler for single-block `U16`/`U8` (`Separable1D + CleanFastPath`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bilinear_row_typed_avx2<T: Copy, F: Fn(T) -> f32, const N: usize>(
+    u_coords: &[f32; N],
+    base_col: u32,
+    row0_ptr: *const T,
+    row1_ptr: *const T,
+    max_x: i32,
+    fy: f32,
+    out_row: &mut [f32],
+    to_f32: &F,
+) {
+    use std::arch::x86_64::*;
+    let v_fy = _mm256_set1_ps(fy);
+    let v_base = _mm256_set1_ps(base_col as f32);
+    let v_zero = _mm256_setzero_si256();
+    let v_max_x = _mm256_set1_epi32(max_x);
+    let mut idxs = [0i32; 8];
+    let mut px = 0usize;
+    while px + 8 <= N {
+        let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_base);
+        let x0_f = _mm256_floor_ps(u);
+        let fx = _mm256_sub_ps(u, x0_f);
+        let idx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero), v_max_x);
+        _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
+
+        let mut a00 = [0.0f32; 8];
+        let mut a10 = [0.0f32; 8];
+        let mut a01 = [0.0f32; 8];
+        let mut a11 = [0.0f32; 8];
+        for k in 0..8 {
+            let c = idxs[k] as usize;
+            a00[k] = to_f32(*row0_ptr.add(c));
+            a10[k] = to_f32(*row0_ptr.add(c + 1));
+            a01[k] = to_f32(*row1_ptr.add(c));
+            a11[k] = to_f32(*row1_ptr.add(c + 1));
+        }
+
+        let v00 = _mm256_loadu_ps(a00.as_ptr());
+        let v10 = _mm256_loadu_ps(a10.as_ptr());
+        let v01 = _mm256_loadu_ps(a01.as_ptr());
+        let v11 = _mm256_loadu_ps(a11.as_ptr());
+
+        let top = _mm256_fmadd_ps(_mm256_sub_ps(v10, v00), fx, v00);
+        let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
+        let res = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), v_fy, top);
+        _mm256_storeu_ps(out_row.as_mut_ptr().add(px), res);
+        px += 8;
+    }
+    let bc_f = base_col as f32;
+    while px < N {
+        let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc_f);
+        let c = x0_raw.clamp(0, max_x) as usize;
+        let v00 = to_f32(*row0_ptr.add(c));
+        let v10 = to_f32(*row0_ptr.add(c + 1));
+        let v01 = to_f32(*row1_ptr.add(c));
+        let v11 = to_f32(*row1_ptr.add(c + 1));
+        let top = v00 + (v10 - v00) * fx;
+        let bot = v01 + (v11 - v01) * fx;
+        *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        px += 1;
+    }
+}
+
+#[inline(always)]
+fn bilinear_row_typed_dispatch<T: Copy, F: Fn(T) -> f32, const N: usize>(
+    u_coords: &[f32; N],
+    base_col: u32,
+    row0: &[T],
+    row1: &[T],
+    fy: f32,
+    out_row: &mut [f32],
+    to_f32: F,
+) {
+    let row_len = row0.len().min(row1.len());
+    if row_len < 2 || out_row.len() < N {
+        return;
+    }
+    let max_x = (row_len as i32) - 2;
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            bilinear_row_typed_neon::<T, F, N>(
+                u_coords,
+                base_col,
+                row0.as_ptr(),
+                row1.as_ptr(),
+                max_x,
+                fy,
+                out_row,
+                &to_f32,
+            );
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe {
+                bilinear_row_typed_avx2::<T, F, N>(
+                    u_coords,
+                    base_col,
+                    row0.as_ptr(),
+                    row1.as_ptr(),
+                    max_x,
+                    fy,
+                    out_row,
+                    &to_f32,
+                );
+            }
+            return;
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        let bc = base_col as f32;
+        let max_x_u = row_len.saturating_sub(2);
+        for px in 0..N {
+            let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc);
+            let x0 = (x0_raw.max(0) as usize).min(max_x_u);
+            let v00 = to_f32(unsafe { *row0.get_unchecked(x0) });
+            let v10 = to_f32(unsafe { *row0.get_unchecked(x0 + 1) });
+            let v01 = to_f32(unsafe { *row1.get_unchecked(x0) });
+            let v11 = to_f32(unsafe { *row1.get_unchecked(x0 + 1) });
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            out_row[px] = top + (bot - top) * fy;
+        }
+    }
+}
+
+/// Unified single-block typed view for clean (`no_nodata`, exact `f32` base, `w/h >= 2`) bands.
+#[derive(Clone, Copy)]
+enum SingleBlockRef<'a> {
+    F32(&'a [f32], u32, u32, usize),
+    U16(&'a [u16], u32, u32, usize),
+    U8(&'a [u8], u32, u32, usize),
+}
+
+impl<'a> SingleBlockRef<'a> {
+    #[inline(always)]
+    fn from_source(src: &BandSource<'a>) -> Option<Self> {
+        if let Some((s, bc, br, st)) = src.single_block_flat() {
+            Some(Self::F32(s, bc, br, st))
+        } else if let Some((s, bc, br, st)) = src.single_block_u16() {
+            Some(Self::U16(s, bc, br, st))
+        } else if let Some((s, bc, br, st)) = src.single_block_u8() {
+            Some(Self::U8(s, bc, br, st))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn base_col(&self) -> u32 {
+        match *self {
+            Self::F32(_, bc, _, _) | Self::U16(_, bc, _, _) | Self::U8(_, bc, _, _) => bc,
+        }
+    }
+
+    #[inline(always)]
+    fn base_row(&self) -> u32 {
+        match *self {
+            Self::F32(_, _, br, _) | Self::U16(_, _, br, _) | Self::U8(_, _, br, _) => br,
+        }
+    }
+
+    #[inline(always)]
+    fn row_stride(&self) -> usize {
+        match *self {
+            Self::F32(_, _, _, st) | Self::U16(_, _, _, st) | Self::U8(_, _, _, st) => st,
+        }
+    }
+
+    #[inline(always)]
+    fn height(&self) -> usize {
+        match *self {
+            Self::F32(s, _, _, st) => s.len() / st,
+            Self::U16(s, _, _, st) => s.len() / st,
+            Self::U8(s, _, _, st) => s.len() / st,
+        }
+    }
+
+    #[inline(always)]
+    fn precompute_nearest_x<const N: usize>(&self, u: &[f32; N]) -> [usize; N] {
+        let max_x = (self.row_stride() as i32 - 1).max(0);
+        let bc_f = self.base_col() as f32;
+        let mut x_idx = [0usize; N];
+        for px in 0..N {
+            x_idx[px] = fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+        }
+        x_idx
+    }
+
+    #[inline(always)]
+    fn sample_nearest_row_f32<const N: usize>(
+        &self,
+        x_idx: &[usize; N],
+        vy: f32,
+        out: &mut [f32],
+    ) {
+        let max_y = (self.height() as i32 - 1).max(0);
+        let y0 = fast_floor_i32(vy + 0.5 - self.base_row() as f32)
+            .0
+            .clamp(0, max_y) as usize;
+        match *self {
+            Self::F32(s, _, _, st) => {
+                let row = &s[y0 * st..];
+                for px in 0..N {
+                    out[px] = row[x_idx[px]];
+                }
+            }
+            Self::U16(s, _, _, st) => {
+                let row = &s[y0 * st..];
+                for px in 0..N {
+                    out[px] = row[x_idx[px]] as f32;
+                }
+            }
+            Self::U8(s, _, _, st) => {
+                let row = &s[y0 * st..];
+                for px in 0..N {
+                    out[px] = row[x_idx[px]] as f32;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn sample_bilinear_row_f32<const N: usize>(&self, u: &[f32; N], vy: f32, out: &mut [f32]) {
+        let max_y = (self.height() as i32 - 2).max(0);
+        let (y0_raw, fy) = fast_floor_i32(vy - self.base_row() as f32);
+        let y0 = y0_raw.clamp(0, max_y) as usize;
+        match *self {
+            Self::F32(s, bc, _, st) => {
+                let r0 = &s[y0 * st..(y0 + 1) * st];
+                let r1 = &s[(y0 + 1) * st..(y0 + 2) * st];
+                bilinear_row_flat_dispatch::<N>(u, bc, r0, r1, fy, out);
+            }
+            Self::U16(s, bc, _, st) => {
+                let r0 = &s[y0 * st..(y0 + 1) * st];
+                let r1 = &s[(y0 + 1) * st..(y0 + 2) * st];
+                bilinear_row_typed_dispatch::<u16, _, N>(u, bc, r0, r1, fy, out, |v| v as f32);
+            }
+            Self::U8(s, bc, _, st) => {
+                let r0 = &s[y0 * st..(y0 + 1) * st];
+                let r1 = &s[(y0 + 1) * st..(y0 + 2) * st];
+                bilinear_row_typed_dispatch::<u8, _, N>(u, bc, r0, r1, fy, out, |v| v as f32);
+            }
+        }
+    }
+}
+
 // ============================================================================
 // General Per-Pixel Samplers
 // ============================================================================
@@ -961,28 +1305,23 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
     let inv_range = 255.0 / range;
     let min_val = style.rescale_min;
 
-    // Ultra-hot Nearest path: Separable1D + Nearest + CleanFastPath + Single-Block!
+    // Ultra-hot Nearest path: Separable1D + Nearest + CleanFastPath + Single-Block (F32/U16/U8)!
     // Hoists `[usize; N]` X-indices once outside `for py in 0..N` for direct flat slice indexing.
     if !BILINEAR && CLEAN {
-        if let (CoordPlan::Separable1D { u, v, .. }, Some((flat, base_col, base_row, row_stride))) =
-            (plan, src.single_block_flat())
+        if let (CoordPlan::Separable1D { u, v, .. }, Some(blk)) =
+            (plan, SingleBlockRef::from_source(src))
         {
-            let max_x = (row_stride as i32 - 1).max(0);
-            let max_y = ((flat.len() / row_stride) as i32 - 1).max(0);
-            let bc_f = base_col as f32;
-            let br_f = base_row as f32;
-            let mut x_idx = [0usize; N];
-            for px in 0..N {
-                x_idx[px] = fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
-            }
+            let x_idx = blk.precompute_nearest_x(u);
+            let max_y = (blk.height() as i32 - 1).max(0);
+            let br_f = blk.base_row() as f32;
             match style.format {
                 OutputFormat::RawF32 | OutputFormat::Npy => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
+                    let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
-                        let y0 = fast_floor_i32(v[py] + 0.5 - br_f).0.clamp(0, max_y) as usize;
-                        let row = &flat[y0 * row_stride..];
-                        for px in 0..N {
-                            out.put_slice(&row[x_idx[px]].to_le_bytes());
+                        blk.sample_nearest_row_f32(&x_idx, v[py], &mut row_f32);
+                        for &val in &row_f32 {
+                            out.put_slice(&val.to_le_bytes());
                         }
                     }
                     return out.freeze();
@@ -1001,18 +1340,61 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         if sc.row_buf.len() < N {
                             sc.row_buf.resize(N, 0);
                         }
-                        for py in 0..N {
-                            let y0 =
-                                fast_floor_i32(v[py] + 0.5 - br_f).0.clamp(0, max_y) as usize;
-                            let row = &flat[y0 * row_stride..];
-                            let row_idx = &mut sc.row_buf[..N];
-                            for px in 0..N {
-                                row_idx[px] = rescale_u8(row[x_idx[px]], inv_range, min_val);
+                        match blk {
+                            SingleBlockRef::F32(flat, _, _, row_stride) => {
+                                for py in 0..N {
+                                    let y0 = fast_floor_i32(v[py] + 0.5 - br_f)
+                                        .0
+                                        .clamp(0, max_y) as usize;
+                                    let row = &flat[y0 * row_stride..];
+                                    let row_idx = &mut sc.row_buf[..N];
+                                    for px in 0..N {
+                                        row_idx[px] =
+                                            rescale_u8(row[x_idx[px]], inv_range, min_val);
+                                    }
+                                    filter_sub_u8_row(
+                                        row_idx,
+                                        &mut sc.img_buf[py * stride..(py + 1) * stride],
+                                    );
+                                }
                             }
-                            filter_sub_u8_row(
-                                row_idx,
-                                &mut sc.img_buf[py * stride..(py + 1) * stride],
-                            );
+                            SingleBlockRef::U16(flat, _, _, row_stride) => {
+                                for py in 0..N {
+                                    let y0 = fast_floor_i32(v[py] + 0.5 - br_f)
+                                        .0
+                                        .clamp(0, max_y) as usize;
+                                    let row = &flat[y0 * row_stride..];
+                                    let row_idx = &mut sc.row_buf[..N];
+                                    for px in 0..N {
+                                        row_idx[px] =
+                                            rescale_u8(row[x_idx[px]] as f32, inv_range, min_val);
+                                    }
+                                    filter_sub_u8_row(
+                                        row_idx,
+                                        &mut sc.img_buf[py * stride..(py + 1) * stride],
+                                    );
+                                }
+                            }
+                            SingleBlockRef::U8(flat, _, _, row_stride) => {
+                                let mut u8_lut = [0u8; 256];
+                                for i in 0..256 {
+                                    u8_lut[i] = rescale_u8(i as f32, inv_range, min_val);
+                                }
+                                for py in 0..N {
+                                    let y0 = fast_floor_i32(v[py] + 0.5 - br_f)
+                                        .0
+                                        .clamp(0, max_y) as usize;
+                                    let row = &flat[y0 * row_stride..];
+                                    let row_idx = &mut sc.row_buf[..N];
+                                    for px in 0..N {
+                                        row_idx[px] = u8_lut[row[x_idx[px]] as usize];
+                                    }
+                                    filter_sub_u8_row(
+                                        row_idx,
+                                        &mut sc.img_buf[py * stride..(py + 1) * stride],
+                                    );
+                                }
+                            }
                         }
                         encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
                     });
@@ -1027,18 +1409,66 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             sc.img_buf.resize(total, 0);
                         }
                         let buf = &mut sc.img_buf[..total];
-                        for py in 0..N {
-                            let y0 =
-                                fast_floor_i32(v[py] + 0.5 - br_f).0.clamp(0, max_y) as usize;
-                            let row = &flat[y0 * row_stride..];
-                            let row_off = py * N * 3;
-                            for px in 0..N {
-                                let idx = rescale_u8(row[x_idx[px]], inv_range, min_val) as usize;
-                                let c = lut.rgb[idx];
-                                let off = row_off + px * 3;
-                                buf[off] = c[0];
-                                buf[off + 1] = c[1];
-                                buf[off + 2] = c[2];
+                        match blk {
+                            SingleBlockRef::F32(flat, _, _, row_stride) => {
+                                for py in 0..N {
+                                    let y0 = fast_floor_i32(v[py] + 0.5 - br_f)
+                                        .0
+                                        .clamp(0, max_y) as usize;
+                                    let row = &flat[y0 * row_stride..];
+                                    let row_off = py * N * 3;
+                                    for px in 0..N {
+                                        let idx =
+                                            rescale_u8(row[x_idx[px]], inv_range, min_val) as usize;
+                                        let c = lut.rgb[idx];
+                                        let off = row_off + px * 3;
+                                        buf[off] = c[0];
+                                        buf[off + 1] = c[1];
+                                        buf[off + 2] = c[2];
+                                    }
+                                }
+                            }
+                            SingleBlockRef::U16(flat, _, _, row_stride) => {
+                                for py in 0..N {
+                                    let y0 = fast_floor_i32(v[py] + 0.5 - br_f)
+                                        .0
+                                        .clamp(0, max_y) as usize;
+                                    let row = &flat[y0 * row_stride..];
+                                    let row_off = py * N * 3;
+                                    for px in 0..N {
+                                        let idx = rescale_u8(
+                                            row[x_idx[px]] as f32,
+                                            inv_range,
+                                            min_val,
+                                        ) as usize;
+                                        let c = lut.rgb[idx];
+                                        let off = row_off + px * 3;
+                                        buf[off] = c[0];
+                                        buf[off + 1] = c[1];
+                                        buf[off + 2] = c[2];
+                                    }
+                                }
+                            }
+                            SingleBlockRef::U8(flat, _, _, row_stride) => {
+                                let mut rgb_lut = [[0u8; 3]; 256];
+                                for i in 0..256 {
+                                    rgb_lut[i] =
+                                        lut.rgb[rescale_u8(i as f32, inv_range, min_val) as usize];
+                                }
+                                for py in 0..N {
+                                    let y0 = fast_floor_i32(v[py] + 0.5 - br_f)
+                                        .0
+                                        .clamp(0, max_y) as usize;
+                                    let row = &flat[y0 * row_stride..];
+                                    let row_off = py * N * 3;
+                                    for px in 0..N {
+                                        let c = rgb_lut[row[x_idx[px]] as usize];
+                                        let off = row_off + px * 3;
+                                        buf[off] = c[0];
+                                        buf[off + 1] = c[1];
+                                        buf[off + 2] = c[2];
+                                    }
+                                }
                             }
                         }
                         match style.format {
@@ -1057,33 +1487,17 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
         }
     }
 
-    // Ultra-hot SIMD path: Separable1D + Bilinear + CleanFastPath + Single-Block!
+    // Ultra-hot SIMD path: Separable1D + Bilinear + CleanFastPath + Single-Block (F32/U16/U8)!
     if BILINEAR && CLEAN {
-        if let (CoordPlan::Separable1D { u, v, .. }, Some((flat, base_col, base_row, row_stride))) =
-            (plan, src.single_block_flat())
+        if let (CoordPlan::Separable1D { u, v, .. }, Some(blk)) =
+            (plan, SingleBlockRef::from_source(src))
         {
-            let max_y = (flat.len() / row_stride).saturating_sub(2);
             match style.format {
                 OutputFormat::RawF32 | OutputFormat::Npy => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
                     let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
-                        let vy = v[py] - (base_row as f32);
-                        let y0_f = vy.floor();
-                        let fy = vy - y0_f;
-                        let y0 = (y0_f.max(0.0) as usize).min(max_y);
-                        let r0_off = y0 * row_stride;
-                        let r1_off = r0_off + row_stride;
-                        let r0 = &flat[r0_off..r0_off + row_stride];
-                        let r1 = &flat[r1_off..r1_off + row_stride];
-                        bilinear_row_flat_dispatch::<N>(
-                            u,
-                            base_col,
-                            r0,
-                            r1,
-                            fy,
-                            &mut row_f32,
-                        );
+                        blk.sample_bilinear_row_f32(u, v[py], &mut row_f32);
                         for &val in &row_f32 {
                             out.put_slice(&val.to_le_bytes());
                         }
@@ -1108,22 +1522,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             sc.f32_row.resize(N, 0.0);
                         }
                         for py in 0..N {
-                            let vy = v[py] - (base_row as f32);
-                            let y0_f = vy.floor();
-                            let fy = vy - y0_f;
-                            let y0 = (y0_f.max(0.0) as usize).min(max_y);
-                            let r0_off = y0 * row_stride;
-                            let r1_off = r0_off + row_stride;
-                            let r0 = &flat[r0_off..r0_off + row_stride];
-                            let r1 = &flat[r1_off..r1_off + row_stride];
-                            bilinear_row_flat_dispatch::<N>(
-                                u,
-                                base_col,
-                                r0,
-                                r1,
-                                fy,
-                                &mut sc.f32_row[..N],
-                            );
+                            blk.sample_bilinear_row_f32(u, v[py], &mut sc.f32_row[..N]);
                             let row_idx = &mut sc.row_buf[..N];
                             for px in 0..N {
                                 row_idx[px] = rescale_u8(sc.f32_row[px], inv_range, min_val);
@@ -1149,22 +1548,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             sc.f32_row.resize(N, 0.0);
                         }
                         for py in 0..N {
-                            let vy = v[py] - (base_row as f32);
-                            let y0_f = vy.floor();
-                            let fy = vy - y0_f;
-                            let y0 = (y0_f.max(0.0) as usize).min(max_y);
-                            let r0_off = y0 * row_stride;
-                            let r1_off = r0_off + row_stride;
-                            let r0 = &flat[r0_off..r0_off + row_stride];
-                            let r1 = &flat[r1_off..r1_off + row_stride];
-                            bilinear_row_flat_dispatch::<N>(
-                                u,
-                                base_col,
-                                r0,
-                                r1,
-                                fy,
-                                &mut sc.f32_row[..N],
-                            );
+                            blk.sample_bilinear_row_f32(u, v[py], &mut sc.f32_row[..N]);
                             let row_off = py * N * 3;
                             for px in 0..N {
                                 let idx = rescale_u8(sc.f32_row[px], inv_range, min_val) as usize;
@@ -1892,7 +2276,266 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
     });
 }
 
+/// ARM NEON 4-wide bilinear row sampler for interleaved `RgbU8Channel` on `Separable1D`
+/// (hoisted `y0`/`fy` once per scanline, 1 cache-line load per sample pair).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn bilinear_row_rgb_u8_separable_neon<const N: usize>(
+    u_coords: &[f32; N],
+    bc: f32,
+    r0_ptr: *const u8,
+    r1_ptr: *const u8,
+    max_x: i32,
+    fy: f32,
+    inv: [f32; 3],
+    mins: [f32; 3],
+    identity: bool,
+    row_rgb: &mut [u8],
+) {
+    use std::arch::aarch64::*;
+    let (
+        v_bc,
+        v_fy,
+        v_zero_i,
+        v_max_x,
+        v_zero,
+        v_255,
+        v_half,
+        v_inv0,
+        v_inv1,
+        v_inv2,
+        v_min0,
+        v_min1,
+        v_min2,
+    ) = unsafe {
+        (
+            vdupq_n_f32(bc),
+            vdupq_n_f32(fy),
+            vdupq_n_s32(0),
+            vdupq_n_s32(max_x),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(255.0),
+            vdupq_n_f32(0.5),
+            vdupq_n_f32(inv[0]),
+            vdupq_n_f32(inv[1]),
+            vdupq_n_f32(inv[2]),
+            vdupq_n_f32(mins[0]),
+            vdupq_n_f32(mins[1]),
+            vdupq_n_f32(mins[2]),
+        )
+    };
+    let mut xs = [0i32; 4];
+    let mut out_r = [0i32; 4];
+    let mut out_g = [0i32; 4];
+    let mut out_b = [0i32; 4];
+    let mut px = 0usize;
+    while px + 4 <= N {
+        unsafe {
+            let u = vsubq_f32(vld1q_f32(u_coords.as_ptr().add(px)), v_bc);
+            let x0_f = vrndmq_f32(u);
+            let fx = vsubq_f32(u, x0_f);
+            let vx = vminq_s32(vmaxq_s32(vcvtq_s32_f32(x0_f), v_zero_i), v_max_x);
+            vst1q_s32(xs.as_mut_ptr(), vx);
+
+            let o0 = (xs[0] as usize) * 3;
+            let o1 = (xs[1] as usize) * 3;
+            let o2 = (xs[2] as usize) * 3;
+            let o3 = (xs[3] as usize) * 3;
+
+            macro_rules! eval_ch {
+                ($ch:expr, $v_inv:expr, $v_min:expr, $out:expr) => {{
+                    let a00 = [
+                        *r0_ptr.add(o0 + $ch) as f32,
+                        *r0_ptr.add(o1 + $ch) as f32,
+                        *r0_ptr.add(o2 + $ch) as f32,
+                        *r0_ptr.add(o3 + $ch) as f32,
+                    ];
+                    let a10 = [
+                        *r0_ptr.add(o0 + 3 + $ch) as f32,
+                        *r0_ptr.add(o1 + 3 + $ch) as f32,
+                        *r0_ptr.add(o2 + 3 + $ch) as f32,
+                        *r0_ptr.add(o3 + 3 + $ch) as f32,
+                    ];
+                    let a01 = [
+                        *r1_ptr.add(o0 + $ch) as f32,
+                        *r1_ptr.add(o1 + $ch) as f32,
+                        *r1_ptr.add(o2 + $ch) as f32,
+                        *r1_ptr.add(o3 + $ch) as f32,
+                    ];
+                    let a11 = [
+                        *r1_ptr.add(o0 + 3 + $ch) as f32,
+                        *r1_ptr.add(o1 + 3 + $ch) as f32,
+                        *r1_ptr.add(o2 + 3 + $ch) as f32,
+                        *r1_ptr.add(o3 + 3 + $ch) as f32,
+                    ];
+                    let v00 = vld1q_f32(a00.as_ptr());
+                    let v10 = vld1q_f32(a10.as_ptr());
+                    let v01 = vld1q_f32(a01.as_ptr());
+                    let v11 = vld1q_f32(a11.as_ptr());
+                    let top = vfmaq_f32(v00, vsubq_f32(v10, v00), fx);
+                    let bot = vfmaq_f32(v01, vsubq_f32(v11, v01), fx);
+                    let val = vfmaq_f32(top, vsubq_f32(bot, top), v_fy);
+                    let rounded = if identity {
+                        vaddq_f32(val, v_half)
+                    } else {
+                        let scaled = vmulq_f32(vsubq_f32(val, $v_min), $v_inv);
+                        let clamped = vminq_f32(vmaxq_f32(scaled, v_zero), v_255);
+                        vaddq_f32(clamped, v_half)
+                    };
+                    vst1q_s32($out.as_mut_ptr(), vcvtq_s32_f32(rounded));
+                }};
+            }
+
+            eval_ch!(0, v_inv0, v_min0, out_r);
+            eval_ch!(1, v_inv1, v_min1, out_g);
+            eval_ch!(2, v_inv2, v_min2, out_b);
+
+            let base = px * 3;
+            for k in 0..4 {
+                *row_rgb.get_unchecked_mut(base + k * 3) = out_r[k] as u8;
+                *row_rgb.get_unchecked_mut(base + k * 3 + 1) = out_g[k] as u8;
+                *row_rgb.get_unchecked_mut(base + k * 3 + 2) = out_b[k] as u8;
+            }
+        }
+        px += 4;
+    }
+    while px < N {
+        let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc);
+        let o = (x0_raw.clamp(0, max_x) as usize) * 3;
+        unsafe {
+            let off = px * 3;
+            for ch in 0..3 {
+                let v00 = *r0_ptr.add(o + ch) as f32;
+                let v10 = *r0_ptr.add(o + 3 + ch) as f32;
+                let v01 = *r1_ptr.add(o + ch) as f32;
+                let v11 = *r1_ptr.add(o + 3 + ch) as f32;
+                let top = v00 + (v10 - v00) * fx;
+                let bot = v01 + (v11 - v01) * fx;
+                let val = top + (bot - top) * fy;
+                *row_rgb.get_unchecked_mut(off + ch) = if identity {
+                    (val + 0.5) as u8
+                } else {
+                    rescale_u8(val, inv[ch], mins[ch])
+                };
+            }
+        }
+        px += 1;
+    }
+}
+
+/// x86_64 AVX2+FMA 8-wide bilinear row sampler for interleaved `RgbU8Channel` on `Separable1D`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
+    u_coords: &[f32; N],
+    bc: f32,
+    r0_ptr: *const u8,
+    r1_ptr: *const u8,
+    max_x: i32,
+    fy: f32,
+    inv: [f32; 3],
+    mins: [f32; 3],
+    identity: bool,
+    row_rgb: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+    let v_bc = _mm256_set1_ps(bc);
+    let v_fy = _mm256_set1_ps(fy);
+    let v_zero_i = _mm256_setzero_si256();
+    let v_max_x = _mm256_set1_epi32(max_x);
+    let v_zero = _mm256_setzero_ps();
+    let v_255 = _mm256_set1_ps(255.0);
+    let v_half = _mm256_set1_ps(0.5);
+    let v_inv0 = _mm256_set1_ps(inv[0]);
+    let v_inv1 = _mm256_set1_ps(inv[1]);
+    let v_inv2 = _mm256_set1_ps(inv[2]);
+    let v_min0 = _mm256_set1_ps(mins[0]);
+    let v_min1 = _mm256_set1_ps(mins[1]);
+    let v_min2 = _mm256_set1_ps(mins[2]);
+    let mut xs = [0i32; 8];
+    let mut out_r = [0i32; 8];
+    let mut out_g = [0i32; 8];
+    let mut out_b = [0i32; 8];
+    let mut px = 0usize;
+    while px + 8 <= N {
+        let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_bc);
+        let x0_f = _mm256_floor_ps(u);
+        let fx = _mm256_sub_ps(u, x0_f);
+        let vx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero_i), v_max_x);
+        _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, vx);
+
+        let mut os = [0usize; 8];
+        for k in 0..8 {
+            os[k] = (xs[k] as usize) * 3;
+        }
+
+        macro_rules! eval_ch {
+            ($ch:expr, $v_inv:expr, $v_min:expr, $out:expr) => {{
+                let mut a00 = [0.0f32; 8];
+                let mut a10 = [0.0f32; 8];
+                let mut a01 = [0.0f32; 8];
+                let mut a11 = [0.0f32; 8];
+                for k in 0..8 {
+                    let o = os[k];
+                    a00[k] = *r0_ptr.add(o + $ch) as f32;
+                    a10[k] = *r0_ptr.add(o + 3 + $ch) as f32;
+                    a01[k] = *r1_ptr.add(o + $ch) as f32;
+                    a11[k] = *r1_ptr.add(o + 3 + $ch) as f32;
+                }
+                let v00 = _mm256_loadu_ps(a00.as_ptr());
+                let v10 = _mm256_loadu_ps(a10.as_ptr());
+                let v01 = _mm256_loadu_ps(a01.as_ptr());
+                let v11 = _mm256_loadu_ps(a11.as_ptr());
+                let top = _mm256_fmadd_ps(_mm256_sub_ps(v10, v00), fx, v00);
+                let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
+                let val = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), v_fy, top);
+                let rounded = if identity {
+                    _mm256_add_ps(val, v_half)
+                } else {
+                    let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
+                    let clamped = _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255);
+                    _mm256_add_ps(clamped, v_half)
+                };
+                _mm256_storeu_si256($out.as_mut_ptr() as *mut __m256i, _mm256_cvttps_epi32(rounded));
+            }};
+        }
+
+        eval_ch!(0, v_inv0, v_min0, out_r);
+        eval_ch!(1, v_inv1, v_min1, out_g);
+        eval_ch!(2, v_inv2, v_min2, out_b);
+
+        let base = px * 3;
+        for k in 0..8 {
+            *row_rgb.get_unchecked_mut(base + k * 3) = out_r[k] as u8;
+            *row_rgb.get_unchecked_mut(base + k * 3 + 1) = out_g[k] as u8;
+            *row_rgb.get_unchecked_mut(base + k * 3 + 2) = out_b[k] as u8;
+        }
+        px += 8;
+    }
+    while px < N {
+        let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc);
+        let o = (x0_raw.clamp(0, max_x) as usize) * 3;
+        let off = px * 3;
+        for ch in 0..3 {
+            let v00 = *r0_ptr.add(o + ch) as f32;
+            let v10 = *r0_ptr.add(o + 3 + ch) as f32;
+            let v01 = *r1_ptr.add(o + ch) as f32;
+            let v11 = *r1_ptr.add(o + 3 + ch) as f32;
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            let val = top + (bot - top) * fy;
+            *row_rgb.get_unchecked_mut(off + ch) = if identity {
+                (val + 0.5) as u8
+            } else {
+                rescale_u8(val, inv[ch], mins[ch])
+            };
+        }
+        px += 1;
+    }
+}
+
 /// Fused clean RGB bilinear scanline sampler:
+/// - Fast path 0: shared interleaved `RgbU8` slab (NEON/AVX2 on `Separable1D`, 1 cache-line stream).
 /// - Fast path 1: single-block `U8`, `U16`, or `F32` (NEON 4-wide / AVX2 8-wide, zero block lookups).
 /// - Fast path 2: multi-block aligned grid (computes floor/frac + `(bidx, p00, p01)` once per pixel instead of 3×).
 /// - Fallback: per-band sampling for heterogeneous grids.
@@ -1916,9 +2559,6 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
             && srcs[0].same_grid_as(&srcs[1])
             && srcs[0].same_grid_as(&srcs[2])
         {
-            let mut u_row = [0.0f32; N];
-            let mut v_row = [0.0f32; N];
-            fill_uv_row(plan, py, &mut u_row, &mut v_row);
             let bc_f = bc as f32;
             let br_f = br as f32;
             let ptr = rgb0.as_ptr();
@@ -1929,6 +2569,65 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
                 && (inv[2] - 1.0).abs() < 1e-6;
             let max_x = (st as i32 - 2).max(0);
             let max_y = ((rgb0.len() / stride3) as i32 - 2).max(0);
+            if let CoordPlan::Separable1D { u, v, .. } = plan
+                && row_rgb.len() >= N * 3
+                && rgb0.len() >= (max_y as usize + 2) * stride3
+            {
+                let (y0_raw, fy) = fast_floor_i32(v[py] - br_f);
+                let y0 = y0_raw.clamp(0, max_y) as usize;
+                let r0_ptr = unsafe { ptr.add(y0 * stride3) };
+                let r1_ptr = unsafe { ptr.add((y0 + 1) * stride3) };
+                #[cfg(target_arch = "aarch64")]
+                {
+                    unsafe {
+                        bilinear_row_rgb_u8_separable_neon::<N>(
+                            u, bc_f, r0_ptr, r1_ptr, max_x, fy, inv, mins, identity, row_rgb,
+                        );
+                    }
+                    return;
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if std::is_x86_feature_detected!("avx2")
+                        && std::is_x86_feature_detected!("fma")
+                    {
+                        unsafe {
+                            bilinear_row_rgb_u8_separable_avx2::<N>(
+                                u, bc_f, r0_ptr, r1_ptr, max_x, fy, inv, mins, identity, row_rgb,
+                            );
+                        }
+                        return;
+                    }
+                }
+                #[allow(unreachable_code)]
+                {
+                    for px in 0..N {
+                        let (x0_raw, fx) = fast_floor_i32(u[px] - bc_f);
+                        let o = (x0_raw.clamp(0, max_x) as usize) * 3;
+                        let off = px * 3;
+                        unsafe {
+                            for ch in 0..3 {
+                                let v00 = *r0_ptr.add(o + ch) as f32;
+                                let v10 = *r0_ptr.add(o + 3 + ch) as f32;
+                                let v01 = *r1_ptr.add(o + ch) as f32;
+                                let v11 = *r1_ptr.add(o + 3 + ch) as f32;
+                                let top = v00 + (v10 - v00) * fx;
+                                let bot = v01 + (v11 - v01) * fx;
+                                let val = top + (bot - top) * fy;
+                                *row_rgb.get_unchecked_mut(off + ch) = if identity {
+                                    (val + 0.5) as u8
+                                } else {
+                                    rescale_u8(val, inv[ch], mins[ch])
+                                };
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            let mut u_row = [0.0f32; N];
+            let mut v_row = [0.0f32; N];
+            fill_uv_row(plan, py, &mut u_row, &mut v_row);
             for px in 0..N {
                 let (x0_raw, fx) = fast_floor_i32(u_row[px] - bc_f);
                 let (y0_raw, fy) = fast_floor_i32(v_row[px] - br_f);
@@ -2128,6 +2827,306 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
     });
 }
 
+/// Pre-resolved single-block `Separable1D` Nearest plan hoisted outside `for py in 0..N`
+/// in `render_rgb_specialized`, eliminating `N` redundant mode dispatches, `u_row`/`v_row` copies,
+/// and `N²` `fast_floor_i32` X-index computations.
+enum CleanRgbNearestPlan<'a, const N: usize> {
+    InterleavedRgbU8 {
+        rgb: &'a [u8],
+        v: &'a [f32; N],
+        br_f: f32,
+        stride3: usize,
+        max_y: i32,
+        x_off3: [usize; N],
+        identity: bool,
+    },
+    PlanarU8 {
+        r: &'a [u8],
+        g: &'a [u8],
+        b: &'a [u8],
+        v: &'a [f32; N],
+        br_f: f32,
+        st: usize,
+        max_y: i32,
+        x_idx: [usize; N],
+        identity: bool,
+    },
+    PlanarU16 {
+        r: &'a [u16],
+        g: &'a [u16],
+        b: &'a [u16],
+        v: &'a [f32; N],
+        br_f: f32,
+        st: usize,
+        max_y: i32,
+        x_idx: [usize; N],
+    },
+    PlanarF32 {
+        r: &'a [f32],
+        g: &'a [f32],
+        b: &'a [f32],
+        v: &'a [f32; N],
+        br_f: f32,
+        st: usize,
+        max_y: i32,
+        x_idx: [usize; N],
+    },
+    Generic,
+}
+
+impl<'a, const N: usize> CleanRgbNearestPlan<'a, N> {
+    fn build(
+        plan: &'a CoordPlan<N>,
+        srcs: &[BandSource<'a>; 3],
+        inv: [f32; 3],
+        mins: [f32; 3],
+    ) -> Self {
+        let CoordPlan::Separable1D { u, v, .. } = plan else {
+            return Self::Generic;
+        };
+        let identity = mins == [0.0, 0.0, 0.0]
+            && (inv[0] - 1.0).abs() < 1e-6
+            && (inv[1] - 1.0).abs() < 1e-6
+            && (inv[2] - 1.0).abs() < 1e-6;
+
+        if let (Some((rgb0, 0, bc, br, st)), Some((rgb1, 1, _, _, _)), Some((rgb2, 2, _, _, _))) = (
+            srcs[0].single_block_rgb_u8(),
+            srcs[1].single_block_rgb_u8(),
+            srcs[2].single_block_rgb_u8(),
+        ) {
+            if std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
+                && std::ptr::eq(rgb0.as_ptr(), rgb2.as_ptr())
+                && srcs[0].same_grid_as(&srcs[1])
+                && srcs[0].same_grid_as(&srcs[2])
+            {
+                let bc_f = bc as f32;
+                let max_x = (st as i32 - 1).max(0);
+                let stride3 = st * 3;
+                let max_y = ((rgb0.len() / stride3) as i32 - 1).max(0);
+                let mut x_off3 = [0usize; N];
+                for px in 0..N {
+                    x_off3[px] =
+                        (fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize) * 3;
+                }
+                return Self::InterleavedRgbU8 {
+                    rgb: rgb0,
+                    v,
+                    br_f: br as f32,
+                    stride3,
+                    max_y,
+                    x_off3,
+                    identity,
+                };
+            }
+        }
+        if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
+            srcs[0].single_block_u8(),
+            srcs[1].single_block_u8(),
+            srcs[2].single_block_u8(),
+        ) {
+            if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+                let bc_f = bc as f32;
+                let max_x = (st as i32 - 1).max(0);
+                let min_len = r.len().min(g.len()).min(b.len());
+                let max_y = ((min_len / st) as i32 - 1).max(0);
+                let mut x_idx = [0usize; N];
+                for px in 0..N {
+                    x_idx[px] = fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                }
+                return Self::PlanarU8 {
+                    r,
+                    g,
+                    b,
+                    v,
+                    br_f: br as f32,
+                    st,
+                    max_y,
+                    x_idx,
+                    identity,
+                };
+            }
+        }
+        if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
+            srcs[0].single_block_u16(),
+            srcs[1].single_block_u16(),
+            srcs[2].single_block_u16(),
+        ) {
+            if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+                let bc_f = bc as f32;
+                let max_x = (st as i32 - 1).max(0);
+                let min_len = r.len().min(g.len()).min(b.len());
+                let max_y = ((min_len / st) as i32 - 1).max(0);
+                let mut x_idx = [0usize; N];
+                for px in 0..N {
+                    x_idx[px] = fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                }
+                return Self::PlanarU16 {
+                    r,
+                    g,
+                    b,
+                    v,
+                    br_f: br as f32,
+                    st,
+                    max_y,
+                    x_idx,
+                };
+            }
+        }
+        if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
+            srcs[0].single_block_flat(),
+            srcs[1].single_block_flat(),
+            srcs[2].single_block_flat(),
+        ) {
+            if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+                let bc_f = bc as f32;
+                let max_x = (st as i32 - 1).max(0);
+                let min_len = r.len().min(g.len()).min(b.len());
+                let max_y = ((min_len / st) as i32 - 1).max(0);
+                let mut x_idx = [0usize; N];
+                for px in 0..N {
+                    x_idx[px] = fast_floor_i32(u[px] + 0.5 - bc_f).0.clamp(0, max_x) as usize;
+                }
+                return Self::PlanarF32 {
+                    r,
+                    g,
+                    b,
+                    v,
+                    br_f: br as f32,
+                    st,
+                    max_y,
+                    x_idx,
+                };
+            }
+        }
+        Self::Generic
+    }
+
+    #[inline(always)]
+    fn sample_row(
+        &self,
+        plan: &CoordPlan<N>,
+        py: usize,
+        srcs: &[BandSource<'_>; 3],
+        inv: [f32; 3],
+        mins: [f32; 3],
+        row_rgb: &mut [u8],
+    ) {
+        match self {
+            Self::InterleavedRgbU8 {
+                rgb,
+                v,
+                br_f,
+                stride3,
+                max_y,
+                x_off3,
+                identity,
+            } => {
+                let y = fast_floor_i32(v[py] + 0.5 - *br_f).0.clamp(0, *max_y) as usize;
+                let y_off = y * *stride3;
+                let row_src = &rgb[y_off..];
+                if *identity {
+                    for px in 0..N {
+                        let o = x_off3[px];
+                        let d = px * 3;
+                        row_rgb[d] = row_src[o];
+                        row_rgb[d + 1] = row_src[o + 1];
+                        row_rgb[d + 2] = row_src[o + 2];
+                    }
+                } else {
+                    for px in 0..N {
+                        let o = x_off3[px];
+                        let d = px * 3;
+                        row_rgb[d] = rescale_u8(row_src[o] as f32, inv[0], mins[0]);
+                        row_rgb[d + 1] = rescale_u8(row_src[o + 1] as f32, inv[1], mins[1]);
+                        row_rgb[d + 2] = rescale_u8(row_src[o + 2] as f32, inv[2], mins[2]);
+                    }
+                }
+            }
+            Self::PlanarU8 {
+                r,
+                g,
+                b,
+                v,
+                br_f,
+                st,
+                max_y,
+                x_idx,
+                identity,
+            } => {
+                let y = fast_floor_i32(v[py] + 0.5 - *br_f).0.clamp(0, *max_y) as usize;
+                let y_off = y * *st;
+                let rr = &r[y_off..];
+                let rg = &g[y_off..];
+                let rb = &b[y_off..];
+                if *identity {
+                    for px in 0..N {
+                        let x = x_idx[px];
+                        let d = px * 3;
+                        row_rgb[d] = rr[x];
+                        row_rgb[d + 1] = rg[x];
+                        row_rgb[d + 2] = rb[x];
+                    }
+                } else {
+                    for px in 0..N {
+                        let x = x_idx[px];
+                        let d = px * 3;
+                        row_rgb[d] = rescale_u8(rr[x] as f32, inv[0], mins[0]);
+                        row_rgb[d + 1] = rescale_u8(rg[x] as f32, inv[1], mins[1]);
+                        row_rgb[d + 2] = rescale_u8(rb[x] as f32, inv[2], mins[2]);
+                    }
+                }
+            }
+            Self::PlanarU16 {
+                r,
+                g,
+                b,
+                v,
+                br_f,
+                st,
+                max_y,
+                x_idx,
+            } => {
+                let y = fast_floor_i32(v[py] + 0.5 - *br_f).0.clamp(0, *max_y) as usize;
+                let y_off = y * *st;
+                let rr = &r[y_off..];
+                let rg = &g[y_off..];
+                let rb = &b[y_off..];
+                for px in 0..N {
+                    let x = x_idx[px];
+                    let d = px * 3;
+                    row_rgb[d] = rescale_u8(rr[x] as f32, inv[0], mins[0]);
+                    row_rgb[d + 1] = rescale_u8(rg[x] as f32, inv[1], mins[1]);
+                    row_rgb[d + 2] = rescale_u8(rb[x] as f32, inv[2], mins[2]);
+                }
+            }
+            Self::PlanarF32 {
+                r,
+                g,
+                b,
+                v,
+                br_f,
+                st,
+                max_y,
+                x_idx,
+            } => {
+                let y = fast_floor_i32(v[py] + 0.5 - *br_f).0.clamp(0, *max_y) as usize;
+                let y_off = y * *st;
+                let rr = &r[y_off..];
+                let rg = &g[y_off..];
+                let rb = &b[y_off..];
+                for px in 0..N {
+                    let x = x_idx[px];
+                    let d = px * 3;
+                    row_rgb[d] = rescale_u8(rr[x], inv[0], mins[0]);
+                    row_rgb[d + 1] = rescale_u8(rg[x], inv[1], mins[1]);
+                    row_rgb[d + 2] = rescale_u8(rb[x], inv[2], mins[2]);
+                }
+            }
+            Self::Generic => sample_rgb_nearest_row_clean(plan, py, srcs, inv, mins, row_rgb),
+        }
+    }
+}
+
 fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: bool>(
     plan: &CoordPlan<N>,
     srcs: &[BandSource<'_>; 3],
@@ -2165,12 +3164,17 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                 if sc.row_buf.len() < N * 3 {
                     sc.row_buf.resize(N * 3, 0);
                 }
+                let nearest_plan = if !BILINEAR {
+                    Some(CleanRgbNearestPlan::build(plan, srcs, inv, mins))
+                } else {
+                    None
+                };
                 for py in 0..N {
                     let row_rgb = &mut sc.row_buf[..N * 3];
                     if BILINEAR {
                         sample_rgb_bilinear_row_clean(plan, py, srcs, inv, mins, row_rgb);
-                    } else {
-                        sample_rgb_nearest_row_clean(plan, py, srcs, inv, mins, row_rgb);
+                    } else if let Some(ref np) = nearest_plan {
+                        np.sample_row(plan, py, srcs, inv, mins, row_rgb);
                     }
                     filter_sub_rgb_row(row_rgb, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
@@ -2217,6 +3221,11 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                     sc.img_buf.resize(total, 0);
                 }
                 let buf = &mut sc.img_buf[..total];
+                let nearest_plan = if !BILINEAR {
+                    Some(CleanRgbNearestPlan::build(plan, srcs, inv, mins))
+                } else {
+                    None
+                };
                 for py in 0..N {
                     let row_off = py * N * 3;
                     if BILINEAR {
@@ -2228,8 +3237,8 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                             mins,
                             &mut buf[row_off..row_off + N * 3],
                         );
-                    } else {
-                        sample_rgb_nearest_row_clean(
+                    } else if let Some(ref np) = nearest_plan {
+                        np.sample_row(
                             plan,
                             py,
                             srcs,
@@ -2846,11 +3855,22 @@ pub fn render_expr_vm<const N: usize>(
     let inv_range_254 = 254.0 / range;
     let min_val = style.rescale_min;
 
-    let flat_bands: Vec<Option<(&[f32], u32, u32, usize)>> = if style.resample
-        == ResampleMode::Bilinear
-        && all_clean
-    {
-        srcs[..nb].iter().map(|s| s.single_block_flat()).collect()
+    let single_bands: Vec<Option<SingleBlockRef<'_>>> =
+        if all_clean && matches!(style.resample, ResampleMode::Bilinear | ResampleMode::Nearest) {
+            srcs[..nb].iter().map(SingleBlockRef::from_source).collect()
+        } else {
+            Vec::new()
+        };
+    let all_single = !single_bands.is_empty() && single_bands.iter().all(|s| s.is_some());
+    let nearest_x_idxs: Vec<[usize; N]> = if all_single && style.resample == ResampleMode::Nearest {
+        if let CoordPlan::Separable1D { u, .. } = plan {
+            single_bands
+                .iter()
+                .map(|b| b.unwrap().precompute_nearest_x(u))
+                .collect()
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -2859,25 +3879,13 @@ pub fn render_expr_vm<const N: usize>(
         match (style.resample, all_clean) {
             (ResampleMode::Bilinear, true) => {
                 if let CoordPlan::Separable1D { u, v, .. } = plan
-                    && !flat_bands.is_empty()
-                    && flat_bands.iter().all(|f| f.is_some())
+                    && all_single
                 {
                     let vy = v[py];
                     for b in 0..nb {
-                        let (slice, bc, br, stride) = flat_bands[b].unwrap();
-                        let (y0_raw, fy) = fast_floor_i32(vy - br as f32);
-                        let max_y = ((slice.len() / stride) as i32 - 2).max(0);
-                        let y0 = y0_raw.clamp(0, max_y) as usize;
-                        let r0_off = y0 * stride;
-                        let r1_off = r0_off + stride;
-                        bilinear_row_flat_dispatch::<N>(
-                            u,
-                            bc,
-                            &slice[r0_off..r0_off + stride],
-                            &slice[r1_off..r1_off + stride],
-                            fy,
-                            &mut band_rows[b],
-                        );
+                        single_bands[b]
+                            .unwrap()
+                            .sample_bilinear_row_f32(u, vy, &mut band_rows[b]);
                     }
                     return;
                 }
@@ -2895,6 +3903,19 @@ pub fn render_expr_vm<const N: usize>(
                 });
             }
             (ResampleMode::Nearest, true) => {
+                if let CoordPlan::Separable1D { v, .. } = plan
+                    && !nearest_x_idxs.is_empty()
+                {
+                    let vy = v[py];
+                    for b in 0..nb {
+                        single_bands[b].unwrap().sample_nearest_row_f32(
+                            &nearest_x_idxs[b],
+                            vy,
+                            &mut band_rows[b],
+                        );
+                    }
+                    return;
+                }
                 for_each_pixel_in_row(plan, py, |px, u, v| {
                     for b in 0..nb {
                         band_rows[b][px] = sample_nearest::<true>(&srcs[b], u, v);
@@ -4558,5 +5579,191 @@ mod tests {
             [0.0; 3],
             "F32 rescaled",
         );
+    }
+
+    #[test]
+    fn single_block_u16_u8_and_rgb_separable_fast_paths_match_scalar() {
+        use crate::colormap::ColormapName;
+        use cogzilla_codec::{BandData, BlockStats, DecodedBand};
+        use std::sync::Arc;
+
+        let tw = 64u32;
+        let th = 64u32;
+        let n_px = (tw * th) as usize;
+        let stats = BlockStats {
+            min: 0.0,
+            max: 4000.0,
+            all_nodata: false,
+            no_nodata: true,
+        };
+        let mut u = [0.0f32; 256];
+        let mut v = [0.0f32; 256];
+        for i in 0..256 {
+            u[i] = 1.25 + (i as f32) * (60.0 / 255.0);
+            v[i] = 1.75 + (i as f32) * (59.5 / 255.0);
+        }
+        let plan = CoordPlan::Separable1D {
+            u: Box::new(u),
+            v: Box::new(v),
+            src_min_col: 1,
+            src_max_col: 62,
+            src_min_row: 1,
+            src_max_row: 62,
+            all_in_bounds: true,
+        };
+
+        // 1. Single-band U16 & U8 (Nearest + Bilinear) in render_single_specialized + render_expr_vm
+        let u16_a = DecodedBand {
+            data: BandData::U16 {
+                data: (0..n_px).map(|i| ((i * 29 + 17) % 3500) as u16).collect(),
+                nodata: None,
+            },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let u16_b = DecodedBand {
+            data: BandData::U16 {
+                data: (0..n_px).map(|i| ((i * 13 + 211) % 3500) as u16).collect(),
+                nodata: None,
+            },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let u8_a = DecodedBand {
+            data: BandData::U8 {
+                data: (0..n_px).map(|i| ((i * 7 + 5) & 0xFF) as u8).collect(),
+                nodata: None,
+            },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let s_u16_a = [Some(&u16_a)];
+        let s_u16_b = [Some(&u16_b)];
+        let s_u8_a = [Some(&u8_a)];
+        let bs_u16_a = BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s_u16_a);
+        let bs_u8_a = BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s_u8_a);
+
+        for (label, bs) in [("U16", &bs_u16_a), ("U8", &bs_u8_a)] {
+            for (is_bilin, resample) in [
+                (false, ResampleMode::Nearest),
+                (true, ResampleMode::Bilinear),
+            ] {
+                let style = SingleBandStyle {
+                    rescale_min: 0.0,
+                    rescale_max: 255.0,
+                    colormap: ColormapName::Viridis,
+                    format: OutputFormat::RawF32,
+                    resample,
+                };
+                let got = if is_bilin {
+                    render_single_specialized::<256, true, true>(&plan, bs, &style)
+                } else {
+                    render_single_specialized::<256, false, true>(&plan, bs, &style)
+                };
+                for py in 0..256 {
+                    for px in 0..256 {
+                        let idx = (py * 256 + px) * 4;
+                        let g = f32::from_le_bytes(got[idx..idx + 4].try_into().unwrap());
+                        let e = if is_bilin {
+                            sample_bilinear::<true>(bs, u[px], v[py])
+                        } else {
+                            sample_nearest::<true>(bs, u[px], v[py])
+                        };
+                        assert!(
+                            (g - e).abs() <= 1e-3,
+                            "{label} bilin={is_bilin} mismatch at ({px},{py}): got {g}, exp {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. render_expr_vm on U16 pair (Nearest + Bilinear)
+        let prog = crate::expr_vm::ExprProgram::compile("(b1 - b2) / (b1 + b2 + 1.0)").unwrap();
+        let pair = [
+            BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s_u16_a),
+            BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &s_u16_b),
+        ];
+        for resample in [ResampleMode::Nearest, ResampleMode::Bilinear] {
+            let style = SingleBandStyle {
+                rescale_min: -1.0,
+                rescale_max: 1.0,
+                colormap: ColormapName::Viridis,
+                format: OutputFormat::RawF32,
+                resample,
+            };
+            let got = render_expr_vm(&plan, &pair, &prog, &style);
+            for py in 0..256 {
+                for px in 0..256 {
+                    let idx = (py * 256 + px) * 4;
+                    let g = f32::from_le_bytes(got[idx..idx + 4].try_into().unwrap());
+                    let v1 = match resample {
+                        ResampleMode::Bilinear => sample_bilinear::<true>(&pair[0], u[px], v[py]),
+                        _ => sample_nearest::<true>(&pair[0], u[px], v[py]),
+                    };
+                    let v2 = match resample {
+                        ResampleMode::Bilinear => sample_bilinear::<true>(&pair[1], u[px], v[py]),
+                        _ => sample_nearest::<true>(&pair[1], u[px], v[py]),
+                    };
+                    let e = (v1 - v2) / (v1 + v2 + 1.0);
+                    assert!(
+                        (g - e).abs() <= 1e-4,
+                        "expr_vm {resample:?} mismatch at ({px},{py}): got {g}, exp {e}"
+                    );
+                }
+            }
+        }
+
+        // 3. Interleaved RgbU8Channel on Separable1D (hoisted Nearest + SIMD Bilinear)
+        let rgb_raw: Arc<[u8]> = (0..n_px * 3).map(|i| ((i * 37 + 11) & 0xFF) as u8).collect();
+        let ch = |c: u8| DecodedBand {
+            data: BandData::RgbU8Channel {
+                rgb: Arc::clone(&rgb_raw),
+                channel: c,
+                nodata: None,
+            },
+            width: tw,
+            height: th,
+            stats,
+        };
+        let (c0, c1, c2) = (ch(0), ch(1), ch(2));
+        let (sc0, sc1, sc2) = ([Some(&c0)], [Some(&c1)], [Some(&c2)]);
+        let rgb_srcs = [
+            BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sc0),
+            BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sc1),
+            BandSource::new(tw, th, tw, th, 0, 0, 1, 1, &sc2),
+        ];
+        for (mins, maxs) in [([0.0; 3], [255.0; 3]), ([10.0, 20.0, 30.0], [220.0, 230.0, 240.0])] {
+            let inv = [
+                255.0 / (maxs[0] - mins[0]),
+                255.0 / (maxs[1] - mins[1]),
+                255.0 / (maxs[2] - mins[2]),
+            ];
+            let np = CleanRgbNearestPlan::build(&plan, &rgb_srcs, inv, mins);
+            let mut row_fast = [0u8; 256 * 3];
+            let mut row_ref = [0u8; 256 * 3];
+            for py in [0usize, 13, 128, 255] {
+                np.sample_row(&plan, py, &rgb_srcs, inv, mins, &mut row_fast);
+                sample_rgb_nearest_row_clean(&plan, py, &rgb_srcs, inv, mins, &mut row_ref);
+                assert_eq!(row_fast, row_ref, "CleanRgbNearestPlan mismatch at py={py}");
+
+                sample_rgb_bilinear_row_clean(&plan, py, &rgb_srcs, inv, mins, &mut row_fast);
+                for px in 0..256 {
+                    for ch_i in 0..3 {
+                        let val = sample_bilinear::<true>(&rgb_srcs[ch_i], u[px], v[py]);
+                        let exp = rescale_u8(val, inv[ch_i], mins[ch_i]);
+                        let diff = (row_fast[px * 3 + ch_i] as i32 - exp as i32).abs();
+                        assert!(
+                            diff <= 1,
+                            "RgbU8 bilinear mismatch at ({px},{py}) ch={ch_i}: got {}, exp {exp}",
+                            row_fast[px * 3 + ch_i]
+                        );
+                    }
+                }
+            }
+        }
     }
 }
