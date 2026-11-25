@@ -118,7 +118,7 @@ pub struct MosaicItem {
 
 /// Whether an href says where it is by itself: a URL, an absolute path, a GDAL `/vsi` path.
 pub(crate) fn href_is_absolute(href: &str) -> bool {
-    href.contains("://") || href.starts_with('/')
+    href.contains("://") || href.starts_with("/vsi")
 }
 
 impl MosaicItem {
@@ -171,8 +171,17 @@ impl MosaicItem {
         if href_is_absolute(href) {
             return Some(href.into());
         }
-        let base = self.self_href.as_deref()?;
+        let Some(base) = self.self_href.as_deref() else {
+            // A path from the root is a file of this machine when the item says no more.
+            return href.starts_with('/').then(|| href.into());
+        };
         let base = base.split(['?', '#']).next().unwrap_or(base);
+        if href.starts_with('/') {
+            // From the root of wherever the item is.
+            let after_scheme = base.find("://")? + 3;
+            let origin = base[after_scheme..].find('/').map_or(base, |at| &base[..after_scheme + at]);
+            return Some(format!("{origin}{href}").into());
+        }
         let folder = &base[..=base.rfind('/')?];
         Some(format!("{folder}{}", href.trim_start_matches("./")).into())
     }
@@ -714,6 +723,8 @@ mod tests {
         assert_eq!(relative.asset_href("visual"), None);
         relative.self_href = Some("https://example.test/c/items/i.json?x=1".into());
         assert_eq!(relative.asset_href("visual").as_deref(), Some("https://example.test/c/items/data/TCI.tif"));
+        relative.assets.insert("visual".into(), serde_json::json!({ "href": "/data/TCI.tif" }));
+        assert_eq!(relative.asset_href("visual").as_deref(), Some("https://example.test/data/TCI.tif"));
         let back = item.to_json();
         assert_eq!(back["collection"], "sentinel-2-l2a");
         assert_eq!(back["assets"]["visual"]["type"], "image/tiff");

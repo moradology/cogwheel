@@ -2847,16 +2847,16 @@ where
                     // `pgstac::item_fixup`, with TiTiler's names: `/stac` must not apply it first.
                     // An expression is over every band read, so the request's `bidx` does
                     // not narrow them first; each asset's own selection still applies.
-                    if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
-                        pq.bidx.clear();
-                    }
-                    match pgstac::item_asset_options(&raw_query) {
+                    match pgstac::item_asset_options(rest, &raw_query) {
                         Err(resp) => return Ok(resp),
-                        Ok(Some(per_asset)) => {
-                            pq.bidx.clear();
+                        Ok(Some((per_asset, own))) => {
+                            pq.bidx = own;
                             pq.asset_bidx = per_asset;
                         }
                         Ok(None) => {}
+                    }
+                    if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
+                        pq.bidx.clear();
                     }
                     stac_prefix = format!("collections/{c}/items/{i}");
                     let mut as_stac = vec!["stac"];

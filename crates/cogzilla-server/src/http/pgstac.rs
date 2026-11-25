@@ -1317,7 +1317,9 @@ fn parse_assets(pairs: &[(String, String)]) -> Result<Vec<AssetSpec>, Resp> {
                     .ok_or_else(|| bad("not enough values to unpack (expected 2, got 1)"))?;
                 match key {
                     "bidx" => {
-                        let indexes: Option<Vec<u16>> = value.split(',').map(|i| i.parse().ok()).collect();
+                        // Bands are counted from one.
+                        let indexes: Option<Vec<u16>> =
+                            value.split(',').map(|i| i.parse().ok().filter(|b| *b > 0)).collect();
                         spec.indexes = Some(indexes.ok_or_else(|| {
                             bad(&format!("invalid literal for int() with base 10: '{value}'"))
                         })?);
@@ -1621,23 +1623,41 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// parser adds every asset's `|bidx=` to one list, which is right for one asset and reads
 /// the wrong bands for several; here each asset keeps its own. Band math on one asset is
 /// not something those handlers do: it is refused, not left out of the picture.
-pub(super) fn item_asset_options(raw_query: &str) -> Result<Option<AssetBidx>, Resp> {
-    let specs = parse_assets(&query_pairs(raw_query))?;
+///
+/// Returns each asset's bands and the request's own `bidx`, or `None` when no asset has
+/// options. Only the info, statistics and point handlers read bands asset by asset; on
+/// the others several assets with bands of their own are refused too.
+pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
+    let pairs = query_pairs(raw_query);
+    let specs = parse_assets(&pairs)?;
     if let Some(spec) = specs.iter().find(|s| s.expression.is_some()) {
         return Err(detail(
             StatusCode::BAD_REQUEST,
             format!("assets={}|expression= is not supported on item routes yet; use `expression`", spec.name),
         ));
     }
-    if specs.len() < 2 || specs.iter().all(|s| s.indexes.is_none()) {
+    if specs.iter().all(|s| s.indexes.is_none()) {
         return Ok(None);
     }
-    Ok(Some(specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect()))
+    let by_asset = matches!(rest, ["info" | "info.geojson" | "statistics" | "asset_statistics"] | ["point", _]);
+    if specs.len() > 1 && !by_asset {
+        return Err(detail(
+            StatusCode::BAD_REQUEST,
+            "`|bidx=` on several assets is not supported on this item route yet",
+        ));
+    }
+    let own: Vec<u16> = pairs
+        .iter()
+        .filter(|(k, _)| k == "bidx")
+        .flat_map(|(_, v)| v.split(','))
+        .filter_map(|b| b.trim().parse().ok())
+        .collect();
+    Ok(Some((specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect(), own)))
 }
 
 /// Whether the shared parser's complaint is about something these routes read for
-/// themselves and answer as titiler-pgstac does, with a 422: `reproject`, which the shared
-/// parser does not know, `asset_as_band`, `histogram_bins` and the options of `assets`.
+/// themselves and answer for: `reproject`, whose methods are checked here, and
+/// `asset_as_band`, `histogram_bins` and the options of `assets`, which get a 422.
 fn own_error(e: &str) -> bool {
     match error_parameter(e) {
         Some("reproject" | "asset_as_band" | "histogram_bins") => true,
@@ -3541,6 +3561,10 @@ async fn point_values(
     if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return detail(StatusCode::BAD_REQUEST, e.clone());
     }
+    // A point is one pixel whatever the method; one that is not a method is still refused.
+    if let Err(resp) = parse_resample(pairs, "reproject") {
+        return resp;
+    }
     let specs = match parse_assets(pairs) {
         Ok(specs) if specs.is_empty() => return missing_query_param("assets"),
         Ok(specs) => specs,
@@ -4433,6 +4457,13 @@ pub(super) async fn item_route(
         {
             item.assets.insert(name.clone(), crate::stac::resolve_href(self_href, href));
         }
+    }
+    // With no `self` link a relative href is relative to nothing: such an asset is not
+    // read from wherever the server happens to run.
+    if self_href.is_empty() {
+        item.assets.retain(|name, _| {
+            doc["assets"][name]["href"].as_str().is_some_and(|h| h.contains("://") || h.starts_with('/'))
+        });
     }
     let item = Arc::new(item);
     let get = *method == Method::GET;
