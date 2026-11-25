@@ -169,6 +169,7 @@ struct ParsedQuery {
     urls: Vec<String>,
     assets: Vec<String>,
     asset_bidx: Vec<(String, Vec<u16>)>,
+    asset_exprs: Vec<(String, String)>,
     asset_as_band: bool,
     bidx: Vec<u16>,
     rescale: Vec<(f32, f32)>,
@@ -235,6 +236,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         urls: Vec::new(),
         assets: Vec::new(),
         asset_bidx: Vec::new(),
+        asset_exprs: Vec::new(),
         asset_as_band: false,
         bidx: Vec::new(),
         rescale: Vec::new(),
@@ -308,9 +310,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             // Do not convert `+` to space in `url=` (S3 keys and Azure SAS tokens often contain literal `+`)
             "url" => pq.urls.push(percent_decode_opts(v, false)),
             "assets" => {
-                let dec = percent_decode(v);
+                // Preserve literal `+` in per-asset expressions (`assets=red|expression=b1+1`).
+                let dec = percent_decode_opts(v, false);
                 if dec.contains('|') {
-                    // TiTiler `assets=name|bidx=1,2,3` or `assets=name|indexes=1,2,3`
+                    // TiTiler `assets=name|bidx=1,2,3`, `assets=name|indexes=1,2,3`, or `assets=name|expression=b1*2`
                     let mut parts = dec.split('|');
                     let asset_name = parts.next().map(str::trim).unwrap_or("");
                     if !asset_name.is_empty() {
@@ -326,6 +329,18 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                                 match tok.trim().parse::<u16>() {
                                     Ok(b) if b >= 1 => parsed.push(b),
                                     _ => bad("expected positive integer band indices in |bidx="),
+                                }
+                            }
+                        } else if let Some(expr_str) = opt.strip_prefix("expression=") {
+                            let expr_str = expr_str.trim();
+                            if !asset_name.is_empty() && !expr_str.is_empty() {
+                                if let Some((_, existing)) =
+                                    pq.asset_exprs.iter_mut().find(|(n, _)| n == asset_name)
+                                {
+                                    *existing = expr_str.to_string();
+                                } else {
+                                    pq.asset_exprs
+                                        .push((asset_name.to_string(), expr_str.to_string()));
                                 }
                             }
                         }
@@ -2236,6 +2251,57 @@ fn resolve_resample(
     if same_crs { pq.resample } else { pq.reproject }
 }
 
+fn effective_bbox_max_size(pq: &ParsedQuery) -> u32 {
+    if pq.keys.iter().any(|k| k == "max_size") {
+        pq.max_size
+    } else {
+        // TiTiler defaults max_size=None on /bbox and /feature (full native resolution, capped at 4096)
+        4096
+    }
+}
+
+fn maybe_upgrade_multiband_default(
+    bands: BandRequest,
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    default_bands: u16,
+) -> BandRequest {
+    if pq.bidx.is_empty()
+        && pq.expr_raw.is_none()
+        && pq.algorithm.is_none()
+        && (default_bands == 2 || (4..=15).contains(&default_bands))
+        && (matches!(fmt, OutputFormat::Npy | OutputFormat::RawF32)
+            || (ct == GEOTIFF_CONTENT_TYPE
+                && pq.rescale.is_empty()
+                && !pq.colormap_explicit
+                && pq.custom_colormap_json.is_none()
+                && pq.color_formula.is_none()))
+    {
+        return BandRequest::MultiBand {
+            bands_1based: (1..=default_bands).collect(),
+        };
+    }
+    bands
+}
+
+fn build_band_request_for_output(
+    pq: &ParsedQuery,
+    default_bands: u16,
+    sample_type: cogzilla_tiff::SampleType,
+    fmt: OutputFormat,
+    ct: &str,
+) -> Result<BandRequest, EngineError> {
+    let bands = build_band_request(pq, default_bands, sample_type)?;
+    Ok(maybe_upgrade_multiband_default(
+        bands,
+        fmt,
+        ct,
+        pq,
+        default_bands,
+    ))
+}
+
 fn build_tile_request(
     engine: Option<&TileEngine>,
     tile: TileCoord,
@@ -2304,7 +2370,7 @@ fn build_tile_request_for_tms(
     }
     let eff_ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
-    let bands = build_band_request(pq, default_bands, sample_type)?;
+    let bands = build_band_request_for_output(pq, default_bands, sample_type, format, content_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
     if matches!(bands, BandRequest::MultiBand { .. })
         && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -3183,11 +3249,40 @@ async fn render_mosaic_tile_styled(
     }
 }
 
+fn stac_asset_expr<'a>(pq: &'a ParsedQuery, asset_name: &str) -> Option<&'a str> {
+    pq.asset_exprs
+        .iter()
+        .find(|(n, _)| n == asset_name)
+        .map(|(_, e)| e.as_str())
+}
+
 fn expand_stac_asset_bidx(
     pq: &mut ParsedQuery,
     names: &[String],
     cogs: Vec<Arc<cogzilla_io::OpenedCog>>,
 ) -> Result<(Vec<Arc<cogzilla_io::OpenedCog>>, Option<Vec<u16>>), EngineError> {
+    if pq.expr_raw.is_none() && !pq.asset_exprs.is_empty() {
+        if names.len() == 1 {
+            if let Some(expr) = stac_asset_expr(pq, &names[0]) {
+                pq.expr_raw = Some(expr.to_string());
+            }
+        } else if names.len() == 3
+            && names.iter().any(|n| stac_asset_expr(pq, n).is_some())
+        {
+            let parts: Vec<String> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let slot = format!("b{}", i + 1);
+                    match stac_asset_expr(pq, n) {
+                        Some(expr) => expr.replace("b1", &slot),
+                        None => slot,
+                    }
+                })
+                .collect();
+            pq.expr_raw = Some(parts.join(";"));
+        }
+    }
     if pq.bidx.is_empty() && names.len() == 1 {
         if let Some((_, bands)) = pq.asset_bidx.iter().find(|(n, _)| n == &names[0]) {
             pq.bidx = bands.clone();
@@ -3365,7 +3460,8 @@ async fn render_mosaic_bbox_composite(
         };
         let cogs = [cog];
         let full = cogs[0].index.full_res();
-        let mut bands = build_band_request(pq, full.samples_per_pixel, full.sample_type)?;
+        let mut bands =
+            build_band_request_for_output(pq, full.samples_per_pixel, full.sample_type, fmt, ct)?;
         let scene_fmt = *eff_fmt.get_or_insert_with(|| {
             geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, full.sample_type)
         });
@@ -3521,15 +3617,22 @@ async fn render_mosaic_bbox_composite(
     let final_fmt = eff_fmt.unwrap_or(fmt);
     if matches!(final_fmt, OutputFormat::RawF32 | OutputFormat::Npy) {
         let (nb, acc) = acc_f32.unwrap_or_else(|| (1, vec![f32::NAN; total_px]));
-        let mut out = bytes::BytesMut::with_capacity(128 + acc.len() * 4);
-        if matches!(final_fmt, OutputFormat::Npy) {
-            out.extend_from_slice(&cogzilla_kernel::encode_npy_f32_header(nb, out_h, out_w));
-        }
+        let mut raw_buf = bytes::BytesMut::with_capacity(acc.len() * 4);
         for v in acc {
-            out.extend_from_slice(&v.to_le_bytes());
+            raw_buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let raw = raw_buf.freeze();
+        if matches!(final_fmt, OutputFormat::Npy) {
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                raw,
+                nb,
+                out_h,
+                out_w,
+                pq.return_mask,
+            ));
         }
         return Ok(wrap_geotiff_fmt(
-            out.freeze(),
+            raw,
             ct,
             final_fmt,
             out_w,
@@ -5711,7 +5814,10 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let mut opts_c = stats_opts.clone();
-                    if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
+                    if let Some(expr_str) = stac_asset_expr(&pq, &names[idx]) {
+                        let prog = ExprProgram::compile(expr_str).map_err(EngineError::BadRequest)?;
+                        opts_c.expressions = Some(vec![(expr_str.to_string(), prog)]);
+                    } else if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
                         opts_c.bidx = Some(sel.to_vec());
                     }
                     set.spawn(async move {
@@ -5913,7 +6019,10 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let mut opts_c = stats_opts.clone();
-                    if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
+                    if let Some(expr_str) = stac_asset_expr(&pq, &names[idx]) {
+                        let prog = ExprProgram::compile(expr_str).map_err(EngineError::BadRequest)?;
+                        opts_c.expressions = Some(vec![(expr_str.to_string(), prog)]);
+                    } else if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
                         opts_c.bidx = Some(sel.to_vec());
                     }
                     set.spawn(async move {
@@ -6287,7 +6396,8 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let ext = pq_stac.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let mut bands = build_band_request(&pq_stac, db, full.sample_type)?;
+                let mut bands =
+                    build_band_request_for_output(&pq_stac, db, full.sample_type, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, full.sample_type);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -6624,6 +6734,39 @@ where
                 for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         if !single_asset_expr
+                            && let Some(expr_str) = stac_asset_expr(&pq, &name)
+                        {
+                            let parts: Vec<&str> = expr_str
+                                .split(';')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            for expr in parts {
+                                let prog =
+                                    ExprProgram::compile(expr).map_err(EngineError::BadRequest)?;
+                                let mut slot_vals = Vec::with_capacity(prog.used_bands.len());
+                                for &b in &prog.used_bands {
+                                    if b == 0 || (b as usize) > vs.len() {
+                                        return Err(EngineError::BadRequest(format!(
+                                            "expression references b{b} out of range for asset '{name}' (dataset has {} bands)",
+                                            vs.len()
+                                        )));
+                                    }
+                                    let f = vs[(b - 1) as usize]
+                                        .as_f64()
+                                        .map(|x| x as f32)
+                                        .unwrap_or(f32::NAN);
+                                    slot_vals.push(f);
+                                }
+                                let res = prog.eval(&slot_vals);
+                                all_vals.push(if res.is_finite() {
+                                    serde_json::json!(res)
+                                } else {
+                                    serde_json::Value::Null
+                                });
+                                all_names.push(format!("{name}_{expr}"));
+                            }
+                        } else if !single_asset_expr
                             && let Some(sel) = stac_asset_selected_bands(&pq, &name)
                         {
                             used_asset_bidx = true;
@@ -6663,10 +6806,12 @@ where
                         }
                     }
                 }
+                let band_names: Vec<String> =
+                    (1..=all_vals.len()).map(|i| format!("b{i}")).collect();
                 let mut pt_json = serde_json::json!({
                     "coordinates": [x, y],
                     "values": all_vals,
-                    "band_names": all_names,
+                    "band_names": band_names,
                     "band_descriptions": all_names,
                 });
                 let point_bidx: &[u16] = if used_asset_bidx && rewritten_expr.is_none() {
@@ -6696,7 +6841,7 @@ where
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq_stac, db, st)?;
+                let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
@@ -6782,7 +6927,7 @@ where
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq_stac, db, st)?;
+                let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -6861,7 +7006,7 @@ where
                     pq_stac.jpeg_quality,
                 )?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq_stac, db, st)?;
+                let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
@@ -6878,13 +7023,14 @@ where
                     .transpose()
                     .map_err(EngineError::BadRequest)?;
                 let wgs_bbox_src = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
+                let bbox_max = effective_bbox_max_size(&pq_stac);
                 let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
                     let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
                         bbox
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, &dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, pq_stac.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_stac_bbox_opt(
@@ -6899,7 +7045,7 @@ where
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, pq_stac.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_stac_bbox_opt(
@@ -6909,7 +7055,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else if pq_stac.coord_crs_3857 {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, bbox, pq_stac.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 3857);
                     let d = render_stac_bbox_opt(
@@ -6919,7 +7065,7 @@ where
                     .await?;
                     (d, bbox, out_w, out_h, 3857u16)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, wgs_bbox_src, pq_stac.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, wgs_bbox_src, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                     let d = render_stac_bbox_opt(
@@ -6951,7 +7097,7 @@ where
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq_stac, db, st)?;
+                let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -7034,7 +7180,7 @@ where
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq_stac, db, st)?;
+                let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -7076,7 +7222,7 @@ where
             async {
                 let ext_opt = feat_ext.strip_prefix("feature.");
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
-                let s = pq.max_size;
+                let s = effective_bbox_max_size(&pq);
                 let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -7091,7 +7237,7 @@ where
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq_stac, db, st)?;
+                let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
@@ -7680,7 +7826,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let ext = pq.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request(&pq, db, full.sample_type)?;
+                let mut bands = build_band_request_for_output(&pq, db, full.sample_type, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, full.sample_type);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -7774,7 +7920,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq, db, st)?;
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
@@ -7850,7 +7996,7 @@ where
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq, db, st)?;
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -7920,7 +8066,7 @@ where
                     pq.jpeg_quality,
                 )?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq, db, st)?;
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
@@ -7932,13 +8078,14 @@ where
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let wgs_bbox_src = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                let bbox_max = effective_bbox_max_size(&pq);
                 let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
                     let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
                         bbox
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, &dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
@@ -7953,7 +8100,7 @@ where
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
@@ -7963,7 +8110,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else if pq.coord_crs_3857 {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, bbox, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 3857);
                     let d = render_mercator_bbox(
@@ -7973,7 +8120,7 @@ where
                     .await?;
                     (d, bbox, out_w, out_h, 3857u16)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, wgs_bbox_src, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, wgs_bbox_src, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                     let d = render_wgs84_bbox(
@@ -8001,7 +8148,7 @@ where
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq, db, st)?;
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -8076,7 +8223,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq, db, st)?;
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
@@ -8091,9 +8238,10 @@ where
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq.shape_mask.then_some(&mask);
+                let feat_max = effective_bbox_max_size(&pq);
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = eff_dst {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, feat_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, mask_opt, &bands, resample, fmt,
@@ -8102,7 +8250,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, bbox, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, bbox, feat_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
@@ -8130,7 +8278,7 @@ where
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
-                let mut bands = build_band_request(&pq, db, st)?;
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
