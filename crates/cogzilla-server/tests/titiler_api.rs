@@ -568,6 +568,19 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             .unwrap();
         assert_eq!(&stac_tile[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
+        // /stac/tiles with per-asset asset_bidx=red|1&asset_bidx=green|1&asset_bidx=blue|1 must match assets=red,green,blue
+        let stac_ab_tile = client
+            .get(format!(
+                "{base}/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_url}&asset_bidx=red|1&asset_bidx=green|1&asset_bidx=blue|1&rescale=7000,20000"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(stac_ab_tile, stac_tile, "per-asset asset_bidx should render identical 3-asset RGB");
+
         // /stac/tiles/... with asset-named expression
         let stac_expr_tile = client
             .get(format!(
@@ -864,6 +877,24 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(mj_tile.status(), 200);
             let bytes = mj_tile.bytes().await.unwrap();
             assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+            // /mosaicjson/info.geojson, /mosaicjson/assets, /mosaicjson/point, /mosaicjson/bbox, /mosaicjson/statistics
+            let mj_geo = get_json(&client, format!("{base}/mosaicjson/info.geojson?url={mj_url}")).await;
+            assert_eq!(mj_geo["type"], "Feature");
+            let mj_assets = get_json(&client, format!("{base}/mosaicjson/assets?url={mj_url}")).await;
+            assert_eq!(mj_assets.as_array().unwrap().len(), 2);
+            let mj_pt = get_json(&client, format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}")).await;
+            assert!(!mj_pt["assets"].as_array().unwrap().is_empty());
+            let mj_stats = get_json(&client, format!("{base}/mosaicjson/statistics?url={mj_url}&max_size=128")).await;
+            assert!(mj_stats["b1"]["mean"].is_number());
+            let mj_bbox = client
+                .get(format!("{base}/mosaicjson/bbox/-122.5,37.7,-122.3,37.8/64x64.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_bbox.status(), 200);
+            let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
+            assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
