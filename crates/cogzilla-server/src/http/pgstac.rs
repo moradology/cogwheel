@@ -2390,7 +2390,10 @@ async fn part_image(
             first.push(engine.store.open_uri(href).await?);
         }
         // A raster with an alpha band is the renderer's too: it reads the alpha as the mask.
-        let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty());
+        // So is one of two bands, or four and more, asked for plainly: it draws the first,
+        // or the first three, where planes would stack them all and TiTiler refuse most.
+        let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty())
+            || (first.len() == 1 && !matches!(first[0].index.full_res().samples_per_pixel, 1 | 3));
         if planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
             if pq.algorithm.is_some() {
                 return Err(EngineError::BadRequest(
@@ -2815,7 +2818,12 @@ async fn warp_nearest(
         let lat = bounds[3] - (grid_row as f64 + 0.5) * dy;
         let exact = |i: usize| {
             let across = bounds[0] + (i as f64 + 0.5) * dx;
-            // The grid is in degrees, or in Web Mercator metres for a map tile.
+            // The grid is in degrees, or in Web Mercator metres for a map tile. A raster
+            // in Web Mercator is then on the grid's own terms: going through degrees and
+            // back would leave noise where pixel centres fall on source pixel edges.
+            if mercator && matches!(crs, CrsModel::Epsg3857) {
+                return ifd.crs_to_pixel.forward(across, lat);
+            }
             let (lon, lat) = if mercator { mercator_to_lonlat_deg(across, lat) } else { (across, lat) };
             let (x, y) = crs.from_lonlat_deg(lon, lat);
             ifd.crs_to_pixel.forward(x, y)
@@ -3659,10 +3667,13 @@ async fn tile(
             // raw arrays, and tile sizes it alone takes.
             let dim = scale.map_or(pq.tile_size, |s| s.saturating_mul(256));
             let raw = matches!(explicit.as_str(), "npy" | "bin" | "raw" | "f32");
+            // And a raster of two bands, or four and more: the renderer draws the first, or
+            // the first three, where planes would stack them all and TiTiler refuse most.
             let preferred = planes_preferred
                 && !raw
                 && matches!(dim, 256 | 512)
-                && full.extra_samples.is_empty();
+                && full.extra_samples.is_empty()
+                && (scenes[0].len() > 1 || matches!(full.samples_per_pixel, 1 | 3));
             if planes_wanted || !one_grid || preferred {
                 if dim != 256 && dim != 512 {
                     return Err(EngineError::BadRequest(format!(
