@@ -167,6 +167,10 @@ struct ParsedQuery {
     altitude: f32,
     z_factor: f32,
     threshold: f32,
+    contour_increment: f32,
+    contour_thickness: u32,
+    contour_minz: f32,
+    contour_maxz: f32,
     cast_dtype: Option<String>,
     colormap_explicit: bool,
     colormap_name_set: bool,
@@ -221,6 +225,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         altitude: 45.0,
         z_factor: 1.0,
         threshold: 128.0,
+        contour_increment: 35.0,
+        contour_thickness: 1,
+        contour_minz: -12000.0,
+        contour_maxz: 8000.0,
         cast_dtype: None,
         colormap_explicit: false,
         colormap_name_set: false,
@@ -331,6 +339,30 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             match val.as_str() {
                                 Some(dt) => pq.cast_dtype = Some(dt.to_ascii_lowercase()),
                                 None => bad("dtype must be a string"),
+                            }
+                        }
+                        if let Some(val) = obj.get("increment") {
+                            match val.as_f64().map(|x| x as f32) {
+                                Some(x) if x.is_finite() && x > 0.0 => pq.contour_increment = x,
+                                _ => bad("increment must be a positive finite number"),
+                            }
+                        }
+                        if let Some(val) = obj.get("thickness") {
+                            match val.as_u64() {
+                                Some(t) if (1..=16).contains(&t) => pq.contour_thickness = t as u32,
+                                _ => bad("thickness must be an integer in 1..=16"),
+                            }
+                        }
+                        if let Some(val) = obj.get("minz") {
+                            match val.as_f64().map(|x| x as f32) {
+                                Some(x) if x.is_finite() => pq.contour_minz = x,
+                                _ => bad("minz must be a finite number"),
+                            }
+                        }
+                        if let Some(val) = obj.get("maxz") {
+                            match val.as_f64().map(|x| x as f32) {
+                                Some(x) if x.is_finite() => pq.contour_maxz = x,
+                                _ => bad("maxz must be a finite number"),
                             }
                         }
                     }
@@ -461,26 +493,22 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "resample" | "resampling" => {
-                pq.resample = match v {
-                    "nearest" => ResampleMode::Nearest,
-                    "cubic" | "cubicspline" | "cubic_spline" | "lanczos" => ResampleMode::Cubic,
-                    "bilinear" => ResampleMode::Bilinear,
-                    _ => {
-                        bad("use nearest, bilinear or cubic");
-                        ResampleMode::Nearest
+                match parse_resample_mode(v) {
+                    Some(m) => pq.resample = m,
+                    None => {
+                        bad("unsupported resampling method");
+                        pq.resample = ResampleMode::Nearest;
                     }
-                };
+                }
             }
             "reproject" => {
-                pq.reproject = match v {
-                    "nearest" => ResampleMode::Nearest,
-                    "cubic" | "cubicspline" | "cubic_spline" | "lanczos" => ResampleMode::Cubic,
-                    "bilinear" => ResampleMode::Bilinear,
-                    _ => {
-                        bad("use nearest, bilinear or cubic");
-                        ResampleMode::Nearest
+                match parse_resample_mode(v) {
+                    Some(m) => pq.reproject = m,
+                    None => {
+                        bad("unsupported reproject method");
+                        pq.reproject = ResampleMode::Nearest;
                     }
-                };
+                }
             }
             "tile_size" | "tilesize" | "size" => {
                 match v.parse::<u32>() {
@@ -675,7 +703,29 @@ const SUPPORTED_ALGORITHMS: &[&str] = &[
     "sum",
     "grayscale",
     "bitonal",
+    "contours",
 ];
+
+fn parse_resample_mode(raw: &str) -> Option<ResampleMode> {
+    match raw {
+        "nearest" => Some(ResampleMode::Nearest),
+        "bilinear" => Some(ResampleMode::Bilinear),
+        "cubic" => Some(ResampleMode::Cubic),
+        "cubic_spline" | "cubicspline" => Some(ResampleMode::CubicSpline),
+        "lanczos" => Some(ResampleMode::Lanczos),
+        "average" => Some(ResampleMode::Average),
+        "mode" => Some(ResampleMode::Mode),
+        "gauss" => Some(ResampleMode::Gauss),
+        "rms" => Some(ResampleMode::Rms),
+        "min" => Some(ResampleMode::Min),
+        "max" => Some(ResampleMode::Max),
+        "med" => Some(ResampleMode::Med),
+        "q1" => Some(ResampleMode::Q1),
+        "q3" => Some(ResampleMode::Q3),
+        "sum" => Some(ResampleMode::Sum),
+        _ => None,
+    }
+}
 
 /// Reject requests that ask for something this server would otherwise ignore.
 ///
@@ -1275,6 +1325,25 @@ fn build_band_request(
                     algorithm: DemAlgorithm::Aspect,
                     rescale,
                     colormap: pq.colormap,
+                });
+            }
+            "contours" => {
+                let rescale = pq.rescale.first().copied().unwrap_or((0.0, 255.0));
+                let colormap = if pq.colormap_explicit {
+                    pq.colormap
+                } else {
+                    ColormapName::from_str_opt("gray").unwrap_or(ColormapName::Viridis)
+                };
+                return Ok(BandRequest::Dem {
+                    band_1based,
+                    algorithm: DemAlgorithm::Contours {
+                        increment: pq.contour_increment,
+                        thickness: pq.contour_thickness,
+                        minz: pq.contour_minz,
+                        maxz: pq.contour_maxz,
+                    },
+                    rescale,
+                    colormap,
                 });
             }
             "normalizedindex" | "cast" | "ceil" | "floor" | "min" | "max" | "median" | "mean"
@@ -5159,8 +5228,9 @@ mod tests {
         // AlgorithmFactory JSON responses (/algorithms and /algorithms/{id})
         let algs = list_algorithms_json("http://localhost:8080");
         let list = algs["algorithms"].as_array().unwrap();
-        assert_eq!(list.len(), 18);
+        assert_eq!(list.len(), 19);
         assert_eq!(list[0]["id"], "hillshade");
+        assert_eq!(get_algorithm_json("contours").unwrap()["title"], "Contours");
         assert_eq!(
             list[0]["links"][0]["href"],
             "http://localhost:8080/algorithms/hillshade"

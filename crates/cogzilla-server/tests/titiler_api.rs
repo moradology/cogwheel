@@ -50,10 +50,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     // 0b. Options this server does not implement are rejected, not ignored.
     let tile = format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.png?url={sat_url}");
     for (what, url) in [
-        ("unknown algorithm", format!("{tile}&algorithm=contours")),
-        ("unsupported resampling", format!("{tile}&resampling=average")),
+        ("unknown algorithm", format!("{tile}&algorithm=does_not_exist")),
+        ("unsupported resampling", format!("{tile}&resampling=bogus")),
         ("excessive padding", format!("{tile}&padding=999")),
-        ("unsupported reproject", format!("{tile}&reproject=average")),
+        ("unsupported reproject", format!("{tile}&reproject=bogus")),
         ("bad rescale", format!("{tile}&rescale=abc")),
         ("unknown colormap", format!("{tile}&bidx=1&colormap_name=nope")),
         ("bad tilesize", format!("{tile}&tilesize=7")),
@@ -77,6 +77,18 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     for (what, url) in [
         ("tilesize alias", format!("{tile}&tilesize=512&rescale=0,1")),
         ("cubic_spline", format!("{tile}&resampling=cubic_spline&rescale=0,1")),
+        ("lanczos", format!("{tile}&resampling=lanczos&rescale=0,1")),
+        ("average", format!("{tile}&resampling=average&rescale=0,1")),
+        ("mode", format!("{tile}&resampling=mode&rescale=0,1")),
+        ("gauss", format!("{tile}&resampling=gauss&rescale=0,1")),
+        ("rms", format!("{tile}&resampling=rms&rescale=0,1")),
+        ("med", format!("{tile}&resampling=med&rescale=0,1")),
+        ("q1", format!("{tile}&resampling=q1&rescale=0,1")),
+        ("q3", format!("{tile}&resampling=q3&rescale=0,1")),
+        ("sum", format!("{tile}&resampling=sum&rescale=0,1")),
+        ("reproject=average", format!("{tile}&reproject=average&rescale=0,1")),
+        ("algorithm contours", format!("{tile}&bidx=1&algorithm=contours&algorithm_params=%7B%22increment%22:0.1,%22thickness%22:2%7D")),
+        ("algorithm contours meta", format!("{base}/algorithms/contours")),
         ("reproject=bilinear", format!("{tile}&reproject=bilinear&rescale=0,1")),
         ("padding=0", format!("{tile}&padding=0&rescale=0,1")),
         ("padding=4", format!("{tile}&padding=4&rescale=0,1")),

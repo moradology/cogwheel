@@ -33,7 +33,7 @@ Mt. Rainier from the public Copernicus 30 m DEM on S3, six ways from one file: c
 One command, no data to download and no account:
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.5.46
+docker run --rm -p 8080:8080 ghcr.io/moradology/cogzilla:0.5.47
 ```
 
 Then open <http://localhost:8080>.
