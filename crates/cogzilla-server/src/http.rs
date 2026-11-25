@@ -1065,10 +1065,17 @@ fn reproject_wgs84_bounds(
     }
     let [w, mut s, e, mut n] = wgs84;
     // TransverseMercator::forward_raw rejects |lat| > 1.56 rad (~89.38°); clamp polar edges
-    // to [-89°, 89°] so global COGs don't drop the 67.5°..89.3° band above the interior lattice.
+    // to [-89.35°, 89.35°] so global COGs don't drop the 67.5°..89.3° band, while rejecting
+    // bboxes wholly outside the TM domain (s >= n after clamping).
     if matches!(dst, cogzilla_proj::CrsModel::TransverseMercator(_)) {
-        s = s.clamp(-89.0, 89.0);
-        n = n.clamp(-89.0, 89.0);
+        const MAX_TM_LAT: f64 = 89.35;
+        s = s.clamp(-MAX_TM_LAT, MAX_TM_LAT);
+        n = n.clamp(-MAX_TM_LAT, MAX_TM_LAT);
+        if s >= n {
+            return Err(EngineError::BadRequest(
+                "bounds could not be projected to target CRS".into(),
+            ));
+        }
     }
     let antimeridian = e < w;
     let crosses_180 = antimeridian || e > 180.0;
@@ -1234,7 +1241,13 @@ fn bbox_to_wgs84(
         let (lo, la) = crs.to_lonlat_deg(x, y);
         if lo.is_finite() && la.is_finite() {
             let r = *ref_lon.get_or_insert(lo);
-            let unwrapped = r + ((lo - r + 180.0).rem_euclid(360.0) - 180.0);
+            let mut delta = lo - r;
+            if delta > 180.0 {
+                delta -= 360.0;
+            } else if delta < -180.0 {
+                delta += 360.0;
+            }
+            let unwrapped = r + delta;
             min_lon = min_lon.min(unwrapped);
             max_lon = max_lon.max(unwrapped);
             min_lat = min_lat.min(la);
@@ -1244,6 +1257,33 @@ fn bbox_to_wgs84(
     if min_lon < -180.0 {
         min_lon += 360.0;
         max_lon += 360.0;
+    }
+    // Polar-centered projected bboxes (e.g. EPSG:3413 / EPSG:3031) contain a pole in their interior:
+    // if either pole projects inside [x0..=x1, y0..=y1], span full [-180, 180] and extend to ±90°.
+    if !matches!(
+        crs,
+        cogzilla_proj::CrsModel::Geographic | cogzilla_proj::CrsModel::Epsg3857
+    ) {
+        let (bx0, bx1) = (x0.min(x1), x0.max(x1));
+        let (by0, by1) = (y0.min(y1), y0.max(y1));
+        for pole_lat in [90.0_f64, -90.0_f64] {
+            let (px, py) = crs.from_lonlat_deg(0.0, pole_lat);
+            if px.is_finite()
+                && py.is_finite()
+                && px >= bx0
+                && px <= bx1
+                && py >= by0
+                && py <= by1
+            {
+                min_lon = -180.0;
+                max_lon = 180.0;
+                if pole_lat > 0.0 {
+                    max_lat = 90.0;
+                } else {
+                    min_lat = -90.0;
+                }
+            }
+        }
     }
     if !min_lon.is_finite() || min_lon >= max_lon || min_lat >= max_lat {
         return Err(EngineError::BadRequest(
@@ -7070,5 +7110,23 @@ mod tests {
             None,
         )
         .is_err());
+
+        // 16. bbox_to_wgs84 preserves full [-180, 180] on global EPSG:3857 and polar EPSG:3413,
+        // and reproject_wgs84_bounds rejects polar-cap bboxes wholly outside TM's ±89.35° domain
+        let m = 20_037_508.342_789_244;
+        let glob_3857 =
+            bbox_to_wgs84([-m, -m, m, m], Some(&cogzilla_proj::CrsModel::Epsg3857)).unwrap();
+        assert!(
+            (glob_3857[0] + 180.0).abs() < 1e-6 && (glob_3857[2] - 180.0).abs() < 1e-6,
+            "global EPSG:3857 bbox must span [-180, 180], got {glob_3857:?}"
+        );
+        let ps_north = cogzilla_proj::CrsModel::from_epsg(3413).unwrap();
+        let polar_wgs =
+            bbox_to_wgs84([-2_000_000.0, -2_000_000.0, 2_000_000.0, 2_000_000.0], Some(&ps_north))
+                .unwrap();
+        assert_eq!(polar_wgs[0], -180.0);
+        assert_eq!(polar_wgs[2], 180.0);
+        assert_eq!(polar_wgs[3], 90.0);
+        assert!(reproject_wgs84_bounds([0.0, 89.5, 10.0, 90.0], &utm31).is_err());
     }
 }
