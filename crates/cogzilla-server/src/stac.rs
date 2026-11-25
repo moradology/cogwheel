@@ -46,6 +46,78 @@ fn is_raster_asset(key: &str, asset: &serde_json::Value) -> bool {
         || (!key.contains("thumbnail") && !key.contains("metadata") && lower_href.contains(".tif"))
 }
 
+/// Split a remote URI (including GDAL `/vsicurl/`, `/vsis3/`, `/vsigs/`, `/vsiaz/`)
+/// into `(origin_prefix, path_part)` with query/fragment stripped from `item_uri`.
+/// Returns `None` for local filesystem paths.
+fn split_remote_origin_and_path(item_uri: &str) -> Option<(&str, &str)> {
+    let path_only = item_uri.split(['?', '#']).next().unwrap_or(item_uri);
+    if let Some(rest) = path_only.strip_prefix("/vsicurl/") {
+        let scheme_end = rest.find("://")?;
+        let after_scheme = "/vsicurl/".len() + scheme_end + 3;
+        let origin_end = path_only[after_scheme..]
+            .find('/')
+            .map(|p| after_scheme + p)
+            .unwrap_or(path_only.len());
+        return Some((&path_only[..origin_end], &path_only[origin_end..]));
+    }
+    for vsi in ["/vsis3/", "/vsigs/", "/vsiaz/"] {
+        if let Some(rest) = path_only.strip_prefix(vsi) {
+            let bucket_end = vsi.len() + rest.find('/').unwrap_or(rest.len());
+            return Some((&path_only[..bucket_end], &path_only[bucket_end..]));
+        }
+    }
+    if path_only.starts_with("http://")
+        || path_only.starts_with("https://")
+        || path_only.starts_with("s3://")
+        || path_only.starts_with("gs://")
+        || path_only.starts_with("az://")
+        || path_only.starts_with("abfs://")
+        || path_only.starts_with("abfss://")
+    {
+        let scheme_end = path_only.find("://")?;
+        let after_scheme = scheme_end + 3;
+        let origin_end = path_only[after_scheme..]
+            .find('/')
+            .map(|p| after_scheme + p)
+            .unwrap_or(path_only.len());
+        return Some((&path_only[..origin_end], &path_only[origin_end..]));
+    }
+    None
+}
+
+/// Normalize `.` and `..` segments in a remote URI path, clamped at the origin/bucket root,
+/// while preserving any `?query` or `#fragment` suffix on `href`.
+fn normalize_remote_path(base_dir: &str, href: &str) -> String {
+    let (href_path, suffix) = match href.find(['?', '#']) {
+        Some(idx) => (&href[..idx], &href[idx..]),
+        None => (href, ""),
+    };
+    let mut segs: Vec<&str> = Vec::new();
+    let iter = if href_path.starts_with('/') {
+        itertools_none_or_chain("", href_path)
+    } else {
+        itertools_none_or_chain(base_dir, href_path)
+    };
+    for seg in iter {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    if segs.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("/{}{suffix}", segs.join("/"))
+    }
+}
+
+fn itertools_none_or_chain<'a>(a: &'a str, b: &'a str) -> impl Iterator<Item = &'a str> {
+    a.split('/').chain(b.split('/'))
+}
+
 fn resolve_href(item_uri: &str, href: &str) -> String {
     if href.starts_with("http://")
         || href.starts_with("https://")
@@ -62,31 +134,13 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
     {
         return href.to_string();
     }
-    let is_remote_item = item_uri.starts_with("http://")
-        || item_uri.starts_with("https://")
-        || item_uri.starts_with("s3://")
-        || item_uri.starts_with("gs://")
-        || item_uri.starts_with("az://")
-        || item_uri.starts_with("abfs://")
-        || item_uri.starts_with("abfss://");
-    if is_remote_item {
-        let path_only = item_uri.split(['?', '#']).next().unwrap_or(item_uri);
-        if href.starts_with('/') {
-            // Root-relative href against remote scheme://authority origin
-            if let Some(scheme_end) = path_only.find("://") {
-                let after_scheme = scheme_end + 3;
-                let origin_end = path_only[after_scheme..]
-                    .find('/')
-                    .map(|p| after_scheme + p)
-                    .unwrap_or(path_only.len());
-                return format!("{}{}", &path_only[..origin_end], href);
-            }
-        }
-        let base = match path_only.rfind('/') {
-            Some(idx) => &path_only[..=idx],
-            None => path_only,
+    if let Some((origin, item_path)) = split_remote_origin_and_path(item_uri) {
+        let base_dir = match item_path.rfind('/') {
+            Some(idx) => &item_path[..=idx],
+            None => "/",
         };
-        format!("{base}{}", href.trim_start_matches("./"))
+        let norm = normalize_remote_path(base_dir, href);
+        format!("{origin}{norm}")
     } else if href.starts_with('/') {
         href.to_string()
     } else {
@@ -566,7 +620,8 @@ mod tests {
             "(b3-b1)/(b3+b1)"
         );
 
-        // resolve_href must ignore slashes inside signed query strings and resolve root-relative hrefs
+        // resolve_href must ignore slashes inside signed query strings, handle /vsi* prefixes
+        // without escaping to local disk, and normalize `..` segments clamped at origin/bucket root
         assert_eq!(
             resolve_href(
                 "https://host.example/items/scene.json?sig=a/b/c",
@@ -577,6 +632,36 @@ mod tests {
         assert_eq!(
             resolve_href("https://host.example/stac/items/scene.json", "/data/B10.tif"),
             "https://host.example/data/B10.tif"
+        );
+        assert_eq!(
+            resolve_href("s3://bucket/stac/items/scene.json", "../cogs/B04.tif"),
+            "s3://bucket/stac/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href("s3://bucket/stac/scene.json", "../../../../cogs/B04.tif"),
+            "s3://bucket/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href(
+                "/vsicurl/https://host.example/stac/item.json?sig=a/b",
+                "/etc/passwd"
+            ),
+            "/vsicurl/https://host.example/etc/passwd"
+        );
+        assert_eq!(
+            resolve_href(
+                "/vsicurl/https://host.example/stac/items/item.json?sig=a/b",
+                "../cogs/B04.tif"
+            ),
+            "/vsicurl/https://host.example/stac/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href("/vsis3/mybucket/stac/items/item.json", "/etc/passwd"),
+            "/vsis3/mybucket/etc/passwd"
+        );
+        assert_eq!(
+            resolve_href("/vsis3/mybucket/stac/items/item.json", "../cogs/B04.tif"),
+            "/vsis3/mybucket/stac/cogs/B04.tif"
         );
     }
 }
