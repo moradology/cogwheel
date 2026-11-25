@@ -3970,8 +3970,7 @@ where
 
             // GET /stac/bounds?url=item.json
             (Method::GET, ["bounds"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let bounds = if let Some(b) = item.bbox {
                     b
                 } else {
@@ -4325,8 +4324,7 @@ where
             }
             // GET /stac/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4368,8 +4366,7 @@ where
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                    let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                    let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                    let item = stac_source.load(&engine).await?;
                     let (_, cogs, _) =
                         resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref())
                             .await?;
@@ -4902,7 +4899,6 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -4957,7 +4953,6 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
-                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;

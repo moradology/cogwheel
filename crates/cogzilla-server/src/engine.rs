@@ -2019,8 +2019,8 @@ impl TileEngine {
 
         // 1-scene fast path: skip canvas allocation, pixel compositing, and re-encoding so single-scene
         // mosaic tiles keep zero-decode JPEG/WebP passthrough and 8-bit indexed PLTE PNG encoding!
-        if urls.len() == 1 {
-            let cog = self.store.open_uri(&urls[0]).await?;
+        if scenes.len() == 1 && scenes[0].len() == 1 {
+            let cog = self.store.open_uri(&scenes[0][0]).await?;
             let scene_req = fold_scene_unscale(&cog, req);
             return self.render_tile(&cog, &scene_req).await;
         }

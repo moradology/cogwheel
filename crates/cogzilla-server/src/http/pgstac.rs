@@ -1471,7 +1471,7 @@ impl Paint {
             | BandRequest::Dem { rescale, colormap, .. } => Self::Gray { min: rescale.0, max: rescale.1, colormap: *colormap },
             BandRequest::Rgb { rescale_min, rescale_max, .. }
             | BandRequest::SarRgb { rescale_min, rescale_max, .. } => Self::Rgb { min: *rescale_min, max: *rescale_max },
-            BandRequest::Terrain { .. } => return None,
+            BandRequest::Terrain { .. } | BandRequest::CustomExprRgb { .. } => return None,
         })
     }
 
@@ -1568,7 +1568,7 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
     }
     // The mosaic engine renders whole tiles at the two native sizes without these.
-    if pq.buffer > 0 {
+    if pq.buffer > 0.0 {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'buffer' is not supported on mosaic routes yet"));
     }
     if pq.nodata.is_some() {
@@ -3622,9 +3622,17 @@ async fn tile(
             } else {
                 full.samples_per_pixel
             };
-            let is_u8 = full.sample_type == cogzilla_tiff::SampleType::Uint8;
-            let (mut treq, content_type) =
-                build_tile_request(tile, scale, &explicit, &pq, default_bands, is_u8)?;
+            let (mut treq, content_type) = build_tile_request(
+                Some(&engine),
+                tile,
+                scale,
+                Some(explicit.as_str()),
+                &pq,
+                default_bands,
+                full.sample_type,
+                false,
+                Some(&first),
+            )?;
             // As in TiTiler, `resampling` applies to a source already in the tile's projection
             // and `reproject` to one that has to be warped into it.
             treq.resample = match engine.get_or_build_crs(&first)? {
@@ -4459,7 +4467,7 @@ async fn mosaic_route(
                 return detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
             };
             // Without an extension the format is chosen from the rendered pixels.
-            let ext = if ys.contains('.') { ext } else { "" };
+            let ext = if ys.contains('.') { ext.unwrap_or("") } else { "" };
             match parse_zxy(zs, xs, y) {
                 Err(r) => r,
                 Ok(None) if pq.assets.is_empty() => missing_query_param("assets"),

@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-pgstac"
-version = "0.5.19"
+version = "0.7.0"
 dependencies = [
  "deadpool-postgres",
  "parking_lot",
