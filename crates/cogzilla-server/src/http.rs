@@ -2815,7 +2815,7 @@ where
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"cleared"), "text/plain"));
     }
 
-    let pq = parse_query(if raw_query.is_empty() {
+    let mut pq = parse_query(if raw_query.is_empty() {
         None
     } else {
         Some(&raw_query)
@@ -2843,6 +2843,13 @@ where
                 pgstac::ItemRoute::Stac(item, extent) => {
                     pgstac_item = Some(item);
                     pgstac_item_extent = extent;
+                    // Band math on an item's point is applied to the `/stac` answer by
+                    // `pgstac::item_fixup`, with TiTiler's names: `/stac` must not apply it first.
+                    // An expression is over every band read, so the request's `bidx` does
+                    // not narrow them first; each asset's own selection still applies.
+                    if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
+                        pq.bidx.clear();
+                    }
                     stac_prefix = format!("collections/{c}/items/{i}");
                     let mut as_stac = vec!["stac"];
                     as_stac.extend_from_slice(rest);
