@@ -1597,13 +1597,33 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
 /// themselves and answer as titiler-pgstac does, with a 422: `reproject`, which the shared
 /// parser does not know, `asset_as_band`, `histogram_bins` and the options of `assets`.
 fn own_error(e: &str) -> bool {
-    e.contains("'reproject'") || e.contains("asset_as_band") || e.contains("histogram_bins") || e.contains("in |bidx=")
+    match error_parameter(e) {
+        Some("reproject" | "asset_as_band" | "histogram_bins") => true,
+        Some("assets") => e.ends_with("in |bidx="),
+        _ => false,
+    }
 }
 
 /// Whether the shared parser's complaint is about a `width` or `height` it could not read.
 /// Routes that take those answer for them themselves, with a 422.
 fn own_size_error(e: &str) -> bool {
-    e.starts_with("invalid width=") || e.starts_with("invalid height=")
+    matches!(error_parameter(e), Some("width" | "height"))
+}
+
+/// The parameter one of the shared parser's complaints is about. They read
+/// `invalid name=value: why` or `parameter 'name' is not supported by cogzilla`; the name
+/// is taken from where it stands, never looked for in the value.
+fn error_parameter(e: &str) -> Option<&str> {
+    if let Some(rest) = e.strip_prefix("invalid ") {
+        return rest.split_once('=').map(|(name, _)| name);
+    }
+    e.strip_prefix("parameter '")?.split_once('\'').map(|(name, _)| name)
+}
+
+/// The request's `expression`, under any of the names the shared parser takes for it; as
+/// there, the last one given is the one used.
+fn request_expression(pairs: &[(String, String)]) -> Option<&str> {
+    pairs.iter().rev().find(|(k, _)| matches!(k.as_str(), "expression" | "expr" | "index")).map(|(_, v)| v.as_str())
 }
 
 /// The asset names of a request, once its `expression` is known not to use them: band math
@@ -2274,7 +2294,7 @@ async fn part_image(
     pairs: &[(String, String)],
 ) -> Resp {
     // `width` and `height` are read here; the shared parser does not know them.
-    pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'") && !own_size_error(e));
+    pq.errors.retain(|e| !own_size_error(e));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3241,11 +3261,9 @@ async fn mosaic_statistics(
     pairs: &[(String, String)],
 ) -> Resp {
     // Read here; the shared parser does not know them on this route.
-    const OWN: [&str; 8] = [
-        "'width'", "'height'", "'categorical'", "'c'", "'p'", "'histogram_bins'",
-        "'histogram_range'", "'cover_scale'",
-    ];
-    pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)) && !own_size_error(e));
+    const OWN: [&str; 8] =
+        ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
+    pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3986,7 +4004,7 @@ pub(super) fn item_fixup(
             }
             // The `/stac` handler returns the bands as they are; band math is applied here.
             let pairs = query_pairs(raw_query);
-            if let Some(expression) = query_value(&pairs, "expression") {
+            if let Some(expression) = request_expression(&pairs) {
                 let values = doc["values"].as_array().cloned().unwrap_or_default();
                 let descriptions: Vec<String> = doc["band_descriptions"]
                     .as_array()
@@ -4570,6 +4588,21 @@ async fn mosaic_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complaints_are_matched_by_the_parameter_they_name() {
+        assert_eq!(error_parameter("invalid width=wide: expected width in 1..=4096"), Some("width"));
+        assert_eq!(error_parameter("parameter 'cover_scale' is not supported by cogzilla"), Some("cover_scale"));
+        assert!(own_error("invalid asset_as_band=perhaps: expected a boolean"));
+        assert!(own_error("invalid assets=visual|bidx=x: expected positive integer band indices in |bidx="));
+        // A value that spells a parameter's name is not that parameter.
+        assert!(!own_error("invalid nodata=histogram_bins: expected a number"));
+        assert!(!own_size_error("invalid nodata=width=3: expected a number"));
+        let pairs = |q: &str| query_pairs(q);
+        assert_eq!(request_expression(&pairs("assets=red&expr=b1*2")), Some("b1*2"));
+        assert_eq!(request_expression(&pairs("expression=b1&index=b2")), Some("b2"));
+        assert_eq!(request_expression(&pairs("assets=red")), None);
+    }
 
     #[test]
     fn register_body_is_split_like_titiler_pgstac() {
