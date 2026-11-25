@@ -32,6 +32,7 @@ struct ThreadCodecState {
     zstd_dctx: *mut zstd_sys::ZSTD_DCtx,
     lzw: lzw::LzwDecoder,
     scratch: Vec<u8>,
+    jpeg_merge: Vec<u8>,
 }
 
 impl ThreadCodecState {
@@ -43,6 +44,7 @@ impl ThreadCodecState {
             zstd_dctx,
             lzw: lzw::LzwDecoder::new(),
             scratch: Vec::with_capacity(512 * 512 * 4),
+            jpeg_merge: Vec::new(),
         }
     }
 }
@@ -276,7 +278,6 @@ pub fn decode_tile_rows(
                     )));
                 }
                 // Merge shared TIFF JPEGTables (tag 347) with abbreviated tile bitstream if present
-                let merged_buf: Vec<u8>;
                 let jpeg_bytes: &[u8] = if let Some(tables) = ifd.jpeg_tables.as_deref() {
                     if tables.len() >= 4 && compressed.len() >= 2 {
                         let t_end = if tables.ends_with(&[0xFF, 0xD9]) {
@@ -289,8 +290,11 @@ pub fn decode_tile_rows(
                         } else {
                             0
                         };
-                        merged_buf = [tables[..t_end].as_ref(), compressed[c_start..].as_ref()].concat();
-                        &merged_buf
+                        st.jpeg_merge.clear();
+                        st.jpeg_merge.reserve(t_end + (compressed.len() - c_start));
+                        st.jpeg_merge.extend_from_slice(&tables[..t_end]);
+                        st.jpeg_merge.extend_from_slice(&compressed[c_start..]);
+                        &st.jpeg_merge
                     } else {
                         compressed
                     }

@@ -126,6 +126,7 @@ fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
 struct ParsedQuery {
     urls: Vec<String>,
     assets: Vec<String>,
+    asset_bidx: Vec<(String, Vec<u16>)>,
     bidx: Vec<u16>,
     rescale: Vec<(f32, f32)>,
     colormap: ColormapName,
@@ -185,6 +186,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     let mut pq = ParsedQuery {
         urls: Vec::new(),
         assets: Vec::new(),
+        asset_bidx: Vec::new(),
         bidx: Vec::new(),
         rescale: Vec::new(),
         colormap: ColormapName::Grayscale,
@@ -286,13 +288,19 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 let dec = percent_decode(v);
                 if let Some((name, bidx_str)) = dec.split_once('|') {
                     let name = name.trim();
-                    if !name.is_empty() && !pq.assets.iter().any(|a| a == name) {
-                        pq.assets.push(name.to_string());
-                    }
+                    let mut parsed = Vec::new();
                     for tok in bidx_str.split(',') {
                         match tok.trim().parse::<u16>() {
-                            Ok(b) if b >= 1 => pq.bidx.push(b),
+                            Ok(b) if b >= 1 => parsed.push(b),
                             _ => bad("expected positive integer band indices in asset_bidx"),
+                        }
+                    }
+                    if !name.is_empty() {
+                        if !pq.assets.iter().any(|a| a == name) {
+                            pq.assets.push(name.to_string());
+                        }
+                        if !parsed.is_empty() {
+                            pq.asset_bidx.push((name.to_string(), parsed));
                         }
                     }
                 } else {
@@ -2055,6 +2063,110 @@ async fn render_mosaic_tile_styled(
     }
 }
 
+fn apply_stac_asset_bidx(pq: &mut ParsedQuery, names: &[String]) {
+    if pq.bidx.is_empty() && names.len() == 1 {
+        if let Some((_, bands)) = pq.asset_bidx.iter().find(|(n, _)| n == &names[0]) {
+            pq.bidx = bands.clone();
+        }
+    }
+}
+
+/// Composite up to 16 intersecting MosaicJSON scenes for `/mosaicjson/bbox` and `/mosaicjson/feature`
+/// using first-non-transparent alpha-over blending in target CRS.
+#[allow(clippy::too_many_arguments)]
+async fn render_mosaic_bbox_composite(
+    engine: &TileEngine,
+    urls: &[String],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    out_w: u32,
+    out_h: u32,
+    poly_mask: Option<&PolygonMask>,
+    pq: &ParsedQuery,
+    fmt: OutputFormat,
+    ct: &'static str,
+    epsg: u16,
+) -> Result<Bytes, EngineError> {
+    if urls.is_empty() {
+        return Err(EngineError::NotFound("no mosaic scenes intersect requested bounds".into()));
+    }
+    let urls = &urls[..urls.len().min(16)];
+    let mut acc_rgba: Option<Vec<u8>> = None;
+    let total_px = (out_w as usize).saturating_mul(out_h as usize);
+    let mut opaque_count = 0usize;
+
+    for u in urls {
+        let cog = engine.store.open_uri(u).await?;
+        let cogs = [cog];
+        let full = cogs[0].index.full_res();
+        let mut bands = build_band_request(pq, full.samples_per_pixel, full.sample_type)?;
+        if pq.unscale {
+            apply_unscale_cogs(&mut bands, &cogs);
+        }
+        let custom_lut = resolve_custom_lut(pq, &cogs[0], &bands)?;
+        let cf = pq
+            .color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), matches!(dst_crs, cogzilla_proj::CrsModel::Geographic));
+        if urls.len() == 1 || matches!(fmt, OutputFormat::RawF32 | OutputFormat::Npy) {
+            let d = render_crs_bbox(
+                engine,
+                &cogs,
+                bbox,
+                dst_crs,
+                out_w,
+                out_h,
+                poly_mask,
+                &bands,
+                resample,
+                fmt,
+                pq.nodata,
+                custom_lut.as_ref(),
+                cf.as_ref(),
+                pq.return_mask,
+                pq.unscale,
+            )
+            .await?;
+            return Ok(wrap_geotiff(d, ct, out_w, out_h, bbox, epsg, pq.return_mask));
+        }
+        let raw = render_crs_bbox(
+            engine,
+            &cogs,
+            bbox,
+            dst_crs,
+            out_w,
+            out_h,
+            poly_mask,
+            &bands,
+            resample,
+            OutputFormat::RawRgba,
+            pq.nodata,
+            custom_lut.as_ref(),
+            cf.as_ref(),
+            true,
+            pq.unscale,
+        )
+        .await?;
+        let acc = acc_rgba.get_or_insert_with(|| vec![0u8; total_px * 4]);
+        for i in 0..total_px {
+            let off = i * 4;
+            if acc[off + 3] == 0 && raw[off + 3] > 0 {
+                acc[off..off + 4].copy_from_slice(&raw[off..off + 4]);
+                opaque_count += 1;
+            }
+        }
+        if opaque_count >= total_px {
+            break;
+        }
+    }
+    let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
+    let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, fmt, pq.return_mask);
+    Ok(wrap_geotiff(data, ct, out_w, out_h, bbox, epsg, pq.return_mask))
+}
+
 fn web_mercator_buffered_3857_bbox(z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> [f64; 4] {
     let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
     let pad_x = (max_x - min_x) * (buffer as f64 / tile_size as f64);
@@ -2620,15 +2732,115 @@ where
     //   GET  /mosaicjson/tiles/{tms}/{z}/{x}/{y}[@scale][.{ext}]?url=...
     //   POST /mosaicjson/validate
     // ------------------------------------------------------------------------
-    if method == Method::POST && segs.as_slice() == ["mosaicjson", "validate"] {
-        let res: Result<(Bytes, &'static str), EngineError> = async {
-            let body_bytes = read_limited_body(req.into_body()).await?;
-            let text = std::str::from_utf8(&body_bytes)
-                .map_err(|e| EngineError::BadRequest(format!("invalid UTF-8 body: {e}")))?;
-            let mj = MosaicJsonCatalog::from_json_str(text).map_err(EngineError::BadRequest)?;
-            Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
-        }
-        .await;
+    if method == Method::POST && segs.first() == Some(&"mosaicjson") {
+        let mj_url = pq.urls.first().cloned();
+        let res: Result<(Bytes, &'static str), EngineError> = match segs.as_slice() {
+            ["mosaicjson", "validate"] => async {
+                let body_bytes = read_limited_body(req.into_body()).await?;
+                let text = std::str::from_utf8(&body_bytes)
+                    .map_err(|e| EngineError::BadRequest(format!("invalid UTF-8 body: {e}")))?;
+                let mj = MosaicJsonCatalog::from_json_str(text).map_err(EngineError::BadRequest)?;
+                Ok((Bytes::from(mj.info_json().to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "statistics"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let body_bytes = read_limited_body(req.into_body()).await?;
+                let stats_opts = build_stats_options(&pq, false)?;
+                let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
+                    .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
+                let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
+                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
+                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
+                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let first_u = urls.first().ok_or_else(|| {
+                    EngineError::NotFound("no mosaic scenes intersect requested geometry".into())
+                })?;
+                let cog = engine.store.open_uri(first_u).await?;
+                let stats = compute_statistics_with_options(
+                    &engine, &cog, pq.max_size, Some(&mask), pq.unscale, pq.nodata, &stats_opts,
+                )
+                .await?;
+                if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                    if let Some(props) = geojson.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                        props.insert("statistics".into(), stats);
+                    } else if let Some(obj) = geojson.as_object_mut() {
+                        obj.insert("properties".into(), serde_json::json!({"statistics": stats}));
+                    }
+                    Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
+                } else {
+                    let feat = serde_json::json!({
+                        "type": "Feature",
+                        "geometry": geojson,
+                        "properties": { "statistics": stats },
+                    });
+                    Ok((Bytes::from(feat.to_string()), "application/geo+json"))
+                }
+            }
+            .await,
+            ["mosaicjson", feat_ext]
+                if *feat_ext == "feature" || feat_ext.starts_with("feature.") =>
+            async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let body_bytes = read_limited_body(req.into_body()).await?;
+                let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
+                    .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
+                let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
+                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
+                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
+                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let ext = feat_ext
+                    .strip_prefix("feature.")
+                    .or(pq.format_param.as_deref())
+                    .unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let (dst_crs, dst_epsg) = pq
+                    .dst_crs
+                    .clone()
+                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
+                let out_bbox = reproject_wgs84_bounds(bbox, &dst_crs)?;
+                let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                let mask_opt = pq.shape_mask.then_some(&mask);
+                let data = render_mosaic_bbox_composite(
+                    &engine, &urls, out_bbox, &dst_crs, out_w, out_h, mask_opt, &pq, fmt, ct, dst_epsg,
+                )
+                .await?;
+                Ok((data, ct))
+            }
+            .await,
+            ["mosaicjson", "feature", dims_ext] => async {
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
+                    return Err(EngineError::BadRequest("expected /mosaicjson/feature/{w}x{h}.{ext}".into()));
+                };
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let body_bytes = read_limited_body(req.into_body()).await?;
+                let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
+                    .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
+                let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
+                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
+                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
+                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let (dst_crs, dst_epsg) = pq
+                    .dst_crs
+                    .clone()
+                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
+                let out_bbox = reproject_wgs84_bounds(bbox, &dst_crs)?;
+                let mask_opt = pq.shape_mask.then_some(&mask);
+                let data = render_mosaic_bbox_composite(
+                    &engine, &urls, out_bbox, &dst_crs, out_w, out_h, mask_opt, &pq, fmt, ct, dst_epsg,
+                )
+                .await?;
+                Ok((data, ct))
+            }
+            .await,
+            _ => Err(EngineError::NotFound(path.clone())),
+        };
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
     }
 
@@ -2676,8 +2888,85 @@ where
             ["mosaicjson", "bounds"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let body = serde_json::json!({ "bounds": mj.bounds }).to_string();
+                let bounds = if let Some((ref dst, _)) = pq.bounds_crs {
+                    reproject_wgs84_bounds(mj.bounds, dst)?
+                } else {
+                    mj.bounds
+                };
+                let body = serde_json::json!({ "bounds": bounds }).to_string();
                 Ok((Bytes::from(body), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "statistics"] => async {
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let [w, s, e, n] = mj.bounds;
+                let (mx0, my0) = lonlat_deg_to_mercator(w, s);
+                let (mx1, my1) = lonlat_deg_to_mercator(e, n);
+                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let first_u = urls.first().ok_or_else(|| {
+                    EngineError::NotFound("mosaicjson contains no raster scenes".into())
+                })?;
+                let cog = engine.store.open_uri(first_u).await?;
+                let stats_opts = build_stats_options(&pq, false)?;
+                let json = compute_statistics_with_options(
+                    &engine, &cog, pq.max_size, None, pq.unscale, pq.nodata, &stats_opts,
+                )
+                .await?;
+                Ok((Bytes::from(json.to_string()), "application/json"))
+            }
+            .await,
+            ["mosaicjson", "bbox", bbox_seg] => async {
+                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                    return Err(EngineError::BadRequest("invalid bbox".into()));
+                };
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                let (mx0, my0) = lonlat_deg_to_mercator(wgs_bbox[0], wgs_bbox[1]);
+                let (mx1, my1) = lonlat_deg_to_mercator(wgs_bbox[2], wgs_bbox[3]);
+                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let (dst_crs, dst_epsg) = pq
+                    .dst_crs
+                    .clone()
+                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
+                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let (def_w, def_h) = aspect_preserving_dims(out_bbox, pq.max_size);
+                let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
+                let data = render_mosaic_bbox_composite(
+                    &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
+                )
+                .await?;
+                Ok((data, ct))
+            }
+            .await,
+            ["mosaicjson", "bbox", bbox_seg, dims_ext] => async {
+                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                    return Err(EngineError::BadRequest("invalid bbox".into()));
+                };
+                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
+                    return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
+                };
+                let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let mj = load_mosaicjson(&engine, &u).await?;
+                let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
+                let (mx0, my0) = lonlat_deg_to_mercator(wgs_bbox[0], wgs_bbox[1]);
+                let (mx1, my1) = lonlat_deg_to_mercator(wgs_bbox[2], wgs_bbox[3]);
+                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
+                let (dst_crs, dst_epsg) = pq
+                    .dst_crs
+                    .clone()
+                    .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
+                let out_bbox = reproject_wgs84_bounds(wgs_bbox, &dst_crs)?;
+                let data = render_mosaic_bbox_composite(
+                    &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
+                )
+                .await?;
+                Ok((data, ct))
             }
             .await,
             ["mosaicjson", "tiles"] => {
@@ -2723,7 +3012,9 @@ where
                 let urls = mj.query_bbox_3857(mx, my, mx, my);
                 let mut assets_out = Vec::new();
                 for asset_url in urls.into_iter().take(16) {
-                    let cog = engine.store.open_uri(&asset_url).await?;
+                    let Ok(cog) = engine.store.open_uri(&asset_url).await else {
+                        continue;
+                    };
                     match query_point(&engine, &cog, lon, lat, pq.unscale, pq.nodata).await {
                         Ok(pt) => {
                             let vals = pt["values"].clone();
@@ -3656,10 +3947,11 @@ where
             (Method::GET, ["map"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let wgs_bbox = pq_stac.bbox_param.unwrap_or_else(|| {
@@ -3749,7 +4041,7 @@ where
                             .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                         let item =
                             load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                        let (_, cogs, rewritten_expr) = resolve_stac_assets(
+                        let (names, cogs, rewritten_expr) = resolve_stac_assets(
                             &engine,
                             &item,
                             &pq.assets,
@@ -3765,6 +4057,7 @@ where
                         };
                         let mut pq_stac = pq;
                         pq_stac.expr_raw = rewritten_expr;
+                        apply_stac_asset_bidx(&mut pq_stac, &names);
                         let db = if cogs.len() > 1 {
                             cogs.len() as u16
                         } else {
@@ -3955,10 +4248,11 @@ where
                 let ext_opt = p.strip_prefix("preview.");
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -4009,10 +4303,11 @@ where
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -4061,10 +4356,11 @@ where
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let (fmt, ct) = parse_ext_format(
                     ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
@@ -4126,10 +4422,11 @@ where
                 };
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -4189,10 +4486,11 @@ where
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -4241,10 +4539,11 @@ where
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson(&geojson)?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let (_, cogs, rewritten_expr) =
+                let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
+                apply_stac_asset_bidx(&mut pq_stac, &names);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
