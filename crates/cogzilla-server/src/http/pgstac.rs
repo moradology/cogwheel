@@ -1663,9 +1663,6 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.buffer > 0.0 {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'buffer' is not supported on mosaic routes yet"));
     }
-    if pq.nodata.is_some() {
-        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'nodata' is not supported on mosaic routes yet"));
-    }
     if pq.unscale && assets.len() > 1 {
         return Err(detail(
             StatusCode::BAD_REQUEST,
@@ -1823,6 +1820,9 @@ struct PlanesTile {
     resampling: ResampleMode,
     reproject: ResampleMode,
     window: Window,
+    /// The value that stands for no data, when the request names one: it is then that
+    /// value and not the raster's own, as GDAL has it.
+    nodata: Option<f32>,
     /// Whether the per-pixel work goes to the pool for heavy work: when there is more
     /// than one raster to work out, or a picture larger than a tile.
     pool: bool,
@@ -1869,13 +1869,19 @@ impl Window {
         reproject: ResampleMode,
         max_values: usize,
         pool: bool,
+        nodata: Option<f32>,
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
+        // Only the reader of nearest pixels takes a `nodata` of the request's own.
+        let nearest_only = || EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into());
         let (bbox, mercator, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
                 let cog = engine.store.open_uri(href).await?;
                 let crs = engine.get_or_build_crs(&cog)?;
                 let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
                 let Some(res) = mercator_resolution(&crs, &cog).filter(|_| resample == ResampleMode::Nearest) else {
+                    if nodata.is_some() {
+                        return Err(nearest_only());
+                    }
                     return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
                 };
                 // The way GDAL's warp reads a tile: from the overview it would pick for
@@ -1895,7 +1901,7 @@ impl Window {
                 // are, and a band then comes from other pixels than it does in the whole
                 // raster; a band is the same band here either way.
                 let read =
-                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted, true)
+                    warp_nearest(engine, &cog, &crs, [w, s, e, n], true, (side, side), (own(e - w), own(n - s)), WarpPath::Direct, request.unscale, pool, &wanted, true, nodata)
                         .await?;
                 let mut planes = Vec::with_capacity(wanted.len());
                 for band in &wanted {
@@ -1953,7 +1959,7 @@ impl Window {
                 )));
             }
             // One road whatever bands are asked for: see the tile's reading above.
-            let read = match warp_nearest(engine, &cog, &crs, bbox, mercator, own, native, WarpPath::Direct, unscale, true, &[], true).await {
+            let read = match warp_nearest(engine, &cog, &crs, bbox, mercator, own, native, WarpPath::Direct, unscale, true, &[], true, nodata).await {
                 Ok(read) => read,
                 // The item's footprint meets the box but this raster does not.
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
@@ -2002,6 +2008,9 @@ impl Window {
                 }
             }
             return Ok((planes, sample_type));
+        }
+        if nodata.is_some() {
+            return Err(nearest_only());
         }
         let cogs = [cog];
         let mut planes = Vec::with_capacity(wanted.len());
@@ -2084,7 +2093,7 @@ impl PlanesTile {
         // Each asset may take its share of what an item may hold.
         let (planes, sample_type) =
             self.window
-                .read(engine, href, wanted, self.resampling, self.reproject, MAX_PLANE_VALUES / self.assets.len().max(1), self.pool)
+                .read(engine, href, wanted, self.resampling, self.reproject, MAX_PLANE_VALUES / self.assets.len().max(1), self.pool, self.nodata)
                 .await?;
         let planes = match &spec.expression {
             Some(expression) => band_math(expression, &planes)?,
@@ -2577,7 +2586,8 @@ async fn part_image(
         Ok(map) => map.flatten(),
         Err(e) => return detail(StatusCode::BAD_REQUEST, e),
     };
-    let planes_needed = wants_planes(&pq, &query) || custom.is_some();
+    // So is a `nodata` of the request's own: the renderer on this road reads the raster's.
+    let planes_needed = wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some();
     let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
@@ -2657,7 +2667,9 @@ async fn part_image(
 
     // The lean lookup samples the box as a grid in degrees. A grid in metres is another
     // set of pixel centres, so there pgSTAC's own search lists the items.
-    let grid = if mercator { None } else { part_grid(size, bbox) };
+    // Nor does it list for a `nodata` of the request's own: it passes over an item whose
+    // footprint adds nothing, and such an item's raster may still hold values there.
+    let grid = if mercator || pq.nodata.is_some() { None } else { part_grid(size, bbox) };
     let items = match pixel_items(ctx, pg, geometry, hash, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
@@ -2728,6 +2740,7 @@ async fn part_image(
                 selection: query.selection.unwrap_or(Selection::First),
                 resampling: query.resampling,
                 reproject: query.reproject,
+                nodata: pq.nodata,
                 window: Window::Part { bbox, mercator, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
                 pool: true,
             };
@@ -2882,7 +2895,7 @@ async fn part_image(
             let mut resp = Response::new(Full::new(body));
             resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
             resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-            resp
+            placed(resp, bbox, if mercator { 3857 } else { 4326 })
         }
         Err(e) => engine_error(&e),
     }
@@ -3212,7 +3225,13 @@ async fn warp_nearest(
     pool: bool,
     only: &[u16],
     every_pixel: bool,
+    nodata: Option<f32>,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
+    if let (Some(named), Some(ifd)) = (nodata, cog.index.ifds.first())
+        && !nodata_fits(named, ifd.sample_type)
+    {
+        return Err(EngineError::BadRequest(format!("`nodata` of {named} is not a value the raster's samples can hold")));
+    }
     let sizes: Vec<(u32, u32)> = cog.index.ifds.iter().map(|i| (i.width, i.height)).collect();
     // The grid the warp is worked out on, and how wide a stretch of a row GDAL
     // approximates in one go.
@@ -3353,12 +3372,42 @@ async fn warp_nearest(
             grid_h,
             &blocks,
         );
-        if unscale {
+        // A `nodata` of the request's own is told from the raster's values as stored.
+        if unscale && nodata.is_none() {
             let scale = cog.index.scales.get(band).copied().unwrap_or(1.0);
             let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
             source = source.with_scale_offset(scale, offset);
         }
         planes.push(cells.iter().map(|&(col, row)| source.sample_checked(col, row)).collect::<Vec<f32>>());
+    }
+    if let Some(named) = nodata {
+        // The request's value stands in the place of the raster's own, as in GDAL: where
+        // the raster had none, its own value is a number again, and each band is without
+        // data where it holds the value named. A pixel some bands of which are left is
+        // still drawn, and a mosaic fills the others from the items below.
+        let own = cog.index.nodata.filter(|n| !n.is_nan());
+        for plane in planes.iter_mut().filter(|p| !p.is_empty()) {
+            for (v, &(col, _)) in plane.iter_mut().zip(&cells) {
+                if col < 0 {
+                    continue;
+                }
+                if let (true, Some(own)) = (v.is_nan(), own) {
+                    *v = own;
+                }
+                if *v == named {
+                    *v = f32::NAN;
+                }
+            }
+        }
+        if unscale {
+            for (band, plane) in planes.iter_mut().enumerate() {
+                let scale = cog.index.scales.get(band).copied().unwrap_or(1.0);
+                let offset = cog.index.offsets.get(band).copied().unwrap_or(0.0);
+                if scale != 1.0 || offset != 0.0 {
+                    plane.iter_mut().for_each(|v| *v = *v * scale + offset);
+                }
+            }
+        }
     }
     planes
     };
@@ -3587,7 +3636,7 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false).await
+                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, None).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
                 };
@@ -3795,6 +3844,9 @@ async fn mosaic_statistics(
     const OWN: [&str; 8] =
         ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
     pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
+    if pq.nodata.is_some() {
+        return detail(StatusCode::BAD_REQUEST, "parameter 'nodata' is not supported on mosaic statistics yet");
+    }
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -4064,7 +4116,9 @@ async fn tile(
         Ok(map) => map.flatten(),
         Err(e) => return detail(StatusCode::BAD_REQUEST, e),
     };
-    let planes_wanted = wants_planes(&pq, &query) || custom.is_some();
+    // So is a `nodata` of the request's own: the renderer on this road reads the raster's.
+    let nodata = pq.nodata;
+    let planes_wanted = wants_planes(&pq, &query) || custom.is_some() || nodata.is_some();
     let planes_preferred = planes_read_all(&pq, &query)
         && query.resampling == ResampleMode::Nearest
         && query.reproject == ResampleMode::Nearest
@@ -4076,7 +4130,9 @@ async fn tile(
         Ok(names) => names,
         Err(r) => return r,
     };
-    let grid = tile_grid(scale, &pq);
+    // A `nodata` of the request's own leaves the listing to pgSTAC's search: the lean
+    // lookup passes over an item whose footprint adds nothing, and its raster may not.
+    let grid = if pq.nodata.is_some() { None } else { tile_grid(scale, &pq) };
     let items = match pixel_items(ctx, pg, &tile_polygon(tile), id, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
@@ -4198,6 +4254,7 @@ async fn tile(
                     selection: selection.unwrap_or(Selection::First),
                     resampling,
                     reproject,
+                    nodata,
                     window: Window::Tile(crate::engine::TileRequest {
                         tile,
                         tile_size: dim,
@@ -4303,9 +4360,57 @@ async fn tile(
         })
         .await;
     match rendered {
-        Ok(tile) => to_http_response_cached(engine, Ok(tile), ctx.if_none_match),
+        Ok(made) => {
+            let (west, south, east, north) = tile_bounds_3857(tile);
+            placed(to_http_response_cached(engine, Ok(made), ctx.if_none_match), [west, south, east, north], 3857)
+        }
         Err(e) => engine_error(&e),
     }
+}
+
+/// Whether samples of this kind can hold `named`. GDAL refuses a no-data value they
+/// cannot; a fraction among whole numbers it takes, and no sample is ever equal to it.
+fn nodata_fits(named: f32, kind: cogzilla_tiff::SampleType) -> bool {
+    use cogzilla_tiff::SampleType as T;
+    let named = f64::from(named);
+    let within = |lo: f64, hi: f64| named >= lo && named <= hi;
+    match kind {
+        T::Uint8 => within(0.0, f64::from(u8::MAX)),
+        T::Int8 => within(f64::from(i8::MIN), f64::from(i8::MAX)),
+        T::Uint16 => within(0.0, f64::from(u16::MAX)),
+        T::Int16 => within(f64::from(i16::MIN), f64::from(i16::MAX)),
+        T::Uint32 => within(0.0, f64::from(u32::MAX)),
+        T::Int32 => within(f64::from(i32::MIN), f64::from(i32::MAX)),
+        _ => true,
+    }
+}
+
+/// A number as Python writes it, which is how the reference's headers carry bounds: the
+/// shortest digits that read back the same, in powers of ten below 1e-4 and from 1e16.
+fn python_float(c: f64) -> String {
+    let c = c + 0.0;
+    let short = format!("{c:e}");
+    let Some((digits, power)) = short.split_once('e') else { return short };
+    match power.parse::<i32>() {
+        Ok(power) if c.is_finite() && !(-4..16).contains(&power) => {
+            format!("{digits}e{}{:02}", if power < 0 { '-' } else { '+' }, power.abs())
+        }
+        _ => format!("{c:?}"),
+    }
+}
+
+/// A picture's answer with where the picture lies, as TiTiler says it: `Content-Bbox`,
+/// the bounds as Python writes floats, and `Content-Crs`, the system they are in.
+fn placed(mut resp: Resp, bounds: [f64; 4], epsg: u16) -> Resp {
+    if resp.status() == StatusCode::OK {
+        let bbox = bounds.map(python_float).join(",");
+        let crs = format!("<http://www.opengis.net/def/crs/EPSG/0/{epsg}>");
+        if let (Ok(bbox), Ok(crs)) = (HeaderValue::from_str(&bbox), HeaderValue::from_str(&crs)) {
+            resp.headers_mut().insert("content-bbox", bbox);
+            resp.headers_mut().insert("content-crs", crs);
+        }
+    }
+    resp
 }
 
 /// A picture asked for as a GeoTIFF, which until here is its bare RGBA pixels, written as
@@ -6414,4 +6519,25 @@ mod tests {
         assert!(parse_zxy("31", "0", 0).unwrap().is_none());
         assert_eq!(parse_zxy("x", "0", 0).unwrap_err().status(), StatusCode::BAD_REQUEST);
     }
+    #[test]
+    fn bounds_are_written_as_python_writes_floats() {
+        for (given, written) in [
+            (6.0, "6.0"), (43.580390855607845, "43.580390855607845"), (-0.0, "0.0"), (0.00001, "1e-05"),
+            (-0.00001234, "-1.234e-05"), (0.0001, "0.0001"), (1e16, "1e+16"), (1234567890123456.0, "1234567890123456.0"),
+            (-20037508.342789244, "-20037508.342789244"),
+        ] {
+            assert_eq!(python_float(given), written);
+        }
+    }
+
+    #[test]
+    fn a_nodata_the_samples_cannot_hold_is_refused() {
+        use cogzilla_tiff::SampleType as T;
+        assert!(nodata_fits(1000.0, T::Uint16) && nodata_fits(1000.5, T::Uint16) && nodata_fits(-1.0, T::Int16));
+        for bad in [f32::NAN, f32::INFINITY, -1.0, 70000.0] {
+            assert!(!nodata_fits(bad, T::Uint16));
+        }
+        assert!(!nodata_fits(256.0, T::Uint8) && nodata_fits(f32::NAN, T::Float32));
+    }
+
 }
