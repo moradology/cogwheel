@@ -4924,7 +4924,18 @@ async fn tile(
                 let paint = Paint::of(&treq.bands).ok_or_else(|| {
                     EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
                 })?;
-                if raw_array {
+                // An array of what the method leaves, when it is of the raster's own bands
+                // and nothing makes a picture's bytes of them.
+                let array = matches!(treq.format, OutputFormat::Npy)
+                    && own_bands
+                    && pq.rescale.is_empty()
+                    && !pq.colormap_explicit
+                    && formula.is_none()
+                    && pq.expr_raw.is_none()
+                    && pq.algorithm.is_none()
+                    && full.extra_samples.is_empty()
+                    && !super::has_embedded_palette(&pq, &first, &treq.bands);
+                if raw_array && !array {
                     return Err(EngineError::BadRequest(
                         "raw array formats are not supported with pixel_selection other than 'first' yet".into(),
                     ));
@@ -4943,7 +4954,29 @@ async fn tile(
                 }
                 let mut fold = Fold::new(method, bands, dim * dim, integer);
                 engine.mosaic_scene_values(&scenes, &treq, |scene| fold.add_le_bytes(scene)).await?;
-                match fold.finish() {
+                let selected = fold.finish();
+                if array {
+                    // A count is of bytes and a deviation of doubles; the rest are in the
+                    // type that holds every asset read, rounded where that is of whole numbers.
+                    let mut kind = full.sample_type;
+                    for uri in scenes[0].iter().skip(1) {
+                        kind = wider_type(kind, engine.store.open_uri(uri).await?.index.full_res().sample_type);
+                    }
+                    let kind = match method {
+                        Selection::Count => SampleType::Uint8,
+                        Selection::Stdev => SampleType::Float64,
+                        _ if pq.unscale => SampleType::Float32,
+                        _ => kind,
+                    };
+                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    let values: Vec<f32> = match selected {
+                        Some(selected) => selected.values.iter().map(|v| if whole { v.round() } else { *v }).collect(),
+                        None => vec![f32::NAN; bands * dim * dim],
+                    };
+                    let shown = values.len() / (dim * dim);
+                    return Ok((npy_array(&values, shown, dim, dim, kind, return_mask, None), content_type));
+                }
+                match selected {
                     Some(selected) => paint.rgba(&selected, dim * dim),
                     None => vec![0u8; dim * dim * 4],
                 }
