@@ -3136,7 +3136,9 @@ async fn part_image_of(
             };
             if n == 0 {
                 map_after = taken;
-                one_grey = !pq.colormap_explicit && one_grey_band(&bands);
+                one_grey = !pq.colormap_explicit
+                    && (one_grey_band(&bands) || query.selection == Some(Selection::Count))
+                    && !super::has_embedded_palette(&pq, &cogs[0], &bands);
             }
             // A formula on one band works on the band's byte, which is made here from the
             // values: the first there is, as a mosaic is.
@@ -3252,7 +3254,13 @@ async fn part_image_of(
                 parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?
             }
         };
-        let made = (encode_rgba_output_colour(width, height, &canvas, format, pq.return_mask), content_type);
+        // One band, or a count, is a grey picture as on tiles: one channel, or two with the mask.
+        let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+        let made = if grey {
+            encode_picture(canvas, width, height, None, Some((format, content_type)), pq.jpeg_quality, pq.return_mask, true)?
+        } else {
+            (encode_rgba_output_colour(width, height, &canvas, format, pq.return_mask), content_type)
+        };
         Ok(as_geotiff(made, width, height, bbox, 4326, pq.return_mask))
     }
     .await;
