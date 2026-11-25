@@ -6,7 +6,7 @@ pub enum TiffError {
     NeedMoreBytes { required: u64, available: u64 },
     #[error("invalid TIFF header magic or byte order")]
     InvalidHeader,
-    #[error("unsupported sample format: cogzilla supports f32, u16, i16, u8, got format={format}, bits={bits}")]
+    #[error("unsupported sample format: cogzilla supports u8, i8, u16, i16, u32, i32, f32, f64, got format={format}, bits={bits}")]
     UnsupportedSampleFormat { format: u16, bits: u16 },
     #[error("unsupported compression code: {0}")]
     UnsupportedCompression(u16),
@@ -32,6 +32,7 @@ pub enum Compression {
     Lzw,
     Jpeg,
     Deflate,
+    PackBits,
     Zstd,
     Webp,
 }
@@ -341,6 +342,10 @@ pub struct CogIndex {
     pub scales: Vec<f32>,
     /// Per-band additive offsets parsed from `GDAL_METADATA` (defaults to `0.0` per band).
     pub offsets: Vec<f32>,
+    /// Full f64 precision scale factors for JSON metadata responses (`/cog/info`, `/cog/validate`).
+    pub scales_f64: Vec<f64>,
+    /// Full f64 precision offsets for JSON metadata responses (`/cog/info`, `/cog/validate`).
+    pub offsets_f64: Vec<f64>,
     /// Per-band GDAL metadata key/value tags parsed from `GDAL_METADATA` (`sample="k"`).
     pub band_metadata: Vec<Vec<(String, String)>>,
     /// Optional per-band descriptions parsed from `GDAL_METADATA` (`name="DESCRIPTION"`).

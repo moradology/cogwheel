@@ -2351,10 +2351,11 @@ impl PlanesTile {
                 // An array of rescaled values and nothing else: each band's bytes, however
                 // many bands there are.
                 if matches!(look.asked, Some((OutputFormat::Npy, _))) && !look.mapped && look.custom.is_none() && look.formula.is_none() {
+                    // One range for each band when there are as many; the first for all otherwise.
                     let range = |band: usize| match look.rescale {
                         [] => default,
-                        [one] => *one,
-                        several => several.get(band).copied().unwrap_or(several[0]),
+                        several if several.len() == selected.bands => several[band],
+                        several => several[0],
                     };
                     let values: Vec<f32> = selected
                         .values
@@ -2486,27 +2487,36 @@ fn npy_array(
     out.extend_from_slice(b"\x93NUMPY\x01\x00");
     out.extend_from_slice(&(dict.len() as u16).to_le_bytes());
     out.extend_from_slice(dict.as_bytes());
-    // One value in the array's type; `top` is the type's largest, which marks the mask.
-    let mut put = |v: f64, top: bool| match kind {
-        SampleType::Uint8 => out.push(if top { u8::MAX } else { v as u8 }),
-        SampleType::Int8 => out.push((if top { i8::MAX } else { v as i8 }) as u8),
-        SampleType::Uint16 => out.extend_from_slice(&(if top { u16::MAX } else { v as u16 }).to_le_bytes()),
-        SampleType::Int16 => out.extend_from_slice(&(if top { i16::MAX } else { v as i16 }).to_le_bytes()),
-        SampleType::Uint32 => out.extend_from_slice(&(if top { u32::MAX } else { v as u32 }).to_le_bytes()),
-        SampleType::Int32 => out.extend_from_slice(&(if top { i32::MAX } else { v as i32 }).to_le_bytes()),
-        // Band math's largest number is an infinity once it has been through a plane of f32.
-        SampleType::Float32 => out.extend_from_slice(&(if top { f32::MAX } else { (v as f32).clamp(f32::MIN, f32::MAX) }).to_le_bytes()),
-        SampleType::Float64 => out.extend_from_slice(&(if top { f64::MAX } else { v.clamp(f64::MIN, f64::MAX) }).to_le_bytes()),
-    };
     let absent = f64::from(absent.unwrap_or(0.0));
-    for v in values.iter().take(bands * pixels) {
-        put(if v.is_nan() { absent } else { f64::from(*v) }, false);
+    let data = &values[..(bands * pixels).min(values.len())];
+    // The values in the array's type, then the mask: the type's largest number where any
+    // band has a value. One loop for each type, so the type is not asked about per value.
+    macro_rules! write {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for v in data {
+                let x: $t = cast(if v.is_nan() { absent } else { f64::from(*v) });
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if mask {
+                for i in 0..pixels {
+                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+                    let x: $t = if there { <$t>::MAX } else { cast(0.0) };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
     }
-    if mask {
-        for i in 0..pixels {
-            let there = (0..bands).any(|band| values.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
-            put(0.0, there);
-        }
+    match kind {
+        SampleType::Uint8 => write!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write!(i32, |v: f64| v as i32),
+        // Band math's largest number is an infinity once it has been through a plane of f32.
+        SampleType::Float32 => write!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }
     Bytes::from(out)
 }
@@ -2647,11 +2657,12 @@ fn paint_bands(
     custom: Option<&MosaicColormap>,
     before_map: Option<&cogzilla_kernel::ColorFormula>,
 ) -> Result<Vec<u8>, usize> {
-    // One range is for every band; several are one each.
+    // One range for each band when there are as many of them; the first for all
+    // otherwise, as TiTiler has it.
     let range = |band: usize| match rescale {
         [] => default,
-        [one] => *one,
-        several => several.get(band).copied().unwrap_or(several[0]),
+        several if several.len() == selected.bands => several[band],
+        several => several[0],
     };
     match selected.bands {
         1 => {
@@ -3128,6 +3139,11 @@ async fn part_image_of(
             }
             let default_bands =
                 if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+            // The renderer's bands are one or three: ranges that are not one each are the
+            // first for all, as TiTiler has it (the shared routes refuse two for one band).
+            if pq.rescale.len() > 1 && pq.rescale.len() != 3 {
+                pq.rescale.truncate(1);
+            }
             let mut bands = build_band_request(&pq, default_bands, full.sample_type)?;
             // Every scene is drawn the same way, and the first says how the picture is finished.
             let taken = match &formula {
@@ -4751,6 +4767,16 @@ async fn tile(
             } else {
                 full.samples_per_pixel
             };
+            // The renderer's bands are one or three: ranges that are not one each are the
+            // first for all, as TiTiler has it (the shared routes refuse two for one band).
+            let pq = if pq.rescale.len() > 1 && pq.rescale.len() != 3 {
+                let mut first = pq.clone();
+                first.rescale.truncate(1);
+                std::borrow::Cow::Owned(first)
+            } else {
+                std::borrow::Cow::Borrowed(&pq)
+            };
+            let pq: &ParsedQuery = &pq;
             let (mut treq, content_type) = build_tile_request(
                 Some(&engine),
                 tile,
@@ -4787,6 +4813,59 @@ async fn tile(
                 Some(formula) if pq.colormap_explicit && !raw_array => MapAfterFormula::take(formula, &mut treq.bands),
                 _ => None,
             };
+            // An array of a raster's own bands, read with another resampling than nearest: the
+            // renderer's values, written in the raster's type with the mask as a band, as
+            // an array from planes is. What makes a picture's bytes of them, band math and
+            // `algorithm` are still the renderer's own float32.
+            let own_bands = matches!(treq.bands, BandRequest::Single { .. } | BandRequest::Rgb { .. });
+            if matches!(treq.format, OutputFormat::Npy)
+                && own_bands
+                && selection.is_none()
+                && !pq.colormap_explicit
+                && formula.is_none()
+                && pq.expr_raw.is_none()
+                && pq.algorithm.is_none()
+                && full.extra_samples.is_empty()
+                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+            {
+                let bands = TileEngine::value_bands(&treq.bands);
+                treq.format = OutputFormat::RawF32;
+                let raw = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
+                if raw.len() == bands * dim * dim * 4 {
+                    // Several assets read as bands: the type that holds them all.
+                    let mut kind = full.sample_type;
+                    for uri in scenes[0].iter().skip(1) {
+                        kind = wider_type(kind, engine.store.open_uri(uri).await?.index.full_res().sample_type);
+                    }
+                    let kind = if pq.unscale { SampleType::Float32 } else { kind };
+                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    // A whole-number raster's values between pixels are rounded to its type.
+                    let read = raw
+                        .chunks_exact(4)
+                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                        .map(|v| if whole { v.round() } else { v });
+                    // With `rescale` the array is of the bytes a picture would show, band by
+                    // band, in the ranges the picture's bands were given.
+                    if !pq.rescale.is_empty() {
+                        let range = |band: usize| match &treq.bands {
+                            BandRequest::Rgb { rescale_min, rescale_max, .. } => (rescale_min[band.min(2)], rescale_max[band.min(2)]),
+                            BandRequest::Single { rescale, .. } => *rescale,
+                            _ => pq.rescale[0],
+                        };
+                        let values: Vec<f32> = read
+                            .enumerate()
+                            .map(|(i, v)| {
+                                let (min, max) = range(i / (dim * dim));
+                                if v.is_nan() { v } else { f32::from(rescale_byte(v, min, max)) }
+                            })
+                            .collect();
+                        return Ok((npy_array(&values, bands, dim, dim, SampleType::Uint8, return_mask, None), content_type));
+                    }
+                    let values: Vec<f32> = read.collect();
+                    return Ok((npy_array(&values, bands, dim, dim, kind, return_mask, None), content_type));
+                }
+                treq.format = OutputFormat::Npy;
+            }
             // A formula on one band works on the band's byte, made here from the values.
             let exact = formula.is_some()
                 && !raw_array

@@ -138,7 +138,7 @@ def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     return mask >= 99.0 and psnr >= 25.0, f"mask {mask:.2f}%, PSNR {psnr:.1f} dB"
 
 
-def compare_arrays(cz: bytes, tt: bytes) -> tuple[bool, str]:
+def compare_arrays(cz: bytes, tt: bytes, smooth: bool = False) -> tuple[bool, str]:
     """NumPy arrays: the same type and shape, the same mask band, and values as close as
     two pictures of them would be (most equal; the rest from the pixel next door)."""
     try:
@@ -162,6 +162,11 @@ def compare_arrays(cz: bytes, tt: bytes) -> tuple[bool, str]:
         return mask >= 99.0 and tops and close, f"{a.dtype} {a.shape}, mask {mask:.2f}%, mean {va.mean():.5g} vs {vb.mean():.5g}"
     # Band by band: one band that is wrong is not hidden by the others that are right.
     same = min(float((va[i] == vb[i]).mean()) * 100 for i in range(va.shape[0]))
+    if smooth:
+        # Between pixels two readers do not land on the same number: the worst band's
+        # mean difference is held to a tenth of its mean value.
+        off = max(float(np.abs(va[i] - vb[i]).mean() / (np.abs(vb[i]).mean() + 1e-9)) for i in range(va.shape[0])) * 100
+        return mask >= 99.0 and tops and off <= 10.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, values {off:.1f}% apart in the worst band"
     return mask >= 99.0 and tops and same >= 75.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, {same:.1f}% of values equal in the worst band"
 
 
@@ -322,7 +327,7 @@ class Oracle:
             elif ct_cz != ct_tt:
                 ok, note = False, f"content type {ct_cz} vs {ct_tt}"
             elif cz.content[:6] == b"\x93NUMPY":
-                ok, note = compare_arrays(cz.content, tt.content)
+                ok, note = compare_arrays(cz.content, tt.content, smooth="resampling=" in path)
             else:
                 ok, note = compare_images(cz.content, tt.content)
                 note = f"{ct_cz}, {note}"
@@ -727,6 +732,10 @@ def main() -> int:
         o.check("tile as an array, five assets", "image", f"{base12}.npy?assets=red&assets=green&assets=blue&assets=nir&assets=scl")
         o.check("tile as an array, band math", "image", f"{base12}.npy?assets=red&expression=b1*2")
         o.check("tile as an array, a mean", "image", f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3")
+        o.check("tile as an array, bilinear", "image", f"{base12}.npy?assets=red&resampling=bilinear&reproject=bilinear")
+        o.check("tile as an array, bilinear, three bands", "image", f"{base12}.npy?assets=visual&resampling=bilinear&reproject=bilinear")
+        o.check("tile as an array, bilinear, rescaled", "image",
+                f"{base12}.npy?assets=red&rescale=0,3000&resampling=bilinear&reproject=bilinear")
         o.check("box as an array, band math in doubles", "image",
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/120x80.npy?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)")
         o.check("feature as an array, band math", "image",

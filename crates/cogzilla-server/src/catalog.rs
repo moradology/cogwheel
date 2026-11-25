@@ -400,12 +400,25 @@ pub fn tile_to_quadkey(z: u8, x: u32, y: u32) -> String {
 /// `/mosaic/{name}/tiles` (via `--mosaic`) and `/mosaicjson/tiles?...&url=...`.
 pub struct MosaicJsonCatalog {
     pub version: String,
+    pub doc_version: String,
     pub name: Option<String>,
     pub minzoom: u8,
     pub maxzoom: u8,
     pub quadkey_zoom: u8,
     pub bounds: [f64; 4],
+    pub raw_json: serde_json::Value,
     tiles: HashMap<String, Vec<String>, ahash::RandomState>,
+}
+
+fn apply_asset_prefix(prefix: &str, asset: &str) -> String {
+    if prefix.is_empty() || asset.starts_with('/') || asset.contains("://") {
+        return asset.to_string();
+    }
+    if prefix.ends_with('/') {
+        format!("{prefix}{asset}")
+    } else {
+        format!("{prefix}/{asset}")
+    }
 }
 
 impl MosaicJsonCatalog {
@@ -417,7 +430,17 @@ impl MosaicJsonCatalog {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'mosaicjson' version field".to_string())?
             .to_string();
+        let doc_version = val
+            .get("version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("1.0.0")
+            .to_string();
         let name = val.get("name").and_then(|v| v.as_str()).map(String::from);
+        let asset_prefix = val
+            .get("asset_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let minzoom = val.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
         let maxzoom = val.get("maxzoom").and_then(|v| v.as_u64()).unwrap_or(22) as u8;
         let bounds = val
@@ -439,7 +462,7 @@ impl MosaicJsonCatalog {
             if let Some(urls) = arr.as_array() {
                 let list: Vec<String> = urls
                     .iter()
-                    .filter_map(|u| u.as_str().map(|s| s.to_string()))
+                    .filter_map(|u| u.as_str().map(|s| apply_asset_prefix(asset_prefix, s)))
                     .collect();
                 if !list.is_empty() {
                     tiles.insert(qk.clone(), list);
@@ -460,11 +483,13 @@ impl MosaicJsonCatalog {
 
         Ok(Self {
             version,
+            doc_version,
             name,
             minzoom,
             maxzoom,
             quadkey_zoom,
             bounds,
+            raw_json: val,
             tiles,
         })
     }
@@ -475,7 +500,7 @@ impl MosaicJsonCatalog {
         serde_json::json!({
             "bounds": self.bounds,
             "crs": "http://www.opengis.net/def/crs/EPSG/0/4326",
-            "name": self.name,
+            "name": self.name.as_deref().unwrap_or("mosaic"),
             "quadkeys": quadkeys,
             "mosaic_tilematrixset": "WebMercatorQuad",
             "mosaic_minzoom": self.minzoom,
@@ -624,8 +649,15 @@ pub fn load_catalog_json_str(json: &str) -> Result<Arc<dyn SceneCatalog>, String
 }
 
 pub fn load_catalog_json_file(path: impl AsRef<Path>) -> Result<Arc<dyn SceneCatalog>, String> {
-    let raw = std::fs::read_to_string(path.as_ref())
+    let raw_bytes = std::fs::read(path.as_ref())
         .map_err(|e| format!("failed to read catalog {}: {e}", path.as_ref().display()))?;
+    let json_bytes = if raw_bytes.len() >= 2 && raw_bytes[0] == 0x1f && raw_bytes[1] == 0x8b {
+        cogzilla_codec::decompress_gzip_limited(&raw_bytes, 64 * 1024 * 1024)?
+    } else {
+        raw_bytes
+    };
+    let raw = String::from_utf8(json_bytes)
+        .map_err(|e| format!("catalog {} is not valid UTF-8: {e}", path.as_ref().display()))?;
     load_catalog_json_str(&raw)
 }
 

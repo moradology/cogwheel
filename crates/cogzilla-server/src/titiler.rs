@@ -13,8 +13,11 @@ use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
 
-fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta) -> Vec<&'static str> {
+fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta, has_color_map: bool) -> Vec<&'static str> {
     let count = full.samples_per_pixel as usize;
+    if has_color_map || full.photometric == 3 {
+        return vec!["palette"; count];
+    }
     let alpha_idx = cogzilla_codec::alpha_channel_index(count, &full.extra_samples);
     match full.photometric {
         // RGB (2) or YCbCr (6)
@@ -27,8 +30,6 @@ fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta) -> Vec<&'static str> {
                 _ => "undefined",
             })
             .collect(),
-        // Palette (3)
-        3 => vec!["palette"; count],
         // MinIsWhite (0) or MinIsBlack (1)
         0 | 1 => (0..count)
             .map(|i| {
@@ -85,7 +86,7 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
             serde_json::json!([bname, desc])
         })
         .collect();
-    let colorinterp = infer_colorinterp(full);
+    let colorinterp = infer_colorinterp(full, cog.index.color_map.is_some());
     let overviews: Vec<u32> = cog
         .index
         .ifds
@@ -119,11 +120,11 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         "http://www.opengis.net/def/crs/EPSG/0/4326".to_string()
     };
 
-    let scales: Vec<f32> = (0..count)
-        .map(|i| cog.index.scales.get(i).copied().unwrap_or(1.0))
+    let scales: Vec<f64> = (0..count)
+        .map(|i| cog.index.scales_f64.get(i).copied().unwrap_or(1.0))
         .collect();
-    let offsets: Vec<f32> = (0..count)
-        .map(|i| cog.index.offsets.get(i).copied().unwrap_or(0.0))
+    let offsets: Vec<f64> = (0..count)
+        .map(|i| cog.index.offsets_f64.get(i).copied().unwrap_or(0.0))
         .collect();
 
     let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
@@ -167,9 +168,15 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         info["nodata_value"] = nv;
     }
     if let Some(ref pal) = cog.index.color_map {
+        let nd_idx: Option<usize> = cog
+            .index
+            .nodata
+            .filter(|v| v.is_finite() && *v >= 0.0 && v.fract() == 0.0)
+            .map(|v| v as usize);
         let mut cmap = serde_json::Map::with_capacity(pal.len());
         for (i, &[r, g, b, a]) in pal.iter().enumerate() {
-            cmap.insert(i.to_string(), serde_json::json!([r, g, b, a]));
+            let eff_a = if nd_idx == Some(i) { 0 } else { a };
+            cmap.insert(i.to_string(), serde_json::json!([r, g, b, eff_a]));
         }
         info["colormap"] = serde_json::Value::Object(cmap);
     }
@@ -224,7 +231,7 @@ pub fn build_cog_validate(
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    if full.is_stripped {
+    if full.is_stripped && (full.width > 512 || full.height > 512) {
         errors.push(
             "The file is not tiled (strip-organized); COGs must use tiled IFD layout".into(),
         );
@@ -236,8 +243,36 @@ pub fn build_cog_validate(
         );
     }
     for (idx, ifd) in cog.index.ifds.iter().enumerate().skip(1) {
-        if ifd.is_stripped {
+        if ifd.is_stripped && (ifd.width > 512 || ifd.height > 512) {
             errors.push(format!("Overview IFD {idx} is not tiled"));
+        }
+    }
+    // rio-cogeo COG block-offset order check: coarser overviews must be stored before finer levels.
+    let first_block_offset = |ifd: &cogzilla_tiff::IfdMeta| -> Option<u64> {
+        ifd.tile_offsets.iter().copied().find(|&o| o > 0)
+    };
+    if cog.index.ifds.len() > 1 {
+        if let (Some(main_off), Some(ov1_off)) = (
+            first_block_offset(&cog.index.ifds[0]),
+            first_block_offset(&cog.index.ifds[1]),
+        ) && main_off < ov1_off
+        {
+            errors.push(
+                "The offset of the first block of the main resolution image should be after the one of the overview of index 1"
+                    .into(),
+            );
+        }
+        for idx in 1..(cog.index.ifds.len() - 1) {
+            if let (Some(finer_off), Some(coarser_off)) = (
+                first_block_offset(&cog.index.ifds[idx]),
+                first_block_offset(&cog.index.ifds[idx + 1]),
+            ) && finer_off < coarser_off
+            {
+                errors.push(format!(
+                    "The offset of the first block of overview of index {idx} should be after the one of the overview of index {}",
+                    idx + 1
+                ));
+            }
         }
     }
 
@@ -248,6 +283,7 @@ pub fn build_cog_validate(
         cogzilla_tiff::Compression::Lzw => Some("LZW"),
         cogzilla_tiff::Compression::Jpeg => Some("JPEG"),
         cogzilla_tiff::Compression::Deflate => Some("DEFLATE"),
+        cogzilla_tiff::Compression::PackBits => Some("PACKBITS"),
         cogzilla_tiff::Compression::Zstd => Some("ZSTD"),
         cogzilla_tiff::Compression::Webp => Some("WEBP"),
     };
@@ -266,12 +302,12 @@ pub fn build_cog_validate(
     };
     let count = full.samples_per_pixel as usize;
     let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
-    let colorinterp = infer_colorinterp(full);
-    let scales: Vec<f32> = (0..count)
-        .map(|i| cog.index.scales.get(i).copied().unwrap_or(1.0))
+    let colorinterp = infer_colorinterp(full, cog.index.color_map.is_some());
+    let scales: Vec<f64> = (0..count)
+        .map(|i| cog.index.scales_f64.get(i).copied().unwrap_or(1.0))
         .collect();
-    let offsets: Vec<f32> = (0..count)
-        .map(|i| cog.index.offsets.get(i).copied().unwrap_or(0.0))
+    let offsets: Vec<f64> = (0..count)
+        .map(|i| cog.index.offsets_f64.get(i).copied().unwrap_or(0.0))
         .collect();
     let nodata_json = match cog.index.nodata {
         Some(v) if v.is_nan() => serde_json::json!("nan"),
@@ -824,6 +860,20 @@ pub fn build_tilejson(
     } else {
         format!("{origin}/cog/tiles/{tms}/{{z}}/{{x}}/{{y}}?{raw_query}")
     };
+    let count = full.samples_per_pixel as usize;
+    let band_descriptions: Vec<_> = (0..count)
+        .map(|i| {
+            let bname = format!("b{}", i + 1);
+            let desc = cog
+                .index
+                .band_descriptions
+                .get(i)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| bname.clone());
+            serde_json::json!([bname, desc])
+        })
+        .collect();
     Ok(serde_json::json!({
         "tilejson": "3.0.0",
         "name": cog.uri,
@@ -834,6 +884,8 @@ pub fn build_tilejson(
         "maxzoom": maxzoom,
         "bounds": bounds,
         "center": center,
+        "band_descriptions": band_descriptions,
+        "data_type": full.sample_type.gdal_name(),
     }))
 }
 
@@ -861,7 +913,9 @@ pub async fn query_point(
     let row = row_f.floor() as i64;
 
     let count = ifd.samples_per_pixel as usize;
-    let band_names: Vec<String> = (1..=count).map(|i| format!("b{i}")).collect();
+    let alpha_idx = cogzilla_codec::alpha_channel_index(count, &ifd.extra_samples);
+    let data_bands: Vec<usize> = (0..count).filter(|&b| Some(b) != alpha_idx).collect();
+    let band_names: Vec<String> = data_bands.iter().map(|&b| format!("b{}", b + 1)).collect();
 
     if !col_f.is_finite()
         || !row_f.is_finite()
@@ -895,12 +949,12 @@ pub async fn query_point(
         }
     };
 
-    let mut values: Vec<serde_json::Value> = Vec::with_capacity(count);
+    let mut values: Vec<serde_json::Value> = Vec::with_capacity(data_bands.len());
     match ifd.planar_config {
         PlanarConfig::Chunky => {
             let idx = ifd.tile_index(tx, ty, 0) as u32;
             let tiles = engine.store.get_blocks(cog, 0, &[Some(idx)]).await?;
-            for b in 0..count {
+            for &b in &data_bands {
                 let v = maybe_unscale(
                     b,
                     tiles[0]
@@ -917,14 +971,15 @@ pub async fn query_point(
             }
         }
         PlanarConfig::Planar => {
-            let indices: Vec<Option<u32>> = (0..count)
-                .map(|b| Some(ifd.tile_index(tx, ty, b as u16) as u32))
+            let indices: Vec<Option<u32>> = data_bands
+                .iter()
+                .map(|&b| Some(ifd.tile_index(tx, ty, b as u16) as u32))
                 .collect();
             let tiles = engine.store.get_blocks(cog, 0, &indices).await?;
-            for b in 0..count {
+            for (slot, &b) in data_bands.iter().enumerate() {
                 let v = maybe_unscale(
                     b,
-                    tiles[b]
+                    tiles[slot]
                         .as_ref()
                         .and_then(|t| t.bands.first())
                         .map(|band| band.data.get_f32(pidx))
@@ -2411,13 +2466,16 @@ fn compute_statistics_cpu(
         total_pixels
     };
 
+    let alpha_idx = cogzilla_codec::alpha_channel_index(count, &ifd.extra_samples);
     let mut out = serde_json::Map::new();
     let selected_bands: Option<&[u16]> = opts.bidx.as_deref().filter(|b| !b.is_empty());
     for (b, acc) in per_band.into_iter().enumerate() {
         let band_1based = (b + 1) as u16;
-        if let Some(sel) = selected_bands
-            && !sel.contains(&band_1based)
-        {
+        if let Some(sel) = selected_bands {
+            if !sel.contains(&band_1based) {
+                continue;
+            }
+        } else if Some(b) == alpha_idx {
             continue;
         }
         let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
@@ -3308,9 +3366,12 @@ pub async fn compute_statistics_with_options(
             }
             return Ok(serde_json::Value::Object(out));
         }
+        let alpha_idx = cogzilla_codec::alpha_channel_index(count as usize, &full.extra_samples);
         let sel_bands: Vec<u16> = match &opts.bidx {
             Some(b) if !b.is_empty() => b.clone(),
-            _ => (1..=count).collect(),
+            _ => (1..=count)
+                .filter(|&b| Some((b - 1) as usize) != alpha_idx)
+                .collect(),
         };
         for chunk in sel_bands.chunks(15) {
             let bands_req = if chunk.len() == 1 {

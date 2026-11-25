@@ -166,7 +166,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     )
     .await;
     assert_eq!(pt_expr["values"].as_array().unwrap().len(), 1);
-    assert_eq!(pt_expr["band_names"][0], "b1-b2");
+    assert_eq!(pt_expr["band_names"][0], "b1");
+    assert_eq!(pt_expr["band_descriptions"][0], "b1-b2");
 
     let pt_b2 = get_json(
         &client,
@@ -193,7 +194,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
     )
     .await;
     assert_eq!(pt_multi["values"].as_array().unwrap().len(), 2);
-    assert_eq!(pt_multi["band_names"], serde_json::json!(["b1-b2", "b2-b3"]));
+    assert_eq!(pt_multi["band_names"], serde_json::json!(["b1", "b2"]));
+    assert_eq!(pt_multi["band_descriptions"], serde_json::json!(["b1-b2", "b2-b3"]));
 
     let tif_resp = client
         .get(format!("{base}/cog/tiles/WebMercatorQuad/10/163/395.tif?url={sat_url}&rescale=0,1"))
@@ -880,10 +882,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(mj_info["quadkeys"].as_array().is_some_and(|a| !a.is_empty()));
             assert!(mj_info["crs"].as_str().is_some());
 
-            // Non-WebMercatorQuad TMS on /mosaicjson/tiles (WorldCRS84Quad)
+            // Non-WebMercatorQuad TMS on /mosaicjson/tiles (WorldCRS84Quad overlapping 12/655/1583)
             let mj_crs84 = client
                 .get(format!(
-                    "{base}/mosaicjson/tiles/WorldCRS84Quad/10/325/297.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"
+                    "{base}/mosaicjson/tiles/WorldCRS84Quad/10/327/297.png?url={mj_url}&rescale=0,2500&colormap_name=viridis"
                 ))
                 .send()
                 .await
@@ -915,7 +917,8 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}&expression=b1*2"),
             )
             .await;
-            assert_eq!(mj_pt_expr["assets"][0]["band_names"][0], "b1*2");
+            assert_eq!(mj_pt_expr["assets"][0]["band_names"][0], "b1");
+            assert_eq!(mj_pt_expr["assets"][0]["band_descriptions"][0], "b1*2");
             let mj_stats = get_json(&client, format!("{base}/mosaicjson/statistics?url={mj_url}&max_size=128")).await;
             assert!(mj_stats["b1"]["mean"].is_number());
             let mj_bbox = client
@@ -927,7 +930,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
             assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
-            // Empty buffered /mosaicjson/tiles must honor ?buffer=8 -> 272x272 PNG
+            // Empty /mosaicjson/tiles returns 204 No Content (matching TiTiler 2.4 EmptyMosaicError)
             let mj_empty_buf = client
                 .get(format!(
                     "{base}/mosaicjson/tiles/WebMercatorQuad/12/0/0.png?url={mj_url}&buffer=8"
@@ -935,12 +938,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(mj_empty_buf.status(), 200);
-            let mj_eb_bytes = mj_empty_buf.bytes().await.unwrap();
-            assert_eq!(&mj_eb_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            let eb_w = u32::from_be_bytes([mj_eb_bytes[16], mj_eb_bytes[17], mj_eb_bytes[18], mj_eb_bytes[19]]);
-            let eb_h = u32::from_be_bytes([mj_eb_bytes[20], mj_eb_bytes[21], mj_eb_bytes[22], mj_eb_bytes[23]]);
-            assert_eq!((eb_w, eb_h), (272, 272));
+            assert_eq!(mj_empty_buf.status(), 204);
 
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
@@ -1418,6 +1416,94 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let cnt_v = read_f32_first(&cnt_bytes);
             assert!(hi_v >= lo_v, "highest ({hi_v}) must be >= lowest ({lo_v})");
             assert!((cnt_v - 2.0).abs() < 1e-4, "count on 2 identical scenes must be 2.0, got {cnt_v}");
+
+            // Sweep #1 C1, C2, C3, C4, D2(validate), D3 regression checks
+            let cog_stac = get_json(
+                &client,
+                format!("{base}/cog/stac?url={sat_url}&id=my-sat&collection=c1&asset_name=rgb"),
+            )
+            .await;
+            assert_eq!(cog_stac["type"], "Feature");
+            assert_eq!(cog_stac["stac_version"], "1.0.0");
+            assert_eq!(cog_stac["id"], "my-sat");
+            assert_eq!(cog_stac["collection"], "c1");
+            assert_eq!(cog_stac["properties"]["proj:epsg"], 32610);
+            assert!(cog_stac["assets"]["rgb"]["raster:bands"].is_array());
+            assert!(cog_stac["assets"]["rgb"]["eo:bands"].is_array());
+
+            let viewer_cog = client
+                .get(format!("{base}/cog/viewer?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(viewer_cog.status(), 200);
+            assert!(viewer_cog.text().await.unwrap().contains("tilejson.json"));
+
+            let stac_renders_path = std::env::temp_dir().join(format!(
+                "cogzilla_test_stac_renders_{}.json",
+                std::process::id()
+            ));
+            let stac_renders_doc = serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": "renders-test",
+                "bbox": [-122.9, 37.5, -122.4, 38.0],
+                "geometry": null,
+                "properties": {},
+                "assets": {
+                    "red": { "href": sat_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+                },
+                "renders": {
+                    "visual": { "assets": ["red"], "rescale": [[0, 1]] }
+                }
+            });
+            std::fs::write(&stac_renders_path, stac_renders_doc.to_string()).unwrap();
+            let stac_item_url = stac_renders_path.to_str().unwrap();
+            let viewer_stac = client
+                .get(format!("{base}/stac/viewer?url={stac_item_url}&assets=red"))
+                .send().await.unwrap();
+            assert_eq!(viewer_stac.status(), 200);
+
+            let renders_json = get_json(&client, format!("{base}/stac/renders?url={stac_item_url}")).await;
+            assert!(renders_json["visual"].is_object());
+            let visual_render = get_json(&client, format!("{base}/stac/renders/visual?url={stac_item_url}")).await;
+            assert_eq!(visual_render["assets"][0], "red");
+            let missing_render = client
+                .get(format!("{base}/stac/renders/nonexistent?url={stac_item_url}"))
+                .send().await.unwrap();
+            assert_eq!(missing_render.status(), 404);
+            let _ = std::fs::remove_file(&stac_renders_path);
+
+            let mj_doc = serde_json::json!({
+                "mosaicjson": "0.0.3",
+                "minzoom": 10,
+                "maxzoom": 12,
+                "quadkey_zoom": 10,
+                "bounds": [-123.0, 37.0, -122.0, 38.0],
+                "tiles": { "0230102033": [merc_url.clone()] }
+            });
+            let mj_val = client
+                .post(format!("{base}/mosaicjson/validate"))
+                .header("content-type", "application/json")
+                .body(mj_doc.to_string())
+                .send().await.unwrap();
+            assert_eq!(mj_val.status(), 200);
+            let mj_val_json: serde_json::Value =
+                serde_json::from_slice(&mj_val.bytes().await.unwrap()).unwrap();
+            assert_eq!(mj_val_json["mosaicjson"], "0.0.3");
+            assert!(mj_val_json["tiles"].is_object());
+
+            let mj_root_path = std::env::temp_dir().join(format!(
+                "cogzilla_test_mj_root_{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&mj_root_path, mj_doc.to_string()).unwrap();
+            let mj_root = get_json(
+                &client,
+                format!("{base}/mosaicjson/?url={}", mj_root_path.to_str().unwrap()),
+            )
+            .await;
+            assert_eq!(mj_root["mosaicjson"], "0.0.3");
+            assert!(mj_root["tiles"].is_object());
+            let _ = std::fs::remove_file(&mj_root_path);
         }
     }
 }

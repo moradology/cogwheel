@@ -80,6 +80,8 @@ pub enum EngineError {
     BadRequest(String),
     #[error("dataset not found: {0}")]
     NotFound(String),
+    #[error("no content")]
+    NoContent,
     #[error("{0}")]
     Shared(Arc<EngineError>),
 }
@@ -2557,6 +2559,8 @@ mod tests {
             nodata: None,
             scales: vec![1.0; 3],
             offsets: vec![0.0; 3],
+            scales_f64: vec![1.0; 3],
+            offsets_f64: vec![0.0; 3],
             band_metadata: vec![Vec::new(); 3],
             band_descriptions: vec![String::new(); 3],
             color_map: None,
