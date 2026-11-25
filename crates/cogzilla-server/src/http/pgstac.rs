@@ -1882,6 +1882,12 @@ impl Window {
                     if nodata.is_some() {
                         return Err(nearest_only());
                     }
+                    if !matches!(request.tile_size, 256 | 512) {
+                        return Err(EngineError::BadRequest(format!(
+                            "tilesize={} is drawn with nearest-neighbour resampling only; use 256 or 512 otherwise",
+                            request.tile_size
+                        )));
+                    }
                     return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
                 };
                 // The way GDAL's warp reads a tile: from the overview it would pick for
@@ -2146,10 +2152,9 @@ impl PlanesTile {
         // A tile's planes are small, and its items are read eight at once from the start.
         // An image's can be large: its first item is read alone, and how many follow at
         // once is set by what that one took.
-        let mut ahead = match self.window {
-            Window::Tile(_) => MOSAIC_SCENES_AHEAD,
-            Window::Part { .. } => 1,
-        };
+        // So can a tile's above 512 pixels a side, which is read as an image is.
+        let small = matches!(self.window, Window::Tile(_)) && pixels <= 512 * 512;
+        let mut ahead = if small { MOSAIC_SCENES_AHEAD } else { 1 };
         loop {
             while reading.len() < ahead && next < scenes.len() {
                 reading.push_back(Box::pin(self.item(engine, &scenes[next])));
@@ -2159,7 +2164,7 @@ impl PlanesTile {
                 break;
             };
             let item = item?;
-            if matches!(self.window, Window::Part { .. }) {
+            if !small {
                 ahead = (2 * MAX_PLANE_VALUES / (item.stacked.max(item.bands.len()).max(1) * pixels).max(1))
                     .clamp(1, MOSAIC_SCENES_AHEAD);
             }
@@ -4130,6 +4135,10 @@ async fn tile(
         Ok(names) => names,
         Err(r) => return r,
     };
+    // `@{n}x` is a tile of n times 256 pixels, within the sizes `tilesize` takes.
+    if scale.is_some_and(|s| !(1..=8).contains(&s)) {
+        return detail(StatusCode::BAD_REQUEST, "a tile's scale is from @1x to @8x");
+    }
     // A `nodata` of the request's own leaves the listing to pgSTAC's search: the lean
     // lookup passes over an item whose footprint adds nothing, and its raster may not.
     let grid = if pq.nodata.is_some() { None } else { tile_grid(scale, &pq) };
