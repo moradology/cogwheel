@@ -46,7 +46,7 @@ pub fn wgs84_bbox_to_3857(bbox: [f64; 4]) -> [f64; 4] {
         ((std::f64::consts::FRAC_PI_4 + clamped * 0.5).tan().ln() * WEB_MERCATOR_R)
             .clamp(-ORIGIN_SHIFT, ORIGIN_SHIFT)
     };
-    let (min_x, max_x) = if bbox[0] > bbox[2] {
+    let (min_x, max_x) = if bbox[0] > bbox[2] || bbox[0] < -180.0 || bbox[2] > 180.0 {
         // Antimeridian-crossing bbox: cover full WebMercator X span conservatively.
         (-ORIGIN_SHIFT, ORIGIN_SHIFT)
     } else {

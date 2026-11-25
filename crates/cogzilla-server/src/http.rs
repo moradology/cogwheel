@@ -1063,8 +1063,15 @@ fn reproject_wgs84_bounds(
     if matches!(dst, cogzilla_proj::CrsModel::Geographic) {
         return Ok(wgs84);
     }
-    let [w, s, e, n] = wgs84;
+    let [w, mut s, e, mut n] = wgs84;
+    // TransverseMercator::forward_raw rejects |lat| > 1.56 rad (~89.38°); clamp polar edges
+    // to [-89°, 89°] so global COGs don't drop the 67.5°..89.3° band above the interior lattice.
+    if matches!(dst, cogzilla_proj::CrsModel::TransverseMercator(_)) {
+        s = s.clamp(-89.0, 89.0);
+        n = n.clamp(-89.0, 89.0);
+    }
     let antimeridian = e < w;
+    let crosses_180 = antimeridian || e > 180.0;
     let lon_span = if antimeridian { (e + 360.0) - w } else { e - w };
     let wrap_lon = |lo: f64| if lo > 180.0 { lo - 360.0 } else { lo };
     let mut min_x = f64::INFINITY;
@@ -1087,9 +1094,9 @@ fn reproject_wgs84_bounds(
         let lat = s + (n - s) * t;
         accum(lon, s);
         accum(lon, n);
-        accum(w, lat);
-        accum(e, lat);
-        if antimeridian {
+        accum(wrap_lon(w), lat);
+        accum(wrap_lon(e), lat);
+        if crosses_180 {
             accum(180.0, lat);
             accum(-180.0, lat);
         }
@@ -1213,6 +1220,12 @@ fn bbox_to_wgs84(
         (x0, my),
         (x1, my),
     ];
+    let (center_lon, center_lat) = crs.to_lonlat_deg(mx, my);
+    let mut ref_lon = if center_lon.is_finite() && center_lat.is_finite() {
+        Some(center_lon)
+    } else {
+        None
+    };
     let mut min_lon = f64::INFINITY;
     let mut min_lat = f64::INFINITY;
     let mut max_lon = f64::NEG_INFINITY;
@@ -1220,11 +1233,17 @@ fn bbox_to_wgs84(
     for (x, y) in pts {
         let (lo, la) = crs.to_lonlat_deg(x, y);
         if lo.is_finite() && la.is_finite() {
-            min_lon = min_lon.min(lo);
-            max_lon = max_lon.max(lo);
+            let r = *ref_lon.get_or_insert(lo);
+            let unwrapped = r + ((lo - r + 180.0).rem_euclid(360.0) - 180.0);
+            min_lon = min_lon.min(unwrapped);
+            max_lon = max_lon.max(unwrapped);
             min_lat = min_lat.min(la);
             max_lat = max_lat.max(la);
         }
+    }
+    if min_lon < -180.0 {
+        min_lon += 360.0;
+        max_lon += 360.0;
     }
     if !min_lon.is_finite() || min_lon >= max_lon || min_lat >= max_lat {
         return Err(EngineError::BadRequest(
@@ -1232,6 +1251,29 @@ fn bbox_to_wgs84(
         ));
     }
     Ok([min_lon, min_lat, max_lon, max_lat])
+}
+
+/// Query a MosaicJSON's WebMercator quadkey index for a WGS84 bbox, splitting antimeridian-crossing
+/// bboxes (`e > 180` or `w > e`) into eastern and western hemisphere halves deduplicated in order.
+fn query_mosaicjson_wgs84_bbox(mj: &crate::catalog::MosaicJsonCatalog, wgs_bbox: [f64; 4]) -> Vec<String> {
+    let [w, s, e, n] = wgs_bbox;
+    let query_half = |lo0: f64, lo1: f64| {
+        let (mx0, my0) = lonlat_deg_to_mercator(lo0, s);
+        let (mx1, my1) = lonlat_deg_to_mercator(lo1, n);
+        mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1))
+    };
+    if e > 180.0 || w > e {
+        let e_wrapped = if e > 180.0 { e - 360.0 } else { e };
+        let mut urls = query_half(w.clamp(-180.0, 180.0), 180.0);
+        for u in query_half(-180.0, e_wrapped.clamp(-180.0, 180.0)) {
+            if !urls.contains(&u) {
+                urls.push(u);
+            }
+        }
+        urls
+    } else {
+        query_half(w, e)
+    }
 }
 
 /// Check whether a requested tile intersects the dataset's WGS84 footprint (used to return
@@ -2043,6 +2085,13 @@ fn build_tile_request_for_tms(
             }
         }
     };
+    let buffered_dim = (tile_size as f32 + 2.0 * pq.buffer).round() as u32;
+    if buffered_dim > 4096 {
+        return Err(EngineError::BadRequest(format!(
+            "buffered tile size {buffered_dim} (tile_size={tile_size}, buffer={}) exceeds maximum (4096) for {tms_id}",
+            pq.buffer
+        )));
+    }
     Ok((
         TileRequest {
             tile,
@@ -3565,9 +3614,7 @@ where
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
-                let (mx0, my0) = lonlat_deg_to_mercator(wgs_bbox[0], wgs_bbox[1]);
-                let (mx1, my1) = lonlat_deg_to_mercator(wgs_bbox[2], wgs_bbox[3]);
-                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
@@ -3601,9 +3648,7 @@ where
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
-                let (mx0, my0) = lonlat_deg_to_mercator(wgs_bbox[0], wgs_bbox[1]);
-                let (mx1, my1) = lonlat_deg_to_mercator(wgs_bbox[2], wgs_bbox[3]);
-                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
@@ -6991,6 +7036,38 @@ mod tests {
         assert!(normalize_render_bbox(
             [10.0, 0.0, 5.0, 1.0],
             &cogzilla_proj::CrsModel::Epsg3857,
+        )
+        .is_err());
+
+        // 13. bbox_to_wgs84 unwraps antimeridian-crossing projected bboxes instead of inverting
+        let utm60n = cogzilla_proj::CrsModel::from_epsg(32660).unwrap();
+        let am_wgs = bbox_to_wgs84([800_000.0, 0.0, 900_000.0, 100_000.0], Some(&utm60n)).unwrap();
+        assert!(
+            am_wgs[0] > 179.0 && am_wgs[2] > 180.0 && (am_wgs[2] - am_wgs[0]) < 2.0,
+            "antimeridian UTM60N bbox inverted to complement: {am_wgs:?}"
+        );
+
+        // 14. reproject_wgs84_bounds into UTM on a global [-180,-90,180,90] COG covers >67.5°N
+        let utm31_global = reproject_wgs84_bounds([-180.0, -90.0, 180.0, 90.0], &utm31).unwrap();
+        let (_, sval_y) = utm31.from_lonlat_deg(3.0, 78.0);
+        assert!(
+            sval_y <= utm31_global[3],
+            "global UTM31 bounds truncated below 78°N ({sval_y} > {})",
+            utm31_global[3]
+        );
+
+        // 15. Buffered CDB1GlobalGrid @4x tile exceeding 4096 px must return 400 (not silent clamp)
+        let pq_cdb_buf = parse_query(Some("url=a.tif&buffer=64"));
+        assert!(build_tile_request_for_tms(
+            None,
+            TileCoord { z: 0, x: 0, y: 0 },
+            Some(4),
+            Some("png"),
+            &pq_cdb_buf,
+            1,
+            cogzilla_tiff::SampleType::Uint8,
+            "CDB1GlobalGrid",
+            None,
         )
         .is_err());
     }
