@@ -129,6 +129,28 @@ pub struct TileEngine {
     pub stats: Arc<EngineStats>,
 }
 
+/// Fast check whether all COGs in a multi-COG / STAC composite share the exact same base
+/// dimensions, tile grid, and overview count (allowing the zero-copy single-grid fast path).
+pub(crate) fn cogs_share_base_grid(cogs: &[Arc<OpenedCog>]) -> bool {
+    if cogs.len() <= 1 {
+        return true;
+    }
+    let p = cogs[0].index.full_res();
+    let n_ifds = cogs[0].index.ifds.len();
+    cogs.iter().skip(1).all(|c| {
+        if c.index.ifds.len() != n_ifds {
+            return false;
+        }
+        let o = c.index.full_res();
+        o.width == p.width
+            && o.height == p.height
+            && o.tile_width == p.tile_width
+            && o.tile_height == p.tile_height
+            && o.tiles_across == p.tiles_across
+            && o.tiles_down == p.tiles_down
+    })
+}
+
 /// Verify that all secondary COGs in a multi-COG / STAC composite share the exact same overview
 /// index, image dimensions, and internal tile grid as `cogs[0]` so `BandSource` never reads OOB.
 pub(crate) fn validate_multi_cog_grid(

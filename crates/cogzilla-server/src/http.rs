@@ -284,7 +284,11 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "asset_bidx" => {
                 let dec = percent_decode(v);
-                if let Some((_name, bidx_str)) = dec.split_once('|') {
+                if let Some((name, bidx_str)) = dec.split_once('|') {
+                    let name = name.trim();
+                    if !name.is_empty() && !pq.assets.iter().any(|a| a == name) {
+                        pq.assets.push(name.to_string());
+                    }
                     for tok in bidx_str.split(',') {
                         match tok.trim().parse::<u16>() {
                             Ok(b) if b >= 1 => pq.bidx.push(b),
@@ -3065,7 +3069,8 @@ where
                                 || pq.buffer > 0.0
                                 || (treq.tile_size != 256 && treq.tile_size != 512)
                                 || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
-                                || has_embedded_palette(&pq, &cogs[0], &treq.bands);
+                                || has_embedded_palette(&pq, &cogs[0], &treq.bands)
+                                || !crate::engine::cogs_share_base_grid(&cogs);
                             if needs_general_path {
                                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
                                 let cf = pq
@@ -3733,7 +3738,8 @@ where
                             || pq_stac.custom_colormap_json.is_some()
                             || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512)
-                            || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands);
+                            || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
+                            || !crate::engine::cogs_share_base_grid(&cogs);
                         if needs_general {
                             let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
                             let cf = pq_stac
@@ -4478,7 +4484,8 @@ where
                             || pq.custom_colormap_json.is_some()
                             || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512)
-                            || has_embedded_palette(&pq, &cogs[0], &treq.bands);
+                            || has_embedded_palette(&pq, &cogs[0], &treq.bands)
+                            || !crate::engine::cogs_share_base_grid(&cogs);
 
                         if needs_general_path {
                             let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;

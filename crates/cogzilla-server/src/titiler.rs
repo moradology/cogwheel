@@ -3363,7 +3363,27 @@ async fn render_bbox_impl(
         }
         primary.index.select_ifd(target_rx, target_ry)
     };
-    crate::engine::validate_multi_cog_grid(cogs, ifd_idx)?;
+    if cogs.len() > 1 && crate::engine::validate_multi_cog_grid(cogs, ifd_idx).is_err() {
+        return render_mixed_grid_bbox(
+            engine,
+            cogs,
+            bbox,
+            dst_crs,
+            native_preview,
+            w,
+            h,
+            poly_mask,
+            bands,
+            resample,
+            format,
+            nodata_override,
+            custom_lut,
+            color_formula,
+            return_mask,
+            unscale,
+        )
+        .await;
+    }
     let ifd = &primary.index.ifds[ifd_idx];
 
     // Precompute source pixel coordinates `(u, v)`.
@@ -4647,4 +4667,439 @@ pub fn build_map_html(tilejson_url: &str) -> String {
 </body>
 </html>"#
     )
+}
+
+/// Fallback multi-COG / STAC renderer when assets have mixed resolutions, tile grids, overview
+/// counts, or CRSes (e.g. Sentinel-2 10m + 20m bands). Samples each needed asset independently
+/// into a `(w * h)` f32 plane in the target CRS, then evaluates the band math / styling / encoding.
+#[allow(clippy::too_many_arguments)]
+async fn render_mixed_grid_bbox(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    _native_preview: bool,
+    w: usize,
+    h: usize,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&CustomColormap>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    let max_b = cogs.len() as u16;
+    let mut needed: Vec<u16> = Vec::new();
+    let mut push_b = |b: u16| -> Result<(), EngineError> {
+        if b == 0 || b > max_b {
+            return Err(EngineError::BadRequest(format!(
+                "band {b} out of range (dataset has {max_b} assets)"
+            )));
+        }
+        if !needed.contains(&b) {
+            needed.push(b);
+        }
+        Ok(())
+    };
+    match bands {
+        BandRequest::Single { band_1based, .. }
+        | BandRequest::Terrain { band_1based, .. }
+        | BandRequest::Dem { band_1based, .. }
+        | BandRequest::Spectral1 { band_1based, .. } => push_b(*band_1based)?,
+        BandRequest::SarRgb { bands_1based, .. } | BandRequest::Spectral2 { bands_1based, .. } => {
+            push_b(bands_1based[0])?;
+            push_b(bands_1based[1])?;
+        }
+        BandRequest::Rgb { bands_1based, .. } | BandRequest::Spectral3 { bands_1based, .. } => {
+            push_b(bands_1based[0])?;
+            push_b(bands_1based[1])?;
+            push_b(bands_1based[2])?;
+        }
+        BandRequest::CustomExpr { prog, .. } => {
+            for &b in &prog.used_bands {
+                push_b(b)?;
+            }
+        }
+        BandRequest::CustomExprRgb { progs, .. } => {
+            for p in progs {
+                for &b in &p.used_bands {
+                    push_b(b)?;
+                }
+            }
+        }
+    }
+
+    // Sample each needed COG independently into a w*h f32 plane in target CRS.
+    let mut planes: Vec<(u16, Vec<f32>)> = Vec::with_capacity(needed.len());
+    for &b1 in &needed {
+        let single_cog = [cogs[(b1 - 1) as usize].clone()];
+        let single_band = BandRequest::Single {
+            band_1based: 1,
+            rescale: (0.0, 1.0),
+            colormap: ColormapName::Grayscale,
+        };
+        let raw = Box::pin(render_bbox_impl(
+            engine,
+            &single_cog,
+            bbox,
+            dst_crs,
+            false,
+            w as u32,
+            h as u32,
+            poly_mask,
+            &single_band,
+            resample,
+            OutputFormat::RawF32,
+            nodata_override,
+            None,
+            None,
+            return_mask,
+            unscale,
+        ))
+        .await?;
+        let mut vals = vec![f32::NAN; w * h];
+        for (i, chunk) in raw.chunks_exact(4).take(w * h).enumerate() {
+            vals[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        planes.push((b1, vals));
+    }
+
+    let get_plane = |b1: u16| -> &[f32] {
+        planes
+            .iter()
+            .find(|(k, _)| *k == b1)
+            .map(|(_, v)| v.as_slice())
+            .unwrap()
+    };
+
+    let npix = w * h;
+    if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
+        let mut out = BytesMut::with_capacity(npix * 4);
+        let nb: usize = match bands {
+            BandRequest::Single { band_1based, .. } | BandRequest::Dem { band_1based, .. } => {
+                for &v in get_plane(*band_1based) {
+                    out.put_slice(&v.to_le_bytes());
+                }
+                1
+            }
+            BandRequest::Terrain {
+                band_1based,
+                encoding,
+            } => {
+                let p = get_plane(*band_1based);
+                let mut g_p = Vec::with_capacity(npix * 4);
+                let mut b_p = Vec::with_capacity(npix * 4);
+                for &elev in p {
+                    if elev.is_nan() {
+                        out.put_slice(&f32::NAN.to_le_bytes());
+                        g_p.extend_from_slice(&f32::NAN.to_le_bytes());
+                        b_p.extend_from_slice(&f32::NAN.to_le_bytes());
+                    } else {
+                        let [r, g, b] = match encoding {
+                            cogzilla_kernel::TerrainEncoding::Terrarium => {
+                                cogzilla_kernel::encode_terrarium_rgb(elev)
+                            }
+                            cogzilla_kernel::TerrainEncoding::TerrainRgb => {
+                                cogzilla_kernel::encode_terrain_rgb(elev)
+                            }
+                        };
+                        out.put_slice(&(r as f32).to_le_bytes());
+                        g_p.extend_from_slice(&(g as f32).to_le_bytes());
+                        b_p.extend_from_slice(&(b as f32).to_le_bytes());
+                    }
+                }
+                out.put_slice(&g_p);
+                out.put_slice(&b_p);
+                3
+            }
+            BandRequest::Rgb { bands_1based, .. } => {
+                for &b in bands_1based {
+                    for &v in get_plane(b) {
+                        out.put_slice(&v.to_le_bytes());
+                    }
+                }
+                3
+            }
+            BandRequest::Spectral1 {
+                band_1based, expr, ..
+            } => {
+                for &v in get_plane(*band_1based) {
+                    out.put_slice(&expr.eval1(v).to_le_bytes());
+                }
+                1
+            }
+            BandRequest::Spectral2 {
+                bands_1based, expr, ..
+            } => {
+                let p0 = get_plane(bands_1based[0]);
+                let p1 = get_plane(bands_1based[1]);
+                for i in 0..npix {
+                    out.put_slice(&expr.eval2(p0[i], p1[i]).to_le_bytes());
+                }
+                1
+            }
+            BandRequest::Spectral3 {
+                bands_1based, expr, ..
+            } => {
+                let p0 = get_plane(bands_1based[0]);
+                let p1 = get_plane(bands_1based[1]);
+                let p2 = get_plane(bands_1based[2]);
+                for i in 0..npix {
+                    out.put_slice(&expr.eval3(p0[i], p1[i], p2[i]).to_le_bytes());
+                }
+                1
+            }
+            BandRequest::SarRgb { bands_1based, .. } => {
+                let p0 = get_plane(bands_1based[0]);
+                let p1 = get_plane(bands_1based[1]);
+                let mut g_p = Vec::with_capacity(npix * 4);
+                let mut b_p = Vec::with_capacity(npix * 4);
+                for i in 0..npix {
+                    let vv = cogzilla_kernel::fast_db_from_power(p0[i]);
+                    let vh = cogzilla_kernel::fast_db_from_power(p1[i]);
+                    out.put_slice(&vv.to_le_bytes());
+                    g_p.extend_from_slice(&vh.to_le_bytes());
+                    b_p.extend_from_slice(&(vv - vh).to_le_bytes());
+                }
+                out.put_slice(&g_p);
+                out.put_slice(&b_p);
+                3
+            }
+            BandRequest::CustomExpr { prog, .. } => {
+                let p_refs: Vec<&[f32]> = prog.used_bands.iter().map(|&b| get_plane(b)).collect();
+                let mut vals = [0.0f32; 16];
+                let k = p_refs.len().min(16);
+                for i in 0..npix {
+                    for j in 0..k {
+                        vals[j] = p_refs[j][i];
+                    }
+                    out.put_slice(&prog.eval(&vals[..k]).to_le_bytes());
+                }
+                1
+            }
+            BandRequest::CustomExprRgb { progs, .. } => {
+                for prog in progs {
+                    let p_refs: Vec<&[f32]> =
+                        prog.used_bands.iter().map(|&b| get_plane(b)).collect();
+                    let mut vals = [0.0f32; 16];
+                    let k = p_refs.len().min(16);
+                    for i in 0..npix {
+                        for j in 0..k {
+                            vals[j] = p_refs[j][i];
+                        }
+                        out.put_slice(&prog.eval(&vals[..k]).to_le_bytes());
+                    }
+                }
+                3
+            }
+        };
+        let raw = out.freeze();
+        if format == OutputFormat::Npy {
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(raw, nb, h as u32, w as u32));
+        }
+        return Ok(raw);
+    }
+
+    let map_color = |v: f32, rmin: f32, inv: f32, default_cmap: ColormapName| -> [u8; 4] {
+        if let Some(cmap) = custom_lut {
+            cmap.lookup(v, rmin, inv)
+        } else {
+            let idx = ((v - rmin) * inv).clamp(0.0, 255.0) as usize;
+            let [r, g, b] = default_cmap.lut().rgb[idx];
+            [r, g, b, 255]
+        }
+    };
+
+    let mut rgba = vec![0u8; npix * 4];
+    match bands {
+        BandRequest::Single {
+            band_1based,
+            rescale: (rescale_min, rescale_max),
+            colormap,
+        }
+        | BandRequest::Dem {
+            band_1based,
+            rescale: (rescale_min, rescale_max),
+            colormap,
+            ..
+        } => {
+            let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(*rescale_min, *rescale_max);
+            for (i, &v) in get_plane(*band_1based).iter().enumerate() {
+                if !v.is_nan() {
+                    let c = map_color(v, *rescale_min, inv, *colormap);
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&c);
+                }
+            }
+        }
+        BandRequest::Rgb {
+            bands_1based,
+            rescale_min,
+            rescale_max,
+        } => {
+            let p0 = get_plane(bands_1based[0]);
+            let p1 = get_plane(bands_1based[1]);
+            let p2 = get_plane(bands_1based[2]);
+            let inv = [
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[0], rescale_max[0]),
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
+            ];
+            for i in 0..npix {
+                let (v0, v1, v2) = (p0[i], p1[i], p2[i]);
+                if !(v0.is_nan() || v1.is_nan() || v2.is_nan()) {
+                    rgba[i * 4] = ((v0 - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 1] = ((v1 - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 2] = ((v2 - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+        }
+        BandRequest::Terrain {
+            band_1based,
+            encoding,
+        } => {
+            for (i, &v) in get_plane(*band_1based).iter().enumerate() {
+                if !v.is_nan() {
+                    let [r, g, b] = match encoding {
+                        cogzilla_kernel::TerrainEncoding::Terrarium => {
+                            cogzilla_kernel::encode_terrarium_rgb(v)
+                        }
+                        cogzilla_kernel::TerrainEncoding::TerrainRgb => {
+                            cogzilla_kernel::encode_terrain_rgb(v)
+                        }
+                    };
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, 255]);
+                }
+            }
+        }
+        BandRequest::Spectral1 {
+            band_1based,
+            expr,
+            rescale,
+            colormap,
+        } => {
+            let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
+            for (i, &v) in get_plane(*band_1based).iter().enumerate() {
+                let out_v = expr.eval1(v);
+                if !out_v.is_nan() {
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&map_color(out_v, rescale.0, inv, *colormap));
+                }
+            }
+        }
+        BandRequest::Spectral2 {
+            bands_1based,
+            expr,
+            rescale,
+            colormap,
+        } => {
+            let p0 = get_plane(bands_1based[0]);
+            let p1 = get_plane(bands_1based[1]);
+            let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
+            for i in 0..npix {
+                let out_v = expr.eval2(p0[i], p1[i]);
+                if !out_v.is_nan() {
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&map_color(out_v, rescale.0, inv, *colormap));
+                }
+            }
+        }
+        BandRequest::Spectral3 {
+            bands_1based,
+            expr,
+            rescale,
+            colormap,
+        } => {
+            let p0 = get_plane(bands_1based[0]);
+            let p1 = get_plane(bands_1based[1]);
+            let p2 = get_plane(bands_1based[2]);
+            let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
+            for i in 0..npix {
+                let out_v = expr.eval3(p0[i], p1[i], p2[i]);
+                if !out_v.is_nan() {
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&map_color(out_v, rescale.0, inv, *colormap));
+                }
+            }
+        }
+        BandRequest::SarRgb {
+            bands_1based,
+            rescale_min,
+            rescale_max,
+        } => {
+            let p0 = get_plane(bands_1based[0]);
+            let p1 = get_plane(bands_1based[1]);
+            let inv = [
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[0], rescale_max[0]),
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
+            ];
+            for i in 0..npix {
+                let vv = cogzilla_kernel::fast_db_from_power(p0[i]);
+                let vh = cogzilla_kernel::fast_db_from_power(p1[i]);
+                if !vv.is_nan() && !vh.is_nan() {
+                    rgba[i * 4] = ((vv - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 1] = ((vh - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 2] = (((vv - vh) - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+        }
+        BandRequest::CustomExpr {
+            prog,
+            rescale,
+            colormap,
+        } => {
+            let p_refs: Vec<&[f32]> = prog.used_bands.iter().map(|&b| get_plane(b)).collect();
+            let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
+            let mut vals = [0.0f32; 16];
+            let k = p_refs.len().min(16);
+            for i in 0..npix {
+                for j in 0..k {
+                    vals[j] = p_refs[j][i];
+                }
+                let out_v = prog.eval(&vals[..k]);
+                if !out_v.is_nan() {
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&map_color(out_v, rescale.0, inv, *colormap));
+                }
+            }
+        }
+        BandRequest::CustomExprRgb {
+            progs,
+            rescale_min,
+            rescale_max,
+        } => {
+            let p_refs: [Vec<&[f32]>; 3] = [
+                progs[0].used_bands.iter().map(|&b| get_plane(b)).collect(),
+                progs[1].used_bands.iter().map(|&b| get_plane(b)).collect(),
+                progs[2].used_bands.iter().map(|&b| get_plane(b)).collect(),
+            ];
+            let inv = [
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[0], rescale_max[0]),
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
+                255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
+            ];
+            let mut vals = [0.0f32; 16];
+            for i in 0..npix {
+                let mut ch = [f32::NAN; 3];
+                for c in 0..3 {
+                    let k = p_refs[c].len().min(16);
+                    for j in 0..k {
+                        vals[j] = p_refs[c][j][i];
+                    }
+                    ch[c] = progs[c].eval(&vals[..k]);
+                }
+                if !(ch[0].is_nan() || ch[1].is_nan() || ch[2].is_nan()) {
+                    rgba[i * 4] = ((ch[0] - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 1] = ((ch[1] - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 2] = ((ch[2] - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+        }
+    }
+    if let Some(cf) = color_formula {
+        cf.apply_buffer_in_place(&mut rgba, 4);
+    }
+    Ok(encode_rgba_output(w, h, &rgba, format, return_mask))
 }
