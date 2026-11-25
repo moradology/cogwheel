@@ -1521,6 +1521,28 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(mj_root.get("attribution").is_none());
             assert!(mj_root["tiles"].is_object());
             let _ = std::fs::remove_file(&mj_root_path);
+
+            // Sweep #1 D4, D6, E2 regression checks
+            let ts_one = get_json(&client, format!("{base}/cog/tiles/WebMercatorQuad?url={sat_url}")).await;
+            assert!(ts_one["links"].as_array().is_some_and(|l| l.len() >= 3));
+            assert!(ts_one["boundingBox"]["lowerLeft"].is_array());
+            assert!(ts_one["tileMatrixSetLimits"].as_array().is_some_and(|l| !l.is_empty()));
+            assert_eq!(ts_one["accessConstraints"], "unclassified");
+
+            let tms_one = get_json(&client, format!("{base}/tileMatrixSets/WebMercatorQuad")).await;
+            assert!(tms_one["uri"].as_str().is_some_and(|s| s.contains("WebMercatorQuad")));
+            assert!(tms_one["wellKnownScaleSet"].as_str().is_some_and(|s| s.contains("GoogleMapsCompatible")));
+
+            let conf = get_json(&client, format!("{base}/conformance")).await;
+            assert_eq!(conf["conformsTo"].as_array().unwrap().len(), 23);
+
+            let mna1 = client.post(format!("{base}/cog/info?url={sat_url}")).send().await.unwrap();
+            assert_eq!(mna1.status(), 405);
+            assert!(mna1.headers().get("allow").is_some());
+            let mna2 = client.get(format!("{base}/cog/feature?url={sat_url}")).send().await.unwrap();
+            assert_eq!(mna2.status(), 405);
+            let mna3 = client.delete(format!("{base}/healthz")).send().await.unwrap();
+            assert_eq!(mna3.status(), 405);
         }
     }
 }

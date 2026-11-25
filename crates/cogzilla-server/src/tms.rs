@@ -517,9 +517,17 @@ impl TmsDef {
                 })
             })
             .collect();
+        let wkss = match self.id {
+            "WebMercatorQuad" => "http://www.opengis.net/def/wkss/OGC/1.0/GoogleMapsCompatible",
+            "WorldCRS84Quad" => "http://www.opengis.net/def/wkss/OGC/1.0/GoogleCRS84Quad",
+            "WorldMercatorWGS84Quad" => "http://www.opengis.net/def/wkss/OGC/1.0/WorldMercatorWGS84",
+            _ => "http://www.opengis.net/def/wkss/OGC/1.0/GoogleMapsCompatible",
+        };
         serde_json::json!({
             "id": self.id,
             "title": self.title,
+            "uri": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{}", self.id),
+            "wellKnownScaleSet": wkss,
             "crs": self.crs_uri,
             "orderedAxes": self.ordered_axes,
             "tileMatrices": matrices,
