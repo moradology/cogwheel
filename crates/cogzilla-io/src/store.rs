@@ -180,10 +180,7 @@ fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 
     let mut headers = HeaderMap::new();
-    let allowlist_active = std::env::var("COGZILLA_ALLOWED_URL_PREFIXES")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty());
-    if !allowlist_active {
+    if !crate::allowlist::allowlist_enabled() {
         return headers;
     }
     let mut push_line = |line: &str| {
@@ -868,6 +865,35 @@ impl CogStore {
             return Err(IoError::Tiff(TiffError::Corrupt(
                 "request exceeds maximum 256 MiB decoded blocks per operation",
             )));
+        }
+        // Cap compressed byte counts as well so a hostile TIFF with tiny decoded dimensions
+        // and huge/duplicate compressed tile_byte_counts cannot trigger multi-GiB transfers.
+        const MAX_COMPRESSED_TILE_BYTES: u32 = 64 * 1024 * 1024;
+        const MAX_COMPRESSED_BYTES_PER_REQUEST: u64 = 256 * 1024 * 1024;
+        let mut total_compressed: u64 = 0;
+        for tidx in tile_indices.iter().flatten() {
+            let bc = ifd.tile_byte_counts.get(*tidx as usize).copied().unwrap_or(0);
+            if bc > MAX_COMPRESSED_TILE_BYTES {
+                return Err(IoError::Tiff(TiffError::Corrupt(
+                    "compressed tile exceeds 64 MiB limit",
+                )));
+            }
+            total_compressed = total_compressed.saturating_add(bc as u64);
+            if let Some(ref m) = ifd.mask_ifd {
+                let per_plane = (ifd.tiles_across as usize).saturating_mul(ifd.tiles_down as usize).max(1);
+                let mbc = m.tile_byte_counts.get((*tidx as usize) % per_plane).copied().unwrap_or(0);
+                if mbc > MAX_COMPRESSED_TILE_BYTES {
+                    return Err(IoError::Tiff(TiffError::Corrupt(
+                        "compressed mask tile exceeds 64 MiB limit",
+                    )));
+                }
+                total_compressed = total_compressed.saturating_add(mbc as u64);
+            }
+            if total_compressed > MAX_COMPRESSED_BYTES_PER_REQUEST {
+                return Err(IoError::Tiff(TiffError::Corrupt(
+                    "request exceeds maximum 256 MiB compressed tiles per operation",
+                )));
+            }
         }
 
         // Fast path: if local or already warm in cache, zero async overhead!
@@ -1977,7 +2003,18 @@ impl CogStore {
             return Err(IoError::InvalidUri(uri.to_string()));
         }
 
-        if uri.starts_with("http://") || uri.starts_with("https://") {
+        let http_uri = if let Some(rest) = uri.strip_prefix("/vsicurl/") {
+            if rest.starts_with("http://") || rest.starts_with("https://") {
+                Some(rest)
+            } else {
+                return Err(IoError::InvalidUri(uri.to_string()));
+            }
+        } else if uri.starts_with("http://") || uri.starts_with("https://") {
+            Some(uri)
+        } else {
+            None
+        };
+        if let Some(uri) = http_uri {
             let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())

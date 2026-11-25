@@ -146,8 +146,10 @@ pub fn coalesce_ranges(
         let r_end = r.offset.saturating_add(r.len as u64);
         if let Some(last) = spans.last_mut() {
             let new_end = last.end.max(r_end);
-            if r.offset <= last.end.saturating_add(gap_threshold)
-                && new_end.saturating_sub(last.start) <= max_span_bytes
+            let contained = r.offset >= last.start && r_end <= last.end;
+            if contained
+                || (r.offset <= last.end.saturating_add(gap_threshold)
+                    && new_end.saturating_sub(last.start) <= max_span_bytes)
             {
                 last.end = new_end;
                 last.items.push(r);

@@ -641,6 +641,11 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     sample_format = Some(entry.read_u16_vec(&r)?);
                 }
                 TAG_JPEG_TABLES => {
+                    if !matches!(entry.ty, TYPE_UNDEFINED | TYPE_BYTE)
+                        || entry.count > MAX_JPEG_TABLES_BYTES as u64
+                    {
+                        return Err(TiffError::Corrupt("JPEGTables exceeds 64 KiB limit"));
+                    }
                     charge_tag(entry.count, 1)?;
                     jpeg_tables = Some(entry.read_bytes(&r)?);
                 }
@@ -799,9 +804,11 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             }
         };
 
+        const MAX_SAMPLES_PER_PIXEL: u16 = 1024;
         if width == 0
             || height == 0
             || samples_per_pixel == 0
+            || samples_per_pixel > MAX_SAMPLES_PER_PIXEL
             || width > i32::MAX as u32
             || height > i32::MAX as u32
         {
@@ -1097,9 +1104,12 @@ fn parse_gdal_metadata(
                     band_descriptions[idx] = val_str.to_string();
                 }
                 None => {
+                    const MAX_BROADCAST_DESC_BYTES: usize = 256 * 1024;
+                    let mut budget = MAX_BROADCAST_DESC_BYTES;
                     for d in band_descriptions.iter_mut() {
-                        if d.is_empty() {
+                        if d.is_empty() && budget >= val_str.len() {
                             *d = val_str.to_string();
+                            budget -= val_str.len();
                         }
                     }
                 }

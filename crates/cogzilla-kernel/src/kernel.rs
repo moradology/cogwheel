@@ -1072,8 +1072,10 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         let y0_f = vy.floor();
                         let fy = vy - y0_f;
                         let y0 = (y0_f.max(0.0) as usize).min(max_y);
-                        let r0 = &flat[y0 * row_stride..];
-                        let r1 = &flat[(y0 + 1) * row_stride..];
+                        let r0_off = y0 * row_stride;
+                        let r1_off = r0_off + row_stride;
+                        let r0 = &flat[r0_off..r0_off + row_stride];
+                        let r1 = &flat[r1_off..r1_off + row_stride];
                         bilinear_row_flat_dispatch::<N>(
                             u,
                             base_col,
@@ -1110,8 +1112,10 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             let y0_f = vy.floor();
                             let fy = vy - y0_f;
                             let y0 = (y0_f.max(0.0) as usize).min(max_y);
-                            let r0 = &flat[y0 * row_stride..];
-                            let r1 = &flat[(y0 + 1) * row_stride..];
+                            let r0_off = y0 * row_stride;
+                            let r1_off = r0_off + row_stride;
+                            let r0 = &flat[r0_off..r0_off + row_stride];
+                            let r1 = &flat[r1_off..r1_off + row_stride];
                             bilinear_row_flat_dispatch::<N>(
                                 u,
                                 base_col,
@@ -1149,8 +1153,10 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             let y0_f = vy.floor();
                             let fy = vy - y0_f;
                             let y0 = (y0_f.max(0.0) as usize).min(max_y);
-                            let r0 = &flat[y0 * row_stride..];
-                            let r1 = &flat[(y0 + 1) * row_stride..];
+                            let r0_off = y0 * row_stride;
+                            let r1_off = r0_off + row_stride;
+                            let r0 = &flat[r0_off..r0_off + row_stride];
+                            let r1 = &flat[r1_off..r1_off + row_stride];
                             bilinear_row_flat_dispatch::<N>(
                                 u,
                                 base_col,
@@ -1841,7 +1847,11 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
                         *s0.blocks.get_unchecked(bidx),
                         *s1.blocks.get_unchecked(bidx),
                         *s2.blocks.get_unchecked(bidx),
-                    ) {
+                    ) && b1.width == b0.width
+                        && b1.height == b0.height
+                        && b2.width == b0.width
+                        && b2.height == b0.height
+                    {
                         (
                             b0.data.get_f32_unchecked(pidx),
                             b1.data.get_f32_unchecked(pidx),
@@ -2073,7 +2083,11 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
                         *s0.blocks.get_unchecked(bidx),
                         *s1.blocks.get_unchecked(bidx),
                         *s2.blocks.get_unchecked(bidx),
-                    ) {
+                    ) && b1.width == b0.width
+                        && b1.height == b0.height
+                        && b2.width == b0.width
+                        && b2.height == b0.height
+                    {
                         (
                             eval_band_at(b0, p00, p01, fx, fy),
                             eval_band_at(b1, p00, p01, fx, fy),
