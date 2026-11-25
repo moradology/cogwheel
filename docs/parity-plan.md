@@ -4,6 +4,7 @@ Written 2026-11-23 against cogzilla `ea0d248` (v0.5.2), TiTiler 2.3.0, titiler-p
 
 ## Progress
 
+- **2026-11-25, survey fixes, first batch.** From the survey below: a search's or collection's picture asked for as `.tif` was its bare RGBA pixels under a GeoTIFF content type, and is now a GeoTIFF placed where the tile or box lies (8-bit pictures are titiler-pgstac's; 16-bit or float data comes as a picture from the planes road and as float32 without a mask from the renderer's, where titiler-pgstac writes the data in its own type and a mask); a `filter` that is a JSON object is read as CQL2 JSON without `filter-lang` and written back as titiler-pgstac's converter writes it (operators in lower case, timestamps in UTC, numbers as floats, stray members dropped), so it registers the same search, and what that converter refuses is a `422`; `/searches/list` sorts by any metadata key, filters by metadata compared as text, and builds its paging links as titiler-pgstac does.
 - **2026-11-25, exact projection tried against hostile cases.** Rows were drawn for twenty projections (Web and World Mercator, degrees, UTM at both ends of the world, polar stereographic, Lambert azimuthal and conformal, Albers, New Zealand and Swedish transverse Mercator, sinusoidal), with rasters at home and far outside their area, under tiles from z0 to z20 at the antimeridian and the pole rows and boxes past the edge of the world, rasters turned, 257 pixels a side, and with pixels from a twentieth to thirty times the picture's: 569 million pixels, none taking another pixel than the projection gives. Two faults were found and fixed. A row that jumps by a few thousandths of a source pixel (a longitude wrapping, on a raster whose pixels are far larger than the Earth) could be drawn 2.6 times the tolerance out where the edge check allows for 2; the two checks of a curve must now also balance, which a jump cannot do, and the worst is 1.1. A position outside the projection at one of the two checked columns, in one coordinate only, was ignored. What stays true of any scheme that does not project every pixel: a gap in a projection narrower than a quarter of a stretch and lying between the columns looked at is not seen; no projection here has one along a row. The halves of a split stretch now share the positions already projected and a column costs two multiplications a coordinate: the row work is 6 to 9% quicker than it was on Sentinel-2 tiles and 29% where rows split, and tiles over HTTP are level (72.1 ms before, 71.9 after, summed over the twenty measured).
 - **2026-11-25, options on an item's assets.** Item tiles and `bbox` images refused band math on one asset (`assets=red|expression=b1*2`) and bands chosen on several (`assets=visual|bidx=1&assets=red|bidx=1`), both of which titiler-pgstac draws. They are now drawn by the search routes' code from the one item, and the 32 pictures compared are titiler-pgstac's. Still refused: the same on `preview`, which is read on the raster's own grid, and on `POST feature`. Seen on the way and not changed: a PNG of one band is grey with alpha from titiler-pgstac and RGB or RGBA here, the same picture in more bytes.
 - **2026-11-25, exact projection at the old speed.** The first cut of exact projection (below) made tiles 1.2 to 2.3 times slower than this server had been. A row is now drawn as a curve through the two ends and the middle of a stretch, all three of which were already projected, and checked at the quarter points to 1/1024 of a source pixel; positions within 1/512 of a pixel's edge are worked out exactly. Still identical to projecting every pixel on the 2.5 million measured, and warm tiles are 3.1 to 5.8 ms where the approximation took 2.8 to 6.8 (a z8 tile of six items and three assets 5.5 ms where it was 6.5; a 1024 px image 18 ms either way).
@@ -226,6 +227,34 @@ The bitmask is the untested part. Exact geometry unions are what make low zooms 
 | M7 | E3 and F | E2 |
 
 M3 and M4 can run in parallel once B lands. E1's item routes can start alongside M2.
+
+## Survey of 2026-11-25
+
+Every route and documented parameter of titiler-pgstac 3.2.2 was sent to both servers on the baseline catalog: 2,276 requests. titiler-pgstac answered 369 that cogzilla refused, about 345 pictures were clearly different and 176 JSON bodies differed; cogzilla answered 105 that titiler-pgstac failed. What is still open, by cause, with the number of surveyed requests behind each. "Shared" means the `/cog` and `/stac` code, which is being worked on in `main` and is only recorded here.
+
+**In the pgSTAC routes**
+
+- Resampling and reproject methods on mosaics other than nearest, bilinear and cubic are a `400` (29): `average`, `mode`, `max`, `min`, `med`, `q1`, `q3`, `sum`, `rms`, `gauss`.
+- `dst_crs=epsg:3857` on bbox, feature and statistics (24) and `coord_crs=epsg:3857` everywhere (19) are a `400`.
+- `algorithm_params` (14), a JSON `colormap` (11), `buffer` (6), `nodata` (9), tile sizes other than 256 and 512 (5) and `.npy` on bbox and feature (7) are a `400` on mosaic routes.
+- `scan_limit` is not followed when a picture or a point is read: `scan_limit=1` gives a picture where titiler-pgstac gives a `204`. `items_limit=0` lists one item where titiler-pgstac lists a hundred.
+- `padding` changes nothing.
+- A `.tif` of 16-bit or float data is a picture, or float32 without a mask when the renderer draws it; titiler-pgstac writes the data in its own type and a mask. `.npy` has no mask band and is float32 where titiler-pgstac keeps the type. A PNG of 16-bit data is 8-bit.
+- `pixel_selection` by the last band with one band is a `400` (5).
+- A LineString, Point or GeometryCollection posted to statistics or feature is a `400` (12).
+- `f=html` on the tileset routes (12), `tile_format=tif` and `pngraw` in WMTS (6).
+- No `Cache-Control`, `Content-Crs` or `Content-Bbox` headers. A one-band PNG or JPEG is RGB where titiler-pgstac writes grey.
+- Tile matrix sets other than WebMercatorQuad (48), left out with projections.
+
+**Shared**
+
+- Algorithms: `normalizedIndex` has the opposite sign; `hillshade`'s defaults differ (azimuth, buffer, cropping); `contours`, `cast`, `ceil`, `floor`, `bitonal`, `grayscale`, `std` and `var` differ in type or values; `algorithm_params` is ignored on item routes; `/algorithms/{id}` differs for every id.
+- Item bbox, feature and preview: the size without `max_size`, with `max_size` larger than the data and off by one; pictures sized by `max_size` read other pixels (22 to 27 dB).
+- `nodata` is applied differently on item routes; `bidx` and `asset_bidx` are applied on item pictures where titiler-pgstac passes them over.
+- Item statistics: POST is not coverage-weighted, `resampling` is ignored, `categorical` has another shape, `valid_percent` is not rounded, an empty histogram has another shape, and `algorithm`, `expression`, `width`, `height`, `dst_crs` and `cover_scale` are refused.
+- Expressions: comparisons, `where`, and functions of several arguments are refused on point and statistics.
+- Resampling kernels on item routes are accepted and far from titiler-pgstac's (7 to 30 dB).
+- `/colorMaps/{id}` as an image with a size, `/` as JSON, `f=html` on the metadata routes, `/api`, the conformance classes.
 
 ## Risks
 

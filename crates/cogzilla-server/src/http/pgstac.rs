@@ -14,7 +14,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cogzilla_kernel::{ColormapName, OutputFormat, ResampleMode};
 use cogzilla_pgstac::{
-    Lookup, MosaicItem, PgStac, PgStacError, SampleGrid, SearchLimits, SearchOrder, SearchRecord,
+    Lookup, MosaicItem, PgStac, PgStacError, SampleGrid, SearchField, SearchLimits, SearchOrder, SearchRecord,
     jsonb_key_order,
 };
 use cogzilla_proj::mercator::lonlat_deg_to_mercator;
@@ -561,31 +561,65 @@ async fn list(ctx: &Ctx<'_>, pg: &PgStac, pairs: &[(String, String)]) -> Resp {
         Some(Ok(n)) if n >= 0 => n,
         Some(_) => return invalid_param("query", "offset", "Input should be greater than or equal to 0"),
     };
-    let order = match query_value(pairs, "sortby") {
-        None | Some("") => None,
-        Some(spec) => {
-            let (descending, field) = match spec.as_bytes()[0] {
-                b'-' => (true, &spec[1..]),
-                b'+' => (false, &spec[1..]),
-                _ => (false, spec),
-            };
-            match field {
-                "lastused" => Some(SearchOrder::LastUsed { descending }),
-                "usecount" => Some(SearchOrder::UseCount { descending }),
-                _ => {
-                    return invalid_param("query", "sortby", "sortby must be lastused or usecount");
-                }
-            }
+    // Sorted by `lastused` or `usecount`, or by any key of the searches' metadata.
+    let mut order = Vec::new();
+    for spec in query_value(pairs, "sortby").unwrap_or("").split(',').map(str::trim_start).filter(|s| !s.is_empty()) {
+        let (descending, field) = match spec.as_bytes()[0] {
+            b'-' => (true, &spec[1..]),
+            b'+' => (false, &spec[1..]),
+            _ => (false, spec),
+        };
+        let field = match field {
+            "lastused" => SearchField::LastUsed,
+            "usecount" => SearchField::UseCount,
+            other => SearchField::Metadata(other.to_string()),
+        };
+        order.push(SearchOrder { field, descending });
+    }
+    if order.len() > 64 {
+        return invalid_param("query", "sortby", "sortby takes at most 64 fields");
+    }
+    // Every other parameter is metadata a search must have been registered with; given
+    // twice, the last value is the one meant.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    for (k, v) in pairs {
+        if matches!(k.to_ascii_lowercase().as_str(), "limit" | "offset" | "properties" | "sortby") {
+            continue;
         }
-    };
-    let (searches, matched) = match pg.list_searches(limit, offset, order).await {
+        match wanted.iter_mut().find(|(seen, _)| seen == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => wanted.push((k.clone(), v.clone())),
+        }
+    }
+    let (searches, matched) = match pg.list_searches(limit, offset, &order, &wanted).await {
         Ok(page) => page,
         Err(e) => return db_error(&e),
     };
-    let page_url = |off: i64| format!("{}/searches/list?limit={limit}&offset={off}", ctx.host);
+    // A page's link is the request's own parameters with the page's `offset`, and the
+    // `limit` used when the request gave none.
+    let page_url = |off: i64| {
+        let mut params: Vec<(String, String)> = Vec::with_capacity(pairs.len() + 2);
+        for (k, v) in pairs {
+            match params.iter_mut().find(|(seen, _)| seen == k) {
+                Some(slot) => slot.1 = v.clone(),
+                None => params.push((k.clone(), v.clone())),
+            }
+        }
+        for (k, v) in [("limit", limit.to_string()), ("offset", off.to_string())] {
+            match params.iter_mut().find(|(seen, _)| seen == k) {
+                Some(slot) => slot.1 = v,
+                None => params.push((k.to_string(), v)),
+            }
+        }
+        let query: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v))).collect();
+        format!("{}/searches/list?{}", ctx.host, query.join("&"))
+    };
+    // As titiler-pgstac has it: a next page whenever this one is not all there is,
+    // starting after what this one returned.
+    let returned = searches.len() as i64;
     let mut links = vec![json!({ "href": page_url(offset), "rel": "self" })];
-    if offset + limit < matched {
-        links.push(json!({ "href": page_url(offset + limit), "rel": "next" }));
+    if returned < matched {
+        links.push(json!({ "href": page_url(offset + returned), "rel": "next" }));
     }
     if offset > 0 {
         links.push(json!({ "href": page_url((offset - limit).max(0)), "rel": "prev" }));
@@ -759,6 +793,15 @@ fn collection_search(
         let parsed: Value = if filter_lang == "cql2-json" {
             serde_json::from_str(v)
                 .map_err(|_| invalid_param("query", "filter", "Input should be valid JSON"))?
+        } else if v.starts_with('{') {
+            // titiler-pgstac's converter reads CQL2 JSON too where it expects text, and
+            // writes it back as it writes text.
+            let given: Value = serde_json::from_str(v).map_err(|e| {
+                detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 JSON filter: {e}"))
+            })?;
+            super::cql2_text::json_to_json(&given).map_err(|e| {
+                detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 JSON filter: {e}"))
+            })?
         } else {
             super::cql2_text::to_json(v).map_err(|e| {
                 detail(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid CQL2 text filter: {e}"))
@@ -2542,7 +2585,8 @@ async fn part_image(
                 jpeg_quality: pq.jpeg_quality,
                 return_mask: pq.return_mask,
             };
-            return job.picture(engine, &scenes, w as usize, h as usize, &look).await;
+            let made = job.picture(engine, &scenes, w as usize, h as usize, &look).await?;
+            return Ok(as_geotiff(made, w as usize, h as usize, bbox, 4326, pq.return_mask));
         }
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
@@ -2674,7 +2718,8 @@ async fn part_image(
                 parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?
             }
         };
-        Ok((encode_rgba_output(width, height, &canvas, format, pq.return_mask), content_type))
+        let made = (encode_rgba_output(width, height, &canvas, format, pq.return_mask), content_type);
+        Ok(as_geotiff(made, width, height, bbox, 4326, pq.return_mask))
     }
     .await;
     match rendered {
@@ -3913,6 +3958,9 @@ async fn tile(
     let rendered = engine
         .tile_cache
         .get_or_render(cache_key, || async {
+            // A tile asked for as a GeoTIFF is one, placed where the tile lies.
+            let (west, south, east, north) = tile_bounds_3857(tile);
+            let lies = [west, south, east, north];
             // The first scene is opened here, to learn what the tile's bands are. The scenes
             // after it are put on their way meanwhile, so the mosaic does not start their
             // headers only once this one has come back. The list holds only scenes whose
@@ -4008,7 +4056,8 @@ async fn tile(
                     jpeg_quality,
                     return_mask,
                 };
-                return job.picture(engine, &scenes, dim as usize, dim as usize, &look).await;
+                let made = job.picture(engine, &scenes, dim as usize, dim as usize, &look).await?;
+                return Ok(as_geotiff(made, dim as usize, dim as usize, lies, 3857, return_mask));
             }
             // On planes the bands are counted after an asset's own options; here they are the raster's.
             if asset_as_band && full.samples_per_pixel > 1 {
@@ -4078,19 +4127,40 @@ async fn tile(
             } else {
                 // Nothing to do to the pixels after the mosaic: the renderer encodes them itself.
                 if !auto_format && (raw_array || (formula.is_none() && return_mask)) {
-                    return Ok((engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?, content_type));
+                    let made = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
+                    // The renderer's bare pixels or values, written as the GeoTIFF asked for:
+                    // floats when the tile is of numbers, not of a picture.
+                    let made = super::wrap_geotiff_fmt(made, content_type, treq.format, dim as u32, dim as u32, lies, 3857, return_mask);
+                    return Ok((made, content_type));
                 }
                 treq.format = OutputFormat::RawRgba;
                 engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?.to_vec()
             };
             let asked = (!auto_format).then_some((asked, content_type));
             encode_picture(rgba, dim, dim, formula.as_ref(), asked, jpeg_quality, return_mask)
+                .map(|made| as_geotiff(made, dim, dim, lies, 3857, return_mask))
         })
         .await;
     match rendered {
         Ok(tile) => to_http_response_cached(engine, Ok(tile), ctx.if_none_match),
         Err(e) => engine_error(&e),
     }
+}
+
+/// A picture asked for as a GeoTIFF, which until here is its bare RGBA pixels, written as
+/// one: `bounds` and `epsg` say where it lies. Any other format is left as it is.
+fn as_geotiff(
+    (body, content_type): (Bytes, &'static str),
+    width: usize,
+    height: usize,
+    bounds: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> (Bytes, &'static str) {
+    if content_type != super::GEOTIFF_CONTENT_TYPE || width == 0 || body.len() != width * height * 4 {
+        return (body, content_type);
+    }
+    (crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &body, bounds, epsg, return_mask), content_type)
 }
 
 /// An RGBA picture as the response's bytes and media type: the colour formula, then
@@ -5971,6 +6041,21 @@ mod tests {
             "assets=red%7Cexpression=b1*2&rescale=0,9"
         );
         assert_eq!(without_search_options("algorithm=hillshade&algorithm_params={}"), "algorithm=hillshade&algorithm_params={}");
+    }
+
+    #[test]
+    fn geotiff_pictures_are_geotiffs() {
+        // Bare RGBA pixels under the GeoTIFF content type become a TIFF; anything else,
+        // and a body that is not the pixels it should be, is left alone.
+        let pixels = Bytes::from(vec![7u8; 4 * 3 * 4]);
+        let (tiff, kind) = as_geotiff((pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE), 4, 3, [8.0, 45.0, 9.0, 46.0], 4326, true);
+        assert_eq!(kind, super::super::GEOTIFF_CONTENT_TYPE);
+        assert_eq!(&tiff[..4], b"II*\0");
+        assert!(tiff.len() > pixels.len());
+        let (png, _) = as_geotiff((pixels.clone(), "image/png"), 4, 3, [8.0, 45.0, 9.0, 46.0], 4326, true);
+        assert_eq!(png, pixels);
+        let (short, _) = as_geotiff((pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE), 4, 4, [8.0, 45.0, 9.0, 46.0], 4326, true);
+        assert_eq!(short, pixels);
     }
 
     #[test]

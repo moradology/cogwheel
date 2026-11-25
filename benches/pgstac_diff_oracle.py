@@ -278,6 +278,14 @@ class Oracle:
             ok = all(i in rest for i in a) and bool(a) == bool(b)
             note = (f"{len(a)} of their {len(b)} items, same order" if ok
                     else f"not a part of their list: {len(a)} vs {len(b)}")
+        elif kind == "list":
+            try:
+                a, b = normalize(cz.json(), COGZILLA), normalize(tt.json(), TITILER)
+                view = lambda d: ([s["search"]["hash"] for s in d["searches"]], d["links"], d["context"])  # noqa: E731
+                if view(a) != view(b):
+                    ok, note = False, f"{view(a)} vs {view(b)}"[:300]
+            except Exception as e:  # noqa: BLE001 - a body that is not a list page is a failed check
+                ok, note = False, f"not a list page: {e}"
         elif kind == "image":
             ct_cz = cz.headers.get("content-type", "")
             ct_tt = tt.headers.get("content-type", "")
@@ -363,6 +371,18 @@ def main() -> int:
             "filter": {"op": "nope", "args": [1]},
         })
 
+        print("list")
+        # The page itself carries counters that move with every request; its order, its
+        # links and what it matched are what is compared.
+        for name, qs in [("list", "limit=3"), ("list sorted by a metadata key", "limit=5&sortby=-name,lastused"),
+                         ("list sorted by something no search has", "limit=5&sortby=-hash"),
+                         ("list of searches with some metadata", "name=low%20cloud&limit=4"),
+                         ("list of searches with metadata none has", "limit=3&name=nope&owner=me"),
+                         ("list page two", "limit=2&offset=2&sortby=usecount"),
+                         ("list of searches with a number in their metadata", "minzoom=3&limit=5"),
+                         ("list past the last page", "limit=2&offset=100000")]:
+            o.check(name, "list", f"/searches/list?{qs}")
+
         print("metadata")
         o.check("info", "json", f"/searches/{sid}/info")
         o.check("info with metadata", "json", f"/searches/{sid_meta}/info")
@@ -414,6 +434,8 @@ def main() -> int:
             o.check(f"z{z} png", "image", f"/searches/{sid}/tiles/WebMercatorQuad/{z}/{t.x}/{t.y}.png?assets=visual")
         o.check("format chosen from the pixels", "image", f"{base12}?assets=visual")
         o.check("jpg", "image", f"{base12}.jpg?assets=visual")
+        o.check("tif", "image", f"{base12}.tif?assets=visual")
+        o.check("tif, bilinear", "image", f"{base12}.tif?assets=visual&resampling=bilinear")
         o.check("webp", "image", f"{base12}.webp?assets=visual")
         o.check("tilesize=512", "image", f"{base12}.png?assets=visual&tilesize=512")
         o.check("resampling=bilinear on a reprojected source", "image", f"{base12}.png?assets=visual&resampling=bilinear")
@@ -483,6 +505,9 @@ def main() -> int:
         o.check("collection info", "json", f"{col}/info")
         o.check("collection info for an unknown collection", "json", "/collections/nope/info")
         o.check("collection info with ids", "json", f"{col}/info?ids=a,b")
+        cql_json = "%7B%22op%22%3A%22%3C%22%2C%22args%22%3A%5B%7B%22property%22%3A%22eo%3Acloud_cover%22%7D%2C50%5D%7D"
+        o.check("collection info with a JSON filter and no filter-lang", "json", f"{col}/info?filter={cql_json}")
+        o.check("collection info with a JSON filter that is not JSON", "status", f"{col}/info?filter=%7Bnot+json")
         o.check("collection info with a bbox", "json", f"{col}/info?bbox=6,44,8,46")
         o.check("collection info with a bad bbox", "status", f"{col}/info?bbox=6,44,8")
         o.check("collection info with a datetime", "json",
@@ -591,6 +616,7 @@ def main() -> int:
             [lon - 0.1, lat - 0.05], [lon + 0.1, lat - 0.05], [lon, lat + 0.05], [lon - 0.1, lat - 0.05]]]}}
         o.check("bbox, max_size", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&max_size=256")
         o.check("bbox, exact size", "image", f"/searches/{sid}/bbox/{part}/300x200.png?assets=visual")
+        o.check("bbox, tif", "image", f"/searches/{sid}/bbox/{part}/300x200.tif?assets=visual")
         o.check("bbox, width only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&width=300")
         o.check("bbox, height only", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual&height=90")
         o.check("bbox at the data's own resolution", "image", f"/searches/{sid}/bbox/{part}.png?assets=visual")

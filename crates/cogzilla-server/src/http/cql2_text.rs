@@ -28,6 +28,95 @@ pub(super) fn to_json(text: &str) -> Result<Value, String> {
     Ok(expr)
 }
 
+/// A filter given as CQL2 JSON where text was expected, as the reference's converter
+/// writes it back: operators in lower case, timestamps in UTC, every number a float, and
+/// nothing kept in an expression but what CQL2 puts there.
+pub(super) fn json_to_json(filter: &Value) -> Result<Value, String> {
+    let expr = tidy(filter, 0)?;
+    if op_of(&expr).is_none() || !is_boolean(&expr) {
+        return Err("the filter is not a valid CQL2 boolean expression".into());
+    }
+    Ok(expr)
+}
+
+/// Every number in a JSON value as a float: `50` is written `50.0`.
+fn numbers_as_floats(value: &mut Value) {
+    match value {
+        Value::Number(n) if !n.is_f64() => {
+            if let Some(f) = n.as_f64().and_then(serde_json::Number::from_f64) {
+                *n = f;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(numbers_as_floats),
+        Value::Object(fields) => fields.values_mut().for_each(numbers_as_floats),
+        _ => {}
+    }
+}
+
+fn tidy(v: &Value, depth: usize) -> Result<Value, String> {
+    if depth > MAX_DEPTH {
+        return Err("the filter is nested too deeply".into());
+    }
+    let instant = |text: &str| -> Result<Value, String> {
+        // A timestamp is known by what it is once brought to UTC.
+        let utc = normalize_timestamp(text);
+        if text == ".." || is_date(text) {
+            Ok(json!(text))
+        } else if is_timestamp(&utc) {
+            Ok(json!(utc))
+        } else {
+            Err(format!("'{text}' is not a date or a timestamp"))
+        }
+    };
+    match v {
+        Value::Null => Err("null is not a CQL2 expression".into()),
+        Value::Bool(_) | Value::String(_) => Ok(v.clone()),
+        Value::Number(_) => {
+            let mut number = v.clone();
+            numbers_as_floats(&mut number);
+            Ok(number)
+        }
+        Value::Array(items) => Ok(Value::Array(items.iter().map(|i| tidy(i, depth + 1)).collect::<Result<_, _>>()?)),
+        Value::Object(fields) => {
+            if let Some(name) = fields.get("op") {
+                let (Some(name), Some(args)) = (name.as_str(), fields.get("args").and_then(Value::as_array)) else {
+                    return Err("an operation needs an `op` and a list of `args`".into());
+                };
+                let lower = name.to_lowercase();
+                let name = if lower == "isnull" { "isNull" } else { lower.as_str() };
+                let args = args.iter().map(|a| tidy(a, depth + 1)).collect::<Result<Vec<_>, _>>()?;
+                Ok(op(name, args))
+            } else if let Some(name) = fields.get("property") {
+                let name = name.as_str().ok_or("a property is named by a string")?;
+                Ok(json!({ "property": name }))
+            } else if let Some(text) = fields.get("timestamp") {
+                let utc = text.as_str().map(normalize_timestamp).filter(|t| is_timestamp(t)).ok_or("not a timestamp")?;
+                Ok(json!({ "timestamp": utc }))
+            } else if let Some(text) = fields.get("date") {
+                let text = text.as_str().filter(|t| is_date(t)).ok_or("not a date")?;
+                Ok(json!({ "date": text }))
+            } else if let Some(ends) = fields.get("interval") {
+                let ends = ends.as_array().filter(|e| e.len() == 2).ok_or("an interval has two ends")?;
+                let ends = ends
+                    .iter()
+                    .map(|end| match end {
+                        Value::String(text) => instant(text),
+                        other => tidy(other, depth + 1),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(json!({ "interval": ends }))
+            } else if fields.contains_key("bbox") || fields.get("type").is_some_and(|t| t.is_string() && t != "GeometryCollection") {
+                // A box or a GeoJSON geometry is kept whole.
+                let mut shape = v.clone();
+                numbers_as_floats(&mut shape);
+                Ok(shape)
+            } else {
+                Err("not a CQL2 expression".into())
+            }
+        }
+    }
+}
+
 /// Nesting allowed before the parser gives up, so a hostile filter cannot exhaust the stack.
 const MAX_DEPTH: usize = 64;
 
@@ -887,6 +976,56 @@ mod tests {
     /// Text, and what the `cql2` library (0.6.0, as shipped with titiler-pgstac 3.2.2) gives
     /// for it: its JSON and whether its `validate()` passes, or `null` where it cannot parse.
     const VECTORS: &str = include_str!("cql2_text_vectors.json");
+
+    #[test]
+    fn json_given_as_text_is_written_as_the_reference_writes_it() {
+        let tidy = |text: &str| json_to_json(&serde_json::from_str(text).unwrap()).map(|v| v.to_string());
+        let p = r#"{"property":"eo:cloud_cover"}"#;
+        // What titiler-pgstac 3.2.2 registered for each, read back from its `info`.
+        for (given, written) in [
+            (
+                format!(r#"{{"op":"AND","args":[{{"op":"<","args":[{p},50]}},{{"op":"Not","args":[{{"op":"IsNull","args":[{p}]}}]}}]}}"#),
+                format!(r#"{{"args":[{{"args":[{p},50.0],"op":"<"}},{{"args":[{{"args":[{p}],"op":"isNull"}}],"op":"not"}}],"op":"and"}}"#),
+            ),
+            (format!(r#"{{"op":"IN","args":[{p},[1,2]]}}"#), format!(r#"{{"args":[{p},[1.0,2.0]],"op":"in"}}"#)),
+            (format!(r#"{{"op":"BETWEEN","args":[{p},1,2]}}"#), format!(r#"{{"args":[{p},1.0,2.0],"op":"between"}}"#)),
+            (format!(r#"{{"op":"<","args":[{p},50],"extra":1}}"#), format!(r#"{{"args":[{p},50.0],"op":"<"}}"#)),
+            (format!(r#"{{"op":"=","args":[{p},true]}}"#), format!(r#"{{"args":[{p},true],"op":"="}}"#)),
+            (
+                r#"{"op":"T_AFTER","args":[{"property":"datetime"},{"timestamp":"2020-01-01T00:00:00+02:00"}]}"#.to_string(),
+                r#"{"args":[{"property":"datetime"},{"timestamp":"2019-12-31T22:00:00Z"}],"op":"t_after"}"#.to_string(),
+            ),
+            (
+                r#"{"op":"t_during","args":[{"property":"datetime"},{"interval":["2020-01-01","2021-01-01T00:00:00.120Z"]}]}"#.to_string(),
+                r#"{"args":[{"property":"datetime"},{"interval":["2020-01-01","2021-01-01T00:00:00.12Z"]}],"op":"t_during"}"#.to_string(),
+            ),
+            (
+                r#"{"op":"S_INTERSECTS","args":[{"property":"geometry"},{"type":"Point","coordinates":[8,45],"extra":1}]}"#.to_string(),
+                r#"{"args":[{"property":"geometry"},{"coordinates":[8.0,45.0],"extra":1.0,"type":"Point"}],"op":"s_intersects"}"#.to_string(),
+            ),
+            (
+                r#"{"op":"LIKE","args":[{"property":"platform"},"sen%"]}"#.to_string(),
+                r#"{"args":[{"property":"platform"},"sen%"],"op":"like"}"#.to_string(),
+            ),
+        ] {
+            assert_eq!(tidy(&given).as_deref(), Ok(written.as_str()), "{given}");
+        }
+        // What it answered 422 for.
+        for bad in [
+            "{}".to_string(),
+            r#"{"foo":1}"#.to_string(),
+            r#"{"property":"x"}"#.to_string(),
+            "true".to_string(),
+            format!(r#"{{"op":"=","args":[{p}]}}"#),
+            format!(r#"{{"op":"=","args":[{p},null]}}"#),
+            r#"{"op":"and","args":[true]}"#.to_string(),
+            format!(r#"{{"op":"=","args":[{p},{{"timestamp":"nope"}}]}}"#),
+            format!(r#"{{"op":"=","args":[{p},{{"function":{{"name":"f","args":[1]}}}}]}}"#),
+            r#"{"op":"s_intersects","args":[{"property":"geometry"},{"type":"GeometryCollection","geometries":[]}]}"#.to_string(),
+        ] {
+            assert!(tidy(&bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn matches_the_reference_converter() {
