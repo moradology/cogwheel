@@ -2803,12 +2803,12 @@ pub fn encode_geotiff_f32(
     buf.freeze()
 }
 
-/// Project a WGS84 polygon bbox into an IFD's pixel space and return its clipped `(win_w, win_h)`.
+/// Project a WGS84 polygon bbox into an IFD's pixel space and return `(win_w, win_h, intersects)`.
 fn polygon_window_dims(
     ifd: &cogzilla_tiff::IfdMeta,
     crs: &cogzilla_proj::CrsModel,
     bbox: [f64; 4],
-) -> (u32, u32) {
+) -> (u32, u32, bool) {
     let [w, s, e, n] = bbox;
     let mx = 0.5 * (w + e);
     let my = 0.5 * (s + n);
@@ -2845,13 +2845,14 @@ fn polygon_window_dims(
         }
     }
     if !cmin.is_finite() {
-        return (ifd.width, ifd.height);
+        return (ifd.width, ifd.height, true);
     }
     let c0 = cmin.floor().clamp(0.0, ifd.width as f64);
     let c1 = cmax.ceil().clamp(0.0, ifd.width as f64);
     let r0 = rmin.floor().clamp(0.0, ifd.height as f64);
     let r1 = rmax.ceil().clamp(0.0, ifd.height as f64);
-    (((c1 - c0).max(1.0)) as u32, ((r1 - r0).max(1.0)) as u32)
+    let intersects = c1 > c0 && r1 > r0;
+    (((c1 - c0).max(1.0)) as u32, ((r1 - r0).max(1.0)) as u32, intersects)
 }
 
 /// TiTiler-compatible `/cog/statistics` computed from the finest overview whose target window
@@ -2910,6 +2911,8 @@ pub async fn compute_statistics_with_options(
             }
         }
     }
+    const MAX_STATS_BLOCKS: usize = 512;
+    const MAX_STATS_MASK_TILES: usize = 65_536;
     let crs = engine.get_or_build_crs(cog)?;
     let max_size = max_size.max(1);
     let (ifd_idx, step, sample_dims, total_pixels, poly_win_pixels) = if let Some(pm) = poly_mask {
@@ -2918,9 +2921,10 @@ pub async fn compute_statistics_with_options(
         let mut win_h = cog.index.ifds[idx].height;
         let mut win_max_dim = win_w.max(win_h);
         for (i, ifd) in cog.index.ifds.iter().enumerate() {
-            let (ww, wh) = polygon_window_dims(ifd, &crs, pm.bbox);
+            let (ww, wh, intersects) = polygon_window_dims(ifd, &crs, pm.bbox);
             let dim = ww.max(wh);
-            if dim <= max_size {
+            let ifd_tiles = (ifd.tiles_across as usize).saturating_mul(ifd.tiles_down as usize);
+            if intersects && dim <= max_size && ifd_tiles <= MAX_STATS_MASK_TILES {
                 idx = i;
                 win_w = ww;
                 win_h = wh;
@@ -2975,8 +2979,6 @@ pub async fn compute_statistics_with_options(
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
 
-    const MAX_STATS_BLOCKS: usize = 512;
-    const MAX_STATS_MASK_TILES: usize = 65_536;
     let n_tiles = (ifd.tiles_across as usize).saturating_mul(ifd.tiles_down as usize);
     let (sample_has_tx, sample_has_ty): (Option<Vec<bool>>, Option<Vec<bool>>) =
         if let Some((ow, oh)) = sample_dims {
