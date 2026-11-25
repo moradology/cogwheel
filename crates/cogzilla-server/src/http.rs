@@ -4872,7 +4872,7 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    if ct == "image/tiff" && nat_epsg.is_none() {
+                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -4936,7 +4936,7 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    if ct == "image/tiff" && nat_epsg.is_none() {
+                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -5744,7 +5744,7 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    if ct == "image/tiff" && nat_epsg.is_none() {
+                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -5797,7 +5797,7 @@ where
                     (d, dst_bbox, dst_epsg)
                 } else {
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
-                    if ct == "image/tiff" && nat_epsg.is_none() {
+                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -6529,5 +6529,24 @@ mod tests {
         gk_geo.model_type = Some(2);
         gk_geo.geographic_type = Some(4326);
         assert_eq!(cog_standard_epsg(&gk_geo), Some(4326));
+
+        // 3. GEOTIFF_CONTENT_TYPE matches parse_ext_format("tif", ...)
+        let (_, tif_ct) = parse_ext_format("tif", None, 85).unwrap();
+        assert_eq!(tif_ct, GEOTIFF_CONTENT_TYPE);
+
+        // 4. PolygonMask::check_work_budget rejects O(W*H*V) DoS payloads
+        let ring: Vec<serde_json::Value> = (0..10_000)
+            .map(|i| {
+                let a = (i as f64) * std::f64::consts::TAU / 10_000.0;
+                serde_json::json!([a.cos(), a.sin()])
+            })
+            .collect();
+        let poly_json = serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [ring],
+        });
+        let (pm, _) = PolygonMask::from_geojson(&poly_json).unwrap();
+        assert!(pm.check_work_budget(256 * 256).is_err());
+        assert!(pm.check_work_budget(64 * 64).is_ok());
     }
 }

@@ -2948,26 +2948,37 @@ pub async fn compute_statistics_with_options(
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
 
-    let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
-    let tile_has_strided_sample = |tx: u32, ty: u32, x_max: usize, y_max: usize| -> bool {
+    const MAX_STATS_BLOCKS: usize = 512;
+    const MAX_STATS_MASK_TILES: usize = 65_536;
+    let n_tiles = (ifd.tiles_across as usize).saturating_mul(ifd.tiles_down as usize);
+    let (sample_has_tx, sample_has_ty): (Option<Vec<bool>>, Option<Vec<bool>>) =
         if let Some((ow, oh)) = sample_dims {
-            let x0 = tx * ifd.tile_width;
-            let x1 = x0 + x_max as u32;
-            let y0 = ty * ifd.tile_height;
-            let y1 = y0 + y_max as u32;
-            let has_x = (0..ow).any(|px| {
+            let mut has_tx = vec![false; ifd.tiles_across as usize];
+            let mut has_ty = vec![false; ifd.tiles_down as usize];
+            for px in 0..ow {
                 let col = (((px as f64 + 0.5) * (ifd.width as f64) / (ow as f64)).floor() as u32)
                     .min(ifd.width - 1);
-                col >= x0 && col < x1
-            });
-            if !has_x {
-                return false;
+                let tx = (col / ifd.tile_width) as usize;
+                if let Some(slot) = has_tx.get_mut(tx) {
+                    *slot = true;
+                }
             }
-            return (0..oh).any(|py| {
+            for py in 0..oh {
                 let row = (((py as f64 + 0.5) * (ifd.height as f64) / (oh as f64)).floor() as u32)
                     .min(ifd.height - 1);
-                row >= y0 && row < y1
-            });
+                let ty = (row / ifd.tile_height) as usize;
+                if let Some(slot) = has_ty.get_mut(ty) {
+                    *slot = true;
+                }
+            }
+            (Some(has_tx), Some(has_ty))
+        } else {
+            (None, None)
+        };
+    let tile_has_strided_sample = |tx: u32, ty: u32, x_max: usize, y_max: usize| -> bool {
+        if let (Some(has_tx), Some(has_ty)) = (&sample_has_tx, &sample_has_ty) {
+            return has_tx.get(tx as usize).copied().unwrap_or(false)
+                && has_ty.get(ty as usize).copied().unwrap_or(false);
         }
         if step == 1 {
             return true;
@@ -2981,13 +2992,20 @@ pub async fn compute_statistics_with_options(
 
     let (tile_masks, mask_total_pixels): (Option<Vec<Option<Vec<u8>>>>, usize) =
         if let Some(pm) = poly_mask {
+            pm.check_work_budget(total_pixels)?;
+            if n_tiles > MAX_STATS_MASK_TILES {
+                return Err(EngineError::BadRequest(format!(
+                    "statistics IFD tile count ({n_tiles}) exceeds polygon mask limit ({MAX_STATS_MASK_TILES})"
+                )));
+            }
             let build_masks = {
                 let ifd = ifd.clone();
                 let crs = crs.clone();
                 let pm = pm.clone();
-                move || {
+                move || -> Result<(Option<Vec<Option<Vec<u8>>>>, usize), EngineError> {
                     let mut masks = Vec::with_capacity(n_tiles);
                     let mut inside_total = 0usize;
+                    let mut active_blocks = 0usize;
                     for ty in 0..ifd.tiles_down {
                         for tx in 0..ifd.tiles_across {
                             let x_max = (ifd.width - tx * ifd.tile_width).min(ifd.tile_width) as usize;
@@ -3017,6 +3035,12 @@ pub async fn compute_statistics_with_options(
                                 build_tile_polygon_mask(&ifd, &crs, &pm, tx, ty, x_max, y_max)
                             };
                             if let Some((bits, inside)) = built {
+                                active_blocks += 1;
+                                if active_blocks > MAX_STATS_BLOCKS {
+                                    return Err(EngineError::BadRequest(format!(
+                                        "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
+                                    )));
+                                }
                                 inside_total += inside;
                                 masks.push(Some(bits));
                             } else {
@@ -3024,16 +3048,16 @@ pub async fn compute_statistics_with_options(
                             }
                         }
                     }
-                    (Some(masks), inside_total)
+                    Ok((Some(masks), inside_total))
                 }
             };
             if n_tiles >= 4 || total_pixels >= 65_536 {
                 engine
                     .store
                     .run_heavy_cpu(build_masks)
-                    .await?
+                    .await??
             } else {
-                build_masks()
+                build_masks()?
             }
         } else {
             (None, 0)
@@ -3041,7 +3065,8 @@ pub async fn compute_statistics_with_options(
 
     let fetched = match ifd.planar_config {
         PlanarConfig::Chunky => {
-            let mut indices = Vec::with_capacity(n_tiles);
+            let mut indices = Vec::with_capacity(n_tiles.min(MAX_STATS_MASK_TILES));
+            let mut active_blocks = 0usize;
             for ty in 0..ifd.tiles_down {
                 for tx in 0..ifd.tiles_across {
                     let ti = (ty * ifd.tiles_across + tx) as usize;
@@ -3056,6 +3081,12 @@ pub async fn compute_statistics_with_options(
                             indices.push(None);
                             continue;
                         }
+                    }
+                    active_blocks += 1;
+                    if active_blocks > MAX_STATS_BLOCKS {
+                        return Err(EngineError::BadRequest(format!(
+                            "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
+                        )));
                     }
                     indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
                 }
@@ -3097,7 +3128,9 @@ pub async fn compute_statistics_with_options(
 
             // Coalesce all `count * n_tiles` band-plane block indices into one concurrent
             // `get_blocks` batch instead of `count` sequential remote round trips.
-            let mut all_indices = Vec::with_capacity(count * n_tiles);
+            let mut all_indices =
+                Vec::with_capacity(count.saturating_mul(n_tiles).min(MAX_STATS_MASK_TILES));
+            let mut active_blocks = 0usize;
             for (b, &need_b) in needed_bands.iter().enumerate().take(count) {
                 if !need_b {
                     all_indices.resize(all_indices.len() + n_tiles, None);
@@ -3118,6 +3151,12 @@ pub async fn compute_statistics_with_options(
                                 all_indices.push(None);
                                 continue;
                             }
+                        }
+                        active_blocks += 1;
+                        if active_blocks > MAX_STATS_BLOCKS {
+                            return Err(EngineError::BadRequest(format!(
+                                "statistics request exceeds maximum block limit ({MAX_STATS_BLOCKS})"
+                            )));
                         }
                         all_indices.push(Some(ifd.tile_index(tx, ty, b as u16) as u32));
                     }
@@ -3353,6 +3392,27 @@ impl PolygonMask {
             j = i;
         }
         inside
+    }
+
+    /// Total number of polygon vertices across all outer rings and holes.
+    pub fn vertex_count(&self) -> usize {
+        self.polygons
+            .iter()
+            .flat_map(|rings| rings.iter())
+            .map(|ring| ring.len())
+            .sum()
+    }
+
+    /// Guard against `O(pixels * vertices)` point-in-polygon CPU exhaustion.
+    pub fn check_work_budget(&self, pixels: usize) -> Result<(), EngineError> {
+        const MAX_POLYGON_WORK: usize = 256_000_000;
+        let verts = self.vertex_count();
+        if pixels.saturating_mul(verts) > MAX_POLYGON_WORK {
+            return Err(EngineError::BadRequest(format!(
+                "polygon complexity ({verts} vertices x {pixels} pixels) exceeds work budget ({MAX_POLYGON_WORK})"
+            )));
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -3713,6 +3773,9 @@ async fn render_bbox_impl(
         }
         primary.index.select_ifd(target_rx, target_ry)
     };
+    if let Some(pm) = poly_mask {
+        pm.check_work_budget(w.saturating_mul(h))?;
+    }
     if cogs.len() > 1 && crate::engine::validate_multi_cog_grid(cogs, ifd_idx).is_err() {
         return render_mixed_grid_bbox(
             engine,
