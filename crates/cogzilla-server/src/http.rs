@@ -5407,6 +5407,13 @@ where
             .await,
             // GET /stac/statistics (merged band dict: {b1: ..., b2: ...})
             (Method::GET, ["statistics"]) => async {
+                // An item's statistics take band math on the planes road or not at all:
+                // the names this branch reads (`red_b1`) are not titiler-pgstac's.
+                if stac_prefix != "stac" && pq.expr_raw.is_some() {
+                    return Err(EngineError::BadRequest(
+                        "parameter 'expression' is only supported on /cog/statistics routes".into(),
+                    ));
+                }
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;

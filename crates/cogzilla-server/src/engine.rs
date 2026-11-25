@@ -1914,6 +1914,7 @@ impl TileEngine {
     pub fn value_bands(bands: &BandRequest) -> usize {
         match bands {
             BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+            BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
             _ => 1,
         }
     }
