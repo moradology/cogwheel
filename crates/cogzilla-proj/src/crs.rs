@@ -25,6 +25,8 @@ pub enum ProjError {
 #[derive(Debug, Clone)]
 pub enum CrsModel {
     Epsg3857,
+    /// WGS84 Ellipsoidal World Mercator (`EPSG:3395`).
+    WorldMercator,
     Geographic,
     TransverseMercator(TransverseMercator),
     Albers(AlbersEqualArea),
@@ -45,6 +47,9 @@ impl CrsModel {
         }
         if matches!(code, 3857 | 3785) {
             return Ok(Self::Epsg3857);
+        }
+        if code == 3395 {
+            return Ok(Self::WorldMercator);
         }
         if let Some(def) = crate::epsg::lookup(code) {
             return Ok(def.to_model());
@@ -88,6 +93,12 @@ impl CrsModel {
                     return Err(unsupported("EPSG:3857 with non-metre linear units override"));
                 }
                 return Ok(Self::Epsg3857);
+            }
+            Some(3395) => {
+                if matches!(gk.proj_linear_units, Some(u) if u != 9001 && u != 32767) {
+                    return Err(unsupported("EPSG:3395 with non-metre linear units override"));
+                }
+                return Ok(Self::WorldMercator);
             }
             // User-defined: described by the parameter keys below.
             Some(32767) | None => {}
@@ -389,6 +400,10 @@ impl CrsModel {
     pub fn from_3857(&self, mx: f64, my: f64) -> (f64, f64) {
         match self {
             Self::Epsg3857 => (mx, my),
+            Self::WorldMercator => {
+                let (lon, lat) = mercator_to_lonlat_deg(mx, my);
+                world_mercator_forward(lon, lat)
+            }
             Self::Geographic => mercator_to_lonlat_deg(mx, my),
             Self::TransverseMercator(tm) => {
                 let (lon, lat) = mercator_to_lonlat_rad(mx, my);
@@ -454,6 +469,7 @@ impl CrsModel {
     pub fn from_lonlat_deg(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
         match self {
             Self::Epsg3857 => lonlat_deg_to_mercator(lon_deg, lat_deg),
+            Self::WorldMercator => world_mercator_forward(lon_deg, lat_deg),
             Self::Geographic => (lon_deg, lat_deg),
             Self::TransverseMercator(tm) => tm.forward(lon_deg.to_radians(), lat_deg.to_radians()),
             Self::Albers(alb) => alb.forward(lon_deg.to_radians(), lat_deg.to_radians()),
@@ -471,6 +487,7 @@ impl CrsModel {
     pub fn to_lonlat_deg(&self, x: f64, y: f64) -> (f64, f64) {
         let (lon, lat) = match self {
             Self::Epsg3857 => mercator_to_lonlat_deg(x, y),
+            Self::WorldMercator => world_mercator_inverse(x, y),
             Self::Geographic => (x, y),
             Self::TransverseMercator(tm) => {
                 let (lon, lat) = tm.inverse(x, y);
@@ -1438,6 +1455,42 @@ impl<const N: usize> CoordPlan<N> {
         let ty1 = ((r1.max(0) as u32) / tile_h).min(tiles_down.saturating_sub(1));
         (tx0, tx1, ty0, ty1)
     }
+}
+
+/// WGS84 ellipsoidal World Mercator (`EPSG:3395`) forward `(lon_deg, lat_deg) -> (x, y)`.
+#[inline]
+fn world_mercator_forward(lon_deg: f64, lat_deg: f64) -> (f64, f64) {
+    const A: f64 = 6_378_137.0;
+    const E: f64 = 0.081_819_190_842_621_49;
+    let lat = lat_deg.clamp(-85.084_059_050_110_45, 85.084_059_050_110_45).to_radians();
+    let lon = lon_deg.to_radians();
+    let x = A * lon;
+    let con = E * lat.sin();
+    let ts = (std::f64::consts::FRAC_PI_4 + 0.5 * lat).tan()
+        * ((1.0 - con) / (1.0 + con)).powf(0.5 * E);
+    let y = A * ts.ln();
+    (x, y)
+}
+
+/// WGS84 ellipsoidal World Mercator (`EPSG:3395`) inverse `(x, y) -> (lon_deg, lat_deg)`.
+#[inline]
+fn world_mercator_inverse(x: f64, y: f64) -> (f64, f64) {
+    const A: f64 = 6_378_137.0;
+    const E: f64 = 0.081_819_190_842_621_49;
+    let lon_deg = (x / A).to_degrees();
+    let ts = (-y / A).exp();
+    let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * ts.atan();
+    for _ in 0..8 {
+        let con = E * phi.sin();
+        let next = std::f64::consts::FRAC_PI_2
+            - 2.0 * (ts * ((1.0 - con) / (1.0 + con)).powf(-0.5 * E)).atan();
+        if (next - phi).abs() < 1e-13 {
+            phi = next;
+            break;
+        }
+        phi = next;
+    }
+    (lon_deg, phi.to_degrees())
 }
 
 #[cfg(test)]

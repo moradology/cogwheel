@@ -6,7 +6,6 @@ use bytes::Bytes;
 use cogzilla_io::OpenedCog;
 use cogzilla_kernel::ColormapName;
 use cogzilla_kernel::png_fast::{encode_filtered_png, filter_sub_rgb_row};
-use cogzilla_proj::ORIGIN_SHIFT;
 use dashmap::DashMap;
 
 use crate::engine::{EngineError, TileEngine};
@@ -503,97 +502,11 @@ pub fn get_colormap_image(
 // ============================================================================
 
 pub fn list_tms_json(host: &str) -> serde_json::Value {
-    let origin = if host.starts_with("http://") || host.starts_with("https://") {
-        host.to_string()
-    } else {
-        format!("http://{host}")
-    };
-    serde_json::json!({
-        "tileMatrixSets": [
-            {
-                "id": "WebMercatorQuad",
-                "title": "Google Maps Compatible for the World",
-                "links": [{
-                    "href": format!("{origin}/tileMatrixSets/WebMercatorQuad"),
-                    "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
-                    "type": "application/json"
-                }]
-            },
-            {
-                "id": "WorldCRS84Quad",
-                "title": "CRS84 for the World",
-                "links": [{
-                    "href": format!("{origin}/tileMatrixSets/WorldCRS84Quad"),
-                    "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
-                    "type": "application/json"
-                }]
-            }
-        ]
-    })
+    crate::tms::list_all_tms_json(host)
 }
 
 pub fn get_tms_json(id: &str) -> Result<serde_json::Value, EngineError> {
-    match id {
-        "WebMercatorQuad" => {
-            let mut matrices = Vec::with_capacity(25);
-            let world_span = 2.0 * ORIGIN_SHIFT;
-            for z in 0..=24u32 {
-                let n = 1u64 << z;
-                let cell_size = world_span / ((n * 256) as f64);
-                let scale_denom = cell_size / 0.00028;
-                matrices.push(serde_json::json!({
-                    "id": z.to_string(),
-                    "scaleDenominator": scale_denom,
-                    "cellSize": cell_size,
-                    "cornerOfOrigin": "topLeft",
-                    "pointOfOrigin": [-ORIGIN_SHIFT, ORIGIN_SHIFT],
-                    "tileWidth": 256,
-                    "tileHeight": 256,
-                    "matrixWidth": n,
-                    "matrixHeight": n,
-                }));
-            }
-            Ok(serde_json::json!({
-                "id": "WebMercatorQuad",
-                "title": "Google Maps Compatible for the World",
-                "crs": "http://www.opengis.net/def/crs/EPSG/0/3857",
-                "orderedAxes": ["X", "Y"],
-                "wellKnownScaleSet": "http://www.opengis.net/def/wkss/OGC/1.0/GoogleMapsCompatible",
-                "tileMatrices": matrices,
-            }))
-        }
-        "WorldCRS84Quad" => {
-            let mut matrices = Vec::with_capacity(24);
-            for z in 0..=23u32 {
-                let rows = 1u64 << z;
-                let cols = rows * 2;
-                let cell_size = 180.0 / ((rows * 256) as f64);
-                let scale_denom = (cell_size * 111_319.49079327358) / 0.00028;
-                matrices.push(serde_json::json!({
-                    "id": z.to_string(),
-                    "scaleDenominator": scale_denom,
-                    "cellSize": cell_size,
-                    "cornerOfOrigin": "topLeft",
-                    "pointOfOrigin": [-180.0, 90.0],
-                    "tileWidth": 256,
-                    "tileHeight": 256,
-                    "matrixWidth": cols,
-                    "matrixHeight": rows,
-                }));
-            }
-            Ok(serde_json::json!({
-                "id": "WorldCRS84Quad",
-                "title": "CRS84 for the World",
-                "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
-                "orderedAxes": ["Lon", "Lat"],
-                "wellKnownScaleSet": "http://www.opengis.net/def/wkss/OGC/1.0/GoogleCRS84Quad",
-                "tileMatrices": matrices,
-            }))
-        }
-        other => Err(EngineError::NotFound(format!(
-            "unknown TileMatrixSet '{other}' (supported: WebMercatorQuad, WorldCRS84Quad)"
-        ))),
-    }
+    crate::tms::get_tms_def_json(id)
 }
 
 #[cfg(test)]
