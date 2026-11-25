@@ -887,6 +887,12 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(mj_assets.as_array().unwrap().len(), 2);
             let mj_pt = get_json(&client, format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}")).await;
             assert!(!mj_pt["assets"].as_array().unwrap().is_empty());
+            let mj_pt_expr = get_json(
+                &client,
+                format!("{base}/mosaicjson/point/-122.4,37.75?url={mj_url}&expression=b1*2"),
+            )
+            .await;
+            assert_eq!(mj_pt_expr["assets"][0][2][0], "b1*2");
             let mj_stats = get_json(&client, format!("{base}/mosaicjson/statistics?url={mj_url}&max_size=128")).await;
             assert!(mj_stats["b1"]["mean"].is_number());
             let mj_bbox = client

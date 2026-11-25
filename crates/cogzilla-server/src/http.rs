@@ -3453,7 +3453,8 @@ where
                         continue;
                     };
                     match query_point(&engine, &cog, lon, lat, pq.unscale, pq.nodata).await {
-                        Ok(pt) => {
+                        Ok(mut pt) => {
+                            apply_point_filters(&mut pt, pq.expr_raw.as_deref(), &pq.bidx)?;
                             let vals = pt["values"].clone();
                             let names = pt["band_names"].clone();
                             assets_out.push(serde_json::json!([asset_url, vals, names]));
