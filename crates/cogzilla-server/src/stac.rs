@@ -506,17 +506,26 @@ pub fn get_colormap_json(id: &str) -> Result<serde_json::Value, EngineError> {
     Ok(serde_json::Value::Object(map))
 }
 
-pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> {
+pub fn get_colormap_png(
+    id: &str,
+    vertical: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Bytes, EngineError> {
     let cm = ColormapName::from_str_opt(id)
         .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
     let lut = cm.lut();
-    let (w, h) = if vertical { (20usize, 256usize) } else { (256usize, 20usize) };
+    let (def_w, def_h) = if vertical { (20u32, 256u32) } else { (256u32, 20u32) };
+    let w = width.unwrap_or(def_w).clamp(1, 4096) as usize;
+    let h = height.unwrap_or(def_h).clamp(1, 4096) as usize;
     let stride = 1 + w * 3;
     let mut filtered = vec![0u8; h * stride];
     let mut row = vec![0u8; w * 3];
     if vertical {
+        let denom = (h.saturating_sub(1)).max(1);
         for y in 0..h {
-            let c = lut.rgb[y];
+            let idx = ((y * 255 + denom / 2) / denom).min(255);
+            let c = lut.rgb[idx];
             for x in 0..w {
                 row[x * 3] = c[0];
                 row[x * 3 + 1] = c[1];
@@ -525,8 +534,10 @@ pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> 
             filter_sub_rgb_row(&row, &mut filtered[y * stride..(y + 1) * stride]);
         }
     } else {
+        let denom = (w.saturating_sub(1)).max(1);
         for x in 0..w {
-            let c = lut.rgb[x];
+            let idx = ((x * 255 + denom / 2) / denom).min(255);
+            let c = lut.rgb[idx];
             row[x * 3] = c[0];
             row[x * 3 + 1] = c[1];
             row[x * 3 + 2] = c[2];
@@ -538,24 +549,34 @@ pub fn get_colormap_png(id: &str, vertical: bool) -> Result<Bytes, EngineError> 
     Ok(encode_filtered_png(w as u32, h as u32, 2, &filtered))
 }
 
-/// Render a 256×20 (horizontal) or 20×256 (vertical) colormap colorbar in PNG, JPEG, or WebP.
+/// Render a colormap colorbar in PNG, JPEG, or WebP with optional custom width/height.
 pub fn get_colormap_image(
     id: &str,
     format: cogzilla_kernel::OutputFormat,
     vertical: bool,
+    width: Option<u32>,
+    height: Option<u32>,
 ) -> Result<Bytes, EngineError> {
     if matches!(format, cogzilla_kernel::OutputFormat::Png) {
-        return get_colormap_png(id, vertical);
+        return get_colormap_png(id, vertical, width, height);
     }
     let cm = ColormapName::from_str_opt(id)
         .ok_or_else(|| EngineError::NotFound(format!("unknown colormap '{id}'")))?;
     let lut = cm.lut();
-    let (w, h) = if vertical { (20usize, 256usize) } else { (256usize, 20usize) };
+    let (def_w, def_h) = if vertical { (20u32, 256u32) } else { (256u32, 20u32) };
+    let w = width.unwrap_or(def_w).clamp(1, 4096) as usize;
+    let h = height.unwrap_or(def_h).clamp(1, 4096) as usize;
     let mut rgba = vec![0u8; w * h * 4];
+    let denom = if vertical {
+        (h.saturating_sub(1)).max(1)
+    } else {
+        (w.saturating_sub(1)).max(1)
+    };
     for y in 0..h {
         let row_off = y * w * 4;
         for x in 0..w {
-            let idx = if vertical { y } else { x };
+            let pos = if vertical { y } else { x };
+            let idx = ((pos * 255 + denom / 2) / denom).min(255);
             let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
             let o = row_off + x * 4;
             rgba[o] = r;
