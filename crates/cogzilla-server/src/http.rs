@@ -186,6 +186,7 @@ struct ParsedQuery {
     use_epsg: bool,
     percentiles: Vec<f64>,
     histogram_bins: Option<usize>,
+    histogram_edges: Option<Vec<f64>>,
     histogram_range: Option<(f64, f64)>,
     categorical: bool,
     categories: Vec<f64>,
@@ -251,6 +252,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         use_epsg: false,
         percentiles: Vec::new(),
         histogram_bins: None,
+        histogram_edges: None,
         histogram_range: None,
         categorical: false,
         categories: Vec::new(),
@@ -752,10 +754,38 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     }
                 }
             }
-            "histogram_bins" => match v.parse::<usize>() {
-                Ok(n) if (1..=1000).contains(&n) => pq.histogram_bins = Some(n),
-                _ => bad("expected histogram_bins in 1..=1000"),
-            },
+            "histogram_bins" => {
+                let dec = percent_decode(v);
+                if dec.contains(',') {
+                    let mut edges = Vec::new();
+                    let mut ok = true;
+                    for tok in dec
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        match tok.parse::<f64>() {
+                            Ok(e) if e.is_finite() => edges.push(e),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    let monotonic = edges.windows(2).all(|w| w[0] < w[1]);
+                    if ok && edges.len() >= 2 && edges.len() <= 1001 && monotonic {
+                        pq.histogram_edges = Some(edges);
+                    } else {
+                        bad("expected strictly increasing histogram_bins edge list (2..=1001 edges)");
+                    }
+                } else {
+                    match dec.trim().parse::<usize>() {
+                        Ok(n) if (1..=1000).contains(&n) => pq.histogram_bins = Some(n),
+                        _ => bad("expected histogram_bins in 1..=1000 or comma-separated edge list"),
+                    }
+                }
+            }
             "histogram_range" => {
                 let dec = percent_decode(v);
                 let parts: Vec<&str> = dec
@@ -2321,6 +2351,7 @@ fn build_stats_options_with_bands(
     if let Some(bins) = pq.histogram_bins {
         opts.histogram_bins = bins;
     }
+    opts.histogram_edges = pq.histogram_edges.clone();
     opts.histogram_range = pq.histogram_range;
     opts.categorical = pq.categorical;
     if !pq.categories.is_empty() {
@@ -2331,6 +2362,7 @@ fn build_stats_options_with_bands(
     }
     opts.width = pq.width;
     opts.height = pq.height;
+    opts.max_size_explicit = pq.keys.iter().any(|k| k == "max_size");
     if allow_expr
         && let Some(raw) = pq.expr_raw.as_deref()
     {
