@@ -576,20 +576,20 @@ fn lanczos3_weight(x: f32) -> f32 {
 /// General sampler supporting all 15 GDAL/TiTiler resampling methods.
 #[inline]
 pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) -> f32 {
+    if !u.is_finite()
+        || !v.is_finite()
+        || u < -0.5
+        || v < -0.5
+        || u > src.ifd_w as f32 - 0.5
+        || v > src.ifd_h as f32 - 0.5
+    {
+        return f32::NAN;
+    }
     match mode {
         ResampleMode::Nearest => sample_nearest::<false>(src, u, v),
         ResampleMode::Bilinear => sample_bilinear::<false>(src, u, v),
         ResampleMode::Cubic => sample_cubic(src, u, v),
         ResampleMode::CubicSpline => {
-            if !u.is_finite()
-                || !v.is_finite()
-                || u < -2.0
-                || v < -2.0
-                || u > src.ifd_w as f32 + 1.0
-                || v > src.ifd_h as f32 + 1.0
-            {
-                return f32::NAN;
-            }
             let (x0, fx) = fast_floor_i32(u);
             let (y0, fy) = fast_floor_i32(v);
             let wx = cubic_spline_weights(fx);
@@ -611,15 +611,6 @@ pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) 
             if wsum > 1e-6 { sum / wsum } else { f32::NAN }
         }
         ResampleMode::Lanczos => {
-            if !u.is_finite()
-                || !v.is_finite()
-                || u < -3.0
-                || v < -3.0
-                || u > src.ifd_w as f32 + 2.0
-                || v > src.ifd_h as f32 + 2.0
-            {
-                return f32::NAN;
-            }
             let (x0, fx) = fast_floor_i32(u);
             let (y0, fy) = fast_floor_i32(v);
             let mut wx = [0.0f32; 6];
@@ -643,18 +634,13 @@ pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) 
                     }
                 }
             }
-            if wsum.abs() > 1e-6 { sum / wsum } else { f32::NAN }
+            if wsum >= 0.5 {
+                sum / wsum
+            } else {
+                sample_bilinear::<false>(src, u, v)
+            }
         }
         ResampleMode::Gauss => {
-            if !u.is_finite()
-                || !v.is_finite()
-                || u < -1.5
-                || v < -1.5
-                || u > src.ifd_w as f32 + 0.5
-                || v > src.ifd_h as f32 + 0.5
-            {
-                return f32::NAN;
-            }
             let cx = u.round() as i32;
             let cy = v.round() as i32;
             let mut sum = 0.0f32;
@@ -684,15 +670,6 @@ pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) 
         | ResampleMode::Q1
         | ResampleMode::Q3
         | ResampleMode::Sum => {
-            if !u.is_finite()
-                || !v.is_finite()
-                || u < -1.5
-                || v < -1.5
-                || u > src.ifd_w as f32 + 0.5
-                || v > src.ifd_h as f32 + 0.5
-            {
-                return f32::NAN;
-            }
             let cx = u.round() as i32;
             let cy = v.round() as i32;
             let mut vals = [0.0f32; 9];
@@ -3414,7 +3391,7 @@ pub fn eval_horn_3x3_aniso(
                         || (e / inc).floor() != level
                         || (w / inc).floor() != level
                 } else {
-                    (n / inc).floor() > level || (e / inc).floor() > level
+                    (n / inc).floor() != level || (e / inc).floor() != level
                 }
             } else {
                 false

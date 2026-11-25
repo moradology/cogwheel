@@ -174,16 +174,25 @@ pub struct CogStore {
 
 /// Build default outbound HTTP headers from standard GDAL environment variables:
 /// `GDAL_HTTP_BEARER`, `GDAL_HTTP_USERPWD`, `GDAL_HTTP_HEADERS`, and `GDAL_HTTP_HEADER_FILE`.
+/// Only attached when `COGZILLA_ALLOWED_URL_PREFIXES` is explicitly set so credentials can
+/// never be exfiltrated to arbitrary attacker-controlled origins via SSRF.
 fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 
     let mut headers = HeaderMap::new();
+    let allowlist_active = std::env::var("COGZILLA_ALLOWED_URL_PREFIXES")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if !allowlist_active {
+        return headers;
+    }
     let mut push_line = |line: &str| {
         if let Some((k, v)) = line.split_once(':') {
-            if let (Ok(name), Ok(val)) = (
+            if let (Ok(name), Ok(mut val)) = (
                 HeaderName::from_bytes(k.trim().as_bytes()),
                 HeaderValue::from_str(v.trim()),
             ) {
+                val.set_sensitive(true);
                 headers.insert(name, val);
             }
         }
@@ -203,20 +212,24 @@ fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
             push_line(part);
         }
     }
-    if let Ok(bearer) = std::env::var("GDAL_HTTP_BEARER") {
-        let tok = bearer.trim();
-        if !tok.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&format!("Bearer {tok}"))
-        {
+    if let Some(bearer) = std::env::var("GDAL_HTTP_BEARER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {bearer}")) {
+            val.set_sensitive(true);
             headers.insert(AUTHORIZATION, val);
         }
-    } else if let Ok(userpwd) = std::env::var("GDAL_HTTP_USERPWD") {
-        let up = userpwd.trim();
-        if !up.is_empty() {
-            let b64 = encode_base64_std(up.as_bytes());
-            if let Ok(val) = HeaderValue::from_str(&format!("Basic {b64}")) {
-                headers.insert(AUTHORIZATION, val);
-            }
+    } else if let Some(userpwd) = std::env::var("GDAL_HTTP_USERPWD")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        let b64 = encode_base64_std(userpwd.as_bytes());
+        if let Ok(mut val) = HeaderValue::from_str(&format!("Basic {b64}")) {
+            val.set_sensitive(true);
+            headers.insert(AUTHORIZATION, val);
         }
     }
     headers

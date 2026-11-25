@@ -27,6 +27,8 @@ fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta) -> Vec<&'static str> {
                 _ => "undefined",
             })
             .collect(),
+        // Palette (3)
+        3 => vec!["palette"; count],
         // MinIsWhite (0) or MinIsBlack (1) with an explicit alpha channel (e.g. gray+alpha)
         0 | 1 if alpha_idx.is_some() => (0..count)
             .map(|i| {
@@ -339,7 +341,7 @@ pub fn build_cog_validate(
             "InternalMask": full.mask_ifd.is_some(),
             "Nodata": nodata_json,
             "ColorInterp": colorinterp,
-            "ColorMap": false,
+            "ColorMap": cog.index.color_map.is_some(),
             "Scales": scales,
             "Offsets": offsets,
         },
@@ -651,10 +653,25 @@ pub fn build_wmts_capabilities(
         tms_def.crs_uri.to_string()
     };
 
+    let max_tms_z = tms_def
+        .matrices
+        .iter()
+        .filter_map(|m| m.id.parse::<u8>().ok())
+        .max()
+        .unwrap_or(0);
+    let min_tms_z = tms_def
+        .matrices
+        .iter()
+        .filter_map(|m| m.id.parse::<u8>().ok())
+        .min()
+        .unwrap_or(0);
+    let eff_minz = minzoom.clamp(min_tms_z, max_tms_z);
+    let eff_maxz = maxzoom.clamp(eff_minz, max_tms_z);
+
     let mut matrices_xml = String::new();
     for m in tms_def.matrices {
         if let Ok(z) = m.id.parse::<u8>()
-            && (minzoom..=maxzoom).contains(&z)
+            && (eff_minz..=eff_maxz).contains(&z)
         {
             let (tl0, tl1) = if tms_def.invert_axis {
                 (m.origin_y, m.origin_x)
@@ -3652,7 +3669,8 @@ async fn render_bbox_impl(
                 let nb: usize = match bands {
                     BandRequest::Rgb { .. }
                     | BandRequest::SarRgb { .. }
-                    | BandRequest::CustomExprRgb { .. } => 3,
+                    | BandRequest::CustomExprRgb { .. }
+                    | BandRequest::Terrain { .. } => 3,
                     _ => 1,
                 };
                 let hdr = if format == OutputFormat::Npy {
@@ -4733,6 +4751,12 @@ async fn render_mixed_grid_bbox(
     }
 
     // Sample each needed COG independently into a w*h f32 plane in target CRS.
+    // Avoid double-unscaling when Single/Rgb already folded GDAL scale/offset into rescale bounds.
+    let sub_unscale = unscale
+        && (crate::engine::needs_source_unscale(bands, format)
+            || custom_lut.is_some_and(|c| {
+                matches!(c, CustomColormap::Discrete { direct_lookup: true, .. })
+            }));
     let mut planes: Vec<(u16, Vec<f32>)> = Vec::with_capacity(needed.len());
     for &b1 in &needed {
         let single_cog = [cogs[(b1 - 1) as usize].clone()];
@@ -4757,7 +4781,7 @@ async fn render_mixed_grid_bbox(
             None,
             None,
             return_mask,
-            unscale,
+            sub_unscale,
         ))
         .await?;
         let mut vals = vec![f32::NAN; w * h];

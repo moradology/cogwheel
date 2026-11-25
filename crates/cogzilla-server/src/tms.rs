@@ -416,6 +416,9 @@ impl TmsDef {
     /// expanded by `buffer` pixels on all 4 sides.
     pub fn tile_bounds(&self, z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> Option<[f64; 4]> {
         let m = self.matrix(z)?;
+        if (x as u64) >= m.matrix_width || (y as u64) >= m.matrix_height {
+            return None;
+        }
         let span_x = m.cell_size * (m.tile_width as f64);
         let span_y = m.cell_size * (m.tile_height as f64);
         let pad_x = span_x * (buffer as f64 / tile_size.max(1) as f64);
@@ -453,12 +456,24 @@ impl TmsDef {
         let (dx1, dy1) = dst_crs.from_lonlat_deg(lo1, la1);
         let diag_src = ((width as f64).hypot(height as f64)).max(1.0);
         let diag_dst = (dx1 - dx0).hypot(dy1 - dy0);
+        let first_z = self
+            .matrices
+            .iter()
+            .filter_map(|m| m.id.parse::<u8>().ok())
+            .min()
+            .unwrap_or(0);
+        let last_z = self
+            .matrices
+            .iter()
+            .filter_map(|m| m.id.parse::<u8>().ok())
+            .max()
+            .unwrap_or(first_z);
         let res = if diag_dst.is_finite() && diag_dst > 0.0 {
             diag_dst / diag_src
         } else {
-            return (0, 12);
+            return (first_z, last_z.min(12).max(first_z));
         };
-        let mut max_z = 0u8;
+        let mut max_z = first_z;
         for m in self.matrices {
             if let Ok(z) = m.id.parse::<u8>() {
                 max_z = z;
@@ -468,7 +483,7 @@ impl TmsDef {
             }
         }
         let min_res = res * ov_factor.max(1.0);
-        let mut min_z = 0u8;
+        let mut min_z = first_z;
         for m in self.matrices {
             if let Ok(z) = m.id.parse::<u8>() {
                 if m.cell_size >= min_res {
@@ -476,7 +491,7 @@ impl TmsDef {
                 }
             }
         }
-        (min_z.min(max_z), max_z)
+        (min_z.clamp(first_z, max_z), max_z)
     }
 
     pub fn to_ogc_json(&self) -> serde_json::Value {
