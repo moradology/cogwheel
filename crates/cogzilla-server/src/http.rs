@@ -29,7 +29,8 @@ use crate::stac::{
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, compute_statistics_with_options,
-    encode_geotiff_rgba, encode_rgba_output, get_algorithm_json, list_algorithms_json, query_point,
+    encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output, get_algorithm_json,
+    list_algorithms_json, query_point,
     render_crs_bbox, render_mercator_bbox, render_native_preview, render_wgs84_bbox,
 };
 
@@ -1180,6 +1181,91 @@ fn tile_intersects_cog(
     Ok(lon_overlaps)
 }
 
+/// Return true when a `.tif`/`.tiff` request should emit a native IEEE Float32 GeoTIFF
+/// (`SampleFormat=3`, `GDAL_NODATA="nan"`) instead of an 8-bit visual RGB/RGBA GeoTIFF.
+fn wants_f32_geotiff(
+    ct: &str,
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    bands: &BandRequest,
+    sample_type: cogzilla_tiff::SampleType,
+) -> bool {
+    if ct != GEOTIFF_CONTENT_TYPE {
+        return false;
+    }
+    if !pq.rescale.is_empty()
+        || pq.colormap_explicit
+        || pq.custom_colormap_json.is_some()
+        || pq.color_formula.is_some()
+    {
+        return false;
+    }
+    if source_cog.is_some_and(|c| c.index.color_map.is_some()) {
+        return false;
+    }
+    match bands {
+        BandRequest::Terrain { .. } => false,
+        BandRequest::Dem { algorithm, .. } => {
+            !matches!(algorithm, cogzilla_kernel::DemAlgorithm::Hillshade { .. })
+        }
+        BandRequest::Rgb { .. } | BandRequest::Single { .. } => {
+            !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
+        }
+        BandRequest::CustomExpr { .. }
+        | BandRequest::CustomExprRgb { .. }
+        | BandRequest::Spectral1 { .. }
+        | BandRequest::Spectral2 { .. }
+        | BandRequest::Spectral3 { .. }
+        | BandRequest::SarRgb { .. } => true,
+    }
+}
+
+fn geotiff_render_format(
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    bands: &BandRequest,
+    sample_type: cogzilla_tiff::SampleType,
+) -> OutputFormat {
+    if wants_f32_geotiff(ct, pq, source_cog, bands, sample_type) {
+        OutputFormat::RawF32
+    } else {
+        fmt
+    }
+}
+
+fn wrap_geotiff_fmt(
+    data: Bytes,
+    ct: &'static str,
+    fmt: OutputFormat,
+    w: u32,
+    h: u32,
+    bbox: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> Bytes {
+    if ct == GEOTIFF_CONTENT_TYPE {
+        if matches!(fmt, OutputFormat::RawF32) {
+            encode_geotiff_f32(w, h, &data, bbox, epsg)
+        } else {
+            encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
+        }
+    } else {
+        data
+    }
+}
+
+fn attach_x_assets(resp: &mut Response<Full<Bytes>>, assets: &[String]) {
+    if assets.is_empty() || !resp.status().is_success() {
+        return;
+    }
+    let joined = assets.join(",");
+    if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
+        resp.headers_mut().insert("x-assets", hv);
+    }
+}
+
 fn wrap_geotiff(
     data: Bytes,
     ct: &'static str,
@@ -1189,11 +1275,7 @@ fn wrap_geotiff(
     epsg: u16,
     return_mask: bool,
 ) -> Bytes {
-    if ct == GEOTIFF_CONTENT_TYPE {
-        encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
-    } else {
-        data
-    }
+    wrap_geotiff_fmt(data, ct, OutputFormat::RawRgba, w, h, bbox, epsg, return_mask)
 }
 
 fn parse_ext_format(
@@ -1805,6 +1887,7 @@ fn build_tile_request_for_tms(
     let eff_ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
     let (format, content_type) = parse_ext_format(eff_ext, pq.webp_quality, pq.jpeg_quality)?;
     let bands = build_band_request(pq, default_bands, sample_type)?;
+    let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
     let tile_size = match scale_opt {
         Some(sc) if (1..=4).contains(&sc) => sc * 256,
         Some(other) => {
@@ -3811,6 +3894,7 @@ where
     if segs.first() == Some(&"stac") {
         let sub = &segs[1..];
         let stac_url = pq.urls.first().cloned();
+        let stac_x_assets = pq.assets.clone();
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // GET /stac/assets?url=item.json
             (Method::GET, ["assets"]) => async {
@@ -4207,6 +4291,7 @@ where
                 let ext = pq_stac.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let mut bands = build_band_request(&pq_stac, db, full.sample_type)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, full.sample_type);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4218,7 +4303,7 @@ where
                     pq_stac.nodata, custom_lut.as_ref(), cf.as_ref(), pq_stac.return_mask, pq_stac.unscale,
                 )
                 .await?;
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, dst_epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, dst_epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4399,7 +4484,7 @@ where
                                 .await?;
                                 (d, bbox_3857, 3857u16)
                             };
-                            let data = wrap_geotiff(data, ct, out_dim, out_dim, bbox, epsg, pq_stac.return_mask);
+                            let data = wrap_geotiff_fmt(data, ct, treq.format, out_dim, out_dim, bbox, epsg, pq_stac.return_mask);
                             Ok((data, ct))
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -4422,17 +4507,19 @@ where
                                 encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
                             };
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
+                            let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
+                            let data = wrap_geotiff_fmt(data, ct, treq.format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                             Ok((data, ct))
                         }
                     })
                     .await;
-                return Ok(to_http_response_cached(&engine, cached, if_none_match.as_deref()));
+                let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                attach_x_assets(&mut resp, &stac_x_assets);
+                return Ok(resp);
             }
 
             // GET /stac/point/{lon},{lat}
@@ -4516,6 +4603,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4544,7 +4632,7 @@ where
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
                     (d, nat_bbox, nat_epsg)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4567,6 +4655,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4595,7 +4684,7 @@ where
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
                     (d, nat_bbox, nat_epsg)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4620,6 +4709,7 @@ where
                 )?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4668,7 +4758,7 @@ where
                     .await?;
                     (d, wgs_bbox, out_w, out_h, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4691,6 +4781,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4733,7 +4824,7 @@ where
                     .await?;
                     (d, wgs_bbox, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4759,6 +4850,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4788,7 +4880,7 @@ where
                     .await?;
                     (d, bbox, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -4813,6 +4905,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq_stac, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -4844,14 +4937,16 @@ where
                     .await?;
                     (d, bbox, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq_stac.return_mask);
                 Ok((data, ct))
             }
             .await,
 
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
+        let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
+        attach_x_assets(&mut resp, &stac_x_assets);
+        return Ok(resp);
     }
 
     // ------------------------------------------------------------------------
@@ -5181,7 +5276,7 @@ where
                                 .await?;
                                 (d, bbox_3857, 3857u16)
                             };
-                            let data = wrap_geotiff(data, ct, out_dim, out_dim, bbox, epsg, pq.return_mask);
+                            let data = wrap_geotiff_fmt(data, ct, treq.format, out_dim, out_dim, bbox, epsg, pq.return_mask);
                             Ok((data, ct))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -5204,12 +5299,12 @@ where
                                 encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
                             };
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
+                            let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                             Ok((data, ct))
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff(data, ct, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
+                            let data = wrap_geotiff_fmt(data, ct, treq.format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                             Ok((data, ct))
                         }
                     })
@@ -5260,6 +5355,7 @@ where
                 let ext = pq.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let mut bands = build_band_request(&pq, db, full.sample_type)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, full.sample_type);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5271,7 +5367,7 @@ where
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, dst_epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, dst_epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -5352,6 +5448,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5375,7 +5472,7 @@ where
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
                     (d, nat_bbox, nat_epsg)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -5392,6 +5489,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5415,7 +5513,7 @@ where
                     let (nat_epsg, nat_bbox) = cog_native_epsg_and_bounds(&cogs[0]);
                     (d, nat_bbox, nat_epsg)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -5435,6 +5533,7 @@ where
                 )?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5478,7 +5577,7 @@ where
                     .await?;
                     (d, wgs_bbox, out_w, out_h, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -5496,6 +5595,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5533,7 +5633,7 @@ where
                     .await?;
                     (d, wgs_bbox, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -5554,6 +5654,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5580,7 +5681,7 @@ where
                     .await?;
                     (d, bbox, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,
@@ -5599,6 +5700,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
                 let mut bands = build_band_request(&pq, db, st)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -5623,7 +5725,7 @@ where
                     .await?;
                     (d, bbox, 4326u16)
                 };
-                let data = wrap_geotiff(data, ct, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
+                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
                 Ok((data, ct))
             }
             .await,

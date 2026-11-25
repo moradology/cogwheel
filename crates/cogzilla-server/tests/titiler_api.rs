@@ -569,16 +569,18 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         assert_eq!(&stac_tile[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
         // /stac/tiles with per-asset asset_bidx=red|1&asset_bidx=green|1&asset_bidx=blue|1 must match assets=red,green,blue
-        let stac_ab_tile = client
+        let stac_ab_resp = client
             .get(format!(
                 "{base}/stac/tiles/WebMercatorQuad/12/652/1583.png?url={stac_url}&asset_bidx=red|1&asset_bidx=green|1&asset_bidx=blue|1&rescale=7000,20000"
             ))
             .send()
             .await
-            .unwrap()
-            .bytes()
-            .await
             .unwrap();
+        assert_eq!(
+            stac_ab_resp.headers().get("x-assets").and_then(|v| v.to_str().ok()),
+            Some("red,green,blue")
+        );
+        let stac_ab_tile = stac_ab_resp.bytes().await.unwrap();
         assert_eq!(stac_ab_tile, stac_tile, "per-asset asset_bidx should render identical 3-asset RGB");
 
         // /stac/tiles/... with asset-named expression
@@ -1026,6 +1028,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(oob_dim.status(), 400);
 
             // 2. Non-4326 geographic GeoTIFF (NAD83 EPSG:4269) must write ModelTypeGeographic (2)
+            //    and unstyled float32 DEM .tif must emit native IEEE Float32 GeoTIFF (SampleType::Float32)
             let nad83_resp = client
                 .get(format!(
                     "{base}/cog/bbox/-122.5,37.7,-122.4,37.8/16x16.tif?url={merc_url}&dst_crs=EPSG:4269"
@@ -1039,6 +1042,19 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(parsed_nad83.geo_keys.model_type, Some(2));
             assert_eq!(parsed_nad83.geo_keys.geographic_type, Some(4269));
             assert_eq!(parsed_nad83.geo_keys.projected_cs_type, None);
+            assert_eq!(parsed_nad83.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+
+            // Styled .tif with rescale+colormap must still emit 8-bit visual GeoTIFF
+            let styled_tif_resp = client
+                .get(format!(
+                    "{base}/cog/bbox/-122.5,37.7,-122.4,37.8/16x16.tif?url={merc_url}&rescale=0,2500&colormap_name=viridis"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(styled_tif_resp.status(), 200);
+            let parsed_styled = cogzilla_tiff::parse_cog(&styled_tif_resp.bytes().await.unwrap()).unwrap();
+            assert_eq!(parsed_styled.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
 
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];
