@@ -254,6 +254,7 @@ Every route and documented parameter of titiler-pgstac 3.2.2 was sent to both se
 - Item statistics: POST is not coverage-weighted, `resampling` is ignored, `categorical` has another shape, `valid_percent` is not rounded, an empty histogram has another shape, and `algorithm`, `expression`, `width`, `height`, `dst_crs` and `cover_scale` are refused.
 - Expressions: comparisons, `where`, and functions of several arguments are refused on point and statistics.
 - Resampling kernels on item routes are accepted and far from titiler-pgstac's (7 to 30 dB).
+- `coord_crs` spellings: a bare `3857` and `ESRI:3857` are taken where titiler-pgstac answers `422`, and `epsg:900913` is refused where it is taken.
 - `/colorMaps/{id}` as an image with a size, `/` as JSON, `f=html` on the metadata routes, `/api`, the conformance classes.
 
 ## Risks

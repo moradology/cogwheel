@@ -51,6 +51,9 @@ pub(crate) enum Aside {
     Footprint,
     /// An item kept has no href for an asset asked for.
     Asset,
+    /// The scan limit was reached in a walk whose newest chunk was thought empty: which
+    /// chunk a row came from then decides the list, and that is not known here.
+    Limit,
 }
 
 pub(crate) enum Outcome {
@@ -180,7 +183,11 @@ impl Plan {
         // pgSTAC gives its first chunk the whole scan limit and every later one what its
         // counter, which starts at one, leaves of it: one fewer. A first run that opens
         // with a chunk no partition has rows in takes its rows from a later chunk.
-        let first_limit = walk.scan_limit - i64::from(runs.chunks().first().is_some_and(|c| !c.2));
+        // That chunk is known empty only as of when the plan was made. If a row has come
+        // to it since, pgSTAC gives it the whole limit; the difference shows only when the
+        // walk reads as many rows as it was allowed, and then the reference path answers.
+        let opens_empty = runs.chunks().first().is_some_and(|c| !c.2);
+        let first_limit = walk.scan_limit - i64::from(opens_empty);
         if let Some((start, end)) = runs.next()
             && first_limit > 0
         {
@@ -224,6 +231,9 @@ impl Plan {
         }
         if let Step::Aside(why) = step {
             return Ok(Outcome::Aside(why));
+        }
+        if opens_empty && walk.scanned >= first_limit {
+            return Ok(Outcome::Aside(Aside::Limit));
         }
         if !walk.owed.is_empty() {
             let asked = Instant::now();
