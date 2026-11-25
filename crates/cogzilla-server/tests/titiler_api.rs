@@ -1108,6 +1108,16 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 bad_wmts.status()
             );
 
+            // Audit c47 regression check: buffered WebMercatorQuad x=0 tile must not false-404
+            let buf_x0 = client
+                .get(format!(
+                    "{base}/cog/tiles/WebMercatorQuad/1/0/0.png?url={sat_url}&buffer=2&rescale=0,1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(buf_x0.status(), 200, "buffered x=0 WebMercatorQuad tile must not false-404");
+
             // 3. 16-bit Tag 320 palette entries >= 256 must be preserved in CustomColormap
             let mut pal = vec![[10u8, 20, 30, 255]; 300];
             pal[299] = [200, 150, 100, 255];
