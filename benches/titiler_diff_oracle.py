@@ -527,6 +527,12 @@ def main():
             ("STAC [per-asset expr tile .npy]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.npy?url={stac_item}&assets=red|expression=b1*2", None, "npy"),
             ("STAC [per-asset expr /point]", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red|expression=b1*2", None, "json_point"),
             ("POST /cog/statistics (Triangle valid_percent)", "POST", f"/cog/statistics?url={sat}&max_size=256", tri_feature, "json_post_stats"),
+            # --- Sweep #1 parity regressions (A4, A6, B4, B6) ---
+            ("OGC /cog/map default native CRS + aspect", "GET", f"/cog/map?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&width=128", None, "png"),
+            ("OGC /cog/map bbox + width=128 aspect", "GET", f"/cog/map?url={sat}&bbox=-122.8,37.6,-122.5,37.9&bidx=1&bidx=2&bidx=3&rescale=0,0.35&width=128", None, "png"),
+            ("OGC /cog/map crs=[EPSG:3857] safe CURIE", "GET", f"/cog/map?url={sat}&crs=[EPSG:3857]&bidx=1&bidx=2&bidx=3&rescale=0,0.35&width=128&height=128", None, "png"),
+            ("STAC [1-band styled .tif gray+alpha]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.tif?url={stac_item}&assets=red&rescale=7000,20000", None, "geotiff"),
+            ("STAC [bbox/{w}x{h} ignores max_size]", "GET", f"/stac/bbox/-122.8,37.6,-122.5,37.9/64x64.png?url={stac_item}&assets=red&rescale=7000,20000&max_size=32", None, "png"),
         ])
 
         print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks) ===")
