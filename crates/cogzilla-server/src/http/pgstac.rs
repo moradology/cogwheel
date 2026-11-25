@@ -150,6 +150,13 @@ pub(super) fn engine_error(err: &EngineError) -> Resp {
         EngineError::Shared(inner) => engine_error(inner),
         EngineError::NotFound(msg) => detail(StatusCode::NOT_FOUND, msg.clone()),
         EngineError::BadRequest(msg) => detail(StatusCode::BAD_REQUEST, msg.clone()),
+        // As Starlette answers it. An item's routes are each for one method.
+        EngineError::MethodNotAllowed(allow) => {
+            let mut resp = detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+            let allow = if allow.contains("GET") { "GET" } else { "POST" };
+            resp.headers_mut().insert(hyper::header::ALLOW, HeaderValue::from_static(allow));
+            resp
+        }
         EngineError::Proj(e) => detail(StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::Io(e @ cogzilla_io::IoError::InvalidUri(_)) => {
             detail(StatusCode::BAD_REQUEST, e.to_string())
@@ -1630,12 +1637,13 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     }
     // `colormap` is a map written out, never a name; a name nobody has is FastAPI's to refuse.
     if let Some(map) = query_value(pairs, "colormap")
+        && !map.is_empty()
         && !map.trim_start().starts_with(['{', '['])
     {
         return Err(detail(StatusCode::BAD_REQUEST, "Could not parse the colormap value."));
     }
     if let Some(name) = query_value(pairs, "colormap_name")
-        && ColormapName::from_str_opt(name).is_none()
+        && (ColormapName::from_str_opt(name).is_none() || name.chars().any(char::is_uppercase))
     {
         return Err(json_resp(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1757,7 +1765,8 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
 /// `asset_as_band`, `histogram_bins` and the options of `assets`, which get a 422.
 fn own_error(e: &str) -> bool {
     // The selection is read here, and one nobody has is a 422 as titiler-pgstac answers it.
-    if e.starts_with("unsupported pixel_selection") {
+    // A `colormap` with nothing in it is passed over.
+    if e.starts_with("unsupported pixel_selection") || e.starts_with("invalid colormap=:") {
         return true;
     }
     match error_parameter(e) {
@@ -3004,7 +3013,8 @@ async fn part_image_of(
     };
     if bbox.iter().any(|c| !c.is_finite()) || bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
         // A posted point covers no pixel: nothing to draw, as titiler-pgstac answers it.
-        if mask.is_some() && bbox[0] == bbox[2] && bbox[1] == bbox[3] {
+        // So does a line along a row or a column of them.
+        if mask.is_some() && bbox.iter().all(|c| c.is_finite()) && (bbox[0] == bbox[2] || bbox[1] == bbox[3]) {
             return no_content();
         }
         return detail(StatusCode::BAD_REQUEST, "the box has no area in the coordinate system asked for");
@@ -4300,10 +4310,15 @@ async fn mosaic_statistics(
     pairs: &[(String, String)],
 ) -> Resp {
     // Read here; the shared parser does not know them on this route.
-    const OWN: [&str; 8] =
-        ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
+    const OWN: [&str; 10] = [
+        "width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale",
+        // Statistics have no colours: titiler-pgstac passes these over, whatever they hold.
+        "colormap", "colormap_name",
+    ];
     pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
-    let query = match check_mosaic_query(&pq, pairs) {
+    let uncoloured: Vec<(String, String)> =
+        pairs.iter().filter(|(k, _)| !matches!(k.as_str(), "colormap" | "colormap_name")).cloned().collect();
+    let query = match check_mosaic_query(&pq, &uncoloured) {
         Ok(q) => q,
         Err(r) => return r,
     };

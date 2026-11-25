@@ -717,6 +717,7 @@ def main() -> int:
         dot = {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": triangle["geometry"]["coordinates"][0][0]}}
         o.check("feature, a point", "status", f"/searches/{sid}/feature.png?assets=visual&max_size=64", "POST", dot)
         o.check("feature, a point, exact size", "status", f"/searches/{sid}/feature/64x64.png?assets=visual", "POST", dot)
+        o.check("statistics pass a colour map over", "status", f"/searches/{sid}/statistics?assets=red&colormap_name=nope&max_size=64", "POST", triangle)
         # Arrays keep the data's type and carry the mask as a band of their own.
         o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)
         o.check("feature as an array, 16-bit", "image", f"/searches/{sid}/feature/120x80.npy?assets=red", "POST", triangle)
