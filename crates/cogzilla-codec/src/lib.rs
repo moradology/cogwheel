@@ -42,6 +42,18 @@ fn decode_packbits(src: &[u8], dst: &mut [u8]) -> Result<usize, CodecError> {
     Ok(di)
 }
 
+/// Compress a byte slice into a gzip stream (RFC 1952) using `libdeflater` at default level.
+pub fn compress_gzip(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+    let max_sz = compressor.gzip_compress_bound(input.len());
+    let mut out = vec![0u8; max_sz];
+    let n = compressor
+        .gzip_compress(input, &mut out)
+        .map_err(|e| format!("gzip compress error: {e:?}"))?;
+    out.truncate(n);
+    Ok(out)
+}
+
 /// Decompress a gzip-encoded buffer using `libdeflater` with an upper bound on decompressed size
 /// to guard against decompression bombs.
 pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {

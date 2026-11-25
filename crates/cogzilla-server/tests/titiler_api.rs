@@ -1563,6 +1563,42 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(mna2.status(), 405);
             let mna3 = client.delete(format!("{base}/healthz")).send().await.unwrap();
             assert_eq!(mna3.status(), 405);
+
+            // Sweep #1 E1 & D5 regression checks: gzip + Vary + Cache-Control on metadata, and 13-TMS WMTS
+            let gz_resp = client
+                .get(format!("{base}/tileMatrixSets/WebMercatorQuad"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(gz_resp.status(), 200);
+            assert_eq!(
+                gz_resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+                Some("gzip")
+            );
+            assert!(
+                gz_resp
+                    .headers()
+                    .get("vary")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("accept-encoding"))
+            );
+            assert!(gz_resp.headers().get("cache-control").is_some());
+            let gz_bytes = gz_resp.bytes().await.unwrap();
+            let decomp = cogzilla_codec::decompress_gzip_limited(&gz_bytes, 1024 * 1024).unwrap();
+            let tms_decomp: serde_json::Value = serde_json::from_slice(&decomp).unwrap();
+            assert_eq!(tms_decomp["id"], "WebMercatorQuad");
+
+            let wmts_all = client
+                .get(format!("{base}/cog/WMTSCapabilities.xml?url={sat_url}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wmts_all.status(), 200);
+            assert!(wmts_all.headers().get("cache-control").is_some());
+            let wmts_body = wmts_all.text().await.unwrap();
+            assert_eq!(wmts_body.matches("<Layer>").count(), 13);
+            assert_eq!(wmts_body.matches("<TileMatrixSet>").count(), 26); // 13 links + 13 definitions
         }
     }
 }
