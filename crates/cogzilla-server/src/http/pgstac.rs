@@ -55,6 +55,28 @@ pub(super) struct Ctx<'a> {
     pub path: &'a str,
     pub raw_query: &'a str,
     pub if_none_match: Option<&'a str>,
+    /// The one item a picture is made of, when the request is for an item and not a
+    /// search: the search's routes then draw that item and look nothing up.
+    pub only: Option<&'a Arc<Vec<MosaicItem>>>,
+}
+
+/// The items a picture over `geometry` is made of: the request's own item, or what the
+/// search finds there.
+#[allow(clippy::too_many_arguments)]
+async fn pixel_items(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    geometry: &Value,
+    hash: &str,
+    limits: SearchLimits,
+    names: &[String],
+    grid: Option<SampleGrid>,
+    lookup: Lookup,
+) -> Result<Arc<Vec<MosaicItem>>, cogzilla_pgstac::PgStacError> {
+    match ctx.only {
+        Some(only) => Ok(only.clone()),
+        None => pg.items_for_pixels(geometry, hash, limits, names, grid, lookup).await,
+    }
 }
 
 type Resp = Response<Full<Bytes>>;
@@ -1622,7 +1644,9 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// The asset options of an item request, as the `/stac` handlers take them. The shared
 /// parser adds every asset's `|bidx=` to one list, which is right for one asset and reads
 /// the wrong bands for several; here each asset keeps its own. Band math on one asset is
-/// not something those handlers do: it is refused, not left out of the picture.
+/// not something those handlers do. A tile or a box with it never gets here: the search
+/// routes draw those (`item_picture_by_asset`). On what is left, a preview or an image
+/// over a posted shape, it is refused, not left out of the picture.
 ///
 /// Returns each asset's bands and the request's own `bidx`, or `None` when no asset has
 /// options. Only the info, statistics and point handlers read bands asset by asset; on
@@ -1633,7 +1657,7 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
     if let Some(spec) = specs.iter().find(|s| s.expression.is_some()) {
         return Err(detail(
             StatusCode::BAD_REQUEST,
-            format!("assets={}|expression= is not supported on item routes yet; use `expression`", spec.name),
+            format!("assets={}|expression= is not supported on this item route yet; use `expression`", spec.name),
         ));
     }
     if specs.iter().all(|s| s.indexes.is_none()) {
@@ -2442,7 +2466,7 @@ async fn part_image(
     let mask = if whole_box { None } else { mask };
 
     let grid = part_grid(size, bbox);
-    let items = match pg.items_for_pixels(geometry, hash, query.limits, &names, grid, query.lookup).await {
+    let items = match pixel_items(ctx, pg, geometry, hash, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -2868,8 +2892,10 @@ fn curved_scanline(exact: &impl Fn(usize) -> (f64, f64), out: &mut [(f64, f64)],
         // A row that jumps, as a longitude does where it wraps, leaves them lopsided by at
         // least a quarter of the jump, even when the row's bend hides the jump from each
         // column on its own. Held to an eighth of the tolerance, no jump of more than half
-        // the tolerance is drawn across, and no position is more than twice the tolerance
-        // out: the margin the check at a source pixel's edge is built on.
+        // the tolerance is drawn across, and a row that is smooth but for one jump is
+        // nowhere more than twice the tolerance out: the margin the check at a source
+        // pixel's edge is built on. That is not a bound on any row whatever: one that
+        // wiggles between the five columns looked at is not seen, and no projection does.
         let lopsided = (first.0 + second.0).abs().max((first.1 + second.1).abs());
         if finite && error <= tolerance && lopsided <= tolerance / 8.0 {
             for (k, slot) in out[lo..=hi].iter_mut().enumerate() {
@@ -3846,7 +3872,7 @@ async fn tile(
         Err(r) => return r,
     };
     let grid = tile_grid(scale, &pq);
-    let items = match pg.items_for_pixels(&tile_polygon(tile), id, query.limits, &names, grid, query.lookup).await {
+    let items = match pixel_items(ctx, pg, &tile_polygon(tile), id, query.limits, &names, grid, query.lookup).await {
         Ok(items) => items,
         Err(e) => return db_error(&e),
     };
@@ -4707,7 +4733,60 @@ pub(super) async fn item_route(
             ));
         }
     }
+    // Band math on one asset, and bands chosen on each of several, are things the search
+    // routes draw and the `/stac` ones do not: a tile or a box of this item with either
+    // is drawn by the search routes, from this item alone.
+    if get && item_picture_by_asset(rest, &pairs) {
+        let assets: std::collections::BTreeMap<String, Value> = doc["assets"]
+            .as_object()
+            .map(|a| a.iter().filter(|(name, _)| readable.contains(name)).map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let bbox = doc["bbox"].as_array().and_then(|b| match b.len() {
+            4 => Some([b[0].as_f64()?, b[1].as_f64()?, b[2].as_f64()?, b[3].as_f64()?]),
+            6 => Some([b[0].as_f64()?, b[1].as_f64()?, b[3].as_f64()?, b[4].as_f64()?]),
+            _ => None,
+        });
+        // What is drawn is cached under the item and where its assets are read from.
+        let identity = source_identity(&(&collection, &item_id, &item.assets));
+        let only = Arc::new(vec![MosaicItem {
+            id: item_id.clone(),
+            collection: Some(collection.clone()),
+            bbox,
+            assets,
+            self_href: (!self_href.is_empty()).then(|| self_href.to_string()),
+        }]);
+        let rec = SearchRecord {
+            hash: format!("item-{identity:016x}"),
+            search: Value::Null,
+            where_clause: None,
+            orderby: None,
+            lastused: None,
+            usecount: None,
+            metadata: Value::Null,
+        };
+        let ctx = Ctx {
+            engine: ctx.engine,
+            host: ctx.host,
+            forwarded_prefix: ctx.forwarded_prefix,
+            path: ctx.path,
+            raw_query: ctx.raw_query,
+            if_none_match: ctx.if_none_match,
+            only: Some(&only),
+        };
+        let own = super::parse_query((!ctx.raw_query.is_empty()).then_some(ctx.raw_query));
+        return Done(mosaic_route(&ctx, pg, &base, &rec, rest, None, own, &pairs).await);
+    }
     ItemRoute::Stac(item, extent)
+}
+
+/// Whether an item request is for a tile or a box whose assets carry band math, or bands
+/// of their own on more than one of them.
+fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
+    if !matches!(rest, ["tiles", "WebMercatorQuad", _, _, _] | ["bbox", _] | ["bbox", _, _]) || rest.last() == Some(&"assets") {
+        return false;
+    }
+    let Ok(specs) = parse_assets(pairs) else { return false };
+    specs.iter().any(|s| s.expression.is_some()) || (specs.len() > 1 && specs.iter().any(|s| s.indexes.is_some()))
 }
 
 /// Serve a request whose path starts with `/searches`.
@@ -5281,6 +5360,7 @@ mod tests {
             path: "/searches/abc/WMTSCapabilities.xml",
             raw_query,
             if_none_match: None,
+            only: None,
         };
         let source = || WmtsSource {
             title: "abc",
@@ -5827,6 +5907,29 @@ mod tests {
             worst_jump / PICTURE_TOLERANCE,
             worst_kink / PICTURE_TOLERANCE
         );
+    }
+
+    #[test]
+    fn item_pictures_with_options_on_assets_go_to_the_search_routes() {
+        let by_asset = |rest: &[&str], q: &str| item_picture_by_asset(rest, &query_pairs(q));
+        let tile = ["tiles", "WebMercatorQuad", "11", "1059", "746.png"];
+        // Band math on an asset, and bands chosen on more than one.
+        assert!(by_asset(&tile, "assets=red%7Cexpression=b1*2"));
+        assert!(by_asset(&tile, "assets=visual%7Cbidx=1&assets=red%7Cbidx=1"));
+        assert!(by_asset(&tile, "assets=visual%7Cbidx=3,1&assets=red"));
+        assert!(by_asset(&["bbox", "6,43,7,44.png"], "assets=red%7Cexpression=b1*2"));
+        assert!(by_asset(&["bbox", "6,43,7,44", "256x256.png"], "assets=red%7Cexpression=b1*2"));
+        // What `/stac` draws stays there: plain assets, and bands of a single one.
+        assert!(!by_asset(&tile, "assets=visual"));
+        assert!(!by_asset(&tile, "assets=red&assets=green&expression=b1/b2"));
+        assert!(!by_asset(&tile, "assets=visual%7Cbidx=1"));
+        // So does every other route, and a tile in another tile matrix set.
+        for rest in [&["preview.png"][..], &["info"], &["statistics"], &["point", "6,43"], &["bbox", "6,43,7,44", "assets"]] {
+            assert!(!by_asset(rest, "assets=red%7Cexpression=b1*2"), "{rest:?}");
+        }
+        assert!(!by_asset(&["tiles", "WGS1984Quad", "11", "1059", "746.png"], "assets=red%7Cexpression=b1*2"));
+        // Options that cannot be read are answered for by the route they were sent to.
+        assert!(!by_asset(&tile, "assets=red%7Cbidx=x&assets=green"));
     }
 
     #[test]

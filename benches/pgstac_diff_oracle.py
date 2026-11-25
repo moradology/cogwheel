@@ -898,6 +898,23 @@ def main() -> int:
         o.check("item preview", "image", f"{it}/preview.png?assets=visual&max_size=256")
         o.check("item preview, sized", "image", f"{it}/preview/200x200.png?assets=visual")
         o.check("item bbox", "image", f"{it}/bbox/{ibox}/256x256.png?assets=visual")
+        # Options on the assets themselves: band math on one, bands chosen on several.
+        o.check("item tile, band math on one asset", "image", f"{itile}.png?assets=red%7Cexpression=b1*2&rescale=0,6000")
+        o.check("item tile, band math on each of two assets", "image",
+                f"{itile}.png?assets=red%7Cexpression=b1/2&assets=nir%7Cexpression=b1/4&rescale=0,3000")
+        o.check("item tile, band math on one asset beside a plain one", "image",
+                f"{itile}.png?assets=red%7Cexpression=b1*2&assets=green&asset_as_band=true&rescale=0,6000")
+        o.check("item tile, band math giving two bands of one asset", "image",
+                f"{itile}.png?assets=visual%7Cexpression=b1%2Bb2;b3&rescale=0,400")
+        o.check("item tile, bands chosen on two assets", "image",
+                f"{itile}.png?assets=visual%7Cbidx=1&assets=red%7Cbidx=1&rescale=0,3000")
+        o.check("item tile, bands chosen on one of two assets", "image",
+                f"{itile}.png?assets=visual%7Cbidx=3,1&assets=red&rescale=0,3000")
+        o.check("item bbox, band math on one asset", "image", f"{it}/bbox/{ibox}/256x256.png?assets=red%7Cexpression=b1*2&rescale=0,6000")
+        o.check("item bbox, bands chosen on two assets", "image",
+                f"{it}/bbox/{ibox}.png?assets=visual%7Cbidx=1&assets=red%7Cbidx=1&rescale=0,3000")
+        o.check("item preview, band math on one asset", "image", f"{it}/preview.png?assets=red%7Cexpression=b1*2&rescale=0,6000",
+                known="a preview is read on the raster's own grid, which only the /stac routes do, and they do no band math on one asset; cogzilla answers 400")
         o.check("item point", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual")
         o.check("item point, two assets", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir")
         o.check("item point outside the item", "status", f"{it}/point/0,0?assets=visual",

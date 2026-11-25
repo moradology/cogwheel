@@ -109,6 +109,7 @@ An image's planes can be large, so more is bounded than on a tile: the first ite
 - An unknown item is a `404`, a tile that does not touch the item is a `404`, and errors are JSON `{"detail": ...}`.
 - The item's bounds and zoom range come from its projection metadata (`proj:shape`, `proj:transform`, `proj:epsg` or `proj:code`) by rio-tiler's rule, or from its bbox when it has none. They are used for the tilesets, the TileJSON and `info.geojson`.
 - A tile with no extension is a JPEG when every pixel is valid and a PNG otherwise, and `.jpg` is served as `image/jpg`.
+- A tile or a `bbox` image whose assets carry band math (`assets=red|expression=b1*2`), or bands of their own on more than one asset (`assets=visual|bidx=1&assets=red|bidx=1`), is drawn by the code that draws a search's, from this one item, and is TiTiler's picture. `preview` and `POST feature` with either are still a `400`.
 
 Known differences from titiler-pgstac on these routes, inherited from the shared `/stac` code:
 
