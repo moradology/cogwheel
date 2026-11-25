@@ -4611,6 +4611,9 @@ where
                 }
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_x_assets(&mut resp, &stac_x_assets);
+                if stac_prefix != "stac" {
+                    resp = pgstac::item_placed(resp, &segs[1..], &raw_query);
+                }
                 return Ok(resp);
             }
 
@@ -5044,6 +5047,11 @@ where
                         Ok(fixed) => {
                             let mut resp = to_http_response(&engine, Ok(fixed), if_none_match.as_deref());
                             attach_x_assets(&mut resp, &stac_x_assets);
+                            let resp = if method == Method::GET {
+                                pgstac::item_placed(resp, &segs[1..], &raw_query)
+                            } else {
+                                resp
+                            };
                             pgstac_cacheable(resp, &method)
                         }
                         Err(resp) => resp,

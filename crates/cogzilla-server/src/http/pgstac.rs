@@ -4778,6 +4778,60 @@ pub(super) async fn item_tile_auto_format(
     Ok((encode_rgba_output(dim, dim, &rgba, format, pq.return_mask), content_type))
 }
 
+/// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
+/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in.
+/// Only degrees and Web Mercator are worked out here; a picture in any other system, a
+/// preview and a posted shape go without the headers.
+pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
+    match sub {
+        ["tiles", "WebMercatorQuad", z, x, y] => {
+            let (Ok(z), Ok(x), Some((y, _, _))) = (z.parse::<u8>(), x.parse::<u32>(), super::parse_y_scale_ext(y)) else {
+                return resp;
+            };
+            if z > 30 || u64::from(x.max(y)) >= 1u64 << z {
+                return resp;
+            }
+            let (west, south, east, north) = tile_bounds_3857(TileCoord { z, x, y });
+            placed(resp, [west, south, east, north], 3857)
+        }
+        ["bbox", seg] | ["bbox", seg, _] => {
+            let Some((bbox, _)) = super::parse_bbox4(seg) else {
+                return resp;
+            };
+            let pairs = query_pairs(raw_query);
+            // 4326 or 3857, or nothing for a system not placed here.
+            let system = |key: &str, default: u16| match query_value(&pairs, key).map(super::parse_coord_crs_with_epsg) {
+                None => Some(default),
+                Some(Ok((_, epsg @ (4326 | 3857)))) => Some(epsg),
+                Some(_) => None,
+            };
+            let Some(given) = system("coord_crs", 4326) else {
+                return resp;
+            };
+            let Some(drawn) = system("dst_crs", given) else {
+                return resp;
+            };
+            let corners = |to: fn(f64, f64) -> (f64, f64)| {
+                let ((w, s), (e, n)) = (to(bbox[0], bbox[1]), to(bbox[2], bbox[3]));
+                [w, s, e, n]
+            };
+            let bounds = match (given, drawn) {
+                (4326, 3857) => corners(cogzilla_proj::mercator::lonlat_deg_to_mercator),
+                (3857, 4326) => corners(mercator_to_lonlat_deg),
+                _ => bbox,
+            };
+            if bounds.iter().any(|c| !c.is_finite()) {
+                return resp;
+            }
+            placed(resp, bounds, drawn)
+        }
+        _ => resp,
+    }
+}
+
 /// Make a `/stac` answer read the way titiler-pgstac's item routes do.
 pub(super) fn item_fixup(
     sub: &[&str],
@@ -6659,6 +6713,40 @@ mod tests {
             assert!(!nodata_fits(bad, T::Uint16));
         }
         assert!(!nodata_fits(256.0, T::Uint8) && nodata_fits(f32::NAN, T::Float32));
+    }
+
+    #[test]
+    fn item_pictures_say_where_they_lie() {
+        let ok = || Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap();
+        let said = |sub: &[&str], query: &str| {
+            let resp = item_placed(ok(), sub, query);
+            let header = |name: &str| resp.headers().get(name).map(|v| v.to_str().unwrap().to_string());
+            header("content-bbox").zip(header("content-crs"))
+        };
+        let crs = |epsg: u16| format!("<http://www.opengis.net/def/crs/EPSG/0/{epsg}>");
+        let (bbox, system) = said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "assets=visual").unwrap();
+        assert_eq!(system, crs(3857));
+        assert!(bbox.starts_with("-20037508.34278") && bbox.split(',').count() == 4);
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "assets=visual").unwrap(), ("6.3,43.6,6.5,43.8".into(), crs(4326)));
+        assert_eq!(
+            said(&["bbox", "701000,5404000,720000,5420000", "64x64.png"], "coord_crs=epsg:3857").unwrap(),
+            ("701000.0,5404000.0,720000.0,5420000.0".into(), crs(3857))
+        );
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=EPSG%3A3857").unwrap().1, crs(3857));
+        assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
+        // Systems not placed here, tiles that are not tiles, and other routes go without.
+        for (sub, query) in [
+            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:32631"),
+            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "coord_crs=epsg:32631"),
+            (&["tiles", "WebMercatorQuad", "1", "2", "0.png"][..], ""),
+            (&["tiles", "WGS1984Quad", "0", "0", "0.png"][..], ""),
+            (&["preview.png"][..], ""),
+            (&["info"][..], ""),
+        ] {
+            assert_eq!(said(sub, query), None, "{sub:?} {query}");
+        }
+        let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
+        assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
     }
 
 }
