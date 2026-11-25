@@ -4953,7 +4953,21 @@ async fn tile(
                     )));
                 }
                 let mut fold = Fold::new(method, bands, dim * dim, integer);
-                engine.mosaic_scene_values(&scenes, &treq, |scene| fold.add_le_bytes(scene)).await?;
+                // For an array each scene's values are brought to whole numbers first, where
+                // the raster's are: rio-tiler's scenes are in the raster's type before the
+                // method sees them, and a mean cut off after is otherwise half a level low.
+                if array && integer {
+                    let pixels = bands * dim * dim * 4;
+                    engine
+                        .mosaic_scene_values(&scenes, &treq, |scene| {
+                            if scene.len() == pixels {
+                                fold.add(scene.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]).round()));
+                            }
+                        })
+                        .await?;
+                } else {
+                    engine.mosaic_scene_values(&scenes, &treq, |scene| fold.add_le_bytes(scene)).await?;
+                }
                 let selected = fold.finish();
                 if array {
                     // A count is of bytes and a deviation of doubles; the rest are in the
@@ -4971,7 +4985,8 @@ async fn tile(
                     let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
                     let values: Vec<f32> = match selected {
                         Some(selected) => selected.values.iter().map(|v| if whole { v.round() } else { *v }).collect(),
-                        None => vec![f32::NAN; bands * dim * dim],
+                        // No scene reached the tile: nothing, in the method's own shape.
+                        None => vec![f32::NAN; if method == Selection::Count { 1 } else { bands } * dim * dim],
                     };
                     let shown = values.len() / (dim * dim);
                     return Ok((npy_array(&values, shown, dim, dim, kind, return_mask, None), content_type));
