@@ -3208,6 +3208,29 @@ pub async fn compute_statistics_with_options(
         };
         let cogs = [cog.clone()];
         let n_px = (out_w as usize) * (out_h as usize);
+        let feature_covered_px = pm
+            .rasterize_all_touched(
+                out_w as usize,
+                out_h as usize,
+                eff_bbox,
+                &cogzilla_proj::CrsModel::Geographic,
+            )
+            .iter()
+            .filter(|&&b| b)
+            .count();
+        let patch_valid_percent = |mut stat: serde_json::Value| -> serde_json::Value {
+            if feature_covered_px > 0
+                && let Some(obj) = stat.as_object_mut()
+                && let Some(vp) = obj.get("valid_pixels").and_then(|v| v.as_f64())
+            {
+                let pct = ((vp / feature_covered_px as f64) * 100.0).min(100.0);
+                obj.insert(
+                    "valid_percent".into(),
+                    serde_json::json!((pct * 100.0).round() / 100.0),
+                );
+            }
+            stat
+        };
         let mut out = serde_json::Map::new();
         if let Some(ref exprs) = opts.expressions {
             for (i, (desc, prog)) in exprs.iter().enumerate() {
@@ -3240,7 +3263,7 @@ pub async fn compute_statistics_with_options(
                     .collect();
                 out.insert(
                     format!("b{}", i + 1),
-                    compute_f32_band_stats(&pixels, desc, opts),
+                    patch_valid_percent(compute_f32_band_stats(&pixels, desc, opts)),
                 );
             }
             return Ok(serde_json::Value::Object(out));
@@ -3293,7 +3316,10 @@ pub async fn compute_statistics_with_options(
                     .filter(|s| !s.is_empty())
                     .map(String::from)
                     .unwrap_or_else(|| format!("b{b1}"));
-                out.insert(format!("b{b1}"), compute_f32_band_stats(&pixels, &desc, opts));
+                out.insert(
+                    format!("b{b1}"),
+                    patch_valid_percent(compute_f32_band_stats(&pixels, &desc, opts)),
+                );
             }
         }
         return Ok(serde_json::Value::Object(out));

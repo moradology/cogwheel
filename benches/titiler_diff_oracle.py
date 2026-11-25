@@ -522,6 +522,11 @@ def main():
             ("MODE 1-band /cog/preview return_mask=false -> L", "GET", f"/cog/preview/64x64.png?url={sat}&bidx=1&rescale=0,0.35&return_mask=false", None, "gray_png_l"),
             ("MODE 1-band /cog/tiles JPEG -> L", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.jpg?url={sat}&bidx=1&rescale=0,0.35", None, "gray_jpg"),
             ("MODE 1-band /cog/preview JPEG -> L", "GET", f"/cog/preview/64x64.jpg?url={sat}&bidx=1&rescale=0,0.35", None, "gray_jpg"),
+            # --- Sweep #4 parity regressions (P1, P2, P3, P4, P5b) ---
+            ("STAC [2-asset .npy (3,256,256)]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.npy?url={stac_item}&assets=red&assets=green", None, "npy"),
+            ("STAC [per-asset expr tile .npy]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.npy?url={stac_item}&assets=red|expression=b1*2", None, "npy"),
+            ("STAC [per-asset expr /point]", "GET", f"/stac/point/-122.65,37.773?url={stac_item}&assets=red|expression=b1*2", None, "json_point"),
+            ("POST /cog/statistics (Triangle valid_percent)", "POST", f"/cog/statistics?url={sat}&max_size=256", tri_feature, "json_post_stats"),
         ])
 
         print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks) ===")
