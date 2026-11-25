@@ -2302,6 +2302,229 @@ fn resolve_resample(
     if same_crs { pq.resample } else { pq.reproject }
 }
 
+fn build_ogc_tileset_json(
+    host: &str,
+    forwarded_prefix: &str,
+    route_prefix: &str,
+    tms_def: &crate::tms::TmsDef,
+    raw_query: &str,
+    bounds: Option<[f64; 4]>,
+    minzoom: Option<u8>,
+    maxzoom: Option<u8>,
+) -> serde_json::Value {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        format!("{host}{forwarded_prefix}")
+    } else {
+        format!("http://{host}{forwarded_prefix}")
+    };
+    let q_suffix = if raw_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{raw_query}")
+    };
+    let [w, s, e, n] = bounds.unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+    let limits: Vec<serde_json::Value> = tms_def
+        .matrices
+        .iter()
+        .filter(|m| {
+            let z = m.id.parse::<u8>().unwrap_or(0);
+            minzoom.is_none_or(|mn| z >= mn) && maxzoom.is_none_or(|mx| z <= mx)
+        })
+        .map(|m| {
+            serde_json::json!({
+                "tileMatrix": m.id,
+                "minTileRow": 0,
+                "maxTileRow": m.matrix_height.saturating_sub(1),
+                "minTileCol": 0,
+                "maxTileCol": m.matrix_width.saturating_sub(1),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "title": tms_def.id,
+        "id": tms_def.id,
+        "tileMatrixSetId": tms_def.id,
+        "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{}", tms_def.id),
+        "dataType": "map",
+        "crs": tms_def.crs_uri,
+        "accessConstraints": "unclassified",
+        "boundingBox": {
+            "lowerLeft": [w, s],
+            "upperRight": [e, n],
+            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        },
+        "tileMatrixSetLimits": limits,
+        "links": [
+            {
+                "href": format!("{origin}/{route_prefix}/tiles/{}{q_suffix}", tms_def.id),
+                "rel": "self",
+                "type": "application/json",
+                "title": tms_def.id,
+            },
+            {
+                "href": format!("{origin}/tileMatrixSets/{}", tms_def.id),
+                "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
+                "type": "application/json",
+                "title": format!("Definition of '{}' tile matrix set", tms_def.id),
+            },
+            {
+                "href": format!("{origin}/{route_prefix}/tiles/{}/{{tileMatrix}}/{{tileCol}}/{{tileRow}}{q_suffix}", tms_def.id),
+                "rel": "item",
+                "type": "image/png",
+                "title": "Tiles",
+                "templated": true,
+            },
+        ],
+    })
+}
+
+fn build_ogc_tilesets_list(
+    host: &str,
+    forwarded_prefix: &str,
+    route_prefix: &str,
+    raw_query: &str,
+    bounds: Option<[f64; 4]>,
+) -> serde_json::Value {
+    let tilesets: Vec<serde_json::Value> = crate::tms::ALL_TMS
+        .iter()
+        .map(|t| {
+            build_ogc_tileset_json(
+                host,
+                forwarded_prefix,
+                route_prefix,
+                t,
+                raw_query,
+                bounds,
+                None,
+                None,
+            )
+        })
+        .collect();
+    serde_json::json!({ "tilesets": tilesets })
+}
+
+fn method_not_allowed_resp(allow: &'static str) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({ "detail": "Method Not Allowed" }).to_string();
+    let mut resp = plain_resp(
+        StatusCode::METHOD_NOT_ALLOWED,
+        Bytes::from(body),
+        "application/json",
+    );
+    resp.headers_mut()
+        .insert(hyper::header::ALLOW, HeaderValue::from_static(allow));
+    resp
+}
+
+fn strip_null_object_fields(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.retain(|_, val| !val.is_null());
+    }
+    v
+}
+
+fn utc_now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Howard Hinnant's civil-from-days algorithm
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+fn build_stac_render_entry(
+    host: &str,
+    forwarded_prefix: &str,
+    stac_url: &str,
+    render_id: &str,
+    render: &serde_json::Value,
+) -> serde_json::Value {
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        format!("{host}{forwarded_prefix}")
+    } else {
+        format!("http://{host}{forwarded_prefix}")
+    };
+    let mut qs_parts = vec![format!("url={stac_url}")];
+    if let Some(obj) = render.as_object() {
+        for (k, v) in obj {
+            match k.as_str() {
+                "title" | "minmax_zoom" | "tilematrixsets" => continue,
+                "assets" => {
+                    if let Some(arr) = v.as_array() {
+                        for a in arr {
+                            if let Some(s) = a.as_str() {
+                                qs_parts.push(format!("assets={s}"));
+                            }
+                        }
+                    }
+                }
+                "rescale" => {
+                    if let Some(arr) = v.as_array() {
+                        for pair in arr {
+                            if let Some(p) = pair.as_array()
+                                && p.len() == 2
+                            {
+                                qs_parts.push(format!("rescale={},{}", p[0], p[1]));
+                            }
+                        }
+                    }
+                }
+                "bidx" => {
+                    if let Some(arr) = v.as_array() {
+                        for b in arr {
+                            qs_parts.push(format!("bidx={b}"));
+                        }
+                    }
+                }
+                _ => match v {
+                    serde_json::Value::String(s) => qs_parts.push(format!("{k}={s}")),
+                    serde_json::Value::Number(n) => qs_parts.push(format!("{k}={n}")),
+                    serde_json::Value::Bool(b) => qs_parts.push(format!("{k}={b}")),
+                    _ => {}
+                },
+            }
+        }
+    }
+    let render_qs = qs_parts.join("&");
+    serde_json::json!({
+        "valid": true,
+        "params": render,
+        "links": [
+            {
+                "rel": "self",
+                "type": "application/json",
+                "href": format!("{origin}/stac/renders/{render_id}?url={stac_url}"),
+            },
+            {
+                "rel": "tilesets-map",
+                "type": "application/json",
+                "title": "TileJSON",
+                "href": format!("{origin}/stac/WebMercatorQuad/tilejson.json?{render_qs}"),
+            },
+            {
+                "rel": "tilesets-map",
+                "type": "application/xml",
+                "title": "WMTS",
+                "href": format!("{origin}/stac/WebMercatorQuad/WMTSCapabilities.xml?{render_qs}"),
+            },
+        ],
+    })
+}
+
 fn data_band_count(ifd: &cogzilla_tiff::IfdMeta) -> u16 {
     if cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples)
         .is_some()
@@ -4047,12 +4270,25 @@ where
                 "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
                 "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
                 "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/json",
+                "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/html",
                 "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
                 "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
                 "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/dataset-tilesets",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/jpeg",
+                "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tiff",
                 "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
+                "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tiff",
                 "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
-                "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset"
+                "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
+                "http://www.opengis.net/spec/tms/2.0/conf/tilematrixsetlimits"
             ]
         });
         return Ok(plain_resp(
@@ -4432,7 +4668,8 @@ where
                 let text = std::str::from_utf8(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid UTF-8 body: {e}")))?;
                 let mj = MosaicJsonCatalog::from_json_str(text).map_err(EngineError::BadRequest)?;
-                Ok((Bytes::from(mj.raw_json.to_string()), "application/json"))
+                let clean = strip_null_object_fields(mj.raw_json.clone());
+                Ok((Bytes::from(clean.to_string()), "application/json"))
             }
             .await,
             ["mosaicjson", "statistics"] => async {
@@ -4640,7 +4877,8 @@ where
             ["mosaicjson"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                Ok((Bytes::from(mj.raw_json.to_string()), "application/json"))
+                let clean = strip_null_object_fields(mj.raw_json.clone());
+                Ok((Bytes::from(clean.to_string()), "application/json"))
             }
             .await,
             ["mosaicjson", "viewer"] => {
@@ -4820,28 +5058,46 @@ where
                 Ok((data, ct))
             }
             .await,
-            ["mosaicjson", "tiles"] => {
-                let tilesets: Vec<serde_json::Value> = crate::tms::ALL_TMS
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "title": t.id,
-                            "id": t.id,
-                            "crs": t.crs_uri,
-                        })
-                    })
-                    .collect();
-                let body = serde_json::json!({ "tilesets": tilesets }).to_string();
+            ["mosaicjson", "tiles"] => async {
+                let bounds = if let Some(ref u) = mj_url {
+                    load_mosaicjson(&engine, u).await.ok().map(|m| m.bounds)
+                } else {
+                    None
+                };
+                let body = build_ogc_tilesets_list(
+                    &host,
+                    &forwarded_prefix,
+                    "mosaicjson",
+                    &raw_query,
+                    bounds,
+                )
+                .to_string();
                 Ok((Bytes::from(body), "application/json"))
             }
-            ["mosaicjson", "tiles", tms] => {
+            .await,
+            ["mosaicjson", "tiles", tms] => async {
                 if let Some(tms_def) = crate::tms::lookup_tms(tms) {
-                    let body = serde_json::json!({
-                        "title": tms_def.id,
-                        "tileMatrixSetId": tms_def.id,
-                        "dataType": "map",
-                        "crs": tms_def.crs_uri
-                    })
+                    let (bounds, minz, maxz) = if let Some(ref u) = mj_url
+                        && let Ok(m) = load_mosaicjson(&engine, u).await
+                    {
+                        (
+                            Some(m.bounds),
+                            pq.minzoom.or(Some(m.minzoom)),
+                            pq.maxzoom.or(Some(m.maxzoom)),
+                        )
+                    } else {
+                        (None, pq.minzoom, pq.maxzoom)
+                    };
+                    let body = build_ogc_tileset_json(
+                        &host,
+                        &forwarded_prefix,
+                        "mosaicjson",
+                        tms_def,
+                        &raw_query,
+                        bounds,
+                        minz,
+                        maxz,
+                    )
                     .to_string();
                     Ok((Bytes::from(body), "application/json"))
                 } else {
@@ -4850,6 +5106,7 @@ where
                     )))
                 }
             }
+            .await,
             ["mosaicjson", "point", coord] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
@@ -4894,9 +5151,7 @@ where
                     }
                 }
                 if assets_out.is_empty() {
-                    return Err(EngineError::NotFound(
-                        "point outside all MosaicJSON scenes".into(),
-                    ));
+                    return Err(EngineError::NoContent);
                 }
                 let body = serde_json::json!({
                     "coordinates": [x, y],
@@ -6358,33 +6613,37 @@ where
             .await,
 
             // GET /stac/tiles & /stac/tiles/{tms} (OGC TilesetList & Tileset, matching /cog/tiles*)
-            (Method::GET, ["tiles"]) => {
-                let tilesets: Vec<serde_json::Value> = crate::tms::ALL_TMS
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "title": t.id,
-                            "id": t.id,
-                            "crs": t.crs_uri,
-                        })
-                    })
-                    .collect();
-                let body = serde_json::json!({ "tilesets": tilesets }).to_string();
-                Ok((Bytes::from(body), "application/json"))
-            }
-            (Method::GET, ["tiles", tms]) => {
-                let crs_uri = crate::tms::lookup_tms(tms)
-                    .map(|t| t.crs_uri)
-                    .unwrap_or("http://www.opengis.net/def/crs/EPSG/0/3857");
-                let body = serde_json::json!({
-                    "title": tms,
-                    "id": tms,
-                    "crs": crs_uri,
-                    "dataType": "map",
-                })
+            (Method::GET, ["tiles"]) => async {
+                let bounds = stac_source.load(&engine).await.ok().and_then(|item| item.bbox);
+                let body = build_ogc_tilesets_list(
+                    &host,
+                    &forwarded_prefix,
+                    "stac",
+                    &raw_query,
+                    bounds,
+                )
                 .to_string();
                 Ok((Bytes::from(body), "application/json"))
             }
+            .await,
+            (Method::GET, ["tiles", tms]) => async {
+                let tms_def = crate::tms::lookup_tms(tms)
+                    .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
+                let bounds = stac_source.load(&engine).await.ok().and_then(|item| item.bbox);
+                let body = build_ogc_tileset_json(
+                    &host,
+                    &forwarded_prefix,
+                    "stac",
+                    tms_def,
+                    &raw_query,
+                    bounds,
+                    pq.minzoom,
+                    pq.maxzoom,
+                )
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
+            .await,
 
             // GET /stac/{tms}/tilejson.json, /stac/tilejson.json, /stac/{tms}/map.html, /stac/map.html
             (Method::GET, [_, "tilejson.json"]) | (Method::GET, ["tilejson.json"]) => async {
@@ -6409,17 +6668,49 @@ where
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
             (Method::GET, ["renders"]) => async {
+                // The links name the item's address, which only an item given by `url` has.
+                let u = match &stac_source {
+                    StacSource::Url(Some(u)) => u.clone(),
+                    _ => return Err(EngineError::BadRequest("missing ?url=".into())),
+                };
                 let item = stac_source.load(&engine).await?;
-                Ok((Bytes::from(serde_json::json!(item.renders).to_string()), "application/json"))
+                let origin = if host.starts_with("http://") || host.starts_with("https://") {
+                    format!("{host}{forwarded_prefix}")
+                } else {
+                    format!("http://{host}{forwarded_prefix}")
+                };
+                let mut renders_map = serde_json::Map::new();
+                for (rid, rval) in &item.renders {
+                    renders_map.insert(
+                        rid.clone(),
+                        build_stac_render_entry(&host, &forwarded_prefix, &u, rid, rval),
+                    );
+                }
+                let out = serde_json::json!({
+                    "renders": serde_json::Value::Object(renders_map),
+                    "links": [
+                        {
+                            "rel": "self",
+                            "type": "application/json",
+                            "href": format!("{origin}/stac/renders?url={u}"),
+                        }
+                    ],
+                });
+                Ok((Bytes::from(out.to_string()), "application/json"))
             }
             .await,
             (Method::GET, ["renders", render_id]) => async {
+                let u = match &stac_source {
+                    StacSource::Url(Some(u)) => u.clone(),
+                    _ => return Err(EngineError::BadRequest("missing ?url=".into())),
+                };
                 let item = stac_source.load(&engine).await?;
                 let render = item
                     .renders
                     .get(*render_id)
                     .ok_or_else(|| EngineError::NotFound(format!("render '{render_id}' not found")))?;
-                Ok((Bytes::from(render.to_string()), "application/json"))
+                let out = build_stac_render_entry(&host, &forwarded_prefix, &u, render_id, render);
+                Ok((Bytes::from(out.to_string()), "application/json"))
             }
             .await,
             // GET /stac/map (OGC API - Maps)
@@ -7344,6 +7635,15 @@ where
             }
             .await,
 
+            (_, ["statistics"]) => Err(EngineError::MethodNotAllowed("GET, POST, HEAD")),
+            (_, [f]) if *f == "feature" || f.starts_with("feature.") => {
+                Err(EngineError::MethodNotAllowed("POST"))
+            }
+            (_, ["feature", _]) => Err(EngineError::MethodNotAllowed("POST")),
+            (_, ["info"] | ["info.geojson"] | ["bounds"] | ["assets"] | ["asset_statistics"] | ["tiles"] | ["tiles", ..] | ["point", _] | ["preview", ..] | ["bbox", ..] | ["map"] | ["viewer"] | ["renders"] | ["renders", _] | ["tilejson.json"] | [_, "tilejson.json"] | ["map.html"] | [_, "map.html"] | ["WMTSCapabilities.xml"] | [_, "WMTSCapabilities.xml"]) => {
+                Err(EngineError::MethodNotAllowed("GET, HEAD"))
+            }
+
             _ => Err(EngineError::NotFound(path.clone())),
         };
         // titiler-pgstac answers errors as JSON `{"detail": ...}`.
@@ -7636,35 +7936,63 @@ where
             .await,
 
             // 4. GET /cog/tiles (OGC Tiles list)
-            (Method::GET, ["tiles"]) => {
-                let tilesets: Vec<serde_json::Value> = crate::tms::ALL_TMS
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "title": t.id,
-                            "id": t.id,
-                            "crs": t.crs_uri,
-                        })
-                    })
-                    .collect();
-                let body = serde_json::json!({ "tilesets": tilesets }).to_string();
-                Ok((Bytes::from(body), "application/json"))
-            }
-
-            // 5. GET /cog/tiles/{tileMatrixSetId}
-            (Method::GET, ["tiles", tms]) => {
-                let crs_uri = crate::tms::lookup_tms(tms)
-                    .map(|t| t.crs_uri)
-                    .unwrap_or("http://www.opengis.net/def/crs/EPSG/0/3857");
-                let body = serde_json::json!({
-                    "id": tms,
-                    "title": tms,
-                    "crs": crs_uri,
-                    "dataType": "map",
-                })
+            (Method::GET, ["tiles"]) => async {
+                let bounds = if let Ok(cogs) = open_query_urls(&engine, &pq.urls).await
+                    && let Ok(crs) = engine.get_or_build_crs(&cogs[0])
+                {
+                    let full = cogs[0].index.full_res();
+                    Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                } else {
+                    None
+                };
+                let body = build_ogc_tilesets_list(
+                    &host,
+                    &forwarded_prefix,
+                    "cog",
+                    &raw_query,
+                    bounds,
+                )
                 .to_string();
                 Ok((Bytes::from(body), "application/json"))
             }
+            .await,
+
+            // 5. GET /cog/tiles/{tileMatrixSetId}
+            (Method::GET, ["tiles", tms]) => async {
+                let tms_def = crate::tms::lookup_tms(tms)
+                    .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
+                let (bounds, minz, maxz) = if let Ok(cogs) = open_query_urls(&engine, &pq.urls).await
+                    && let Ok(crs) = engine.get_or_build_crs(&cogs[0])
+                {
+                    let full = cogs[0].index.full_res();
+                    let coarsest = cogs[0].index.ifds.last().unwrap();
+                    let ov = (full.width as f64 / coarsest.width.max(1) as f64)
+                        .max(full.height as f64 / coarsest.height.max(1) as f64);
+                    let (dmin, dmax) =
+                        tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov);
+                    let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                    (
+                        Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
+                        Some(mn),
+                        Some(mx),
+                    )
+                } else {
+                    (None, pq.minzoom, pq.maxzoom)
+                };
+                let body = build_ogc_tileset_json(
+                    &host,
+                    &forwarded_prefix,
+                    "cog",
+                    tms_def,
+                    &raw_query,
+                    bounds,
+                    minz,
+                    maxz,
+                )
+                .to_string();
+                Ok((Bytes::from(body), "application/json"))
+            }
+            .await,
 
             // 6 & 7. GET /cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{format}]
             //        and alias GET /cog/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
@@ -7875,7 +8203,7 @@ where
                 let tj_url = format!("{forwarded_prefix}/cog/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
-            // GET /cog/stac — build a STAC 1.0.0 Item JSON from a COG (matching TiTiler / rio-stac)
+            // GET /cog/stac — build a STAC 1.1.0 Item JSON from a COG (matching TiTiler / rio-stac)
             (Method::GET, ["stac"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let cog = &cogs[0];
@@ -7884,20 +8212,39 @@ where
                 let full = cog.index.full_res();
                 let wgs_bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
                 let [w, s, e, n] = wgs_bbox;
+                let [nw, ns, ne, nn] = native_bounds;
                 let mut q_id: Option<String> = None;
                 let mut q_collection: Option<String> = None;
+                let mut q_collection_url: Option<String> = None;
                 let mut q_asset_name: Option<String> = None;
+                let mut q_asset_href: Option<String> = None;
+                let mut q_asset_media_type: Option<String> = None;
+                let mut q_asset_roles: Vec<String> = Vec::new();
+                let mut q_extensions: Vec<String> = Vec::new();
                 let mut q_datetime: Option<String> = None;
                 let mut with_proj = true;
                 let mut with_raster = true;
                 let mut with_eo = true;
                 for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
                     if let Some((k, v)) = pair.split_once('=') {
-                        let dec = percent_decode(v);
+                        let dec = percent_decode_opts(v, false);
                         match k {
                             "id" if !dec.is_empty() => q_id = Some(dec),
                             "collection" if !dec.is_empty() => q_collection = Some(dec),
+                            "collection_url" if !dec.is_empty() => q_collection_url = Some(dec),
                             "asset_name" if !dec.is_empty() => q_asset_name = Some(dec),
+                            "asset_href" if !dec.is_empty() => q_asset_href = Some(dec),
+                            "asset_media_type" if !dec.is_empty() => q_asset_media_type = Some(dec),
+                            "asset_roles" => {
+                                for r in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                                    q_asset_roles.push(r.to_string());
+                                }
+                            }
+                            "extensions" => {
+                                for ext in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                                    q_extensions.push(ext.to_string());
+                                }
+                            }
                             "datetime" if !dec.is_empty() => q_datetime = Some(dec),
                             "with_proj" => with_proj = !dec.eq_ignore_ascii_case("false") && dec != "0",
                             "with_raster" => with_raster = !dec.eq_ignore_ascii_case("false") && dec != "0",
@@ -7914,14 +8261,25 @@ where
                         .to_string()
                 });
                 let asset_name = q_asset_name.unwrap_or_else(|| "data".to_string());
-                let mut extensions: Vec<&'static str> = Vec::new();
+                let asset_href = q_asset_href.unwrap_or_else(|| cog.uri.clone());
+                let media_type = match q_asset_media_type.as_deref() {
+                    None | Some("auto") => "image/tiff; application=geotiff".to_string(),
+                    Some("cog") => "image/tiff; application=geotiff; profile=cloud-optimized".to_string(),
+                    Some(other) => other.to_string(),
+                };
+                let mut extensions: Vec<String> = Vec::new();
+                let mut push_ext = |uri: &str| {
+                    if !extensions.iter().any(|e| e == uri) {
+                        extensions.push(uri.to_string());
+                    }
+                };
                 let mut props = serde_json::Map::new();
                 props.insert(
                     "datetime".into(),
-                    serde_json::json!(q_datetime.unwrap_or_else(|| "1970-01-01T00:00:00Z".into())),
+                    serde_json::json!(q_datetime.unwrap_or_else(utc_now_rfc3339)),
                 );
                 if with_proj {
-                    extensions.push("https://stac-extensions.github.io/projection/v1.1.0/schema.json");
+                    push_ext("https://stac-extensions.github.io/projection/v2.0.0/schema.json");
                     props.insert("proj:epsg".into(), serde_json::json!(native_epsg));
                     props.insert("proj:shape".into(), serde_json::json!([full.height, full.width]));
                     props.insert(
@@ -7939,26 +8297,77 @@ where
                         ]),
                     );
                     props.insert("proj:bbox".into(), serde_json::json!(native_bounds));
+                    props.insert(
+                        "proj:geometry".into(),
+                        serde_json::json!({
+                            "type": "Polygon",
+                            "coordinates": [[[nw, ns], [ne, ns], [ne, nn], [nw, nn], [nw, ns]]]
+                        }),
+                    );
                 }
                 let count = full.samples_per_pixel as usize;
                 let mut asset_obj = serde_json::json!({
-                    "href": cog.uri,
-                    "type": "image/tiff; application=geotiff; profile=cloud-optimized",
-                    "roles": ["data"],
+                    "href": asset_href,
+                    "type": media_type,
+                    "roles": q_asset_roles,
                 });
                 if with_raster {
-                    extensions.push("https://stac-extensions.github.io/raster/v1.1.0/schema.json");
+                    push_ext("https://stac-extensions.github.io/raster/v1.1.0/schema.json");
+                    let sampling = if cog.index.geo_keys.raster_type == Some(2) {
+                        "point"
+                    } else {
+                        "area"
+                    };
+                    let stats_json = compute_statistics_with_options(
+                        &engine,
+                        cog,
+                        128,
+                        None,
+                        false,
+                        None,
+                        &StatsOptions::default(),
+                    )
+                    .await
+                    .ok();
                     let rb: Vec<serde_json::Value> = (0..count)
                         .map(|i| {
                             let mut b = serde_json::Map::new();
                             b.insert("data_type".into(), serde_json::json!(full.sample_type.gdal_name()));
                             b.insert("scale".into(), serde_json::json!(cog.index.scales_f64.get(i).copied().unwrap_or(1.0)));
                             b.insert("offset".into(), serde_json::json!(cog.index.offsets_f64.get(i).copied().unwrap_or(0.0)));
+                            b.insert("sampling".into(), serde_json::json!(sampling));
                             if let Some(nd) = cog.index.nodata {
                                 if nd.is_nan() {
                                     b.insert("nodata".into(), serde_json::json!("nan"));
                                 } else {
                                     b.insert("nodata".into(), serde_json::json!(nd));
+                                }
+                            }
+                            if let Some(bs) = stats_json.as_ref().and_then(|s| s.get(format!("b{}", i + 1))) {
+                                b.insert(
+                                    "statistics".into(),
+                                    serde_json::json!({
+                                        "mean": bs["mean"],
+                                        "minimum": bs["min"],
+                                        "maximum": bs["max"],
+                                        "stddev": bs["std"],
+                                        "valid_percent": bs["valid_percent"],
+                                    }),
+                                );
+                                if let Some(h) = bs.get("histogram").and_then(|h| h.as_array())
+                                    && h.len() == 2
+                                    && let (Some(counts), Some(edges)) = (h[0].as_array(), h[1].as_array())
+                                    && edges.len() >= 2
+                                {
+                                    b.insert(
+                                        "histogram".into(),
+                                        serde_json::json!({
+                                            "count": counts.len() + 1,
+                                            "min": edges.first(),
+                                            "max": edges.last(),
+                                            "buckets": counts,
+                                        }),
+                                    );
                                 }
                             }
                             serde_json::Value::Object(b)
@@ -7967,7 +8376,7 @@ where
                     asset_obj["raster:bands"] = serde_json::Value::Array(rb);
                 }
                 if with_eo {
-                    extensions.push("https://stac-extensions.github.io/eo/v1.1.0/schema.json");
+                    push_ext("https://stac-extensions.github.io/eo/v1.1.0/schema.json");
                     let eb: Vec<serde_json::Value> = (0..count)
                         .map(|i| {
                             let name = format!("b{}", i + 1);
@@ -7983,11 +8392,22 @@ where
                         .collect();
                     asset_obj["eo:bands"] = serde_json::Value::Array(eb);
                 }
+                for ext in &q_extensions {
+                    push_ext(ext);
+                }
+                let mut links: Vec<serde_json::Value> = Vec::new();
+                if let Some(col_url) = q_collection_url {
+                    links.push(serde_json::json!({
+                        "rel": "collection",
+                        "type": "application/json",
+                        "href": col_url,
+                    }));
+                }
                 let mut assets_map = serde_json::Map::new();
                 assets_map.insert(asset_name, asset_obj);
                 let mut item = serde_json::json!({
                     "type": "Feature",
-                    "stac_version": "1.0.0",
+                    "stac_version": "1.1.0",
                     "stac_extensions": extensions,
                     "id": item_id,
                     "geometry": {
@@ -7996,7 +8416,7 @@ where
                     },
                     "bbox": wgs_bbox,
                     "properties": serde_json::Value::Object(props),
-                    "links": [],
+                    "links": links,
                     "assets": serde_json::Value::Object(assets_map),
                 });
                 if let Some(col) = q_collection {
@@ -8562,6 +8982,15 @@ where
             }
             .await,
 
+            (_, ["statistics"]) => Err(EngineError::MethodNotAllowed("GET, POST, HEAD")),
+            (_, [f]) if *f == "feature" || f.starts_with("feature.") => {
+                Err(EngineError::MethodNotAllowed("POST"))
+            }
+            (_, ["feature", _]) => Err(EngineError::MethodNotAllowed("POST")),
+            (_, ["info"] | ["info.geojson"] | ["bounds"] | ["validate"] | ["stac"] | ["tiles"] | ["tiles", ..] | ["point", _] | ["preview", ..] | ["bbox", ..] | ["map"] | ["viewer"] | ["tilejson.json"] | [_, "tilejson.json"] | ["map.html"] | [_, "map.html"] | ["WMTSCapabilities.xml"] | [_, "WMTSCapabilities.xml"]) => {
+                Err(EngineError::MethodNotAllowed("GET, HEAD"))
+            }
+
             _ => Err(EngineError::NotFound(path)),
         };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
@@ -8569,6 +8998,30 @@ where
             attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
         }
         return Ok(resp);
+    }
+
+    // 405 Method Not Allowed when a known route is requested with an unsupported HTTP verb
+    if matches!(
+        path.as_str(),
+        "/" | "/index.html"
+            | "/healthz"
+            | "/metrics"
+            | "/conformance"
+            | "/conformance/"
+            | "/openapi.json"
+            | "/api"
+            | "/docs"
+            | "/api.html"
+    ) || matches!(
+        segs.first().copied(),
+        Some("algorithms" | "colorMaps" | "tileMatrixSets" | "mosaicjson")
+    ) {
+        let allow = if matches!(segs.as_slice(), ["mosaicjson", "validate" | "statistics" | "feature", ..]) {
+            "POST"
+        } else {
+            "GET, HEAD"
+        };
+        return Ok(method_not_allowed_resp(allow));
     }
 
     Ok(json_error_resp(StatusCode::NOT_FOUND, &path))
@@ -8860,6 +9313,7 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
             .header("access-control-allow-origin", "*")
             .body(Full::new(Bytes::new()))
             .unwrap(),
+        EngineError::MethodNotAllowed(allow) => method_not_allowed_resp(allow),
         EngineError::NotFound(msg) => json_error_resp(StatusCode::NOT_FOUND, msg),
         EngineError::BadRequest(msg) => json_error_resp(StatusCode::BAD_REQUEST, msg),
         // The file is in a coordinate system this server cannot place. That is a
