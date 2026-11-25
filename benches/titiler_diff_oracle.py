@@ -158,8 +158,8 @@ def compare_geotiffs(cw_bytes: bytes, tt_bytes: bytes) -> tuple[bool, str]:
 def compare_npy(cw_bytes: bytes, tt_bytes: bytes) -> tuple[bool, str]:
     a_cw = np.load(io.BytesIO(cw_bytes))
     a_tt = np.load(io.BytesIO(tt_bytes))
-    if a_cw.shape[-2:] != a_tt.shape[-2:]:
-        return False, f"spatial shape cw={a_cw.shape} vs tt={a_tt.shape}"
+    if a_cw.shape != a_tt.shape:
+        return False, f"shape cw={a_cw.shape} vs tt={a_tt.shape}"
     return True, f"cw={a_cw.shape}:{a_cw.dtype} tt={a_tt.shape}:{a_tt.dtype}"
 
 
@@ -322,7 +322,10 @@ def main():
             ("GET /cog/tiles/.../12/652/1583.jpg (JPEG output)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.jpg?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/.../12/652/1583.webp (WebP output)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.webp?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/.../12/652/1583.tif (GeoTIFF output)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.tif?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "geotiff"),
-            ("GET /cog/tiles/.../12/652/1583.npy (NPY output)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat}&bidx=1", None, "npy"),
+            ("GET /cog/tiles/.../12/657/1582.tif (f32 + mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={merc}", None, "geotiff"),
+            ("GET /cog/tiles/.../12/657/1582.tif (f32 no mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={merc}&return_mask=false", None, "geotiff"),
+            ("GET /cog/tiles/.../12/652/1583.npy (NPY + mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat}&bidx=1", None, "npy"),
+            ("GET /cog/tiles/.../12/652/1583.npy (NPY no mask)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat}&bidx=1&return_mask=false", None, "npy"),
             ("GET /cog/tiles/...?buffer=8 (Buffered 272px)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&buffer=8", None, "png"),
             ("GET /cog/tiles/...?padding=2", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&padding=2", None, "png"),
             ("GET /cog/tiles/...?return_mask=false (Opaque RGB)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&return_mask=false", None, "png"),
@@ -341,6 +344,7 @@ def main():
             ("GET /cog/tiles/...?colormap=interval JSON", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&colormap={interval_cmap}", None, "png"),
             ("GET /cog/tiles/...?colormap=discrete JSON (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&colormap={discrete_cmap}", None, "png"),
             ("GET /cog/tiles/...?algorithm=hillshade (buffer=0)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&algorithm_params={hs_params}", None, "png_mask"),
+            ("GET /cog/tiles/...?algorithm=hillshade&buffer=3", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&buffer=3", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=normalizedIndex", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&algorithm=normalizedIndex&rescale=-1,1&colormap_name=viridis&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=terrarium", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=terrarium", None, "png"),
             ("GET /cog/tiles/...?algorithm=terrainrgb", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=terrainrgb", None, "png"),

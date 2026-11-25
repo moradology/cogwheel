@@ -341,11 +341,12 @@ impl TileEngine {
                 | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                 raw,
                 nb,
                 req.tile_size,
                 req.tile_size,
+                true,
             ));
         }
         match req.tile_size {
@@ -1307,11 +1308,12 @@ impl TileEngine {
                 | BandRequest::CustomExprRgb { .. } => 3,
                 _ => 1,
             };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy(
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                 raw,
                 nb,
                 req.tile_size,
                 req.tile_size,
+                true,
             ));
         }
         match req.tile_size {
