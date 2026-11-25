@@ -57,8 +57,9 @@ The `/searches` and `/collections` routes need a [pgSTAC](https://github.com/sta
 | :--- | :--- |
 | `DATABASE_URL` | A `postgresql://user:password@host:port/dbname` URL. Takes precedence over the variables below. |
 | `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` | The libpq variables. pgSTAC support turns on when `PGHOST` or `PGDATABASE` is set. |
-| `PGSSLMODE` (or `sslmode=` in the URL) | `disable`, `prefer` (the default) and `require` behave as in libpq: `prefer` and `require` encrypt without checking the server's certificate. `verify-ca` and `verify-full` check it. |
-| `PGSSLROOTCERT` | PEM file of certificate authorities for the verifying modes. Without it the public web roots are used, which a managed database's private authority is usually not in. |
+| `DATABASE_URL` parameters | The URL's query, or a libpq `keyword=value` string, may carry `sslmode`, `sslrootcert`, `options`, `application_name`, `connect_timeout`, `channel_binding`, `target_session_attrs` and the keepalive settings. `options` are kept and the search path is added after them. Client certificates (`sslcert`, `sslkey`) and the other libpq parameters are not supported and are refused by name. |
+| `PGSSLMODE` (or `sslmode=` in the URL) | `disable`, `prefer` (the default), `require`, `verify-ca` and `verify-full`, with libpq's meanings. `prefer` and `require` encrypt without checking the server's certificate, except that `require` checks the certificate's chain once a root certificate file is configured. `verify-ca` checks the chain; `verify-full` checks the chain and that the certificate is for the host being connected to. |
+| `PGSSLROOTCERT` (or `sslrootcert=` in the URL) | PEM file of certificate authorities the chain is checked against. Without it `verify-ca` and `verify-full` use the public web roots, which a managed database's private authority is usually not in. `system` means the public web roots and needs `verify-full`. |
 | `DB_MAX_CONN_SIZE` | Largest number of open connections. Default 10. |
 | `PGSTAC_SEARCH_PATH` | Schemas searched for pgSTAC's functions and tables. Default `pgstac,public`. |
 | `TITILER_PGSTAC_CACHE_TTL`, `TITILER_PGSTAC_CACHE_MAXSIZE`, `TITILER_PGSTAC_CACHE_DISABLE` | The per-process cache of item lists and search lookups, with titiler-pgstac's names and defaults (300 seconds, 512 entries, enabled). |

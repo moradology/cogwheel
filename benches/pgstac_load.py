@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -44,16 +46,27 @@ DEFAULT_DATETIME = "2024-01-01T00:00:00Z/2024-12-31T23:59:59Z"
 def dsn_from_env() -> str:
     if os.environ.get("DATABASE_URL"):
         return os.environ["DATABASE_URL"]
-    user = os.environ.get("PGUSER", "username")
-    password = os.environ.get("PGPASSWORD", "password")
+    # Escaped so a "/" or "@" in either does not break the URL.
+    user = quote(os.environ.get("PGUSER", "username"), safe="")
+    password = quote(os.environ.get("PGPASSWORD", "password"), safe="")
     host = os.environ.get("PGHOST", "127.0.0.1")
     port = os.environ.get("PGPORT", os.environ.get("PGSTAC_PORT", "5439"))
     db = os.environ.get("PGDATABASE", "postgis")
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
-def cache_paths(collection: str, bbox: str, dt: str, max_items: int) -> tuple[Path, Path]:
+def normalize_api(api: str) -> str:
+    """The API URL with scheme and host lowercased and no trailing slash."""
+    u = urlsplit(api.strip())
+    return u._replace(scheme=u.scheme.lower(), netloc=u.netloc.lower(), path=u.path.rstrip("/")).geturl()
+
+
+def cache_paths(api: str, collection: str, bbox: str, dt: str, max_items: int) -> tuple[Path, Path]:
     tag = f"{collection}_{bbox}_{dt}_{max_items}".replace("/", "_").replace(":", "").replace(",", "_")
+    # Items from another API must not be taken for this one's. The default API keeps
+    # the name without a digest, so caches written before the digest existed still hit.
+    if normalize_api(api) != normalize_api(DEFAULT_API):
+        tag += "_api-" + hashlib.sha256(normalize_api(api).encode()).hexdigest()[:12]
     CACHE.mkdir(parents=True, exist_ok=True)
     return CACHE / f"{tag}.collection.json", CACHE / f"{tag}.items.ndjson.gz"
 
@@ -77,7 +90,7 @@ def fetch_with_retry(client: httpx.Client, method: str, url: str, **kw) -> httpx
 
 
 def download(api: str, collection: str, bbox: str, dt: str, max_items: int, page: int) -> tuple[Path, Path]:
-    coll_path, items_path = cache_paths(collection, bbox, dt, max_items)
+    coll_path, items_path = cache_paths(api, collection, bbox, dt, max_items)
     if coll_path.exists() and items_path.exists():
         print(f"using cached items: {items_path}")
         return coll_path, items_path

@@ -401,6 +401,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libdeflater",
  "reqwest",
  "serde",
  "serde_json",

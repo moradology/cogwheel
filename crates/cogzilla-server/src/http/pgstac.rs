@@ -1544,10 +1544,7 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     if pq.assets.is_empty() {
         return Err(missing_query_param("assets"));
     }
-    // `reproject`, `asset_as_band`, and `histogram_bins` are handled here with pgstac's own 422s.
-    if let Some(e) = pq.errors.iter().find(|e| {
-        !e.contains("'reproject'") && !e.contains("asset_as_band") && !e.contains("histogram_bins")
-    }) {
+    if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
     }
     let assets = parse_assets(pairs)?;
@@ -1607,6 +1604,68 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         resampling: parse_resample(pairs, "resampling")?,
         reproject: parse_resample(pairs, "reproject")?,
     })
+}
+
+/// What a cached tile was made from, for its cache key: the hrefs read, in order.
+pub(super) fn source_identity<T: std::hash::Hash>(sources: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sources.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Each asset's own band indexes, as the shared query holds them.
+pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
+
+/// The asset options of an item request, as the `/stac` handlers take them. The shared
+/// parser adds every asset's `|bidx=` to one list, which is right for one asset and reads
+/// the wrong bands for several; here each asset keeps its own. Band math on one asset is
+/// not something those handlers do: it is refused, not left out of the picture.
+pub(super) fn item_asset_options(raw_query: &str) -> Result<Option<AssetBidx>, Resp> {
+    let specs = parse_assets(&query_pairs(raw_query))?;
+    if let Some(spec) = specs.iter().find(|s| s.expression.is_some()) {
+        return Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("assets={}|expression= is not supported on item routes yet; use `expression`", spec.name),
+        ));
+    }
+    if specs.len() < 2 || specs.iter().all(|s| s.indexes.is_none()) {
+        return Ok(None);
+    }
+    Ok(Some(specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect()))
+}
+
+/// Whether the shared parser's complaint is about something these routes read for
+/// themselves and answer as titiler-pgstac does, with a 422: `reproject`, which the shared
+/// parser does not know, `asset_as_band`, `histogram_bins` and the options of `assets`.
+fn own_error(e: &str) -> bool {
+    match error_parameter(e) {
+        Some("reproject" | "asset_as_band" | "histogram_bins") => true,
+        Some("assets") => e.ends_with("in |bidx="),
+        _ => false,
+    }
+}
+
+/// Whether the shared parser's complaint is about a `width` or `height` it could not read.
+/// Routes that take those answer for them themselves, with a 422.
+fn own_size_error(e: &str) -> bool {
+    matches!(error_parameter(e), Some("width" | "height"))
+}
+
+/// The parameter one of the shared parser's complaints is about. They read
+/// `invalid name=value: why` or `parameter 'name' is not supported by cogzilla`; the name
+/// is taken from where it stands, never looked for in the value.
+fn error_parameter(e: &str) -> Option<&str> {
+    if let Some(rest) = e.strip_prefix("invalid ") {
+        return rest.split_once('=').map(|(name, _)| name);
+    }
+    e.strip_prefix("parameter '")?.split_once('\'').map(|(name, _)| name)
+}
+
+/// The request's `expression`, under any of the names the shared parser takes for it; as
+/// there, the last one given is the one used.
+fn request_expression(pairs: &[(String, String)]) -> Option<&str> {
+    pairs.iter().rev().find(|(k, _)| matches!(k.as_str(), "expression" | "expr" | "index")).map(|(_, v)| v.as_str())
 }
 
 /// The asset names of a request, once its `expression` is known not to use them: band math
@@ -2309,7 +2368,7 @@ async fn part_image(
     pairs: &[(String, String)],
 ) -> Resp {
     // `width` and `height` are read here; the shared parser does not know them.
-    pq.errors.retain(|e| !e.contains("'width'") && !e.contains("'height'"));
+    pq.errors.retain(|e| !own_size_error(e));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3080,6 +3139,7 @@ async fn feature_statistics(
         let mut canvas: Vec<Vec<f64>> = Vec::new();
         let mut descriptions: Vec<String> = Vec::new();
         let mut program: Option<Program> = None;
+        let mut program_bands = 0;
         let mut used: Vec<String> = Vec::new();
         let (mut width, mut height, mut bounds) = (0usize, 0usize, bbox);
         // With a pixel selection other than `first`, every scene's bands go through this
@@ -3156,6 +3216,7 @@ async fn feature_statistics(
             if canvas.is_empty() {
                 if let Some(expression) = req.expression {
                     let parsed = Program::parse(expression, planes.len()).map_err(EngineError::BadRequest)?;
+                    program_bands = planes.len();
                     descriptions = parsed.describe(&names);
                     program = Some(parsed);
                 } else {
@@ -3170,6 +3231,12 @@ async fn feature_statistics(
                 }
                 canvas = vec![vec![f64::NAN; width * height]; descriptions.len()];
                 if let Some(method) = req.query.selection {
+                    // The last band decides and is left out: alone, it would leave nothing.
+                    if method.by_last_band() && canvas.len() < 2 {
+                        return Err(EngineError::BadRequest(
+                            "pixel_selection by the last band needs at least two bands".into(),
+                        ));
+                    }
                     if Fold::<f64>::held_bytes(method, scene_count, canvas.len(), width * height) > MAX_HELD_BYTES {
                         return Err(EngineError::BadRequest(format!(
                             "{scene_count} items are too many for a median at this size; narrow the search, lower items_limit or pass max_size"
@@ -3183,6 +3250,13 @@ async fn feature_statistics(
                     check_working_bytes(Fold::<f64>::working_bytes(method, canvas.len(), width * height))?;
                     fold = Some(Fold::new(method, canvas.len(), width * height, integer));
                 }
+            }
+            // The expression was read for the first item's bands; an item with another number
+            // of them has no band for it to name.
+            if program.is_some() && planes.len() != program_bands {
+                return Err(EngineError::BadRequest(
+                    "the items under the feature do not have the same number of bands".into(),
+                ));
             }
             if let Some(fold) = &mut fold {
                 let bands: Vec<Vec<f64>> = match &program {
@@ -3281,9 +3355,10 @@ async fn feature_statistics(
         let stats = engine
             .store
             .run_heavy_cpu(move || {
-                let inside = zonal::cover_counts(&rings, width, height, 1);
+                let inside = zonal::cover_counts(&rings, width, height, 1).map_err(EngineError::BadRequest)?;
                 let cells = (cover_scale * cover_scale) as f32;
                 let coverage: Vec<f32> = zonal::cover_counts(&rings, width, height, cover_scale)
+                    .map_err(EngineError::BadRequest)?
                     .iter()
                     .map(|c| *c as f32 / cells)
                     .collect();
@@ -3299,9 +3374,9 @@ async fn feature_statistics(
                         zonal::band_statistics(band, &coverage, description, &opts),
                     );
                 }
-                Value::Object(out)
+                Ok::<_, EngineError>(Value::Object(out))
             })
-            .await?;
+            .await??;
         Ok(Some((stats, used)))
     }
     .await;
@@ -3319,11 +3394,9 @@ async fn mosaic_statistics(
     pairs: &[(String, String)],
 ) -> Resp {
     // Read here; the shared parser does not know them on this route.
-    const OWN: [&str; 8] = [
-        "'width'", "'height'", "'categorical'", "'c'", "'p'", "'histogram_bins'",
-        "'histogram_range'", "'cover_scale'",
-    ];
-    pq.errors.retain(|e| !OWN.iter().any(|name| e.contains(name)));
+    const OWN: [&str; 8] =
+        ["width", "height", "categorical", "c", "p", "histogram_bins", "histogram_range", "cover_scale"];
+    pq.errors.retain(|e| !error_parameter(e).is_some_and(|name| OWN.contains(&name)));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -3438,7 +3511,7 @@ async fn point_values(
     if pq.assets.is_empty() {
         return missing_query_param("assets");
     }
-    if let Some(e) = pq.errors.iter().find(|e| !e.contains("'reproject'")) {
+    if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return detail(StatusCode::BAD_REQUEST, e.clone());
     }
     let specs = match parse_assets(pairs) {
@@ -3632,7 +3705,9 @@ async fn tile(
     let jpeg_quality = pq.jpeg_quality;
     let engine = ctx.engine;
     let specs = query.assets;
-    let cache_key = format!("{}?{}", ctx.path, ctx.raw_query);
+    // The tile is of these rasters: a search that comes to list others, or an item whose
+    // asset has moved, is another tile, not this one served again.
+    let cache_key = format!("{}?{}#{:x}", ctx.path, ctx.raw_query, source_identity(&scenes));
     let rendered = engine
         .tile_cache
         .get_or_render(cache_key, || async {
@@ -4088,7 +4163,7 @@ pub(super) fn item_fixup(
             }
             // The `/stac` handler returns the bands as they are; band math is applied here.
             let pairs = query_pairs(raw_query);
-            if let Some(expression) = query_value(&pairs, "expression") {
+            if let Some(expression) = request_expression(&pairs) {
                 let values = doc["values"].as_array().cloned().unwrap_or_default();
                 let descriptions: Vec<String> = doc["band_descriptions"]
                     .as_array()
@@ -4312,7 +4387,17 @@ pub(super) async fn item_route(
         .and_then(|links| links.iter().find(|l| l["rel"] == "self"))
         .and_then(|l| l["href"].as_str())
         .unwrap_or("");
-    let item = Arc::new(stac_item_from_json(&doc, self_href));
+    let mut item = stac_item_from_json(&doc, self_href);
+    // `/stac` goes by an href's extension where an asset has no media type. Here every
+    // asset `/assets` lists can be read, whatever its href looks like.
+    for name in &readable {
+        if !item.assets.contains_key(name)
+            && let Some(href) = doc["assets"][name]["href"].as_str().filter(|h| !h.is_empty())
+        {
+            item.assets.insert(name.clone(), crate::stac::resolve_href(self_href, href));
+        }
+    }
+    let item = Arc::new(item);
     let get = *method == Method::GET;
     let pairs = query_pairs(ctx.raw_query);
 
@@ -4672,6 +4757,21 @@ async fn mosaic_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complaints_are_matched_by_the_parameter_they_name() {
+        assert_eq!(error_parameter("invalid width=wide: expected width in 1..=4096"), Some("width"));
+        assert_eq!(error_parameter("parameter 'cover_scale' is not supported by cogzilla"), Some("cover_scale"));
+        assert!(own_error("invalid asset_as_band=perhaps: expected a boolean"));
+        assert!(own_error("invalid assets=visual|bidx=x: expected positive integer band indices in |bidx="));
+        // A value that spells a parameter's name is not that parameter.
+        assert!(!own_error("invalid nodata=histogram_bins: expected a number"));
+        assert!(!own_size_error("invalid nodata=width=3: expected a number"));
+        let pairs = |q: &str| query_pairs(q);
+        assert_eq!(request_expression(&pairs("assets=red&expr=b1*2")), Some("b1*2"));
+        assert_eq!(request_expression(&pairs("expression=b1&index=b2")), Some("b2"));
+        assert_eq!(request_expression(&pairs("assets=red")), None);
+    }
 
     #[test]
     fn register_body_is_split_like_titiler_pgstac() {

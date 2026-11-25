@@ -895,19 +895,15 @@ def main() -> int:
         o.check("item tile without assets", "json", f"{itile}.png")
         o.check("item tile with expression only", "status", f"{itile}.png?expression=(nir-red)/(nir%2Bred)")
         o.check("item tile outside the item", "status", f"{it}/tiles/WebMercatorQuad/5/0/0.png?assets=visual")
-        o.check("item preview", "image", f"{it}/preview.png?assets=visual&max_size=256",
-                known="shared /stac preview: the picture does not fill max_size")
-        o.check("item preview, sized", "image", f"{it}/preview/200x200.png?assets=visual",
-                known="shared /stac preview: the picture does not fill max_size")
+        o.check("item preview", "image", f"{it}/preview.png?assets=visual&max_size=256")
+        o.check("item preview, sized", "image", f"{it}/preview/200x200.png?assets=visual")
         o.check("item bbox", "image", f"{it}/bbox/{ibox}/256x256.png?assets=visual")
         o.check("item point", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual")
         o.check("item point, two assets", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir")
         o.check("item point outside the item", "status", f"{it}/point/0,0?assets=visual",
                 known="titiler-pgstac answers 500 for a point outside the item; cogzilla answers 404")
-        o.check("item statistics", "stats", f"{it}/statistics?assets=visual&max_size=128",
-                known="shared /stac statistics: the sample is smaller than max_size, and merged bands are described as b1, not visual_b1")
-        o.check("item asset statistics", "stats", f"{it}/asset_statistics?assets=red&max_size=128",
-                known="shared /stac statistics: the sample is smaller than max_size, and merged bands are described as b1, not visual_b1")
+        o.check("item statistics", "stats", f"{it}/statistics?assets=visual&max_size=128")
+        o.check("item asset statistics", "stats", f"{it}/asset_statistics?assets=red&max_size=128")
         o.check("item wmts", "wmts", f"{it}/WMTSCapabilities.xml?assets=visual")
         o.check("item wmts, jpg and EPSG codes", "wmts",
                 f"{it}/WMTSCapabilities.xml?assets=visual&tile_format=jpg&use_epsg=true&minzoom=9&maxzoom=10")
