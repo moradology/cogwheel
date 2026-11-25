@@ -4359,6 +4359,14 @@ where
                             let needs_general_path = pq.nodata.is_some()
                                 || pq.custom_colormap_json.is_some()
                                 || pq.buffer > 0.0
+                                || (pq.color_formula.is_some()
+                                    && !matches!(
+                                        treq.bands,
+                                        BandRequest::Rgb { .. }
+                                            | BandRequest::SarRgb { .. }
+                                            | BandRequest::CustomExprRgb { .. }
+                                            | BandRequest::Terrain { .. }
+                                    ))
                                 || (treq.tile_size != 256 && treq.tile_size != 512)
                                 || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                                 || has_embedded_palette(&pq, &cogs[0], &treq.bands)
@@ -5173,6 +5181,14 @@ where
                             || pq_stac.buffer > 0.0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some()
+                            || (pq_stac.color_formula.is_some()
+                                && !matches!(
+                                    treq.bands,
+                                    BandRequest::Rgb { .. }
+                                        | BandRequest::SarRgb { .. }
+                                        | BandRequest::CustomExprRgb { .. }
+                                        | BandRequest::Terrain { .. }
+                                ))
                             || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
@@ -6091,6 +6107,14 @@ where
                             || pq.buffer > 0.0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some()
+                            || (pq.color_formula.is_some()
+                                && !matches!(
+                                    treq.bands,
+                                    BandRequest::Rgb { .. }
+                                        | BandRequest::SarRgb { .. }
+                                        | BandRequest::CustomExprRgb { .. }
+                                        | BandRequest::Terrain { .. }
+                                ))
                             || matches!(treq.bands, BandRequest::CustomExprRgb { .. })
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq, &cogs[0], &treq.bands)

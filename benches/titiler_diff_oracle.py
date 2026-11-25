@@ -328,6 +328,8 @@ def main():
             ("GET /cog/tiles/...?return_mask=false (Opaque RGB)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&return_mask=false", None, "png"),
             ("GET /cog/tiles/...?color_formula=Gamma RGB 1.5", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&color_formula=Gamma%20RGB%201.5", None, "png"),
             ("GET /cog/tiles/...?color_formula=Sigmoidal RGB 15 0.35", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&color_formula=Sigmoidal%20RGB%2015%200.35", None, "png"),
+            ("GET /cog/tiles/...?bidx=1+viridis+Gamma R 1.5", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&rescale=0,0.35&colormap_name=viridis&color_formula=Gamma%20R%201.5&reproject=bilinear", None, "png"),
+            ("GET /cog/preview/...?bidx=1+viridis+Gamma R 1.5", "GET", f"/cog/preview/64x64.png?url={sat}&bidx=1&rescale=0,0.35&colormap_name=viridis&color_formula=Gamma%20R%201.5", None, "png"),
             ("GET /cog/tiles/WorldCRS84Quad/10/325/297.png (CRS84)", "GET", f"/cog/tiles/WorldCRS84Quad/10/325/297.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "png"),
             ("GET /cog/tiles/...?expression=(b1-b2)/(b1+b2)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&expression=(b1-b2)/(b1%2Bb2)&rescale=-0.5,0.5&colormap_name=viridis&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?expression=b3;b2;b1 (3-band expr)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&expression=b3;b2;b1&rescale=0,0.35", None, "png"),
