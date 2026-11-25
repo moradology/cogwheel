@@ -2932,7 +2932,9 @@ async fn part_image(
             let mut resp = Response::new(Full::new(body));
             resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
             resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-            placed(resp, bbox, if mercator { 3857 } else { 4326 })
+            // The system drawn in is `dst_crs`, or `coord_crs` without one.
+            let spelled = query_value(pairs, "dst_crs").or_else(|| query_value(pairs, "coord_crs"));
+            placed_as(resp, bbox, if mercator { 3857 } else { 4326 }, spelled)
         }
         Err(e) => engine_error(&e),
     }
@@ -4484,10 +4486,21 @@ fn python_float(c: f64) -> String {
 
 /// A picture's answer with where the picture lies, as TiTiler says it: `Content-Bbox`,
 /// the bounds as Python writes floats, and `Content-Crs`, the system they are in.
-fn placed(mut resp: Resp, bounds: [f64; 4], epsg: u16) -> Resp {
+fn placed(resp: Resp, bounds: [f64; 4], epsg: u16) -> Resp {
+    placed_as(resp, bounds, epsg, None)
+}
+
+/// [`placed`], with the system named as the request spelled it: degrees asked for as
+/// `CRS84` are TiTiler's `OGC/0/CRS84`, not `EPSG/0/4326`, though the picture is the same.
+fn placed_as(mut resp: Resp, bounds: [f64; 4], epsg: u16, spelled: Option<&str>) -> Resp {
     if resp.status() == StatusCode::OK {
         let bbox = bounds.map(python_float).join(",");
-        let crs = format!("<http://www.opengis.net/def/crs/EPSG/0/{epsg}>");
+        let crs84 = epsg == 4326 && spelled.is_some_and(|s| s.to_ascii_lowercase().contains("crs84"));
+        let crs = if crs84 {
+            "<http://www.opengis.net/def/crs/OGC/0/CRS84>".to_string()
+        } else {
+            format!("<http://www.opengis.net/def/crs/EPSG/0/{epsg}>")
+        };
         if let (Ok(bbox), Ok(crs)) = (HeaderValue::from_str(&bbox), HeaderValue::from_str(&crs)) {
             resp.headers_mut().insert("content-bbox", bbox);
             resp.headers_mut().insert("content-crs", crs);
@@ -4786,12 +4799,27 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
     }
+    // A parameter as the handlers that drew the picture read it: by its key as written,
+    // not percent-decoded, and the last one given.
+    let asked = |key: &str| {
+        raw_query
+            .split('&')
+            .rev()
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| super::percent_decode(v))
+    };
     match sub {
         ["tiles", "WebMercatorQuad", z, x, y] => {
             let (Ok(z), Ok(x), Some((y, _, _))) = (z.parse::<u8>(), x.parse::<u32>(), super::parse_y_scale_ext(y)) else {
                 return resp;
             };
             if z > 30 || u64::from(x.max(y)) >= 1u64 << z {
+                return resp;
+            }
+            // A buffered tile reaches past its bounds by an amount that depends on its
+            // size: it goes without the headers sooner than with the wrong ones.
+            if asked("buffer").is_some_and(|b| b.parse::<f64>().map_or(true, |b| b != 0.0)) {
                 return resp;
             }
             let (west, south, east, north) = tile_bounds_3857(TileCoord { z, x, y });
@@ -4801,9 +4829,8 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             let Some((bbox, _)) = super::parse_bbox4(seg) else {
                 return resp;
             };
-            let pairs = query_pairs(raw_query);
             // 4326 or 3857, or nothing for a system not placed here.
-            let system = |key: &str, default: u16| match query_value(&pairs, key).map(super::parse_coord_crs_with_epsg) {
+            let system = |key: &str, default: u16| match asked(key).as_deref().map(super::parse_coord_crs_with_epsg) {
                 None => Some(default),
                 Some(Ok((_, epsg @ (4326 | 3857)))) => Some(epsg),
                 Some(_) => None,
@@ -4826,7 +4853,8 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             if bounds.iter().any(|c| !c.is_finite()) {
                 return resp;
             }
-            placed(resp, bounds, drawn)
+            let spelled = asked("dst_crs").or_else(|| asked("coord_crs"));
+            placed_as(resp, bounds, drawn, spelled.as_deref())
         }
         _ => resp,
     }
@@ -6745,6 +6773,15 @@ mod tests {
         ] {
             assert_eq!(said(sub, query), None, "{sub:?} {query}");
         }
+        // A key the handlers do not read as that parameter is not read as it here either.
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857").unwrap().1, crs(4326));
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
+        // Degrees asked for as CRS84 are named so; a buffered tile is not placed.
+        let ogc = "<http://www.opengis.net/def/crs/OGC/0/CRS84>";
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "coord_crs=OGC:CRS84").unwrap().1, ogc);
+        assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=OGC%3ACRS84").unwrap().1, ogc);
+        assert_eq!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=10"), None);
+        assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
     }
