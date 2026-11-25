@@ -37,7 +37,8 @@ use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, compute_f32_band_stats,
     compute_statistics_with_options,
-    encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output, get_algorithm_json,
+    encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
+    get_algorithm_json,
     list_algorithms_json, query_point,
     render_crs_bbox, render_mercator_bbox, render_multi_asset_bbox, render_native_preview,
     render_wgs84_bbox,
@@ -905,11 +906,6 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             }
         };
         if let Some(tms) = tms {
-            if matches!(family, "mosaic" | "mosaicjson") && tms != "WebMercatorQuad" {
-                return Err(format!(
-                    "tile matrix set '{tms}' is not supported on /{family} routes (use WebMercatorQuad)"
-                ));
-            }
             if crate::tms::lookup_tms(tms).is_none() {
                 return Err(format!(
                     "tile matrix set '{tms}' is not supported (see /tileMatrixSets)"
@@ -1575,6 +1571,26 @@ fn wrap_geotiff_fmt(
         }
     } else {
         data
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_image_output(
+    data: Bytes,
+    ct: &'static str,
+    fmt: OutputFormat,
+    auto_fmt: bool,
+    out_w: u32,
+    out_h: u32,
+    bbox: [f64; 4],
+    epsg: u16,
+    jpeg_quality: u8,
+    return_mask: bool,
+) -> (Bytes, &'static str) {
+    if auto_fmt {
+        encode_auto_image(out_w as usize, out_h as usize, &data, jpeg_quality, return_mask)
+    } else {
+        (wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, bbox, epsg, return_mask), ct)
     }
 }
 
@@ -4556,27 +4572,34 @@ where
             }
             .await,
             ["mosaicjson", "tiles"] => {
-                let body = serde_json::json!({
-                    "tilesets": [
-                        {
-                            "title": "WebMercatorQuad",
-                            "id": "WebMercatorQuad",
-                            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857"
-                        }
-                    ]
-                })
-                .to_string();
+                let tilesets: Vec<serde_json::Value> = crate::tms::ALL_TMS
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "title": t.id,
+                            "id": t.id,
+                            "crs": t.crs_uri,
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({ "tilesets": tilesets }).to_string();
                 Ok((Bytes::from(body), "application/json"))
             }
             ["mosaicjson", "tiles", tms] => {
-                let body = serde_json::json!({
-                    "title": tms,
-                    "tileMatrixSetId": tms,
-                    "dataType": "map",
-                    "crs": "http://www.opengis.net/def/crs/EPSG/0/3857"
-                })
-                .to_string();
-                Ok((Bytes::from(body), "application/json"))
+                if let Some(tms_def) = crate::tms::lookup_tms(tms) {
+                    let body = serde_json::json!({
+                        "title": tms_def.id,
+                        "tileMatrixSetId": tms_def.id,
+                        "dataType": "map",
+                        "crs": tms_def.crs_uri
+                    })
+                    .to_string();
+                    Ok((Bytes::from(body), "application/json"))
+                } else {
+                    Err(EngineError::NotFound(format!(
+                        "unknown TileMatrixSet '{tms}'"
+                    )))
+                }
             }
             ["mosaicjson", "point", coord] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -4606,7 +4629,11 @@ where
                             apply_point_filters(&mut pt, pq.expr_raw.as_deref(), &pq.bidx)?;
                             let vals = pt["values"].clone();
                             let names = pt["band_names"].clone();
-                            assets_out.push(serde_json::json!([asset_url, vals, names]));
+                            assets_out.push(serde_json::json!({
+                                "name": asset_url,
+                                "values": vals,
+                                "band_names": names,
+                            }));
                         }
                         Err(EngineError::NotFound(_)) => continue,
                         Err(e) => return Err(e),
@@ -4756,8 +4783,9 @@ where
                 Ok((Bytes::from(serde_json::json!(urls).to_string()), "application/json"))
             }
             .await,
-            ["mosaicjson", "tiles", "WebMercatorQuad", zs, xs, ys]
+            ["mosaicjson", "tiles", _, zs, xs, ys]
             | ["mosaicjson", "tiles", zs, xs, ys] => {
+                let tms = if segs.len() == 6 { segs[2] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
                 let cached = engine
                     .tile_cache
@@ -4780,6 +4808,104 @@ where
                             )));
                         }
                         let tile = TileCoord { z, x, y };
+                        let auto_fmt = ext.is_none() && pq.format_param.is_none();
+                        if tms != "WebMercatorQuad" {
+                            let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
+                                EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'"))
+                            })?;
+                            let query_ts = match sc {
+                                Some(s) if (1..=4).contains(&s) => s * 256,
+                                _ => pq.tile_size,
+                            };
+                            let tb = tms_def
+                                .tile_bounds(z, x, y, pq.buffer, query_ts)
+                                .ok_or_else(|| {
+                                    EngineError::BadRequest(format!(
+                                        "tile coordinate ({z}/{x}/{y}) out of range for TileMatrixSet '{tms}'"
+                                    ))
+                                })?;
+                            let dst_crs = tms_def.crs_model()?;
+                            let wgs = bbox_to_wgs84(tb, Some(&dst_crs))?;
+                            let urls = query_mosaicjson_wgs84_bbox(&mj, wgs);
+                            let empty_default_bands = if pq.bidx.is_empty()
+                                && (pq.colormap_explicit || pq.custom_colormap_json.is_some())
+                            {
+                                1
+                            } else {
+                                3
+                            };
+                            let (mut treq, ct) = build_tile_request_for_tms(
+                                Some(&engine),
+                                tile,
+                                sc,
+                                ext,
+                                &pq,
+                                empty_default_bands,
+                                cogzilla_tiff::SampleType::Uint8,
+                                tms,
+                                None,
+                            )?;
+                            validate_mosaic_tile_params(&pq, treq.tile_size)?;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
+                            if auto_fmt {
+                                treq.format = OutputFormat::RawRgba;
+                            }
+                            if urls.is_empty() {
+                                let nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
+                                let b = if treq.format == OutputFormat::Npy {
+                                    let raw = cogzilla_kernel::empty_tile_bytes(
+                                        out_dim,
+                                        OutputFormat::RawF32,
+                                        nb,
+                                    );
+                                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                                        raw,
+                                        nb,
+                                        out_dim,
+                                        out_dim,
+                                        pq.return_mask,
+                                    )
+                                } else {
+                                    cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb)
+                                };
+                                return Ok(finalize_image_output(
+                                    b,
+                                    ct,
+                                    treq.format,
+                                    auto_fmt,
+                                    out_dim,
+                                    out_dim,
+                                    tb,
+                                    tms_def.epsg,
+                                    pq.jpeg_quality,
+                                    pq.return_mask,
+                                ));
+                            }
+                            let data = render_mosaic_bbox_composite(
+                                &engine,
+                                &urls,
+                                tb,
+                                &dst_crs,
+                                out_dim,
+                                out_dim,
+                                None,
+                                &pq,
+                                treq.format,
+                                if auto_fmt { "application/octet-stream" } else { ct },
+                                tms_def.epsg,
+                            )
+                            .await?;
+                            if auto_fmt {
+                                return Ok(encode_auto_image(
+                                    out_dim as usize,
+                                    out_dim as usize,
+                                    &data,
+                                    pq.jpeg_quality,
+                                    pq.return_mask,
+                                ));
+                            }
+                            return Ok((data, ct));
+                        }
                         let query_ts = match sc {
                             Some(s) if (1..=4).contains(&s) => s * 256,
                             _ => pq.tile_size,
@@ -4800,7 +4926,7 @@ where
                             } else {
                                 3
                             };
-                            let (treq, ct) = build_tile_request(
+                            let (mut treq, ct) = build_tile_request(
                                 Some(&engine),
                                 tile,
                                 sc,
@@ -4813,6 +4939,9 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
+                            if auto_fmt {
+                                treq.format = OutputFormat::RawRgba;
+                            }
                             let nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
                             let b = if treq.format == OutputFormat::Npy {
                                 let raw = cogzilla_kernel::empty_tile_bytes(
@@ -4830,22 +4959,23 @@ where
                             } else {
                                 cogzilla_kernel::empty_tile_bytes(out_dim, treq.format, nb)
                             };
-                            let b = wrap_geotiff_fmt(
+                            Ok(finalize_image_output(
                                 b,
                                 ct,
                                 treq.format,
+                                auto_fmt,
                                 out_dim,
                                 out_dim,
                                 buf_bbox,
                                 3857,
+                                pq.jpeg_quality,
                                 pq.return_mask,
-                            );
-                            Ok((b, ct))
+                            ))
                         } else {
                             let first_cog = open_first_mosaic_cog(&engine, &urls).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
                             let st = first_cog.index.full_res().sample_type;
-                            let (treq, ct) = build_tile_request(
+                            let (mut treq, ct) = build_tile_request(
                                 Some(&engine),
                                 tile,
                                 sc,
@@ -4858,6 +4988,9 @@ where
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let ts = treq.tile_size;
+                            if auto_fmt {
+                                treq.format = OutputFormat::RawRgba;
+                            }
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
@@ -4869,17 +5002,18 @@ where
                                 first_cog.index.color_map.is_some(),
                             )
                             .await?;
-                            let b = wrap_geotiff_fmt(
+                            Ok(finalize_image_output(
                                 b,
                                 ct,
                                 fmt,
+                                auto_fmt,
                                 out_dim,
                                 out_dim,
                                 buf_bbox,
                                 3857,
+                                pq.jpeg_quality,
                                 pq.return_mask,
-                            );
-                            Ok((b, ct))
+                            ))
                         }
                     })
                     .await;
@@ -4887,7 +5021,7 @@ where
                 if let (Ok(z), Ok(x), Some((y, sc, _))) =
                     (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
                 {
-                    attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
+                    attach_tile_geo_headers(&mut resp, tms, z, x, y, sc, &pq);
                 }
                 return Ok(resp);
             }
@@ -6246,6 +6380,10 @@ where
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);
+                        let auto_fmt = ext.is_none() && pq_stac.format_param.is_none();
+                        if auto_fmt {
+                            treq.format = OutputFormat::RawRgba;
+                        }
                         if needs_general {
                             let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
                             let cf = pq_stac
@@ -6318,8 +6456,17 @@ where
                                 .await?;
                                 (d, bbox_3857, 3857u16)
                             };
-                            let data = wrap_geotiff_fmt(data, ct, treq.format, out_dim, out_dim, bbox, epsg, pq_stac.return_mask);
-                            Ok((data, ct))
+                            // An item's picture with pixels missing is a PNG whether or not
+                            // the mask was asked for: the format is chosen from the pixels.
+                            if item_auto_format
+                                && !pq_stac.return_mask
+                                && data.len() == (out_dim as usize).pow(2) * 4
+                                && data.chunks_exact(4).any(|p| p[3] != 255)
+                            {
+                                let (w, h) = (out_dim as usize, out_dim as usize);
+                                return Ok((encode_rgba_output(w, h, &data, OutputFormat::Png, false), "image/png"));
+                            }
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq_stac.jpeg_quality, pq_stac.return_mask))
                         } else if item_auto_format {
                             pgstac::item_tile_auto_format(&engine, &cogs, treq, &pq_stac).await
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
@@ -6335,21 +6482,31 @@ where
                             treq.format = OutputFormat::RawRgba;
                             let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             let dim = treq.tile_size as usize;
-                            let data = if let Some(cf) = cf {
-                                let mut buf = raw.to_vec();
-                                cf.apply_buffer_in_place(&mut buf, 4);
-                                encode_rgba_output(dim, dim, &buf, orig_format, pq_stac.return_mask)
-                            } else {
-                                encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
-                            };
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
-                            Ok((data, ct))
+                            if auto_fmt {
+                                let buf = if let Some(cf) = cf {
+                                    let mut b = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut b, 4);
+                                    Bytes::from(b)
+                                } else {
+                                    raw
+                                };
+                                Ok(encode_auto_image(dim, dim, &buf, pq_stac.jpeg_quality, pq_stac.return_mask))
+                            } else {
+                                let data = if let Some(cf) = cf {
+                                    let mut buf = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut buf, 4);
+                                    encode_rgba_output(dim, dim, &buf, orig_format, pq_stac.return_mask)
+                                } else {
+                                    encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
+                                };
+                                let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
+                                Ok((data, ct))
+                            }
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff_fmt(data, ct, treq.format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
-                            Ok((data, ct))
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.jpeg_quality, pq_stac.return_mask))
                         }
                     })
                     .await;
@@ -7285,6 +7442,11 @@ where
                             || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);
 
+                        let auto_fmt = ext.is_none() && pq.format_param.is_none();
+                        if auto_fmt {
+                            treq.format = OutputFormat::RawRgba;
+                        }
+
                         if needs_general_path {
                             let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
                             let cf = pq
@@ -7351,8 +7513,7 @@ where
                                 .await?;
                                 (d, bbox_3857, 3857u16)
                             };
-                            let data = wrap_geotiff_fmt(data, ct, treq.format, out_dim, out_dim, bbox, epsg, pq.return_mask);
-                            Ok((data, ct))
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq.jpeg_quality, pq.return_mask))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
                         {
@@ -7366,21 +7527,31 @@ where
                             treq.format = OutputFormat::RawRgba;
                             let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             let dim = treq.tile_size as usize;
-                            let data = if let Some(cf) = cf {
-                                let mut buf = raw.to_vec();
-                                cf.apply_buffer_in_place(&mut buf, 4);
-                                encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
-                            } else {
-                                encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
-                            };
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
-                            Ok((data, ct))
+                            if auto_fmt {
+                                let buf = if let Some(cf) = cf {
+                                    let mut b = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut b, 4);
+                                    Bytes::from(b)
+                                } else {
+                                    raw
+                                };
+                                Ok(encode_auto_image(dim, dim, &buf, pq.jpeg_quality, pq.return_mask))
+                            } else {
+                                let data = if let Some(cf) = cf {
+                                    let mut buf = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut buf, 4);
+                                    encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
+                                } else {
+                                    encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
+                                };
+                                let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
+                                Ok((data, ct))
+                            }
                         } else {
                             let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                            let data = wrap_geotiff_fmt(data, ct, treq.format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
-                            Ok((data, ct))
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq.jpeg_quality, pq.return_mask))
                         }
                     })
                     .await;
@@ -8476,7 +8647,8 @@ mod tests {
 
         let pq_wmts = parse_query(Some("url=a.tif&minzoom=4&maxzoom=12&tile_format=png&tile_scale=2"));
         assert!(validate_query(&["cog", "WebMercatorQuad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
-        assert!(validate_query(&["mosaicjson", "WorldCRS84Quad", "WMTSCapabilities.xml"], &pq_wmts).is_err());
+        assert!(validate_query(&["mosaicjson", "WorldCRS84Quad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
+        assert!(validate_query(&["mosaicjson", "NotATms", "WMTSCapabilities.xml"], &pq_wmts).is_err());
     }
 
     #[test]

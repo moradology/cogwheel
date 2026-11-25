@@ -2273,6 +2273,7 @@ impl PlanesTile {
         look: &Look<'_>,
     ) -> Result<(Bytes, &'static str), EngineError> {
         let pixels = width * height;
+        let mut formula = look.formula;
         let (rgba, bands, full) = match self.mosaic(engine, scenes).await? {
             None => (vec![0u8; pixels * 4], 1, false),
             Some((selected, sample_type, widest)) => {
@@ -2367,7 +2368,15 @@ impl PlanesTile {
                     let content_type = look.asked.map_or("application/x-binary", |(_, ct)| ct);
                     return Ok((npy_array(&values, selected.bands, width, height, SampleType::Uint8, look.return_mask, None), content_type));
                 }
-                let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap, look.custom).map_err(|bands| {
+                // One band under a colour map takes the formula before the map; the
+                // formula is then done with.
+                let before_map = formula.filter(|_| {
+                    selected.bands == 1 && (look.mapped || look.custom.is_some())
+                });
+                if before_map.is_some() {
+                    formula = None;
+                }
+                let rgba = paint_bands(&selected, pixels, look.rescale, default, look.colormap, look.custom, before_map).map_err(|bands| {
                     EngineError::BadRequest(format!(
                         "Could not encode array of shape ({bands},{height},{width}) and of datatype `uint8` using {driver} driver"
                     ))
@@ -2394,7 +2403,7 @@ impl PlanesTile {
         // An array of a picture: its bytes, band by band, and the mask as a band of its own.
         if let (OutputFormat::Npy, content_type) = asked {
             let mut rgba = rgba;
-            if let Some(formula) = look.formula {
+            if let Some(formula) = formula {
                 formula.apply_buffer_in_place(&mut rgba, 4);
             }
             let shown = if grey { 1 } else { 3 };
@@ -2404,7 +2413,7 @@ impl PlanesTile {
             }
             return Ok((npy_array(&values, shown, width, height, SampleType::Uint8, look.return_mask, None), content_type));
         }
-        encode_picture(rgba, width, height, look.formula, Some(asked), look.jpeg_quality, look.return_mask, grey)
+        encode_picture(rgba, width, height, formula, Some(asked), look.jpeg_quality, look.return_mask, grey)
     }
 }
 
@@ -2572,6 +2581,7 @@ fn paint_bands(
     default: (f32, f32),
     colormap: ColormapName,
     custom: Option<&MosaicColormap>,
+    before_map: Option<&cogzilla_kernel::ColorFormula>,
 ) -> Result<Vec<u8>, usize> {
     // One range is for every band; several are one each.
     let range = |band: usize| match rescale {
@@ -2582,8 +2592,30 @@ fn paint_bands(
     match selected.bands {
         1 => {
             let (min, max) = range(0);
+            // A colour formula works on the band's byte, and the colour map is looked up
+            // with what it leaves: rio-tiler's order.
+            let levels = before_map.map(|formula| {
+                let mut levels = [0u8; 256];
+                for (level, out) in levels.iter_mut().enumerate() {
+                    let mut px = [level as u8, level as u8, level as u8, 255];
+                    formula.apply_buffer_in_place(&mut px, 4);
+                    *out = px[0];
+                }
+                levels
+            });
             let Some(custom) = custom else {
-                return Ok(Paint::Gray { min, max, colormap }.rgba(selected, pixels));
+                let Some(levels) = levels else {
+                    return Ok(Paint::Gray { min, max, colormap }.rgba(selected, pixels));
+                };
+                let lut = colormap.lut();
+                let mut out = vec![0u8; pixels * 4];
+                for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
+                    if !v.is_nan() {
+                        px[..3].copy_from_slice(&lut.rgb[usize::from(levels[usize::from(rescale_byte(*v, min, max))])]);
+                        px[3] = 255;
+                    }
+                }
+                return Ok(out);
             };
             // A colour map of the request's own: each value's class or interval, with
             // the transparency it names, and nothing where there is no value. With
@@ -2593,7 +2625,12 @@ fn paint_bands(
             let mut out = vec![0u8; pixels * 4];
             for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
                 if !v.is_nan() {
-                    px.copy_from_slice(&custom.colour(*v, scaled));
+                    px.copy_from_slice(&match &levels {
+                        // The map is over the byte, and the byte is the formula's: of the
+                        // value over `rescale`, or over its type's range without one.
+                        Some(levels) => custom.colour(f32::from(levels[usize::from(rescale_byte(*v, min, max))]), Some((0.0, 255.0))),
+                        None => custom.colour(*v, scaled),
+                    });
                 }
             }
             Ok(out)
@@ -6293,43 +6330,43 @@ mod tests {
         let ranges = [(0.0, 100.0), (0.0, 10.0), (0.0, 1.0)];
         // One range is for every band, several are one each, none is the default.
         let one = Selected { bands: 1, values: vec![50.0, nan] };
-        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 127, 127, 255, 0, 0, 0, 0]);
-        assert_eq!(paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale, None).unwrap()[..4], [255, 255, 255, 255]);
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None, None).unwrap(), [127, 127, 127, 255, 0, 0, 0, 0]);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 50.0), ColormapName::Grayscale, None, None).unwrap()[..4], [255, 255, 255, 255]);
         // A colour map of the request's own: classes over the values themselves, or over
         // the byte `rescale` makes of them, or intervals; nothing where there is no value
         // or no class for it.
         let map = |json: &str| MosaicColormap::parse(json).unwrap().unwrap();
         let classes = map(r#"{"50": [1, 2, 3, 200], "127": [9, 9, 9, 255], "700": [7, 7, 7, 255]}"#);
-        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap(), [1, 2, 3, 200, 0, 0, 0, 0]);
-        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap()[..4], [9, 9, 9, 255]);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes), None).unwrap(), [1, 2, 3, 200, 0, 0, 0, 0]);
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&classes), None).unwrap()[..4], [9, 9, 9, 255]);
         // A class is for the value that equals it: none for one beside it, or with no class.
         let near = Selected { bands: 1, values: vec![50.4, 70.0, 700.0] };
-        assert_eq!(paint_bands(&near, 3, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes)).unwrap(), [0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 255]);
+        assert_eq!(paint_bands(&near, 3, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&classes), None).unwrap(), [0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 255]);
         // Intervals: by the value, or under `rescale` by the byte, and the last given wins.
         let spans = map("[[[0, 40], [1, 1, 1, 255]], [[40, 60], [2, 2, 2, 255]], [[45, 55], [3, 3, 3, 255]], [[120, 130], [4, 4, 4, 255]]]");
-        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&spans)).unwrap()[..4], [3, 3, 3, 255]);
-        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&spans)).unwrap()[..4], [4, 4, 4, 255]);
+        assert_eq!(paint_bands(&one, 2, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&spans), None).unwrap()[..4], [3, 3, 3, 255]);
+        assert_eq!(paint_bands(&one, 2, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, Some(&spans), None).unwrap()[..4], [4, 4, 4, 255]);
         // Classes for every byte take the value as a byte: cut towards zero, round the clock.
         let bytes: Vec<String> = (0..256).map(|k| format!(r#""{k}": [{k}, 0, 0, 255]"#)).collect();
         let bytes = map(&format!("{{{}}}", bytes.join(",")));
         let wide = Selected { bands: 1, values: vec![300.9, -1.0, 7.9] };
-        assert_eq!(paint_bands(&wide, 3, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&bytes)).unwrap(), [44, 0, 0, 255, 255, 0, 0, 255, 7, 0, 0, 255]);
+        assert_eq!(paint_bands(&wide, 3, &[], (0.0, 1.0), ColormapName::Grayscale, Some(&bytes), None).unwrap(), [44, 0, 0, 255, 255, 0, 0, 255, 7, 0, 0, 255]);
         // A map with nothing in it is no map, and one with too many intervals is refused.
         assert!(MosaicColormap::parse("{}").unwrap().is_none() && MosaicColormap::parse("[]").unwrap().is_none());
         let many: Vec<String> = (0..257).map(|k| format!("[[{k}, {}], [1, 1, 1, 255]]", k + 1)).collect();
         assert!(MosaicColormap::parse(&format!("[{}]", many.join(","))).is_err() && MosaicColormap::parse("{nope").is_err());
         let three = Selected { bands: 3, values: vec![50.0, 5.0, 0.5] };
-        assert_eq!(paint_bands(&three, 1, &ranges, (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 127, 127, 255]);
-        assert_eq!(paint_bands(&three, 1, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(), [127, 12, 1, 255]);
+        assert_eq!(paint_bands(&three, 1, &ranges, (0.0, 1.0), ColormapName::Grayscale, None, None).unwrap(), [127, 127, 127, 255]);
+        assert_eq!(paint_bands(&three, 1, &ranges[..1], (0.0, 1.0), ColormapName::Grayscale, None, None).unwrap(), [127, 12, 1, 255]);
         // Two bands: red and green, and the mask for blue; never transparent.
         let two = Selected { bands: 2, values: vec![50.0, nan, nan, 5.0, 10.0, nan] };
         assert_eq!(
-            paint_bands(&two, 3, &ranges[..2], (0.0, 1.0), ColormapName::Grayscale, None).unwrap(),
+            paint_bands(&two, 3, &ranges[..2], (0.0, 1.0), ColormapName::Grayscale, None, None).unwrap(),
             [127, 127, 255, 255, 0, 255, 255, 255, 0, 0, 0, 255]
         );
         // Four bands and more are no picture.
         let four = Selected { bands: 4, values: vec![1.0; 4] };
-        assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale, None).unwrap_err(), 4);
+        assert_eq!(paint_bands(&four, 1, &[], (0.0, 1.0), ColormapName::Grayscale, None, None).unwrap_err(), 4);
     }
 
     #[test]
@@ -7094,6 +7131,19 @@ mod tests {
             assert_eq!(wider_type(a, b), both, "{a:?} with {b:?}");
             assert_eq!(wider_type(b, a), both, "{b:?} with {a:?}");
         }
+    }
+
+    #[test]
+    fn a_colour_formula_comes_before_the_colour_map() {
+        let one = Selected { bands: 1, values: vec![64.0, f32::NAN] };
+        let formula = cogzilla_kernel::ColorFormula::parse("gamma r 2").unwrap();
+        let mut level = [64u8, 64, 64, 255];
+        formula.apply_buffer_in_place(&mut level, 4);
+        assert_ne!(level[0], 64);
+        let viridis = ColormapName::Viridis.lut();
+        let got = paint_bands(&one, 2, &[(0.0, 255.0)], (0.0, 255.0), ColormapName::Viridis, None, Some(&formula)).unwrap();
+        assert_eq!(got[..3], viridis.rgb[usize::from(level[0])]);
+        assert_eq!(got[3..], [255, 0, 0, 0, 0]);
     }
 
 }

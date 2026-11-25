@@ -400,6 +400,7 @@ pub fn tile_to_quadkey(z: u8, x: u32, y: u32) -> String {
 /// `/mosaic/{name}/tiles` (via `--mosaic`) and `/mosaicjson/tiles?...&url=...`.
 pub struct MosaicJsonCatalog {
     pub version: String,
+    pub name: Option<String>,
     pub minzoom: u8,
     pub maxzoom: u8,
     pub quadkey_zoom: u8,
@@ -416,6 +417,7 @@ impl MosaicJsonCatalog {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'mosaicjson' version field".to_string())?
             .to_string();
+        let name = val.get("name").and_then(|v| v.as_str()).map(String::from);
         let minzoom = val.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
         let maxzoom = val.get("maxzoom").and_then(|v| v.as_u64()).unwrap_or(22) as u8;
         let bounds = val
@@ -458,6 +460,7 @@ impl MosaicJsonCatalog {
 
         Ok(Self {
             version,
+            name,
             minzoom,
             maxzoom,
             quadkey_zoom,
@@ -467,12 +470,20 @@ impl MosaicJsonCatalog {
     }
 
     pub fn info_json(&self) -> serde_json::Value {
+        let mut quadkeys: Vec<&String> = self.tiles.keys().collect();
+        quadkeys.sort();
         serde_json::json!({
+            "bounds": self.bounds,
+            "crs": "http://www.opengis.net/def/crs/EPSG/0/4326",
+            "name": self.name,
+            "quadkeys": quadkeys,
+            "mosaic_tilematrixset": "WebMercatorQuad",
+            "mosaic_minzoom": self.minzoom,
+            "mosaic_maxzoom": self.maxzoom,
             "mosaicjson": self.version,
             "minzoom": self.minzoom,
             "maxzoom": self.maxzoom,
             "quadkey_zoom": self.quadkey_zoom,
-            "bounds": self.bounds,
             "tiles_count": self.tiles.len(),
         })
     }
