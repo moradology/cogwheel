@@ -7,8 +7,8 @@ use cogzilla_gpu::{
     GpuColorFormula, GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
     GpuExprRenderer, GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
     GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuStatsReducer,
-    GpuTerrainRenderer, GpuTileBatcher, MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey,
-    TileCoordSlice, opcodes,
+    GpuTerrainRenderer, GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
+    MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -113,6 +113,7 @@ pub struct GpuBackend {
     batcher: Mutex<GpuTileBatcher>,
     jpeg: Mutex<GpuJpegEncoder>,
     stats: Mutex<GpuStatsReducer>,
+    weighted_stats: Mutex<GpuWeightedStatsReducer>,
     in_flight: AtomicUsize,
 }
 
@@ -747,6 +748,7 @@ impl GpuBackend {
         let batcher = Mutex::new(GpuTileBatcher::new(&ctx));
         let jpeg = Mutex::new(GpuJpegEncoder::new(&ctx));
         let stats = Mutex::new(GpuStatsReducer::new(&ctx));
+        let weighted_stats = Mutex::new(GpuWeightedStatsReducer::new(&ctx));
         Some(Arc::new(Self {
             ctx,
             policy,
@@ -761,6 +763,7 @@ impl GpuBackend {
             batcher,
             jpeg,
             stats,
+            weighted_stats,
             in_flight: AtomicUsize::new(0),
         }))
     }
@@ -996,6 +999,47 @@ impl GpuBackend {
         let mut guard = self.stats.lock().ok()?;
         guard
             .reduce_f32(pixels, nodata, num_bins, hist_range, percentiles)
+            .ok()
+    }
+
+    /// Single-submit GPU weighted zonal statistics across one or more aligned bands sharing
+    /// the same analytical coverage mask `covs` and normalized per-row areas `row_areas`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_reduce_weighted_zonal_stats(
+        &self,
+        bands: &[&[f32]],
+        covs: &[f32],
+        win_w: usize,
+        row_areas: &[f32],
+        area_weighted: bool,
+        cov_eps: f32,
+        pixel_set_eps: f32,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<Vec<GpuWeightedBandStats>> {
+        let min_px = if self.ctx.info.unified_memory {
+            512 * 512
+        } else {
+            256 * 256
+        };
+        if covs.len() < min_px || bands.is_empty() {
+            return None;
+        }
+        let mut guard = self.weighted_stats.lock().ok()?;
+        guard
+            .reduce_weighted_bands(
+                bands,
+                covs,
+                win_w,
+                row_areas,
+                area_weighted,
+                cov_eps,
+                pixel_set_eps,
+                num_bins,
+                hist_range,
+                percentiles,
+            )
             .ok()
     }
 

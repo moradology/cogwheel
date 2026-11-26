@@ -1575,6 +1575,112 @@ pub fn compute_weighted_band_stats_with_geom(
 
 /// Compute exact analytical coverage-weighted & ellipsoidal area-weighted zonal statistics
 /// directly on the COG's native pixel grid (zero resampling).
+#[cfg(feature = "gpu")]
+fn weighted_gpu_stats_to_json(
+    gs: &cogzilla_gpu::GpuWeightedBandStats,
+    area_scale: f64,
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let total_touched = gs.valid_pixels + gs.masked_pixels;
+    let valid_percent = if total_touched > 0 {
+        ((gs.valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let count_out = snap_near_int(gs.count_cov);
+    let mut obj = serde_json::Map::new();
+    obj.insert("min".into(), serde_json::json!(gs.min));
+    obj.insert("max".into(), serde_json::json!(gs.max));
+    obj.insert("mean".into(), serde_json::json!(gs.mean));
+    obj.insert("count".into(), serde_json::json!(count_out));
+    obj.insert("sum".into(), serde_json::json!(gs.sum_cov));
+    obj.insert("std".into(), serde_json::json!(gs.std));
+    obj.insert("median".into(), serde_json::json!(gs.median));
+    obj.insert("majority".into(), serde_json::json!(gs.majority));
+    obj.insert("minority".into(), serde_json::json!(gs.minority));
+    obj.insert("unique".into(), serde_json::json!(gs.unique_bins as f64));
+    obj.insert(
+        "histogram".into(),
+        serde_json::json!([gs.hist_counts, gs.hist_edges]),
+    );
+    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
+    obj.insert("masked_pixels".into(), serde_json::json!(gs.masked_pixels as f64));
+    obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels as f64));
+    obj.insert("area".into(), serde_json::json!(gs.area_valid_m2 * area_scale));
+    for &(p, val) in &gs.percentiles {
+        let key = if p.fract() == 0.0 {
+            format!("percentile_{}", p as i64)
+        } else {
+            format!("percentile_{p}")
+        };
+        obj.insert(key, serde_json::json!(val));
+    }
+    let _ = opts;
+    obj.insert("description".into(), serde_json::json!(description));
+    serde_json::Value::Object(obj)
+}
+
+#[cfg(feature = "gpu")]
+fn try_gpu_weighted_polygon_bands(
+    gpu: &crate::gpu_backend::GpuBackend,
+    bands: &[(&str, &[f32])],
+    cov: &[f64],
+    win_w: usize,
+    win_h: usize,
+    area_model: &PixelAreaModel,
+    opts: &StatsOptions,
+) -> Option<Vec<serde_json::Value>> {
+    if opts.categorical || opts.histogram_edges.is_some() || bands.is_empty() {
+        return None;
+    }
+    let (row_areas, area_scale): (Vec<f32>, f64) = match area_model {
+        PixelAreaModel::Constant(a) => {
+            let scale = if *a > 0.0 { *a } else { 1.0 };
+            (vec![(*a / scale) as f32; win_h], scale)
+        }
+        PixelAreaModel::PerRow(rows) => {
+            if rows.len() != win_h {
+                return None;
+            }
+            let max_a = rows.iter().copied().fold(0.0_f64, f64::max);
+            let scale = if max_a > 0.0 { max_a } else { 1.0 };
+            (rows.iter().map(|&a| (a / scale) as f32).collect(), scale)
+        }
+        PixelAreaModel::Lattice { .. } => return None,
+    };
+    let cov_f32: Vec<f32> = cov.iter().map(|&c| c as f32).collect();
+    let slices: Vec<&[f32]> = bands.iter().map(|&(_, s)| s).collect();
+    let pcts: Vec<f64> = if opts.percentiles.is_empty() {
+        vec![2.0, 98.0]
+    } else {
+        opts.percentiles.clone()
+    };
+    let gs_list = gpu.try_reduce_weighted_zonal_stats(
+        &slices,
+        &cov_f32,
+        win_w,
+        &row_areas,
+        opts.area_weighted,
+        COV_EPS as f32,
+        PIXEL_SET_EPS as f32,
+        opts.histogram_bins.clamp(1, 1000),
+        opts.histogram_range,
+        &pcts,
+    )?;
+    // If any band hit 0 valid_pixels (e.g. microscopic sub-pixel polygon), fall back to CPU.
+    if gs_list.iter().any(|gs| gs.valid_pixels == 0) {
+        return None;
+    }
+    Some(
+        gs_list
+            .iter()
+            .zip(bands.iter())
+            .map(|(gs, &(desc, _))| weighted_gpu_stats_to_json(gs, area_scale, desc, opts))
+            .collect(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn compute_native_exact_polygon_stats(
     engine: &TileEngine,
@@ -1973,6 +2079,10 @@ pub async fn compute_native_exact_polygon_stats(
     } else {
         ZonalGeomKind::Point
     };
+    #[cfg(feature = "gpu")]
+    let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
+    #[cfg(feature = "gpu")]
+    let gpu_stats_counter = Arc::clone(&engine.stats);
     let compute_cpu = move || -> serde_json::Value {
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
         let line_len_m = if geom_kind == ZonalGeomKind::Line {
@@ -1989,7 +2099,8 @@ pub async fn compute_native_exact_polygon_stats(
         };
         let mut out = serde_json::Map::new();
         if let Some(ref exprs) = opts_owned.expressions {
-            for (ei, (desc, prog)) in exprs.iter().enumerate() {
+            let mut expr_bufs: Vec<(&str, Vec<f32>)> = Vec::with_capacity(exprs.len());
+            for (desc, prog) in exprs {
                 let mut expr_px = vec![f32::NAN; n_px];
                 let slot_bufs: Vec<Option<&[f32]>> = prog
                     .used_bands
@@ -2001,24 +2112,70 @@ pub async fn compute_native_exact_polygon_stats(
                             .map(|(_, buf)| buf.as_slice())
                     })
                     .collect();
-                let mut b_vals = vec![0.0_f32; slot_bufs.len()];
-                for i in 0..n_px {
-                    if cov[i] <= COV_EPS {
-                        continue;
-                    }
-                    let mut all_valid = true;
-                    for (slot, buf_opt) in slot_bufs.iter().enumerate() {
-                        let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
-                        if !v.is_finite() {
-                            all_valid = false;
-                            break;
+                let eval_chunk = |start: usize, dst: &mut [f32]| {
+                    let mut b_vals = vec![0.0_f32; slot_bufs.len()];
+                    for (j, out_v) in dst.iter_mut().enumerate() {
+                        let i = start + j;
+                        if cov[i] <= COV_EPS {
+                            continue;
                         }
-                        b_vals[slot] = v;
+                        let mut all_valid = true;
+                        for (slot, buf_opt) in slot_bufs.iter().enumerate() {
+                            let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
+                            if !v.is_finite() {
+                                all_valid = false;
+                                break;
+                            }
+                            b_vals[slot] = v;
+                        }
+                        if all_valid {
+                            *out_v = prog.eval(&b_vals);
+                        }
                     }
-                    if all_valid {
-                        expr_px[i] = prog.eval(&b_vals);
-                    }
+                };
+                if n_px >= 65_536 {
+                    let threads = std::thread::available_parallelism()
+                        .map(|p| p.get().clamp(2, 8))
+                        .unwrap_or(4);
+                    let chunk = n_px.div_ceil(threads);
+                    std::thread::scope(|s| {
+                        for (ci, dst) in expr_px.chunks_mut(chunk).enumerate() {
+                            let off = ci * chunk;
+                            s.spawn(move || eval_chunk(off, dst));
+                        }
+                    });
+                } else {
+                    eval_chunk(0, &mut expr_px);
                 }
+                expr_bufs.push((desc.as_str(), expr_px));
+            }
+            #[cfg(feature = "gpu")]
+            if geom_kind == ZonalGeomKind::Polygon
+                && let Some(ref gpu) = gpu_opt
+            {
+                let pairs: Vec<(&str, &[f32])> = expr_bufs
+                    .iter()
+                    .map(|(d, b)| (*d, b.as_slice()))
+                    .collect();
+                if let Some(vals) = try_gpu_weighted_polygon_bands(
+                    gpu,
+                    &pairs,
+                    &cov,
+                    win_w,
+                    win_h,
+                    &area_model,
+                    &opts_owned,
+                ) {
+                    gpu_stats_counter
+                        .gpu_dispatches
+                        .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    for (ei, val) in vals.into_iter().enumerate() {
+                        out.insert(format!("b{}", ei + 1), val);
+                    }
+                    return serde_json::Value::Object(out);
+                }
+            }
+            for (ei, (desc, expr_px)) in expr_bufs.into_iter().enumerate() {
                 out.insert(
                     format!("b{}", ei + 1),
                     compute_weighted_band_stats_with_geom(
@@ -2036,13 +2193,45 @@ pub async fn compute_native_exact_polygon_stats(
                 );
             }
         } else {
-            for (b1, pixels) in &band_bufs {
-                let desc = descs_owned
-                    .get((*b1 - 1) as usize)
-                    .map(String::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .unwrap_or_else(|| format!("b{b1}"));
+            let band_descs: Vec<String> = band_bufs
+                .iter()
+                .map(|(b1, _)| {
+                    descs_owned
+                        .get((*b1 - 1) as usize)
+                        .map(String::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("b{b1}"))
+                })
+                .collect();
+            #[cfg(feature = "gpu")]
+            if geom_kind == ZonalGeomKind::Polygon
+                && let Some(ref gpu) = gpu_opt
+            {
+                let pairs: Vec<(&str, &[f32])> = band_bufs
+                    .iter()
+                    .zip(band_descs.iter())
+                    .map(|((_, px), d)| (d.as_str(), px.as_slice()))
+                    .collect();
+                if let Some(vals) = try_gpu_weighted_polygon_bands(
+                    gpu,
+                    &pairs,
+                    &cov,
+                    win_w,
+                    win_h,
+                    &area_model,
+                    &opts_owned,
+                ) {
+                    gpu_stats_counter
+                        .gpu_dispatches
+                        .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    for ((b1, _), val) in band_bufs.iter().zip(vals.into_iter()) {
+                        out.insert(format!("b{b1}"), val);
+                    }
+                    return serde_json::Value::Object(out);
+                }
+            }
+            for ((b1, pixels), desc) in band_bufs.iter().zip(band_descs.iter()) {
                 out.insert(
                     format!("b{b1}"),
                     compute_weighted_band_stats_with_geom(
@@ -2054,7 +2243,7 @@ pub async fn compute_native_exact_polygon_stats(
                         opts_owned.area_weighted,
                         geom_kind,
                         line_len_m.as_deref(),
-                        &desc,
+                        desc,
                         &opts_owned,
                     ),
                 );
@@ -2367,6 +2556,10 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let p2c = ifd.pixel_to_crs;
     let opts_owned = opts.clone();
     let exprs_owned = exprs.to_vec();
+    #[cfg(feature = "gpu")]
+    let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
+    #[cfg(feature = "gpu")]
+    let gpu_stats_counter = Arc::clone(&engine.stats);
     let compute_cpu = move || -> serde_json::Value {
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
         let line_len_m = if geom_kind == ZonalGeomKind::Line {
@@ -2382,7 +2575,8 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             PixelAreaModel::Constant(0.0)
         };
         let mut out = serde_json::Map::new();
-        for (ei, (desc, prog)) in exprs_owned.iter().enumerate() {
+        let mut expr_bufs: Vec<(&str, Vec<f32>)> = Vec::with_capacity(exprs_owned.len());
+        for (desc, prog) in &exprs_owned {
             let mut expr_px = vec![f32::NAN; n_px];
             let slot_bufs: Vec<Option<&[f32]>> = prog
                 .used_bands
@@ -2394,24 +2588,70 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                         .map(|(_, buf)| buf.as_slice())
                 })
                 .collect();
-            let mut b_vals = vec![0.0_f32; slot_bufs.len()];
-            for i in 0..n_px {
-                if cov[i] <= COV_EPS {
-                    continue;
-                }
-                let mut all_valid = true;
-                for (slot, buf_opt) in slot_bufs.iter().enumerate() {
-                    let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
-                    if !v.is_finite() {
-                        all_valid = false;
-                        break;
+            let eval_chunk = |start: usize, dst: &mut [f32]| {
+                let mut b_vals = vec![0.0_f32; slot_bufs.len()];
+                for (j, out_v) in dst.iter_mut().enumerate() {
+                    let i = start + j;
+                    if cov[i] <= COV_EPS {
+                        continue;
                     }
-                    b_vals[slot] = v;
+                    let mut all_valid = true;
+                    for (slot, buf_opt) in slot_bufs.iter().enumerate() {
+                        let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
+                        if !v.is_finite() {
+                            all_valid = false;
+                            break;
+                        }
+                        b_vals[slot] = v;
+                    }
+                    if all_valid {
+                        *out_v = prog.eval(&b_vals);
+                    }
                 }
-                if all_valid {
-                    expr_px[i] = prog.eval(&b_vals);
-                }
+            };
+            if n_px >= 65_536 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get().clamp(2, 8))
+                    .unwrap_or(4);
+                let chunk = n_px.div_ceil(threads);
+                std::thread::scope(|s| {
+                    for (ci, dst) in expr_px.chunks_mut(chunk).enumerate() {
+                        let off = ci * chunk;
+                        s.spawn(move || eval_chunk(off, dst));
+                    }
+                });
+            } else {
+                eval_chunk(0, &mut expr_px);
             }
+            expr_bufs.push((desc.as_str(), expr_px));
+        }
+        #[cfg(feature = "gpu")]
+        if geom_kind == ZonalGeomKind::Polygon
+            && let Some(ref gpu) = gpu_opt
+        {
+            let pairs: Vec<(&str, &[f32])> = expr_bufs
+                .iter()
+                .map(|(d, b)| (*d, b.as_slice()))
+                .collect();
+            if let Some(vals) = try_gpu_weighted_polygon_bands(
+                gpu,
+                &pairs,
+                &cov,
+                win_w,
+                win_h,
+                &area_model,
+                &opts_owned,
+            ) {
+                gpu_stats_counter
+                    .gpu_dispatches
+                    .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                for (ei, val) in vals.into_iter().enumerate() {
+                    out.insert(format!("b{}", ei + 1), val);
+                }
+                return serde_json::Value::Object(out);
+            }
+        }
+        for (ei, (desc, expr_px)) in expr_bufs.into_iter().enumerate() {
             out.insert(
                 format!("b{}", ei + 1),
                 compute_weighted_band_stats_with_geom(

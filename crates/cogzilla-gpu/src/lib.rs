@@ -11,6 +11,7 @@ pub mod predictor;
 pub mod resample;
 pub mod stats;
 pub mod terrain;
+pub mod weighted_stats;
 
 pub use batch::{GpuTileBatcher, TileCoordSlice};
 pub use cache::{GpuCacheStats, GpuMultiBandCache, GpuSlabCache, MultiBandSlabKey, SlabKey};
@@ -28,4 +29,5 @@ pub use predictor::{GpuPredictorDecoder, GpuPredictorKind};
 pub use resample::{GpuResampleMode, GpuResampler, GpuSlab, ResampleTimings};
 pub use stats::{GpuBandStats, GpuStatsReducer, decode_stats_readback};
 pub use terrain::{GpuDemAlgorithm, GpuTerrainRenderer};
+pub use weighted_stats::{GpuWeightedBandStats, GpuWeightedStatsReducer};
 pub use wgpu;

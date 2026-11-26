@@ -137,5 +137,9 @@ required-features = ["gpu"]
 name = "e2e_utm_grid2d_bbox_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "e2e_weighted_zonal_gpu_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 zune-jpeg.workspace = true
