@@ -6341,6 +6341,68 @@ async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
     assert_eq!(f64::from_le_bytes(body[0..8].try_into().unwrap()), 12_345_678_901.234_568_f64);
     assert_eq!(f64::from_le_bytes(body[8..16].try_into().unwrap()), f64::MIN);
 
+    // Audit #94 regression checks:
+    // 1. Default return_mask=true on wide-dtype GeoTIFF must NOT invert masked pixels to u32::MAX.
+    let tif_masked = client
+        .get(format!("{base}/cog/bbox/0,0,16,8/16x8.tif?url={p_u32}&resampling=nearest"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let idx_m = cogzilla_tiff::parse_cog(&tif_masked).unwrap();
+    assert_eq!(idx_m.full_res().samples_per_pixel, 2);
+    assert_eq!(idx_m.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    let mask_off = idx_m.full_res().tile_offsets[1] as usize;
+    let mask_len = idx_m.full_res().tile_byte_counts[1] as usize;
+    let mask_slice = &tif_masked[mask_off..mask_off + mask_len];
+    // Pixel (0, 0) is inside [0,8]x[0,8] -> u32::MAX; pixel (12, 0) is outside -> 0 (u32::MIN).
+    assert_eq!(u32::from_le_bytes(mask_slice[0..4].try_into().unwrap()), u32::MAX);
+    assert_eq!(u32::from_le_bytes(mask_slice[12 * 4..12 * 4 + 4].try_into().unwrap()), 0);
+
+    // 2. Styled .npy (rescale / colormap_name) on wide-dtype COG must return painted |u1 bytes, not raw <u4.
+    let styled_npy = client
+        .get(format!("{base}/cog/preview.npy?url={p_u32}&rescale=0,4294967295"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let hlen = u16::from_le_bytes([styled_npy[8], styled_npy[9]]) as usize;
+    let hdr = std::str::from_utf8(&styled_npy[10..10 + hlen]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected painted |u1 npy header, got: {hdr}");
+
+    // 3. Multi-COG wide-dtype .tif must produce a valid 2-band uint32 GeoTIFF (not bit-garbled f64).
+    let multi_tif = client
+        .get(format!("{base}/cog/bbox/0,0,8,8/8x8.tif?url={p_u32}&url={p_u32}&return_mask=false&resampling=nearest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(multi_tif.status(), 200);
+    let multi_bytes = multi_tif.bytes().await.unwrap();
+    let idx_multi = cogzilla_tiff::parse_cog(&multi_bytes).unwrap();
+    assert_eq!(idx_multi.full_res().samples_per_pixel, 2);
+    assert_eq!(idx_multi.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+
+    // 4. Extreme f64 statistics (f64::MIN + f64::MAX) must produce finite mean, std, and histogram edges (no JSON null).
+    let mut f64_ext_raw = Vec::with_capacity(64 * 8);
+    for i in 0..64 {
+        let v = if i % 2 == 0 { f64::MIN } else { f64::MAX };
+        f64_ext_raw.extend_from_slice(&v.to_le_bytes());
+    }
+    let f64_ext_path = tmp.join("f64_ext.tif");
+    write_8x8(&f64_ext_path, 64, 3, &f64_ext_raw);
+    let p_f64_ext = f64_ext_path.to_string_lossy();
+    let st_ext: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/statistics?url={p_f64_ext}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert!(st_ext["b1"]["mean"].as_f64().is_some_and(f64::is_finite), "mean must be finite: {st_ext}");
+    assert!(st_ext["b1"]["std"].as_f64().is_some_and(f64::is_finite), "std must be finite: {st_ext}");
+    let edges = st_ext["b1"]["histogram"][1].as_array().unwrap();
+    assert!(edges.iter().all(|e| e.as_f64().is_some_and(f64::is_finite)), "all histogram edges must be finite: {edges:?}");
+
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }

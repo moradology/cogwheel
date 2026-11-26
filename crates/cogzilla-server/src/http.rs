@@ -26,6 +26,7 @@ mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
 mod paint;
+mod html;
 pub(crate) mod pixel_selection;
 mod cql2_text;
 mod point_expr;
@@ -2059,22 +2060,29 @@ fn geotiff_render_format(
     source_cog: Option<&cogzilla_io::OpenedCog>,
     bands: &BandRequest,
     sample_type: cogzilla_tiff::SampleType,
+    allow_f64: bool,
 ) -> OutputFormat {
+    let can_exact_f64 = allow_f64
+        && sample_type.needs_f64()
+        && !pq.unscale
+        && !array_type::shown(pq)
+        && pq.algorithm.is_none()
+        && pq.expr_raw.is_none()
+        && pq.buffer == 0.0
+        && matches!(pq.resample, ResampleMode::Nearest | ResampleMode::Bilinear)
+        && matches!(pq.reproject, ResampleMode::Nearest | ResampleMode::Bilinear)
+        && matches!(
+            bands,
+            BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
+        );
     if wants_f32_geotiff(ct, pq, source_cog, bands, sample_type) {
-        if sample_type.needs_f64()
-            && !pq.unscale
-            && !array_type::shown(pq)
-            && pq.algorithm.is_none()
-            && pq.expr_raw.is_none()
-            && matches!(
-                bands,
-                BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
-            )
-        {
+        if can_exact_f64 {
             OutputFormat::RawF64
         } else {
             OutputFormat::RawF32
         }
+    } else if fmt == OutputFormat::Npy && can_exact_f64 {
+        OutputFormat::NpyF64
     } else {
         fmt
     }
@@ -3462,9 +3470,9 @@ fn build_tile_request_for_tms(
         _ => default_bands,
     };
     let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
-    let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
+    let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
     if let BandRequest::MultiBand { ref bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
         && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4))
     {
         return Err(EngineError::BadRequest(
@@ -4268,7 +4276,7 @@ async fn render_mosaic_tile_styled(
     }
 
     if (pq.color_formula.is_some() || !pq.return_mask)
-        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
+        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
     {
         let cf = pq
             .color_formula
@@ -4522,7 +4530,7 @@ async fn render_mosaic_bbox_composite(
         let mut bands =
             build_band_request_for_output(pq, data_bands, full.sample_type, fmt, ct)?;
         let scene_fmt = *eff_fmt.get_or_insert_with(|| {
-            geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, full.sample_type)
+            geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, full.sample_type, false)
         });
         let is_f32_out = matches!(scene_fmt, OutputFormat::RawF32 | OutputFormat::Npy);
         if let BandRequest::MultiBand { ref bands_1based } = bands
@@ -5522,6 +5530,11 @@ where
     } else {
         None
     };
+    // `f=html` on a route that describes something: its JSON, written out as a page.
+    let as_page = (is_get_or_head
+        && html::wants_html(req.uri().query().unwrap_or(""))
+        && html::offers_html(req.uri().path()))
+    .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
     let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
@@ -5533,6 +5546,27 @@ where
         *retry_req.headers_mut() = h;
         resp = handle_request_inner(engine, retry_req, is_head).await?;
         resp.headers_mut().remove("x-cogzilla-retry");
+    }
+    if let Some((path, query)) = as_page
+        && resp.status() == StatusCode::OK
+        && resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/json"))
+    {
+        let (mut parts, body) = resp.into_parts();
+        let raw = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+        resp = match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(doc) => {
+                let page = html::page(&path, &query, &doc);
+                parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+                parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                parts.headers.remove(ETAG);
+                Response::from_parts(parts, Full::new(Bytes::from(page)))
+            }
+            Err(_) => Response::from_parts(parts, Full::new(raw)),
+        };
     }
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
@@ -7443,7 +7477,7 @@ where
                                 );
                                 Ok((data, ct))
                             } else if (pq.color_formula.is_some() || !pq.return_mask)
-                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
+                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                             {
                                 let cf = pq
                                     .color_formula
@@ -8534,7 +8568,15 @@ where
                 let st = widest_sample_type(&cogs);
                 let mut bands =
                     build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(
+                    fmt,
+                    ct,
+                    &pq_stac,
+                    Some(&cogs[0]),
+                    &bands,
+                    st,
+                    cogs.len() == 1 && slot_bands.is_none(),
+                );
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -8698,6 +8740,20 @@ where
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
+                        if cogs.len() == 1
+                            && slot_bands.is_none()
+                            && matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                        {
+                            treq.format = geotiff_render_format(
+                                treq.format,
+                                ct,
+                                &pq_stac,
+                                Some(&cogs[0]),
+                                &treq.bands,
+                                st,
+                                true,
+                            );
+                        }
                         let mut any_intersects = false;
                         for c in &cogs {
                             if tile_intersects_cog(
@@ -8834,7 +8890,7 @@ where
                         } else if item_auto_format {
                             pgstac::item_tile_auto_format(&engine, &cogs, treq, &pq_stac).await
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
-                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                         {
                             let cf = pq_stac
                                 .color_formula
@@ -9037,7 +9093,15 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st)
+                    geotiff_render_format(
+                        fmt,
+                        ct,
+                        &pq_stac,
+                        Some(&cogs[0]),
+                        &bands,
+                        st,
+                        cogs.len() == 1 && slot_bands.is_none(),
+                    )
                 };
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -9118,7 +9182,15 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(
+                    fmt,
+                    ct,
+                    &pq_stac,
+                    Some(&cogs[0]),
+                    &bands,
+                    st,
+                    cogs.len() == 1 && slot_bands.is_none(),
+                );
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -9201,7 +9273,15 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st)
+                    geotiff_render_format(
+                        fmt,
+                        ct,
+                        &pq_stac,
+                        Some(&cogs[0]),
+                        &bands,
+                        st,
+                        cogs.len() == 1 && slot_bands.is_none(),
+                    )
                 };
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -9288,7 +9368,15 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(
+                    fmt,
+                    ct,
+                    &pq_stac,
+                    Some(&cogs[0]),
+                    &bands,
+                    st,
+                    cogs.len() == 1 && slot_bands.is_none(),
+                );
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -9369,7 +9457,15 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(
+                    fmt,
+                    ct,
+                    &pq_stac,
+                    Some(&cogs[0]),
+                    &bands,
+                    st,
+                    cogs.len() == 1 && slot_bands.is_none(),
+                );
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -9429,7 +9525,15 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st)
+                    geotiff_render_format(
+                        fmt,
+                        ct,
+                        &pq_stac,
+                        Some(&cogs[0]),
+                        &bands,
+                        st,
+                        cogs.len() == 1 && slot_bands.is_none(),
+                    )
                 };
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -9977,6 +10081,19 @@ where
                         if pq.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
+                        if cogs.len() == 1
+                            && matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                        {
+                            treq.format = geotiff_render_format(
+                                treq.format,
+                                ct,
+                                &pq,
+                                Some(&cogs[0]),
+                                &treq.bands,
+                                st,
+                                true,
+                            );
+                        }
 
                         let mut any_intersects = false;
                         for c in &cogs {
@@ -10097,7 +10214,7 @@ where
                             };
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq.jpeg_quality, pq.return_mask))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
-                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                         {
                             let cf = pq
                                 .color_formula
@@ -10307,7 +10424,7 @@ where
                             b.insert("scale".into(), serde_json::json!(cog.index.scales_f64.get(i).copied().unwrap_or(1.0)));
                             b.insert("offset".into(), serde_json::json!(cog.index.offsets_f64.get(i).copied().unwrap_or(0.0)));
                             b.insert("sampling".into(), serde_json::json!(sampling));
-                            if let Some(nd) = cog.index.nodata {
+                            if let Some(nd) = cog.index.nodata_f64.or_else(|| cog.index.nodata.map(|v| v as f64)) {
                                 if nd.is_nan() {
                                     b.insert("nodata".into(), serde_json::json!("nan"));
                                 } else {
@@ -10485,7 +10602,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -10639,7 +10756,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st)
+                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -10738,7 +10855,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -10826,7 +10943,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st)
+                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -10904,7 +11021,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -10982,7 +11099,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st)
+                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11038,7 +11155,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }

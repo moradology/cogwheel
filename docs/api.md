@@ -23,6 +23,7 @@
 - `GET /algorithms`, `GET /algorithms/{algorithmId}`: TiTiler `AlgorithmFactory` metadata for all 19 supported algorithms (`hillshade`, `slope`, `aspect`, `contours`, `terrarium`, `terrainrgb`, `normalizedIndex`, `cast`, `ceil`, `floor`, `min`, `max`, `median`, `mean`, `std`, `var`, `sum`, `grayscale`, `bitonal`).
 - `GET /colorMaps`, `GET /colorMaps/{colorMapId}`: all 211 lookup tables match `rio-tiler` bit-for-bit, and `?f=png` returns a 256×20 colorbar.
 - `GET /tileMatrixSets`, `GET /tileMatrixSets/{tileMatrixSetId}`: all 13 `morecantile` OGC TileMatrixSet 2.0 JSON definitions.
+- `?f=html` on the documents that describe things (`/conformance`, `/tileMatrixSets[/{id}]`, `/colorMaps`, `/algorithms[/{id}]`, and every tileset list and tileset, `.../tiles` and `.../tiles/{tms}`) returns the same document as a page, as TiTiler's templates do: a trail back up the path, a link to the JSON, the document's links (kept as pages where they lead to one), and the rest as tables.
 
 ## pgSTAC
 
