@@ -143,7 +143,10 @@ impl<T: Sample> Fold<T> {
             | Selection::Lowest
             | Selection::LastBandLow
             | Selection::LastBandHigh => State::Kept(vec![T::NAN; len]),
-            Selection::Mean | Selection::Stdev => {
+            Selection::Mean => {
+                State::Moments { sum: vec![0.0; len], squares: Vec::new(), count: vec![0; len] }
+            }
+            Selection::Stdev => {
                 State::Moments { sum: vec![0.0; len], squares: vec![0.0; len], count: vec![0; len] }
             }
             Selection::Median => State::All(Vec::new()),
@@ -177,7 +180,8 @@ impl<T: Sample> Fold<T> {
     /// a sum of squares and a count, for each value of each band.
     pub(super) fn working_bytes(method: Selection, bands: usize, pixels: usize) -> usize {
         let each = match method {
-            Selection::Mean | Selection::Stdev => 2 * std::mem::size_of::<f64>() + std::mem::size_of::<u32>(),
+            Selection::Mean => std::mem::size_of::<f64>() + std::mem::size_of::<u32>(),
+            Selection::Stdev => 2 * std::mem::size_of::<f64>() + std::mem::size_of::<u32>(),
             Selection::Median => 0,
             Selection::Count => return pixels.saturating_mul(std::mem::size_of::<T>()),
             _ => std::mem::size_of::<T>(),
@@ -229,12 +233,13 @@ impl<T: Sample> Fold<T> {
                 }
             }
             State::Moments { sum, squares, count } => {
+                let track_sq = !squares.is_empty();
                 for (i, v) in scene.enumerate().take(sum.len()) {
                     if !v.is_nan() {
                         let v = v.to_f64();
                         // The squared distances are kept, not the squares: the squares of
                         // large values that sit close together lose the spread between them.
-                        if count[i] > 0 {
+                        if track_sq && count[i] > 0 {
                             let before = v - sum[i] / f64::from(count[i]);
                             let after = v - (sum[i] + v) / f64::from(count[i] + 1);
                             squares[i] += before * after;
@@ -297,6 +302,9 @@ impl<T: Sample> Fold<T> {
                     let mean = sum[i] / n;
                     values[i] = if self.method == Selection::Mean {
                         cast(mean)
+                    } else if !mean.is_finite() || squares[i].is_nan() {
+                        // Guard against `f64::NAN.max(0.0) == 0.0` and non-finite inputs (±Inf).
+                        T::NAN
                     } else {
                         // The population figure, as `numpy.ma.std` gives; never cast.
                         T::from_f64((squares[i] / n).max(0.0).sqrt())
@@ -498,9 +506,31 @@ mod tests {
         let px = 1000;
         assert_eq!(Fold::<f32>::working_bytes(Selection::First, 3, px), 3 * px * 4);
         assert_eq!(Fold::<f64>::working_bytes(Selection::Highest, 3, px), 3 * px * 8);
-        assert_eq!(Fold::<f32>::working_bytes(Selection::Mean, 3, px), 3 * px * 20);
+        assert_eq!(Fold::<f32>::working_bytes(Selection::Mean, 3, px), 3 * px * 12);
+        assert_eq!(Fold::<f32>::working_bytes(Selection::Stdev, 3, px), 3 * px * 20);
         assert_eq!(Fold::<f32>::working_bytes(Selection::Count, 3, px), px * 4);
         assert_eq!(Fold::<f32>::working_bytes(Selection::Median, 3, px), 0);
+    }
+
+    #[test]
+    fn stdev_returns_nan_for_non_finite_inputs_regardless_of_scene_order() {
+        for scenes in [
+            vec![vec![2.0f32], vec![f32::INFINITY]],
+            vec![vec![f32::INFINITY], vec![2.0f32]],
+            vec![vec![f32::INFINITY]],
+            vec![vec![f32::NEG_INFINITY], vec![2.0f32]],
+        ] {
+            let mut fold = Fold::<f32>::new(Selection::Stdev, 1, 1, false);
+            for s in &scenes {
+                fold.add(s.iter().copied());
+            }
+            let out = fold.finish().unwrap();
+            assert!(
+                out.values[0].is_nan(),
+                "expected NaN stdev for {scenes:?}, got {:?}",
+                out.values[0]
+            );
+        }
     }
 
     #[test]
