@@ -6002,6 +6002,99 @@ async fn render_bbox_impl(
 
         // Real RawF32 / Npy output for single-band / expression / DEM / Terrain / RGB requests
         if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
+            #[cfg(feature = "gpu")]
+            if let Some((ref gpu, ref stats, primary_id)) = gpu_ctx {
+                let v_rows: Vec<f32> = if native_preview {
+                    (0..h).map(|py| v_map[py * w]).collect()
+                } else {
+                    Vec::new()
+                };
+                let coords = if native_preview {
+                    crate::gpu_backend::BboxCoordSource::Separable {
+                        u: &u_map[..w],
+                        v: &v_rows,
+                    }
+                } else {
+                    crate::gpu_backend::BboxCoordSource::Exact2D {
+                        dst_w: w,
+                        dst_h: h,
+                        u_map: &u_map,
+                        v_map: &v_map,
+                    }
+                };
+                let gpu_raw: Option<Bytes> = match bands {
+                    BandRequest::Single { band_1based, .. } => {
+                        let refs = get_band_refs(*band_1based, 0);
+                        let src = make_src!(&refs);
+                        gpu.try_render_bbox_single_band_f32(
+                            primary_id,
+                            ifd_idx,
+                            band_1based.saturating_sub(1),
+                            coords,
+                            &src,
+                            resample,
+                        )
+                    }
+                    BandRequest::Dem {
+                        band_1based,
+                        algorithm,
+                        ..
+                    } => {
+                        let refs = get_band_refs(*band_1based, 0);
+                        let src = make_src!(&refs);
+                        let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                        let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
+                        let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                        gpu.try_render_bbox_dem_f32(
+                            primary_id,
+                            ifd_idx,
+                            band_1based.saturating_sub(1),
+                            coords,
+                            &src,
+                            *algorithm,
+                            dx_m,
+                            dy_m,
+                            resample,
+                        )
+                    }
+                    BandRequest::CustomExpr { prog, .. } => {
+                        let ref_vecs: Vec<_> = prog
+                            .used_bands
+                            .iter()
+                            .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                            .collect();
+                        let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                        let cache_key = if num_cogs == 1 {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id,
+                                ifd_idx,
+                                &prog.used_bands,
+                                &srcs,
+                            )
+                        } else {
+                            None
+                        };
+                        gpu.try_render_bbox_expr_f32(cache_key, coords, &srcs, prog, resample)
+                    }
+                    _ => None,
+                };
+                if let Some(raw) = gpu_raw {
+                    stats
+                        .gpu_dispatches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if format == OutputFormat::Npy {
+                        return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                            raw,
+                            1,
+                            h as u32,
+                            w as u32,
+                            return_mask,
+                        );
+                    }
+                    return raw;
+                }
+            }
+
             let mut out = BytesMut::with_capacity(w * h * 4);
             match bands {
                 BandRequest::Dem {

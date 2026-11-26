@@ -351,6 +351,25 @@ fn dem_horn_rgba8(
     }
 }
 
+/// Fused resample + 18x18 shared-memory Horn 3x3 (Hillshade / Slope / Aspect) -> raw f32.
+@compute @workgroup_size(16, 16, 1)
+fn dem_horn_f32(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(global_invocation_id) gid: vec3<u32>,
+) {
+    load_shared_tile(wg_id, lid);
+
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.dst_w || py >= params.dst_h) {
+        return;
+    }
+
+    let val = eval_horn_from_shared(lid.x, lid.y);
+    dst_words[py * params.dst_w + px] = bitcast<u32>(val);
+}
+
 /// Fused resample + 18x18 shared-memory Horn 3x3 -> packed IndexedU8 (4 pixels per u32, 4x smaller readback).
 @compute @workgroup_size(16, 16, 1)
 fn dem_horn_indexed_u8(

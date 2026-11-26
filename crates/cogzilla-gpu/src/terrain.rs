@@ -57,6 +57,7 @@ pub struct GpuTerrainRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     horn_rgba8_pipeline: wgpu::ComputePipeline,
     horn_indexed_pipeline: wgpu::ComputePipeline,
+    horn_f32_pipeline: wgpu::ComputePipeline,
     terrain_rgb_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
@@ -171,6 +172,15 @@ impl GpuTerrainRenderer {
                 cache: None,
             });
 
+        let horn_f32_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cogzilla-dem-horn-f32"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("dem_horn_f32"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let terrain_rgb_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("cogzilla-dem-terrain-rgb"),
@@ -208,6 +218,7 @@ impl GpuTerrainRenderer {
             bind_group_layout,
             horn_rgba8_pipeline,
             horn_indexed_pipeline,
+            horn_f32_pipeline,
             terrain_rgb_pipeline,
             params_buf,
             lut_buf,
@@ -515,6 +526,158 @@ impl GpuTerrainRenderer {
         self.staging_buf.unmap();
 
         Ok(result)
+    }
+
+    /// Evaluate Horn 3×3 (`Hillshade` / `Slope` / `Aspect`) over a GPU-resident `GpuSlab` with
+    /// an arbitrary `GpuCoordPlan`, returning raw little-endian `f32` bytes (`dst_w * dst_h * 4`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_slab_f32_with_plan(
+        &mut self,
+        slab: &GpuSlab,
+        plan: GpuCoordPlan<'_>,
+        resample: GpuColormapMode,
+        alg: GpuDemAlgorithm,
+        pixel_size_x_m: f32,
+        pixel_size_y_m: f32,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (alg_mode, sun_e, sun_n, sun_u, z_factor) = match alg {
+            GpuDemAlgorithm::Hillshade {
+                azimuth_deg,
+                altitude_deg,
+                z_factor,
+            } => {
+                let az = azimuth_deg.to_radians();
+                let alt = altitude_deg.to_radians();
+                (0u32, alt.cos() * az.sin(), alt.cos() * az.cos(), alt.sin(), z_factor)
+            }
+            GpuDemAlgorithm::Slope { z_factor } => (1u32, 0.0, 0.0, 1.0, z_factor),
+            GpuDemAlgorithm::Aspect => (2u32, 0.0, 0.0, 1.0, 1.0),
+            GpuDemAlgorithm::Terrarium | GpuDemAlgorithm::TerrainRgb => {
+                return Err(GpuError::InvalidDimensions(
+                    "render_slab_f32_with_plan supports Hillshade/Slope/Aspect only".into(),
+                ));
+            }
+        };
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D { u_coords, v_coords } => {
+                    (u_coords.len(), v_coords.len(), 0, u_coords, v_coords)
+                }
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v slice lengths must equal dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
+        if dst_w == 0 || dst_h == 0 {
+            return Err(GpuError::InvalidDimensions(
+                "dst_w and dst_h must be non-zero".into(),
+            ));
+        }
+
+        let out_words = dst_w * dst_h;
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
+
+        let params = TerrainParams {
+            src_w: slab.width,
+            src_h: slab.height,
+            src_stride: slab.stride,
+            dst_w: dst_w as u32,
+            dst_h: dst_h as u32,
+            resample_mode: resample.as_u32(),
+            alg_mode,
+            coord_mode,
+            inv_8dx: 1.0 / (8.0 * pixel_size_x_m.max(1e-3)),
+            inv_8dy: 1.0 / (8.0 * pixel_size_y_m.max(1e-3)),
+            z_factor,
+            sun_e,
+            sun_n,
+            sun_u,
+            rescale_min: 0.0,
+            inv_range_255: 1.0,
+            inv_range_254: 1.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
+        self.queue
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cogzilla-tr-f32-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: slab.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.u_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let out_bytes = (out_words * std::mem::size_of::<u32>()) as u64;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cogzilla-tr-f32-enc"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-tr-f32-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.horn_f32_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((dst_w as u32).div_ceil(16), (dst_h as u32).div_ceil(16), 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging_buf, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_buf.slice(..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::BufferMap(e.to_string()))?
+            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
+
+        let raw = slice.get_mapped_range().to_vec();
+        self.staging_buf.unmap();
+        Ok(raw)
     }
 }
 

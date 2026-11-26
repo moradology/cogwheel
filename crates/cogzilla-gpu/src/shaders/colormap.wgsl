@@ -249,6 +249,18 @@ fn fused_colormap_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst_words[py * params.dst_w + px] = value_to_rgba8(val);
 }
 
+@compute @workgroup_size(16, 16, 1)
+fn resample_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.dst_w || py >= params.dst_h) {
+        return;
+    }
+    let uv = eval_uv(px, py);
+    let val = sample_mode(uv.x, uv.y);
+    dst_words[py * params.dst_w + px] = bitcast<u32>(val);
+}
+
 /// Each invocation computes 4 horizontally adjacent pixels and packs them into 1 u32,
 /// shrinking GPU -> CPU readback bandwidth by 4x vs RGBA8/f32.
 @compute @workgroup_size(16, 16, 1)

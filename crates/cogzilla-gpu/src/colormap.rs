@@ -14,7 +14,7 @@ pub enum GpuColormapMode {
 }
 
 impl GpuColormapMode {
-    fn as_u32(self) -> u32 {
+    pub(crate) fn as_u32(self) -> u32 {
         match self {
             Self::Bilinear => 0,
             Self::Cubic => 1,
@@ -86,6 +86,7 @@ pub struct GpuColormapRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     rgba8_pipeline: wgpu::ComputePipeline,
     indexed_pipeline: wgpu::ComputePipeline,
+    f32_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
     u_buf: wgpu::Buffer,
@@ -197,6 +198,15 @@ impl GpuColormapRenderer {
             cache: None,
         });
 
+        let f32_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cogzilla-resample-f32"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("resample_f32"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-colormap-params"),
             size: std::mem::size_of::<ColormapParams>() as u64,
@@ -224,6 +234,7 @@ impl GpuColormapRenderer {
             bind_group_layout,
             rgba8_pipeline,
             indexed_pipeline,
+            f32_pipeline,
             params_buf,
             lut_buf,
             u_buf,
@@ -486,6 +497,128 @@ impl GpuColormapRenderer {
         self.staging_buf.unmap();
 
         Ok(result)
+    }
+
+    /// Resample a GPU-resident `GpuSlab` with an arbitrary `GpuCoordPlan` directly to raw
+    /// little-endian `f32` bytes (`dst_w * dst_h * 4` bytes, for `.npy`, `.tif`, `.f32`, and mosaics).
+    pub fn render_slab_f32_with_plan(
+        &mut self,
+        slab: &GpuSlab,
+        plan: GpuCoordPlan<'_>,
+        mode: GpuColormapMode,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D { u_coords, v_coords } => {
+                    (u_coords.len(), v_coords.len(), 0, u_coords, v_coords)
+                }
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v slice lengths must equal dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
+        if dst_w == 0 || dst_h == 0 {
+            return Err(GpuError::InvalidDimensions(
+                "dst_w and dst_h must be non-zero".into(),
+            ));
+        }
+
+        let out_words = dst_w * dst_h;
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
+
+        let params = ColormapParams {
+            src_w: slab.width,
+            src_h: slab.height,
+            src_stride: slab.stride,
+            dst_w: dst_w as u32,
+            dst_h: dst_h as u32,
+            mode: mode.as_u32(),
+            rescale_min: 0.0,
+            inv_range_255: 1.0,
+            inv_range_254: 1.0,
+            coord_mode,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
+        self.queue
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cogzilla-cm-f32-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: slab.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.u_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let out_bytes = (out_words * std::mem::size_of::<u32>()) as u64;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cogzilla-cm-f32-enc"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-cm-f32-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.f32_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((dst_w as u32).div_ceil(16), (dst_h as u32).div_ceil(16), 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging_buf, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_buf.slice(..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::BufferMap(e.to_string()))?
+            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
+
+        let raw = slice.get_mapped_range().to_vec();
+        self.staging_buf.unmap();
+        Ok(raw)
     }
 }
 
