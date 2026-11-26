@@ -917,9 +917,30 @@ fn lanczos3_weight(x: f32) -> f32 {
     (px.sin() / px) * (px3.sin() / px3)
 }
 
-/// General sampler supporting all 15 GDAL/TiTiler resampling methods.
+/// General sampler supporting all 15 GDAL/TiTiler resampling methods at 1:1 source scale.
 #[inline]
 pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) -> f32 {
+    sample_general_scaled(src, u, v, 1.0, 1.0, mode)
+}
+
+/// General sampler supporting all 15 GDAL/TiTiler resampling methods with an explicit
+/// destination-to-source pixel footprint `(scale_x, scale_y)` in source pixel units.
+///
+/// For footprint-based modes (`Average`, `Mode`, `Rms`, `Min`, `Max`, `Med`, `Q1`, `Q3`, `Sum`),
+/// integrates over the exact source-pixel box `[u + 0.5 - 0.5*scale_x, u + 0.5 + 0.5*scale_x] x
+/// [v + 0.5 - 0.5*scale_y, v + 0.5 + 0.5*scale_y]` weighted by exact overlap area:
+/// - At 1:1 scale (`scale_x == 1, scale_y == 1`), reads the exact single source pixel (0 blur).
+/// - At exact integer factors (2x, 4x, 8x, ...), computes the exact block mean / mode / stat.
+/// - At non-integer factors, weights each overlapped source pixel by its exact overlap area.
+#[inline]
+pub fn sample_general_scaled(
+    src: &BandSource<'_>,
+    u: f32,
+    v: f32,
+    scale_x: f32,
+    scale_y: f32,
+    mode: ResampleMode,
+) -> f32 {
     if !u.is_finite()
         || !v.is_finite()
         || u < -0.5
@@ -1014,66 +1035,295 @@ pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) 
         | ResampleMode::Q1
         | ResampleMode::Q3
         | ResampleMode::Sum => {
-            let cx = u.round() as i32;
-            let cy = v.round() as i32;
-            let mut vals = [0.0f32; 9];
-            let mut n = 0usize;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let s = src.sample_checked(cx + dx, cy + dy);
+            sample_footprint_exact(src, u, v, scale_x, scale_y, mode)
+        }
+    }
+}
+
+/// Area-exact footprint sampler for `Average`, `Mode`, `Rms`, `Min`, `Max`, `Med`, `Q1`, `Q3`, `Sum`.
+///
+/// Maps destination pixel center `(u, v)` and footprint width/height `(scale_x, scale_y)` to
+/// source corner box `[x0, x1] x [y0, y1]` (where source pixel `(ix, iy)` spans `[ix, ix+1] x
+/// [iy, iy+1]`) and weights every overlapped valid source pixel by its exact overlap area.
+#[inline]
+fn sample_footprint_exact(
+    src: &BandSource<'_>,
+    u: f32,
+    v: f32,
+    scale_x: f32,
+    scale_y: f32,
+    mode: ResampleMode,
+) -> f32 {
+    let sx = (scale_x as f64).abs().max(1e-6);
+    let sy = (scale_y as f64).abs().max(1e-6);
+    let cx = u as f64 + 0.5;
+    let cy = v as f64 + 0.5;
+    let x0 = (cx - 0.5 * sx).clamp(0.0, src.ifd_w as f64);
+    let x1 = (cx + 0.5 * sx).clamp(0.0, src.ifd_w as f64);
+    let y0 = (cy - 0.5 * sy).clamp(0.0, src.ifd_h as f64);
+    let y1 = (cy + 0.5 * sy).clamp(0.0, src.ifd_h as f64);
+    if x1 <= x0 + 1e-12 || y1 <= y0 + 1e-12 {
+        return f32::NAN;
+    }
+
+    let ix0 = x0.floor() as i32;
+    let ix1 = (x1 - 1e-12).floor() as i32;
+    let iy0 = y0.floor() as i32;
+    let iy1 = (y1 - 1e-12).floor() as i32;
+
+    // Fast 1-pixel path: exact 1:1 overview read or upsampling strictly inside one source pixel.
+    if ix0 == ix1 && iy0 == iy1 {
+        let s = src.sample_checked(ix0, iy0);
+        return if matches!(mode, ResampleMode::Sum) && !s.is_nan() {
+            ((s as f64) * (x1 - x0) * (y1 - y0)) as f32
+        } else {
+            s
+        };
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn visit_footprint<F: FnMut(f32, f64)>(
+        src: &BandSource<'_>,
+        x0: f64,
+        x1: f64,
+        y0: f64,
+        y1: f64,
+        ix0: i32,
+        ix1: i32,
+        iy0: i32,
+        iy1: i32,
+        mut cb: F,
+    ) {
+        const MAX_EXACT_SPAN: i32 = 64;
+        let nx = ix1 - ix0 + 1;
+        let ny = iy1 - iy0 + 1;
+        if nx <= MAX_EXACT_SPAN && ny <= MAX_EXACT_SPAN {
+            for iy in iy0..=iy1 {
+                let wy = ((iy + 1) as f64).min(y1) - (iy as f64).max(y0);
+                if wy <= 1e-9 {
+                    continue;
+                }
+                for ix in ix0..=ix1 {
+                    let wx = ((ix + 1) as f64).min(x1) - (ix as f64).max(x0);
+                    if wx <= 1e-9 {
+                        continue;
+                    }
+                    let s = src.sample_checked(ix, iy);
                     if !s.is_nan() {
-                        vals[n] = s;
-                        n += 1;
+                        cb(s, wx * wy);
                     }
                 }
             }
-            if n == 0 {
+        } else {
+            let steps_x = nx.min(MAX_EXACT_SPAN) as usize;
+            let steps_y = ny.min(MAX_EXACT_SPAN) as usize;
+            let dx = (x1 - x0) / (steps_x as f64);
+            let dy = (y1 - y0) / (steps_y as f64);
+            let cell_w = dx * dy;
+            for gy in 0..steps_y {
+                let iy = (y0 + (gy as f64 + 0.5) * dy).floor() as i32;
+                for gx in 0..steps_x {
+                    let ix = (x0 + (gx as f64 + 0.5) * dx).floor() as i32;
+                    let s = src.sample_checked(ix, iy);
+                    if !s.is_nan() {
+                        cb(s, cell_w);
+                    }
+                }
+            }
+        }
+    }
+
+    match mode {
+        ResampleMode::Average => {
+            let mut sum = 0.0f64;
+            let mut wsum = 0.0f64;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, w| {
+                sum += (s as f64) * w;
+                wsum += w;
+            });
+            if wsum > 0.0 {
+                (sum / wsum) as f32
+            } else {
+                f32::NAN
+            }
+        }
+        ResampleMode::Sum => {
+            let mut sum = 0.0f64;
+            let mut any = false;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, w| {
+                sum += (s as f64) * w;
+                any = true;
+            });
+            if any { sum as f32 } else { f32::NAN }
+        }
+        ResampleMode::Rms => {
+            let mut sq = 0.0f64;
+            let mut wsum = 0.0f64;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, w| {
+                let sf = s as f64;
+                sq += sf * sf * w;
+                wsum += w;
+            });
+            if wsum > 0.0 {
+                (sq / wsum).sqrt() as f32
+            } else {
+                f32::NAN
+            }
+        }
+        ResampleMode::Min => {
+            let mut best = f32::INFINITY;
+            let mut any = false;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, _| {
+                if s < best {
+                    best = s;
+                }
+                any = true;
+            });
+            if any { best } else { f32::NAN }
+        }
+        ResampleMode::Max => {
+            let mut best = f32::NEG_INFINITY;
+            let mut any = false;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, _| {
+                if s > best {
+                    best = s;
+                }
+                any = true;
+            });
+            if any { best } else { f32::NAN }
+        }
+        ResampleMode::Mode => {
+            // Stack-allocated fast path for <= 64 distinct values (covers up to 8x8 exact blocks
+            // with zero heap allocation); falls back to Vec only for larger footprints.
+            let mut stack_bins = [(0u32, 0.0f32, 0.0f64); 64];
+            let mut stack_len = 0usize;
+            let mut heap_bins: Option<Vec<(u32, f32, f64)>> = None;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, w| {
+                // Normalize -0.0 to +0.0 so they bin together.
+                let norm = if s == 0.0 { 0.0f32 } else { s };
+                let bits = norm.to_bits();
+                if let Some(ref mut bins) = heap_bins {
+                    for b in bins.iter_mut() {
+                        if b.0 == bits {
+                            b.2 += w;
+                            return;
+                        }
+                    }
+                    bins.push((bits, norm, w));
+                } else {
+                    for b in &mut stack_bins[..stack_len] {
+                        if b.0 == bits {
+                            b.2 += w;
+                            return;
+                        }
+                    }
+                    if stack_len < stack_bins.len() {
+                        stack_bins[stack_len] = (bits, norm, w);
+                        stack_len += 1;
+                    } else {
+                        let mut v = Vec::with_capacity(128);
+                        v.extend_from_slice(&stack_bins);
+                        v.push((bits, norm, w));
+                        heap_bins = Some(v);
+                    }
+                }
+            });
+            let bins: &[(u32, f32, f64)] = match heap_bins {
+                Some(ref v) => v.as_slice(),
+                None => &stack_bins[..stack_len],
+            };
+            if bins.is_empty() {
                 return f32::NAN;
             }
-            let slice = &mut vals[..n];
-            match mode {
-                ResampleMode::Average => slice.iter().sum::<f32>() / (n as f32),
-                ResampleMode::Sum => slice.iter().sum::<f32>(),
-                ResampleMode::Rms => {
-                    let sq: f32 = slice.iter().map(|&x| x * x).sum();
-                    (sq / (n as f32)).sqrt()
+            let mut best_val = bins[0].1;
+            let mut best_w = bins[0].2;
+            for &(_, val, wt) in &bins[1..] {
+                if wt > best_w {
+                    best_w = wt;
+                    best_val = val;
                 }
-                ResampleMode::Min => slice.iter().copied().fold(f32::INFINITY, f32::min),
-                ResampleMode::Max => slice.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-                ResampleMode::Med | ResampleMode::Q1 | ResampleMode::Q3 => {
-                    slice.sort_unstable_by(f32::total_cmp);
-                    let q = match mode {
-                        ResampleMode::Q1 => 0.25f32,
-                        ResampleMode::Med => 0.50f32,
-                        ResampleMode::Q3 => 0.75f32,
-                        _ => 0.50f32,
-                    };
-                    let pos = q * ((n - 1) as f32);
-                    let lo = pos.floor() as usize;
-                    let hi = (lo + 1).min(n - 1);
-                    let frac = pos - lo as f32;
-                    slice[lo] + (slice[hi] - slice[lo]) * frac
-                }
-                ResampleMode::Mode => {
-                    let mut best_val = slice[0];
-                    let mut best_cnt = 0usize;
-                    for i in 0..n {
-                        let bits = slice[i].to_bits();
-                        let mut cnt = 1usize;
-                        for j in (i + 1)..n {
-                            if slice[j].to_bits() == bits {
-                                cnt += 1;
-                            }
-                        }
-                        if cnt > best_cnt {
-                            best_cnt = cnt;
-                            best_val = slice[i];
-                        }
-                    }
-                    best_val
-                }
-                _ => unreachable!(),
             }
+            best_val
+        }
+        ResampleMode::Med | ResampleMode::Q1 | ResampleMode::Q3 => {
+            let mut stack_vals = [0.0f32; 64];
+            let mut stack_len = 0usize;
+            let mut heap_vals: Option<Vec<f32>> = None;
+            visit_footprint(src, x0, x1, y0, y1, ix0, ix1, iy0, iy1, |s, _| {
+                if let Some(ref mut v) = heap_vals {
+                    v.push(s);
+                } else if stack_len < stack_vals.len() {
+                    stack_vals[stack_len] = s;
+                    stack_len += 1;
+                } else {
+                    let mut v = Vec::with_capacity(128);
+                    v.extend_from_slice(&stack_vals);
+                    v.push(s);
+                    heap_vals = Some(v);
+                }
+            });
+            let slice: &mut [f32] = match heap_vals {
+                Some(ref mut v) => v.as_mut_slice(),
+                None => &mut stack_vals[..stack_len],
+            };
+            if slice.is_empty() {
+                return f32::NAN;
+            }
+            slice.sort_unstable_by(f32::total_cmp);
+            let q = match mode {
+                ResampleMode::Q1 => 0.25f32,
+                ResampleMode::Med => 0.50f32,
+                ResampleMode::Q3 => 0.75f32,
+                _ => 0.50f32,
+            };
+            let pos = q * ((slice.len() - 1) as f32);
+            let lo = pos.floor() as usize;
+            let hi = (lo + 1).min(slice.len() - 1);
+            let frac = pos - lo as f32;
+            slice[lo] + (slice[hi] - slice[lo]) * frac
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Estimate source-pixel footprint `(scale_x, scale_y)` per output pixel from a `CoordPlan`.
+#[inline]
+fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
+    match plan {
+        CoordPlan::Separable1D { u, v, .. } => {
+            let denom = (N.saturating_sub(1)).max(1) as f32;
+            let sx = (u[N - 1] - u[0]).abs() / denom;
+            let sy = (v[N - 1] - v[0]).abs() / denom;
+            (
+                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
+                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
+            )
+        }
+        CoordPlan::Grid2D { grid_u, grid_v, .. } => {
+            let cell_px = (N / (GRID_DIM - 1)).max(1) as f32;
+            let mid = (GRID_DIM - 1) / 2;
+            let i00 = mid * GRID_DIM + mid;
+            let i10 = i00 + 1;
+            let i01 = (mid + 1) * GRID_DIM + mid;
+            let sx = (grid_u[i10] - grid_u[i00]).hypot(grid_v[i10] - grid_v[i00]) / cell_px;
+            let sy = (grid_u[i01] - grid_u[i00]).hypot(grid_v[i01] - grid_v[i00]) / cell_px;
+            (
+                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
+                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
+            )
+        }
+        CoordPlan::Exact2D { u, v, .. } => {
+            let mid = N / 2;
+            let i00 = mid * N + mid;
+            let i10 = i00 + 1;
+            let i01 = (mid + 1).min(N - 1) * N + mid;
+            let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
+            let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
+            (
+                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
+                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
+            )
         }
     }
 }
@@ -1801,7 +2051,10 @@ pub fn render_single_band<const N: usize>(
         (ResampleMode::Nearest, true) => render_single_specialized::<N, false, true>(plan, src, style),
         (ResampleMode::Nearest, false) => render_single_specialized::<N, false, false>(plan, src, style),
         (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| sample_cubic(src, u, v)),
-        (other, _) => render_eval_fn(plan, style, |u, v| sample_general(src, u, v, other)),
+        (other, _) => {
+            let (sx, sy) = coord_plan_scale(plan);
+            render_eval_fn(plan, style, |u, v| sample_general_scaled(src, u, v, sx, sy, other))
+        }
     }
 }
 
@@ -3414,11 +3667,12 @@ fn render_rgb_cubic<const N: usize>(
     ];
     let mins = style.rescale_min;
     let mode = style.resample;
+    let (sx, sy) = coord_plan_scale(plan);
     let sample_px = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
         if mode == ResampleMode::Cubic {
             sample_cubic(src, u, v)
         } else {
-            sample_general(src, u, v, mode)
+            sample_general_scaled(src, u, v, sx, sy, mode)
         }
     };
     match style.format {
