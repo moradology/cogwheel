@@ -21,11 +21,13 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+mod paint;
 #[allow(dead_code)]
 mod pixel_selection;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
+use self::paint::Paint;
 use self::pixel_selection::{Fold, Selected, Selection};
 use crate::stac::{
     get_colormap_image, get_colormap_json, get_tms_json, list_colormaps_json, list_tms_json,
@@ -3390,24 +3392,21 @@ async fn render_mosaic_tile_pixel_selection(
         fold.add_le_bytes(&raw);
     }
 
-    let (out_nb, combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
-        Some(Selected { bands, values }) => (bands, values),
-        None => {
-            let out_nb = default_raw_band_count(&treq.bands, method);
-            (out_nb, vec![f32::NAN; out_nb * n_px])
-        }
-    };
+    let selected = fold.and_then(Fold::finish).unwrap_or_else(|| {
+        let bands = default_raw_band_count(&treq.bands, method);
+        Selected { bands, values: vec![f32::NAN; bands * n_px] }
+    });
 
     if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
-        let mut out = bytes::BytesMut::with_capacity(combined.len() * 4);
-        for v in combined {
+        let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
+        for v in &selected.values {
             out.extend_from_slice(&v.to_le_bytes());
         }
         let raw = out.freeze();
         if matches!(treq.format, OutputFormat::Npy) {
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                 raw,
-                out_nb,
+                selected.bands,
                 out_dim,
                 out_dim,
                 pq.return_mask,
@@ -3416,100 +3415,7 @@ async fn render_mosaic_tile_pixel_selection(
         return Ok(raw);
     }
 
-    let cf = pq
-        .color_formula
-        .as_deref()
-        .map(ColorFormula::parse)
-        .transpose()
-        .map_err(EngineError::BadRequest)?;
-    let mut rgba = vec![0u8; n_px * 4];
-    if out_nb >= 3 {
-        let (rmin, rmax) = match &treq.bands {
-            BandRequest::Rgb {
-                rescale_min,
-                rescale_max,
-                ..
-            }
-            | BandRequest::SarRgb {
-                rescale_min,
-                rescale_max,
-                ..
-            }
-            | BandRequest::CustomExprRgb {
-                rescale_min,
-                rescale_max,
-                ..
-            } => (*rescale_min, *rescale_max),
-            _ => ([0.0, 0.0, 0.0], [255.0, 255.0, 255.0]),
-        };
-        let inv = [
-            255.0 / cogzilla_kernel::safe_rescale_denom(rmin[0], rmax[0]),
-            255.0 / cogzilla_kernel::safe_rescale_denom(rmin[1], rmax[1]),
-            255.0 / cogzilla_kernel::safe_rescale_denom(rmin[2], rmax[2]),
-        ];
-        for i in 0..n_px {
-            let r = combined[i];
-            let g = combined[n_px + i];
-            let b = combined[2 * n_px + i];
-            if r.is_finite() && g.is_finite() && b.is_finite() {
-                rgba[i * 4] = ((r - rmin[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                rgba[i * 4 + 1] = ((g - rmin[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                rgba[i * 4 + 2] = ((b - rmin[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                rgba[i * 4 + 3] = 255;
-            }
-        }
-        if let Some(ref cf) = cf {
-            cf.apply_buffer_in_place(&mut rgba, 4);
-        }
-    } else {
-        let (rescale, cmap) = match &treq.bands {
-            BandRequest::Single {
-                rescale, colormap, ..
-            }
-            | BandRequest::Dem {
-                rescale, colormap, ..
-            }
-            | BandRequest::CustomExpr {
-                rescale, colormap, ..
-            }
-            | BandRequest::Spectral1 {
-                rescale, colormap, ..
-            }
-            | BandRequest::Spectral2 {
-                rescale, colormap, ..
-            }
-            | BandRequest::Spectral3 {
-                rescale, colormap, ..
-            } => (*rescale, *colormap),
-            _ => ((0.0, 255.0), pq.colormap),
-        };
-        let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-        let cf_lut = cf.as_ref().map(|c| {
-            let mut t = [0u8; 256];
-            for i in 0..256 {
-                let mut px = [i as u8, i as u8, i as u8, 255];
-                c.apply_buffer_in_place(&mut px, 4);
-                t[i] = px[0];
-            }
-            t
-        });
-        let lut = cmap.lut();
-        for i in 0..n_px {
-            let v = combined[i];
-            if v.is_finite() {
-                let px = if let Some(ref custom) = first_lut {
-                    custom.lookup(v, rescale.0, inv)
-                } else {
-                    let mut idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                    if let Some(ref cl) = cf_lut {
-                        idx = cl[idx] as usize;
-                    }
-                    lut.rgba_u32[idx].to_le_bytes()
-                };
-                rgba[i * 4..i * 4 + 4].copy_from_slice(&px);
-            }
-        }
-    }
+    let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
     Ok(encode_rgba_output(
         out_dim as usize,
         out_dim as usize,
@@ -3517,6 +3423,63 @@ async fn render_mosaic_tile_pixel_selection(
         treq.format,
         pq.return_mask,
     ))
+}
+
+/// The picture of what a pixel selection left: `pixels` RGBA pixels, by the rules in
+/// [`paint`]. Three bands or more are red, green and blue (the first three); fewer are the
+/// first band under the request's colour map. Kept from the single-scene renderer, where
+/// rio-tiler has no equivalent or does otherwise: a raster's own palette and a colour map
+/// given as JSON (`custom`, which the kernel looks up from the value), and a range given
+/// upside down.
+fn paint_selected(
+    mut selected: Selected,
+    pixels: usize,
+    bands: &BandRequest,
+    pq: &ParsedQuery,
+    custom: Option<&CustomColormap>,
+) -> Result<Vec<u8>, EngineError> {
+    let formula = pq
+        .color_formula
+        .as_deref()
+        .map(ColorFormula::parse)
+        .transpose()
+        .map_err(EngineError::BadRequest)?;
+    let three = selected.bands >= 3;
+    // The request's own ranges and colour map where it has them for this many bands;
+    // otherwise bytes as they are.
+    let paint = match (Paint::of(bands), bands) {
+        (Some(paint @ Paint::Rgb { .. }), _) if three => paint,
+        (Some(paint @ Paint::Gray { .. }), _) if !three => paint,
+        (_, BandRequest::CustomExprRgb { rescale_min, rescale_max, .. }) if three => {
+            Paint::Rgb { min: *rescale_min, max: *rescale_max }
+        }
+        _ if three => Paint::Rgb { min: [0.0; 3], max: [255.0; 3] },
+        _ => Paint::Gray { min: 0.0, max: 255.0, colormap: pq.colormap },
+    };
+    if three {
+        selected.bands = 3;
+        let paint = paint.upright(&mut selected, pixels);
+        let mut rgba = paint.rgba(&selected, pixels);
+        if let Some(formula) = &formula {
+            formula.apply_buffer_in_place(&mut rgba, 4);
+        }
+        return Ok(rgba);
+    }
+    if let (Some(custom), Paint::Gray { min, max, .. }) = (custom, paint) {
+        let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(min, max);
+        let mut rgba = vec![0u8; pixels * 4];
+        for (px, v) in rgba.chunks_exact_mut(4).zip(&selected.values) {
+            if v.is_finite() {
+                px.copy_from_slice(&custom.lookup(*v, min, inv));
+            }
+        }
+        return Ok(rgba);
+    }
+    let paint = paint.upright(&mut selected, pixels);
+    Ok(match &formula {
+        Some(formula) => paint.rgba_through(&selected, pixels, &paint::formula_levels(formula)),
+        None => paint.rgba(&selected, pixels),
+    })
 }
 
 async fn render_mosaic_tile_styled(
@@ -10396,6 +10359,162 @@ pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn single(rescale: (f32, f32), colormap: ColormapName) -> BandRequest {
+        BandRequest::Single { band_1based: 1, rescale, colormap }
+    }
+
+    fn selected(bands: usize, values: &[f32]) -> Selected {
+        Selected { bands, values: values.to_vec() }
+    }
+
+    #[test]
+    fn a_pixel_selection_is_painted_by_rio_tilers_rules() {
+        let pq = parse_query(None);
+        let nan = f32::NAN;
+        // One band without a colour map: the byte is the grey, also where the kernel's
+        // grey table is a level below (33 is 32 there).
+        let grey = single((0.0, 255.0), ColormapName::Grayscale);
+        let rgba = paint_selected(selected(1, &[33.0, 244.0, nan]), 3, &grey, &pq, None).unwrap();
+        assert_eq!(rgba, [33, 33, 33, 255, 244, 244, 244, 255, 0, 0, 0, 0]);
+        // The byte is `linear_rescale`'s: the top of the range is 255.
+        let rgba = paint_selected(selected(1, &[0.3]), 1, &single((0.0, 0.3), ColormapName::Grayscale), &pq, None).unwrap();
+        assert_eq!(rgba, [255, 255, 255, 255]);
+        // Red, green and blue: there where any band has a value, with 0 for one that has not.
+        let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
+        let rgba = paint_selected(selected(3, &[10.0, nan, nan, 20.0, 20.0, nan, 30.0, nan, nan]), 3, &rgb, &pq, None).unwrap();
+        assert_eq!(rgba, [10, 20, 30, 255, 0, 20, 0, 255, 0, 0, 0, 0]);
+        // An infinity is a value, clipped to the range.
+        let rgba = paint_selected(selected(1, &[f32::INFINITY, f32::NEG_INFINITY]), 2, &grey, &pq, None).unwrap();
+        assert_eq!(rgba, [255, 255, 255, 255, 0, 0, 0, 255]);
+        // A range with no width is 0 throughout.
+        let rgba = paint_selected(selected(1, &[2.0, 3.0, 4.0]), 3, &single((3.0, 3.0), ColormapName::Grayscale), &pq, None).unwrap();
+        assert_eq!(rgba, [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_pixel_selection_keeps_the_colour_maps_a_raster_or_a_request_brings() {
+        let pq = parse_query(None);
+        let grey = single((0.0, 255.0), ColormapName::Grayscale);
+        let values = selected(1, &[1.0, 2.0, 7.0, f32::NAN, 300.0]);
+        // A raster's own palette: the class's colour and its transparency, by the value.
+        let mut palette = vec![[0u8; 4]; 256];
+        palette[1] = [10, 20, 30, 255];
+        palette[2] = [40, 50, 60, 128];
+        let own = CustomColormap::from_rgba_palette(&palette);
+        let rgba = paint_selected(values.clone(), 5, &grey, &pq, Some(&own)).unwrap();
+        assert_eq!(rgba[..8], [10, 20, 30, 255, 40, 50, 60, 128]);
+        assert_eq!(rgba[8..], [0; 12]);
+        // A colour map given as JSON, classes and intervals.
+        let classes = CustomColormap::from_json_str(r##"{"1": [1, 2, 3, 200], "300": "#ff0000"}"##, false).unwrap();
+        let rgba = paint_selected(values.clone(), 5, &grey, &pq, Some(&classes)).unwrap();
+        assert_eq!(rgba[..4], [1, 2, 3, 200]);
+        assert_eq!(rgba[4..16], [0; 12]);
+        assert_eq!(rgba[16..], [255, 0, 0, 255]);
+        let spans = CustomColormap::from_json_str("[[[0, 5], [9, 9, 9, 255]], [[5, 10], [7, 7, 7, 255]]]", false).unwrap();
+        let rgba = paint_selected(values.clone(), 5, &grey, &pq, Some(&spans)).unwrap();
+        assert_eq!(rgba[..12], [9, 9, 9, 255, 9, 9, 9, 255, 7, 7, 7, 255]);
+        assert_eq!(rgba[12..], [0; 8]);
+        // A ramp between stops, over the rescaled byte.
+        let ramp = CustomColormap::from_json_str_with_type(r#"{"0": [0, 0, 0, 255], "255": [255, 255, 255, 255]}"#, true, true).unwrap();
+        let rgba = paint_selected(selected(1, &[0.0, 50.0, 100.0]), 3, &single((0.0, 100.0), ColormapName::Grayscale), &pq, Some(&ramp)).unwrap();
+        assert_eq!([rgba[0], rgba[8]], [0, 255]);
+        assert!((126..=128).contains(&rgba[4]), "{}", rgba[4]);
+        // Three bands are a picture already: no colour map is looked at.
+        let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
+        let rgba = paint_selected(selected(3, &[1.0, 2.0, 3.0]), 1, &rgb, &pq, Some(&own)).unwrap();
+        assert_eq!(rgba, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn a_pixel_selection_keeps_a_range_given_upside_down() {
+        let pq = parse_query(None);
+        let rgba = paint_selected(selected(1, &[0.0, 51.0, 255.0, f32::NAN]), 4, &single((255.0, 0.0), ColormapName::Grayscale), &pq, None).unwrap();
+        assert_eq!(rgba, [255, 255, 255, 255, 204, 204, 204, 255, 0, 0, 0, 255, 0, 0, 0, 0]);
+        let table = ColormapName::Viridis.lut();
+        let rgba = paint_selected(selected(1, &[0.0]), 1, &single((255.0, 0.0), ColormapName::Viridis), &pq, None).unwrap();
+        assert_eq!(rgba[..3], table.rgb[255]);
+        let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0, 100.0, 0.0], rescale_max: [100.0, 0.0, 100.0] };
+        let rgba = paint_selected(selected(3, &[20.0, 20.0, 20.0]), 1, &rgb, &pq, None).unwrap();
+        assert_eq!(rgba, [51, 204, 51, 255]);
+    }
+
+    #[test]
+    fn a_pixel_selection_paints_whatever_bands_the_request_leaves() {
+        let pq = parse_query(None);
+        // Band math for red, green and blue keeps its own ranges.
+        let prog = || ExprProgram::compile("b1").unwrap();
+        let math = BandRequest::CustomExprRgb { progs: [prog(), prog(), prog()], rescale_min: [0.0; 3], rescale_max: [100.0, 200.0, 400.0] };
+        let rgba = paint_selected(selected(3, &[100.0, 100.0, 100.0]), 1, &math, &pq, None).unwrap();
+        assert_eq!(rgba, [255, 127, 63, 255]);
+        // Bands with no range of their own are bytes as they are: a terrain encoding's
+        // three, and the first three of however many were asked for.
+        let terrain = BandRequest::Terrain { band_1based: 1, encoding: TerrainEncoding::Terrarium };
+        let rgba = paint_selected(selected(3, &[128.0, 7.0, 255.0]), 1, &terrain, &pq, None).unwrap();
+        assert_eq!(rgba, [128, 7, 255, 255]);
+        let four = BandRequest::MultiBand { bands_1based: vec![1, 2, 3, 4] };
+        let rgba = paint_selected(selected(4, &[1.0, 2.0, 3.0, 4.0]), 1, &four, &pq, None).unwrap();
+        assert_eq!(rgba, [1, 2, 3, 255]);
+        // Two bands: the first, under the request's colour map.
+        let two = BandRequest::MultiBand { bands_1based: vec![1, 2] };
+        let mapped = parse_query(Some("colormap_name=viridis"));
+        let table = ColormapName::Viridis.lut();
+        let rgba = paint_selected(selected(2, &[64.0, 200.0]), 1, &two, &mapped, None).unwrap();
+        assert_eq!(rgba[..3], table.rgb[64]);
+        // One band left of a request for three (a count): bytes as they are, not the
+        // request's ranges.
+        let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [4000.0; 3] };
+        let rgba = paint_selected(selected(1, &[2.0]), 1, &rgb, &pq, None).unwrap();
+        assert_eq!(rgba, [2, 2, 2, 255]);
+        // A request for one band that three came of: red, green and blue as they are.
+        let rgba = paint_selected(selected(3, &[1.0, 2.0, 3.0]), 1, &single((0.0, 4000.0), ColormapName::Viridis), &pq, None).unwrap();
+        assert_eq!(rgba, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn a_pixel_selection_takes_a_colour_formula_before_the_colour_map() {
+        let pq = parse_query(Some("color_formula=gamma%20rgb%202"));
+        let formula = ColorFormula::parse("gamma rgb 2").unwrap();
+        let levels = paint::formula_levels(&formula);
+        assert_ne!(levels[64], 64);
+        // One band: the formula on its byte, then the map, or the grey that byte is.
+        let table = ColormapName::Viridis.lut();
+        let rgba = paint_selected(selected(1, &[64.0, f32::NAN]), 2, &single((0.0, 255.0), ColormapName::Viridis), &pq, None).unwrap();
+        assert_eq!(rgba[..3], table.rgb[usize::from(levels[64])]);
+        assert_eq!(rgba[3..], [255, 0, 0, 0, 0]);
+        let rgba = paint_selected(selected(1, &[64.0]), 1, &single((0.0, 255.0), ColormapName::Grayscale), &pq, None).unwrap();
+        assert_eq!(rgba, [levels[64], levels[64], levels[64], 255]);
+        // Three bands: the formula on the finished picture.
+        let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
+        let rgba = paint_selected(selected(3, &[64.0, 0.0, 255.0]), 1, &rgb, &pq, None).unwrap();
+        assert_eq!(rgba, [levels[64], 0, 255, 255]);
+        // Under a colour map of the raster's or the request's own it is not applied.
+        let classes = CustomColormap::from_json_str(r#"{"64": [1, 2, 3, 255]}"#, false).unwrap();
+        let rgba = paint_selected(selected(1, &[64.0]), 1, &single((0.0, 255.0), ColormapName::Grayscale), &pq, Some(&classes)).unwrap();
+        assert_eq!(rgba, [1, 2, 3, 255]);
+        // A formula that does not parse is the request's fault.
+        let bad = parse_query(Some("color_formula=nonsense"));
+        assert!(matches!(
+            paint_selected(selected(1, &[1.0]), 1, &single((0.0, 255.0), ColormapName::Grayscale), &bad, None),
+            Err(EngineError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn a_painted_pixel_selection_is_encoded_as_any_other_picture() {
+        let pq = parse_query(None);
+        let grey = single((0.0, 255.0), ColormapName::Grayscale);
+        let rgba = paint_selected(selected(1, &[33.0, f32::NAN, 200.0, 90.0]), 4, &grey, &pq, None).unwrap();
+        // The bare pixels, with and without the mask.
+        assert_eq!(encode_rgba_output(2, 2, &rgba, OutputFormat::RawRgba, true).as_ref(), rgba.as_slice());
+        let png = encode_rgba_output(2, 2, &rgba, OutputFormat::Png, true);
+        assert_eq!(png[..8], [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let unmasked = encode_rgba_output(2, 2, &rgba, OutputFormat::Png, false);
+        assert_eq!(unmasked[..8], png[..8]);
+        assert_ne!(unmasked, png, "return_mask=false leaves the mask out");
+        let jpeg = encode_rgba_output(2, 2, &rgba, OutputFormat::Jpeg { quality: 75 }, true);
+        assert_eq!(jpeg[..2], [0xff, 0xd8]);
+    }
 
     #[test]
     fn pixel_selection_names_keep_their_aliases_and_any_case() {
