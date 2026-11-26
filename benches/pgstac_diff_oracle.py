@@ -518,9 +518,9 @@ def main() -> int:
         o.check("tif of three assets that are not bytes", "image", f"{base12}.tif?assets=red&assets=green&assets=blue&asset_as_band=true")
         o.check("bbox, tif under an algorithm", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x64.tif?assets=red&algorithm=hillshade")
         # Band math read with a smoothing resampling: whole numbers stay whole, rescaled is bytes.
-        math = "assets=red&assets=nir&asset_as_band=true&resampling=bilinear&reproject=bilinear&expression="
-        o.check("array of whole band math, bilinear", "image", f"{base12}.npy?{math}b1*2")
-        o.check("array of band math, bilinear, rescaled", "image", f"{base12}.npy?{math}(b2-b1)/(b2%2Bb1)&rescale=-1,1")
+        band_math = "assets=red&assets=nir&asset_as_band=true&resampling=bilinear&reproject=bilinear&expression="
+        o.check("array of whole band math, bilinear", "image", f"{base12}.npy?{band_math}b1*2")
+        o.check("array of band math, bilinear, rescaled", "image", f"{base12}.npy?{band_math}(b2-b1)/(b2%2Bb1)&rescale=-1,1")
         o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
         o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
         o.check("bbox, bilinear, a nodata of the request's own", "image",
@@ -790,6 +790,15 @@ def main() -> int:
         for bad in ("unscale=maybe", "return_mask=maybe", "nodata=abc"):
             o.check(f"tile with {bad}", "status", f"{base12}.png?assets=red&{bad}")
         o.check("bbox in a system that is not one", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/32x32.png?assets=red&coord_crs=nope")
+        # A feature posted in Web Mercator metres is read as one, and drawn in metres.
+        def metres(lon: float, lat: float) -> list[float]:
+            return [lon * 20037508.342789244 / 180, math.log(math.tan((90 + lat) * math.pi / 360)) * 6378137]
+        kite = [[8.41, 45.71], [8.63, 45.69], [8.57, 45.83], [8.47, 45.79], [8.41, 45.71]]
+        in_metres = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[metres(*p) for p in kite]]}}
+        o.check("feature posted in metres", "image", f"/searches/{sid}/feature/32x32.npy?assets=red&coord_crs=epsg:3857", "POST", in_metres)
+        o.check("feature posted in metres, drawn in degrees", "image",
+                f"/searches/{sid}/feature/32x32.npy?assets=red&coord_crs=epsg:3857&dst_crs=epsg:4326", "POST", in_metres)
+        o.check("statistics of a feature posted in metres", "status", f"/searches/{sid}/statistics?assets=red&max_size=64&coord_crs=epsg:3857", "POST", in_metres)
         o.check("statistics pass a colour map over", "status", f"/searches/{sid}/statistics?assets=red&colormap_name=nope&max_size=64", "POST", triangle)
         # Arrays keep the data's type and carry the mask as a band of their own.
         o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)

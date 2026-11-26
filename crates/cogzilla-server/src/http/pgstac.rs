@@ -6535,6 +6535,39 @@ fn route_method(rest: &[&str]) -> Option<Method> {
     }
 }
 
+/// A posted Feature or FeatureCollection whose coordinates are Web Mercator metres, with
+/// them in degrees. `None` when the body is not JSON, which its route then says.
+fn posted_in_degrees(body: &Bytes) -> Option<Bytes> {
+    fn turn(coordinates: &mut Value) {
+        let Some(list) = coordinates.as_array_mut() else { return };
+        match (list.first().and_then(Value::as_f64), list.get(1).and_then(Value::as_f64)) {
+            (Some(x), Some(y)) => {
+                let (lon, lat) = mercator_to_lonlat_deg(x, y);
+                (list[0], list[1]) = (json!(lon), json!(lat));
+            }
+            _ => list.iter_mut().for_each(turn),
+        }
+    }
+    fn geometry(of: &mut Value) {
+        if let Some(members) = of.get_mut("geometries").and_then(Value::as_array_mut) {
+            members.iter_mut().for_each(geometry);
+        }
+        if let Some(coordinates) = of.get_mut("coordinates") {
+            turn(coordinates);
+        }
+    }
+    let mut doc = serde_json::from_slice::<Value>(body).ok()?;
+    match doc.get_mut("features").and_then(Value::as_array_mut) {
+        Some(features) => features.iter_mut().filter_map(|f| f.get_mut("geometry")).for_each(geometry),
+        None => {
+            if let Some(g) = doc.get_mut("geometry") {
+                geometry(g);
+            }
+        }
+    }
+    serde_json::to_vec(&doc).ok().map(Bytes::from)
+}
+
 /// The routes shared by a registered search and a collection's mosaic.
 #[allow(clippy::too_many_arguments)]
 async fn mosaic_route(
@@ -6554,6 +6587,24 @@ async fn mosaic_route(
     if body.is_some() != takes_body {
         return if body.is_some() && route_method(rest).is_none() { not_found() } else { method_not_allowed(route_method(rest)) };
     }
+    // What is posted in Web Mercator metres is read in degrees from here on, the one place
+    // a posted geometry changes system. As in TiTiler, a picture of it is then drawn in
+    // the system it came in unless `dst_crs` says another.
+    let mut pq = pq;
+    let in_metres = pq.coord_crs_3857.then(|| body.and_then(posted_in_degrees)).flatten();
+    let own_pairs: Vec<(String, String)>;
+    let (body, pairs) = match &in_metres {
+        Some(turned) => {
+            (pq.coord_crs_3857, pq.coord_crs, pq.coord_crs_epsg) = (false, None, None);
+            let mut kept: Vec<(String, String)> = pairs.iter().filter(|(k, _)| k != "coord_crs").cloned().collect();
+            if rest != ["statistics"] && query_value(pairs, "dst_crs").is_none() {
+                kept.push(("dst_crs".into(), "epsg:3857".into()));
+            }
+            own_pairs = kept;
+            (Some(turned), own_pairs.as_slice())
+        }
+        None => (body, pairs),
+    };
     match rest {
         ["info"] => {
             let mut search = search_json(rec);
