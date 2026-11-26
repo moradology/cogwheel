@@ -3590,7 +3590,7 @@ pub async fn compute_statistics_with_options(
                     rescale: (0.0, 1.0),
                     colormap: ColormapName::Grayscale,
                 };
-                let raw = match render_wgs84_bbox(
+                let stat = match render_wgs84_bbox_stats(
                     engine,
                     &cogs,
                     eff_bbox,
@@ -3599,30 +3599,20 @@ pub async fn compute_statistics_with_options(
                     Some(pm),
                     &bands,
                     ResampleMode::Nearest,
-                    OutputFormat::RawF32,
                     nodata_override,
-                    None,
-                    None,
-                    true,
                     unscale,
+                    desc,
+                    opts,
                 )
                 .await
                 {
-                    Ok(b) => b,
-                    Err(EngineError::NotFound(_)) => Bytes::new(),
+                    Ok(v) => v,
+                    Err(EngineError::NotFound(_)) => {
+                        compute_f32_band_stats_with_engine(engine, &[], desc, opts)
+                    }
                     Err(e) => return Err(e),
                 };
-                let pixels: Vec<f32> = raw
-                    .chunks_exact(4)
-                    .take(n_px)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                out.insert(
-                    format!("b{}", i + 1),
-                    patch_valid_percent(compute_f32_band_stats_with_engine(
-                        engine, &pixels, desc, opts,
-                    )),
-                );
+                out.insert(format!("b{}", i + 1), patch_valid_percent(stat));
             }
             return Ok(serde_json::Value::Object(out));
         }
@@ -3634,16 +3624,48 @@ pub async fn compute_statistics_with_options(
                 .collect(),
         };
         for chunk in sel_bands.chunks(15) {
-            let bands_req = if chunk.len() == 1 {
-                BandRequest::Single {
-                    band_1based: chunk[0],
+            if chunk.len() == 1 {
+                let b1 = chunk[0];
+                let bands_req = BandRequest::Single {
+                    band_1based: b1,
                     rescale: (0.0, 1.0),
                     colormap: ColormapName::Grayscale,
-                }
-            } else {
-                BandRequest::MultiBand {
-                    bands_1based: chunk.to_vec(),
-                }
+                };
+                let desc = cog
+                    .index
+                    .band_descriptions
+                    .get((b1 - 1) as usize)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("b{b1}"));
+                let stat = match render_wgs84_bbox_stats(
+                    engine,
+                    &cogs,
+                    eff_bbox,
+                    out_w,
+                    out_h,
+                    Some(pm),
+                    &bands_req,
+                    ResampleMode::Nearest,
+                    nodata_override,
+                    unscale,
+                    &desc,
+                    opts,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(EngineError::NotFound(_)) => {
+                        compute_f32_band_stats_with_engine(engine, &[], &desc, opts)
+                    }
+                    Err(e) => return Err(e),
+                };
+                out.insert(format!("b{b1}"), patch_valid_percent(stat));
+                continue;
+            }
+            let bands_req = BandRequest::MultiBand {
+                bands_1based: chunk.to_vec(),
             };
             let raw = match render_wgs84_bbox(
                 engine,
@@ -5069,8 +5091,171 @@ pub async fn render_mercator_bbox(
     .await
 }
 
+enum BboxRenderOutput {
+    Bytes(Bytes),
+    #[cfg(feature = "gpu")]
+    Stats(serde_json::Value),
+}
+
+/// 1-pass fused GPU (with seamless CPU/2-pass fallback) native-preview band/expression statistics.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_native_preview_stats(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    nodata_override: Option<f32>,
+    unscale: bool,
+    description: &str,
+    stats_opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let n_px = (width.clamp(1, 4096) as usize) * (height.clamp(1, 4096) as usize);
+    match render_bbox_core(
+        engine,
+        cogs,
+        bbox,
+        &cogzilla_proj::CrsModel::Geographic,
+        true,
+        width,
+        height,
+        None,
+        bands,
+        resample,
+        OutputFormat::RawF32,
+        nodata_override,
+        None,
+        None,
+        true,
+        unscale,
+        Some((stats_opts, description)),
+    )
+    .await?
+    {
+        #[cfg(feature = "gpu")]
+        BboxRenderOutput::Stats(val) => Ok(val),
+        BboxRenderOutput::Bytes(raw) => {
+            let pixels: Vec<f32> = raw
+                .chunks_exact(4)
+                .take(n_px)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok(compute_f32_band_stats_with_engine(
+                engine,
+                &pixels,
+                description,
+                stats_opts,
+            ))
+        }
+    }
+}
+
+/// 1-pass fused GPU (with seamless CPU/2-pass fallback) WGS84 bbox / polygon-masked statistics.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_wgs84_bbox_stats(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    nodata_override: Option<f32>,
+    unscale: bool,
+    description: &str,
+    stats_opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let n_px = (width.clamp(1, 4096) as usize) * (height.clamp(1, 4096) as usize);
+    match render_bbox_core(
+        engine,
+        cogs,
+        bbox,
+        &cogzilla_proj::CrsModel::Geographic,
+        false,
+        width,
+        height,
+        poly_mask,
+        bands,
+        resample,
+        OutputFormat::RawF32,
+        nodata_override,
+        None,
+        None,
+        true,
+        unscale,
+        Some((stats_opts, description)),
+    )
+    .await?
+    {
+        #[cfg(feature = "gpu")]
+        BboxRenderOutput::Stats(val) => Ok(val),
+        BboxRenderOutput::Bytes(raw) => {
+            let pixels: Vec<f32> = raw
+                .chunks_exact(4)
+                .take(n_px)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok(compute_f32_band_stats_with_engine(
+                engine,
+                &pixels,
+                description,
+                stats_opts,
+            ))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_bbox_impl(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    native_preview: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&CustomColormap>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    match render_bbox_core(
+        engine,
+        cogs,
+        bbox,
+        dst_crs,
+        native_preview,
+        width,
+        height,
+        poly_mask,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+        unscale,
+        None,
+    )
+    .await?
+    {
+        BboxRenderOutput::Bytes(b) => Ok(b),
+        #[cfg(feature = "gpu")]
+        BboxRenderOutput::Stats(_) => unreachable!("fused_stats is None"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_bbox_core(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
     mut bbox: [f64; 4],
@@ -5087,7 +5272,8 @@ async fn render_bbox_impl(
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
-) -> Result<Bytes, EngineError> {
+    fused_stats: Option<(&StatsOptions, &str)>,
+) -> Result<BboxRenderOutput, EngineError> {
     if cogs.is_empty() || cogs.len() > 16 {
         return Err(EngineError::BadRequest(format!(
             "render_bbox supports 1..=16 assets, got {}",
@@ -5227,7 +5413,8 @@ async fn render_bbox_impl(
             unscale,
             None,
         )
-        .await;
+        .await
+        .map(BboxRenderOutput::Bytes);
     }
     let ifd = &primary.index.ifds[ifd_idx];
 
@@ -5872,8 +6059,11 @@ async fn render_bbox_impl(
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
                            bands: &BandRequest,
                            custom_lut: Option<&CustomColormap>,
-                           color_formula: Option<&ColorFormula>|
-          -> Bytes {
+                           color_formula: Option<&ColorFormula>,
+                           fused_stats: Option<(&StatsOptions, &str)>|
+          -> BboxRenderOutput {
+        #[cfg(not(feature = "gpu"))]
+        let _ = fused_stats;
         let ifd_w_i = ifd_width as i32;
         let ifd_h_i = ifd_height as i32;
         let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
@@ -6144,6 +6334,70 @@ async fn render_bbox_impl(
                         v_map: &v_map,
                     }
                 };
+                if format == OutputFormat::RawF32
+                    && let Some((sopts, desc)) = fused_stats
+                    && !sopts.categorical
+                    && sopts.histogram_edges.is_none()
+                {
+                    let hist_bins = sopts.histogram_bins.clamp(1, 1000);
+                    let gpu_stats: Option<cogzilla_gpu::GpuBandStats> = match bands {
+                        BandRequest::Single { band_1based, .. } => {
+                            let refs = get_band_refs(*band_1based, 0);
+                            let src = make_src!(&refs);
+                            gpu.try_render_bbox_single_band_stats(
+                                primary_id,
+                                ifd_idx,
+                                band_1based.saturating_sub(1),
+                                coords,
+                                &src,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::CustomExpr { prog, .. } => {
+                            let ref_vecs: Vec<_> = prog
+                                .used_bands
+                                .iter()
+                                .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                                .collect();
+                            let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                            let cache_key = if num_cogs == 1 {
+                                crate::gpu_backend::GpuBackend::multiband_key(
+                                    primary_id,
+                                    ifd_idx,
+                                    &prog.used_bands,
+                                    &srcs,
+                                )
+                            } else {
+                                None
+                            };
+                            gpu.try_render_bbox_expr_stats(
+                                cache_key,
+                                coords,
+                                &srcs,
+                                prog,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        _ => None,
+                    };
+                    if let Some(gs) = gpu_stats {
+                        stats
+                            .gpu_dispatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return BboxRenderOutput::Stats(gpu_band_stats_to_json(
+                            &gs,
+                            w * h,
+                            desc,
+                            sopts,
+                        ));
+                    }
+                }
                 let gpu_raw: Option<Bytes> = match bands {
                     BandRequest::Single { band_1based, .. } => {
                         let refs = get_band_refs(*band_1based, 0);
@@ -6336,15 +6590,17 @@ async fn render_bbox_impl(
                         .gpu_dispatches
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if format == OutputFormat::Npy {
-                        return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                            raw,
-                            1,
-                            h as u32,
-                            w as u32,
-                            return_mask,
+                        return BboxRenderOutput::Bytes(
+                            cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                                raw,
+                                1,
+                                h as u32,
+                                w as u32,
+                                return_mask,
+                            ),
                         );
                     }
-                    return raw;
+                    return BboxRenderOutput::Bytes(raw);
                 }
             }
 
@@ -6551,15 +6807,15 @@ async fn render_bbox_impl(
                     BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
                     _ => 1,
                 };
-                return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                return BboxRenderOutput::Bytes(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                     raw,
                     nb,
                     h as u32,
                     w as u32,
                     return_mask,
-                );
+                ));
             }
-            return raw;
+            return BboxRenderOutput::Bytes(raw);
         }
 
         let cf_single_lut: Option<[u8; 256]> = if matches!(
@@ -6996,7 +7252,7 @@ async fn render_bbox_impl(
                 stats
                     .gpu_dispatches
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return bytes;
+                return BboxRenderOutput::Bytes(bytes);
             }
         }
 
@@ -7306,7 +7562,7 @@ async fn render_bbox_impl(
             cf.apply_buffer_in_place(&mut rgba, 4);
         }
 
-        encode_rgba_output(w, h, &rgba, format, return_mask)
+        BboxRenderOutput::Bytes(encode_rgba_output(w, h, &rgba, format, return_mask))
     };
 
     // Offload large (>512x512) bbox renders to bounded spawn_blocking so giant previews/crops
@@ -7315,7 +7571,8 @@ async fn render_bbox_impl(
         let bands_owned = bands.clone();
         let lut_owned = custom_lut.cloned();
         let cf_owned = color_formula.cloned();
-        let bytes = engine
+        let stats_owned = fused_stats.map(|(o, d)| (o.clone(), d.to_string()));
+        let out = engine
             .store
             .run_heavy_cpu(move || {
                 render_cpu(
@@ -7325,10 +7582,11 @@ async fn render_bbox_impl(
                     &bands_owned,
                     lut_owned.as_ref(),
                     cf_owned.as_ref(),
+                    stats_owned.as_ref().map(|(o, d)| (o, d.as_str())),
                 )
             })
             .await?;
-        Ok(bytes)
+        Ok(out)
     } else {
         Ok(render_cpu(
             u_map,
@@ -7337,6 +7595,7 @@ async fn render_bbox_impl(
             bands,
             custom_lut,
             color_formula,
+            fused_stats,
         ))
     }
 }

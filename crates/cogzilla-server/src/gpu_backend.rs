@@ -20,6 +20,7 @@ use cogzilla_kernel::{
 use cogzilla_proj::CoordPlan;
 
 /// Coordinate mapping passed from `titiler::render_bbox_impl` or `TileEngine` into `GpuBackend`.
+#[derive(Clone, Copy)]
 pub enum BboxCoordSource<'a> {
     /// Separable 1D axes (used by `/cog/preview` native previews & WebMercator/EPSG:4326 tiles).
     Separable { u: &'a [f32], v: &'a [f32] },
