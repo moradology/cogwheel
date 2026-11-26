@@ -619,6 +619,19 @@ pub fn decode_tile_rows(
                     _ => None,
                 };
                 let lerc_blob: &[u8] = unwrapped.as_deref().unwrap_or(compressed);
+                // Pre-decode LERC1/LERC2 header dimension guard so a crafted tiny tile cannot
+                // trigger a multi-hundred-MiB allocation inside `lerc_reader::decode_first`.
+                if let Some((hdr_w, hdr_h)) = parse_lerc_header_dims(lerc_blob)
+                    && (hdr_w == 0
+                        || hdr_h == 0
+                        || hdr_w > ifd.tile_width as usize
+                        || hdr_h > tile_h as usize)
+                {
+                    return Err(CodecError::Lerc(format!(
+                        "LERC header dimensions {}x{} exceed tile {}x{}",
+                        hdr_w, hdr_h, ifd.tile_width, tile_h
+                    )));
+                }
                 let decoded = lerc_reader::decode_first(lerc_blob)
                     .map_err(|e| CodecError::Lerc(e.to_string()))?;
                 let w = decoded.info.width as usize;
@@ -857,6 +870,29 @@ pub fn alpha_channel_index(samples_per_pixel: usize, extra_samples: &[u16]) -> O
 /// e.g. 2-band Gray+Alpha or 4-band RGBA), mask transparent pixels (`alpha == 0`) to `f32::NAN`
 /// in the color bands and recompute their `BlockStats` so every downstream kernel renders alpha
 /// identically to TiTiler.
+/// Parse `(width, height)` directly from a LERC1 (`CntZImage `) or LERC2 (`Lerc2 `) header
+/// before calling `lerc_reader::decode_first`, preventing crafted tiny tiles from triggering
+/// multi-hundred-MiB allocations.
+fn parse_lerc_header_dims(blob: &[u8]) -> Option<(usize, usize)> {
+    if blob.len() >= 26 && blob.starts_with(b"Lerc2 ") {
+        let w = i32::from_le_bytes([blob[18], blob[19], blob[20], blob[21]]);
+        let h = i32::from_le_bytes([blob[22], blob[23], blob[24], blob[25]]);
+        if w < 0 || h < 0 {
+            return Some((usize::MAX, usize::MAX));
+        }
+        return Some((w as usize, h as usize));
+    }
+    if blob.len() >= 26 && blob.starts_with(b"CntZImage ") {
+        let h = i32::from_le_bytes([blob[18], blob[19], blob[20], blob[21]]);
+        let w = i32::from_le_bytes([blob[22], blob[23], blob[24], blob[25]]);
+        if w < 0 || h < 0 {
+            return Some((usize::MAX, usize::MAX));
+        }
+        return Some((w as usize, h as usize));
+    }
+    None
+}
+
 fn apply_rgba_alpha_if_present(
     bands: &mut [DecodedBand],
     ifd: &IfdMeta,

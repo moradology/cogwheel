@@ -253,28 +253,58 @@ impl PixelAreaModel {
             }
         }
 
-        // General projected / rotated CRS: evaluate exact WGS84 Jacobian on a 5×5 lattice.
+        // Fast exact constant area for WGS84/GRS80 equal-area projections (Albers, LAEA, CEA,
+        // Equal Earth, Sinusoidal): every pixel has identical ellipsoidal ground area |det(p2c)| * unit^2.
+        let equal_area_ellipsoidal = match crs {
+            CrsModel::Albers(p) => p.e2 > 0.0,
+            CrsModel::Laea(p) => p.e2 > 0.0,
+            CrsModel::CylindricalEqualArea(p) => p.e2 > 0.0,
+            CrsModel::EqualEarth(p) => p.e2 > 0.0,
+            CrsModel::Sinusoidal(p) => p.e2 > 0.0,
+            _ => false,
+        };
+        if equal_area_ellipsoidal {
+            let unit = crs.linear_unit_metres();
+            let det = (p2c.a * p2c.e - p2c.b * p2c.d).abs();
+            return Self::Constant(det * unit * unit);
+        }
+
+        // General projected / rotated CRS: evaluate exact WGS84 Jacobian on a 5×5 lattice of
+        // in-bounds pixel centers [c0 .. c0 + win_w - 1] × [r0 .. r0 + win_h - 1].
         let nx = if win_w <= 1 { 1 } else { 5 };
         let ny = if win_h <= 1 { 1 } else { 5 };
         let mut vals = Vec::with_capacity(nx * ny);
         let mut min_a = f64::INFINITY;
         let mut max_a = 0.0_f64;
         let mut sum_a = 0.0_f64;
+        let mut valid_nodes = 0usize;
         for iy in 0..ny {
-            let fy = if ny == 1 { 0.5 } else { iy as f64 / (ny - 1) as f64 };
-            let row = r0 as f64 + fy * win_h as f64;
+            let fy = if ny == 1 { 0.0 } else { iy as f64 / (ny - 1) as f64 };
+            let row = r0 as f64 + fy * ((win_h - 1) as f64);
             for ix in 0..nx {
-                let fx = if nx == 1 { 0.5 } else { ix as f64 / (nx - 1) as f64 };
-                let col = c0 as f64 + fx * win_w as f64;
+                let fx = if nx == 1 { 0.0 } else { ix as f64 / (nx - 1) as f64 };
+                let col = c0 as f64 + fx * ((win_w - 1) as f64);
                 let a = wgs84_projected_pixel_area_m2(crs, p2c, col, row);
-                min_a = min_a.min(a);
-                max_a = max_a.max(a);
-                sum_a += a;
+                if a > 0.0 {
+                    min_a = min_a.min(a);
+                    max_a = max_a.max(a);
+                    sum_a += a;
+                    valid_nodes += 1;
+                }
                 vals.push(a);
             }
         }
+        if valid_nodes == 0 {
+            return Self::Constant(0.0);
+        }
+        let mean_a = sum_a / (valid_nodes as f64);
+        for v in &mut vals {
+            if *v <= 0.0 {
+                *v = mean_a;
+            }
+        }
         if max_a > 0.0 && (max_a - min_a) / max_a < 1e-6 {
-            return Self::Constant(sum_a / vals.len().max(1) as f64);
+            return Self::Constant(mean_a);
         }
         Self::Lattice {
             nx,
@@ -612,12 +642,6 @@ pub fn rasterize_exact_coverage(
                 let dy = y1 - y0;
                 let len = dx.hypot(dy);
                 if len <= 1e-15 {
-                    let c = x0.floor() as i64;
-                    let r = y0.floor() as i64;
-                    if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
-                        let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
-                        cov[idx] = 1.0;
-                    }
                     continue;
                 }
                 st.t_breaks.clear();
@@ -666,6 +690,18 @@ pub fn rasterize_exact_coverage(
                     }
                 }
             }
+        }
+        // Shrink oversized thread-local scratch buffers so blocking pool threads never retain
+        // hundreds of MiB after a large 4096×4096 polygon request.
+        const MAX_RETAINED_ELEMS: usize = 512 * 512;
+        if st.area.capacity() > MAX_RETAINED_ELEMS {
+            st.area = Vec::new();
+        }
+        if st.run_delta.capacity() > MAX_RETAINED_ELEMS {
+            st.run_delta = Vec::new();
+        }
+        if st.t_breaks.capacity() > 4096 {
+            st.t_breaks = Vec::new();
         }
     });
 
@@ -975,37 +1011,7 @@ pub fn compute_weighted_band_stats_with_geom(
         }
     }
 
-    // Weighted histogram (counts scaled to `count_cov` so histogram sums to `count`).
-    let (h_lo, h_hi) = opts.histogram_range.unwrap_or((min_v, max_v));
-    let edges: Vec<f64> = if let Some(ref custom_edges) = opts.histogram_edges {
-        custom_edges.clone()
-    } else {
-        let nbins = opts.histogram_bins.clamp(1, 1000);
-        let span = if (h_hi - h_lo).abs() < 1e-12 {
-            1.0
-        } else {
-            h_hi - h_lo
-        };
-        (0..=nbins)
-            .map(|k| h_lo + span * (k as f64) / (nbins as f64))
-            .collect()
-    };
-    let nbins = edges.len().saturating_sub(1).max(1);
-    let mut hist_w = vec![0.0_f64; nbins];
     let scale_to_count = count_cov / w_total;
-    for &(vf, w) in &weighted_vals {
-        if vf < edges[0] || vf > edges[nbins] {
-            continue;
-        }
-        let bin = if vf == edges[nbins] {
-            nbins - 1
-        } else {
-            let pos = edges.partition_point(|&e| e <= vf);
-            pos.saturating_sub(1).min(nbins - 1)
-        };
-        hist_w[bin] += w * scale_to_count;
-    }
-
     let count_out = snap_near_int(count_cov);
     let mut obj = serde_json::Map::new();
     obj.insert("min".into(), serde_json::json!(min_v));
@@ -1043,6 +1049,37 @@ pub fn compute_weighted_band_stats_with_geom(
         obj.insert("histogram".into(), serde_json::json!([cat_counts, cat_vals]));
         obj.insert("categories".into(), serde_json::Value::Object(cats_obj));
     } else {
+        // Weighted histogram (counts scaled to `count_cov` so histogram sums to `count`).
+        let (h_lo, h_hi) = opts.histogram_range.unwrap_or((min_v, max_v));
+        let edges: Vec<f64> = if let Some(ref custom_edges) = opts.histogram_edges
+            && custom_edges.len() >= 2
+        {
+            custom_edges.clone()
+        } else {
+            let nbins = opts.histogram_bins.clamp(1, 1000);
+            let span = if (h_hi - h_lo).abs() < 1e-12 {
+                1.0
+            } else {
+                h_hi - h_lo
+            };
+            (0..=nbins)
+                .map(|k| h_lo + span * (k as f64) / (nbins as f64))
+                .collect()
+        };
+        let nbins = edges.len() - 1;
+        let mut hist_w = vec![0.0_f64; nbins];
+        for &(vf, w) in &weighted_vals {
+            if vf < edges[0] || vf > edges[nbins] {
+                continue;
+            }
+            let bin = if vf == edges[nbins] {
+                nbins - 1
+            } else {
+                let pos = edges.partition_point(|&e| e <= vf);
+                pos.saturating_sub(1).min(nbins - 1)
+            };
+            hist_w[bin] += w * scale_to_count;
+        }
         obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
     }
     obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
@@ -1465,25 +1502,29 @@ pub async fn compute_native_exact_polygon_stats(
         if let Some(ref exprs) = opts_owned.expressions {
             for (ei, (desc, prog)) in exprs.iter().enumerate() {
                 let mut expr_px = vec![f32::NAN; n_px];
-                let mut b_vals = [0.0_f32; 16];
+                let slot_bufs: Vec<Option<&[f32]>> = prog
+                    .used_bands
+                    .iter()
+                    .map(|&b1| {
+                        band_bufs
+                            .iter()
+                            .find(|(k, _)| *k == b1)
+                            .map(|(_, buf)| buf.as_slice())
+                    })
+                    .collect();
+                let mut b_vals = vec![0.0_f32; slot_bufs.len()];
                 for i in 0..n_px {
                     if cov[i] <= COV_EPS {
                         continue;
                     }
                     let mut all_valid = true;
-                    for &b1 in &prog.used_bands {
-                        let v = band_bufs
-                            .iter()
-                            .find(|(k, _)| *k == b1)
-                            .map(|(_, buf)| buf[i])
-                            .unwrap_or(f32::NAN);
+                    for (slot, buf_opt) in slot_bufs.iter().enumerate() {
+                        let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
                         if !v.is_finite() {
                             all_valid = false;
                             break;
                         }
-                        if (b1 as usize) <= b_vals.len() {
-                            b_vals[(b1 - 1) as usize] = v;
-                        }
+                        b_vals[slot] = v;
                     }
                     if all_valid {
                         expr_px[i] = prog.eval(&b_vals);

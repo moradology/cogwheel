@@ -5083,12 +5083,19 @@ async fn render_bbox_impl(
                         | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
                 );
             if is_separable {
-                let mid_y = 0.5 * (bbox[1] + bbox[3]);
-                let mid_x = 0.5 * (bbox[0] + bbox[2]);
+                // Probe separable axes at the destination CRS's origin (0, 0) / (false_easting, false_northing)
+                // so a partially overlapping CylindricalEqualArea bbox whose midpoint falls beyond ±y_pole
+                // or ±x_max never produces NaN for every column/row.
+                let (origin_x, origin_y) = match &dst_crs {
+                    cogzilla_proj::CrsModel::CylindricalEqualArea(cea) => {
+                        (cea.false_easting, cea.false_northing)
+                    }
+                    _ => (0.0, 0.0),
+                };
                 let mut u_cols = vec![f32::NAN; w];
                 for px in 0..w {
                     let x_coord = bbox[0] + (px as f64 + 0.5) * dlx;
-                    let (sx, _) = to_src_crs(x_coord, mid_y);
+                    let (sx, _) = to_src_crs(x_coord, origin_y);
                     if sx.is_finite() {
                         let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
                         if uu >= -1.0 && uu <= ifd_w_f {
@@ -5099,7 +5106,7 @@ async fn render_bbox_impl(
                 let mut v_rows = vec![f32::NAN; h];
                 for py in 0..h {
                     let y_coord = bbox[3] - (py as f64 + 0.5) * dly;
-                    let (_, sy) = to_src_crs(mid_x, y_coord);
+                    let (_, sy) = to_src_crs(origin_x, y_coord);
                     if sy.is_finite() {
                         let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
                         if vv >= -1.0 && vv <= ifd_h_f {
