@@ -119,7 +119,7 @@ enum State<T> {
     /// values went into them.
     Moments { sum: Vec<f64>, squares: Vec<f64>, count: Vec<u32> },
     /// `median`: every scene's values, scene after scene.
-    All(Vec<T>),
+    All(Vec<Vec<T>>),
     /// `count`: how many scenes had a value in the first band.
     Count(Vec<T>),
 }
@@ -200,11 +200,12 @@ impl<T: Sample> Fold<T> {
                 if scene.len() != kept.len() {
                     return;
                 }
-                // The last band is decided last, so every band sees the one kept before.
-                for band in 0..self.bands {
-                    for i in 0..pixels {
-                        let (new, old) = (stored(scene[last + i]), stored(kept[last + i]));
-                        let beyond = if high { new > old } else { new < old };
+                // Each pixel is decided once, by the last bands as they were, for all its bands.
+                let bands = self.bands;
+                for i in 0..pixels {
+                    let (new, old) = (stored(scene[last + i]), stored(kept[last + i]));
+                    let beyond = if high { new > old } else { new < old };
+                    for band in 0..bands {
                         let at = band * pixels + i;
                         if (beyond && !scene[at].is_nan()) || kept[at].is_nan() {
                             kept[at] = scene[at];
@@ -245,9 +246,9 @@ impl<T: Sample> Fold<T> {
             }
             State::All(all) => {
                 let len = self.bands * self.pixels;
-                let before = all.len();
-                all.extend(scene.take(len));
-                all.resize(before + len, T::NAN);
+                let mut held: Vec<T> = scene.take(len).collect();
+                held.resize(len, T::NAN);
+                all.push(held);
             }
             State::Count(counts) => {
                 // rio-tiler keeps the first band's counts.
@@ -308,7 +309,7 @@ impl<T: Sample> Fold<T> {
                 let mut column: Vec<T> = Vec::with_capacity(self.scenes);
                 for (i, out) in values.iter_mut().enumerate() {
                     column.clear();
-                    column.extend(all.iter().skip(i).step_by(len).copied().filter(|v| !v.is_nan()));
+                    column.extend(all.iter().map(|scene| scene[i]).filter(|v| !v.is_nan()));
                     if column.is_empty() {
                         continue;
                     }
