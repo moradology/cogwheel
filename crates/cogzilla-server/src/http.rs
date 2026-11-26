@@ -5398,28 +5398,40 @@ pub async fn handle_bytes_request(
 }
 
 fn header_accepts_gzip(val: &str) -> bool {
+    let mut gzip_q: Option<f32> = None;
+    let mut star_q: Option<f32> = None;
     for part in val.split(',') {
         let mut iter = part.split(';');
         let enc = iter.next().unwrap_or("").trim();
-        if !enc.eq_ignore_ascii_case("gzip") && !enc.eq_ignore_ascii_case("x-gzip") && enc != "*" {
+        let is_gzip = enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip");
+        let is_star = enc == "*";
+        if !is_gzip && !is_star {
             continue;
         }
-        let mut q_ok = true;
+        let mut q_val = 1.0f32;
+        let mut valid = true;
         for param in iter {
             let p = param.trim();
             if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                if let Ok(q) = qv.trim().parse::<f32>() {
-                    if q <= 0.0 {
-                        q_ok = false;
+                match qv.trim().parse::<f32>() {
+                    Ok(q) if q.is_finite() && (0.0..=1.0).contains(&q) => q_val = q,
+                    _ => {
+                        valid = false;
+                        break;
                     }
                 }
             }
         }
-        if q_ok {
-            return true;
+        if !valid {
+            continue;
+        }
+        if is_gzip {
+            gzip_q = Some(gzip_q.map_or(q_val, |prev| prev.max(q_val)));
+        } else {
+            star_q = Some(star_q.map_or(q_val, |prev| prev.max(q_val)));
         }
     }
-    false
+    gzip_q.or(star_q).is_some_and(|q| q > 0.0)
 }
 
 fn is_compressible_content_type(ct: &str) -> bool {
@@ -12098,5 +12110,19 @@ mod tests {
         let tj_href = links[1]["href"].as_str().unwrap();
         assert!(self_href.contains("/stac/renders/true%20color?url=https%3A%2F%2Fs3.example%2Fitem.json%3Fa%3D1%26b%3D2"), "{self_href}");
         assert!(tj_href.contains("colormap=%7B%221%22%3A%5B255%2C0%2C0%2C255%5D%7D"), "{tj_href}");
+    }
+
+    #[test]
+    fn audit87_header_accepts_gzip_rfc9110_precedence_and_nan() {
+        assert!(!header_accepts_gzip("gzip;q=0, *"));
+        assert!(!header_accepts_gzip("*, gzip;q=0"));
+        assert!(!header_accepts_gzip("x-gzip;q=0, *;q=1"));
+        assert!(!header_accepts_gzip("gzip;q=NaN"));
+        assert!(!header_accepts_gzip("gzip;q=inf"));
+        assert!(!header_accepts_gzip("gzip;q=-0.5"));
+        assert!(!header_accepts_gzip("br, deflate"));
+        assert!(header_accepts_gzip("br, *;q=0.5"));
+        assert!(header_accepts_gzip("x-gzip;q=0.1"));
+        assert!(header_accepts_gzip("gzip, deflate"));
     }
 }
