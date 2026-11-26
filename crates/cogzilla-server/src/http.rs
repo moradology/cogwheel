@@ -25,6 +25,7 @@ mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
 mod paint;
+mod html;
 #[allow(dead_code)]
 pub(crate) mod pixel_selection;
 
@@ -5523,6 +5524,11 @@ where
     } else {
         None
     };
+    // `f=html` on a route that describes something: its JSON, written out as a page.
+    let as_page = (is_get_or_head
+        && html::wants_html(req.uri().query().unwrap_or(""))
+        && html::offers_html(req.uri().path()))
+    .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
     let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
@@ -5534,6 +5540,27 @@ where
         *retry_req.headers_mut() = h;
         resp = handle_request_inner(engine, retry_req, is_head).await?;
         resp.headers_mut().remove("x-cogzilla-retry");
+    }
+    if let Some((path, query)) = as_page
+        && resp.status() == StatusCode::OK
+        && resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/json"))
+    {
+        let (mut parts, body) = resp.into_parts();
+        let raw = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+        resp = match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(doc) => {
+                let page = html::page(&path, &query, &doc);
+                parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+                parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                parts.headers.remove(ETAG);
+                Response::from_parts(parts, Full::new(Bytes::from(page)))
+            }
+            Err(_) => Response::from_parts(parts, Full::new(raw)),
+        };
     }
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
