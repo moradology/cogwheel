@@ -24,21 +24,75 @@ use cogzilla_proj::CoordPlan;
 pub enum BboxCoordSource<'a> {
     /// Separable 1D axes (used by `/cog/preview` native previews & WebMercator/EPSG:4326 tiles).
     Separable { u: &'a [f32], v: &'a [f32] },
-    /// 17×17 coarse bilinear warp grid (used by projected UTM/Albers/LCC/Polar tiles).
+    /// 17×17 coarse bilinear warp grid (used by projected UTM/Albers/LCC/Polar tiles & bboxes).
     Grid2D {
         dst_w: usize,
         dst_h: usize,
         grid_u: &'a [f32; 289],
         grid_v: &'a [f32; 289],
     },
-    /// Per-pixel 2D coordinate maps (used by `/cog/bbox`, `/cog/crop`, `/cog/feature`, curved
-    /// projected CRSs, and GeoJSON polygon masks where outside pixels carry `NaN`).
+    /// Per-pixel 2D coordinate maps (used by extreme-curvature CRSs & GCP rasters).
     Exact2D {
         dst_w: usize,
         dst_h: usize,
         u_map: &'a [f32],
         v_map: &'a [f32],
     },
+    /// Separable 1D axes + 1-bit-per-pixel polygon mask (64× smaller than `Exact2D`!).
+    SeparableMasked {
+        u: &'a [f32],
+        v: &'a [f32],
+        mask_bits: &'a [u32],
+    },
+    /// 17×17 coarse warp grid + 1-bit-per-pixel polygon mask (64× smaller than `Exact2D`!).
+    Grid2DMasked {
+        dst_w: usize,
+        dst_h: usize,
+        grid_u: &'a [f32; 289],
+        grid_v: &'a [f32; 289],
+        mask_bits: &'a [u32],
+    },
+}
+
+impl BboxCoordSource<'_> {
+    fn dims_and_upload_bytes(&self) -> Option<(usize, usize, usize)> {
+        match *self {
+            Self::Separable { u, v } => Some((u.len(), v.len(), 0)),
+            Self::Grid2D { dst_w, dst_h, .. } => Some((dst_w, dst_h, 0)),
+            Self::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                Some((dst_w, dst_h, dst_w * dst_h * 8))
+            }
+            Self::SeparableMasked { u, v, mask_bits } => {
+                let dst_w = u.len();
+                let dst_h = v.len();
+                let need = (dst_w * dst_h).div_ceil(32);
+                if mask_bits.len() < need {
+                    return None;
+                }
+                Some((dst_w, dst_h, need * 4))
+            }
+            Self::Grid2DMasked {
+                dst_w,
+                dst_h,
+                mask_bits,
+                ..
+            } => {
+                let need = (dst_w * dst_h).div_ceil(32);
+                if mask_bits.len() < need {
+                    return None;
+                }
+                Some((dst_w, dst_h, need * 4))
+            }
+        }
+    }
 }
 
 /// Optional GPU acceleration backend owned by `TileEngine` when built with `--features gpu`.
@@ -612,6 +666,38 @@ fn to_owned_plan(coords: BboxCoordSource<'_>, bc: f32, br: f32) -> OwnedCoordPla
             };
             OwnedCoordPlan::Exact2D { dst_w, dst_h, u, v }
         }
+        BboxCoordSource::SeparableMasked { u, v, mask_bits } => {
+            let dst_w = u.len();
+            let dst_h = v.len();
+            let need = (dst_w * dst_h).div_ceil(32);
+            let mut uv_packed = Vec::with_capacity(dst_w + dst_h);
+            uv_packed.extend(u.iter().map(|&x| x - bc));
+            uv_packed.extend(v.iter().map(|&y| y - br));
+            OwnedCoordPlan::SeparableMasked {
+                dst_w,
+                dst_h,
+                uv_packed,
+                mask_bits: mask_bits[..need].to_vec(),
+            }
+        }
+        BboxCoordSource::Grid2DMasked {
+            dst_w,
+            dst_h,
+            grid_u,
+            grid_v,
+            mask_bits,
+        } => {
+            let need = (dst_w * dst_h).div_ceil(32);
+            let mut uv_packed = Vec::with_capacity(578);
+            uv_packed.extend(grid_u.iter().map(|&x| x - bc));
+            uv_packed.extend(grid_v.iter().map(|&y| y - br));
+            OwnedCoordPlan::Grid2DMasked {
+                dst_w,
+                dst_h,
+                uv_packed,
+                mask_bits: mask_bits[..need].to_vec(),
+            }
+        }
     }
 }
 
@@ -808,21 +894,7 @@ impl GpuBackend {
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -1177,21 +1249,7 @@ impl GpuBackend {
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -1358,21 +1416,7 @@ impl GpuBackend {
         ) {
             return None;
         }
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -1806,21 +1850,7 @@ impl GpuBackend {
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
@@ -2132,21 +2162,7 @@ impl GpuBackend {
     ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -2350,21 +2366,7 @@ impl GpuBackend {
         resample: ResampleMode,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -2418,21 +2420,7 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -2545,21 +2533,7 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
@@ -2638,21 +2612,7 @@ impl GpuBackend {
             DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
             DemAlgorithm::Contours { .. } => return None,
         };
-        let (dst_w, dst_h) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len()),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h)
-            }
-        };
+        let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -2730,21 +2690,7 @@ impl GpuBackend {
             DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
             DemAlgorithm::Contours { .. } => return None,
         };
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -2814,21 +2760,7 @@ impl GpuBackend {
         resample: ResampleMode,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
@@ -3005,21 +2937,7 @@ impl GpuBackend {
     ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -3182,21 +3100,7 @@ impl GpuBackend {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {
             return None;
         }
@@ -3263,21 +3167,7 @@ impl GpuBackend {
         resample: ResampleMode,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         let nb = srcs.len();
         if dst_w == 0 || dst_h == 0 || nb == 0 || nb > 8 {
             return None;
@@ -3332,21 +3222,7 @@ impl GpuBackend {
     ) -> Option<Bytes> {
         let gpu_mode = map_resample(resample)?;
         let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
-        let (dst_w, dst_h, coord_upload_bytes) = match coords {
-            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
-            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
-                    return None;
-                }
-                (dst_w, dst_h, dst_w * dst_h * 8)
-            }
-        };
+        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {
             return None;
         }

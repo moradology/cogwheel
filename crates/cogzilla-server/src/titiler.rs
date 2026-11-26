@@ -3845,16 +3845,12 @@ pub async fn compute_statistics_with_options(
         };
         let cogs = [cog.clone()];
         let n_px = (out_w as usize) * (out_h as usize);
-        let feature_covered_px = pm
-            .rasterize_all_touched(
-                out_w as usize,
-                out_h as usize,
-                eff_bbox,
-                &cogzilla_proj::CrsModel::Geographic,
-            )
-            .iter()
-            .filter(|&&b| b)
-            .count();
+        let (_, feature_covered_px) = pm.rasterize_all_touched_bits(
+            out_w as usize,
+            out_h as usize,
+            eff_bbox,
+            &cogzilla_proj::CrsModel::Geographic,
+        );
         let patch_valid_percent = |mut stat: serde_json::Value| -> serde_json::Value {
             if feature_covered_px > 0
                 && let Some(obj) = stat.as_object_mut()
@@ -4905,19 +4901,171 @@ impl PolygonMask {
         }
         let wrap_hi = self.bbox[2] > 180.0;
         let wrap_lo = self.bbox[0] < -180.0;
-        for py in 0..h {
-            let y = bbox[3] - (py as f64 + 0.5) * dly;
-            let row_off = py * w;
-            for px in 0..w {
-                let x = bbox[0] + (px as f64 + 0.5) * dlx;
-                let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
-                if lon.is_finite()
-                    && lat.is_finite()
-                    && (self.contains(lon, lat)
-                        || (wrap_hi && self.contains(lon + 360.0, lat))
-                        || (wrap_lo && self.contains(lon - 360.0, lat)))
-                {
-                    mask[row_off + px] = true;
+        // Scanline fast path for separable Geographic & EPSG:3857:
+        // lon(px) = lon0 + (px + 0.5) * dlon is strictly increasing per row and lat(py) is constant,
+        // reducing interior fill from O(W * H * E) to O(H * E + W * H / 64) bit-exact with contains().
+        let scanline_lon: Option<(f64, f64, bool)> = match dst_crs {
+            cogzilla_proj::CrsModel::Geographic => Some((bbox[0], dlx, false)),
+            cogzilla_proj::CrsModel::Epsg3857 => {
+                const R_INV_DEG: f64 = 180.0 / (std::f64::consts::PI * 6_378_137.0);
+                Some((bbox[0] * R_INV_DEG, dlx * R_INV_DEG, true))
+            }
+            _ => None,
+        };
+        if let Some((lon0, dlon, is_3857)) = scanline_lon {
+            let fill_row_chunk = |row_start: usize, chunk_mask: &mut [bool]| {
+                let n_rows = chunk_mask.len() / w;
+                let mut xs = Vec::<f64>::with_capacity(16);
+                let mut hxs = Vec::<f64>::with_capacity(16);
+                let mut poly_row = Vec::<bool>::new();
+                let fill_ring_spans = |ring: &[(f64, f64)], lat: f64, shift: f64, dst: &mut [bool], val: bool, buf: &mut Vec<f64>| {
+                    let n = ring.len();
+                    if n < 3 {
+                        return;
+                    }
+                    buf.clear();
+                    let mut j = n - 1;
+                    for i in 0..n {
+                        let (xi, yi) = ring[i];
+                        let (xj, yj) = ring[j];
+                        if (yi > lat) != (yj > lat) {
+                            buf.push((xj - xi) * (lat - yi) / (yj - yi) + xi + shift);
+                        }
+                        j = i;
+                    }
+                    if buf.len() < 2 {
+                        return;
+                    }
+                    buf.sort_unstable_by(f64::total_cmp);
+                    let inv_dlon = 1.0 / dlon;
+                    let mut k = 0;
+                    while k + 1 < buf.len() {
+                        let c0 = buf[k];
+                        let c1 = buf[k + 1];
+                        k += 2;
+                        if c1 <= lon0 {
+                            continue;
+                        }
+                        let mut px0 = (((c0 - lon0) * inv_dlon - 0.5).ceil().max(0.0) as usize).min(w);
+                        while px0 > 0 && (lon0 + ((px0 - 1) as f64 + 0.5) * dlon) >= c0 {
+                            px0 -= 1;
+                        }
+                        while px0 < w && (lon0 + (px0 as f64 + 0.5) * dlon) < c0 {
+                            px0 += 1;
+                        }
+                        let mut px1 = (((c1 - lon0) * inv_dlon - 0.5).ceil().max(0.0) as usize).min(w);
+                        while px1 > px0 && (lon0 + ((px1 - 1) as f64 + 0.5) * dlon) >= c1 {
+                            px1 -= 1;
+                        }
+                        while px1 < w && (lon0 + (px1 as f64 + 0.5) * dlon) < c1 {
+                            px1 += 1;
+                        }
+                        if px0 < px1 {
+                            dst[px0..px1].fill(val);
+                        }
+                    }
+                };
+                for r in 0..n_rows {
+                    let py = row_start + r;
+                    let y = bbox[3] - (py as f64 + 0.5) * dly;
+                    let lat = if is_3857 {
+                        let (_, la) = dst_crs.to_lonlat_deg(0.0, y);
+                        la
+                    } else {
+                        y
+                    };
+                    if !lat.is_finite() || lat < self.bbox[1] || lat > self.bbox[3] {
+                        continue;
+                    }
+                    let row_slice = &mut chunk_mask[r * w..(r + 1) * w];
+                    let shifts: &[f64] = match (wrap_hi, wrap_lo) {
+                        (false, false) => &[0.0],
+                        (true, false) => &[0.0, -360.0],
+                        (false, true) => &[0.0, 360.0],
+                        (true, true) => &[0.0, -360.0, 360.0],
+                    };
+                    for &shift in shifts {
+                        for poly in &self.polygons {
+                            let Some(outer) = poly.first() else { continue };
+                            if poly.len() == 1 {
+                                fill_ring_spans(outer, lat, shift, row_slice, true, &mut xs);
+                            } else {
+                                if poly_row.len() != w {
+                                    poly_row.resize(w, false);
+                                } else {
+                                    poly_row.fill(false);
+                                }
+                                fill_ring_spans(outer, lat, shift, &mut poly_row, true, &mut xs);
+                                for hole in &poly[1..] {
+                                    fill_ring_spans(hole, lat, shift, &mut poly_row, false, &mut hxs);
+                                }
+                                for (dst, &src) in row_slice.iter_mut().zip(poly_row.iter()) {
+                                    *dst |= src;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            if w * h >= 65_536 && h >= 16 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get().clamp(2, 8))
+                    .unwrap_or(4);
+                let rows_per_chunk = h.div_ceil(threads);
+                std::thread::scope(|s| {
+                    for (ci, chunk) in mask.chunks_mut(rows_per_chunk * w).enumerate() {
+                        let r0 = ci * rows_per_chunk;
+                        s.spawn(move || fill_row_chunk(r0, chunk));
+                    }
+                });
+            } else {
+                fill_row_chunk(0, &mut mask);
+            }
+        } else if w * h >= 65_536 && h >= 16 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get().clamp(2, 8))
+                .unwrap_or(4);
+            let rows_per_chunk = h.div_ceil(threads);
+            std::thread::scope(|s| {
+                for (ci, chunk) in mask.chunks_mut(rows_per_chunk * w).enumerate() {
+                    let r0 = ci * rows_per_chunk;
+                    s.spawn(move || {
+                        let n_rows = chunk.len() / w;
+                        for r in 0..n_rows {
+                            let py = r0 + r;
+                            let y = bbox[3] - (py as f64 + 0.5) * dly;
+                            let row_off = r * w;
+                            for px in 0..w {
+                                let x = bbox[0] + (px as f64 + 0.5) * dlx;
+                                let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
+                                if lon.is_finite()
+                                    && lat.is_finite()
+                                    && (self.contains(lon, lat)
+                                        || (wrap_hi && self.contains(lon + 360.0, lat))
+                                        || (wrap_lo && self.contains(lon - 360.0, lat)))
+                                {
+                                    chunk[row_off + px] = true;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for py in 0..h {
+                let y = bbox[3] - (py as f64 + 0.5) * dly;
+                let row_off = py * w;
+                for px in 0..w {
+                    let x = bbox[0] + (px as f64 + 0.5) * dlx;
+                    let (lon, lat) = dst_crs.to_lonlat_deg(x, y);
+                    if lon.is_finite()
+                        && lat.is_finite()
+                        && (self.contains(lon, lat)
+                            || (wrap_hi && self.contains(lon + 360.0, lat))
+                            || (wrap_lo && self.contains(lon - 360.0, lat)))
+                    {
+                        mask[row_off + px] = true;
+                    }
                 }
             }
         }
@@ -5065,6 +5213,57 @@ impl PolygonMask {
             }
         }
         mask
+    }
+
+    /// Rasterize the polygon into a compact 1-bit-per-pixel `Vec<u32>` mask (64× smaller than
+    /// `Exact2D` `f32` coords) and return `(mask_bits, covered_pixel_count)`.
+    pub fn rasterize_all_touched_bits(
+        &self,
+        w: usize,
+        h: usize,
+        bbox: [f64; 4],
+        dst_crs: &cogzilla_proj::CrsModel,
+    ) -> (Vec<u32>, usize) {
+        let bools = self.rasterize_all_touched(w, h, bbox, dst_crs);
+        let n = bools.len();
+        let n_words = n.div_ceil(32);
+        let mut words = vec![0u32; n_words];
+        let pack_chunk = |word_start: usize, dst: &mut [u32]| -> usize {
+            let mut covered = 0usize;
+            for (i, w_out) in dst.iter_mut().enumerate() {
+                let base = (word_start + i) * 32;
+                let end = (base + 32).min(n);
+                let mut acc = 0u32;
+                for (bit, &b) in bools[base..end].iter().enumerate() {
+                    if b {
+                        acc |= 1u32 << bit;
+                    }
+                }
+                *w_out = acc;
+                covered += acc.count_ones() as usize;
+            }
+            covered
+        };
+        let covered = if n_words >= 4096 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get().clamp(2, 8))
+                .unwrap_or(4);
+            let words_per = n_words.div_ceil(threads);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = words
+                    .chunks_mut(words_per)
+                    .enumerate()
+                    .map(|(ci, chunk)| {
+                        let w0 = ci * words_per;
+                        s.spawn(move || pack_chunk(w0, chunk))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+            })
+        } else {
+            pack_chunk(0, &mut words)
+        };
+        (words, covered)
     }
 }
 
@@ -5393,6 +5592,8 @@ enum BboxRenderOutput {
 enum BboxCoordMap {
     Separable { u_cols: Vec<f32>, v_rows: Vec<f32> },
     Grid2D { grid_u: [f32; 289], grid_v: [f32; 289] },
+    SeparableMasked { u_cols: Vec<f32>, v_rows: Vec<f32>, mask_bits: Vec<u32> },
+    Grid2DMasked { grid_u: [f32; 289], grid_v: [f32; 289], mask_bits: Vec<u32> },
     Exact2D { u_map: Vec<f32>, v_map: Vec<f32> },
 }
 
@@ -5413,6 +5614,28 @@ impl BboxCoordMap {
                     for px in 0..w {
                         if u_cols[px].is_finite() {
                             v_map[row_off + px] = vv;
+                        }
+                    }
+                }
+                (u_map, v_map)
+            }
+            Self::SeparableMasked { u_cols, v_rows, mask_bits } => {
+                let mut u_map = vec![f32::NAN; w * h];
+                let mut v_map = vec![f32::NAN; w * h];
+                for py in 0..h {
+                    let vv = v_rows[py];
+                    if !vv.is_finite() {
+                        continue;
+                    }
+                    let row_off = py * w;
+                    for px in 0..w {
+                        let idx = row_off + px;
+                        if (mask_bits[idx >> 5] & (1u32 << (idx & 31))) != 0 {
+                            let uu = u_cols[px];
+                            if uu.is_finite() {
+                                u_map[idx] = uu;
+                                v_map[idx] = vv;
+                            }
                         }
                     }
                 }
@@ -5440,6 +5663,36 @@ impl BboxCoordMap {
                         let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
                         u_map[row_off + px] = u_l + (u_r - u_l) * tx;
                         v_map[row_off + px] = v_l + (v_r - v_l) * tx;
+                    }
+                }
+                (u_map, v_map)
+            }
+            Self::Grid2DMasked { grid_u, grid_v, mask_bits } => {
+                let mut u_map = vec![f32::NAN; w * h];
+                let mut v_map = vec![f32::NAN; w * h];
+                let inv_w = 16.0f32 / (w as f32);
+                let inv_h = 16.0f32 / (h as f32);
+                for py in 0..h {
+                    let gy_f = (py as f32) * inv_h;
+                    let gy = (gy_f as usize).min(15);
+                    let ty = gy_f - (gy as f32);
+                    let r0 = gy * 17;
+                    let r1 = (gy + 1) * 17;
+                    let row_off = py * w;
+                    for px in 0..w {
+                        let idx = row_off + px;
+                        if (mask_bits[idx >> 5] & (1u32 << (idx & 31))) == 0 {
+                            continue;
+                        }
+                        let gx_f = (px as f32) * inv_w;
+                        let gx = (gx_f as usize).min(15);
+                        let tx = gx_f - (gx as f32);
+                        let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+                        let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+                        let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+                        let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+                        u_map[idx] = u_l + (u_r - u_l) * tx;
+                        v_map[idx] = v_l + (v_r - v_l) * tx;
                     }
                 }
                 (u_map, v_map)
@@ -5784,8 +6037,7 @@ async fn render_bbox_core(
         let max_v = v_rows.last().copied().unwrap_or(0.0);
         (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
     } else {
-        let is_separable_unmasked = poly_mask.is_none()
-            && ifd.gcp_poly.is_none()
+        let is_separable_fast = ifd.gcp_poly.is_none()
             && ifd.crs_to_pixel.is_axis_aligned()
             && matches!(
                 dst_crs,
@@ -5801,7 +6053,7 @@ async fn render_bbox_core(
                     | cogzilla_proj::CrsModel::WorldMercator
                     | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
             );
-        if is_separable_unmasked {
+        if is_separable_fast {
             // O(w + h) fast path: zero 2D allocation, zero spawn_blocking overhead, and
             // enables 32 KB `BboxCoordSource::Separable` GPU uploads instead of 128 MB `Exact2D`.
             let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
@@ -5874,12 +6126,33 @@ async fn render_bbox_core(
                 min_v = f32::INFINITY;
                 max_v = f32::NEG_INFINITY;
             }
-            (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
+            if let Some(pm) = poly_mask {
+                let (mask_bits, covered) = pm.rasterize_all_touched_bits(w, h, bbox, dst_crs);
+                if covered == 0 {
+                    min_u = f32::INFINITY;
+                    max_u = f32::NEG_INFINITY;
+                    min_v = f32::INFINITY;
+                    max_v = f32::NEG_INFINITY;
+                }
+                (
+                    BboxCoordMap::SeparableMasked {
+                        u_cols,
+                        v_rows,
+                        mask_bits,
+                    },
+                    min_u,
+                    max_u,
+                    min_v,
+                    max_v,
+                )
+            } else {
+                (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
+            }
         } else {
-            // Try 17x17 coarse Grid2D fast path (2.3 KB vs 128 MB Exact2D!) for unmasked curved
+            // Try 17x17 coarse Grid2D fast path (2.3 KB vs 128 MB Exact2D!) for curved
             // projections (UTM, Albers, LCC, Polar Stereo) when all 289 control knots are finite
             // and 4 interior midpoint probes verify bilinear error < 0.05 source pixels.
-            let grid2d_fast = if poly_mask.is_none() && ifd.gcp_poly.is_none() {
+            let grid2d_fast = if ifd.gcp_poly.is_none() {
                 let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
                 let crs_to_pixel = ifd.crs_to_pixel;
                 let ifd_w_f = ifd.width as f32;
@@ -6011,13 +6284,35 @@ async fn render_bbox_core(
                             min_v = f32::INFINITY;
                             max_v = f32::NEG_INFINITY;
                         }
-                        Some((
-                            BboxCoordMap::Grid2D { grid_u, grid_v },
-                            min_u,
-                            max_u,
-                            min_v,
-                            max_v,
-                        ))
+                        if let Some(pm) = poly_mask {
+                            let (mask_bits, covered) =
+                                pm.rasterize_all_touched_bits(w, h, bbox, dst_crs);
+                            if covered == 0 {
+                                min_u = f32::INFINITY;
+                                max_u = f32::NEG_INFINITY;
+                                min_v = f32::INFINITY;
+                                max_v = f32::NEG_INFINITY;
+                            }
+                            Some((
+                                BboxCoordMap::Grid2DMasked {
+                                    grid_u,
+                                    grid_v,
+                                    mask_bits,
+                                },
+                                min_u,
+                                max_u,
+                                min_v,
+                                max_v,
+                            ))
+                        } else {
+                            Some((
+                                BboxCoordMap::Grid2D { grid_u, grid_v },
+                                min_u,
+                                max_u,
+                                min_v,
+                                max_v,
+                            ))
+                        }
                     } else {
                         None
                     }
@@ -6922,6 +7217,26 @@ async fn render_bbox_core(
                             grid_v,
                         }
                     }
+                    BboxCoordMap::SeparableMasked {
+                        u_cols,
+                        v_rows,
+                        mask_bits,
+                    } => crate::gpu_backend::BboxCoordSource::SeparableMasked {
+                        u: u_cols,
+                        v: v_rows,
+                        mask_bits,
+                    },
+                    BboxCoordMap::Grid2DMasked {
+                        grid_u,
+                        grid_v,
+                        mask_bits,
+                    } => crate::gpu_backend::BboxCoordSource::Grid2DMasked {
+                        dst_w: w,
+                        dst_h: h,
+                        grid_u,
+                        grid_v,
+                        mask_bits,
+                    },
                     BboxCoordMap::Exact2D { u_map, v_map } => {
                         crate::gpu_backend::BboxCoordSource::Exact2D {
                             dst_w: w,
@@ -7579,6 +7894,26 @@ async fn render_bbox_core(
                         grid_v,
                     }
                 }
+                BboxCoordMap::SeparableMasked {
+                    u_cols,
+                    v_rows,
+                    mask_bits,
+                } => crate::gpu_backend::BboxCoordSource::SeparableMasked {
+                    u: u_cols,
+                    v: v_rows,
+                    mask_bits,
+                },
+                BboxCoordMap::Grid2DMasked {
+                    grid_u,
+                    grid_v,
+                    mask_bits,
+                } => crate::gpu_backend::BboxCoordSource::Grid2DMasked {
+                    dst_w: w,
+                    dst_h: h,
+                    grid_u,
+                    grid_v,
+                    mask_bits,
+                },
                 BboxCoordMap::Exact2D { u_map, v_map } => {
                     crate::gpu_backend::BboxCoordSource::Exact2D {
                         dst_w: w,
