@@ -523,6 +523,11 @@ def main() -> int:
         o.check("array of band math, bilinear, rescaled", "image", f"{base12}.npy?{band_math}(b2-b1)/(b2%2Bb1)&rescale=-1,1")
         o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
         o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
+        # A method that gathers a pixel's footprint, far below the raster's coarsest overview:
+        # read as a box is. (The reference takes seconds for each of these.)
+        low7 = f"/searches/{sid}/tiles/WebMercatorQuad/7/66/45"
+        o.check("tile far below the overviews, average", "image", f"{low7}.npy?assets=red&resampling=average&reproject=average")
+        o.check("tile far below the overviews, rms, three bands", "image", f"{low7}.png?assets=visual&resampling=rms&reproject=rms")
         # Smoothed pixels on a grid in metres: one reader for all four.
         smoothed_shape = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
             [8.40, 45.70], [8.52, 45.71], [8.50, 45.78], [8.41, 45.76], [8.40, 45.70]]]}}
