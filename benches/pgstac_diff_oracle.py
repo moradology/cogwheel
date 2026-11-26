@@ -1044,6 +1044,22 @@ def main() -> int:
         o.check("collection statistics", "zonal", f"/collections/{collection}/statistics?assets=red&max_size=64", "POST", five)
         o.check("collection statistics, filtered", "zonal",
                 f"/collections/{collection}/statistics?assets=red&max_size=64&datetime=2024-12-01T00:00:00Z/..", "POST", five)
+        # Lines burned through every pixel they cross, points in the pixel they are in, as
+        # GDAL burns them; their coverage is the share of a finer grid they touch.
+        def shaped(geometry):
+            return {"type": "Feature", "properties": {}, "geometry": geometry}
+        line = shaped({"type": "LineString", "coordinates": [[8.41, 45.71], [8.45, 45.77], [8.51, 45.73]]})
+        lines = shaped({"type": "MultiLineString", "coordinates": [[[8.42, 45.72], [8.50, 45.76]], [[8.43, 45.75], [8.49, 45.71]]]})
+        points = shaped({"type": "MultiPoint", "coordinates": [[8.42, 45.72], [8.50, 45.76], [8.46, 45.74]]})
+        held = shaped({"type": "GeometryCollection", "geometries": [line["geometry"]]})
+        o.check("statistics of a line", "zonal", f"{st}?assets=red", "POST", line)
+        o.check("statistics of a line, in metres", "zonal", f"{st}?assets=red&dst_crs=epsg:3857", "POST", line)
+        o.check("statistics of two lines, max_size", "zonal", f"{st}?assets=red&max_size=200", "POST", lines)
+        o.check("statistics of points", "zonal", f"{st}?assets=red", "POST", points)
+        o.check("statistics of a line in a geometry collection", "zonal", f"{st}?assets=red&max_size=200", "POST", held)
+        o.check("feature, a line", "image", f"/searches/{sid}/feature.npy?assets=red&max_size=128", "POST", line)
+        o.check("feature, a line, in metres", "image", f"/searches/{sid}/feature.npy?assets=red&max_size=128&dst_crs=epsg:3857", "POST", line)
+        o.check("feature, a line, picture", "image", f"/searches/{sid}/feature.png?assets=red&rescale=0,3000&max_size=128", "POST", held)
         o.check("statistics without assets", "json", st, "POST", five)
         o.check("statistics of a bare geometry", "status", f"{st}?assets=red", "POST", five["geometry"])
         o.check("statistics outside the data", "status", f"{st}?assets=red&max_size=64", "POST", far)

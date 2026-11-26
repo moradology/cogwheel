@@ -7,15 +7,32 @@ use serde_json::{Value, json};
 /// A ring in pixel coordinates: `x` to the right, `y` down, one unit per pixel.
 pub(super) type Ring = Vec<(f64, f64)>;
 
+/// A shape on a pixel grid: its polygons (each an outer ring, then its holes), its lines
+/// and its points.
+#[derive(Default)]
+pub(super) struct GridShape {
+    pub(super) polygons: Vec<Vec<Ring>>,
+    pub(super) lines: Vec<Ring>,
+    pub(super) points: Vec<(f64, f64)>,
+}
+
+/// `shape_cover_counts` of polygons alone.
+#[cfg(test)]
+fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, scale: usize) -> Result<Vec<u32>, String> {
+    shape_cover_counts(&GridShape { polygons: polygons.to_vec(), ..Default::default() }, width, height, scale)
+}
+
 /// For every pixel of a `width` x `height` grid, how many of its `scale` x `scale`
-/// sub-cells the polygon touches. With `scale` 1 this is rasterio's
-/// `rasterize(all_touched=True)`; a sub-cell is touched when its centre is inside the
-/// polygon (even-odd over its rings) or a ring passes through it. Each polygon is burned
-/// on its own, as GDAL burns them, so where two overlap a sub-cell is counted once.
+/// sub-cells the shape touches. With `scale` 1 this is rasterio's
+/// `rasterize(all_touched=True)`; a sub-cell is touched when its centre is inside a
+/// polygon (even-odd over its rings), a ring or a line passes through it, or a point is in
+/// it. Each polygon is burned on its own, as GDAL burns them, so where two overlap (or a line
+/// crosses a polygon) a sub-cell is counted once.
 ///
-/// The polygon and the scale come from a request, so the work they ask for is counted
+/// The shape and the scale come from a request, so the work they ask for is counted
 /// first and refused when it is more than a statistics request has any use for.
-pub(super) fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, scale: usize) -> Result<Vec<u32>, String> {
+pub(super) fn shape_cover_counts(shape: &GridShape, width: usize, height: usize, scale: usize) -> Result<Vec<u32>, String> {
+    let polygons = &shape.polygons;
     let scale = scale.max(1);
     let (fw, fh) = (width * scale, height * scale);
     let mut counts = vec![0u32; width * height];
@@ -25,14 +42,16 @@ pub(super) fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, 
     // Every row of the fine grid looks at every segment, and a segment burns a cell for
     // every row and column it crosses inside the grid.
     let too_much = || "the polygon has too many vertices for this size and cover_scale; simplify it, or lower cover_scale".to_string();
-    let segments: u64 = polygons.iter().flatten().map(|ring| ring.len() as u64).sum();
+    let segments: u64 = polygons.iter().flatten().map(|ring| ring.len() as u64).sum::<u64>()
+        + shape.lines.iter().map(|line| line.len() as u64).sum::<u64>();
     if segments.saturating_mul(fh as u64) > MAX_ROW_CHECKS {
         return Err(too_much());
     }
     let s = scale as f64;
-    let mut burned = 0u64;
-    for ring in polygons.iter().flatten() {
-        let closing = ring.first().zip(ring.last()).filter(|(a, b)| a != b).map(|(a, b)| [*b, *a]);
+    let mut burned = shape.points.len() as u64;
+    let rings = polygons.iter().flatten().map(|ring| (ring, true));
+    for (ring, closed) in rings.chain(shape.lines.iter().map(|line| (line, false))) {
+        let closing = ring.first().zip(ring.last()).filter(|(a, b)| closed && a != b).map(|(a, b)| [*b, *a]);
         for pair in ring.windows(2).map(|p| [p[0], p[1]]).chain(closing) {
             let across = (pair[0].0 * s).clamp(0.0, fw as f64) - (pair[1].0 * s).clamp(0.0, fw as f64);
             let down = (pair[0].1 * s).clamp(0.0, fh as f64) - (pair[1].1 * s).clamp(0.0, fh as f64);
@@ -63,11 +82,22 @@ pub(super) fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, 
         })
         .collect();
 
-    // Cells the rings pass through, as (row, column).
+    // Cells the rings and lines pass through, and the points are in, as (row, column).
     let mut edge_cells: Vec<(u32, u32)> = Vec::new();
     for ring in fine.iter().flatten() {
         for pair in ring.windows(2) {
             burn_line(pair[0], pair[1], fw as i64, fh as i64, &mut edge_cells);
+        }
+    }
+    for line in &shape.lines {
+        for pair in line.windows(2) {
+            burn_line((pair[0].0 * s, pair[0].1 * s), (pair[1].0 * s, pair[1].1 * s), fw as i64, fh as i64, &mut edge_cells);
+        }
+    }
+    for &(x, y) in &shape.points {
+        let (col, row) = ((x * s).floor(), (y * s).floor());
+        if (0.0..fw as f64).contains(&col) && (0.0..fh as f64).contains(&row) {
+            edge_cells.push((row as u32, col as u32));
         }
     }
     edge_cells.sort_unstable();
@@ -128,7 +158,7 @@ pub(super) fn cover_counts(polygons: &[Vec<Ring>], width: usize, height: usize, 
                 counts[out_row + cx] += (hi - lo + 1) as u32;
             }
         }
-        // Cells a ring passes through that the fill did not already take.
+        // Cells a ring, line or point burns that the fill did not already take.
         while next_edge < edge_cells.len() && edge_cells[next_edge].0 as usize == row {
             let x = edge_cells[next_edge].1 as usize;
             // The spans are in order and apart, so the one that could hold `x` is found, not looked for.
@@ -538,6 +568,24 @@ mod tests {
         assert_eq!(s["valid_pixels"], 0.0);
         assert_eq!(s["histogram"][0], json!([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
     }
+    #[test]
+    fn lines_and_points_burn_the_cells_they_touch() {
+        // A line across three cells, a point, and a line inside a square: the square's cells
+        // are counted once.
+        let shape = GridShape {
+            polygons: vec![vec![vec![(3.2, 0.2), (4.8, 0.2), (4.8, 1.8), (3.2, 1.8), (3.2, 0.2)]]],
+            lines: vec![vec![(0.2, 0.5), (2.8, 0.5)], vec![(3.5, 0.5), (4.5, 1.5)]],
+            points: vec![(0.5, 2.5)],
+        };
+        let mask = shape_cover_counts(&shape, 5, 3, 1).unwrap();
+        assert_eq!(grid(&mask, 5), ["#####", "...##", "#...."]);
+        assert!(mask.iter().all(|c| *c <= 1));
+        // On a grid ten times finer a line takes about a tenth of each pixel it crosses and
+        // a point a hundredth, as rio-tiler's coverage gives them.
+        let counts = shape_cover_counts(&GridShape { lines: vec![vec![(0.0, 0.5), (1.95, 0.5)]], points: vec![(2.5, 0.5)], ..Default::default() }, 3, 1, 10).unwrap();
+        assert_eq!(counts, [10, 10, 1]);
+    }
+
     #[test]
     fn polygons_that_overlap_are_counted_once() {
         let square = |x: f64| vec![(x, 0.0), (x + 2.0, 0.0), (x + 2.0, 2.0), (x, 2.0), (x, 0.0)];
