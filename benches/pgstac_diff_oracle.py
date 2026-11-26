@@ -1264,8 +1264,9 @@ def main() -> int:
         o.check("item preview, a height of zero in the path", "image", f"{it}/preview/100x0.png?assets=red&rescale=0,3000")
         o.check("item preview, no size in the path and a max_size", "image", f"{it}/preview/0x0.png?assets=visual&max_size=128")
         o.check("item preview, a side in the path outranks max_size", "image", f"{it}/preview/0x64.png?assets=visual&max_size=32")
-        o.check("item preview, a width of zero as an array", "image", f"{it}/preview/0x64.npy?assets=red",
-                known="an item's preview is drawn by the /stac routes, which write an array as float32; titiler-pgstac writes the data's own type")
+        o.check("item preview, a width of zero as an array", "image", f"{it}/preview/0x64.npy?assets=red")
+        o.check("item preview as an array, three bands of bytes", "image", f"{it}/preview.npy?assets=visual&max_size=128")
+        o.check("item preview as an array, two assets", "image", f"{it}/preview.npy?assets=red&assets=nir&max_size=128")
         o.check("item tile as an array, in the data's type", "image", f"{itile}.npy?assets=red")
         o.check("item tile as an array, three bands of bytes", "image", f"{itile}.npy?assets=visual")
         o.check("item tile as an array, two assets, no mask", "image", f"{itile}.npy?assets=red&assets=nir&return_mask=false")

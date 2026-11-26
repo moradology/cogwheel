@@ -423,8 +423,16 @@ impl LambertConformalConic {
         {
             return (f64::NAN, f64::NAN);
         }
-        let t = Self::t_fn(self.e, lat);
-        let rho = self.a * self.f_const * t.powf(self.n);
+        // At the same-hemisphere pole, tan(pi/4 - lat/2) is 0 (north) or finite ~1.63e16 (south
+        // in f64 instead of +inf), so clamp rho directly to the cone apex 0.0.
+        let rho = if (self.n > 0.0 && lat >= std::f64::consts::FRAC_PI_2 - 1e-12)
+            || (self.n < 0.0 && lat <= -std::f64::consts::FRAC_PI_2 + 1e-12)
+        {
+            0.0
+        } else {
+            let t = Self::t_fn(self.e, lat);
+            self.a * self.f_const * t.powf(self.n)
+        };
         let theta = self.n * wrap_dlon(lon - self.lon0);
         let (st, ct) = theta.sin_cos();
         (
@@ -799,6 +807,10 @@ impl Sinusoidal {
         }
         let (s, c) = lat.sin_cos();
         if c.abs() < 1e-12 {
+            // The Sinusoidal lobe has zero width at ±90°; any nonzero x lies outside Earth.
+            if x.abs() > 1e-6 {
+                return (f64::NAN, f64::NAN);
+            }
             return (self.lon0, lat);
         }
         let dlon = x * (1.0 - self.e2 * s * s).sqrt() / (self.a * c);
@@ -1038,5 +1050,27 @@ mod tests {
         let aea = AlbersEqualArea::new(Ellipsoid::GRS80, 29.5, 45.5, 23.0, -96.0, 0.0, 0.0);
         let (alo, ala) = aea.inverse(500_000.0, 10_000_000.0);
         assert!(alo.is_nan() && ala.is_nan(), "Albers unmapped cone wedge must be NaN, got ({alo}, {ala})");
+
+        // Audit #70 #1: Sinusoidal out-of-lobe polar coordinates (x != 0 at y = +y_pole) must be NaN
+        let sinu = Sinusoidal::new(Ellipsoid::sphere(6_371_007.181), 0.0, 0.0, 0.0);
+        let y_pole = 6_371_007.181 * std::f64::consts::FRAC_PI_2;
+        let (slo, sla) = sinu.inverse(-1_111_950.0, y_pole);
+        assert!(slo.is_nan() && sla.is_nan(), "Sinusoidal off-lobe pole must be NaN, got ({slo}, {sla})");
+        let (plo, pla) = sinu.inverse(0.0, y_pole);
+        assert!(plo.abs() < 1e-12 && (pla - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+
+        // Audit #70 #6: Southern Hemisphere LCC at South Pole must land on cone apex (rho == 0)
+        let s_lcc = LambertConformalConic::new_2sp(
+            Ellipsoid::WGS84,
+            -5.0,
+            -7.0,
+            -6.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        let (sx, sy) = s_lcc.forward(0.5, -std::f64::consts::FRAC_PI_2);
+        assert!(sx.abs() < 1e-6, "Southern LCC South Pole X must be 0, got {sx}");
+        assert!((sy - s_lcc.rho0).abs() < 1e-6, "Southern LCC South Pole Y must equal rho0, got {sy} vs {}", s_lcc.rho0);
     }
 }
