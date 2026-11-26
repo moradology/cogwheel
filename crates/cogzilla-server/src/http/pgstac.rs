@@ -1723,14 +1723,6 @@ fn check_working_bytes(bytes: usize) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Whether a request's values are the raster's own whole numbers, which `mean` and `median`
-/// are cast back to; only then does the cast lose anything.
-fn whole_numbers(unscale: bool, bands: &BandRequest, sample_type: SampleType) -> bool {
-    !unscale
-        && matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
-        && !matches!(sample_type, SampleType::Float32 | SampleType::Float64)
-}
-
 /// A value as a byte, by rio-tiler's `linear_rescale` step for step and in its double
 /// precision: clip to the range, take the share of it, scale to 255, drop the fraction.
 /// Done in another order or in single precision, a value on a boundary lands a level off.
@@ -3412,7 +3404,7 @@ async fn part_image_of(
                     let paint = Paint::of(&bands).ok_or_else(|| {
                         EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
                     })?;
-                    let integer = whole_numbers(pq.unscale, &bands, full.sample_type);
+                    let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
                     selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint));
                 }
                 let values = render_wgs84_bbox(
@@ -5177,7 +5169,7 @@ async fn tile(
                 }
                 // `mean` and `median` are cast back to the source's type, which only loses
                 // anything when the values are the raster's own whole numbers.
-                let integer = whole_numbers(pq.unscale, &treq.bands, full.sample_type);
+                let integer = super::reads_whole_numbers(pq.unscale, &treq.bands, full.sample_type);
                 let bands = TileEngine::value_bands(&treq.bands);
                 // The median has to hold every scene, so it is refused before anything is
                 // read when that would be too much.
