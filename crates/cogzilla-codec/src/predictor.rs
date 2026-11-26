@@ -68,6 +68,172 @@ unsafe fn prefix_sum_stride1_neon(row: &mut [u8]) {
     }
 }
 
+/// 16-lane NEON Kogge-Stone prefix sum for stride-3 interleaved byte streams (e.g. 3-band chunky
+/// float32 Predictor 3 rows) using `vld3q_u8`/`vst3q_u8` to deinterleave all 3 channels in hardware.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefix_sum_stride3_neon(row: &mut [u8]) {
+    use std::arch::aarch64::*;
+    let len = row.len();
+    let ptr = row.as_mut_ptr();
+    let zero = unsafe { vdupq_n_u8(0) };
+    let mut c0 = zero;
+    let mut c1 = zero;
+    let mut c2 = zero;
+    let mut i = 0usize;
+
+    while i + 48 <= len {
+        unsafe {
+            let mut v = vld3q_u8(ptr.add(i));
+            macro_rules! kstone {
+                ($ch:expr, $carry:expr) => {
+                    $ch = vaddq_u8($ch, vextq_u8::<15>(zero, $ch));
+                    $ch = vaddq_u8($ch, vextq_u8::<14>(zero, $ch));
+                    $ch = vaddq_u8($ch, vextq_u8::<12>(zero, $ch));
+                    $ch = vaddq_u8($ch, vextq_u8::<8>(zero, $ch));
+                    $ch = vaddq_u8($ch, $carry);
+                    $carry = vdupq_laneq_u8::<15>($ch);
+                };
+            }
+            kstone!(v.0, c0);
+            kstone!(v.1, c1);
+            kstone!(v.2, c2);
+            vst3q_u8(ptr.add(i), v);
+        }
+        i += 48;
+    }
+
+    if i < len {
+        let mut idx = i.max(3);
+        while idx < len {
+            row[idx] = row[idx].wrapping_add(row[idx - 3]);
+            idx += 1;
+        }
+    }
+}
+
+/// Single-pass NEON 3-band chunky `uint8` horizontal differencing (optional) + min/max/nodata stats.
+/// Uses `vld3q_u8`/`vst3q_u8` to eliminate both the scalar prefix-sum and the second pass over RAM.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reconstruct_u8_rgb3_neon(
+    slice: &mut [u8],
+    w: usize,
+    h: usize,
+    horizontal_diff: bool,
+    nd_u8: Option<u8>,
+    any_valid: &mut [bool; 3],
+    any_nodata: &mut [bool; 3],
+    min_u8: &mut [u8; 3],
+    max_u8: &mut [u8; 3],
+) {
+    use std::arch::aarch64::*;
+    let zero = unsafe { vdupq_n_u8(0) };
+    let v255 = unsafe { vdupq_n_u8(255) };
+    let mut vmin = [v255; 3];
+    let mut vmax = [zero; 3];
+    let mut v_any_valid = [zero; 3];
+    let mut v_any_nodata = [zero; 3];
+    let v_nd = unsafe { vdupq_n_u8(nd_u8.unwrap_or(0)) };
+    let has_nd = nd_u8.is_some();
+
+    for y in 0..h {
+        let row = &mut slice[y * w * 3..(y + 1) * w * 3];
+        let ptr = row.as_mut_ptr();
+        let mut c0 = zero;
+        let mut c1 = zero;
+        let mut c2 = zero;
+        let mut x = 0usize;
+
+        while x + 16 <= w {
+            unsafe {
+                let mut v = vld3q_u8(ptr.add(x * 3));
+                if horizontal_diff {
+                    macro_rules! kstone {
+                        ($ch:expr, $carry:expr) => {
+                            $ch = vaddq_u8($ch, vextq_u8::<15>(zero, $ch));
+                            $ch = vaddq_u8($ch, vextq_u8::<14>(zero, $ch));
+                            $ch = vaddq_u8($ch, vextq_u8::<12>(zero, $ch));
+                            $ch = vaddq_u8($ch, vextq_u8::<8>(zero, $ch));
+                            $ch = vaddq_u8($ch, $carry);
+                            $carry = vdupq_laneq_u8::<15>($ch);
+                        };
+                    }
+                    kstone!(v.0, c0);
+                    kstone!(v.1, c1);
+                    kstone!(v.2, c2);
+                    vst3q_u8(ptr.add(x * 3), v);
+                }
+
+                let chs = [v.0, v.1, v.2];
+                if has_nd {
+                    for b in 0..3 {
+                        let is_nd = vceqq_u8(chs[b], v_nd);
+                        let is_val = vmvnq_u8(is_nd);
+                        v_any_nodata[b] = vorrq_u8(v_any_nodata[b], is_nd);
+                        v_any_valid[b] = vorrq_u8(v_any_valid[b], is_val);
+                        vmin[b] = vminq_u8(vmin[b], vbslq_u8(is_val, chs[b], v255));
+                        vmax[b] = vmaxq_u8(vmax[b], vbslq_u8(is_val, chs[b], zero));
+                    }
+                } else {
+                    for b in 0..3 {
+                        vmin[b] = vminq_u8(vmin[b], chs[b]);
+                        vmax[b] = vmaxq_u8(vmax[b], chs[b]);
+                    }
+                }
+            }
+            x += 16;
+        }
+
+        if x < w {
+            let mut acc = if horizontal_diff && x > 0 {
+                [row[(x - 1) * 3], row[(x - 1) * 3 + 1], row[(x - 1) * 3 + 2]]
+            } else {
+                [0u8; 3]
+            };
+            for px in row[x * 3..].chunks_exact_mut(3) {
+                for b in 0..3 {
+                    let v = if horizontal_diff {
+                        acc[b] = acc[b].wrapping_add(px[b]);
+                        px[b] = acc[b];
+                        acc[b]
+                    } else {
+                        px[b]
+                    };
+                    if nd_u8 == Some(v) {
+                        any_nodata[b] = true;
+                    } else {
+                        any_valid[b] = true;
+                        if v < min_u8[b] { min_u8[b] = v; }
+                        if v > max_u8[b] { max_u8[b] = v; }
+                    }
+                }
+            }
+        }
+    }
+
+    if w >= 16 && h > 0 {
+        unsafe {
+            for b in 0..3 {
+                if has_nd {
+                    if vmaxvq_u8(v_any_nodata[b]) != 0 {
+                        any_nodata[b] = true;
+                    }
+                    if vmaxvq_u8(v_any_valid[b]) != 0 {
+                        any_valid[b] = true;
+                        min_u8[b] = min_u8[b].min(vminvq_u8(vmin[b]));
+                        max_u8[b] = max_u8[b].max(vmaxvq_u8(vmax[b]));
+                    }
+                } else {
+                    any_valid[b] = true;
+                    min_u8[b] = min_u8[b].min(vminvq_u8(vmin[b]));
+                    max_u8[b] = max_u8[b].max(vmaxvq_u8(vmax[b]));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn transpose_and_store_16_f32_neon(
@@ -1189,6 +1355,11 @@ pub fn reconstruct_predictor3(
 
         for y in 0..h {
             let row = &mut raw[y * row_bytes..(y + 1) * row_bytes];
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                prefix_sum_stride3_neon(row);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             prefix_sum_scalar(row, 3);
 
             let p0 = &row[0..samples_per_row];
@@ -2294,44 +2465,65 @@ pub fn reconstruct_u8(
         let mut min_u8 = [255u8; 3];
         let mut max_u8 = [0u8; 3];
 
-        if horizontal_diff {
+        #[cfg(target_arch = "aarch64")]
+        {
             let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
-            for y in 0..h {
-                let row = &mut slice[y * w * 3..(y + 1) * w * 3];
-                let mut acc = [0u8; 3];
-                for px in row.chunks_exact_mut(3) {
-                    acc[0] = acc[0].wrapping_add(px[0]);
-                    acc[1] = acc[1].wrapping_add(px[1]);
-                    acc[2] = acc[2].wrapping_add(px[2]);
-                    px[0] = acc[0];
-                    px[1] = acc[1];
-                    px[2] = acc[2];
-                }
+            unsafe {
+                reconstruct_u8_rgb3_neon(
+                    slice,
+                    w,
+                    h,
+                    horizontal_diff,
+                    nd_u8,
+                    &mut any_valid,
+                    &mut any_nodata,
+                    &mut min_u8,
+                    &mut max_u8,
+                );
             }
         }
 
-        if let Some(nd) = nd_u8 {
-            for px in rgb.chunks_exact(3) {
-                for b in 0..3 {
-                    let v = px[b];
-                    if v == nd {
-                        any_nodata[b] = true;
-                    } else {
-                        any_valid[b] = true;
-                        if v < min_u8[b] { min_u8[b] = v; }
-                        if v > max_u8[b] { max_u8[b] = v; }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            if horizontal_diff {
+                let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
+                for y in 0..h {
+                    let row = &mut slice[y * w * 3..(y + 1) * w * 3];
+                    let mut acc = [0u8; 3];
+                    for px in row.chunks_exact_mut(3) {
+                        acc[0] = acc[0].wrapping_add(px[0]);
+                        acc[1] = acc[1].wrapping_add(px[1]);
+                        acc[2] = acc[2].wrapping_add(px[2]);
+                        px[0] = acc[0];
+                        px[1] = acc[1];
+                        px[2] = acc[2];
                     }
                 }
             }
-        } else {
-            any_valid = [pixels > 0; 3];
-            for px in rgb.chunks_exact(3) {
-                if px[0] < min_u8[0] { min_u8[0] = px[0]; }
-                if px[0] > max_u8[0] { max_u8[0] = px[0]; }
-                if px[1] < min_u8[1] { min_u8[1] = px[1]; }
-                if px[1] > max_u8[1] { max_u8[1] = px[1]; }
-                if px[2] < min_u8[2] { min_u8[2] = px[2]; }
-                if px[2] > max_u8[2] { max_u8[2] = px[2]; }
+
+            if let Some(nd) = nd_u8 {
+                for px in rgb.chunks_exact(3) {
+                    for b in 0..3 {
+                        let v = px[b];
+                        if v == nd {
+                            any_nodata[b] = true;
+                        } else {
+                            any_valid[b] = true;
+                            if v < min_u8[b] { min_u8[b] = v; }
+                            if v > max_u8[b] { max_u8[b] = v; }
+                        }
+                    }
+                }
+            } else {
+                any_valid = [pixels > 0; 3];
+                for px in rgb.chunks_exact(3) {
+                    if px[0] < min_u8[0] { min_u8[0] = px[0]; }
+                    if px[0] > max_u8[0] { max_u8[0] = px[0]; }
+                    if px[1] < min_u8[1] { min_u8[1] = px[1]; }
+                    if px[1] > max_u8[1] { max_u8[1] = px[1]; }
+                    if px[2] < min_u8[2] { min_u8[2] = px[2]; }
+                    if px[2] > max_u8[2] { max_u8[2] = px[2]; }
+                }
             }
         }
         return (0..3u8)
@@ -2475,4 +2667,89 @@ pub fn reconstruct_u8(
             ),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u8_rgb3_pred1_and_pred2_match_scalar_across_widths_and_nodata() {
+        for &(w, h) in &[(1u32, 1u32), (7, 3), (15, 2), (16, 4), (17, 5), (63, 7), (256, 4)] {
+            let pixels = (w * h) as usize;
+            let raw: Vec<u8> = (0..pixels * 3)
+                .map(|i| ((i.wrapping_mul(37) ^ (i >> 3)) & 0xFF) as u8)
+                .collect();
+
+            for horizontal_diff in [false, true] {
+                for nodata in [None, Some(0.0f32), Some(255.0f32)] {
+                    let bands = reconstruct_u8(&raw, w, h, 3, horizontal_diff, nodata);
+                    assert_eq!(bands.len(), 3);
+
+                    // Scalar reference
+                    let mut expected = raw.clone();
+                    if horizontal_diff {
+                        for y in 0..h as usize {
+                            let row = &mut expected[y * (w as usize) * 3..(y + 1) * (w as usize) * 3];
+                            let mut acc = [0u8; 3];
+                            for px in row.chunks_exact_mut(3) {
+                                for b in 0..3 {
+                                    acc[b] = acc[b].wrapping_add(px[b]);
+                                    px[b] = acc[b];
+                                }
+                            }
+                        }
+                    }
+                    let nd_u8 = nodata.map(|v| v as u8);
+                    let mut av = [false; 3];
+                    let mut an = [false; 3];
+                    let mut mn = [255u8; 3];
+                    let mut mx = [0u8; 3];
+                    for px in expected.chunks_exact(3) {
+                        for b in 0..3 {
+                            if nd_u8 == Some(px[b]) {
+                                an[b] = true;
+                            } else {
+                                av[b] = true;
+                                mn[b] = mn[b].min(px[b]);
+                                mx[b] = mx[b].max(px[b]);
+                            }
+                        }
+                    }
+
+                    for b in 0..3 {
+                        let BandData::RgbU8Channel { ref rgb, .. } = bands[b].data else {
+                            panic!("expected RgbU8Channel");
+                        };
+                        assert_eq!(rgb.as_ref(), expected.as_slice());
+                        let exp_stats = finalize_stats(
+                            av[b],
+                            an[b],
+                            if av[b] { mn[b] as f32 } else { f32::INFINITY },
+                            if av[b] { mx[b] as f32 } else { f32::NEG_INFINITY },
+                        );
+                        assert_eq!(bands[b].stats.all_nodata, exp_stats.all_nodata);
+                        assert_eq!(bands[b].stats.no_nodata, exp_stats.no_nodata);
+                        assert_eq!(bands[b].stats.min.to_bits(), exp_stats.min.to_bits());
+                        assert_eq!(bands[b].stats.max.to_bits(), exp_stats.max.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn prefix_sum_stride3_neon_matches_scalar() {
+        for len in [0usize, 3, 6, 45, 48, 51, 96, 1536, 6144] {
+            let input: Vec<u8> = (0..len)
+                .map(|i| ((i.wrapping_mul(29) ^ (i >> 2)) & 0xFF) as u8)
+                .collect();
+            let mut a = input.clone();
+            let mut b = input;
+            prefix_sum_scalar(&mut a, 3);
+            unsafe { prefix_sum_stride3_neon(&mut b) };
+            assert_eq!(a, b, "mismatch for len={len}");
+        }
+    }
 }
