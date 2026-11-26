@@ -930,15 +930,15 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
             assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
-            // Empty /mosaicjson/tiles returns 204 No Content (matching TiTiler 2.4 EmptyMosaicError)
-            let mj_empty_buf = client
+            // /mosaicjson/tiles outside mosaic bounds returns 404 Not Found with JSON detail
+            let mj_outside = client
                 .get(format!(
                     "{base}/mosaicjson/tiles/WebMercatorQuad/12/0/0.png?url={mj_url}&buffer=8"
                 ))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(mj_empty_buf.status(), 204);
+            assert_eq!(mj_outside.status(), 404);
 
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
@@ -2165,6 +2165,159 @@ async fn sweep11_l1_l2_and_sweep12_m1_self_contained() {
         (mean_aw - mean_un).abs() < 1e-12,
         "equal-area EPSG:6933 area_weighted=true ({mean_aw}) and false ({mean_un}) must match"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn uniform_semantic_http_statuses_across_all_tms() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_statuses_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Small UTM 10N raster in Northern California (~ -122.99..-122.97, 37.94..37.95)
+    let utm_path = tmp.join("small_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &utm_path,
+        32,
+        32,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &vec![123.0f32; 1024],
+    );
+
+    // All-NaN (nodata) raster at the exact same location
+    let nodata_path = tmp.join("all_nodata_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &nodata_path,
+        32,
+        32,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &vec![f32::NAN; 1024],
+    );
+
+    // MosaicJSON with wide advertised bounds [-125, 35, -120, 40] but only one tile covered
+    let mj_path = tmp.join("gap_mosaic.json");
+    let utm_url = utm_path.to_string_lossy().to_string();
+    let nodata_url = nodata_path.to_string_lossy().to_string();
+    let mj_json = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 8,
+        "maxzoom": 12,
+        "bounds": [-125.0, 35.0, -120.0, 40.0],
+        "quadkey_zoom": 8,
+        "tiles": {
+            "02301020": [utm_url]
+        }
+    });
+    std::fs::write(&mj_path, mj_json.to_string()).unwrap();
+    let mj_url = mj_path.to_string_lossy().to_string();
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. Out-of-matrix x returns 400 Bad Request
+    let bad_x = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/4/99/0.png?url={utm_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_x.status(), 400, "out-of-matrix x must return 400");
+
+    // 2. Every single one of the 13 TileMatrixSets returns 404 for a valid tile outside the UTM file
+    let outside_tiles = [
+        ("WebMercatorQuad", "4/15/15"),
+        ("WorldCRS84Quad", "4/31/15"),
+        ("WorldMercatorWGS84Quad", "4/15/15"),
+        ("WGS1984Quad", "4/31/15"),
+        ("UPSArcticWGS84Quad", "4/0/0"),
+        ("UPSAntarcticWGS84Quad", "4/0/0"),
+        ("CanadianNAD83_LCC", "4/0/0"),
+        ("EuropeanETRS89_LAEAQuad", "4/0/0"),
+        ("NZTM2000Quad", "4/0/0"),
+        ("LINZAntarticaMapTilegrid", "4/0/0"),
+        ("NAD83Massachusetts", "4/0/0"),
+        ("CDB1GlobalGrid", "4/0/0"),
+        ("GNOSISGlobalGrid", "4/0/0"),
+    ];
+    for (tms, zxy) in outside_tiles {
+        let r = client
+            .get(format!("{base}/cog/tiles/{tms}/{zxy}.png?url={utm_url}"))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(
+            status, 404,
+            "TMS {tms}/{zxy} outside UTM file must return 404, got {status}: {body}"
+        );
+        assert!(
+            body.contains("outside") && body.contains(tms),
+            "404 body for {tms} should name tile & bounds, got: {body}"
+        );
+    }
+
+    // 3. All-nodata tile INSIDE dataset bounds returns 200 OK
+    // Tile 10/162/394 covers (-123.047..-122.695, 37.718..37.996) which contains our UTM raster
+    let nd_resp = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/162/394.png?url={nodata_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        nd_resp.status(),
+        200,
+        "all-nodata tile inside footprint must return 200"
+    );
+
+    // 4. Mosaic gap INSIDE advertised mj.bounds returns 204; tile OUTSIDE mj.bounds returns 404
+    // (-121.0, 36.0) is inside [-125, 35, -120, 40] -> WebMercator z=8 x=41, y=99 (uncovered gap)
+    let gap_resp = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/8/41/99.png?url={mj_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gap_resp.status(), 204, "mosaic gap inside bounds must return 204");
+    let out_mj = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/8/0/0.png?url={mj_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out_mj.status(), 404, "mosaic tile outside bounds must return 404");
+
+    // 5. /cog/point, /cog/bbox, and /cog/feature outside footprint all return 404 with detail
+    let pt_out = client
+        .get(format!("{base}/cog/point/0,0?url={utm_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pt_out.status(), 404);
+    let bbox_out = client
+        .get(format!("{base}/cog/bbox/0,0,1,1/32x32.png?url={utm_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bbox_out.status(), 404);
+    let feat_out = client
+        .post(format!("{base}/cog/feature.png?url={utm_url}&max_size=32"))
+        .header("content-type", "application/json")
+        .body(r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(feat_out.status(), 404);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
