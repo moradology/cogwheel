@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 mod asset_query_pins;
 mod paint;
 #[allow(dead_code)]
-mod pixel_selection;
+pub(crate) mod pixel_selection;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
@@ -4318,6 +4318,47 @@ async fn compute_mosaic_statistics_with_fold(
     let dst_crs = cogzilla_proj::CrsModel::Geographic;
     let resample = pq.resample;
 
+    // Exact analytical native-grid path for POST /mosaicjson/statistics when no explicit
+    // output width/height resampling was requested and all contributing assets share one grid
+    // (always true for a single-asset mosaic, guaranteeing exact parity with /cog/statistics).
+    if let Some(mask) = poly_mask
+        && pq.width.is_none()
+        && pq.height.is_none()
+    {
+        let mut opened: Vec<(String, Arc<cogzilla_io::OpenedCog>)> =
+            Vec::with_capacity(urls.len());
+        let mut open_err: Option<EngineError> = None;
+        for u in urls {
+            match engine.store.open_uri(u).await {
+                Ok(c) => opened.push((u.clone(), c)),
+                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    return Err(EngineError::Io(e));
+                }
+                Err(e) => open_err = Some(crate::engine::asset_fetch_error(u, e)),
+            }
+        }
+        if opened.is_empty() {
+            return Err(open_err.unwrap_or_else(|| {
+                EngineError::NotFound("no readable mosaic scenes intersect requested bounds".into())
+            }));
+        }
+        if let Some(exact) = crate::zonal::compute_native_exact_mosaic_fold_stats(
+            engine,
+            &opened,
+            mask,
+            pq.max_size,
+            pq.unscale,
+            pq.nodata,
+            method,
+            MAX_MEDIAN_BUFFER_BYTES,
+            stats_opts,
+        )
+        .await?
+        {
+            return Ok(exact);
+        }
+    }
+
     let mut eff_bbox = wgs_bbox;
     let mut out_dims: Option<(u32, u32)> = None;
     let mut selected_bidx: Vec<u16> = Vec::new();
@@ -4452,7 +4493,7 @@ async fn compute_mosaic_statistics_with_fold(
             &dst_crs,
             out_w,
             out_h,
-            poly_mask,
+            None,
             &bands,
             resample,
             OutputFormat::RawF32,
@@ -4520,7 +4561,7 @@ async fn compute_mosaic_statistics_with_fold(
 
     let (out_w, out_h) = out_dims.unwrap_or((1, 1));
     let total_px = (out_w as usize).saturating_mul(out_h as usize);
-    let (out_nb, mut combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
+    let (out_nb, combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
         Some(Selected { bands, values }) => (bands, values),
         None => {
             let nb = if method == Selection::Count {
@@ -4533,15 +4574,42 @@ async fn compute_mosaic_statistics_with_fold(
             (nb, vec![f32::NAN; nb * total_px])
         }
     };
-    if method == Selection::Count
-        && let Some(mask) = poly_mask
-    {
-        let kept = mask.rasterize_all_touched(out_w as usize, out_h as usize, eff_bbox, &dst_crs);
-        for (v, &inside) in combined.iter_mut().zip(&kept) {
-            if !inside {
-                *v = f32::NAN;
-            }
+    if let Some(mask) = poly_mask {
+        let mut keys_descs: Vec<(String, String)> = Vec::with_capacity(out_nb);
+        for bi in 0..out_nb {
+            let key = if method == Selection::Count {
+                "b1".to_string()
+            } else {
+                let b_num = selected_bidx.get(bi).copied().unwrap_or((bi + 1) as u16);
+                format!("b{b_num}")
+            };
+            let desc = if method == Selection::Count {
+                "count".to_string()
+            } else {
+                band_descs.get(bi).cloned().unwrap_or_else(|| key.clone())
+            };
+            keys_descs.push((key, desc));
         }
+        let plane_refs: Vec<(&str, &str, &[f32])> = keys_descs
+            .iter()
+            .enumerate()
+            .map(|(bi, (k, d))| {
+                (
+                    k.as_str(),
+                    d.as_str(),
+                    &combined[bi * total_px..(bi + 1) * total_px],
+                )
+            })
+            .collect();
+        let json = crate::zonal::compute_exact_grid_polygon_stats(
+            &plane_refs,
+            eff_bbox,
+            out_w as usize,
+            out_h as usize,
+            mask,
+            stats_opts,
+        );
+        return Ok((json, used_assets));
     }
 
     let mut out = serde_json::Map::new();
@@ -7382,7 +7450,31 @@ where
                             {
                                 return Ok::<_, EngineError>(exact);
                             }
-                            let mut map = serde_json::Map::new();
+                            let mut eff_bbox = poly_bbox;
+                            if eff_bbox[2] <= eff_bbox[0] || eff_bbox[3] <= eff_bbox[1] {
+                                let (px_dx, px_dy) = if let Some(first) = cogs_c.first()
+                                    && let Ok(crs) = eng.get_or_build_crs(first)
+                                {
+                                    let f = first.index.full_res();
+                                    let b = crs.wgs84_bounds(&f.pixel_to_crs, f.width, f.height);
+                                    (
+                                        ((b[2] - b[0]).abs() / f.width.max(1) as f64).max(1e-6),
+                                        ((b[3] - b[1]).abs() / f.height.max(1) as f64).max(1e-6),
+                                    )
+                                } else {
+                                    (1e-5, 1e-5)
+                                };
+                                if eff_bbox[2] <= eff_bbox[0] {
+                                    eff_bbox[0] -= 0.5 * px_dx;
+                                    eff_bbox[2] += 0.5 * px_dx;
+                                }
+                                if eff_bbox[3] <= eff_bbox[1] {
+                                    eff_bbox[1] -= 0.5 * px_dy;
+                                    eff_bbox[3] += 0.5 * px_dy;
+                                }
+                            }
+                            let mut rendered: Vec<(String, String, Vec<f32>)> =
+                                Vec::with_capacity(compiled.len());
                             for (idx, (desc, prog)) in compiled.into_iter().enumerate() {
                                 let mut bands = BandRequest::CustomExpr {
                                     prog,
@@ -7393,7 +7485,7 @@ where
                                     apply_unscale_cogs(&mut bands, &cogs_c);
                                 }
                                 let raw = render_wgs84_bbox(
-                                    &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
+                                    &eng, &cogs_c, eff_bbox, out_w, out_h, None, &bands,
                                     resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
                                 )
                                 .await?;
@@ -7401,9 +7493,22 @@ where
                                     .chunks_exact(4)
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                     .collect();
-                                map.insert(format!("b{}", idx + 1), compute_f32_band_stats(&pixels, &desc, &stats_opts));
+                                rendered.push((format!("b{}", idx + 1), desc, pixels));
                             }
-                            return Ok::<_, EngineError>(serde_json::Value::Object(map));
+                            let plane_refs: Vec<(&str, &str, &[f32])> = rendered
+                                .iter()
+                                .map(|(k, d, p)| (k.as_str(), d.as_str(), p.as_slice()))
+                                .collect();
+                            return Ok::<_, EngineError>(
+                                crate::zonal::compute_exact_grid_polygon_stats(
+                                    &plane_refs,
+                                    eff_bbox,
+                                    out_w as usize,
+                                    out_h as usize,
+                                    &mask,
+                                    &stats_opts,
+                                ),
+                            );
                         }
                         let mut set = tokio::task::JoinSet::new();
                         for (idx, cog) in cogs_c.into_iter().enumerate() {

@@ -18,7 +18,7 @@
 
 /// A pixel selection method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Selection {
+pub(crate) enum Selection {
     First,
     Highest,
     Lowest,
@@ -32,7 +32,7 @@ pub(super) enum Selection {
 
 impl Selection {
     /// The methods by TiTiler's names.
-    pub(super) fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "first" => Self::First,
             "lastbandlow" => Self::LastBandLow,
@@ -48,13 +48,13 @@ impl Selection {
     }
 
     /// Whether the method decides by the last band, which it then leaves out.
-    pub(super) fn by_last_band(self) -> bool {
+    pub(crate) fn by_last_band(self) -> bool {
         matches!(self, Self::LastBandLow | Self::LastBandHigh)
     }
 }
 
 /// A value a selection is worked out over: `f32` for pictures, `f64` for statistics.
-pub(super) trait Sample: Copy + PartialOrd {
+pub(crate) trait Sample: Copy + PartialOrd {
     const NAN: Self;
     const ZERO: Self;
     const ONE: Self;
@@ -94,14 +94,14 @@ sample!(f64);
 
 /// Band-major values, NaN where no scene had one.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct Selected<T = f32> {
+pub(crate) struct Selected<T = f32> {
     pub bands: usize,
     pub values: Vec<T>,
 }
 
 /// A pixel selection being worked out, one scene at a time. Only `median` has to keep the
 /// scenes; the others keep a running figure for each value.
-pub(super) struct Fold<T = f32> {
+pub(crate) struct Fold<T = f32> {
     method: Selection,
     bands: usize,
     pixels: usize,
@@ -135,7 +135,7 @@ impl Fold<f32> {
 impl<T: Sample> Fold<T> {
     /// `integer` says the source holds whole numbers, which `mean` and `median` are cast
     /// back to.
-    pub(super) fn new(method: Selection, bands: usize, pixels: usize, integer: bool) -> Self {
+    pub(crate) fn new(method: Selection, bands: usize, pixels: usize, integer: bool) -> Self {
         let len = bands * pixels;
         let state = match method {
             Selection::First
@@ -158,18 +158,18 @@ impl<T: Sample> Fold<T> {
     /// The number a last band holds where it has no data, which the last-band methods
     /// compare by: the raster's own no-data value, zero in most, or the one the request
     /// named in its place.
-    pub(super) fn absent_as(mut self, value: T) -> Self {
+    pub(crate) fn absent_as(mut self, value: T) -> Self {
         self.absent = value;
         self
     }
 
     /// How many bands each scene must bring.
-    pub(super) fn bands(&self) -> usize {
+    pub(crate) fn bands(&self) -> usize {
         self.bands
     }
 
     /// The bytes `scenes` scenes would be held in, for the method that holds them.
-    pub(super) fn held_bytes(method: Selection, scenes: usize, bands: usize, pixels: usize) -> usize {
+    pub(crate) fn held_bytes(method: Selection, scenes: usize, bands: usize, pixels: usize) -> usize {
         match method {
             Selection::Median => scenes.saturating_mul(bands * pixels * std::mem::size_of::<T>()),
             _ => 0,
@@ -178,7 +178,7 @@ impl<T: Sample> Fold<T> {
 
     /// The bytes the method works in whatever the number of scenes: a value kept, or a sum,
     /// a sum of squares and a count, for each value of each band.
-    pub(super) fn working_bytes(method: Selection, bands: usize, pixels: usize) -> usize {
+    pub(crate) fn working_bytes(method: Selection, bands: usize, pixels: usize) -> usize {
         let each = match method {
             Selection::Mean => std::mem::size_of::<f64>() + std::mem::size_of::<u32>(),
             Selection::Stdev => 2 * std::mem::size_of::<f64>() + std::mem::size_of::<u32>(),
@@ -190,7 +190,7 @@ impl<T: Sample> Fold<T> {
     }
 
     /// Take one scene: `bands * pixels` values, band after band, NaN where it has no data.
-    pub(super) fn add(&mut self, scene: impl Iterator<Item = T>) {
+    pub(crate) fn add(&mut self, scene: impl Iterator<Item = T>) {
         self.scenes += 1;
         match &mut self.state {
             State::Kept(kept) if self.method.by_last_band() => {
@@ -268,7 +268,7 @@ impl<T: Sample> Fold<T> {
 
     /// Whether nothing a later scene holds could change the result: with `first`, once
     /// every value is there. rio-tiler stops reading then.
-    pub(super) fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         match (&self.state, self.method) {
             (State::Kept(kept), Selection::First) => self.scenes > 0 && kept.iter().all(|v| !v.is_nan()),
             _ => false,
@@ -276,7 +276,7 @@ impl<T: Sample> Fold<T> {
     }
 
     /// The values the method leaves. `None` when no scene was taken.
-    pub(super) fn finish(self) -> Option<Selected<T>> {
+    pub(crate) fn finish(self) -> Option<Selected<T>> {
         if self.scenes == 0 {
             return None;
         }
