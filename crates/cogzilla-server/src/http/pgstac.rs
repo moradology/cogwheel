@@ -5576,8 +5576,8 @@ fn respelled(resp: Resp) -> Resp {
 
 /// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
 /// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in.
-/// Only degrees and Web Mercator are worked out here; a picture in any other system, a
-/// preview and a posted shape go without the headers.
+/// Only degrees and Web Mercator are worked out here; a picture in any other system goes
+/// without the headers, and a preview or a posted shape is placed by [`item_drawn_placed`].
 pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
@@ -5639,6 +5639,23 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             }
             let spelled = asked("dst_crs").or_else(|| asked("coord_crs"));
             placed_as(resp, bounds, drawn, spelled.as_deref())
+        }
+        _ => resp,
+    }
+}
+
+/// An item's preview or posted `feature` picture with where it lies, from what the `/stac`
+/// handler that drew it worked out (the raster's own system for a preview): the place
+/// [`item_placed`] cannot tell from the path, in titiler-pgstac's spelling.
+pub(super) fn item_drawn_placed(resp: Resp, sub: &[&str], drawn: Option<([f64; 4], Option<u16>, bool)>) -> Resp {
+    let picture = match sub {
+        ["preview", ..] | ["feature", ..] => true,
+        [one] => one.starts_with("preview.") || one.starts_with("feature."),
+        _ => false,
+    };
+    match drawn {
+        Some((bounds, Some(epsg), crs84)) if picture && bounds.iter().all(|c| c.is_finite()) => {
+            placed_as(resp, bounds, epsg, crs84.then_some("CRS84"))
         }
         _ => resp,
     }
@@ -7776,6 +7793,26 @@ mod tests {
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
+    }
+
+    #[test]
+    fn an_item_preview_and_feature_say_where_they_were_drawn() {
+        let ok = || Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap();
+        let header = |resp: &Resp, name: &str| resp.headers().get(name).map(|v| v.to_str().unwrap().to_string());
+        let drawn = Some(([699960.0, 4790220.0, 809760.0, 4900020.0], Some(32631), false));
+        for sub in [&["preview.png"][..], &["preview"], &["preview", "100x80.png"], &["feature", "64x64.png"], &["feature.png"]] {
+            let resp = item_drawn_placed(ok(), sub, drawn);
+            assert_eq!(header(&resp, "content-bbox").as_deref(), Some("699960.0,4790220.0,809760.0,4900020.0"), "{sub:?}");
+            assert_eq!(header(&resp, "content-crs").as_deref(), Some("<http://www.opengis.net/def/crs/EPSG/0/32631>"));
+        }
+        // Degrees asked for as CRS84 are named so.
+        let resp = item_drawn_placed(ok(), &["feature.png"], Some(([6.5, 43.3, 6.6, 43.4], Some(4326), true)));
+        assert_eq!(header(&resp, "content-crs").as_deref(), Some("<http://www.opengis.net/def/crs/OGC/0/CRS84>"));
+        // Not another route's, nor without a system, nor on an error.
+        assert!(item_drawn_placed(ok(), &["info"], drawn).headers().get("content-bbox").is_none());
+        assert!(item_drawn_placed(ok(), &["preview.png"], Some(([0.0, 0.0, 1.0, 1.0], None, false))).headers().get("content-crs").is_none());
+        let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
+        assert!(item_drawn_placed(missing, &["preview.png"], drawn).headers().get("content-bbox").is_none());
     }
 
     #[test]
