@@ -16,6 +16,57 @@ pub struct GpuMultiBandSlab {
     pub num_bands: u32,
 }
 
+impl GpuMultiBandSlab {
+    /// Allocate a `STORAGE` buffer with `mapped_at_creation: true` and invoke `fill` directly
+    /// on the mapped `&mut [f32]` slice (`num_bands * band_stride` floats) — eliminating all
+    /// intermediate CPU `Vec<f32>` allocations and extra copies, with no renderer mutex lock.
+    pub fn from_mapped_fill<F>(
+        device: &wgpu::Device,
+        num_bands: usize,
+        width: u32,
+        height: u32,
+        stride: u32,
+        fill: F,
+    ) -> Result<Self, GpuError>
+    where
+        F: FnOnce(&mut [f32]) -> Result<(), GpuError>,
+    {
+        if num_bands == 0 || num_bands > 8 || width == 0 || height == 0 || stride < width {
+            return Err(GpuError::InvalidDimensions(format!(
+                "invalid multi-band slab: bands={num_bands}, {width}x{height} stride={stride}"
+            )));
+        }
+        let band_stride = (height as usize)
+            .checked_mul(stride as usize)
+            .ok_or_else(|| GpuError::InvalidDimensions("band_stride overflow".into()))?;
+        let total_elems = band_stride
+            .checked_mul(num_bands)
+            .ok_or_else(|| GpuError::InvalidDimensions("total_elems overflow".into()))?;
+        let byte_size = (total_elems * std::mem::size_of::<f32>()) as u64;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-multiband-slab"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: true,
+        });
+        let res = {
+            let mut mapped = buffer.slice(..).get_mapped_range_mut();
+            let dst: &mut [f32] = bytemuck::cast_slice_mut(&mut mapped);
+            fill(dst)
+        };
+        buffer.unmap();
+        res?;
+        Ok(Self {
+            buffer,
+            width,
+            height,
+            stride,
+            band_stride: band_stride as u32,
+            num_bands: num_bands as u32,
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct GpuInstr {
