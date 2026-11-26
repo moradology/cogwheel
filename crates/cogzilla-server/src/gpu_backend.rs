@@ -6,7 +6,8 @@ use cogzilla_gpu::{
     DispatchPolicy, DispatchRequest, GpuColorFormula, GpuColormapMode, GpuColormapRenderer,
     GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuMosaicCompositor,
     GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab,
-    GpuSlabCache, GpuTerrainRenderer, MultiBandSlabKey, PolicyOverride, SlabKey, opcodes,
+    GpuSlabCache, GpuTerrainRenderer, GpuTileBatcher, MultiBandSlabKey, PolicyOverride, SlabKey,
+    TileCoordSlice, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -48,6 +49,7 @@ pub struct GpuBackend {
     terrain: Mutex<GpuTerrainRenderer>,
     expr: Mutex<GpuExprRenderer>,
     mosaic: Mutex<GpuMosaicCompositor>,
+    batcher: Mutex<GpuTileBatcher>,
     in_flight: AtomicUsize,
 }
 
@@ -157,6 +159,7 @@ impl GpuBackend {
         let terrain = Mutex::new(GpuTerrainRenderer::new(&ctx));
         let expr = Mutex::new(GpuExprRenderer::new(&ctx));
         let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
+        let batcher = Mutex::new(GpuTileBatcher::new(&ctx));
         Some(Arc::new(Self {
             ctx,
             policy,
@@ -167,6 +170,7 @@ impl GpuBackend {
             terrain,
             expr,
             mosaic,
+            batcher,
             in_flight: AtomicUsize::new(0),
         }))
     }
@@ -2424,6 +2428,122 @@ impl GpuBackend {
         drop(expr_guard);
         Some(Bytes::from(raw))
     }
+
+    /// Attempt 3D micro-batched GPU single-band rendering of `K >= 2` separable tiles sharing the
+    /// same source slab in ONE GPU dispatch and ONE readback, amortizing the dispatch floor
+    /// (~1.5 ms Metal / ~50–240 µs Vulkan) across the entire viewport batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_single_band_batch(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        tile_size: usize,
+        tile_uvs: &[(&[f32], &[f32])],
+        src: &BandSource<'_>,
+        style: &SingleBandStyle,
+    ) -> Option<Vec<Bytes>> {
+        let batch_size = tile_uvs.len();
+        if batch_size < 2 || tile_size == 0 || !tile_size.is_multiple_of(4) {
+            return None;
+        }
+        let gpu_mode = map_resample(style.resample)?;
+        let out_kind = match style.format {
+            OutputFormat::Png => GpuPixelOutput::IndexedU8,
+            OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+                GpuPixelOutput::Rgba8
+            }
+            _ => return None,
+        };
+
+        let key = source_slab_key(cog_id, ifd_idx, band0, src);
+        let warm_slab = self.slab_cache.get(&key);
+        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
+        let per_tile_bytes = match out_kind {
+            GpuPixelOutput::IndexedU8 => tile_size * tile_size,
+            GpuPixelOutput::Rgba8 => tile_size * tile_size * 4,
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op: gpu_mode.to_policy_op(),
+            dst_pixels: tile_size * tile_size,
+            upload_bytes,
+            readback_bytes: per_tile_bytes.saturating_mul(batch_size),
+            batch_size,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let mut local_u: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+        let mut local_v: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+        for &(u, v) in tile_uvs {
+            if u.len() != tile_size || v.len() != tile_size {
+                return None;
+            }
+            local_u.push(u.iter().map(|&x| x - bc).collect());
+            local_v.push(v.iter().map(|&y| y - br).collect());
+        }
+        let slices: Vec<TileCoordSlice<'_>> = local_u
+            .iter()
+            .zip(local_v.iter())
+            .map(|(u, v)| TileCoordSlice {
+                u_coords: u.as_slice(),
+                v_coords: v.as_slice(),
+            })
+            .collect();
+
+        let lut = style.colormap.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let raw = self
+            .batcher
+            .lock()
+            .ok()?
+            .render_batch(
+                &slab,
+                &slices,
+                gpu_mode,
+                style.rescale_min,
+                style.rescale_max,
+                &lut_u32,
+                out_kind,
+            )
+            .ok()?;
+
+        if raw.len() != per_tile_bytes * batch_size {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(batch_size);
+        match out_kind {
+            GpuPixelOutput::IndexedU8 => {
+                for i in 0..batch_size {
+                    let chunk = &raw[i * per_tile_bytes..(i + 1) * per_tile_bytes];
+                    out.push(encode_indexed_u8_png(chunk, tile_size as u32, tile_size as u32, lut));
+                }
+            }
+            GpuPixelOutput::Rgba8 => {
+                if style.format == OutputFormat::RawRgba {
+                    let shared = Bytes::from(raw);
+                    for i in 0..batch_size {
+                        out.push(shared.slice(i * per_tile_bytes..(i + 1) * per_tile_bytes));
+                    }
+                } else {
+                    for i in 0..batch_size {
+                        let chunk = &raw[i * per_tile_bytes..(i + 1) * per_tile_bytes];
+                        out.push(encode_rgba_tile(chunk, tile_size as u32, false, style.format));
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
 }
 
 #[cfg(test)]
@@ -3061,6 +3181,77 @@ mod tests {
                     max_err < tol,
                     "SpectralExpr::{expr:?} max err {max_err} >= {tol}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_single_band_tiles_match_single_render() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU batch test (no adapter)");
+            return;
+        };
+
+        let w = 512u32;
+        let h = 512u32;
+        let mut vals = vec![0u16; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                vals[(y * w + x) as usize] = (800.0
+                    + 500.0 * (x as f32 * 0.02).sin()
+                    + 350.0 * (y as f32 * 0.03).cos()) as u16;
+            }
+        }
+        let b0 = DecodedBand {
+            width: w,
+            height: h,
+            data: BandData::U16 {
+                data: vals.into_boxed_slice(),
+                nodata: None,
+            },
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 0.0,
+                max: 2000.0,
+            },
+        };
+        let blocks = [Some(&b0)];
+        let src = BandSource::new(w, h, w, h, 0, 0, 1, 1, &blocks);
+
+        // 16 tiles (4x4 grid of 256x256 tiles) sampling sub-windows of the 512x512 slab
+        let n = 256usize;
+        let mut u_vecs = Vec::with_capacity(16);
+        let mut v_vecs = Vec::with_capacity(16);
+        for ty in 0..4 {
+            for tx in 0..4 {
+                let u0 = 8.0 + (tx as f32) * 120.0;
+                let v0 = 8.0 + (ty as f32) * 120.0;
+                u_vecs.push((0..n).map(|i| u0 + (i as f32) * (116.0 / n as f32)).collect::<Vec<_>>());
+                v_vecs.push((0..n).map(|i| v0 + (i as f32) * (116.0 / n as f32)).collect::<Vec<_>>());
+            }
+        }
+        let uvs: Vec<(&[f32], &[f32])> = u_vecs
+            .iter()
+            .zip(v_vecs.iter())
+            .map(|(u, v)| (u.as_slice(), v.as_slice()))
+            .collect();
+
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 2000.0,
+            colormap: ColormapName::Viridis,
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        if let Some(batch) = gpu.try_render_single_band_batch(4242, 0, 0, n, &uvs, &src, &style) {
+            assert_eq!(batch.len(), 16);
+            // Every tile in the 3D batch must match single-tile GPU render bit-identically
+            for idx in [0usize, 5, 10, 15] {
+                let single = gpu
+                    .try_render_crop_single_band(4242, 0, 0, &u_vecs[idx], &v_vecs[idx], &src, &style)
+                    .expect("warm single tile should render on GPU");
+                assert_eq!(batch[idx], single, "batched tile {idx} differed from single render");
             }
         }
     }
