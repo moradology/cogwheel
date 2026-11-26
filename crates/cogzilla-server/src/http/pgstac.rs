@@ -1447,16 +1447,6 @@ fn in_degrees(pq: &ParsedQuery, pairs: &[(String, String)], x: f64, y: f64) -> R
     check_coord_crs(pairs).map(|()| (x, y))
 }
 
-fn check_dst_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
-    match query_value(pairs, "dst_crs") {
-        Some(dst) if !matches!(dst.to_ascii_lowercase().as_str(), "epsg:4326" | "ogc:crs84") => Err(detail(
-            StatusCode::BAD_REQUEST,
-            format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// `GET {base}/bbox/{minx},{miny},{maxx},{maxy}/assets` and `GET {base}/point/{lon},{lat}/assets`.
 async fn geometry_assets(
     pg: &PgStac,
@@ -3715,9 +3705,10 @@ struct Wgs84Grid {
 
 /// The corner of the raster's extent in WGS84, from points along each edge as GDAL samples
 /// them (one every fifty pixels, between twenty and a hundred steps), and the resolution
-/// of [`wgs84_resolution`].
-fn wgs84_grid(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<Wgs84Grid> {
-    let res = wgs84_resolution(crs, cog)?;
+/// of [`wgs84_resolution`]. With `mercator` the same for a raster warped to Web Mercator:
+/// the corner and the pixel size are then in metres.
+fn warped_grid(crs: &CrsModel, cog: &cogzilla_io::OpenedCog, mercator: bool) -> Option<Wgs84Grid> {
+    let res = if mercator { mercator_resolution(crs, cog)? } else { wgs84_resolution(crs, cog)? };
     let full = cog.index.full_res();
     let (w, h) = (f64::from(full.width), f64::from(full.height));
     let (mut west, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -3727,9 +3718,10 @@ fn wgs84_grid(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<Wgs84Grid>
         for (col, row) in [(f * w, 0.0), (f * w, h), (0.0, f * h), (w, f * h)] {
             let (x, y) = full.pixel_to_crs.forward(col, row);
             let (lon, lat) = crs.to_lonlat_deg(x, y);
-            if lon.is_finite() && lat.is_finite() {
-                west = west.min(lon);
-                north = north.max(lat);
+            let (across, up) = if mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) };
+            if across.is_finite() && up.is_finite() {
+                west = west.min(across);
+                north = north.max(up);
             }
         }
     }
@@ -4327,6 +4319,8 @@ struct StatsRequest<'a> {
     unscale: bool,
     /// A no-data value of the request's own, in the place of each raster's.
     nodata: Option<f32>,
+    /// Whether the pixels counted are those of a grid in Web Mercator metres (`dst_crs`).
+    mercator: bool,
 }
 
 /// The statistics of one feature and the items they were read from, or `None` when the
@@ -4346,8 +4340,21 @@ async fn feature_statistics(
     // numbers come from pgSTAC's list unless the request asks for the lean one.
     let names: Vec<String> = req.query.assets.iter().map(|a| a.name.clone()).collect();
     let lookup = if req.query.lookup == Lookup::Lean { Lookup::Lean } else { Lookup::Reference };
+    // The lean lookup samples a grid in degrees; one in metres is other pixel centres.
+    let sampled = if req.mercator { None } else { part_grid(req.size, bbox) };
+    let search_box = bbox_polygon(bbox);
+    // From here the box and the shape are in the system the pixels are counted in.
+    let on_grid = |lon: f64, lat: f64| if req.mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) };
+    let bbox = {
+        let ((w, s), (e, n)) = (on_grid(bbox[0], bbox[1]), on_grid(bbox[2], bbox[3]));
+        [w, s, e, n]
+    };
+    if bbox.iter().any(|c| !c.is_finite()) {
+        return Err(detail(StatusCode::BAD_REQUEST, "the feature reaches past the edge of Web Mercator, 85.05 degrees north or south"));
+    }
+    let mercator = req.mercator;
     let items = pg
-        .items_for_pixels(&bbox_polygon(bbox), hash, req.query.limits, &names, part_grid(req.size, bbox), lookup)
+        .items_for_pixels(&search_box, hash, req.query.limits, &names, sampled, lookup)
         .await
         .map_err(|e| db_error(&e))?;
     if items.is_empty() {
@@ -4396,7 +4403,7 @@ async fn feature_statistics(
                 // grown to whole pixels of the raster as GDAL would warp it to WGS84. The
                 // first one read sets the size of the result.
                 let crs = engine.get_or_build_crs(cog)?;
-                let grid = wgs84_grid(&crs, cog).ok_or_else(|| {
+                let grid = warped_grid(&crs, cog, mercator).ok_or_else(|| {
                     EngineError::BadRequest(format!("cannot place asset '{}' in WGS84", asset.name))
                 })?;
                 let own_bounds = grid.align(bbox);
@@ -4416,9 +4423,13 @@ async fn feature_statistics(
                 // As on tiles: `resampling` for a source already in the output's projection,
                 // `reproject` for one that has to be warped into it.
                 let resample = match crs {
-                    CrsModel::Geographic => req.query.resampling,
+                    CrsModel::Geographic if !mercator => req.query.resampling,
+                    CrsModel::Epsg3857 if mercator => req.query.resampling,
                     _ => req.query.reproject,
                 };
+                if mercator && resample != ResampleMode::Nearest {
+                    return Err(EngineError::BadRequest("statistics in Web Mercator are read with nearest-neighbour resampling only".into()));
+                }
                 // GDAL takes another road when only some of a raster's bands are read.
                 let all = usize::from(cog.index.full_res().samples_per_pixel);
                 let path = match &asset.indexes {
@@ -4426,7 +4437,7 @@ async fn feature_statistics(
                     _ => WarpPath::Direct,
                 };
                 let read = if resample == ResampleMode::Nearest {
-                    warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, req.nodata).await
+                    warp_nearest(engine, cog, &crs, own_bounds, mercator, size, native, path, req.unscale, true, &[], false, req.nodata).await
                 } else {
                     resampled_planes(engine, cog, own_bounds, size, resample, req.unscale, req.nodata)
                         .await
@@ -4588,7 +4599,14 @@ async fn feature_statistics(
             .map(|polygon| {
                 polygon
                     .iter()
-                    .map(|ring| ring.iter().map(|&(lon, lat)| ((lon - bounds[0]) * sx, (bounds[3] - lat) * sy)).collect())
+                    .map(|ring| {
+                        ring.iter()
+                            .map(|&(lon, lat)| {
+                                let (across, up) = if mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) };
+                                ((across - bounds[0]) * sx, (bounds[3] - up) * sy)
+                            })
+                            .collect()
+                    })
                     .collect()
             })
             .collect();
@@ -4631,6 +4649,7 @@ async fn mosaic_statistics(
     pg: &PgStac,
     hash: &str,
     body: Option<&Bytes>,
+    as_posted: Option<&Bytes>,
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
@@ -4647,9 +4666,20 @@ async fn mosaic_statistics(
         Ok(q) => q,
         Err(r) => return r,
     };
-    if let Err(r) = check_coord_crs(pairs).and_then(|()| check_dst_crs(pairs)) {
+    if let Err(r) = check_coord_crs(pairs) {
         return r;
     }
+    // The pixels counted are those of a grid in `dst_crs`: degrees, or Web Mercator metres.
+    let mercator = match query_value(pairs, "dst_crs").map(|dst| (dst, super::parse_coord_crs_with_epsg(dst))) {
+        None | Some((_, Ok((_, 4326)))) => false,
+        Some((_, Ok((_, 3857)))) => true,
+        Some((dst, _)) => {
+            return detail(
+                StatusCode::BAD_REQUEST,
+                format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
+            );
+        }
+    };
     if query_value(pairs, "algorithm").is_some() {
         return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet");
     }
@@ -4682,9 +4712,18 @@ async fn mosaic_statistics(
         expression: query_value(pairs, "expression"),
         unscale: pq.unscale,
         nodata: pq.nodata,
+        mercator,
+    };
+    // The geometries as they were posted, where the body was in another system than degrees.
+    let posted: Vec<Value> = match as_posted.and_then(|b| serde_json::from_slice::<Value>(b).ok()) {
+        Some(mut doc) => match doc.get_mut("features").and_then(Value::as_array_mut) {
+            Some(list) => list.iter_mut().map(|f| f["geometry"].take()).collect(),
+            None => vec![doc["geometry"].take()],
+        },
+        None => Vec::new(),
     };
     let mut out = Vec::with_capacity(features.len());
-    for feature in &features {
+    for (nth, feature) in features.iter().enumerate() {
         let (stats, used) = match feature_statistics(ctx, pg, hash, feature, &req).await {
             Ok(Some(found)) => found,
             Ok(None) => return no_content(),
@@ -4701,7 +4740,7 @@ async fn mosaic_statistics(
         properties.insert("used_assets".into(), json!(used));
         let mut one = serde_json::Map::new();
         one.insert("type".into(), json!("Feature"));
-        one.insert("geometry".into(), feature["geometry"].clone());
+        one.insert("geometry".into(), posted.get(nth).unwrap_or(&feature["geometry"]).clone());
         one.insert("properties".into(), Value::Object(properties));
         for key in ["id", "bbox"] {
             if let Some(v) = feature.get(key).filter(|v| !v.is_null()) {
@@ -6593,11 +6632,13 @@ async fn mosaic_route(
     let mut pq = pq;
     let in_metres = pq.coord_crs_3857.then(|| body.and_then(posted_in_degrees)).flatten();
     let own_pairs: Vec<(String, String)>;
+    // What was posted, when it was turned: statistics hand each feature back as it came.
+    let as_posted = body.filter(|_| in_metres.is_some());
     let (body, pairs) = match &in_metres {
         Some(turned) => {
             (pq.coord_crs_3857, pq.coord_crs, pq.coord_crs_epsg) = (false, None, None);
             let mut kept: Vec<(String, String)> = pairs.iter().filter(|(k, _)| k != "coord_crs").cloned().collect();
-            if rest != ["statistics"] && query_value(pairs, "dst_crs").is_none() {
+            if query_value(pairs, "dst_crs").is_none() {
                 kept.push(("dst_crs".into(), "epsg:3857".into()));
             }
             own_pairs = kept;
@@ -6756,7 +6797,7 @@ async fn mosaic_route(
             part_image(ctx, pg, &rec.hash, &polygon, bbox, None, size, ext, pq, pairs)
                 .await
         }
-        ["statistics"] => mosaic_statistics(ctx, pg, &rec.hash, body, pq, pairs).await,
+        ["statistics"] => mosaic_statistics(ctx, pg, &rec.hash, body, as_posted, pq, pairs).await,
         ["point", lonlat] => point_values(ctx, pg, &rec.hash, lonlat, &pq, pairs).await,
         ["point", lonlat, "assets"] => {
             let (lon, lat) = match point_coords(lonlat) {

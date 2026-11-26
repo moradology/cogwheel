@@ -351,7 +351,9 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("statistics?assets=visual&histogram_bins=ten", &triangle, 422),
         ("statistics?assets=visual&cover_scale=0", &triangle, 422),
         ("statistics?assets=visual&width=wide", &triangle, 422),
-        ("statistics?assets=visual&dst_crs=epsg:3857", &triangle, 400),
+        // Counted on a grid in metres; nothing lies under the triangle either way.
+        ("statistics?assets=visual&dst_crs=epsg:3857", &triangle, 204),
+        ("statistics?assets=visual&dst_crs=epsg:32632", &triangle, 400),
         ("statistics?assets=visual&algorithm=hillshade", &triangle, 400),
         ("statistics?assets=visual&pixel_selection=mean", &triangle, 204),
         ("statistics?assets=visual&pixel_selection=lastbandhigh", &triangle, 204),
