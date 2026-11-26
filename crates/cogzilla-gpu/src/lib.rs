@@ -4,6 +4,7 @@ pub mod coalesce;
 pub mod colormap;
 pub mod context;
 pub mod expr;
+pub mod jpeg;
 pub mod mosaic;
 pub mod policy;
 pub mod predictor;
@@ -16,6 +17,7 @@ pub use coalesce::{CoalescedJob, CoalescedOutput, CoalescerStats, GpuCoalescer, 
 pub use colormap::{GpuColormapMode, GpuColormapRenderer, GpuCoordPlan, GpuPixelOutput};
 pub use context::{GpuAdapterInfo, GpuContext, GpuError, GpuOptions};
 pub use expr::{GpuColorFormula, GpuExprRenderer, GpuInstr, GpuMultiBandSlab, opcodes};
+pub use jpeg::GpuJpegEncoder;
 pub use mosaic::{GpuMosaicCompositor, GpuPixelSelection, GpuSceneStack};
 pub use policy::{
     DispatchDecision, DispatchPolicy, DispatchReason, DispatchRequest, GpuOp, GpuProfile,

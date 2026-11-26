@@ -88,3 +88,10 @@ required-features = ["gpu"]
 [[example]]
 name = "multiband_npy_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_jpeg_bench"
+required-features = ["gpu"]
+
+[dev-dependencies]
+zune-jpeg.workspace = true
