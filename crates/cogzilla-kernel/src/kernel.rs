@@ -1466,12 +1466,14 @@ pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
 /// The NumPy dtype string of a sample type: little-endian, and `|` for the single bytes.
 pub fn npy_descr(kind: SampleType) -> &'static str {
     match kind {
-        SampleType::Uint8 => "|u1",
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => "|u1",
         SampleType::Int8 => "|i1",
         SampleType::Uint16 => "<u2",
         SampleType::Int16 => "<i2",
         SampleType::Uint32 => "<u4",
         SampleType::Int32 => "<i4",
+        SampleType::Uint64 => "<u8",
+        SampleType::Int64 => "<i8",
         SampleType::Float32 => "<f4",
         SampleType::Float64 => "<f8",
     }
@@ -1526,12 +1528,14 @@ pub fn encode_npy_typed(
         }};
     }
     match kind {
-        SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
         SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
         SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
         SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
         SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
         SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
         SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
         SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }
@@ -1596,12 +1600,14 @@ pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes>
         }};
     }
     match kind {
-        SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
         SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
         SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
         SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
         SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
         SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
         SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
         SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }

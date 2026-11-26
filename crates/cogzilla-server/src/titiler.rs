@@ -302,10 +302,39 @@ pub fn build_cog_validate(
             errors.push(format!("Overview IFD {idx} is not tiled"));
         }
     }
-    // rio-cogeo COG block-offset order check: coarser overviews must be stored before finer levels.
+    // rio-cogeo COG header & block-offset layout checks:
+    // 1. Main IFD must sit near the front of the file (< 300 bytes) so a single initial range read
+    //    can parse the header without extra round-trips.
+    if cog.index.main_ifd_offset >= 300 {
+        errors.push(format!(
+            "The offset of the main IFD should be < 300. It is {} instead",
+            cog.index.main_ifd_offset
+        ));
+    }
     let first_block_offset = |ifd: &cogzilla_tiff::IfdMeta| -> Option<u64> {
         ifd.tile_offsets.iter().copied().find(|&o| o > 0)
     };
+    // 2. Image block data must be stored after its IFD (plain GTiff writes data first, IFD at EOF).
+    if let (Some(first_blk), Some(&main_ifd_off)) = (
+        first_block_offset(&cog.index.ifds[0]),
+        cog.index.ifd_offsets.first(),
+    ) && first_blk < main_ifd_off
+    {
+        errors.push(format!(
+            "The offset of the first block of the image should be after its IFD (block offset {first_blk} < IFD offset {main_ifd_off})"
+        ));
+    }
+    for (idx, ifd) in cog.index.ifds.iter().enumerate().skip(1) {
+        if let (Some(first_blk), Some(&ifd_off)) =
+            (first_block_offset(ifd), cog.index.ifd_offsets.get(idx))
+            && first_blk < ifd_off
+        {
+            errors.push(format!(
+                "The offset of the first block of overview of index {idx} should be after its IFD (block offset {first_blk} < IFD offset {ifd_off})"
+            ));
+        }
+    }
+    // 3. Coarser overviews must be stored before finer levels.
     if cog.index.ifds.len() > 1 {
         if let (Some(main_off), Some(ov1_off)) = (
             first_block_offset(&cog.index.ifds[0]),
@@ -1028,6 +1057,7 @@ pub fn build_tilejson(
         "maxzoom": maxzoom,
         "bounds": bounds,
         "center": center,
+        "raster_layers": {},
         "band_descriptions": band_descriptions,
         "data_type": full.sample_type.gdal_name(),
     }))
@@ -1166,7 +1196,9 @@ enum BandStatsAcc {
 impl BandStatsAcc {
     fn for_sample_type(st: cogzilla_tiff::SampleType, capacity_hint: usize) -> Self {
         match st {
-            cogzilla_tiff::SampleType::Uint8 => Self::HistU8([0u64; 256]),
+            cogzilla_tiff::SampleType::Uint1
+            | cogzilla_tiff::SampleType::Uint4
+            | cogzilla_tiff::SampleType::Uint8 => Self::HistU8([0u64; 256]),
             cogzilla_tiff::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
             _ => Self::Floats(Vec::with_capacity(capacity_hint)),
         }
@@ -3017,9 +3049,71 @@ pub fn encode_geotiff_f32(
 pub fn native_bbox_dims_in_crs(
     ifd: &cogzilla_tiff::IfdMeta,
     src_crs: &cogzilla_proj::CrsModel,
+    dst_crs: &cogzilla_proj::CrsModel,
     wgs_bbox: [f64; 4],
     dst_bbox: [f64; 4],
 ) -> (u32, u32) {
+    let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
+        (dst_bbox[2] + 360.0) - dst_bbox[0]
+    } else {
+        (dst_bbox[2] - dst_bbox[0]).abs()
+    };
+    let dy = (dst_bbox[3] - dst_bbox[1]).abs();
+
+    // Primary path: match GDAL `GDALSuggestedWarpOutput2` / `rasterio.warp.calculate_default_transform`
+    // (diagonal distance in `dst_crs` divided by pixel diagonal `hypot(src_w, src_h)`), or native
+    // per-axis pixel resolution when `src_crs` and `dst_crs` coincide.
+    if dx > 1e-12 && dy > 1e-12 && ifd.width > 0 && ifd.height > 0 && ifd.gcp_poly.is_none() {
+        let (sx0, sy0) = ifd.pixel_to_crs.forward(0.0, 0.0);
+        let (sx1, sy1) = ifd.pixel_to_crs.forward(ifd.width as f64, ifd.height as f64);
+        let (lon0, mut lat0) = src_crs.to_lonlat_deg(sx0, sy0);
+        let (lon1, mut lat1) = src_crs.to_lonlat_deg(sx1, sy1);
+        let mut eff_h = ifd.height as f64;
+        if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
+            && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
+            && (lat0.abs() > 85.06 || lat1.abs() > 85.06)
+        {
+            let orig_span = (lat1 - lat0).abs().max(1e-9);
+            lat0 = lat0.clamp(-85.06, 85.06);
+            lat1 = lat1.clamp(-85.06, 85.06);
+            eff_h = (eff_h * ((lat1 - lat0).abs() / orig_span)).max(1.0);
+        }
+        let (dx0, dy0) = dst_crs.from_lonlat_deg(lon0, lat0);
+        let (dx1, dy1) = dst_crs.from_lonlat_deg(lon1, lat1);
+        if dx0.is_finite() && dy0.is_finite() && dx1.is_finite() && dy1.is_finite() {
+            let src_diag_crs = (sx1 - sx0).hypot(sy1 - sy0);
+            let same_crs = src_diag_crs > 0.0
+                && (dx0 - sx0).hypot(dy0 - sy0) <= 1e-4 * src_diag_crs
+                && (dx1 - sx1).hypot(dy1 - sy1) <= 1e-4 * src_diag_crs;
+            if same_crs {
+                let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+                let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+                if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
+                    return (
+                        (dx / w_res).round().clamp(1.0, 4096.0) as u32,
+                        (dy / h_res).round().clamp(1.0, 4096.0) as u32,
+                    );
+                }
+            }
+            let mut ddx = dx1 - dx0;
+            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && ddx.abs() > 180.0 {
+                let (lon_mid, _) = src_crs.to_lonlat_deg(0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1));
+                if (lon_mid - lon0).abs() > 90.0 && (lon_mid - lon1).abs() > 90.0 {
+                    ddx = if ddx > 0.0 { ddx - 360.0 } else { ddx + 360.0 };
+                }
+            }
+            let ddy = dy1 - dy0;
+            let px_diag = (ifd.width as f64).hypot(eff_h);
+            let res = ddx.hypot(ddy) / px_diag;
+            if res.is_finite() && res > 0.0 {
+                return (
+                    (dx / res).round().clamp(1.0, 4096.0) as u32,
+                    (dy / res).round().clamp(1.0, 4096.0) as u32,
+                );
+            }
+        }
+    }
+
     let [w, s, mut e, n] = wgs_bbox;
     if e < w {
         e += 360.0;
@@ -3066,19 +3160,13 @@ pub fn native_bbox_dims_in_crs(
     }
     let nat_w = (cmax - cmin).abs();
     let nat_h = (rmax - rmin).abs();
-    let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
-        (dst_bbox[2] + 360.0) - dst_bbox[0]
-    } else {
-        (dst_bbox[2] - dst_bbox[0]).abs()
-    };
-    let dy = (dst_bbox[3] - dst_bbox[1]).abs();
     if dx <= 1e-12 || dy <= 1e-12 || nat_w <= 1e-6 || nat_h <= 1e-6 {
         return (
             nat_w.round().clamp(1.0, 4096.0) as u32,
             nat_h.round().clamp(1.0, 4096.0) as u32,
         );
     }
-    // Equal-pixel-density isotropic resolution in dst_crs matching GDAL WarpedVRT:
+    // Equal-pixel-density isotropic resolution in dst_crs fallback:
     let area_px = (nat_w * nat_h).max(1.0);
     let res = ((dx * dy) / area_px).sqrt();
     if !res.is_finite() || res <= 0.0 {
@@ -3245,7 +3333,13 @@ pub async fn compute_statistics_with_options(
                 eff_bbox[3] = cy + 0.5 * dlat;
             }
         }
-        let (nat_w, nat_h) = native_bbox_dims_in_crs(full, &crs, eff_bbox, eff_bbox);
+        let (nat_w, nat_h) = native_bbox_dims_in_crs(
+            full,
+            &crs,
+            &cogzilla_proj::CrsModel::Geographic,
+            eff_bbox,
+            eff_bbox,
+        );
         let (out_w, out_h) = match (opts.width, opts.height) {
             (Some(w), Some(h)) => (w.clamp(1, 4096), h.clamp(1, 4096)),
             (Some(w), None) => {

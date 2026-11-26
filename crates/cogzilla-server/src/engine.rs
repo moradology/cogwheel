@@ -2334,6 +2334,8 @@ mod tests {
             is_bigtiff: false,
             is_georeferenced: true,
             has_rpc: false,
+            main_ifd_offset: 8,
+            ifd_offsets: vec![8],
             gcp_residual_px: None,
             geo_keys,
             nodata: None,

@@ -19,6 +19,8 @@ pub(crate) enum GeoTiffSample {
     I16,
     U32,
     I32,
+    U64,
+    I64,
     F32,
     F64,
 }
@@ -30,15 +32,15 @@ impl GeoTiffSample {
             Self::U8 | Self::I8 => 8,
             Self::U16 | Self::I16 => 16,
             Self::U32 | Self::I32 | Self::F32 => 32,
-            Self::F64 => 64,
+            Self::U64 | Self::I64 | Self::F64 => 64,
         }
     }
 
     /// `SampleFormat` (tag 339): 1 unsigned integer, 2 signed integer, 3 IEEE float.
     pub(crate) const fn format(self) -> u16 {
         match self {
-            Self::U8 | Self::U16 | Self::U32 => 1,
-            Self::I8 | Self::I16 | Self::I32 => 2,
+            Self::U8 | Self::U16 | Self::U32 | Self::U64 => 1,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 => 2,
             Self::F32 | Self::F64 => 3,
         }
     }
@@ -331,12 +333,14 @@ fn write_geotiff_placed(
 pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
     use cogzilla_tiff::SampleType as T;
     match kind {
-        T::Uint8 => GeoTiffSample::U8,
+        T::Uint1 | T::Uint4 | T::Uint8 => GeoTiffSample::U8,
         T::Int8 => GeoTiffSample::I8,
         T::Uint16 => GeoTiffSample::U16,
         T::Int16 => GeoTiffSample::I16,
         T::Uint32 => GeoTiffSample::U32,
         T::Int32 => GeoTiffSample::I32,
+        T::Uint64 => GeoTiffSample::U64,
+        T::Int64 => GeoTiffSample::I64,
         T::Float32 => GeoTiffSample::F32,
         T::Float64 => GeoTiffSample::F64,
     }
@@ -442,12 +446,14 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
         }
         use cogzilla_tiff::SampleType as T;
         match kind {
-            T::Uint8 => put!(u8, |v: f64| v as u8),
+            T::Uint1 | T::Uint4 | T::Uint8 => put!(u8, |v: f64| v as u8),
             T::Int8 => put!(i8, |v: f64| v as i8),
             T::Uint16 => put!(u16, |v: f64| v as u16),
             T::Int16 => put!(i16, |v: f64| v as i16),
             T::Uint32 => put!(u32, |v: f64| v as u32),
             T::Int32 => put!(i32, |v: f64| v as i32),
+            T::Uint64 => put!(u64, |v: f64| v as u64),
+            T::Int64 => put!(i64, |v: f64| v as i64),
             T::Float32 => put!(f32, |v: f64| v as f32),
             T::Float64 => put!(f64, |v: f64| v),
         }
@@ -852,6 +858,8 @@ mod writer_tests {
             GeoTiffSample::I16 => SampleType::Int16,
             GeoTiffSample::U32 => SampleType::Uint32,
             GeoTiffSample::I32 => SampleType::Int32,
+            GeoTiffSample::U64 => SampleType::Uint64,
+            GeoTiffSample::I64 => SampleType::Int64,
             GeoTiffSample::F32 => SampleType::Float32,
             GeoTiffSample::F64 => SampleType::Float64,
         }

@@ -14,22 +14,22 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
         return a;
     }
     let float = |t| matches!(t, T::Float32 | T::Float64);
-    let signed = |t| matches!(t, T::Int8 | T::Int16 | T::Int32);
+    let signed = |t| matches!(t, T::Int8 | T::Int16 | T::Int32 | T::Int64);
     let bits = |t| match t {
-        T::Uint8 | T::Int8 => 8u32,
+        T::Uint1 | T::Uint4 | T::Uint8 | T::Int8 => 8u32,
         T::Uint16 | T::Int16 => 16,
         T::Uint32 | T::Int32 | T::Float32 => 32,
-        T::Float64 => 64,
+        T::Uint64 | T::Int64 | T::Float64 => 64,
     };
     if float(a) || float(b) {
         // float32 holds whole numbers of 16 bits and no more.
         let narrow = |t| if float(t) { bits(t) == 32 } else { bits(t) <= 16 };
         return if narrow(a) && narrow(b) { T::Float32 } else { T::Float64 };
     }
-    let sized = |kinds: [SampleType; 3], width: u32| kinds[match width { 8 => 0, 16 => 1, _ => 2 }];
+    let sized = |kinds: [SampleType; 4], width: u32| kinds[match width { 8 => 0, 16 => 1, 32 => 2, _ => 3 }];
     match (signed(a), signed(b)) {
-        (false, false) => sized([T::Uint8, T::Uint16, T::Uint32], bits(a).max(bits(b))),
-        (true, true) => sized([T::Int8, T::Int16, T::Int32], bits(a).max(bits(b))),
+        (false, false) => sized([T::Uint8, T::Uint16, T::Uint32, T::Uint64], bits(a).max(bits(b))),
+        (true, true) => sized([T::Int8, T::Int16, T::Int32, T::Int64], bits(a).max(bits(b))),
         // A signed type one size up from the unsigned one, or the signed one's own if larger.
         _ => {
             let (own, unsigned) = if signed(a) { (bits(a), bits(b)) } else { (bits(b), bits(a)) };
@@ -73,7 +73,12 @@ pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> +
         SampleType::Float64
     } else {
         match read {
-            SampleType::Uint8 | SampleType::Int8 | SampleType::Uint16 | SampleType::Int16 => SampleType::Int32,
+            SampleType::Uint1
+            | SampleType::Uint4
+            | SampleType::Uint8
+            | SampleType::Int8
+            | SampleType::Uint16
+            | SampleType::Int16 => SampleType::Int32,
             _ => SampleType::Float64,
         }
     }

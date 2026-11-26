@@ -3294,12 +3294,16 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let integer = !unscale
         && matches!(
             ifd.sample_type,
-            cogzilla_tiff::SampleType::Uint8
+            cogzilla_tiff::SampleType::Uint1
+                | cogzilla_tiff::SampleType::Uint4
+                | cogzilla_tiff::SampleType::Uint8
                 | cogzilla_tiff::SampleType::Uint16
                 | cogzilla_tiff::SampleType::Uint32
+                | cogzilla_tiff::SampleType::Uint64
                 | cogzilla_tiff::SampleType::Int8
                 | cogzilla_tiff::SampleType::Int16
                 | cogzilla_tiff::SampleType::Int32
+                | cogzilla_tiff::SampleType::Int64
         );
     let absent = nodata_override.or(primary.index.nodata).unwrap_or(0.0);
     let mut fold = Fold::<f32>::new(method, nb, n_px, integer).absent_as(absent);

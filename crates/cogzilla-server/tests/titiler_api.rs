@@ -5955,3 +5955,222 @@ async fn sweep40_mm1_validate_ungeoreferenced_and_rpc_tiffs() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn parity_nn1_r2_raster_layers_and_f2_sample_types() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_parity_all4_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a minimal 16x16 tiled classic GeoTIFF (EPSG:4326, bounds [0,0,16,16])
+    // with arbitrary (bps, sample_format), raw tile payload, and optional tail-IFD layout.
+    let write_test_geotiff = |path: &std::path::Path, bps: u16, sample_fmt: u16, payload: &[u8], ifd_at_tail: bool| {
+        let write_geo_arrays = |b: &mut Vec<u8>| -> (u32, u32, u32) {
+            let scale_off = b.len() as u32;
+            for v in [1.0f64, 1.0, 0.0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            let tie_off = b.len() as u32;
+            for v in [0.0f64, 0.0, 0.0, 0.0, 16.0, 0.0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            let gk_off = b.len() as u32;
+            let gks: [u16; 16] = [
+                1, 1, 0, 3,
+                1024, 0, 1, 2,    // GTModelTypeGeoKey = Geographic
+                1025, 0, 1, 1,    // GTRasterTypeGeoKey = PixelIsArea
+                2048, 0, 1, 4326, // GeographicTypeGeoKey = WGS84
+            ];
+            for k in gks {
+                b.extend_from_slice(&k.to_le_bytes());
+            }
+            (scale_off, tie_off, gk_off)
+        };
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        let build_ifd = |tile_off: u32, scale_off: u32, tie_off: u32, gk_off: u32| -> Vec<u8> {
+            let mut ifd_bytes: Vec<u8> = Vec::new();
+            ifd_bytes.extend_from_slice(&15u16.to_le_bytes());
+            push_entry(&mut ifd_bytes, 256, 4, 1, 16);                   // ImageWidth
+            push_entry(&mut ifd_bytes, 257, 4, 1, 16);                   // ImageLength
+            push_entry(&mut ifd_bytes, 258, 3, 1, bps as u32);           // BitsPerSample
+            push_entry(&mut ifd_bytes, 259, 3, 1, 1);                    // Compression = None
+            push_entry(&mut ifd_bytes, 262, 3, 1, 1);                    // Photometric = MinIsBlack
+            push_entry(&mut ifd_bytes, 277, 3, 1, 1);                    // SamplesPerPixel
+            push_entry(&mut ifd_bytes, 284, 3, 1, 1);                    // PlanarConfig = Chunky
+            push_entry(&mut ifd_bytes, 322, 4, 1, 16);                   // TileWidth
+            push_entry(&mut ifd_bytes, 323, 4, 1, 16);                   // TileLength
+            push_entry(&mut ifd_bytes, 324, 4, 1, tile_off);             // TileOffsets
+            push_entry(&mut ifd_bytes, 325, 4, 1, payload.len() as u32); // TileByteCounts
+            push_entry(&mut ifd_bytes, 339, 3, 1, sample_fmt as u32);    // SampleFormat
+            push_entry(&mut ifd_bytes, 33550, 12, 3, scale_off);         // ModelPixelScale
+            push_entry(&mut ifd_bytes, 33922, 12, 6, tie_off);           // ModelTiepoint
+            push_entry(&mut ifd_bytes, 34735, 3, 16, gk_off);            // GeoKeyDirectory
+            ifd_bytes.extend_from_slice(&0u32.to_le_bytes());            // next IFD = 0
+            ifd_bytes
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        if ifd_at_tail {
+            let t_off = buf.len() as u32;
+            buf.extend_from_slice(payload);
+            while buf.len() < 400 {
+                buf.push(0);
+            }
+            let (s_off, ti_off, g_off) = write_geo_arrays(&mut buf);
+            let i_off = buf.len() as u32;
+            buf[4..8].copy_from_slice(&i_off.to_le_bytes());
+            buf.extend_from_slice(&build_ifd(t_off, s_off, ti_off, g_off));
+        } else {
+            buf[4..8].copy_from_slice(&8u32.to_le_bytes());
+            let after_ifd = 8 + 2 + 15 * 12 + 4;
+            buf.resize(after_ifd, 0);
+            let (s_off, ti_off, g_off) = write_geo_arrays(&mut buf);
+            let t_off = buf.len() as u32;
+            buf.extend_from_slice(payload);
+            let hdr_ifd = build_ifd(t_off, s_off, ti_off, g_off);
+            buf[8..8 + hdr_ifd.len()].copy_from_slice(&hdr_ifd);
+        }
+        std::fs::write(path, &buf).unwrap();
+    };
+
+    // NN1: valid front-IFD COG vs tail-IFD GTiff
+    let cog_ok_path = tmp.join("cog_front.tif");
+    let gtiff_tail_path = tmp.join("gtiff_tail.tif");
+    write_test_geotiff(&cog_ok_path, 8, 1, &[42u8; 256], false);
+    write_test_geotiff(&gtiff_tail_path, 8, 1, &[42u8; 256], true);
+
+    // F2: 1-bit (alternating 1,0 -> 0b1010_1010 = 0xAA), 4-bit (nibbles 3, 12 -> 0x3C), int64 (-500), uint64 (900)
+    let u1_path = tmp.join("u1.tif");
+    let u4_path = tmp.join("u4.tif");
+    let i64_path = tmp.join("i64.tif");
+    let u64_path = tmp.join("u64.tif");
+    write_test_geotiff(&u1_path, 1, 1, &[0xAAu8; 32], false);
+    write_test_geotiff(&u4_path, 4, 1, &[0x3Cu8; 128], false);
+    let i64_bytes: Vec<u8> = std::iter::repeat((-500i64).to_le_bytes()).take(256).flatten().collect();
+    let u64_bytes: Vec<u8> = std::iter::repeat(900u64.to_le_bytes()).take(256).flatten().collect();
+    write_test_geotiff(&i64_path, 64, 2, &i64_bytes, false);
+    write_test_geotiff(&u64_path, 64, 1, &u64_bytes, false);
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_engine = engine.clone();
+    let srv_task = tokio::spawn(async move {
+        let _ = cogzilla_server::http::serve_listener(srv_engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // 1. NN1: front-IFD COG is valid; tail-IFD GTiff reports COG: false with 2 layout errors.
+    let v_ok: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/cog/validate?url={}", cog_ok_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v_ok["COG"], serde_json::json!(true), "front-IFD COG must pass: {v_ok}");
+    assert!(v_ok["COG_errors"].as_array().unwrap().is_empty());
+
+    let v_tail: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/cog/validate?url={}", gtiff_tail_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v_tail["COG"], serde_json::json!(false), "tail-IFD GTiff must fail COG check: {v_tail}");
+    let errs = v_tail["COG_errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 2, "expected 2 layout errors, got {errs:?}");
+    assert!(errs[0].as_str().unwrap().contains("< 300"), "{errs:?}");
+    assert!(errs[1].as_str().unwrap().contains("after its IFD"), "{errs:?}");
+
+    // 2. TileJSON raster_layers field
+    let tj: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/cog/WebMercatorQuad/tilejson.json?url={}", cog_ok_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(tj.get("raster_layers").is_some_and(|v| v.is_object()), "tilejson missing raster_layers: {tj}");
+
+    // 3. F2: 1-bit, 4-bit, int64, uint64 info + point + statistics + .npy dtype
+    for (path, exp_dtype, exp_val, exp_npy_descr) in [
+        (&u1_path, "uint8", 1.0f64, "'descr': '|u1'"),
+        (&u4_path, "uint8", 3.0f64, "'descr': '|u1'"),
+        (&i64_path, "int64", -500.0f64, "'descr': '<i8'"),
+        (&u64_path, "uint64", 900.0f64, "'descr': '<u8'"),
+    ] {
+        let p = path.to_string_lossy();
+        let info_r = client.get(format!("{base}/cog/info?url={p}")).send().await.unwrap();
+        assert_eq!(info_r.status(), 200, "info failed for {p}");
+        let info: serde_json::Value = serde_json::from_str(&info_r.text().await.unwrap()).unwrap();
+        assert_eq!(info["dtype"], serde_json::json!(exp_dtype), "dtype mismatch for {p}");
+
+        let pt_r = client.get(format!("{base}/cog/point/0.5,15.5?url={p}")).send().await.unwrap();
+        assert_eq!(pt_r.status(), 200, "point failed for {p}");
+        let pt: serde_json::Value = serde_json::from_str(&pt_r.text().await.unwrap()).unwrap();
+        assert!((pt["values"][0].as_f64().unwrap() - exp_val).abs() < 1e-4, "point mismatch for {p}: {pt}");
+
+        let st_r = client.get(format!("{base}/cog/statistics?url={p}")).send().await.unwrap();
+        assert_eq!(st_r.status(), 200, "stats failed for {p}");
+
+        let npy_r = client.get(format!("{base}/cog/preview.npy?url={p}")).send().await.unwrap();
+        assert_eq!(npy_r.status(), 200, "preview.npy failed for {p}");
+        let npy_bytes = npy_r.bytes().await.unwrap();
+        let hdr = std::str::from_utf8(&npy_bytes[10..128.min(npy_bytes.len())]).unwrap_or("");
+        assert!(hdr.contains(exp_npy_descr), "expected {exp_npy_descr} in npy header for {p}, got {hdr:?}");
+    }
+
+    // 4. R2: unsized /cog/bbox + dst_crs matches GDAL/TiTiler WarpedVRT dimensions exactly
+    let sat_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/satellite_utm10n_rgb_zstd_p3.tif");
+    if sat_fixture.exists() {
+        let sat = sat_fixture.to_string_lossy();
+        for (q, exp_w, exp_h) in [
+            ("", 976u32, 976u32),
+            ("&dst_crs=EPSG:3857", 879, 1111),
+            ("&dst_crs=EPSG:32610", 885, 1113),
+        ] {
+            let r = client
+                .get(format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.9.png?url={sat}&max_size=0{q}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let bytes = r.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
+            let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+            let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+            assert_eq!(
+                (w, h),
+                (exp_w, exp_h),
+                "R2 bbox size mismatch for query '{q}'"
+            );
+        }
+    }
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
