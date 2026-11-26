@@ -9,6 +9,7 @@ pub mod mosaic;
 pub mod policy;
 pub mod predictor;
 pub mod resample;
+pub mod stats;
 pub mod terrain;
 
 pub use batch::{GpuTileBatcher, TileCoordSlice};
@@ -25,5 +26,6 @@ pub use policy::{
 };
 pub use predictor::{GpuPredictorDecoder, GpuPredictorKind};
 pub use resample::{GpuResampleMode, GpuResampler, GpuSlab, ResampleTimings};
+pub use stats::{GpuBandStats, GpuStatsReducer};
 pub use terrain::{GpuDemAlgorithm, GpuTerrainRenderer};
 pub use wgpu;
