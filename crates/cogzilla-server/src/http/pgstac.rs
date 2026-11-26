@@ -308,6 +308,25 @@ fn py_whole(s: &str) -> bool {
         && py_number(whole).is_some()
 }
 
+/// Whether the tile engine gathers too little of a raster for this method at this zoom. A
+/// method that gathers a pixel's footprint is right there only while the raster has an
+/// overview about as coarse as the tile (`sum` comes out at half past that); such a tile
+/// is read as a box over its bounds is, which gathers the whole footprint.
+fn engine_gathers_too_little(crs: &CrsModel, cog: &cogzilla_io::OpenedCog, resample: ResampleMode, zoom: u8) -> bool {
+    if !matches!(
+        resample,
+        ResampleMode::Average | ResampleMode::Mode | ResampleMode::Gauss | ResampleMode::Rms | ResampleMode::Min
+            | ResampleMode::Max | ResampleMode::Med | ResampleMode::Q1 | ResampleMode::Q3 | ResampleMode::Sum
+    ) {
+        return false;
+    }
+    let full = cog.index.full_res();
+    let coarsest = cog.index.ifds.iter().map(|ifd| ifd.width).min().unwrap_or(full.width).max(1);
+    let covered = mercator_resolution(crs, cog).map(|res| res * f64::from(full.width) / f64::from(coarsest));
+    let of_tile = 40_075_016.685_578_49 / (256.0 * f64::from(1u32 << u32::from(zoom).min(30)));
+    covered.is_none_or(|covered| of_tile > 2.0 * covered)
+}
+
 /// A tile's `tilesize`, `padding` and `buffer` are more than zero, as titiler-pgstac has them.
 fn tile_bounds_error(pairs: &[(String, String)]) -> Option<Resp> {
     // Of a parameter given twice, the last is the one read.
@@ -2156,7 +2175,10 @@ impl Window {
                     // The tile engine reads the raster's own `nodata` and tiles of 256 and
                     // 512; a `nodata` of the request's, or another size, is read as a box
                     // over the tile's bounds is.
-                    if nodata.is_some() || !matches!(request.tile_size, 256 | 512) {
+                    if nodata.is_some()
+                        || !matches!(request.tile_size, 256 | 512)
+                        || engine_gathers_too_little(&crs, &cog, resample, request.tile.z)
+                    {
                         let full = cog.index.full_res();
                         let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
                         let (w, s, e, n) = tile_bounds_3857(request.tile);
@@ -5138,7 +5160,12 @@ async fn tile(
             }
             // The renderer draws tiles of 256 and 512 pixels: one of another size is read
             // as planes whatever its resampling, where planes can make it.
-            let odd_size = !matches!(dim, 256 | 512) && planes_can && !raw && full.extra_samples.is_empty();
+            // So is one of a method that gathers a pixel's footprint, at a zoom where the
+            // renderer would gather too little of it.
+            let first_crs = engine.get_or_build_crs(&first)?;
+            let first_resample = if matches!(first_crs, CrsModel::Epsg3857) { resampling } else { reproject };
+            let too_little = engine_gathers_too_little(&first_crs, &first, first_resample, tile.z);
+            let odd_size = (!matches!(dim, 256 | 512) || too_little) && planes_can && !raw && full.extra_samples.is_empty();
             if planes_wanted || !one_grid || preferred || odd_size {
                 if pq.algorithm.is_some() {
                     return Err(EngineError::BadRequest(
@@ -5224,23 +5251,11 @@ async fn tile(
                 CrsModel::Epsg3857 => resampling,
                 _ => reproject,
             };
-            // A method that gathers a pixel's footprint is right only while the raster has
-            // an overview about as coarse as the tile: past that the tile engine gathers
-            // too little of it (`sum` comes out at half). Such a tile is refused, not drawn wrong.
-            if matches!(
-                treq.resample,
-                ResampleMode::Average | ResampleMode::Mode | ResampleMode::Gauss | ResampleMode::Rms | ResampleMode::Min
-                    | ResampleMode::Max | ResampleMode::Med | ResampleMode::Q1 | ResampleMode::Q3 | ResampleMode::Sum
-            ) {
-                let crs = engine.get_or_build_crs(&first)?;
-                let coarsest = first.index.ifds.iter().map(|ifd| ifd.width).min().unwrap_or(full.width).max(1);
-                let covered = mercator_resolution(&crs, &first).map(|res| res * f64::from(full.width) / f64::from(coarsest));
-                let of_tile = 40_075_016.685_578_49 / (256.0 * f64::from(1u32 << u32::from(treq.tile.z).min(30)));
-                if covered.is_none_or(|covered| of_tile > 2.0 * covered) {
-                    return Err(EngineError::BadRequest(
-                        "this resampling method is not drawn at a zoom this far below the raster's coarsest overview yet; use nearest, bilinear or cubic, or a `bbox`".into(),
-                    ));
-                }
+            // What planes could not make of such a tile is refused, not drawn wrong.
+            if engine_gathers_too_little(&first_crs, &first, treq.resample, treq.tile.z) {
+                return Err(EngineError::BadRequest(
+                    "this resampling method is drawn at a zoom this far below the raster's coarsest overview without `algorithm`, and with band math planes can read; use nearest, bilinear or cubic, or a `bbox`".into(),
+                ));
             }
             // The renderer draws tiles of 256 and 512 pixels; any other size is read as
             // planes, which is where a request with nearest-neighbour pixels has gone.
