@@ -1957,6 +1957,14 @@ fn tile_intersects_cog(
     ))
 }
 
+/// Return the widest `SampleType` across one or more stacked COGs (matching numpy band stacking).
+fn widest_sample_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_tiff::SampleType {
+    cogs.iter()
+        .map(|c| c.index.full_res().sample_type)
+        .reduce(array_type::wider_type)
+        .unwrap_or(cogzilla_tiff::SampleType::Uint8)
+}
+
 /// Return true when a `.tif`/`.tiff` request should emit a native IEEE Float32 GeoTIFF
 /// (`SampleFormat=3`, `GDAL_NODATA="nan"`) instead of an 8-bit visual RGB/RGBA GeoTIFF.
 fn wants_f32_geotiff(
@@ -1984,10 +1992,13 @@ fn wants_f32_geotiff(
                 | cogzilla_kernel::DemAlgorithm::Contours { .. }
         ),
         BandRequest::Single { .. } => {
-            !source_cog.is_some_and(|c| c.index.color_map.is_some())
-                && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
+            pq.unscale
+                || (!source_cog.is_some_and(|c| c.index.color_map.is_some())
+                    && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8))
         }
-        BandRequest::Rgb { .. } => !matches!(sample_type, cogzilla_tiff::SampleType::Uint8),
+        BandRequest::Rgb { .. } => {
+            pq.unscale || !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
+        }
         BandRequest::CustomExpr { .. }
         | BandRequest::CustomExprRgb { .. }
         | BandRequest::MultiBand { .. }
@@ -6870,7 +6881,7 @@ where
                             } else {
                                 cogs[0].index.full_res().samples_per_pixel
                             };
-                            let st = cogs[0].index.full_res().sample_type;
+                            let st = widest_sample_type(&cogs);
                             let (mut treq, ct) = build_tile_request(
                                 Some(&engine),
                                 TileCoord { z, x, y },
@@ -8011,9 +8022,10 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = pq_stac.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
+                let st = widest_sample_type(&cogs);
                 let mut bands =
-                    build_band_request_for_output(&pq_stac, db, full.sample_type, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, full.sample_type);
+                    build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -8153,7 +8165,7 @@ where
                         } else {
                             cogs[0].index.full_res().samples_per_pixel
                         };
-                        let st = cogs[0].index.full_res().sample_type;
+                        let st = widest_sample_type(&cogs);
                         let (mut treq, ct) = build_tile_request_for_tms(
                             Some(&engine),
                             TileCoord { z, x, y },
@@ -8480,7 +8492,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
@@ -8565,7 +8577,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
@@ -8646,7 +8658,7 @@ where
                     pq_stac.webp_quality,
                     pq_stac.jpeg_quality,
                 )?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
@@ -8737,7 +8749,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
@@ -8819,7 +8831,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq_stac, Some(&cogs[0]), &bands, st);
                 if pq_stac.unscale {
@@ -8877,7 +8889,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
@@ -9387,7 +9399,7 @@ where
                         } else {
                             cogs[0].index.full_res().samples_per_pixel
                         };
-                        let st = cogs[0].index.full_res().sample_type;
+                        let st = widest_sample_type(&cogs);
                         let (mut treq, ct) = build_tile_request_for_tms(
                             Some(&engine),
                             TileCoord { z, x, y },
@@ -9892,8 +9904,9 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = pq.format_param.as_deref().unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let mut bands = build_band_request_for_output(&pq, db, full.sample_type, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, full.sample_type);
+                let st = widest_sample_type(&cogs);
+                let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
+                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -10033,7 +10046,7 @@ where
                 };
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
@@ -10135,7 +10148,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
@@ -10220,7 +10233,7 @@ where
                     pq.webp_quality,
                     pq.jpeg_quality,
                 )?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
@@ -10301,7 +10314,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
@@ -10376,7 +10389,7 @@ where
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
@@ -10435,7 +10448,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let st = cogs[0].index.full_res().sample_type;
+                let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
                 if pq.unscale {
