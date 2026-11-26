@@ -3284,13 +3284,18 @@ fn default_raw_band_count(bands: &BandRequest, pixel_selection: Selection) -> us
     if pixel_selection == Selection::Count {
         return 1;
     }
-    match bands {
+    let raw_nb = match bands {
         BandRequest::Rgb { .. }
         | BandRequest::SarRgb { .. }
         | BandRequest::Terrain { .. }
         | BandRequest::CustomExprRgb { .. } => 3,
         BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
         _ => 1,
+    };
+    if pixel_selection.by_last_band() {
+        raw_nb.saturating_sub(1).max(1)
+    } else {
+        raw_nb
     }
 }
 
@@ -3326,8 +3331,12 @@ async fn render_mosaic_tile_pixel_selection(
         if scene_i > 0 {
             tokio::task::consume_budget().await;
         }
-        let Ok(cog) = engine.store.open_uri(url).await else {
-            continue;
+        let cog = match engine.store.open_uri(url).await {
+            Ok(c) => c,
+            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                return Err(EngineError::Io(e));
+            }
+            Err(_) => continue,
         };
         let cogs = vec![cog];
         let mut scene_bands = treq.bands.clone();
@@ -3374,9 +3383,16 @@ async fn render_mosaic_tile_pixel_selection(
                         "pixel_selection by the last band needs at least two bands".into(),
                     ));
                 }
+                if Fold::<f32>::working_bytes(method, nb, n_px) > MAX_MEDIAN_BUFFER_BYTES {
+                    return Err(EngineError::BadRequest(format!(
+                        "pixel_selection working buffer exceeds memory budget ({} MiB limit); reduce tile_size, buffer, or band count",
+                        MAX_MEDIAN_BUFFER_BYTES / (1024 * 1024)
+                    )));
+                }
                 let integer =
                     reads_whole_numbers(pq.unscale, &scene_bands, cogs[0].index.full_res().sample_type);
-                fold.insert(Fold::new(method, nb, n_px, integer).absent_as(pq.nodata.unwrap_or(0.0)))
+                let absent = pq.nodata.or(cogs[0].index.nodata).unwrap_or(0.0);
+                fold.insert(Fold::new(method, nb, n_px, integer).absent_as(absent))
             }
         };
         if fold.bands() != nb {
@@ -3472,6 +3488,11 @@ fn paint_selected(
             if v.is_finite() {
                 px.copy_from_slice(&custom.lookup(*v, min, inv));
             }
+        }
+        // Under a colour map of the file's or the request's own, the formula is for the
+        // finished picture.
+        if let Some(formula) = &formula {
+            formula.apply_buffer_in_place(&mut rgba, 4);
         }
         return Ok(rgba);
     }
@@ -10488,10 +10509,13 @@ mod tests {
         let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
         let rgba = paint_selected(selected(3, &[64.0, 0.0, 255.0]), 1, &rgb, &pq, None).unwrap();
         assert_eq!(rgba, [levels[64], 0, 255, 255]);
-        // Under a colour map of the raster's or the request's own it is not applied.
+        // Under a colour map of the raster's or the request's own it is for the finished picture.
         let classes = CustomColormap::from_json_str(r#"{"64": [1, 2, 3, 255]}"#, false).unwrap();
         let rgba = paint_selected(selected(1, &[64.0]), 1, &single((0.0, 255.0), ColormapName::Grayscale), &pq, Some(&classes)).unwrap();
-        assert_eq!(rgba, [1, 2, 3, 255]);
+        let mut mapped = [1u8, 2, 3, 255];
+        formula.apply_buffer_in_place(&mut mapped, 4);
+        assert_ne!(mapped, [1, 2, 3, 255]);
+        assert_eq!(rgba, mapped);
         // A formula that does not parse is the request's fault.
         let bad = parse_query(Some("color_formula=nonsense"));
         assert!(matches!(
