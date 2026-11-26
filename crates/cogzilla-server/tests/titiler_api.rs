@@ -3459,9 +3459,17 @@ async fn sweep18_w1_source_freshness_and_w2_referenced_asset_errors() {
     assert_eq!(j["values"][0].as_f64().unwrap(), 111.0);
 
     // Overwrite same size via atomic rename (changes inode + mtime even within same second)
+    // Also exercise encoded TileCache hit invalidation on /cog/tiles!
+    let tile_url = format!("{base}/cog/tiles/WebMercatorQuad/12/655/1583.npy?url={local_url}");
+    let t1 = client.get(&tile_url).send().await.unwrap();
+    assert_eq!(t1.status(), 200);
+    let t1_bytes = t1.bytes().await.unwrap();
     let tmp_swap = tmp.join("mutable_v2.tif");
     std::fs::write(&tmp_swap, build_geo_tiff(64, 64, 222.0)).unwrap();
     std::fs::rename(&tmp_swap, &local_path).unwrap();
+    let t2 = client.get(&tile_url).send().await.unwrap();
+    assert_eq!(t2.status(), 200);
+    assert_ne!(t2.bytes().await.unwrap(), t1_bytes, "W1 TileCache hit must invalidate after overwrite");
     let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={local_url}")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
@@ -3550,6 +3558,15 @@ async fn sweep18_w1_source_freshness_and_w2_referenced_asset_errors() {
     assert_eq!(r.status(), 502, "W2 all-missing mosaic assets must return 502");
     let body = r.text().await.unwrap();
     assert!(body.contains("gone_asset.tif"), "W2 mosaic 502 body should name asset: {body}");
+
+    // MosaicJSON /point where every covering asset is missing -> 502 (not 404)
+    // (-122.4, 37.75) lies inside WebMercatorQuad z=12, x=655, y=1583 (quadkey 023010203333)
+    let r = client
+        .get(format!("{base}/mosaicjson/point/-122.4,37.75?url={}", mj_all_gone.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502, "W2 all-missing mosaicjson/point must return 502");
 
     // MosaicJSON with [gone_asset.tif, valid_asset.tif] -> 200 with X-Failed-Assets header!
     let mj_partial = tmp.join("mj_partial.json");

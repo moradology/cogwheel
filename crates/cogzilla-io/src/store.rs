@@ -628,6 +628,25 @@ impl CogStore {
         }
     }
 
+    /// Validate freshness of any already-cached URIs in `uris` (without opening uncached ones).
+    /// Used before encoded tile-cache lookups so warm `--tile-cache-mb > 0` hits still detect
+    /// overwritten/deleted local files and TTL-expired remote changes.
+    pub async fn ensure_uris_fresh(&self, uris: &[String]) -> Result<(), IoError> {
+        for uri in uris {
+            let cached_hit = self.datasets_by_uri.get(uri).and_then(|existing| {
+                if let OpenSlot::Ready { cog, .. } = existing.value() {
+                    Some(cog.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(cog) = cached_hit {
+                let _ = self.is_cached_cog_fresh(uri, &cog).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Open (or fetch from metadata cache) any local path, `file://`, `http(s)://`, or `s3://` COG.
     /// Singleflight-deduplicated so a 32-tile cold burst against a new S3 COG issues only 1 header GET.
     pub async fn open_uri(&self, uri: &str) -> Result<Arc<OpenedCog>, IoError> {
@@ -648,19 +667,20 @@ impl CogStore {
                 continue;
             }
 
-            let (wait_flight, ready_hit) = {
+            let (wait_flight, ready_hit, own_flight) = {
                 use dashmap::mapref::entry::Entry;
                 match self.datasets_by_uri.entry(uri.to_string()) {
                     Entry::Occupied(occ) => match occ.get() {
                         OpenSlot::Ready { cog, last_used } => {
                             last_used.store(self.uri_tick(), Ordering::Relaxed);
-                            (None, Some(cog.clone()))
+                            (None, Some(cog.clone()), None)
                         }
-                        OpenSlot::InFlight(f) => (Some(f.clone()), None),
+                        OpenSlot::InFlight(f) => (Some(f.clone()), None, None),
                     },
                     Entry::Vacant(vac) => {
-                        vac.insert(OpenSlot::InFlight(Arc::new(OpenFlight::new())));
-                        (None, None)
+                        let f = Arc::new(OpenFlight::new());
+                        vac.insert(OpenSlot::InFlight(f.clone()));
+                        (None, None, Some(f))
                     }
                 }
             };
@@ -706,23 +726,26 @@ impl CogStore {
             struct OpenAbortGuard<'a> {
                 map: &'a DashMap<String, OpenSlot, ahash::RandomState>,
                 uri: String,
+                flight: Arc<OpenFlight>,
                 done: bool,
             }
             impl Drop for OpenAbortGuard<'_> {
                 fn drop(&mut self) {
                     if !self.done {
-                        if let Some((_, OpenSlot::InFlight(f))) = self
-                            .map
-                            .remove_if(&self.uri, |_, v| matches!(v, OpenSlot::InFlight(_)))
-                        {
+                        if let Some((_, OpenSlot::InFlight(f))) = self.map.remove_if(
+                            &self.uri,
+                            |_, v| matches!(v, OpenSlot::InFlight(cur) if Arc::ptr_eq(cur, &self.flight)),
+                        ) {
                             f.notify.notify_waiters();
                         }
                     }
                 }
             }
+            let my_flight = own_flight.expect("owner branch always allocates OpenFlight");
             let mut open_guard = OpenAbortGuard {
                 map: &self.datasets_by_uri,
                 uri: uri.to_string(),
+                flight: my_flight,
                 done: false,
             };
 
@@ -749,7 +772,7 @@ impl CogStore {
 
                 let (index, freshness) = match &source {
                     CogSource::LocalMmap { mmap } => {
-                        let local_path = uri.strip_prefix("file://").unwrap_or(uri);
+                        let local_path = crate::backend::resolve_local_or_reject_scheme(uri)?;
                         let meta = std::fs::metadata(local_path)?;
                         let idx = parse_cog(mmap)?;
                         let fresh = SourceFreshness::Local {

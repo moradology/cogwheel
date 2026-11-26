@@ -13,6 +13,42 @@ use std::sync::OnceLock;
 use crate::backend::IoError;
 
 pub const ALLOWED_URL_PREFIXES_ENV: &str = "COGZILLA_ALLOWED_URL_PREFIXES";
+pub const ALLOWLIST_RESOLVE_SYMLINKS_ENV: &str = "COGZILLA_ALLOWLIST_RESOLVE_SYMLINKS";
+
+/// Normalize `file:///path` and `file://localhost/path` to `/path` (rejecting non-local hosts
+/// like `file://evil/share`). Returns `Ok(Some(path))` if `uri` is a local `file://` URI,
+/// `Ok(None)` if `uri` does not start with `file://`, or `Err(())` for a non-localhost `file://` host.
+pub(crate) fn strip_file_uri_prefix(uri: &str) -> Result<Option<&str>, ()> {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    if rest.starts_with("localhost/") {
+        return Ok(Some(&rest["localhost".len()..]));
+    }
+    if rest == "localhost" {
+        return Ok(Some("/"));
+    }
+    if rest.starts_with('/') {
+        return Ok(Some(rest));
+    }
+    Err(())
+}
+
+fn resolve_symlinks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(ALLOWLIST_RESOLVE_SYMLINKS_ENV)
+            .map(|v| {
+                let s = v.trim();
+                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn is_local_candidate(uri: &str) -> bool {
+    !uri.contains("://") && !uri.starts_with("/vsi")
+}
 
 fn parse_prefixes(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -66,21 +102,39 @@ fn decode_percent_once(s: &str) -> String {
 /// encoded path separators (`%2f`, `%5c`) never match, since they can climb
 /// out of an allowed prefix on downstream HTTP servers/proxies.
 pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
+    matches_any_prefix_with_opts(prefixes, uri, false)
+}
+
+/// Same as [`matches_any_prefix`], with opt-in symlink canonicalization for local paths
+/// (`COGZILLA_ALLOWLIST_RESOLVE_SYMLINKS=1`).
+pub fn matches_any_prefix_with_opts(
+    prefixes: &[String],
+    uri: &str,
+    resolve_symlinks: bool,
+) -> bool {
     // Reject ASCII control characters (including `\t`, `\r`, `\n`), which WHATWG URL parsers
     // (`url` / `reqwest`) silently strip before dot-segment resolution, enabling `.%09./` bypasses.
     if uri.bytes().any(|b| b <= 0x1f || b == 0x7f) {
         return false;
     }
 
+    // Normalize `file:///path` and `file://localhost/path` to `/path` (Z1); reject remote
+    // `file://otherhost/...` URIs.
+    let (is_file_uri, normalized_uri) = match strip_file_uri_prefix(uri) {
+        Ok(Some(local)) => (true, local),
+        Ok(None) => (false, uri),
+        Err(()) => return false,
+    };
+
     // Unwrap GDAL `/vsicurl/http(s)://...` so it receives the exact same HTTP(S) canonicalization
     // and prefix checks as bare `http(s)://` URLs; reject malformed `/vsicurl/` targets.
-    let (is_vsicurl, effective_uri) = if let Some(rest) = uri.strip_prefix("/vsicurl/") {
+    let (is_vsicurl, effective_uri) = if let Some(rest) = normalized_uri.strip_prefix("/vsicurl/") {
         if !(rest.starts_with("http://") || rest.starts_with("https://")) {
             return false;
         }
         (true, rest)
     } else {
-        (false, uri)
+        (false, normalized_uri)
     };
 
     // For HTTP(S) URLs, inspect only the path component (before `?query` / `#fragment`) so valid
@@ -114,14 +168,54 @@ pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
     }
 
     let matches_boundary = |candidate: &str| -> bool {
-        prefixes.iter().any(|p| match candidate.strip_prefix(p.as_str()) {
-            Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
-            None => false,
+        prefixes.iter().any(|raw_p| {
+            let p = match strip_file_uri_prefix(raw_p.as_str()) {
+                Ok(Some(local_p)) => local_p,
+                _ => raw_p.as_str(),
+            };
+            match candidate.strip_prefix(p) {
+                Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
+                None => false,
+            }
         })
     };
 
-    if !(matches_boundary(uri) || (is_vsicurl && matches_boundary(effective_uri))) {
+    if !(matches_boundary(uri)
+        || (is_file_uri && matches_boundary(normalized_uri))
+        || (is_vsicurl && matches_boundary(effective_uri)))
+    {
         return false;
+    }
+
+    // Opt-in symlink hardening (Z3): canonicalize local paths so symlinks inside an allowed
+    // directory pointing outside it are refused with 403.
+    if resolve_symlinks && is_local_candidate(effective_uri) {
+        match std::fs::canonicalize(effective_uri) {
+            Ok(canon) => {
+                let canon_str = canon.to_string_lossy();
+                let canon_ok = prefixes.iter().any(|raw_p| {
+                    let p = match strip_file_uri_prefix(raw_p.as_str()) {
+                        Ok(Some(local_p)) => local_p,
+                        _ => raw_p.as_str(),
+                    };
+                    if !is_local_candidate(p) {
+                        return false;
+                    }
+                    let cp = std::fs::canonicalize(p)
+                        .map(|pb| pb.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| p.to_string());
+                    match canon_str.strip_prefix(cp.as_str()) {
+                        Some(rest) => rest.is_empty() || cp.ends_with('/') || rest.starts_with('/'),
+                        None => false,
+                    }
+                });
+                if !canon_ok {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
     }
 
     // For HTTP(S) URLs, also canonicalize with `reqwest::Url::parse` (the exact parser used by
@@ -147,7 +241,7 @@ pub fn matches_any_prefix(prefixes: &[String], uri: &str) -> bool {
 /// and the location is outside it.
 pub fn check_uri_allowed(uri: &str) -> Result<(), IoError> {
     match configured() {
-        Some(prefixes) if !matches_any_prefix(prefixes, uri) => {
+        Some(prefixes) if !matches_any_prefix_with_opts(prefixes, uri, resolve_symlinks_enabled()) => {
             Err(IoError::Forbidden(uri.to_string()))
         }
         _ => Ok(()),
@@ -258,5 +352,73 @@ mod tests {
             &list(&["/vsicurl/"]),
             "/vsicurl/file:///etc/passwd"
         ));
+    }
+
+    #[test]
+    fn normalizes_file_uri_and_rejects_remote_file_hosts() {
+        let p = list(&["/allowed/dir"]);
+        assert!(matches_any_prefix(&p, "/allowed/dir/a.tif"));
+        assert!(matches_any_prefix(&p, "file:///allowed/dir/a.tif"));
+        assert!(matches_any_prefix(&p, "file://localhost/allowed/dir/a.tif"));
+        assert!(!matches_any_prefix(&p, "file:///allowed/dir2/a.tif"));
+        assert!(!matches_any_prefix(&p, "file:///other/a.tif"));
+        assert!(!matches_any_prefix(&p, "file:///allowed/dir/../etc/passwd"));
+        assert!(!matches_any_prefix(&p, "file://localhost/allowed/dir/../etc/passwd"));
+        assert!(!matches_any_prefix(&p, "file://evil/allowed/dir/a.tif"));
+
+        // Configured `file://` prefix also matches bare local paths and `file://localhost`.
+        let p_file = list(&["file:///allowed/dir/"]);
+        assert!(matches_any_prefix(&p_file, "/allowed/dir/a.tif"));
+        assert!(matches_any_prefix(&p_file, "file:///allowed/dir/a.tif"));
+        assert!(matches_any_prefix(&p_file, "file://localhost/allowed/dir/a.tif"));
+        assert!(!matches_any_prefix(&p_file, "/allowed/other/a.tif"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opt_in_symlink_resolution_blocks_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "cogzilla-allowlist-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let allowed = base.join("allowed");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let ok_file = allowed.join("ok.tif");
+        let secret_file = outside.join("secret.tif");
+        std::fs::write(&ok_file, b"ok").unwrap();
+        std::fs::write(&secret_file, b"secret").unwrap();
+
+        let escape_link = allowed.join("escape.tif");
+        symlink(&secret_file, &escape_link).unwrap();
+
+        let prefixes = vec![allowed.to_string_lossy().into_owned()];
+        let ok_str = ok_file.to_string_lossy();
+        let link_str = escape_link.to_string_lossy();
+        let link_file_uri = format!("file://{link_str}");
+
+        // Default (resolve_symlinks = false): lexical match allows both.
+        assert!(matches_any_prefix_with_opts(&prefixes, &ok_str, false));
+        assert!(matches_any_prefix_with_opts(&prefixes, &link_str, false));
+
+        // Opt-in (resolve_symlinks = true): regular file allowed, escaping symlink refused.
+        assert!(matches_any_prefix_with_opts(&prefixes, &ok_str, true));
+        assert!(!matches_any_prefix_with_opts(&prefixes, &link_str, true));
+        assert!(!matches_any_prefix_with_opts(&prefixes, &link_file_uri, true));
+
+        // Non-existent file under allowed prefix falls through to normal 404.
+        let missing = allowed.join("missing.tif");
+        assert!(matches_any_prefix_with_opts(
+            &prefixes,
+            &missing.to_string_lossy(),
+            true
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
