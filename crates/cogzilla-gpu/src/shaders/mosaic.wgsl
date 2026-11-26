@@ -5,17 +5,22 @@ struct MosaicParams {
     num_scenes: u32,
     /// 0=First, 1=Highest, 2=Lowest, 3=Mean, 4=Median, 5=Stdev, 6=Count
     method: u32,
-    _pad0: u32,
+    /// For 3-band RGB entry point: element stride between R, G, and B stacks (`num_scenes * plane_stride`).
+    band_stride: u32,
     _pad1: u32,
     _pad2: u32,
     rescale_min: f32,
     inv_range_255: f32,
     inv_range_254: f32,
     _pad3: f32,
+    rescale_min_g: f32,
+    inv_range_255_g: f32,
+    rescale_min_b: f32,
+    inv_range_255_b: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: MosaicParams;
-/// Stacked scene planes: scene s at offset s * params.plane_stride
+/// Stacked scene planes: scene s of band b at offset b * params.band_stride + s * params.plane_stride
 @group(0) @binding(1) var<storage, read> scene_planes: array<f32>;
 @group(0) @binding(2) var<storage, read> cmap_lut: array<u32>;
 @group(0) @binding(3) var<storage, read_write> dst_words: array<u32>;
@@ -29,13 +34,13 @@ fn is_finite_f32(v: f32) -> bool {
     return (bits & 0x7f800000u) != 0x7f800000u;
 }
 
-fn select_pixel(px_idx: u32) -> f32 {
+fn select_pixel_at(base_off: u32, px_idx: u32) -> f32 {
     let n = min(params.num_scenes, 32u);
 
     if (params.method == 0u) {
         // First
         for (var s: u32 = 0u; s < n; s = s + 1u) {
-            let v = scene_planes[s * params.plane_stride + px_idx];
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
             if (is_finite_f32(v)) {
                 return v;
             }
@@ -48,7 +53,7 @@ fn select_pixel(px_idx: u32) -> f32 {
         var best = -3.4028234e38;
         var count: u32 = 0u;
         for (var s: u32 = 0u; s < n; s = s + 1u) {
-            let v = scene_planes[s * params.plane_stride + px_idx];
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
             if (is_finite_f32(v)) {
                 if (count == 0u || v > best) {
                     best = v;
@@ -64,7 +69,7 @@ fn select_pixel(px_idx: u32) -> f32 {
         var best = 3.4028234e38;
         var count: u32 = 0u;
         for (var s: u32 = 0u; s < n; s = s + 1u) {
-            let v = scene_planes[s * params.plane_stride + px_idx];
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
             if (is_finite_f32(v)) {
                 if (count == 0u || v < best) {
                     best = v;
@@ -80,7 +85,7 @@ fn select_pixel(px_idx: u32) -> f32 {
         var sum = 0.0;
         var count: u32 = 0u;
         for (var s: u32 = 0u; s < n; s = s + 1u) {
-            let v = scene_planes[s * params.plane_stride + px_idx];
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
             if (is_finite_f32(v)) {
                 sum += v;
                 count += 1u;
@@ -94,7 +99,7 @@ fn select_pixel(px_idx: u32) -> f32 {
         var vals: array<f32, 32>;
         var count: u32 = 0u;
         for (var s: u32 = 0u; s < n; s = s + 1u) {
-            let v = scene_planes[s * params.plane_stride + px_idx];
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
             if (is_finite_f32(v)) {
                 var j = count;
                 while (j > 0u && vals[j - 1u] > v) {
@@ -121,7 +126,7 @@ fn select_pixel(px_idx: u32) -> f32 {
         var m2 = 0.0;
         var count: u32 = 0u;
         for (var s: u32 = 0u; s < n; s = s + 1u) {
-            let v = scene_planes[s * params.plane_stride + px_idx];
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
             if (is_finite_f32(v)) {
                 count += 1u;
                 let delta = v - mean;
@@ -139,12 +144,16 @@ fn select_pixel(px_idx: u32) -> f32 {
     // method == 6u: Count
     var count: u32 = 0u;
     for (var s: u32 = 0u; s < n; s = s + 1u) {
-        let v = scene_planes[s * params.plane_stride + px_idx];
+        let v = scene_planes[base_off + s * params.plane_stride + px_idx];
         if (is_finite_f32(v)) {
             count += 1u;
         }
     }
     return select(nan_f32(), f32(count), count > 0u);
+}
+
+fn select_pixel(px_idx: u32) -> f32 {
+    return select_pixel_at(0u, px_idx);
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -199,4 +208,33 @@ fn mosaic_select_indexed_u8(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     dst_words[py * words_per_row + word_x] = packed;
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn mosaic_select_rgb_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.width || py >= params.height) {
+        return;
+    }
+    let idx = py * params.width + px;
+    let r = select_pixel_at(0u, idx);
+    if (!is_finite_f32(r)) {
+        dst_words[idx] = 0u;
+        return;
+    }
+    let g = select_pixel_at(params.band_stride, idx);
+    if (!is_finite_f32(g)) {
+        dst_words[idx] = 0u;
+        return;
+    }
+    let b = select_pixel_at(2u * params.band_stride, idx);
+    if (!is_finite_f32(b)) {
+        dst_words[idx] = 0u;
+        return;
+    }
+    let r8 = u32(clamp((r - params.rescale_min) * params.inv_range_255, 0.0, 255.0));
+    let g8 = u32(clamp((g - params.rescale_min_g) * params.inv_range_255_g, 0.0, 255.0));
+    let b8 = u32(clamp((b - params.rescale_min_b) * params.inv_range_255_b, 0.0, 255.0));
+    dst_words[idx] = r8 | (g8 << 8u) | (b8 << 16u) | 0xff000000u;
 }

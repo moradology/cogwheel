@@ -161,7 +161,7 @@ fn main() {
 
     println!();
     println!("=== Styled Median Mosaic -> JPEG (1-pass fused GPU JPEG vs 2-pass GPU RGBA8+CPU JPEG vs CPU) ===");
-    for &(dim, n_scenes, iters) in &[(512u32, 12usize, 10usize), (1024, 12, 7), (2048, 12, 5)] {
+    for &(dim, n_scenes, iters) in &[(512u32, 12usize, 10usize), (1024, 12, 7), (2048, 8, 5)] {
         let scenes = make_scenes(dim, dim, n_scenes, 0);
         let refs: Vec<&[f32]> = scenes.iter().map(Vec::as_slice).collect();
 
@@ -233,6 +233,111 @@ fn main() {
         let fus_ms = median_ms(fused_times);
         println!(
             "{dim}x{dim} x {n_scenes} scenes -> JPEG ({} KB): CPU={cpu_ms:7.2} ms | GPU 2-pass(RGBA8+CPU JPEG)={two_ms:6.2} ms | GPU 1-pass fused={fus_ms:6.2} ms ({:.2}x vs 2-pass, {:.1}x vs CPU)",
+            jpg_bytes / 1024,
+            two_ms / fus_ms,
+            cpu_ms / fus_ms
+        );
+    }
+
+    println!();
+    println!("=== 3-Band RGB Median Mosaic -> JPEG (1-pass fused RGB->GPU JPEG vs 2-pass 3xf32+CPU rescale+CPU JPEG vs CPU) ===");
+    for &(dim, n_scenes, iters) in &[(512u32, 12usize, 10usize), (1024, 12, 7), (2048, 8, 5)] {
+        let r_scenes = make_scenes(dim, dim, n_scenes, 0);
+        let g_scenes = make_scenes(dim, dim, n_scenes, 1);
+        let b_scenes = make_scenes(dim, dim, n_scenes, 2);
+        let r_refs: Vec<&[f32]> = r_scenes.iter().map(Vec::as_slice).collect();
+        let g_refs: Vec<&[f32]> = g_scenes.iter().map(Vec::as_slice).collect();
+        let b_refs: Vec<&[f32]> = b_scenes.iter().map(Vec::as_slice).collect();
+        let rgb_planes: [&[&[f32]]; 3] = [&r_refs, &g_refs, &b_refs];
+        let band_vecs: Vec<Vec<&[f32]>> = vec![r_refs.clone(), g_refs.clone(), b_refs.clone()];
+        let rmin = [50.0f32; 3];
+        let rmax = [250.0f32; 3];
+        let inv = 255.0f32 / 200.0;
+        let n_px = (dim * dim) as usize;
+
+        // Warmup
+        let _ = gpu.try_composite_mosaic_rgb_styled(
+            dim,
+            dim,
+            &rgb_planes,
+            GpuPixelSelection::Median,
+            rmin,
+            rmax,
+            OutputFormat::Jpeg { quality: 85 },
+            false,
+        );
+
+        let mut cpu_times = Vec::new();
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let mr = cpu_median_f32(&r_scenes);
+            let mg = cpu_median_f32(&g_scenes);
+            let mb = cpu_median_f32(&b_scenes);
+            let mut rgba = vec![0u8; n_px * 4];
+            for i in 0..n_px {
+                if mr[i].is_finite() && mg[i].is_finite() && mb[i].is_finite() {
+                    rgba[i * 4] = ((mr[i] - 50.0) * inv).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 1] = ((mg[i] - 50.0) * inv).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 2] = ((mb[i] - 50.0) * inv).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+            let jpg = encode_jpeg_rgba(dim, dim, &rgba, 85);
+            std::hint::black_box(jpg.len());
+            cpu_times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+
+        // Old 2-pass: GPU batched 3xf32 readback + CPU RGB rescale + CPU JPEG
+        let mut two_pass_times = Vec::new();
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let bands = gpu
+                .try_composite_mosaic_f32_bands(dim, dim, &band_vecs, GpuPixelSelection::Median)
+                .expect("batched f32 dispatch");
+            let mut rgba = vec![0u8; n_px * 4];
+            for i in 0..n_px {
+                let r = bands[0][i];
+                let g = bands[1][i];
+                let b = bands[2][i];
+                if r.is_finite() && g.is_finite() && b.is_finite() {
+                    rgba[i * 4] = ((r - 50.0) * inv).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 1] = ((g - 50.0) * inv).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 2] = ((b - 50.0) * inv).clamp(0.0, 255.0) as u8;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+            let jpg = encode_jpeg_rgba(dim, dim, &rgba, 85);
+            std::hint::black_box(jpg.len());
+            two_pass_times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+
+        // New 1-pass fused: GPU RGB Mosaic -> GPU JPEG FDCT in 1 submit
+        let mut fused_times = Vec::new();
+        let mut jpg_bytes = 0usize;
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let jpg = gpu
+                .try_composite_mosaic_rgb_styled(
+                    dim,
+                    dim,
+                    &rgb_planes,
+                    GpuPixelSelection::Median,
+                    rmin,
+                    rmax,
+                    OutputFormat::Jpeg { quality: 85 },
+                    false,
+                )
+                .expect("GPU fused RGB JPEG dispatch");
+            jpg_bytes = jpg.len();
+            std::hint::black_box(jpg_bytes);
+            fused_times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+
+        let cpu_ms = median_ms(cpu_times);
+        let two_ms = median_ms(two_pass_times);
+        let fus_ms = median_ms(fused_times);
+        println!(
+            "{dim}x{dim} x {n_scenes} scenes x RGB -> JPEG ({} KB): CPU={cpu_ms:7.2} ms | GPU 2-pass(3xf32+CPU JPEG)={two_ms:6.2} ms | GPU 1-pass fused={fus_ms:6.2} ms ({:.2}x vs 2-pass, {:.1}x vs CPU)",
             jpg_bytes / 1024,
             two_ms / fus_ms,
             cpu_ms / fus_ms
