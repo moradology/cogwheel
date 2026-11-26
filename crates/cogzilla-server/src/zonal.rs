@@ -896,6 +896,73 @@ pub fn compute_weighted_band_stats(
     )
 }
 
+#[inline(always)]
+fn f32_to_sortable_u32(v: f32) -> u32 {
+    let bits = if v == 0.0 { 0u32 } else { v.to_bits() };
+    let mask = ((bits as i32) >> 31) as u32 | 0x8000_0000;
+    bits ^ mask
+}
+
+#[inline(always)]
+fn sortable_u32_to_f32(k: u32) -> f32 {
+    let mask = (((k ^ 0x8000_0000) as i32) >> 31) as u32 | 0x8000_0000;
+    f32::from_bits(k ^ mask)
+}
+
+/// 4-pass 8-bit LSD radix sort keyed by an order-preserving `u32` (skips uniform byte passes).
+#[inline]
+fn radix_sort_by_u32<T: Copy + Default>(data: &mut [T], key: impl Fn(&T) -> u32) {
+    let n = data.len();
+    if n < 1024 {
+        data.sort_unstable_by_key(|x| key(x));
+        return;
+    }
+    let mut tmp = vec![T::default(); n];
+    let mut in_tmp = false;
+    for shift in [0u32, 8, 16, 24] {
+        let (src, dst): (&[T], &mut [T]) = if in_tmp {
+            (&tmp, data)
+        } else {
+            (data, &mut tmp)
+        };
+        let mut counts = [0usize; 256];
+        for item in src {
+            counts[((key(item) >> shift) & 0xFF) as usize] += 1;
+        }
+        if counts[((key(&src[0]) >> shift) & 0xFF) as usize] == n {
+            continue;
+        }
+        let mut sum = 0usize;
+        for c in &mut counts {
+            let v = *c;
+            *c = sum;
+            sum += v;
+        }
+        for &item in src {
+            let b = ((key(&item) >> shift) & 0xFF) as usize;
+            let pos = counts[b];
+            counts[b] = pos + 1;
+            dst[pos] = item;
+        }
+        in_tmp = !in_tmp;
+    }
+    if in_tmp {
+        data.copy_from_slice(&tmp);
+    }
+}
+
+fn radix_sort_u32(data: &mut [u32]) {
+    radix_sort_by_u32(data, |&k| k);
+}
+
+fn radix_sort_u32_f64(data: &mut [(u32, f64)]) {
+    radix_sort_by_u32(data, |&(k, _)| k);
+}
+
+fn radix_sort_u32_f64_f64(data: &mut [(u32, f64, f64)]) {
+    radix_sort_by_u32(data, |&(k, _, _)| k);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute_weighted_band_stats_with_geom(
     pixels: &[f32],
@@ -912,6 +979,9 @@ pub fn compute_weighted_band_stats_with_geom(
     let use_area_w = geom_kind == ZonalGeomKind::Polygon
         && area_weighted
         && !area_model.is_constant();
+    let const_poly_area = (geom_kind == ZonalGeomKind::Polygon && area_model.is_constant())
+        .then(|| area_model.area_at(0, 0));
+    let w_eq_c = !use_area_w && !(geom_kind == ZonalGeomKind::Line && area_weighted && line_len_m.is_some());
     let is_categorical =
         opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty());
 
@@ -930,18 +1000,33 @@ pub fn compute_weighted_band_stats_with_geom(
     let mut min_v_all = f64::INFINITY;
     let mut max_v_all = f64::NEG_INFINITY;
 
-    // `(value, area_or_len_weight, coverage_weight)`
-    let mut weighted_vals: Vec<(f64, f64, f64)> = Vec::new();
+    // Compact value storage:
+    // - `unit_keys`: 4 B/px when `w_eq_c` and every valid pixel so far has `c == 1.0`.
+    // - `cov_vals`: 16 B/px when `w_eq_c` and any valid pixel has `c != 1.0`.
+    // - `weighted_vals`: 24 B/px only when weight differs from coverage (variable-area or geodesic line).
+    let est_cap = (win_w * win_h).min(16 * 1024 * 1024);
+    let mut unit_keys: Vec<u32> = if w_eq_c {
+        Vec::with_capacity(est_cap)
+    } else {
+        Vec::new()
+    };
+    let mut cov_vals: Vec<(u32, f64)> = Vec::new();
+    let mut weighted_vals: Vec<(u32, f64, f64)> = if !w_eq_c {
+        Vec::with_capacity(est_cap)
+    } else {
+        Vec::new()
+    };
+    let mut all_unit = w_eq_c;
+
     // Exact f64 key -> `(coverage_sum, area_m2_sum)` for categorical stats (T2 + T4)
     let mut cat_map: std::collections::BTreeMap<OrderedF64, (f64, f64)> =
         std::collections::BTreeMap::new();
     let mut cat_map_all: std::collections::BTreeMap<OrderedF64, (f64, f64)> =
         std::collections::BTreeMap::new();
 
-    for dy in 0..win_h {
-        let row_off = dy * win_w;
-        for dx in 0..win_w {
-            let i = row_off + dx;
+    if w_eq_c {
+        let total = win_w * win_h;
+        for i in 0..total {
             let c = cov[i];
             if c <= COV_EPS {
                 continue;
@@ -956,26 +1041,17 @@ pub fn compute_weighted_band_stats_with_geom(
                 continue;
             }
             let vf = v as f64;
-            let mut cell_area_m2 = 0.0_f64;
-            let w = match geom_kind {
-                ZonalGeomKind::Polygon => {
-                    let a_px = area_model.area_at(dx, dy);
-                    cell_area_m2 = c * a_px;
-                    area_valid_m2 += cell_area_m2;
-                    if use_area_w { cell_area_m2 } else { c }
-                }
-                ZonalGeomKind::Line => {
-                    let lm = line_len_m.map_or(c, |buf| buf[i]);
-                    length_valid_m += lm;
-                    if area_weighted && lm > 0.0 { lm } else { c }
-                }
-                ZonalGeomKind::Point => c,
-            };
+            let key_u32 = f32_to_sortable_u32(v);
+            if geom_kind == ZonalGeomKind::Polygon && const_poly_area.is_none() {
+                let dy = i / win_w;
+                let dx = i - dy * win_w;
+                area_valid_m2 += c * area_model.area_at(dx, dy);
+            } else if geom_kind == ZonalGeomKind::Line {
+                length_valid_m += line_len_m.map_or(c, |buf| buf[i]);
+            }
             valid_pixels_all += 1;
             count_cov += c;
             sum_cov += c * vf;
-            w_total += w;
-            w_sum += w * vf;
             if vf < min_v_all {
                 min_v_all = vf;
             }
@@ -991,8 +1067,32 @@ pub fn compute_weighted_band_stats_with_geom(
                     max_v = vf;
                 }
             }
-            weighted_vals.push((vf, w, c));
+            if all_unit {
+                if c == 1.0 {
+                    unit_keys.push(key_u32);
+                } else {
+                    all_unit = false;
+                    cov_vals.reserve(est_cap.max(unit_keys.len() + 1));
+                    for &uk in &unit_keys {
+                        cov_vals.push((uk, 1.0));
+                    }
+                    unit_keys.clear();
+                    unit_keys.shrink_to_fit();
+                    cov_vals.push((key_u32, c));
+                }
+            } else {
+                cov_vals.push((key_u32, c));
+            }
             if is_categorical {
+                let cell_area_m2 = if let Some(a_px) = const_poly_area {
+                    c * a_px
+                } else if geom_kind == ZonalGeomKind::Polygon {
+                    let dy = i / win_w;
+                    let dx = i - dy * win_w;
+                    c * area_model.area_at(dx, dy)
+                } else {
+                    0.0
+                };
                 let key = OrderedF64::new(vf);
                 if in_pixel_set {
                     let entry = cat_map.entry(key).or_insert((0.0, 0.0));
@@ -1002,6 +1102,80 @@ pub fn compute_weighted_band_stats_with_geom(
                     let entry = cat_map_all.entry(key).or_insert((0.0, 0.0));
                     entry.0 += c;
                     entry.1 += cell_area_m2;
+                }
+            }
+        }
+        w_total = count_cov;
+        w_sum = sum_cov;
+        if let Some(a_px) = const_poly_area {
+            area_valid_m2 = count_cov * a_px;
+        }
+    } else {
+        for dy in 0..win_h {
+            let row_off = dy * win_w;
+            for dx in 0..win_w {
+                let i = row_off + dx;
+                let c = cov[i];
+                if c <= COV_EPS {
+                    continue;
+                }
+                let in_pixel_set = c > PIXEL_SET_EPS;
+                let v = pixels[i];
+                if !v.is_finite() {
+                    masked_pixels_all += 1;
+                    if in_pixel_set {
+                        masked_pixels += 1;
+                    }
+                    continue;
+                }
+                let vf = v as f64;
+                let mut cell_area_m2 = 0.0_f64;
+                let w = match geom_kind {
+                    ZonalGeomKind::Polygon => {
+                        let a_px = area_model.area_at(dx, dy);
+                        cell_area_m2 = c * a_px;
+                        area_valid_m2 += cell_area_m2;
+                        if use_area_w { cell_area_m2 } else { c }
+                    }
+                    ZonalGeomKind::Line => {
+                        let lm = line_len_m.map_or(c, |buf| buf[i]);
+                        length_valid_m += lm;
+                        if area_weighted && lm > 0.0 { lm } else { c }
+                    }
+                    ZonalGeomKind::Point => c,
+                };
+                valid_pixels_all += 1;
+                count_cov += c;
+                sum_cov += c * vf;
+                w_total += w;
+                w_sum += w * vf;
+                if vf < min_v_all {
+                    min_v_all = vf;
+                }
+                if vf > max_v_all {
+                    max_v_all = vf;
+                }
+                if in_pixel_set {
+                    valid_pixels += 1;
+                    if vf < min_v {
+                        min_v = vf;
+                    }
+                    if vf > max_v {
+                        max_v = vf;
+                    }
+                }
+                weighted_vals.push((f32_to_sortable_u32(v), w, c));
+                if is_categorical {
+                    let key = OrderedF64::new(vf);
+                    if in_pixel_set {
+                        let entry = cat_map.entry(key).or_insert((0.0, 0.0));
+                        entry.0 += c;
+                        entry.1 += cell_area_m2;
+                    } else if valid_pixels == 0 {
+                        let entry = cat_map_all.entry(key).or_insert((0.0, 0.0));
+                        entry.0 += c;
+                        entry.1 += cell_area_m2;
+                    }
                 }
             }
         }
@@ -1041,11 +1215,28 @@ pub fn compute_weighted_band_stats_with_geom(
     }
 
     let mean = w_sum / w_total;
-    let mut var_acc = 0.0_f64;
-    for &(vf, w, _) in &weighted_vals {
-        let d = vf - mean;
-        var_acc += w * d * d;
-    }
+    let var_acc = if all_unit {
+        let mut acc = 0.0_f64;
+        for &k in &unit_keys {
+            let d = sortable_u32_to_f32(k) as f64 - mean;
+            acc += d * d;
+        }
+        acc
+    } else if w_eq_c {
+        let mut acc = 0.0_f64;
+        for &(k, c) in &cov_vals {
+            let d = sortable_u32_to_f32(k) as f64 - mean;
+            acc += c * d * d;
+        }
+        acc
+    } else {
+        let mut acc = 0.0_f64;
+        for &(k, w, _) in &weighted_vals {
+            let d = sortable_u32_to_f32(k) as f64 - mean;
+            acc += w * d * d;
+        }
+        acc
+    };
     let std = (var_acc / w_total).max(0.0).sqrt();
 
     let total_touched = valid_pixels + masked_pixels;
@@ -1055,35 +1246,84 @@ pub fn compute_weighted_band_stats_with_geom(
         0.0
     };
 
-    // Sort once for weighted quantiles, unique count, majority/minority, and histogram.
-    weighted_vals.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    // Radix-sort once for weighted quantiles, unique count, majority/minority, and histogram.
+    if all_unit {
+        radix_sort_u32(&mut unit_keys);
+    } else if w_eq_c {
+        radix_sort_u32_f64(&mut cov_vals);
+    } else {
+        radix_sort_u32_f64_f64(&mut weighted_vals);
+    }
 
     // Weighted quantile helper (linear interpolation on weighted midpoint CDF).
     let weighted_quantile = |pct: f64| -> f64 {
         let q = (pct / 100.0).clamp(0.0, 1.0);
-        if weighted_vals.len() == 1 {
-            return weighted_vals[0].0;
+        if all_unit {
+            let n = unit_keys.len();
+            if n == 1 {
+                return sortable_u32_to_f32(unit_keys[0]) as f64;
+            }
+            let pos = q * (n as f64) - 0.5;
+            if pos <= 0.0 {
+                return sortable_u32_to_f32(unit_keys[0]) as f64;
+            }
+            if pos >= (n - 1) as f64 {
+                return sortable_u32_to_f32(unit_keys[n - 1]) as f64;
+            }
+            let lo = pos.floor() as usize;
+            let frac = pos - (lo as f64);
+            let v0 = sortable_u32_to_f32(unit_keys[lo]) as f64;
+            let v1 = sortable_u32_to_f32(unit_keys[lo + 1]) as f64;
+            return v0 + frac * (v1 - v0);
         }
         let target = q * w_total;
         let mut cum = 0.0_f64;
         let mut prev_mid = 0.0_f64;
-        let mut prev_v = weighted_vals[0].0;
-        for (idx, &(v, w, _)) in weighted_vals.iter().enumerate() {
-            let mid = cum + 0.5 * w;
-            if idx == 0 {
-                if target <= mid {
-                    return v;
-                }
-            } else if target <= mid {
-                let span = (mid - prev_mid).max(1e-30);
-                let frac = ((target - prev_mid) / span).clamp(0.0, 1.0);
-                return prev_v + frac * (v - prev_v);
+        if w_eq_c {
+            if cov_vals.len() == 1 {
+                return sortable_u32_to_f32(cov_vals[0].0) as f64;
             }
-            cum += w;
-            prev_mid = mid;
-            prev_v = v;
+            let mut prev_v = sortable_u32_to_f32(cov_vals[0].0) as f64;
+            for (idx, &(k, w)) in cov_vals.iter().enumerate() {
+                let v = sortable_u32_to_f32(k) as f64;
+                let mid = cum + 0.5 * w;
+                if idx == 0 {
+                    if target <= mid {
+                        return v;
+                    }
+                } else if target <= mid {
+                    let span = (mid - prev_mid).max(1e-30);
+                    let frac = ((target - prev_mid) / span).clamp(0.0, 1.0);
+                    return prev_v + frac * (v - prev_v);
+                }
+                cum += w;
+                prev_mid = mid;
+                prev_v = v;
+            }
+            sortable_u32_to_f32(cov_vals.last().unwrap().0) as f64
+        } else {
+            if weighted_vals.len() == 1 {
+                return sortable_u32_to_f32(weighted_vals[0].0) as f64;
+            }
+            let mut prev_v = sortable_u32_to_f32(weighted_vals[0].0) as f64;
+            for (idx, &(k, w, _)) in weighted_vals.iter().enumerate() {
+                let v = sortable_u32_to_f32(k) as f64;
+                let mid = cum + 0.5 * w;
+                if idx == 0 {
+                    if target <= mid {
+                        return v;
+                    }
+                } else if target <= mid {
+                    let span = (mid - prev_mid).max(1e-30);
+                    let frac = ((target - prev_mid) / span).clamp(0.0, 1.0);
+                    return prev_v + frac * (v - prev_v);
+                }
+                cum += w;
+                prev_mid = mid;
+                prev_v = v;
+            }
+            sortable_u32_to_f32(weighted_vals.last().unwrap().0) as f64
         }
-        weighted_vals.last().unwrap().0
     };
 
     let median = weighted_quantile(50.0);
@@ -1095,30 +1335,82 @@ pub fn compute_weighted_band_stats_with_geom(
     let mut maj_w = -1.0_f64;
     let mut min_val_freq = min_v;
     let mut min_w = f64::INFINITY;
-    let mut idx = 0;
-    while idx < weighted_vals.len() {
-        let v = weighted_vals[idx].0;
-        let mut gc = 0.0_f64;
-        let mut any_in_set = false;
-        while idx < weighted_vals.len() && weighted_vals[idx].0 == v {
-            let c = weighted_vals[idx].2;
-            if c > set_thresh {
-                gc += c;
-                any_in_set = true;
-            }
+    if all_unit {
+        let mut idx = 0;
+        while idx < unit_keys.len() {
+            let k = unit_keys[idx];
+            let start = idx;
             idx += 1;
+            while idx < unit_keys.len() && unit_keys[idx] == k {
+                idx += 1;
+            }
+            let gc = (idx - start) as f64;
+            let v = sortable_u32_to_f32(k) as f64;
+            unique_count += 1;
+            if gc > maj_w {
+                maj_w = gc;
+                maj_val = v;
+            }
+            if gc < min_w {
+                min_w = gc;
+                min_val_freq = v;
+            }
         }
-        if !any_in_set {
-            continue;
+    } else if w_eq_c {
+        let mut idx = 0;
+        while idx < cov_vals.len() {
+            let k = cov_vals[idx].0;
+            let mut gc = 0.0_f64;
+            let mut any_in_set = false;
+            while idx < cov_vals.len() && cov_vals[idx].0 == k {
+                let c = cov_vals[idx].1;
+                if c > set_thresh {
+                    gc += c;
+                    any_in_set = true;
+                }
+                idx += 1;
+            }
+            if !any_in_set {
+                continue;
+            }
+            let v = sortable_u32_to_f32(k) as f64;
+            unique_count += 1;
+            if gc > maj_w {
+                maj_w = gc;
+                maj_val = v;
+            }
+            if gc < min_w {
+                min_w = gc;
+                min_val_freq = v;
+            }
         }
-        unique_count += 1;
-        if gc > maj_w {
-            maj_w = gc;
-            maj_val = v;
-        }
-        if gc < min_w {
-            min_w = gc;
-            min_val_freq = v;
+    } else {
+        let mut idx = 0;
+        while idx < weighted_vals.len() {
+            let k = weighted_vals[idx].0;
+            let mut gc = 0.0_f64;
+            let mut any_in_set = false;
+            while idx < weighted_vals.len() && weighted_vals[idx].0 == k {
+                let c = weighted_vals[idx].2;
+                if c > set_thresh {
+                    gc += c;
+                    any_in_set = true;
+                }
+                idx += 1;
+            }
+            if !any_in_set {
+                continue;
+            }
+            let v = sortable_u32_to_f32(k) as f64;
+            unique_count += 1;
+            if gc > maj_w {
+                maj_w = gc;
+                maj_val = v;
+            }
+            if gc < min_w {
+                min_w = gc;
+                min_val_freq = v;
+            }
         }
     }
 
@@ -1194,17 +1486,54 @@ pub fn compute_weighted_band_stats_with_geom(
         };
         let nbins = edges.len() - 1;
         let mut hist_w = vec![0.0_f64; nbins];
-        for &(vf, _, c) in &weighted_vals {
-            if vf < edges[0] || vf > edges[nbins] {
-                continue;
+        if all_unit {
+            let mut start = unit_keys
+                .partition_point(|&k| (sortable_u32_to_f32(k) as f64) < edges[0]);
+            for bin in 0..nbins {
+                let end = if bin + 1 < nbins {
+                    let hi = edges[bin + 1];
+                    start
+                        + unit_keys[start..]
+                            .partition_point(|&k| (sortable_u32_to_f32(k) as f64) < hi)
+                } else {
+                    let hi = edges[nbins];
+                    start
+                        + unit_keys[start..]
+                            .partition_point(|&k| (sortable_u32_to_f32(k) as f64) <= hi)
+                };
+                hist_w[bin] = (end - start) as f64;
+                start = end;
             }
-            let bin = if vf == edges[nbins] {
-                nbins - 1
-            } else {
-                let pos = edges.partition_point(|&e| e <= vf);
-                pos.saturating_sub(1).min(nbins - 1)
-            };
-            hist_w[bin] += c;
+        } else if w_eq_c {
+            let mut bin = 0usize;
+            for &(k, c) in &cov_vals {
+                let vf = sortable_u32_to_f32(k) as f64;
+                if vf < edges[0] {
+                    continue;
+                }
+                if vf > edges[nbins] {
+                    break;
+                }
+                while bin + 1 < nbins && vf >= edges[bin + 1] {
+                    bin += 1;
+                }
+                hist_w[bin] += c;
+            }
+        } else {
+            let mut bin = 0usize;
+            for &(k, _, c) in &weighted_vals {
+                let vf = sortable_u32_to_f32(k) as f64;
+                if vf < edges[0] {
+                    continue;
+                }
+                if vf > edges[nbins] {
+                    break;
+                }
+                while bin + 1 < nbins && vf >= edges[bin + 1] {
+                    bin += 1;
+                }
+                hist_w[bin] += c;
+            }
         }
         obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
     }
@@ -2415,5 +2744,103 @@ mod tests {
             (len_m - expected_m).abs() / expected_m < 2e-3,
             "100-px 30m UTM diagonal geodesic length expected ~{expected_m} m, got {len_m} m"
         );
+    }
+
+    #[test]
+    fn radix_sort_and_unit_fast_path_match_general_weighted_stats() {
+        // Verify order-preserving f32 <-> u32 bijection across negative, -0.0, +0.0, subnormals, positive.
+        let specials = [-1e20f32, -10.5, -1.0, -1e-40, -0.0, 0.0, 1e-40, 1.0, 10.5, 1e20];
+        let mut keys: Vec<u32> = specials.iter().map(|&v| f32_to_sortable_u32(v)).collect();
+        for w in keys.windows(2) {
+            assert!(w[0] <= w[1], "sortable u32 order broken: {:?}", keys);
+        }
+        assert_eq!(f32_to_sortable_u32(-0.0), f32_to_sortable_u32(0.0));
+        for (&orig, &k) in specials.iter().zip(&keys) {
+            let rt = sortable_u32_to_f32(k);
+            assert_eq!(rt, orig);
+        }
+
+        // Verify radix sort on 2500 elements (> 1024 threshold) for u32 and (u32, f64).
+        let n = 2500usize;
+        let pixels: Vec<f32> = (0..n)
+            .map(|i| (((i * 7919 + 104729) % 2000) as f32 - 1000.0) * 0.013)
+            .collect();
+        let cov_unit = vec![1.0f64; n];
+        let mut cov_frac = vec![1.0f64; n];
+        cov_frac[0] = 0.25;
+        cov_frac[n - 1] = 0.75;
+
+        let opts = StatsOptions::default();
+        // Unit-weight fast path (all c == 1.0, Constant area) vs general variable-area path
+        // (same constant value per row via RowArea -> exercises Path 3).
+        let st_unit = compute_weighted_band_stats(
+            &pixels,
+            &cov_unit,
+            50,
+            50,
+            &PixelAreaModel::Constant(900.0),
+            true,
+            "b1",
+            &opts,
+        );
+        let st_general = compute_weighted_band_stats(
+            &pixels,
+            &cov_unit,
+            50,
+            50,
+            &PixelAreaModel::PerRow(vec![900.0; 50]),
+            true,
+            "b1",
+            &opts,
+        );
+        for k in [
+            "min",
+            "max",
+            "mean",
+            "count",
+            "sum",
+            "std",
+            "median",
+            "majority",
+            "minority",
+            "unique",
+            "percentile_2",
+            "percentile_98",
+            "area",
+        ] {
+            let a = st_unit[k].as_f64().unwrap();
+            let b = st_general[k].as_f64().unwrap();
+            assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "mismatch on {k}: {a} vs {b}");
+        }
+        assert_eq!(st_unit["histogram"], st_general["histogram"]);
+
+        // Fractional-coverage Path 2 vs Path 3
+        let st_cov = compute_weighted_band_stats(
+            &pixels,
+            &cov_frac,
+            50,
+            50,
+            &PixelAreaModel::Constant(900.0),
+            true,
+            "b1",
+            &opts,
+        );
+        let st_cov_gen = compute_weighted_band_stats(
+            &pixels,
+            &cov_frac,
+            50,
+            50,
+            &PixelAreaModel::PerRow(vec![900.0; 50]),
+            true,
+            "b1",
+            &opts,
+        );
+        for k in ["mean", "std", "median", "percentile_2", "percentile_98", "unique"] {
+            let a = st_cov[k].as_f64().unwrap();
+            let b = st_cov_gen[k].as_f64().unwrap();
+            assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "cov mismatch on {k}: {a} vs {b}");
+        }
+        assert_eq!(st_cov["histogram"], st_cov_gen["histogram"]);
+        keys.clear();
     }
 }
