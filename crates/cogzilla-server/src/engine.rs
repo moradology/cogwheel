@@ -1995,6 +1995,24 @@ impl TileEngine {
             .with_scale_offset(sc, off))
         };
 
+        #[cfg(feature = "gpu")]
+        let scene_cog_id = |bands_1based: &[u16]| -> u64 {
+            // Deterministic FNV-1a hash with high-bit tag so multi-COG scene keys never collide
+            // with single-COG `OpenedCog::id` values in `GpuMultiBandCache`.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in bands_1based {
+                let cid = cogs
+                    .get(b.saturating_sub(1) as usize)
+                    .map(|c| c.id)
+                    .unwrap_or(0);
+                for byte in cid.to_le_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            h | (1u64 << 63)
+        };
+
         match &req.bands {
             BandRequest::Single {
                 band_1based,
@@ -2009,6 +2027,17 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_single_band::<N>(cid, ifd_idx, 0, tx0, ty0, &plan, &src, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_single_band::<N>(&plan, &src, &style))
             }
             BandRequest::Terrain {
@@ -2016,6 +2045,28 @@ impl TileEngine {
                 encoding,
             } => {
                 let src = make_src(*band_1based)?;
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_terrain::<N>(
+                            cid,
+                            ifd_idx,
+                            0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *encoding,
+                            req.resample,
+                            req.format,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_terrain_tile::<N>(
                     &plan,
                     &src,
@@ -2042,6 +2093,28 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_dem::<N>(
+                            cid,
+                            ifd_idx,
+                            0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *algorithm,
+                            pixel_size_m,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_dem_algorithm::<N>(
                     &plan,
                     &src,
@@ -2064,6 +2137,25 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            cid,
+                            ifd_idx,
+                            &[1],
+                            &plan,
+                            std::slice::from_ref(&src),
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
             }
             BandRequest::SarRgb {
@@ -2078,6 +2170,17 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_sar_rgb::<N>(sid, ifd_idx, [1, 2], &plan, &srcs, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
             }
             BandRequest::Spectral2 {
@@ -2094,6 +2197,17 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(sid, ifd_idx, &[1, 2], &plan, &srcs, *expr, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
             }
             BandRequest::Spectral3 {
@@ -2114,6 +2228,25 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            sid,
+                            ifd_idx,
+                            &[1, 2, 3],
+                            &plan,
+                            &srcs,
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
             }
             BandRequest::Rgb {
@@ -2132,6 +2265,17 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_rgb::<N>(sid, ifd_idx, [1, 2, 3], &plan, &srcs, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
             }
             BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
@@ -2152,6 +2296,17 @@ impl TileEngine {
                 let mut ordered = Vec::with_capacity(prog.used_bands.len());
                 for &b in &prog.used_bands {
                     ordered.push(make_src(b)?);
+                }
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(&prog.used_bands);
+                    if let Some(bytes) = gpu
+                        .try_render_expr::<N>(sid, ifd_idx, &plan, &ordered, prog, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
                 }
                 Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height)))
             }
