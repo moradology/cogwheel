@@ -4695,6 +4695,116 @@ async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
         .unwrap();
     assert_eq!(r_bogus.status(), 422, "bogus pixel_selection must stay 422");
 
+    // 5. Audit #64 regressions:
+    // (a) POST /mosaicjson/feature.png?pixel_selection=count must succeed (200) and mask outside-polygon corners
+    let tri = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [bounds[0], bounds[1]],
+                [bounds[2], bounds[1]],
+                [bounds[0], bounds[3]],
+                [bounds[0], bounds[1]]
+            ]]
+        }
+    });
+    let r_feat = client
+        .post(format!(
+            "{base}/mosaicjson/feature.npy?url={mp}&width=32&height=32&pixel_selection=count"
+        ))
+        .header("content-type", "application/json")
+        .body(tri.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_feat.status(), 200, "POST /mosaicjson/feature.npy?pixel_selection=count must return 200");
+    let feat_vals = decode_npy_f32(&r_feat.bytes().await.unwrap());
+    // Plane 1 is the mask plane (0 = masked, 255 = valid); top-right corner (row 0, col 31) is outside the triangle
+    let mask_plane = &feat_vals[32 * 32..2 * 32 * 32];
+    assert_eq!(
+        mask_plane[31], 0.0,
+        "Selection::Count on POST /mosaicjson/feature must mask outside-polygon pixels"
+    );
+    assert_eq!(
+        mask_plane[31 * 32], 255.0,
+        "Selection::Count on POST /mosaicjson/feature must keep inside-polygon pixels"
+    );
+
+    // (b) GET /mosaicjson/viewer?pixel_selection=highest -> 200; /mosaicjson/tiles/.../assets?pixel_selection=highest -> 400
+    let r_viewer = client
+        .get(format!("{base}/mosaicjson/viewer?url={mp}&pixel_selection=highest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_viewer.status(), 200, "/mosaicjson/viewer forwards query and must accept pixel_selection");
+    let r_tile_assets = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395/assets?url={mp}&pixel_selection=highest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_tile_assets.status(), 400, "/mosaicjson/tiles/.../assets must refuse pixel_selection with 400");
+
+    // (c) POST /mosaicjson/statistics on Point and horizontal LineString with pixel_selection=count
+    let pt = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": { "type": "Point", "coordinates": [cx, cy] }
+    });
+    let r_pt = client
+        .post(format!("{base}/mosaicjson/statistics?url={mp}&pixel_selection=count"))
+        .header("content-type", "application/json")
+        .body(pt.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pt.status(), 200, "POST /mosaicjson/statistics on Point must succeed");
+    let j_pt: serde_json::Value = serde_json::from_str(&r_pt.text().await.unwrap()).unwrap();
+    assert!(
+        j_pt["properties"]["statistics"]["b1"]["count"].as_f64().unwrap() >= 1.0,
+        "Point stats under count must have valid_pixels >= 1, got {j_pt}"
+    );
+    let hline = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[bounds[0] + 0.05, cy], [bounds[2] - 0.05, cy]]
+        }
+    });
+    let r_line = client
+        .post(format!("{base}/mosaicjson/statistics?url={mp}&pixel_selection=count"))
+        .header("content-type", "application/json")
+        .body(hline.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_line.status(), 200, "POST /mosaicjson/statistics on horizontal LineString must succeed");
+    let j_line: serde_json::Value = serde_json::from_str(&r_line.text().await.unwrap()).unwrap();
+    assert!(
+        j_line["properties"]["statistics"]["b1"]["count"].as_f64().unwrap() >= 1.0,
+        "LineString stats under count must have valid_pixels >= 1, got {j_line}"
+    );
+
+    // (d) 2-band visual PNG under lastbandhigh succeeds (200), while 2-band visual PNG under highest returns 400
+    let r_lbh_png = client
+        .get(format!(
+            "{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.png?url={mp}&bidx=1&bidx=2&pixel_selection=lastbandhigh&rescale=0,100"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_lbh_png.status(), 200, "2-band visual PNG under lastbandhigh must return 200");
+    let r_2b_bad = client
+        .get(format!(
+            "{base}/mosaicjson/bbox/{bbox_str}/32x32.png?url={mp}&bidx=1&bidx=2&pixel_selection=highest"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_2b_bad.status(), 400, "2-band visual PNG under highest must return 400");
+
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
