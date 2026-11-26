@@ -1678,6 +1678,26 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 j6_body.contains("4096") && j6_body.to_ascii_lowercase().contains("exceed"),
                 "expected size-limit message, got: {j6_body}"
             );
+
+            // N4: mismatched rescale count (2 ranges for 3 bands) returns 400 naming the mismatch
+            let n4_bad = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat_url}&rescale=0,0.3&rescale=0,0.3"))
+                .send().await.unwrap();
+            assert_eq!(n4_bad.status(), 400);
+            let n4_body = n4_bad.text().await.unwrap();
+            assert!(
+                n4_body.contains('2') && n4_body.contains('3'),
+                "expected rescale count mismatch message naming 2 and 3, got: {n4_body}"
+            );
+            // 1 range (broadcast) and 3 ranges (per-band) remain valid
+            let n4_one = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat_url}&rescale=0,0.3"))
+                .send().await.unwrap();
+            assert_eq!(n4_one.status(), 200);
+            let n4_three = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat_url}&rescale=0,0.3&rescale=0,0.3&rescale=0,0.3"))
+                .send().await.unwrap();
+            assert_eq!(n4_three.status(), 200);
         }
     }
 }
