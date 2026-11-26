@@ -75,6 +75,20 @@ pub struct RangeResponse {
     pub last_modified: Option<String>,
 }
 
+/// Convert a `reqwest::Error` into `IoError`, surfacing any nested `IoError::Forbidden` thrown
+/// by the redirect-allowlist policy hook as top-level `IoError::Forbidden` so every caller maps
+/// cross-allowlist redirects to `403 Forbidden`.
+pub fn io_error_from_reqwest(e: reqwest::Error) -> IoError {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(s) = src {
+        if let Some(IoError::Forbidden(u)) = s.downcast_ref::<IoError>() {
+            return IoError::Forbidden(u.clone());
+        }
+        src = s.source();
+    }
+    IoError::Http(e.without_url())
+}
+
 #[derive(Clone)]
 pub enum CogSource {
     LocalMmap {
@@ -412,7 +426,7 @@ impl CogSource {
                             if is_retryable_transport_error(&e) {
                                 permit.on_throttle();
                             }
-                            return Err(IoError::Http(e.without_url()));
+                            return Err(io_error_from_reqwest(e));
                         }
                     };
                     let status = resp.status().as_u16();
@@ -573,7 +587,7 @@ impl CogSource {
             client,
             metrics,
             limiter,
-            ..
+            max_retries,
         } = self
         else {
             return Ok(false);
@@ -581,50 +595,78 @@ impl CogSource {
         if validator.etag.is_none() && validator.last_modified.is_none() {
             return Ok(false);
         }
-        let permit = limiter.acquire().await;
-        metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-        let mut req = client.get(url).header("Range", "bytes=0-0");
-        if let Some(ref etag) = validator.etag {
-            req = req.header("If-None-Match", etag);
-        } else if let Some(ref lm) = validator.last_modified {
-            req = req.header("If-Modified-Since", lm);
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => return Err(IoError::Http(e.without_url())),
-        };
-        let status = resp.status().as_u16();
-        if status == 304 {
-            permit.on_success();
-            return Ok(true);
-        }
-        if status == 200 || status == 206 {
-            let resp_etag = resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let resp_lm = resp
-                .headers()
-                .get("last-modified")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            permit.on_success();
-            let unchanged = match (&validator.etag, &resp_etag) {
-                (Some(exp), Some(got)) => exp == got,
-                _ => match (&validator.last_modified, &resp_lm) {
-                    (Some(exp), Some(got)) => exp == got,
-                    _ => false,
-                },
+        let mut attempt = 0u32;
+        loop {
+            let permit = limiter.acquire().await;
+            metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
+            let mut req = client.get(url).header("Range", "bytes=0-0");
+            if let Some(ref etag) = validator.etag {
+                req = req.header("If-None-Match", etag);
+            } else if let Some(ref lm) = validator.last_modified {
+                req = req.header("If-Modified-Since", lm);
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) if attempt < *max_retries && is_retryable_transport_error(&e) => {
+                    permit.on_throttle();
+                    tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    if is_retryable_transport_error(&e) {
+                        permit.on_throttle();
+                    }
+                    return Err(io_error_from_reqwest(e));
+                }
             };
-            return Ok(unchanged);
+            let status = resp.status().as_u16();
+            if status == 304 {
+                permit.on_success();
+                return Ok(true);
+            }
+            if status == 200 || status == 206 {
+                let resp_etag = resp
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let resp_lm = resp
+                    .headers()
+                    .get("last-modified")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                permit.on_success();
+                let unchanged = match (&validator.etag, &resp_etag) {
+                    (Some(exp), Some(got)) => exp == got,
+                    _ => match (&validator.last_modified, &resp_lm) {
+                        (Some(exp), Some(got)) => exp == got,
+                        _ => false,
+                    },
+                };
+                return Ok(unchanged);
+            }
+            if is_retryable_status(status) && attempt < *max_retries {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                permit.on_throttle();
+                tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+            if is_retryable_status(status) {
+                permit.on_throttle();
+            }
+            return Err(IoError::HttpStatus {
+                status,
+                url: redact_http_url(url),
+            });
         }
-        Err(IoError::HttpStatus {
-            status,
-            url: redact_http_url(url),
-        })
     }
 
     /// Zero-copy slice read when backed by local `mmap`.

@@ -736,3 +736,135 @@ async fn disk_cache_serves_ram_misses_with_zero_remote_requests() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn invalidate_uri_never_deadlocks_inflight_open_waiters_and_revalidate_retries_503() {
+    use std::sync::atomic::AtomicUsize;
+
+    // Minimal self-contained 16x16 uint8 uncompressed classic TIFF (no external fixture needed).
+    let mut tiff = Vec::<u8>::new();
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    let num_entries: u16 = 8;
+    let data_offset = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
+    tiff.extend_from_slice(&num_entries.to_le_bytes());
+    let mut entry = |tag: u16, ty: u16, cnt: u32, val: u32| {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&ty.to_le_bytes());
+        tiff.extend_from_slice(&cnt.to_le_bytes());
+        tiff.extend_from_slice(&val.to_le_bytes());
+    };
+    entry(256, 4, 1, 16); // ImageWidth
+    entry(257, 4, 1, 16); // ImageLength
+    entry(258, 3, 1, 8); // BitsPerSample
+    entry(259, 3, 1, 1); // Compression = None
+    entry(262, 3, 1, 1); // Photometric = MinIsBlack
+    entry(273, 4, 1, data_offset); // StripOffsets
+    entry(278, 4, 1, 16); // RowsPerStrip
+    entry(279, 4, 1, 256); // StripByteCounts
+    tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+    tiff.extend(std::iter::repeat_n(42u8, 256));
+    let fixture = Arc::new(tiff);
+
+    let reval_hits = Arc::new(AtomicUsize::new(0));
+    let reval_hits_srv = reval_hits.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fixture_srv = fixture.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let io = TokioIo::new(stream);
+            let data = fixture_srv.clone();
+            let rh = reval_hits_srv.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let data = data.clone();
+                    let rh = rh.clone();
+                    async move {
+                        if req.headers().contains_key("if-none-match") {
+                            let n = rh.fetch_add(1, Ordering::Relaxed);
+                            if n == 0 {
+                                let mut r = Response::new(Full::new(Bytes::from_static(b"busy")));
+                                *r.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                                return Ok::<_, Infallible>(r);
+                            }
+                            let mut r = Response::new(Full::new(Bytes::new()));
+                            *r.status_mut() = StatusCode::NOT_MODIFIED;
+                            return Ok::<_, Infallible>(r);
+                        }
+                        // Slow open so a waiter parks and invalidate_uri(None) races mid-flight.
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        let total = data.len();
+                        let range = req
+                            .headers()
+                            .get("range")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.strip_prefix("bytes="));
+                        if let Some(r) = range
+                            && let Some((a, b)) = r.split_once('-')
+                        {
+                            let start: usize = a.parse().unwrap_or(0);
+                            let end_incl: usize = b.parse().unwrap_or(total - 1).min(total - 1);
+                            let slice = &data[start..=end_incl];
+                            let mut resp = Response::new(Full::new(Bytes::copy_from_slice(slice)));
+                            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                            resp.headers_mut()
+                                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                            resp.headers_mut()
+                                .insert("etag", HeaderValue::from_static("\"v1\""));
+                            resp.headers_mut().insert(
+                                CONTENT_RANGE,
+                                HeaderValue::from_str(&format!("bytes {start}-{end_incl}/{total}"))
+                                    .unwrap(),
+                            );
+                            resp.headers_mut().insert(
+                                CONTENT_LENGTH,
+                                HeaderValue::from_str(&slice.len().to_string()).unwrap(),
+                            );
+                            return Ok::<_, Infallible>(resp);
+                        }
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
+                    }
+                });
+                let _ = ServerBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+
+    let url = format!("http://{addr}/slow.tif");
+    let store = Arc::new(CogStore::new(4 * 1024 * 1024));
+
+    // 1. Start owner + waiter concurrently and call invalidate_uri(&url, None) mid-flight.
+    let s1 = store.clone();
+    let u1 = url.clone();
+    let t1 = tokio::spawn(async move { s1.open_uri(&u1).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let s2 = store.clone();
+    let u2 = url.clone();
+    let t2 = tokio::spawn(async move { s2.open_uri(&u2).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    store.invalidate_uri(&url, None);
+
+    let (r1, r2) = tokio::time::timeout(Duration::from_secs(3), async {
+        (t1.await.unwrap(), t2.await.unwrap())
+    })
+    .await
+    .expect("invalidate_uri(None) deadlocked in-flight open_uri waiter");
+    let cog = r1.unwrap();
+    assert_eq!(cog.id, r2.unwrap().id);
+
+    // 2. revalidate_remote must retry the transient 503 and succeed on 304.
+    let validator = cog.remote_validator().expect("ETag validator present");
+    let unchanged = cog.source.revalidate_remote(validator).await.unwrap();
+    assert!(unchanged, "expected revalidate_remote to retry 503 and return Ok(true) on 304");
+    assert_eq!(reval_hits.load(Ordering::Relaxed), 2);
+
+    // 3. clear_open_uris must evict Ready entries and bump invalidation_epoch.
+    let ep_before = store.invalidation_epoch.load(Ordering::Acquire);
+    store.clear_open_uris();
+    assert!(store.invalidation_epoch.load(Ordering::Acquire) > ep_before);
+}

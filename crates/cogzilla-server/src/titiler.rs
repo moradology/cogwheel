@@ -12,6 +12,9 @@ use cogzilla_kernel::{
 use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
+use crate::geotiff::{
+    GeoTiffLayout, GeoTiffPhotometric, GeoTiffSample, GeoTiffSpec, write_geotiff,
+};
 
 fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta, has_color_map: bool) -> Vec<&'static str> {
     let count = full.samples_per_pixel as usize;
@@ -2832,140 +2835,44 @@ pub fn encode_geotiff_rgba(
     } else {
         3
     };
-    let pixel_bytes = n_px * (spp as usize);
-    let n_entries: u16 = if return_mask { 14 } else { 13 };
-
-    // Layout:
-    // 0..8                     : TIFF header ("II", 42, ifd_offset=8)
-    // 8..8+2+12*n_entries+4    : IFD
-    // out_off..                : BitsPerSample (spp*2 if spp>2), ModelPixelScale (24), ModelTiepoint (48), GeoKeyDir (32)
-    // pixel_off..              : Raw strip pixel data
-    let ifd_size = 2 + 12 * (n_entries as usize) + 4;
-    let bps_bytes: u32 = if spp > 2 { (spp as u32) * 2 } else { 0 };
-    let bps_off = (8 + ifd_size) as u32;
-    let scale_off = bps_off + bps_bytes;
-    let tie_off = scale_off + 24;
-    let gkd_off = tie_off + 48;
-    let pixel_off = gkd_off + 32;
-
-    let mut buf = BytesMut::with_capacity((pixel_off as usize) + pixel_bytes);
-    // TIFF little-endian header
-    buf.put_slice(b"II");
-    buf.put_u16_le(42);
-    buf.put_u32_le(8);
-
-    // IFD entry count
-    buf.put_u16_le(n_entries);
-    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
-        buf.put_u16_le(tag);
-        buf.put_u16_le(ty);
-        buf.put_u32_le(count);
-        buf.put_u32_le(val);
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: spp,
+        sample: GeoTiffSample::U8,
+        // 8-bit unsigned is the TIFF default, and GDAL's own byte GeoTIFFs carry no SampleFormat.
+        sample_format_tag: false,
+        layout: GeoTiffLayout::Chunky,
+        photometric: if is_gray { GeoTiffPhotometric::MinIsBlack } else { GeoTiffPhotometric::Rgb },
+        extra_samples: if return_mask { &[2] } else { &[] }, // UnassociatedAlpha
+        nodata: None,
+        bbox,
+        epsg,
     };
-    const SHORT: u16 = 3;
-    const LONG: u16 = 4;
-    const DOUBLE: u16 = 12;
-
-    put_entry(256, LONG, 1, width);
-    put_entry(257, LONG, 1, height);
-    match spp {
-        1 => put_entry(258, SHORT, 1, 8),
-        2 => put_entry(258, SHORT, 2, 8 | (8 << 16)),
-        _ => put_entry(258, SHORT, spp as u32, bps_off),
-    }
-    put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, if is_gray { 1 } else { 2 }); // Photometric = MinIsBlack (1) or RGB (2)
-    put_entry(273, LONG, 1, pixel_off); // StripOffsets
-    put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
-    put_entry(278, LONG, 1, height); // RowsPerStrip
-    put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
-    put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
-    if return_mask {
-        put_entry(338, SHORT, 1, 2); // ExtraSamples = UnassociatedAlpha
-    }
-    put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
-    put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
-    put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
-    buf.put_u32_le(0); // Next IFD = 0
-
-    // BitsPerSample (only out-of-line when spp > 2)
-    if spp > 2 {
-        for _ in 0..spp {
-            buf.put_u16_le(8);
-        }
-    }
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
-    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
-    let span_x = if is_geographic && bbox[2] < bbox[0] {
-        (bbox[2] + 360.0) - bbox[0]
-    } else {
-        (bbox[2] - bbox[0]).abs()
-    };
-    let dx = (span_x / (width.max(1) as f64)).max(1e-12);
-    let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
-    buf.put_f64_le(dx);
-    buf.put_f64_le(dy);
-    buf.put_f64_le(0.0);
-    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(bbox[0]);
-    buf.put_f64_le(bbox[3]);
-    buf.put_f64_le(0.0);
-    // GeoKeyDirectoryTag (16 u16s = 32 bytes)
-    let (model_type, crs_key): (u16, u16) = if is_geographic {
-        (2, 2048) // ModelTypeGeographic, GeographicTypeGeoKey
-    } else {
-        (1, 3072) // ModelTypeProjected, ProjectedCSTypeGeoKey
-    };
-    let gkd: [u16; 16] = [
-        1, 1, 0, 3, // version 1.1.0, 3 keys
-        1024, 0, 1, model_type, // GTModelTypeGeoKey
-        1025, 0, 1, 1, // GTRasterTypeGeoKey = PixelIsArea
-        crs_key, 0, 1, epsg, // EPSG code
-    ];
-    for &k in &gkd {
-        buf.put_u16_le(k);
-    }
-
-    // Pixel data
-    if is_gray {
-        if return_mask {
-            for px in rgba.chunks_exact(4).take(n_px) {
-                buf.put_u8(px[0]);
-                buf.put_u8(px[3]);
+    // A short `rgba` leaves the rest of the strip zero-filled by the writer.
+    write_geotiff(&spec, |buf| {
+        if is_gray {
+            if return_mask {
+                for px in rgba.chunks_exact(4).take(n_px) {
+                    buf.put_u8(px[0]);
+                    buf.put_u8(px[3]);
+                }
+            } else {
+                for px in rgba.chunks_exact(4).take(n_px) {
+                    buf.put_u8(px[0]);
+                }
             }
+        } else if return_mask {
+            let take = (n_px * 4).min(rgba.len());
+            buf.put_slice(&rgba[..take]);
         } else {
             for px in rgba.chunks_exact(4).take(n_px) {
                 buf.put_u8(px[0]);
+                buf.put_u8(px[1]);
+                buf.put_u8(px[2]);
             }
         }
-        let target_len = (pixel_off as usize) + pixel_bytes;
-        if buf.len() < target_len {
-            buf.resize(target_len, 0);
-        }
-    } else if return_mask {
-        let take = pixel_bytes.min(rgba.len());
-        buf.put_slice(&rgba[..take]);
-        if take < pixel_bytes {
-            buf.resize((pixel_off as usize) + pixel_bytes, 0);
-        }
-    } else {
-        for px in rgba.chunks_exact(4).take(n_px) {
-            buf.put_u8(px[0]);
-            buf.put_u8(px[1]);
-            buf.put_u8(px[2]);
-        }
-        let target_len = (pixel_off as usize) + pixel_bytes;
-        if buf.len() < target_len {
-            buf.resize(target_len, 0);
-        }
-    }
-    buf.freeze()
+    })
 }
 
 /// Encode a CHW `f32` little-endian buffer as a spec-compliant uncompressed Classic IEEE Float32
@@ -2990,11 +2897,12 @@ pub fn encode_geotiff_f32(
     };
     let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
     let pixel_bytes = n_px * (spp as usize) * 4;
-    let photometric: u32 = if data_spp == 3 { 2 } else { 1 }; // RGB when data has 3 bands, MinIsBlack otherwise
-    let extra_samples_count: u16 = if photometric == 2 {
-        spp.saturating_sub(3)
-    } else {
-        spp.saturating_sub(1)
+    // RGB when data has 3 bands, MinIsBlack otherwise
+    let photometric =
+        if data_spp == 3 { GeoTiffPhotometric::Rgb } else { GeoTiffPhotometric::MinIsBlack };
+    let extra_samples_count: u16 = match photometric {
+        GeoTiffPhotometric::Rgb => spp.saturating_sub(3),
+        GeoTiffPhotometric::MinIsBlack => spp.saturating_sub(1),
     };
     let mut extra_samples = Vec::with_capacity(extra_samples_count as usize);
     for idx in 0..extra_samples_count {
@@ -3002,174 +2910,59 @@ pub fn encode_geotiff_f32(
         // 2 = UnassociatedAlpha for the appended validity mask, 0 = Unspecified for extra data bands.
         extra_samples.push(if is_mask { 2u16 } else { 0u16 });
     }
-    let n_entries: u16 = if extra_samples_count > 0 { 16 } else { 15 };
-
-    let ifd_size = 2 + 12 * (n_entries as usize) + 4;
-    let mut extra_off = (8 + ifd_size) as u32;
-    let bps_val = if spp == 1 {
-        32u32
-    } else if spp == 2 {
-        32u32 | (32u32 << 16)
-    } else {
-        let off = extra_off;
-        extra_off += (spp as u32) * 2;
-        off
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: spp,
+        sample: GeoTiffSample::F32,
+        sample_format_tag: true,
+        layout: GeoTiffLayout::Chunky,
+        photometric,
+        extra_samples: &extra_samples,
+        nodata: Some("nan"),
+        bbox,
+        epsg,
     };
-    let extra_samples_val = match extra_samples_count {
-        0 => 0u32,
-        1 => extra_samples[0] as u32,
-        2 => (extra_samples[0] as u32) | ((extra_samples[1] as u32) << 16),
-        _ => {
-            let off = extra_off;
-            extra_off += (extra_samples_count as u32) * 2;
-            off
-        }
-    };
-    let sf_val = if spp == 1 {
-        3u32
-    } else if spp == 2 {
-        3u32 | (3u32 << 16)
-    } else {
-        let off = extra_off;
-        extra_off += (spp as u32) * 2;
-        off
-    };
-    let scale_off = extra_off;
-    let tie_off = scale_off + 24;
-    let gkd_off = tie_off + 48;
-    let pixel_off = gkd_off + 32;
-
-    let mut buf = BytesMut::with_capacity((pixel_off as usize) + pixel_bytes);
-    // TIFF little-endian header
-    buf.put_slice(b"II");
-    buf.put_u16_le(42);
-    buf.put_u32_le(8);
-
-    // IFD entries (must be in strictly ascending tag order)
-    buf.put_u16_le(n_entries);
-    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
-        buf.put_u16_le(tag);
-        buf.put_u16_le(ty);
-        buf.put_u32_le(count);
-        buf.put_u32_le(val);
-    };
-    const ASCII: u16 = 2;
-    const SHORT: u16 = 3;
-    const LONG: u16 = 4;
-    const DOUBLE: u16 = 12;
-
-    put_entry(256, LONG, 1, width);
-    put_entry(257, LONG, 1, height);
-    put_entry(258, SHORT, spp as u32, bps_val); // BitsPerSample = 32
-    put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, photometric); // Photometric = RGB (2) or MinIsBlack (1)
-    put_entry(273, LONG, 1, pixel_off); // StripOffsets
-    put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
-    put_entry(278, LONG, 1, height); // RowsPerStrip
-    put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
-    put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
-    if extra_samples_count > 0 {
-        put_entry(338, SHORT, extra_samples_count as u32, extra_samples_val); // ExtraSamples = Unspecified (0)
-    }
-    put_entry(339, SHORT, spp as u32, sf_val); // SampleFormat = IEEEFloat (3)
-    put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
-    put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
-    put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
-    put_entry(42113, ASCII, 4, u32::from_le_bytes(*b"nan\0")); // GDAL_NODATA = "nan"
-    buf.put_u32_le(0); // Next IFD = 0
-
-    if spp >= 3 {
-        for _ in 0..spp {
-            buf.put_u16_le(32);
-        }
-    }
-    if extra_samples_count >= 3 {
-        for &es in &extra_samples {
-            buf.put_u16_le(es);
-        }
-    }
-    if spp >= 3 {
-        for _ in 0..spp {
-            buf.put_u16_le(3);
-        }
-    }
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
-    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
-    let span_x = if is_geographic && bbox[2] < bbox[0] {
-        (bbox[2] + 360.0) - bbox[0]
-    } else {
-        (bbox[2] - bbox[0]).abs()
-    };
-    let dx = (span_x / (width.max(1) as f64)).max(1e-12);
-    let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
-    buf.put_f64_le(dx);
-    buf.put_f64_le(dy);
-    buf.put_f64_le(0.0);
-    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(bbox[0]);
-    buf.put_f64_le(bbox[3]);
-    buf.put_f64_le(0.0);
-    // GeoKeyDirectoryTag
-    let (model_type, crs_key): (u16, u16) = if is_geographic {
-        (2, 2048)
-    } else {
-        (1, 3072)
-    };
-    let gkd: [u16; 16] = [
-        1, 1, 0, 3,
-        1024, 0, 1, model_type,
-        1025, 0, 1, 1,
-        crs_key, 0, 1, epsg,
-    ];
-    for &k in &gkd {
-        buf.put_u16_le(k);
-    }
-
-    // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
-    if spp == 1 && !return_mask {
-        let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
-        buf.put_slice(&raw_f32_chw[..take]);
-        if take < pixel_bytes {
-            let rem_f32 = (pixel_bytes - take) / 4;
-            for _ in 0..rem_f32 {
-                buf.put_f32_le(f32::NAN);
-            }
-        }
-    } else {
-        let data_spp_us = data_spp as usize;
-        let plane_bytes = n_px * 4;
-        let valid_le = 255.0f32.to_le_bytes();
-        let zero_le = 0.0f32.to_le_bytes();
-        for px in 0..n_px {
-            let px_off = px * 4;
-            let mut any_valid = false;
-            for b in 0..data_spp_us {
-                let off = b * plane_bytes + px_off;
-                if off + 4 <= raw_f32_chw.len() {
-                    let sl = &raw_f32_chw[off..off + 4];
-                    if return_mask
-                        && !any_valid
-                        && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
-                    {
-                        any_valid = true;
-                    }
-                    buf.put_slice(sl);
-                } else {
+    write_geotiff(&spec, |buf| {
+        // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
+        if spp == 1 && !return_mask {
+            let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
+            buf.put_slice(&raw_f32_chw[..take]);
+            if take < pixel_bytes {
+                let rem_f32 = (pixel_bytes - take) / 4;
+                for _ in 0..rem_f32 {
                     buf.put_f32_le(f32::NAN);
                 }
             }
-            if return_mask {
-                buf.put_slice(if any_valid { &valid_le } else { &zero_le });
+        } else {
+            let data_spp_us = data_spp as usize;
+            let plane_bytes = n_px * 4;
+            let valid_le = 255.0f32.to_le_bytes();
+            let zero_le = 0.0f32.to_le_bytes();
+            for px in 0..n_px {
+                let px_off = px * 4;
+                let mut any_valid = false;
+                for b in 0..data_spp_us {
+                    let off = b * plane_bytes + px_off;
+                    if off + 4 <= raw_f32_chw.len() {
+                        let sl = &raw_f32_chw[off..off + 4];
+                        if return_mask
+                            && !any_valid
+                            && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
+                        {
+                            any_valid = true;
+                        }
+                        buf.put_slice(sl);
+                    } else {
+                        buf.put_f32_le(f32::NAN);
+                    }
+                }
+                if return_mask {
+                    buf.put_slice(if any_valid { &valid_le } else { &zero_le });
+                }
             }
         }
-    }
-    buf.freeze()
+    })
 }
 
 /// Project a WGS84 polygon bbox into an IFD's pixel space and return `(win_w, win_h, intersects)`.

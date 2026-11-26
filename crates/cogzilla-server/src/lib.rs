@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod engine;
+mod geotiff;
 pub mod http;
 pub mod openapi;
 pub mod stac;
