@@ -29,6 +29,7 @@ const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_JPEG_TABLES: u16 = 347;
 const TAG_LERC_PARAMETERS: u16 = 50674;
+const TAG_RPC_COEFFICIENT: u16 = 50844;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
@@ -530,7 +531,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         _ => return Err(TiffError::InvalidHeader),
     };
 
+    let main_ifd_offset = next_ifd;
     let mut ifds: Vec<IfdMeta> = Vec::with_capacity(8);
+    let mut ifd_offsets: Vec<u64> = Vec::with_capacity(8);
     let mut mask_ifds: Vec<MaskIfdMeta> = Vec::new();
     let mut geo_keys = GeoKeys::default();
     let mut nodata: Option<f32> = None;
@@ -540,6 +543,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
     let mut base_dims: Option<(u32, u32)> = None;
     let mut base_gcp_poly: Option<crate::gcp::GcpPoly> = None;
     let mut is_georeferenced = true;
+    let mut has_rpc = false;
     let mut gcp_residual_px: Option<f64> = None;
 
     // Guard against cyclic IFD chains, runaway IFD counts, and cumulative heap amplification DoS.
@@ -556,6 +560,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             return Err(TiffError::Corrupt("IFD chain exceeds 64 entries"));
         }
         visited_ifds.push(next_ifd);
+        let current_ifd_offset = next_ifd;
         let (entries, following) = parse_ifd_entries(&r, next_ifd, is_bigtiff)?;
         next_ifd = following;
 
@@ -770,6 +775,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                         }
                     }
                 }
+                TAG_RPC_COEFFICIENT if ifds.is_empty() => {
+                    has_rpc = true;
+                }
                 TAG_MODEL_PIXEL_SCALE if ifds.is_empty() => {
                     charge_tag(entry.count, 8)?;
                     pixel_scale = Some(entry.read_f64_vec(&r)?);
@@ -932,12 +940,16 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             _ => 1,
         };
         let sample_type = match (fmt, bps) {
+            (1, 1) => SampleType::Uint1,
+            (1, 4) => SampleType::Uint4,
             (1, 8) => SampleType::Uint8,
             (2, 8) => SampleType::Int8,
             (1, 16) => SampleType::Uint16,
             (2, 16) => SampleType::Int16,
             (1, 32) => SampleType::Uint32,
             (2, 32) => SampleType::Int32,
+            (1, 64) => SampleType::Uint64,
+            (2, 64) => SampleType::Int64,
             (3, 32) => SampleType::Float32,
             (3, 64) => SampleType::Float64,
             _ => {
@@ -1139,6 +1151,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             .invert()
             .ok_or(TiffError::Corrupt("singular GeoTransform affine"))?;
 
+        ifd_offsets.push(current_ifd_offset);
         ifds.push(IfdMeta {
             width,
             height,
@@ -1206,6 +1219,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         byte_order: bo,
         is_bigtiff,
         is_georeferenced,
+        has_rpc,
+        main_ifd_offset,
+        ifd_offsets,
         gcp_residual_px,
         nodata,
         scales,

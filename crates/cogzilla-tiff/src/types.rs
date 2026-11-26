@@ -53,6 +53,10 @@ pub enum Predictor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleType {
+    /// Unsigned 1-bit packed integer (`NBITS=1`, unpacked to `uint8` values `0`/`1`).
+    Uint1,
+    /// Unsigned 4-bit packed integer (`NBITS=4`, unpacked to `uint8` values `0..=15`).
+    Uint4,
     /// Unsigned 8-bit integer (Sentinel-2 TCI, visual RGB, QA masks).
     Uint8,
     /// Signed 8-bit integer.
@@ -65,6 +69,10 @@ pub enum SampleType {
     Uint32,
     /// Signed 32-bit integer.
     Int32,
+    /// Unsigned 64-bit integer.
+    Uint64,
+    /// Signed 64-bit integer.
+    Int64,
     /// IEEE-754 32-bit float (SAR RTC, DEMs, scientific COGs).
     Float32,
     /// IEEE-754 64-bit float (scientific / geodetic rasters).
@@ -75,21 +83,35 @@ impl SampleType {
     #[inline(always)]
     pub fn bytes_per_sample(self) -> usize {
         match self {
-            Self::Uint8 | Self::Int8 => 1,
+            Self::Uint1 | Self::Uint4 | Self::Uint8 | Self::Int8 => 1,
             Self::Uint16 | Self::Int16 => 2,
             Self::Uint32 | Self::Int32 | Self::Float32 => 4,
-            Self::Float64 => 8,
+            Self::Uint64 | Self::Int64 | Self::Float64 => 8,
+        }
+    }
+
+    /// Packed byte width of one uncompressed scanline of `width` pixels × `bands_in_tile` samples.
+    /// For sub-byte types (`Uint1`, `Uint4`), TIFF pads each row to a byte boundary.
+    #[inline(always)]
+    pub fn row_bytes(self, width: usize, bands_in_tile: usize) -> Option<usize> {
+        let samples = width.checked_mul(bands_in_tile)?;
+        match self {
+            Self::Uint1 => Some(samples.div_ceil(8)),
+            Self::Uint4 => Some(samples.div_ceil(2)),
+            _ => samples.checked_mul(self.bytes_per_sample()),
         }
     }
 
     pub fn gdal_name(self) -> &'static str {
         match self {
-            Self::Uint8 => "uint8",
+            Self::Uint1 | Self::Uint4 | Self::Uint8 => "uint8",
             Self::Int8 => "int8",
             Self::Uint16 => "uint16",
             Self::Int16 => "int16",
             Self::Uint32 => "uint32",
             Self::Int32 => "int32",
+            Self::Uint64 => "uint64",
+            Self::Int64 => "int64",
             Self::Float32 => "float32",
             Self::Float64 => "float64",
         }
@@ -366,8 +388,15 @@ pub struct CogIndex {
     pub byte_order: ByteOrder,
     pub is_bigtiff: bool,
     /// False for ungeoreferenced TIFFs (no GeoTransform and no GCPs); pixel-space routes
-    /// (`/cog/info`, `/cog/preview`, `GET /cog/statistics`) work while geographic routes return 400.
+    /// (`/cog/info`, `/cog/preview`, `GET /cog/statistics`, `/cog/validate`) work while geographic
+    /// routes return 400.
     pub is_georeferenced: bool,
+    /// True when the primary IFD carries `RPCCoefficientTag` (TIFF tag 50844).
+    pub has_rpc: bool,
+    /// Byte offset of the main (first) IFD read from the TIFF/BigTIFF header.
+    pub main_ifd_offset: u64,
+    /// Byte offsets of each image IFD corresponding 1:1 with `ifds`.
+    pub ifd_offsets: Vec<u64>,
     /// Max pixel residual when georeferenced via Ground Control Points (`ModelTiepointTag`).
     pub gcp_residual_px: Option<f64>,
     /// `None` means no explicit GDAL_NODATA tag (NaN is still always treated as nodata).

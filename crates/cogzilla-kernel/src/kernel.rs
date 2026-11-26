@@ -942,13 +942,24 @@ pub fn sample_general_scaled(
     scale_y: f32,
     mode: ResampleMode,
 ) -> f32 {
-    if !u.is_finite()
-        || !v.is_finite()
-        || u < -0.5
-        || v < -0.5
-        || u > src.ifd_w as f32 - 0.5
-        || v > src.ifd_h as f32 - 0.5
-    {
+    if !u.is_finite() || !v.is_finite() {
+        return f32::NAN;
+    }
+    if matches!(
+        mode,
+        ResampleMode::Average
+            | ResampleMode::Mode
+            | ResampleMode::Rms
+            | ResampleMode::Min
+            | ResampleMode::Max
+            | ResampleMode::Med
+            | ResampleMode::Q1
+            | ResampleMode::Q3
+            | ResampleMode::Sum
+    ) {
+        return sample_footprint_exact(src, u, v, scale_x, scale_y, mode);
+    }
+    if u < -0.5 || v < -0.5 || u > src.ifd_w as f32 - 0.5 || v > src.ifd_h as f32 - 0.5 {
         return f32::NAN;
     }
     match mode {
@@ -1455,12 +1466,14 @@ pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
 /// The NumPy dtype string of a sample type: little-endian, and `|` for the single bytes.
 pub fn npy_descr(kind: SampleType) -> &'static str {
     match kind {
-        SampleType::Uint8 => "|u1",
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => "|u1",
         SampleType::Int8 => "|i1",
         SampleType::Uint16 => "<u2",
         SampleType::Int16 => "<i2",
         SampleType::Uint32 => "<u4",
         SampleType::Int32 => "<i4",
+        SampleType::Uint64 => "<u8",
+        SampleType::Int64 => "<i8",
         SampleType::Float32 => "<f4",
         SampleType::Float64 => "<f8",
     }
@@ -1515,12 +1528,14 @@ pub fn encode_npy_typed(
         }};
     }
     match kind {
-        SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
         SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
         SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
         SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
         SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
         SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
         SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
         SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }
@@ -1585,12 +1600,14 @@ pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes>
         }};
     }
     match kind {
-        SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
         SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
         SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
         SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
         SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
         SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
         SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
         SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }
@@ -2325,7 +2342,6 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
         let v_br = vdupq_n_f32(br);
         let v_zero = vdupq_n_f32(0.0);
         let v_255 = vdupq_n_f32(255.0);
-        let v_half = vdupq_n_f32(0.5);
         let v_inv0 = vdupq_n_f32(inv[0]);
         let v_inv1 = vdupq_n_f32(inv[1]);
         let v_inv2 = vdupq_n_f32(inv[2]);
@@ -2397,8 +2413,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
                     let val = vfmaq_f32(top, vsubq_f32(bot, top), fy);
                     let scaled = vmulq_f32(vsubq_f32(val, $v_min), $v_inv);
                     let clamped = vminq_f32(vmaxq_f32(scaled, v_zero), v_255);
-                    let rounded = vaddq_f32(clamped, v_half);
-                    vst1q_u32($out.as_mut_ptr(), vcvtq_u32_f32(rounded));
+                    vst1q_u32($out.as_mut_ptr(), vcvtq_u32_f32(clamped));
                 }};
             }
 
@@ -2498,7 +2513,6 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
     let v_br = _mm256_set1_ps(br);
     let v_zero = _mm256_setzero_ps();
     let v_255 = _mm256_set1_ps(255.0);
-    let v_half = _mm256_set1_ps(0.5);
     let v_inv0 = _mm256_set1_ps(inv[0]);
     let v_inv1 = _mm256_set1_ps(inv[1]);
     let v_inv2 = _mm256_set1_ps(inv[2]);
@@ -2556,10 +2570,9 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
                 let val = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), fy, top);
                 let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
                 let clamped = _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255);
-                let rounded = _mm256_add_ps(clamped, v_half);
                 _mm256_storeu_si256(
                     $out.as_mut_ptr() as *mut __m256i,
-                    _mm256_cvttps_epi32(rounded),
+                    _mm256_cvttps_epi32(clamped),
                 );
             }};
         }
@@ -2898,8 +2911,7 @@ unsafe fn bilinear_row_rgb_u8_separable_neon<const N: usize>(
                         vaddq_f32(val, v_half)
                     } else {
                         let scaled = vmulq_f32(vsubq_f32(val, $v_min), $v_inv);
-                        let clamped = vminq_f32(vmaxq_f32(scaled, v_zero), v_255);
-                        vaddq_f32(clamped, v_half)
+                        vminq_f32(vmaxq_f32(scaled, v_zero), v_255)
                     };
                     vst1q_s32($out.as_mut_ptr(), vcvtq_s32_f32(rounded));
                 }};
@@ -3012,8 +3024,7 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
                     _mm256_add_ps(val, v_half)
                 } else {
                     let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
-                    let clamped = _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255);
-                    _mm256_add_ps(clamped, v_half)
+                    _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255)
                 };
                 _mm256_storeu_si256($out.as_mut_ptr() as *mut __m256i, _mm256_cvttps_epi32(rounded));
             }};
@@ -5146,7 +5157,6 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
         let v_one = vdupq_n_f32(1.0);
         let v_zero = vdupq_n_f32(0.0);
         let v_255 = vdupq_n_f32(255.0);
-        let v_half = vdupq_n_f32(0.5);
         let v_neg_zs = vdupq_n_f32(neg_z_scale);
         let v_pos_zs = vdupq_n_f32(pos_z_scale);
         let v_se = vdupq_n_f32(sun_e);
@@ -5184,7 +5194,7 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
             let hs = vminq_f32(vmulq_f32(vmaxq_f32(dot, v_zero), v_255), v_255);
             let scaled = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(hs, v_min), v_inv_r), v_zero), v_255);
             // Narrow 4x u32 -> 4x u8 in registers and emit a single unaligned u32 store.
-            let u32_v = vcvtq_u32_f32(vaddq_f32(scaled, v_half));
+            let u32_v = vcvtq_u32_f32(scaled);
             let u16_v = vmovn_u32(u32_v);
             let u8_v = vmovn_u16(vcombine_u16(u16_v, u16_v));
             let packed = vget_lane_u32::<0>(vreinterpret_u32_u8(u8_v));
@@ -5292,7 +5302,7 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
             v_255,
         );
         // Narrow 8x i32 -> 8x u8 in registers and emit a single unaligned u64 store.
-        let i32_v = _mm256_cvttps_epi32(_mm256_add_ps(scaled, v_half));
+        let i32_v = _mm256_cvttps_epi32(scaled);
         let lo128 = _mm256_castsi256_si128(i32_v);
         let hi128 = _mm256_extracti128_si256::<1>(i32_v);
         let u16_v = _mm_packus_epi32(lo128, hi128);
@@ -6995,5 +7005,81 @@ mod npy_typed_tests {
         };
         let (sx, sy) = coord_plan_scale::<8>(&plan8);
         assert!((sx - 16.0).abs() < 1e-4 && (sy - 16.0).abs() < 1e-4, "got ({sx}, {sy})");
+    }
+
+    #[test]
+    fn audit87_simd_scalar_rounding_parity_and_downscale_footprint_edge() {
+        // 1. Clean Horn hillshade: SIMD lanes (0..4) and scalar tail (4) must match exactly.
+        let r0 = [10.0f32; 7];
+        let r1 = [10.0f32; 7];
+        let r2 = [10.0f32; 7];
+        let mut out = [0u8; 5];
+        eval_horn_hillshade_row_clean::<5>(&r0, &r1, &r2, 1.0, 315.0, 40.0, 1.0, 1.0, 0.0, &mut out);
+        assert!(
+            out.iter().all(|&v| v == out[0]),
+            "hillshade SIMD lanes and scalar tail diverged: {out:?}"
+        );
+        assert_eq!(out[0], 163);
+
+        // 2. Single-block RGB bilinear: SIMD lanes (0..4) and scalar tail (4) must match exactly.
+        let r_blk: [u8; 16] = [
+            100, 100, 101, 101, 100, 100, 101, 101, 100, 100, 101, 101, 100, 100, 101, 101,
+        ];
+        let u_row = [1.6f32; 5];
+        let v_row = [0.0f32; 5];
+        let mut row_rgb = [0u8; 15];
+        bilinear_rgb_single_block_row::<5, u8, _>(
+            &u_row,
+            &v_row,
+            &r_blk,
+            &r_blk,
+            &r_blk,
+            0,
+            0,
+            4,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            &mut row_rgb,
+            |x| x as f32,
+        );
+        for px in 0..5 {
+            assert_eq!(
+                &row_rgb[px * 3..px * 3 + 3],
+                &[100, 100, 100],
+                "RGB bilinear SIMD/scalar mismatch at px={px}: {row_rgb:?}"
+            );
+        }
+
+        // 3. Downscaled footprint resampling must not clip centers outside [-0.5, w - 0.5]
+        // when the footprint box still overlaps the raster.
+        let band = cogzilla_codec::DecodedBand {
+            data: cogzilla_codec::BandData::U8 {
+                data: vec![10u8; 16 * 16].into_boxed_slice(),
+                nodata: None,
+            },
+            width: 16,
+            height: 16,
+            stats: cogzilla_codec::BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 10.0,
+                max: 10.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        let src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blocks);
+        let avg = sample_general_scaled(&src, -1.0, 4.0, 4.0, 4.0, ResampleMode::Average);
+        assert!(
+            avg.is_finite() && (avg - 10.0).abs() < 1e-4,
+            "expected overlap Average=10.0, got {avg}"
+        );
+        let sum = sample_general_scaled(&src, -1.0, 4.0, 4.0, 4.0, ResampleMode::Sum);
+        // cx = -0.5, footprint x in [-2.5, 1.5] -> overlap width 1.5, height 4.0 -> area 6.0 * 10.0 = 60.0
+        assert!(
+            sum.is_finite() && (sum - 60.0).abs() < 1e-3,
+            "expected overlap Sum=60.0, got {sum}"
+        );
+        // Completely outside footprint still returns NaN
+        assert!(sample_general_scaled(&src, -5.0, 4.0, 4.0, 4.0, ResampleMode::Average).is_nan());
     }
 }

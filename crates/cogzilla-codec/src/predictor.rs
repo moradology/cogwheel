@@ -2420,6 +2420,148 @@ pub fn reconstruct_int32(
         .collect()
 }
 
+/// Reconstruct 64-bit unsigned (`Uint64`) or signed (`Int64`) integer tiles into `BandData::F32`,
+/// supporting both `Predictor::None` and `Predictor::HorizontalInt`.
+pub fn reconstruct_int64(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    signed: bool,
+    horizontal_diff: bool,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut acc = vec![0u64; bands_in_tile];
+
+    for y in 0..h {
+        if horizontal_diff {
+            acc.fill(0);
+        }
+        let row_off = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let off = ((row_off + x) * bands_in_tile + b) * 8;
+                let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
+                let raw_u64 = match byte_order {
+                    ByteOrder::Little => u64::from_le_bytes(bytes),
+                    ByteOrder::Big => u64::from_be_bytes(bytes),
+                };
+                let bits = if horizontal_diff {
+                    acc[b] = acc[b].wrapping_add(raw_u64);
+                    acc[b]
+                } else {
+                    raw_u64
+                };
+                let vf = if signed { (bits as i64) as f32 } else { bits as f32 };
+                let (v, is_nd) = check_val(vf, finite_nodata);
+                slabs[b][row_off + x] = v;
+                if is_nd {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    if v < min_val[b] {
+                        min_val[b] = v;
+                    }
+                    if v > max_val[b] {
+                        max_val[b] = v;
+                    }
+                }
+            }
+        }
+    }
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data: BandData::F32(data),
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
+/// Unpack MSB-first sub-byte (`bits == 1` or `bits == 4`) TIFF tiles into compact `BandData::U8`
+/// bands (`0..=1` for 1-bit, `0..=15` for 4-bit), respecting TIFF's per-scanline byte padding.
+pub fn reconstruct_subbyte(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    bits: u8,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let nd_u8: Option<u8> = nodata
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 255.0 && v.fract() == 0.0)
+        .map(|v| v as u8);
+    let samples_per_row = w * bands_in_tile;
+    let row_bytes = if bits == 1 {
+        samples_per_row.div_ceil(8)
+    } else {
+        samples_per_row.div_ceil(2)
+    };
+    let mut bufs: Vec<Vec<u8>> = (0..bands_in_tile).map(|_| vec![0u8; pixels]).collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    for y in 0..h {
+        let row = &raw[y * row_bytes..(y + 1) * row_bytes];
+        let row_px = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let s = x * bands_in_tile + b;
+                let v = if bits == 1 {
+                    (row[s >> 3] >> (7 - (s & 7))) & 1
+                } else {
+                    (row[s >> 1] >> (4 * (1 - (s & 1)))) & 0x0F
+                };
+                bufs[b][row_px + x] = v;
+                if nd_u8 == Some(v) {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    let vf = v as f32;
+                    if vf < min_val[b] {
+                        min_val[b] = vf;
+                    }
+                    if vf > max_val[b] {
+                        max_val[b] = vf;
+                    }
+                }
+            }
+        }
+    }
+    bufs.into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data: BandData::U8 {
+                data: data.into_boxed_slice(),
+                nodata: nd_u8,
+            },
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
 /// Zero-copy `float64` (`Predictor::None`) decode directly from an immutable slice.
 pub fn reconstruct_f64_uncompressed(
     raw: &[u8],
