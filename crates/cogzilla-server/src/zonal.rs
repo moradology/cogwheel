@@ -1279,13 +1279,33 @@ pub async fn compute_native_exact_polygon_stats(
         }
     };
 
+    let geom_kind = if !pm.polygons.is_empty() {
+        ZonalGeomKind::Polygon
+    } else if !pm.lines.is_empty() {
+        ZonalGeomKind::Line
+    } else {
+        ZonalGeomKind::Point
+    };
+
     let empty_result = || -> serde_json::Value {
         let mut out = serde_json::Map::new();
+        let insert_empty_geom_fields = |o: &mut serde_json::Map<String, serde_json::Value>| match geom_kind {
+            ZonalGeomKind::Polygon => {
+                o.insert("area".into(), serde_json::json!(0.0));
+            }
+            ZonalGeomKind::Line => {
+                o.insert("area".into(), serde_json::Value::Null);
+                o.insert("length".into(), serde_json::json!(0.0));
+            }
+            ZonalGeomKind::Point => {
+                o.insert("area".into(), serde_json::Value::Null);
+            }
+        };
         if let Some(ref exprs) = opts.expressions {
             for (i, (desc, _)) in exprs.iter().enumerate() {
                 let mut e = compute_f32_band_stats(&[], desc, opts);
                 if let Some(o) = e.as_object_mut() {
-                    o.insert("area".into(), serde_json::json!(0.0));
+                    insert_empty_geom_fields(o);
                 }
                 out.insert(format!("b{}", i + 1), e);
             }
@@ -1301,7 +1321,7 @@ pub async fn compute_native_exact_polygon_stats(
                     .unwrap_or_else(|| format!("b{b1}"));
                 let mut e = compute_f32_band_stats(&[], &desc, opts);
                 if let Some(o) = e.as_object_mut() {
-                    o.insert("area".into(), serde_json::json!(0.0));
+                    insert_empty_geom_fields(o);
                 }
                 out.insert(format!("b{b1}"), e);
             }
@@ -1384,9 +1404,9 @@ pub async fn compute_native_exact_polygon_stats(
             for &(c, r) in &lp {
                 if c.is_finite() && r.is_finite() {
                     min_c = min_c.min(c);
-                    max_c = max_c.max(c);
+                    max_c = max_c.max(c + 1.0);
                     min_r = min_r.min(r);
-                    max_r = max_r.max(r);
+                    max_r = max_r.max(r + 1.0);
                 }
             }
             lines_px.push(lp);
@@ -1747,34 +1767,33 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         ));
     }
 
-    let ifd_idx = if max_size == 0 {
-        0
-    } else {
-        let mut best = 0usize;
-        for (idx, ifd) in primary.index.ifds.iter().enumerate() {
-            if ifd.width.max(ifd.height) <= max_size {
-                best = idx;
-                break;
-            }
-            best = idx;
-        }
-        best
-    };
-    if crate::engine::validate_multi_cog_grid(cogs, ifd_idx).is_err() {
-        return Ok(None);
-    }
-    let ifd = &primary.index.ifds[ifd_idx];
     let is_geo = matches!(crs, CrsModel::Geographic);
     let densify_lonlat = !is_geo && !pm.coord_crs_projected;
-    let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
     let total_verts = pm.vertex_count();
 
-    let mut polys_px: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(pm.polygons.len());
-    for poly in &pm.polygons {
-        let mut rings_px = Vec::with_capacity(poly.len());
-        for ring in poly {
-            rings_px.push(densify_ring_lonlat_to_pixel(
-                ring,
+    let project_to_ifd = |ifd: &cogzilla_tiff::IfdMeta| {
+        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let mut polys_px: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(pm.polygons.len());
+        for poly in &pm.polygons {
+            let mut rings_px = Vec::with_capacity(poly.len());
+            for ring in poly {
+                rings_px.push(densify_ring_lonlat_to_pixel(
+                    ring,
+                    &crs,
+                    &ifd.crs_to_pixel,
+                    ifd.gcp_poly.as_deref(),
+                    is_geo,
+                    densify_lonlat,
+                    wrap_lo,
+                    total_verts,
+                ));
+            }
+            polys_px.push(rings_px);
+        }
+        let mut lines_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(pm.lines.len());
+        for line in &pm.lines {
+            lines_px.push(densify_ring_lonlat_to_pixel(
+                line,
                 &crs,
                 &ifd.crs_to_pixel,
                 ifd.gcp_poly.as_deref(),
@@ -1784,72 +1803,66 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 total_verts,
             ));
         }
-        polys_px.push(rings_px);
-    }
-    let mut lines_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(pm.lines.len());
-    for line in &pm.lines {
-        lines_px.push(densify_ring_lonlat_to_pixel(
-            line,
-            &crs,
-            &ifd.crs_to_pixel,
-            ifd.gcp_poly.as_deref(),
-            is_geo,
-            densify_lonlat,
-            wrap_lo,
-            total_verts,
-        ));
-    }
-    let mut pts_px: Vec<(f64, f64)> = Vec::with_capacity(pm.points.len());
-    for &(lo, la) in &pm.points {
-        let mut adj_lo = lo;
-        if let Some(low) = wrap_lo
-            && adj_lo < low
-        {
-            adj_lo += 360.0;
+        let mut pts_px: Vec<(f64, f64)> = Vec::with_capacity(pm.points.len());
+        for &(lo, la) in &pm.points {
+            let mut adj_lo = lo;
+            if let Some(low) = wrap_lo
+                && adj_lo < low
+            {
+                adj_lo += 360.0;
+            }
+            let (sx, sy) = if is_geo { (adj_lo, la) } else { crs.from_lonlat_deg(adj_lo, la) };
+            let (c, r) = ifd.crs_to_pixel_pt(sx, sy);
+            pts_px.push((c, r));
         }
-        let (sx, sy) = if is_geo { (adj_lo, la) } else { crs.from_lonlat_deg(adj_lo, la) };
-        let (c, r) = ifd.crs_to_pixel_pt(sx, sy);
-        pts_px.push((c, r));
-    }
 
-    let mut min_c = f64::INFINITY;
-    let mut max_c = f64::NEG_INFINITY;
-    let mut min_r = f64::INFINITY;
-    let mut max_r = f64::NEG_INFINITY;
-    for poly in &polys_px {
-        if let Some(outer) = poly.first() {
-            for &(c, r) in outer {
-                if c.is_finite() && r.is_finite() {
-                    min_c = min_c.min(c);
-                    max_c = max_c.max(c);
-                    min_r = min_r.min(r);
-                    max_r = max_r.max(r);
+        let mut min_c = f64::INFINITY;
+        let mut max_c = f64::NEG_INFINITY;
+        let mut min_r = f64::INFINITY;
+        let mut max_r = f64::NEG_INFINITY;
+        for poly in &polys_px {
+            if let Some(outer) = poly.first() {
+                for &(c, r) in outer {
+                    if c.is_finite() && r.is_finite() {
+                        min_c = min_c.min(c);
+                        max_c = max_c.max(c);
+                        min_r = min_r.min(r);
+                        max_r = max_r.max(r);
+                    }
                 }
             }
         }
-    }
-    for line in &lines_px {
-        for &(c, r) in line {
-            if c.is_finite() && r.is_finite() {
-                min_c = min_c.min(c);
-                max_c = max_c.max(c);
-                min_r = min_r.min(r);
-                max_r = max_r.max(r);
+        for line in &lines_px {
+            for &(c, r) in line {
+                if c.is_finite() && r.is_finite() {
+                    min_c = min_c.min(c);
+                    max_c = max_c.max(c + 1.0);
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r + 1.0);
+                }
             }
         }
-    }
-    for &(c, r) in &pts_px {
-        if c.is_finite() && r.is_finite() {
-            min_c = min_c.min(c);
-            max_c = max_c.max(c);
-            min_r = min_r.min(r);
-            max_r = max_r.max(r);
+        for &(c, r) in &pts_px {
+            if c.is_finite() && r.is_finite() {
+                min_c = min_c.min(c);
+                max_c = max_c.max(c + 1.0);
+                min_r = min_r.min(r);
+                max_r = max_r.max(r + 1.0);
+            }
         }
-    }
+        if !min_c.is_finite() || !min_r.is_finite() {
+            return (polys_px, lines_px, pts_px, 0usize, 0usize, 0usize, 0usize);
+        }
+        let c0 = min_c.floor().clamp(0.0, ifd.width as f64) as usize;
+        let c1 = max_c.ceil().clamp(c0 as f64, ifd.width as f64) as usize;
+        let r0 = min_r.floor().clamp(0.0, ifd.height as f64) as usize;
+        let r1 = max_r.ceil().clamp(r0 as f64, ifd.height as f64) as usize;
+        (polys_px, lines_px, pts_px, c0, c1, r0, r1)
+    };
 
-    let geom_kind = if !polys_px.is_empty() {
+    let geom_kind = if !pm.polygons.is_empty() {
         ZonalGeomKind::Polygon
-    } else if !lines_px.is_empty() {
+    } else if !pm.lines.is_empty() {
         ZonalGeomKind::Line
     } else {
         ZonalGeomKind::Point
@@ -1878,20 +1891,40 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         serde_json::Value::Object(out)
     };
 
-    if !min_c.is_finite() || !min_r.is_finite() {
+    // Start on full-resolution IFD 0; only step down to an overview if explicit max_size > 0
+    // requests it (matching `compute_native_exact_polygon_stats`).
+    let mut ifd_idx = 0usize;
+    if crate::engine::validate_multi_cog_grid(cogs, 0).is_err() {
+        return Ok(None);
+    }
+    let (mut polys_px, mut lines_px, mut pts_px, mut c0, mut c1, mut r0, mut r1) =
+        project_to_ifd(&primary.index.ifds[0]);
+    if c1 <= c0 || r1 <= r0 {
         return Ok(Some(empty_expr_result()));
     }
-    let c0_i = (min_c.floor() as i64).clamp(0, ifd.width as i64);
-    let c1_i = (max_c.ceil() as i64).clamp(0, ifd.width as i64);
-    let r0_i = (min_r.floor() as i64).clamp(0, ifd.height as i64);
-    let r1_i = (max_r.ceil() as i64).clamp(0, ifd.height as i64);
-    if c1_i <= c0_i || r1_i <= r0_i {
+    if opts.max_size_explicit && max_size > 0 && (c1 - c0).max(r1 - r0) > max_size as usize {
+        for (i, ov) in primary.index.ifds.iter().enumerate().skip(1) {
+            if crate::engine::validate_multi_cog_grid(cogs, i).is_err() {
+                break;
+            }
+            let (pp, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov);
+            ifd_idx = i;
+            polys_px = pp;
+            lines_px = lp;
+            pts_px = ptp;
+            c0 = oc0;
+            c1 = oc1;
+            r0 = or0;
+            r1 = or1;
+            if (c1 - c0).max(r1 - r0) <= max_size as usize {
+                break;
+            }
+        }
+    }
+    if c1 <= c0 || r1 <= r0 {
         return Ok(Some(empty_expr_result()));
     }
-    let c0 = c0_i as usize;
-    let c1 = c1_i as usize;
-    let r0 = r0_i as usize;
-    let r1 = r1_i as usize;
+    let ifd = &primary.index.ifds[ifd_idx];
     let win_w = c1 - c0;
     let win_h = r1 - r0;
     let n_px = win_w.saturating_mul(win_h);
@@ -1919,6 +1952,13 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let ty1 = (r1 - 1) / th;
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
+    const MAX_EXACT_BLOCKS: usize = 1024;
+    if blocks_x * blocks_y > MAX_EXACT_BLOCKS {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window requires {} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
+            blocks_x * blocks_y
+        )));
+    }
 
     let mut indices = Vec::with_capacity(blocks_x * blocks_y);
     for ty in ty0..=ty1 {

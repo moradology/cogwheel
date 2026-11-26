@@ -297,7 +297,11 @@ impl AlbersEqualArea {
         let theta = (sign * dx).atan2(sign * dy);
         let lon = self.lon0 + theta / self.n;
         let q = (self.c - (rho * self.n / self.a).powi(2)) / self.n;
-        let mut lat = (q / 2.0).clamp(-1.0, 1.0).asin();
+        let qp = Self::q_fn(self.e, self.e2, 1.0);
+        if !q.is_finite() || q.abs() > qp + 1e-12 {
+            return (f64::NAN, f64::NAN);
+        }
+        let mut lat = (q / qp).clamp(-1.0, 1.0).asin();
         for _ in 0..6 {
             let s = lat.sin();
             let c = lat.cos();
@@ -308,7 +312,7 @@ impl AlbersEqualArea {
             let one_m_e2s2 = 1.0 - es * es;
             let fq = Self::q_fn(self.e, self.e2, s) - q;
             let dfq = (1.0 - self.e2) * 2.0 * c / (one_m_e2s2 * one_m_e2s2);
-            lat -= fq / dfq;
+            lat = (lat - fq / dfq).clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
         }
         (lon, lat)
     }
@@ -963,5 +967,24 @@ impl EqualEarth {
         let sin_b = (theta.sin() / Self::M).clamp(-1.0, 1.0);
         let lat = lat_from_authalic_q(self.e, self.e2, self.qp * sin_b, self.qp);
         (self.lon0 + dlon, lat)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn albers_inverse_returns_nan_inside_polar_hole() {
+        // EPSG:3338 (NAD83 / Alaska Albers): lat1=55, lat2=65, lat0=50, lon0=-154
+        let aea = AlbersEqualArea::new(Ellipsoid::GRS80, 55.0, 65.0, 50.0, -154.0, 0.0, 0.0);
+        // Point well inside the polar hole (rho < rho_pole ~ 965 km)
+        let (lon, lat) = aea.inverse(0.0, 3_935_540.0);
+        assert!(lon.is_nan() && lat.is_nan(), "expected (NaN, NaN) inside Albers polar hole, got ({lon}, {lat})");
+        // Valid point in Alaska round-trips accurately
+        let (e, n) = aea.forward((-150.0_f64).to_radians(), 61.0_f64.to_radians());
+        let (lon2, lat2) = aea.inverse(e, n);
+        assert!((lon2.to_degrees() + 150.0).abs() < 1e-7);
+        assert!((lat2.to_degrees() - 61.0).abs() < 1e-7);
     }
 }
