@@ -3894,6 +3894,78 @@ pub struct PolygonMask {
     pub coord_crs_projected: bool,
 }
 
+/// Extract a legacy GeoJSON 2008 `"crs"` member (e.g.
+/// `{"type": "name", "properties": {"name": "EPSG:32610"}}` or
+/// `{"type": "EPSG", "properties": {"code": 32610}}`) from a GeoJSON object.
+///
+/// Checks `val["crs"]`, and if `val` is a `Feature` without its own `"crs"`, also checks
+/// `val["geometry"]["crs"]`. Returns `Ok(None)` when absent or `null`.
+pub fn extract_geojson_crs(
+    val: &serde_json::Value,
+) -> Result<Option<cogzilla_proj::CrsModel>, EngineError> {
+    let crs_val = val
+        .get("crs")
+        .filter(|v| !v.is_null())
+        .or_else(|| {
+            if val.get("type").and_then(|v| v.as_str()) == Some("Feature") {
+                val.get("geometry")
+                    .and_then(|g| g.get("crs"))
+                    .filter(|v| !v.is_null())
+            } else {
+                None
+            }
+        });
+    let Some(crs_obj) = crs_val else {
+        return Ok(None);
+    };
+    if let Some(s) = crs_obj.as_str() {
+        let (model, _) = crate::http::parse_coord_crs_with_epsg(s)
+            .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON crs: {e}")))?;
+        return Ok(Some(model));
+    }
+    let crs_type = crs_obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let props = crs_obj.get("properties");
+    if crs_type == "name" {
+        let name = props
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                EngineError::BadRequest(
+                    "invalid GeoJSON crs: type 'name' requires properties.name string".into(),
+                )
+            })?;
+        let (model, _) = crate::http::parse_coord_crs_with_epsg(name)
+            .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON crs: {e}")))?;
+        return Ok(Some(model));
+    }
+    if crs_type == "epsg" {
+        let code_val = props.and_then(|p| p.get("code"));
+        let raw = if let Some(n) = code_val.and_then(|v| v.as_u64()) {
+            format!("EPSG:{n}")
+        } else if let Some(s) = code_val.and_then(|v| v.as_str()) {
+            if s.to_ascii_lowercase().starts_with("epsg:") {
+                s.to_string()
+            } else {
+                format!("EPSG:{s}")
+            }
+        } else {
+            return Err(EngineError::BadRequest(
+                "invalid GeoJSON crs: type 'EPSG' requires properties.code".into(),
+            ));
+        };
+        let (model, _) = crate::http::parse_coord_crs_with_epsg(&raw)
+            .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON crs: {e}")))?;
+        return Ok(Some(model));
+    }
+    Err(EngineError::BadRequest(format!(
+        "unsupported GeoJSON crs member (expected type 'name' or 'EPSG'; pass ?coord_crs=EPSG:<code>)"
+    )))
+}
+
 impl PolygonMask {
     pub fn from_geojson(val: &serde_json::Value) -> Result<(Self, [f64; 4]), EngineError> {
         Self::from_geojson_in_crs(val, None)
@@ -3903,6 +3975,12 @@ impl PolygonMask {
         val: &serde_json::Value,
         coord_crs: Option<&cogzilla_proj::CrsModel>,
     ) -> Result<(Self, [f64; 4]), EngineError> {
+        let owned_geojson_crs = if coord_crs.is_none() {
+            extract_geojson_crs(val)?
+        } else {
+            None
+        };
+        let effective_crs = coord_crs.or(owned_geojson_crs.as_ref());
         let mut geometries: Vec<&serde_json::Value> = Vec::new();
         match val.get("type").and_then(|v| v.as_str()) {
             Some("FeatureCollection") => {
@@ -4005,7 +4083,7 @@ impl PolygonMask {
                     "GeoJSON coordinates must be finite".into(),
                 ));
             }
-            if let Some(crs) = coord_crs {
+            if let Some(crs) = effective_crs {
                 let (lo, la) = crs.to_lonlat_deg(x, y);
                 if !lo.is_finite() || !la.is_finite() {
                     return Err(EngineError::BadRequest(
@@ -4014,6 +4092,12 @@ impl PolygonMask {
                 }
                 Ok((lo, la))
             } else {
+                if x.abs() > 360.0 || y.abs() > 90.0 {
+                    return Err(EngineError::BadRequest(format!(
+                        "GeoJSON coordinate [{x}, {y}] is outside WGS84 lon/lat bounds ([-360, 360] x [-90, 90]); \
+                         if coordinates are in a projected CRS, pass ?coord_crs=EPSG:<code> or include a GeoJSON 'crs' member"
+                    )));
+                }
                 Ok((x, y))
             }
         };
@@ -4170,7 +4254,7 @@ impl PolygonMask {
         }
         let bbox = [min_x, min_y, max_x, max_y];
         let coord_crs_projected =
-            coord_crs.is_some_and(|c| !matches!(c, cogzilla_proj::CrsModel::Geographic));
+            effective_crs.is_some_and(|c| !matches!(c, cogzilla_proj::CrsModel::Geographic));
         Ok((Self { polygons, lines, points, bbox, coord_crs_projected }, bbox))
     }
 
@@ -4789,13 +4873,13 @@ async fn render_bbox_impl(
     let dlx = (bbox[2] - bbox[0]) / (w as f64);
     let dly = (bbox[3] - bbox[1]) / (h as f64);
 
-    let ifd_idx = if native_preview {
+    let (ifd_idx, target_rx, target_ry) = if native_preview {
         let full = primary.index.full_res();
         let rx0 = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d);
         let ry0 = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e);
         let target_rx = rx0 * (full.width as f64) / (w as f64);
         let target_ry = ry0 * (full.height as f64) / (h as f64);
-        primary.index.select_ifd(target_rx, target_ry)
+        (primary.index.select_ifd(target_rx, target_ry), target_rx, target_ry)
     } else {
         let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
             match dst_crs {
@@ -4856,7 +4940,7 @@ async fn render_bbox_impl(
                 }
             }
         }
-        primary.index.select_ifd(target_rx, target_ry)
+        (primary.index.select_ifd(target_rx, target_ry), target_rx, target_ry)
     };
     if let Some(pm) = poly_mask {
         pm.check_work_budget(w.saturating_mul(h))?;
@@ -5177,16 +5261,55 @@ async fn render_bbox_impl(
         });
     }
 
+    let (footprint_sx, footprint_sy) = if native_preview {
+        (
+            (ifd.width as f64 / w as f64) as f32,
+            (ifd.height as f64 / h as f64) as f32,
+        )
+    } else {
+        let ifd_rx = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+        let ifd_ry = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+        let sx = if target_rx.is_finite() && ifd_rx > 0.0 {
+            (target_rx / ifd_rx).max(1e-3) as f32
+        } else {
+            1.0
+        };
+        let sy = if target_ry.is_finite() && ifd_ry > 0.0 {
+            (target_ry / ifd_ry).max(1e-3) as f32
+        } else {
+            1.0
+        };
+        (sx, sy)
+    };
+    let is_footprint_mode = matches!(
+        resample,
+        ResampleMode::Average
+            | ResampleMode::Mode
+            | ResampleMode::Rms
+            | ResampleMode::Min
+            | ResampleMode::Max
+            | ResampleMode::Med
+            | ResampleMode::Q1
+            | ResampleMode::Q3
+            | ResampleMode::Sum
+    );
     let (pad_lo, pad_hi) =
         crate::engine::resample_fetch_margin(resample, matches!(bands, BandRequest::Dem { .. }));
-    let c0 = (min_u.floor() as i32).saturating_sub(pad_lo).max(0) as u32;
+    let (pad_x_lo, pad_x_hi, pad_y_lo, pad_y_hi) = if is_footprint_mode {
+        let hx = (0.5 * footprint_sx).ceil() as i32;
+        let hy = (0.5 * footprint_sy).ceil() as i32;
+        (pad_lo.max(hx), pad_hi.max(hx), pad_lo.max(hy), pad_hi.max(hy))
+    } else {
+        (pad_lo, pad_hi, pad_lo, pad_hi)
+    };
+    let c0 = (min_u.floor() as i32).saturating_sub(pad_x_lo).max(0) as u32;
     let c1 = (max_u.ceil() as i32)
-        .saturating_add(pad_hi)
+        .saturating_add(pad_x_hi)
         .min(ifd.width as i32 - 1)
         .max(0) as u32;
-    let r0 = (min_v.floor() as i32).saturating_sub(pad_lo).max(0) as u32;
+    let r0 = (min_v.floor() as i32).saturating_sub(pad_y_lo).max(0) as u32;
     let r1 = (max_v.ceil() as i32)
-        .saturating_add(pad_hi)
+        .saturating_add(pad_y_hi)
         .min(ifd.height as i32 - 1)
         .max(0) as u32;
     let tx0 = c0 / ifd.tile_width;
@@ -5464,7 +5587,14 @@ async fn render_bbox_impl(
                     }
                     if wsum > 1e-6 { sum / wsum } else { f32::NAN }
                 }
-                other => cogzilla_kernel::sample_general(src, u, v, other),
+                other => cogzilla_kernel::sample_general_scaled(
+                    src,
+                    u,
+                    v,
+                    footprint_sx,
+                    footprint_sy,
+                    other,
+                ),
             }
         };
 
