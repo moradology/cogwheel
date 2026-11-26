@@ -72,3 +72,7 @@ required-features = ["gpu"]
 [[example]]
 name = "continuous_ring_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "multi_cog_stac_bench"
+required-features = ["gpu"]
