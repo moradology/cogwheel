@@ -2766,3 +2766,190 @@ async fn sweep16_u1_stac_post_expr_and_u2a_gcp_message() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+
+#[tokio::test]
+async fn upstream_http_faults_and_uri_schemes_return_semantic_statuses() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Spawn a minimal raw TCP mock origin supporting fault routes:
+    // /e401, /e403, /e404, /e500, /e503, /norange, /trunc, /redirloop
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = mock_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp: Vec<u8> = if path.starts_with("/e401") {
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if path.starts_with("/e403") {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if path.starts_with("/e404") {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if path.starts_with("/e500") {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if path.starts_with("/e503") {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if path.starts_with("/norange") {
+                    // Origin ignores Range and advertises a 500 KiB 200 OK body.
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 512000\r\nConnection: close\r\n\r\n".to_vec()
+                } else if path.starts_with("/trunc") {
+                    // Claims 4096 bytes in Content-Length, sends only 16 bytes, then closes.
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n0123456789abcdef".to_vec()
+                } else if path.starts_with("/redirloop") {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{mock_addr}/redirloop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes()
+                } else {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    // Reserve a closed port for connection-refused testing.
+    let closed_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // V1: COG upstream statuses
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/e401/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("origin refused access") && body.contains("401"), "body={body}");
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/e403/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("origin refused access") && body.contains("403"), "body={body}");
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/e404/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/e500/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("500") && body.contains("/e500/a.tif"), "body={body}");
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/e503/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("503") && body.contains("/e503/a.tif"), "body={body}");
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/trunc/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/redirloop/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+
+    let r = client
+        .get(format!("{base}/cog/info?url=http://127.0.0.1:{closed_port}/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+
+    // V2: Origin ignores Range header (200 OK with full file > 128 KiB) -> 502 with clear message
+    let r = client
+        .get(format!("{base}/cog/info?url=http://{mock_addr}/norange/a.tif"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("origin does not support HTTP range requests"),
+        "body={body}"
+    );
+
+    // V3: Unsupported URI schemes -> 400 naming the scheme and supported ones
+    for route in ["/cog/info", "/stac/info", "/mosaicjson/info"] {
+        let r = client
+            .get(format!("{base}{route}?url=ftp://127.0.0.1/x.tif"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "route={route}");
+        let body = r.text().await.unwrap();
+        assert!(body.contains("ftp://") && body.contains("supported"), "route={route} body={body}");
+    }
+
+    // V1 on STAC & MosaicJSON routes too
+    for route in ["/stac/info", "/mosaicjson/info"] {
+        let r = client
+            .get(format!("{base}{route}?url=http://{mock_addr}/e403/item.json"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "route={route}");
+        let r = client
+            .get(format!("{base}{route}?url=http://{mock_addr}/e500/item.json"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 502, "route={route}");
+        let r = client
+            .get(format!("{base}{route}?url=http://{mock_addr}/e404/item.json"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "route={route}");
+    }
+
+    mock_task.abort();
+    srv_task.abort();
+}

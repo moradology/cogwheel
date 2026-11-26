@@ -2167,7 +2167,7 @@ impl CogStore {
             });
         }
 
-        let local = uri.strip_prefix("file://").unwrap_or(uri);
+        let local = crate::backend::resolve_local_or_reject_scheme(uri)?;
         let meta = std::fs::metadata(local)?;
         if !meta.is_file() {
             return Err(IoError::Fs(std::io::Error::other(format!(
