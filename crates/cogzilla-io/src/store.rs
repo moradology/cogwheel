@@ -137,6 +137,9 @@ pub enum SourceFreshness {
         validator: crate::backend::RemoteValidator,
         opened_at: std::time::Instant,
         last_checked_ms: AtomicU64,
+        /// Serializes TTL-expired conditional revalidation so N concurrent requests don't fire N
+        /// simultaneous `Range: bytes=0-0` GETs when the TTL ticks over.
+        revalidate_lock: tokio::sync::Mutex<()>,
     },
     /// Cloud object store (`s3://`, `gs://`, `az://`, `abfs(s)://`): cached without 5s TTL
     /// thrashing (clearable via `/admin/clear-cache` or LRU eviction).
@@ -634,19 +637,35 @@ impl CogStore {
                 validator,
                 opened_at,
                 last_checked_ms,
+                revalidate_lock,
             } => {
                 let ttl_ms = self.remote_cache_ttl.as_millis() as u64;
                 let now_ms = opened_at.elapsed().as_millis() as u64;
-                let prev_ms = last_checked_ms.load(Ordering::Relaxed);
+                let prev_ms = last_checked_ms.load(Ordering::Acquire);
                 if ttl_ms > 0 && now_ms.saturating_sub(prev_ms) < ttl_ms {
                     return Ok(true);
+                }
+                // Singleflight TTL revalidation: serialize concurrent waiters and re-check TTL
+                // (and whether this cog was already invalidated) after acquiring the lock.
+                let _guard = revalidate_lock.lock().await;
+                let now_ms = opened_at.elapsed().as_millis() as u64;
+                let prev_ms = last_checked_ms.load(Ordering::Acquire);
+                if ttl_ms > 0 && now_ms.saturating_sub(prev_ms) < ttl_ms {
+                    return Ok(true);
+                }
+                let still_cached = self
+                    .datasets_by_uri
+                    .get(uri)
+                    .is_some_and(|slot| matches!(&*slot, OpenSlot::Ready { cog: c, .. } if c.id == cog.id));
+                if !still_cached {
+                    return Ok(false);
                 }
                 if validator.etag.is_some() || validator.last_modified.is_some() {
                     match cog.source.revalidate_remote(validator).await {
                         Ok(true) => {
                             last_checked_ms.store(
                                 opened_at.elapsed().as_millis() as u64,
-                                Ordering::Relaxed,
+                                Ordering::Release,
                             );
                             Ok(true)
                         }
@@ -921,6 +940,7 @@ impl CogStore {
                                 validator,
                                 opened_at: std::time::Instant::now(),
                                 last_checked_ms: AtomicU64::new(0),
+                                revalidate_lock: tokio::sync::Mutex::new(()),
                             }
                         } else {
                             SourceFreshness::Cloud
