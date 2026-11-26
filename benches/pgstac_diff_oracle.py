@@ -165,15 +165,22 @@ def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     return mask >= 99.0 and psnr >= 25.0, f"mask {mask:.2f}%, PSNR {psnr:.1f} dB"
 
 
-def compare_arrays(cz: bytes, tt: bytes, smooth: bool = False) -> tuple[bool, str]:
+def compare_arrays(cz: bytes, tt: bytes, smooth: bool = False, masked: bool = True) -> tuple[bool, str]:
     """NumPy arrays: the same type and shape, the same mask band, and values as close as
-    two pictures of them would be (most equal; the rest from the pixel next door)."""
+    two pictures of them would be (most equal; the rest from the pixel next door).
+    Without a mask band (`return_mask=false`) a pixel counts as there where any band of
+    the reference's is not zero."""
     try:
         a, b = np.load(io.BytesIO(cz)), np.load(io.BytesIO(tt))
     except Exception as e:  # noqa: BLE001 - an unreadable array is a failed check
         return False, f"unreadable array: {e}"
     if a.dtype != b.dtype or a.shape != b.shape:
         return False, f"{a.dtype} {a.shape} vs {b.dtype} {b.shape}"
+    if not masked:
+        there = (b != 0).any(axis=0)
+        top = np.iinfo(a.dtype).max if a.dtype.kind in "ui" else 1
+        a = np.concatenate([a, (there * top).astype(a.dtype)[None]])
+        b = np.concatenate([b, (there * top).astype(b.dtype)[None]])
     ma, mb = a[-1] != 0, b[-1] != 0
     mask = float((ma == mb).mean()) * 100
     tops = set(np.unique(a[-1][ma]).tolist()) == set(np.unique(b[-1][mb]).tolist())
@@ -354,7 +361,7 @@ class Oracle:
             elif ct_cz != ct_tt:
                 ok, note = False, f"content type {ct_cz} vs {ct_tt}"
             elif cz.content[:6] == b"\x93NUMPY":
-                ok, note = compare_arrays(cz.content, tt.content, smooth="resampling=" in path)
+                ok, note = compare_arrays(cz.content, tt.content, smooth="resampling=" in path, masked="return_mask=false" not in path)
             elif cz.content[:4] == b"II*\x00":
                 ok, note = compare_geotiffs(cz.content, tt.content, "resampling=" in path)
             else:
@@ -1257,7 +1264,18 @@ def main() -> int:
         o.check("item preview, a height of zero in the path", "image", f"{it}/preview/100x0.png?assets=red&rescale=0,3000")
         o.check("item preview, no size in the path and a max_size", "image", f"{it}/preview/0x0.png?assets=visual&max_size=128")
         o.check("item preview, a side in the path outranks max_size", "image", f"{it}/preview/0x64.png?assets=visual&max_size=32")
-        o.check("item preview, a width of zero as an array", "npy", f"{it}/preview/0x64.npy?assets=red")
+        o.check("item preview, a width of zero as an array", "image", f"{it}/preview/0x64.npy?assets=red",
+                known="an item's preview is drawn by the /stac routes, which write an array as float32; titiler-pgstac writes the data's own type")
+        o.check("item tile as an array, in the data's type", "image", f"{itile}.npy?assets=red")
+        o.check("item tile as an array, three bands of bytes", "image", f"{itile}.npy?assets=visual")
+        o.check("item tile as an array, two assets, no mask", "image", f"{itile}.npy?assets=red&assets=nir&return_mask=false")
+        o.check("item tile as an array, rescaled", "image", f"{itile}.npy?assets=red&rescale=0,3000")
+        o.check("item tile as an array, format in the query", "image", f"{itile}?assets=red&format=npy")
+        o.check("item tile as a GeoTIFF, in the data's type", "image", f"{itile}.tif?assets=red")
+        o.check("item tile as a GeoTIFF, two assets", "image", f"{itile}.tiff?assets=red&assets=nir")
+        o.check("item bbox as an array, in the data's type", "image", f"{it}/bbox/{ibox}/64x64.npy?assets=red")
+        o.check("item bbox as an array, at the data's own size", "image", f"{it}/bbox/{ibox}.npy?assets=scl&max_size=512")
+        o.check("item bbox as a GeoTIFF, in the data's type", "image", f"{it}/bbox/{ibox}/64x64.tif?assets=red")
         o.check("item bbox, a width of zero in the path", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/0x64.png?assets=visual")
         o.check("item bbox, a height of zero in the path", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/64x0.tif?assets=visual")
         o.check("item bbox, no size in the path and a max_size", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/0x0.png?assets=visual&max_size=200")
