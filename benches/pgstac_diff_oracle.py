@@ -741,6 +741,8 @@ def main() -> int:
         each = "&skipcovered=false&exitwhenfull=false"
         o.check("tile as an array, bilinear, a mean", "image",
                 f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3&resampling=bilinear&reproject=bilinear{each}")
+        o.check("tile as an array, bilinear, a rescaled mean", "image",
+                f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3&rescale=0,3000&resampling=bilinear&reproject=bilinear{each}")
         o.check("tile as an array, bilinear, a count", "image",
                 f"{base12}.npy?assets=visual&pixel_selection=count&items_limit=3&resampling=bilinear&reproject=bilinear{each}")
         o.check("tile as an array, bilinear, rescaled", "image",

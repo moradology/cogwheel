@@ -4928,7 +4928,6 @@ async fn tile(
                 // and nothing makes a picture's bytes of them.
                 let array = matches!(treq.format, OutputFormat::Npy)
                     && own_bands
-                    && pq.rescale.is_empty()
                     && !pq.colormap_explicit
                     && formula.is_none()
                     && pq.expr_raw.is_none()
@@ -4989,6 +4988,24 @@ async fn tile(
                         None => vec![f32::NAN; if method == Selection::Count { 1 } else { bands } * dim * dim],
                     };
                     let shown = values.len() / (dim * dim);
+                    // With `rescale` the array is of the bytes a picture would show, in the
+                    // ranges the picture's bands were given.
+                    if !pq.rescale.is_empty() {
+                        let range = |band: usize| match &treq.bands {
+                            BandRequest::Rgb { rescale_min, rescale_max, .. } => (rescale_min[band.min(2)], rescale_max[band.min(2)]),
+                            BandRequest::Single { rescale, .. } => *rescale,
+                            _ => pq.rescale[0],
+                        };
+                        let bytes: Vec<f32> = values
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                let (min, max) = range(i / (dim * dim));
+                                if v.is_nan() { *v } else { f32::from(rescale_byte(*v, min, max)) }
+                            })
+                            .collect();
+                        return Ok((npy_array(&bytes, shown, dim, dim, SampleType::Uint8, return_mask, None), content_type));
+                    }
                     return Ok((npy_array(&values, shown, dim, dim, kind, return_mask, None), content_type));
                 }
                 match selected {
