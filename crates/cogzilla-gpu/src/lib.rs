@@ -26,6 +26,6 @@ pub use policy::{
 };
 pub use predictor::{GpuPredictorDecoder, GpuPredictorKind};
 pub use resample::{GpuResampleMode, GpuResampler, GpuSlab, ResampleTimings};
-pub use stats::{GpuBandStats, GpuStatsReducer};
+pub use stats::{GpuBandStats, GpuStatsReducer, decode_stats_readback};
 pub use terrain::{GpuDemAlgorithm, GpuTerrainRenderer};
 pub use wgpu;

@@ -213,6 +213,16 @@ pub enum CoalescedJob {
         inner: Box<CoalescedJob>,
         quality: u8,
     },
+    /// Chains the 3-stage `stats.wgsl` reducer directly onto a `RawF32`-producing inner job
+    /// (`Colormap`, `Terrain`, `Expr`) inside the same `CommandEncoder` (zero `f32` readback,
+    /// zero `f32` re-upload), returning a packed ~12 KB buffer ready for
+    /// `crate::stats::decode_stats_readback`.
+    WithStats {
+        inner: Box<CoalescedJob>,
+        nodata: Option<f32>,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+    },
 }
 
 /// Telemetry counters for `GpuCoalescer`.
@@ -228,6 +238,59 @@ type ReplyFn = Box<dyn FnOnce(Result<Vec<u8>, GpuError>) + Send>;
 struct PendingRequest {
     job: CoalescedJob,
     reply: ReplyFn,
+}
+
+struct StatsSlotBuffers {
+    params_buf: wgpu::Buffer,
+    partials_buf: wgpu::Buffer,
+    resolved_buf: wgpu::Buffer,
+    hist_buf: wgpu::Buffer,
+    var_buf: wgpu::Buffer,
+}
+
+impl StatsSlotBuffers {
+    fn new(device: &wgpu::Device) -> Self {
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-stats-params"),
+            size: std::mem::size_of::<crate::stats::StatsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-stats-partials"),
+            size: (crate::stats::MAX_WG as usize * std::mem::size_of::<crate::stats::PartialStats>())
+                as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let resolved_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-stats-resolved"),
+            size: std::mem::size_of::<crate::stats::ResolvedStats>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-stats-hist"),
+            size: (2 * crate::stats::CDF_BINS * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let var_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-stats-var"),
+            size: (crate::stats::MAX_WG as usize * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            params_buf,
+            partials_buf,
+            resolved_buf,
+            hist_buf,
+            var_buf,
+        }
+    }
 }
 
 struct JobSlot {
@@ -246,6 +309,7 @@ struct JobSlot {
     jpeg_inv_q_buf: wgpu::Buffer,
     jpeg_out_buf: Option<wgpu::Buffer>,
     jpeg_out_cap_words: usize,
+    stats_slot: Option<StatsSlotBuffers>,
 }
 
 impl JobSlot {
@@ -314,6 +378,7 @@ impl JobSlot {
             jpeg_inv_q_buf,
             jpeg_out_buf: None,
             jpeg_out_cap_words: 0,
+            stats_slot: None,
         }
     }
 
@@ -356,6 +421,11 @@ impl JobSlot {
             self.jpeg_out_buf = Some(Self::alloc_out(device, self.jpeg_out_cap_words));
         }
     }
+
+    fn ensure_stats_slot(&mut self, device: &wgpu::Device) -> &StatsSlotBuffers {
+        self.stats_slot
+            .get_or_insert_with(|| StatsSlotBuffers::new(device))
+    }
 }
 
 struct PreparedJob {
@@ -372,6 +442,7 @@ struct PreparedJob {
     pipe_kind: u8,
     bind_group: wgpu::BindGroup,
     jpeg_pass: Option<(u32, u32, wgpu::BindGroup)>,
+    stats_pass: Option<(u32, wgpu::BindGroup)>,
     reply: ReplyFn,
 }
 
@@ -409,6 +480,7 @@ struct WorkerState {
     bgl: wgpu::BindGroupLayout,
     expr_bgl: wgpu::BindGroupLayout,
     jpeg_bgl: wgpu::BindGroupLayout,
+    stats_bgl: wgpu::BindGroupLayout,
     cm_rgba8: wgpu::ComputePipeline,
     cm_indexed: wgpu::ComputePipeline,
     cm_f32: wgpu::ComputePipeline,
@@ -425,6 +497,9 @@ struct WorkerState {
     mb_resample_f32: wgpu::ComputePipeline,
     expr_rgb_f32: wgpu::ComputePipeline,
     jpeg_fdct: wgpu::ComputePipeline,
+    stats_pass1: wgpu::ComputePipeline,
+    stats_finalize1: wgpu::ComputePipeline,
+    stats_pass2: wgpu::ComputePipeline,
     frames: Vec<RingFrame>,
     in_flight_order: VecDeque<usize>,
     free_frames: VecDeque<usize>,
@@ -705,6 +780,94 @@ impl WorkerState {
             cache: None,
         });
 
+        let stats_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cogzilla-coal-stats-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/stats.wgsl").into()),
+        });
+        let stats_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cogzilla-coal-stats-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let stats_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cogzilla-coal-stats-pl"),
+            bind_group_layouts: &[&stats_bgl],
+            push_constant_ranges: &[],
+        });
+        let mk_stats_pipe = |label: &str, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&stats_pl),
+                module: &stats_shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let stats_pass1 = mk_stats_pipe("coal-stats-pass1", "stats_reduce_pass1");
+        let stats_finalize1 = mk_stats_pipe("coal-stats-finalize1", "stats_finalize_pass1");
+        let stats_pass2 = mk_stats_pipe("coal-stats-pass2", "stats_hist_pass2");
+
         let depth = ring_depth.clamp(1, 4);
         let frames: Vec<RingFrame> = (0..depth).map(|_| RingFrame::new(&device)).collect();
         let free_frames: VecDeque<usize> = (0..depth).collect();
@@ -715,6 +878,7 @@ impl WorkerState {
             bgl,
             expr_bgl,
             jpeg_bgl,
+            stats_bgl,
             cm_rgba8,
             cm_indexed,
             cm_f32,
@@ -731,6 +895,9 @@ impl WorkerState {
             mb_resample_f32,
             expr_rgb_f32,
             jpeg_fdct,
+            stats_pass1,
+            stats_finalize1,
+            stats_pass2,
             frames,
             in_flight_order: VecDeque::with_capacity(depth),
             free_frames,
@@ -762,9 +929,15 @@ impl WorkerState {
 
         for (slot_idx, req) in batch.into_iter().enumerate() {
             let reply = req.reply;
-            let (job, jpeg_quality) = match req.job {
-                CoalescedJob::WithJpeg { inner, quality } => (*inner, Some(quality)),
-                other => (other, None),
+            let (job, jpeg_quality, stats_cfg) = match req.job {
+                CoalescedJob::WithJpeg { inner, quality } => (*inner, Some(quality), None),
+                CoalescedJob::WithStats {
+                    inner,
+                    nodata,
+                    num_bins,
+                    hist_range,
+                } => (*inner, None, Some((nodata, num_bins, hist_range))),
+                other => (other, None, None),
             };
             let prev_len = prepared.len();
             match job {
@@ -890,6 +1063,7 @@ impl WorkerState {
                         pipe_kind,
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
@@ -1049,6 +1223,7 @@ impl WorkerState {
                         pipe_kind,
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
@@ -1179,6 +1354,7 @@ impl WorkerState {
                         pipe_kind,
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
@@ -1320,6 +1496,7 @@ impl WorkerState {
                         pipe_kind: if is_sar { 11u8 } else { 10u8 },
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
@@ -1462,6 +1639,7 @@ impl WorkerState {
                         pipe_kind: 12u8,
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
@@ -1562,6 +1740,7 @@ impl WorkerState {
                         pipe_kind: 13u8,
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
@@ -1680,12 +1859,13 @@ impl WorkerState {
                         pipe_kind: 14u8,
                         bind_group,
                         jpeg_pass: None,
+                        stats_pass: None,
                         reply,
                     });
                 }
-                CoalescedJob::WithJpeg { .. } => {
+                CoalescedJob::WithJpeg { .. } | CoalescedJob::WithStats { .. } => {
                     reply(Err(GpuError::InvalidDimensions(
-                        "nested CoalescedJob::WithJpeg is not supported".into(),
+                        "nested WithJpeg/WithStats is not supported".into(),
                     )));
                     continue;
                 }
@@ -1748,6 +1928,69 @@ impl WorkerState {
                     total_staging_words += jpeg_words;
                 }
             }
+            if let Some((nodata, num_bins, hist_range)) = stats_cfg {
+                if prepared.len() > prev_len {
+                    let pj = prepared.last_mut().unwrap();
+                    let len = pj.dst_w * pj.dst_h;
+                    let len_u32 = len as u32;
+                    let num_wg = len_u32.div_ceil(256 * 16).clamp(1, crate::stats::MAX_WG);
+                    let n_bins = num_bins.clamp(1, crate::stats::CDF_BINS) as u32;
+                    let (hr_min, hr_max) = hist_range.unwrap_or((0.0, 0.0));
+                    let params = crate::stats::StatsParams {
+                        len: len_u32,
+                        num_wg,
+                        has_nodata: u32::from(nodata.is_some()),
+                        num_bins: n_bins,
+                        has_hist_range: u32::from(hist_range.is_some()),
+                        nodata_val: nodata.unwrap_or(0.0),
+                        h_min: hr_min as f32,
+                        h_max: hr_max as f32,
+                    };
+                    let slot = &mut frame.slots[pj.slot_idx];
+                    slot.ensure_stats_slot(&self.device);
+                    let sb = slot.stats_slot.as_ref().unwrap();
+                    self.queue
+                        .write_buffer(&sb.params_buf, 0, bytemuck::bytes_of(&params));
+                    let stats_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("cogzilla-coal-stats-bg"),
+                        layout: &self.stats_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: sb.params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: slot.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: sb.partials_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: sb.resolved_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: sb.hist_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: sb.var_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    total_staging_words -= pj.out_words;
+                    let rb_words = std::mem::size_of::<crate::stats::ResolvedStats>() / 4;
+                    let hb_words = 2 * crate::stats::CDF_BINS;
+                    let stats_words = rb_words + hb_words + (num_wg as usize);
+                    pj.out_words = stats_words;
+                    pj.output = CoalescedOutput::RawF32;
+                    pj.stats_pass = Some((num_wg, stats_bg));
+                    total_staging_words += stats_words;
+                }
+            }
         }
 
         if prepared.is_empty() {
@@ -1807,7 +2050,89 @@ impl WorkerState {
                 }
             }
         }
+        // Pass 2b (fused VRAM-only): chain 3-stage stats.wgsl directly onto slot.out_buf
+        if prepared.iter().any(|j| j.stats_pass.is_some()) {
+            for job in &prepared {
+                if job.stats_pass.is_some() {
+                    let sb = frame.slots[job.slot_idx]
+                        .stats_slot
+                        .as_ref()
+                        .expect("stats_slot allocated");
+                    encoder.clear_buffer(&sb.hist_buf, 0, None);
+                }
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cogzilla-coal-stats-pass1"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.stats_pass1);
+                for job in &prepared {
+                    if let Some((num_wg, ref bg)) = job.stats_pass {
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(num_wg, 1, 1);
+                    }
+                }
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cogzilla-coal-stats-finalize1"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.stats_finalize1);
+                for job in &prepared {
+                    if let Some((_, ref bg)) = job.stats_pass {
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                }
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cogzilla-coal-stats-pass2"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.stats_pass2);
+                for job in &prepared {
+                    if let Some((num_wg, ref bg)) = job.stats_pass {
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(num_wg, 1, 1);
+                    }
+                }
+            }
+        }
         for job in &prepared {
+            if let Some((num_wg, _)) = job.stats_pass {
+                let sb = frame.slots[job.slot_idx]
+                    .stats_slot
+                    .as_ref()
+                    .expect("stats_slot allocated");
+                let rb = std::mem::size_of::<crate::stats::ResolvedStats>() as u64;
+                let hb = (2 * crate::stats::CDF_BINS * std::mem::size_of::<u32>()) as u64;
+                let vb = (num_wg as usize * std::mem::size_of::<f32>()) as u64;
+                encoder.copy_buffer_to_buffer(
+                    &sb.resolved_buf,
+                    0,
+                    &frame.staging_buf,
+                    job.staging_byte_off,
+                    rb,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &sb.hist_buf,
+                    0,
+                    &frame.staging_buf,
+                    job.staging_byte_off + rb,
+                    hb,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &sb.var_buf,
+                    0,
+                    &frame.staging_buf,
+                    job.staging_byte_off + rb + hb,
+                    vb,
+                );
+                continue;
+            }
             let bytes = (job.out_words * 4) as u64;
             let src_buf = if job.jpeg_pass.is_some() {
                 frame.slots[job.slot_idx]

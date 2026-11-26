@@ -15,46 +15,46 @@ use bytemuck::{Pod, Zeroable};
 use crate::context::{GpuContext, GpuError};
 use crate::resample::GpuSlab;
 
-const MAX_WG: u32 = 1024;
-const CDF_BINS: usize = 1024;
+pub(crate) const MAX_WG: u32 = 1024;
+pub(crate) const CDF_BINS: usize = 1024;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct StatsParams {
-    len: u32,
-    num_wg: u32,
-    has_nodata: u32,
-    num_bins: u32,
-    has_hist_range: u32,
-    nodata_val: f32,
-    h_min: f32,
-    h_max: f32,
+pub(crate) struct StatsParams {
+    pub(crate) len: u32,
+    pub(crate) num_wg: u32,
+    pub(crate) has_nodata: u32,
+    pub(crate) num_bins: u32,
+    pub(crate) has_hist_range: u32,
+    pub(crate) nodata_val: f32,
+    pub(crate) h_min: f32,
+    pub(crate) h_max: f32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct PartialStats {
-    min_val: f32,
-    max_val: f32,
-    sum: f32,
-    count: u32,
+pub(crate) struct PartialStats {
+    pub(crate) min_val: f32,
+    pub(crate) max_val: f32,
+    pub(crate) sum: f32,
+    pub(crate) count: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct ResolvedStats {
-    min_val: f32,
-    max_val: f32,
-    sum: f32,
-    mean: f32,
-    p_inv_span: f32,
-    h_min: f32,
-    h_max: f32,
-    h_inv_span: f32,
-    valid_count: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+pub(crate) struct ResolvedStats {
+    pub(crate) min_val: f32,
+    pub(crate) max_val: f32,
+    pub(crate) sum: f32,
+    pub(crate) mean: f32,
+    pub(crate) p_inv_span: f32,
+    pub(crate) h_min: f32,
+    pub(crate) h_max: f32,
+    pub(crate) h_inv_span: f32,
+    pub(crate) valid_count: u32,
+    pub(crate) _pad0: u32,
+    pub(crate) _pad1: u32,
+    pub(crate) _pad2: u32,
 }
 
 /// Complete TiTiler-compatible band statistics computed on the GPU.
@@ -443,86 +443,101 @@ impl GpuStatsReducer {
             .map_err(|e| GpuError::BufferMap(e.to_string()))?
             .map_err(|e| GpuError::BufferMap(e.to_string()))?;
 
-        let (res, hist_counts, cdf_counts, var_sum) = {
+        let stats = {
             let mapped = slice.get_mapped_range();
-            let rb = resolved_bytes as usize;
-            let hb = hist_bytes as usize;
-            let res: ResolvedStats = *bytemuck::from_bytes(&mapped[..rb]);
-            let h_all: &[u32] = bytemuck::cast_slice(&mapped[rb..rb + hb]);
-            let v_all: &[f32] = bytemuck::cast_slice(&mapped[rb + hb..]);
-            let hc: Vec<u64> = h_all[..n_bins as usize].iter().map(|&c| c as u64).collect();
-            let cc: Vec<u64> = h_all[CDF_BINS..2 * CDF_BINS]
-                .iter()
-                .map(|&c| c as u64)
-                .collect();
-            let vs: f64 = v_all.iter().map(|&x| x as f64).sum();
-            (res, hc, cc, vs)
+            decode_stats_readback(&mapped, len, n_bins as usize, hist_range, percentiles)
         };
         self.staging_buf.unmap();
+        Ok(stats)
+    }
+}
 
-        let valid_px = res.valid_count as usize;
-        if valid_px == 0 {
-            return Ok(empty_stats(len, percentiles));
-        }
+/// Decode the packed 12 KB readback buffer (`[ResolvedStats | hist_out | var_partials]`)
+/// emitted by `GpuStatsReducer` or `CoalescedJob::WithStats` into a `GpuBandStats`.
+pub fn decode_stats_readback(
+    bytes: &[u8],
+    total_pixels: usize,
+    num_bins: usize,
+    hist_range: Option<(f64, f64)>,
+    percentiles: &[f64],
+) -> GpuBandStats {
+    let rb = std::mem::size_of::<ResolvedStats>();
+    let hb = 2 * CDF_BINS * std::mem::size_of::<u32>();
+    if bytes.len() < rb + hb {
+        return empty_stats(total_pixels, percentiles);
+    }
+    let n_bins = num_bins.clamp(1, CDF_BINS);
+    let res: ResolvedStats = *bytemuck::from_bytes(&bytes[..rb]);
+    let valid_px = res.valid_count as usize;
+    if valid_px == 0 {
+        return empty_stats(total_pixels, percentiles);
+    }
+    let h_all: &[u32] = bytemuck::cast_slice(&bytes[rb..rb + hb]);
+    let v_all: &[f32] = bytemuck::cast_slice(&bytes[rb + hb..]);
+    let hist_counts: Vec<u64> = h_all[..n_bins].iter().map(|&c| c as u64).collect();
+    let cdf_counts: Vec<u64> = h_all[CDF_BINS..2 * CDF_BINS]
+        .iter()
+        .map(|&c| c as u64)
+        .collect();
+    let var_sum: f64 = v_all.iter().map(|&x| x as f64).sum();
 
-        let min_v = res.min_val as f64;
-        let max_v = res.max_val as f64;
-        let sum = res.sum as f64;
-        let mean = sum / valid_px as f64;
-        let std_dev = (var_sum / valid_px as f64).sqrt();
-        let median = Some(cdf_percentile(&cdf_counts, valid_px as u64, min_v, max_v, 50.0));
-        let p_vals = percentiles
-            .iter()
-            .map(|&p| (p, Some(cdf_percentile(&cdf_counts, valid_px as u64, min_v, max_v, p))))
-            .collect();
-        let (h_min, h_max) = hist_range.unwrap_or((min_v, max_v));
-        let h_span = (h_max - h_min).max(1e-12);
-        let hist_edges: Vec<f64> = (0..=n_bins as usize)
-            .map(|i| h_min + h_span * (i as f64 / n_bins as f64))
-            .collect();
-        let masked_pixels = len.saturating_sub(valid_px);
-        let valid_percent = ((valid_px as f64 / len as f64) * 100.0 * 100.0).round() / 100.0;
+    let min_v = res.min_val as f64;
+    let max_v = res.max_val as f64;
+    let sum = res.sum as f64;
+    let mean = sum / valid_px as f64;
+    let std_dev = (var_sum / valid_px as f64).sqrt();
+    let median = Some(cdf_percentile(&cdf_counts, valid_px as u64, min_v, max_v, 50.0));
+    let p_vals = percentiles
+        .iter()
+        .map(|&p| (p, Some(cdf_percentile(&cdf_counts, valid_px as u64, min_v, max_v, p))))
+        .collect();
+    let (h_min, h_max) = hist_range.unwrap_or((min_v, max_v));
+    let h_span = (h_max - h_min).max(1e-12);
+    let hist_edges: Vec<f64> = (0..=n_bins)
+        .map(|i| h_min + h_span * (i as f64 / n_bins as f64))
+        .collect();
+    let masked_pixels = total_pixels.saturating_sub(valid_px);
+    let valid_percent = ((valid_px as f64 / total_pixels as f64) * 100.0 * 100.0).round() / 100.0;
 
-        let mut maj_cnt = 0u64;
-        let mut maj_bin = 0usize;
-        let mut min_cnt = u64::MAX;
-        let mut min_bin = 0usize;
-        let mut unique_bins = 0usize;
-        for (i, &c) in cdf_counts.iter().enumerate() {
-            if c > 0 {
-                unique_bins += 1;
-                if c > maj_cnt {
-                    maj_cnt = c;
-                    maj_bin = i;
-                }
-                if c < min_cnt {
-                    min_cnt = c;
-                    min_bin = i;
-                }
+    let mut maj_cnt = 0u64;
+    let mut maj_bin = 0usize;
+    let mut min_cnt = u64::MAX;
+    let mut min_bin = 0usize;
+    let mut unique_bins = 0usize;
+    for (i, &c) in cdf_counts.iter().enumerate() {
+        if c > 0 {
+            unique_bins += 1;
+            if c > maj_cnt {
+                maj_cnt = c;
+                maj_bin = i;
+            }
+            if c < min_cnt {
+                min_cnt = c;
+                min_bin = i;
             }
         }
-        let bin_w = (max_v - min_v) / (CDF_BINS as f64);
-        let majority = Some(min_v + (maj_bin as f64 + 0.5) * bin_w);
-        let minority = Some(min_v + (min_bin as f64 + 0.5) * bin_w);
+    }
+    let bin_w = (max_v - min_v) / (CDF_BINS as f64);
+    let majority = Some(min_v + (maj_bin as f64 + 0.5) * bin_w);
+    let minority = Some(min_v + (min_bin as f64 + 0.5) * bin_w);
 
-        Ok(GpuBandStats {
-            total_pixels: len,
-            valid_pixels: valid_px,
-            masked_pixels,
-            valid_percent,
-            min: Some(min_v),
-            max: Some(max_v),
-            mean: Some(mean),
-            sum,
-            std: Some(std_dev),
-            median,
-            majority,
-            minority,
-            unique_bins,
-            percentiles: p_vals,
-            hist_counts,
-            hist_edges,
-        })
+    GpuBandStats {
+        total_pixels,
+        valid_pixels: valid_px,
+        masked_pixels,
+        valid_percent,
+        min: Some(min_v),
+        max: Some(max_v),
+        mean: Some(mean),
+        sum,
+        std: Some(std_dev),
+        median,
+        majority,
+        minority,
+        unique_bins,
+        percentiles: p_vals,
+        hist_counts,
+        hist_edges,
     }
 }
 
