@@ -2519,11 +2519,12 @@ impl PlanesTile {
                 // An array of the values as they are, when nothing was asked that turns
                 // them into a picture's bytes.
                 let shown = !look.rescale.is_empty() || look.mapped || look.custom.is_some() || look.formula.is_some();
-                if let (Some((OutputFormat::Npy, content_type)), false) = (look.asked, shown) {
+                // The type those values are in.
+                let kind = || {
                     let math_of = || self.expression.iter().chain(self.assets.iter().filter_map(|a| a.expression.as_ref()));
                     // What the bands are before any math: floats once unscaled.
                     let read = if self.window.unscale() { SampleType::Float32 } else { widest };
-                    let kind = if matches!(self.selection, Selection::Stdev) {
+                    if matches!(self.selection, Selection::Stdev) {
                         SampleType::Float64
                     } else if matches!(self.selection, Selection::Count) {
                         SampleType::Uint8
@@ -2531,7 +2532,18 @@ impl PlanesTile {
                         read
                     } else {
                         band_math_type(math_of(), read)
-                    };
+                    }
+                };
+                // A PNG holds 16 bits as well as 8: one or three bands of 16-bit whole
+                // numbers, asked for as a PNG and as they are, are written so, as GDAL
+                // writes them for TiTiler.
+                if let (Some((OutputFormat::Png, content_type)), false, 1 | 3) = (look.asked, shown, selected.bands)
+                    && kind() == SampleType::Uint16
+                {
+                    return Ok((png_of_16_bits(&selected.values, selected.bands, width, height, look.return_mask), content_type));
+                }
+                if let (Some((OutputFormat::Npy, content_type)), false) = (look.asked, shown) {
+                    let kind = kind();
                     return Ok((npy_array(&selected.values, selected.bands, width, height, kind, look.return_mask, self.nodata), content_type));
                 }
                 // An array of rescaled values and nothing else: each band's bytes, however
@@ -5442,6 +5454,38 @@ fn encode_picture(
 
 /// A grey PNG of an RGBA picture whose red is the grey: one channel, or two with `alpha`.
 /// Without it a pixel that is not there is black, as it is in the RGB the renderer writes.
+/// One or three bands of 16-bit whole numbers as a PNG of 16 bits a sample: grey or
+/// colour, and with `alpha` a last sample that is the largest number where any band has
+/// a value and zero elsewhere. A value that is not there is written as zero.
+fn png_of_16_bits(values: &[f32], bands: usize, width: usize, height: usize, alpha: bool) -> Bytes {
+    let pixels = width * height;
+    let samples = bands + usize::from(alpha);
+    let mut rows = Vec::with_capacity(height * (1 + width * samples * 2));
+    for row in 0..height {
+        // No filter: the samples as they are. (PNG's Sub filter was tried: no smaller on
+        // Sentinel-2 and 5% slower.)
+        rows.push(0);
+        for i in row * width..(row + 1) * width {
+            let mut there = false;
+            for band in 0..bands {
+                let v = values.get(band * pixels + i).copied().unwrap_or(f32::NAN);
+                there |= !v.is_nan();
+                rows.extend_from_slice(&(if v.is_nan() { 0 } else { v as u16 }).to_be_bytes());
+            }
+            if alpha {
+                rows.extend_from_slice(&(if there { u16::MAX } else { 0 }).to_be_bytes());
+            }
+        }
+    }
+    let colour_type = match (bands, alpha) {
+        (1, false) => 0,
+        (1, true) => 4,
+        (_, false) => 2,
+        (_, true) => 6,
+    };
+    cogzilla_kernel::png_fast::encode_filtered_png_depth(width as u32, height as u32, colour_type, 16, &rows)
+}
+
 fn grey_png(rgba: &[u8], width: usize, height: usize, alpha: bool) -> Bytes {
     let channels = if alpha { 2 } else { 1 };
     let stride = 1 + width * channels;
