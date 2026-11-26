@@ -644,6 +644,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     | TAG_GEO_DOUBLE_PARAMS
                     | TAG_GDAL_METADATA
                     | TAG_GDAL_NODATA
+                    | TAG_LERC_PARAMETERS
             );
             if is_recognized {
                 if seen_tags.contains(&entry.tag) {
@@ -754,6 +755,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_LERC_PARAMETERS => {
                     if entry.count >= 2 && entry.count <= 16 {
+                        charge_tag(entry.count, 8)?;
                         match entry.read_u64_vec(&r) {
                             Ok(vals) => {
                                 if vals.len() >= 2 {
@@ -1287,7 +1289,10 @@ fn parse_gdal_metadata(
             continue;
         }
 
-        if val_str.len() > MAX_META_VALUE_BYTES || stored_items >= MAX_META_ITEMS {
+        if name.len() > MAX_META_VALUE_BYTES
+            || val_str.len() > MAX_META_VALUE_BYTES
+            || stored_items >= MAX_META_ITEMS
+        {
             continue;
         }
         if name.eq_ignore_ascii_case("DESCRIPTION") {
@@ -1422,5 +1427,34 @@ mod tests {
             matches!(err, TiffError::Corrupt("unexpected TIFF field type for ASCII tag")),
             "expected Corrupt(unexpected TIFF field type for ASCII tag), got {err:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_lerc_parameters_rejected_and_oversized_gdal_metadata_name_skipped() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        for _ in 0..2 {
+            buf.extend_from_slice(&TAG_LERC_PARAMETERS.to_le_bytes());
+            buf.extend_from_slice(&TYPE_LONG.to_le_bytes());
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(matches!(err, TiffError::Corrupt("duplicate TIFF tag in IFD")), "got {err:?}");
+
+        let huge_name = "K".repeat(8192);
+        let xml = format!(
+            r#"<GDALMetadata><Item name="{huge_name}" sample="0">x</Item><Item name="ok" sample="0">y</Item></GDALMetadata>"#
+        );
+        let mut scales = [1.0f64];
+        let mut offsets = [0.0f64];
+        let mut meta = vec![Vec::new(); 1];
+        let mut desc = vec![String::new(); 1];
+        parse_gdal_metadata(&xml, &mut scales, &mut offsets, &mut meta, &mut desc);
+        assert_eq!(meta[0], vec![("ok".to_string(), "y".to_string())]);
     }
 }
