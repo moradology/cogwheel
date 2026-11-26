@@ -1226,13 +1226,13 @@ impl<const N: usize> CoordPlan<N> {
                 _ => unreachable!(),
             }
 
-            // Include +/- 1 pixel margin for bilinear/cubic neighbor lookups across block seams.
+            // Exact bilinear pixel footprint `[floor(min), floor(max) + 1]`.
             // Use saturating arithmetic so extreme low-zoom coordinates on high-res COGs
             // (|u| > i32::MAX) never panic in debug or wrap to i32::MIN in release.
-            let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
-            let src_max_col = (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
-            let src_max_row = (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
+            let src_min_col = (min_u.floor() as i32).max(0);
+            let src_max_col = (max_u.floor() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+            let src_min_row = (min_v.floor() as i32).max(0);
+            let src_max_row = (max_v.floor() as i32).saturating_add(1).min(ifd_h as i32 - 1);
 
             if max_u < -0.5 || min_u > (ifd_w as f32 - 0.5) || max_v < -0.5 || min_v > (ifd_h as f32 - 0.5) {
                 return None;
@@ -1310,18 +1310,63 @@ impl<const N: usize> CoordPlan<N> {
                         };
                         grid_u[gy * GRID_DIM + gx] = uu;
                         grid_v[gy * GRID_DIM + gx] = vv;
-                        if uu.is_finite() && vv.is_finite() {
-                            min_u = min_u.min(uu);
-                            max_u = max_u.max(uu);
-                            min_v = min_v.min(vv);
-                            max_v = max_v.max(vv);
-                        } else {
+                        if !uu.is_finite() || !vv.is_finite() {
                             all_finite = false;
                         }
                     }
                 }
 
                 if all_finite {
+                    // Compute exact min/max over the rendered pixel centers `0..=N-1` (NOT the
+                    // unrendered `px = N` / `py = N` right/bottom control-grid boundary nodes,
+                    // which lie 1 full pixel past the last rendered pixel and can spuriously
+                    // cross a 512-px COG block boundary). Because bilinear interpolation on each
+                    // grid cell is convex, its extrema over `[0, N-1] x [0, N-1]` occur at the
+                    // interior/top/left grid nodes `0..GRID_DIM-1` and the interpolated
+                    // `px = N-1` right edge, `py = N-1` bottom edge, and `(N-1, N-1)` corner.
+                    let last = GRID_DIM - 1;
+                    let t_edge = ((cell_px - 1.0) / cell_px) as f32;
+                    let mut track = |uu: f32, vv: f32| {
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    };
+                    for gy in 0..last {
+                        for gx in 0..last {
+                            track(grid_u[gy * GRID_DIM + gx], grid_v[gy * GRID_DIM + gx]);
+                        }
+                        // Rightmost rendered column `px = N - 1`
+                        let i0 = gy * GRID_DIM + (last - 1);
+                        let i1 = gy * GRID_DIM + last;
+                        track(
+                            grid_u[i0] + t_edge * (grid_u[i1] - grid_u[i0]),
+                            grid_v[i0] + t_edge * (grid_v[i1] - grid_v[i0]),
+                        );
+                    }
+                    for gx in 0..last {
+                        // Bottommost rendered row `py = N - 1`
+                        let i0 = (last - 1) * GRID_DIM + gx;
+                        let i1 = last * GRID_DIM + gx;
+                        track(
+                            grid_u[i0] + t_edge * (grid_u[i1] - grid_u[i0]),
+                            grid_v[i0] + t_edge * (grid_v[i1] - grid_v[i0]),
+                        );
+                    }
+                    // Bottom-right rendered pixel `(N - 1, N - 1)`
+                    let c00 = (last - 1) * GRID_DIM + (last - 1);
+                    let c10 = (last - 1) * GRID_DIM + last;
+                    let c01 = last * GRID_DIM + (last - 1);
+                    let c11 = last * GRID_DIM + last;
+                    let u_top = grid_u[c00] + t_edge * (grid_u[c10] - grid_u[c00]);
+                    let u_bot = grid_u[c01] + t_edge * (grid_u[c11] - grid_u[c01]);
+                    let v_top = grid_v[c00] + t_edge * (grid_v[c10] - grid_v[c00]);
+                    let v_bot = grid_v[c01] + t_edge * (grid_v[c11] - grid_v[c01]);
+                    track(
+                        u_top + t_edge * (u_bot - u_top),
+                        v_top + t_edge * (v_bot - v_top),
+                    );
+
                     if !min_u.is_finite()
                         || max_u < -0.5
                         || min_u > (ifd_w as f32 - 0.5)
@@ -1331,12 +1376,12 @@ impl<const N: usize> CoordPlan<N> {
                         return None;
                     }
 
-                    let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
+                    let src_min_col = (min_u.floor() as i32).max(0);
                     let src_max_col =
-                        (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
-                    let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
+                        (max_u.floor() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+                    let src_min_row = (min_v.floor() as i32).max(0);
                     let src_max_row =
-                        (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
+                        (max_v.floor() as i32).saturating_add(1).min(ifd_h as i32 - 1);
 
                     if src_min_col > src_max_col || src_min_row > src_max_row {
                         return None;
@@ -1593,10 +1638,10 @@ impl<const N: usize> CoordPlan<N> {
             if !any_in {
                 return None;
             }
-            let src_min_col = (min_u.floor() as i32).saturating_sub(1).max(0);
-            let src_max_col = (max_u.ceil() as i32).saturating_add(1).min(ifd_w as i32 - 1);
-            let src_min_row = (min_v.floor() as i32).saturating_sub(1).max(0);
-            let src_max_row = (max_v.ceil() as i32).saturating_add(1).min(ifd_h as i32 - 1);
+            let src_min_col = (min_u.floor() as i32).max(0);
+            let src_max_col = (max_u.floor() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+            let src_min_row = (min_v.floor() as i32).max(0);
+            let src_max_row = (max_v.floor() as i32).saturating_add(1).min(ifd_h as i32 - 1);
             if src_min_col > src_max_col || src_min_row > src_max_row {
                 return None;
             }

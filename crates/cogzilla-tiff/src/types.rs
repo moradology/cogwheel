@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum TiffError {
     #[error("truncated or need more bytes: required offset {required} exceeds available {available}")]
     NeedMoreBytes { required: u64, available: u64 },
+    #[error("need byte range [{offset}..{end}) to parse TIFF metadata")]
+    NeedRange { offset: u64, end: u64 },
     #[error("invalid TIFF header magic or byte order")]
     InvalidHeader,
     #[error("unsupported sample format: cogzilla supports u8, i8, u16, i16, u32, i32, f32, f64, got format={format}, bits={bits}")]
