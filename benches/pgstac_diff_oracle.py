@@ -564,6 +564,9 @@ def main() -> int:
         o.check("normalizedIndex over two assets", "image", f"{base12}.png?{ndi}&rescale=-1,1")
         o.check("normalizedIndex over two assets as bands, a colour map", "image", f"{base12}.png?{ndi}&asset_as_band=true&rescale=-1,1&colormap_name=rdylgn")
         o.check("normalizedIndex over two assets, highest", "image", f"{base12}.png?{ndi}&rescale=0,1&pixel_selection=highest")
+        o.check("normalizedIndex over two assets as an array", "image", f"{base12}.npy?{ndi}")
+        o.check("normalizedIndex over two assets as a GeoTIFF", "image", f"{base12}.tif?{ndi}")
+        o.check("bbox, normalizedIndex over two assets as an array", "image", f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.npy?{ndi}")
         o.check("bbox, normalizedIndex over two assets", "image", f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.png?{ndi}&rescale=-1,1")
         o.check("algorithm parameters of the wrong type", "status",
                 f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%22x%22%7D")

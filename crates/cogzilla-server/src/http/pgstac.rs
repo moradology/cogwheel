@@ -2007,6 +2007,8 @@ struct PlanesTile {
     /// Whether the per-pixel work goes to the pool for heavy work: when there is more
     /// than one raster to work out, or a picture larger than a tile.
     pool: bool,
+    /// Whether the band math is `normalizedIndex`'s, whose array TiTiler writes as float32.
+    index: bool,
 }
 
 /// A polygon an image is cut to, and which of the picture's pixels are inside it once
@@ -2452,6 +2454,8 @@ impl PlanesTile {
                         SampleType::Float64
                     } else if matches!(self.selection, Selection::Count) {
                         SampleType::Uint8
+                    } else if self.index {
+                        SampleType::Float32
                     } else if !math {
                         read
                     } else {
@@ -3007,7 +3011,7 @@ async fn part_image_of(
     if let Some(resp) = format_error(ext) {
         return resp;
     }
-    normalized_index_as_band_math(&mut pq, ext);
+    let index = normalized_index_as_band_math(&mut pq, ext);
     // A GeoTIFF is the array with a place on the ground: made as the array, wrapped at the end.
     // (With `algorithm` no array is written on these routes yet: there it stays the picture.)
     let tiff = matches!(ext.or(pq.format_param.as_deref()), Some("tif" | "tiff")) && pq.algorithm.is_none();
@@ -3185,6 +3189,7 @@ async fn part_image_of(
                 array,
                 window: Window::Part { bbox, mercator, width: w as u32, height: h as u32, size, mask: mask.map(|m| (Arc::new(m.clone()), tokio::sync::OnceCell::new())), unscale: pq.unscale },
                 pool: true,
+                index,
             };
             let look = Look {
                 rescale: &pq.rescale,
@@ -4643,21 +4648,24 @@ async fn point_values(
 /// two bands: band math, which planes read as TiTiler's pixels, where the renderer reads one
 /// raster's bands only. A picture is drawn from -1 to 1 unless `rescale` says otherwise, as the
 /// renderer draws the algorithm. (TiTiler, without `rescale`, paints every pixel 127.) An array
-/// is left to the algorithm: TiTiler writes it as float32, where band math gives doubles.
-fn normalized_index_as_band_math(pq: &mut ParsedQuery, ext: Option<&str>) {
-    let array = matches!(ext.or(pq.format_param.as_deref()), Some("npy" | "tif" | "tiff" | "bin" | "raw" | "f32"));
-    if pq.algorithm.as_deref() == Some("normalizedindex")
-        && pq.expr_raw.is_none()
-        && pq.asset_exprs.is_empty()
-        && pq.assets.len() > 1
-        && !array
+/// is the algorithm's values as they are, which TiTiler writes as float32: `true` says so, for
+/// band math that would otherwise be doubles. Bare arrays are left to the algorithm.
+fn normalized_index_as_band_math(pq: &mut ParsedQuery, ext: Option<&str>) -> bool {
+    let asked = ext.or(pq.format_param.as_deref());
+    if pq.algorithm.as_deref() != Some("normalizedindex")
+        || pq.expr_raw.is_some()
+        || !pq.asset_exprs.is_empty()
+        || pq.assets.len() < 2
+        || matches!(asked, Some("bin" | "raw" | "f32"))
     {
-        pq.algorithm = None;
-        pq.expr_raw = Some("(b2-b1)/(b2+b1)".into());
-        if pq.rescale.is_empty() {
-            pq.rescale.push((-1.0, 1.0));
-        }
+        return false;
     }
+    pq.algorithm = None;
+    pq.expr_raw = Some("(b2-b1)/(b2+b1)".into());
+    if pq.rescale.is_empty() && !matches!(asked, Some("npy" | "tif" | "tiff")) {
+        pq.rescale.push((-1.0, 1.0));
+    }
+    true
 }
 
 async fn tile(
@@ -4670,7 +4678,6 @@ async fn tile(
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
-    normalized_index_as_band_math(&mut pq, Some(ext).filter(|e| !e.is_empty()));
     // A tile with a `buffer` is the tile's box grown by that many pixels on every side,
     // at a size grown as much: to rio-tiler, and here, a box in Web Mercator like any other.
     if pq.buffer > 0.0 {
@@ -4704,6 +4711,8 @@ async fn tile(
         let under = tile_polygon(tile);
         return Box::pin(part_image_of(ctx, pg, id, &under, Some(&under), bbox, None, size, ext, pq, &pairs)).await;
     }
+    // (A buffered tile is a box, which does this for itself.)
+    let index = normalized_index_as_band_math(&mut pq, Some(ext).filter(|e| !e.is_empty()));
     let query = match check_mosaic_query(&pq, pairs) {
         Ok(q) => q,
         Err(r) => return r,
@@ -4874,6 +4883,7 @@ async fn tile(
                         unscale: pq.unscale,
                     }),
                     pool: scenes.len() * specs.len() > 1,
+                    index,
                 };
                 let look = Look {
                     rescale: &pq.rescale,
@@ -7822,7 +7832,8 @@ mod tests {
     fn a_normalized_index_over_assets_is_band_math() {
         let asked = |query: &str, ext: Option<&str>| {
             let mut pq = super::super::parse_query(Some(query));
-            normalized_index_as_band_math(&mut pq, ext);
+            let index = normalized_index_as_band_math(&mut pq, ext);
+            assert_eq!(index, pq.algorithm.is_none(), "{query}");
             (pq.algorithm, pq.expr_raw, pq.rescale)
         };
         let math = (None, Some("(b2-b1)/(b2+b1)".to_string()));
@@ -7831,13 +7842,21 @@ mod tests {
         assert_eq!(rescale, vec![(-1.0, 1.0)]);
         // A range asked for is kept; without an extension the picture is still a picture.
         let (algorithm, expression, rescale) = asked("assets=red&assets=nir&algorithm=normalizedIndex&rescale=0,1", None);
-        assert_eq!((algorithm, expression), math);
+        assert_eq!((algorithm, expression), math.clone());
         assert_eq!(rescale, vec![(0.0, 1.0)]);
-        // One asset is the renderer's; an array keeps the algorithm's float32; band math asked for wins.
+        // An array is the values as they are, with no range put in.
         for (query, ext) in [
-            ("assets=visual&algorithm=normalizedIndex", Some("png")),
             ("assets=red&assets=nir&algorithm=normalizedIndex", Some("npy")),
             ("assets=red&assets=nir&algorithm=normalizedIndex&format=tif", None),
+        ] {
+            let (algorithm, expression, rescale) = asked(query, ext);
+            assert_eq!((algorithm, expression), math.clone(), "{query}");
+            assert!(rescale.is_empty(), "{query}");
+        }
+        // One asset is the renderer's; a bare array is the algorithm's; band math asked for wins.
+        for (query, ext) in [
+            ("assets=visual&algorithm=normalizedIndex", Some("png")),
+            ("assets=red&assets=nir&algorithm=normalizedIndex", Some("bin")),
             ("assets=red&assets=nir&algorithm=normalizedIndex&expression=b1", Some("png")),
             ("assets=red&assets=nir&algorithm=hillshade", Some("png")),
         ] {
