@@ -1180,6 +1180,23 @@ def main() -> int:
         for route in ("WebMercatorQuad/tilejson.json", "WebMercatorQuad/map.html", "WMTSCapabilities.xml"):
             for bad in ("tilesize=0", "buffer=0", "padding=-1"):
                 o.check(f"item {route} with {bad}", "status", f"{it}/{route}?assets=red&{bad}")
+        # What an item's routes answer before the item is read: the method, then the path.
+        for name, method, path in (
+            ("item info, posted to", "POST", f"{it}/info"),
+            ("item tile in a format nobody has", "GET", f"{it}/tiles/WebMercatorQuad/10/529/373.xyz?assets=red"),
+            ("item tile at a zoom that is not a number", "GET", f"{it}/tiles/WebMercatorQuad/abc/1/1.png?assets=red"),
+            ("item tile on a grid nobody has", "GET", f"{it}/tiles/Nope/1/1/1.png?assets=red"),
+            ("item tilejson on a grid nobody has", "GET", f"{it}/Nope/tilejson.json?assets=red"),
+            ("item point that is not numbers", "GET", f"{it}/point/abc,1?assets=red"),
+            ("item preview in a format nobody has", "GET", f"{it}/preview.xyz?assets=red"),
+            ("item preview of a size that is not a number", "GET", f"{it}/preview.png?assets=red&max_size=abc"),
+            ("item statistics of a width that is not a number", "GET", f"{it}/statistics?assets=red&width=abc"),
+        ):
+            o.check(name, "status", path, method, triangle if method == "POST" else None)
+        # A size of zero is a size not given.
+        o.check("item preview, a width of zero", "status", f"{it}/preview.png?assets=red&rescale=0,3000&width=0&max_size=64")
+        o.check("bbox, a max_size of zero", "status", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75.png?assets=red&rescale=0,3000&max_size=0")
+        o.check("bbox, a height of zero beside a width", "image", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75.png?assets=red&rescale=0,3000&width=32&height=0")
         o.check("item in an unknown collection", "json", f"/collections/nope/items/{item_id}/assets")
         o.check("item info", "json", f"{it}/info?assets=visual")
         o.check("item info, two assets", "json", f"{it}/info?assets=red&assets=nir")
