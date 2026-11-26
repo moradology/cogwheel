@@ -4350,3 +4350,351 @@ async fn sweep26_dd1_antimeridian_bbox_and_dd2_partial_polygon_valid_percent() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+fn write_synthetic_u16_2band_4326_geotiff(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    bounds: [f64; 4], // [west, south, east, north]
+    band1_val: u16,
+    band2_val: u16,
+    hole: Option<&str>, // "left" | "top"
+) {
+    let mut pixels = Vec::<u16>::with_capacity((width * height * 2) as usize);
+    for row in 0..height {
+        for col in 0..width {
+            let masked = match hole {
+                Some("left") => col < width / 2,
+                Some("top") => row < height / 2,
+                _ => false,
+            };
+            if masked {
+                pixels.push(0);
+                pixels.push(0);
+            } else {
+                pixels.push(band1_val);
+                pixels.push(band2_val);
+            }
+        }
+    }
+    let mut buf = Vec::<u8>::new();
+    buf.extend_from_slice(b"II");
+    buf.extend_from_slice(&42u16.to_le_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes());
+
+    let num_entries: u16 = 14;
+    let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+    let data_start = 8 + ifd_size;
+
+    let scale_off = data_start as u32;
+    let tiepoint_off = scale_off + 24;
+    let geokey_off = tiepoint_off + 48;
+    let pixel_off = geokey_off + 24;
+    let pixel_bytes = (pixels.len() * 2) as u32;
+
+    let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        b.extend_from_slice(&val.to_le_bytes());
+    };
+
+    buf.extend_from_slice(&num_entries.to_le_bytes());
+    push_entry(&mut buf, 256, 4, 1, width); // ImageWidth
+    push_entry(&mut buf, 257, 4, 1, height); // ImageLength
+    // BitsPerSample = [16, 16] packed inline in 4 bytes
+    push_entry(&mut buf, 258, 3, 2, 16u32 | (16u32 << 16));
+    push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+    push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+    push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+    push_entry(&mut buf, 277, 3, 1, 2); // SamplesPerPixel = 2
+    push_entry(&mut buf, 278, 4, 1, height); // RowsPerStrip
+    push_entry(&mut buf, 279, 4, 1, pixel_bytes); // StripByteCounts
+    push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+    push_entry(&mut buf, 33550, 12, 3, scale_off); // ModelPixelScaleTag
+    push_entry(&mut buf, 33922, 12, 6, tiepoint_off); // ModelTiepointTag
+    push_entry(&mut buf, 34735, 3, 12, geokey_off); // GeoKeyDirectoryTag
+    // GDAL_NODATA = "0\0" (2 bytes inline in 4-byte value field)
+    push_entry(&mut buf, 42113, 2, 2, u32::from_le_bytes([b'0', 0, 0, 0]));
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+
+    let sx = (bounds[2] - bounds[0]) / width as f64;
+    let sy = (bounds[3] - bounds[1]) / height as f64;
+    assert_eq!(buf.len(), scale_off as usize);
+    for v in [sx, sy, 0.0f64] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), tiepoint_off as usize);
+    for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), geokey_off as usize);
+    // GTModelTypeGeoKey(1024)=2 (Geographic), GeographicTypeGeoKey(2048)=4326
+    for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), pixel_off as usize);
+    for &p in &pixels {
+        buf.extend_from_slice(&p.to_le_bytes());
+    }
+    std::fs::write(path, &buf).unwrap();
+}
+
+/// Parity Sweep #30 FF1:
+/// - /mosaicjson/bbox honours all 9 pixel_selection methods and returns X-Assets
+/// - GET & POST /mosaicjson/statistics mosaic all intersecting assets through Fold,
+///   honour all 9 pixel_selection methods, and return X-Assets
+/// - Unsupported routes refuse ?pixel_selection= with 400 (while bogus values stay 422)
+#[tokio::test]
+async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep30_ff1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // WebMercator tile 10/163/395 WGS84 bounds (quadkey "0230102033")
+    let bounds = [-122.6953125, 37.71859032558816, -122.34375, 37.996162679728116];
+    let a_path = tmp.join("a.tif");
+    let b_path = tmp.join("b.tif");
+    let c_path = tmp.join("c.tif");
+    write_synthetic_u16_2band_4326_geotiff(&a_path, 64, 64, bounds, 10, 300, Some("left"));
+    write_synthetic_u16_2band_4326_geotiff(&b_path, 64, 64, bounds, 20, 100, None);
+    write_synthetic_u16_2band_4326_geotiff(&c_path, 64, 64, bounds, 30, 200, Some("top"));
+
+    let mj_path = tmp.join("m.json");
+    let mj = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 8,
+        "maxzoom": 12,
+        "quadkey_zoom": 10,
+        "bounds": bounds,
+        "center": [(bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0, 10],
+        "tiles": {
+            "0230102033": [
+                a_path.to_str().unwrap(),
+                b_path.to_str().unwrap(),
+                c_path.to_str().unwrap()
+            ]
+        }
+    });
+    std::fs::write(&mj_path, mj.to_string()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let mp = mj_path.to_string_lossy().to_string();
+    let ap = a_path.to_string_lossy().to_string();
+    let bbox_str = format!("{},{},{},{}", bounds[0], bounds[1], bounds[2], bounds[3]);
+
+    // Expected [TL, TR, BL, BR] for band 1, plus (expected_bands, min, max, mean) for stats
+    // Over 64x64 = 4096 pixels with equal 32x32 quadrants.
+    let cases = [
+        ("first",        [20.0f32, 10.0, 20.0, 10.0], 2usize, 10.0f64, 20.0f64, 15.0f64),
+        ("highest",      [20.0, 20.0, 30.0, 30.0], 2, 20.0, 30.0, 25.0),
+        ("lowest",       [20.0, 10.0, 20.0, 10.0], 2, 10.0, 20.0, 15.0),
+        ("mean",         [20.0, 15.0, 25.0, 20.0], 2, 15.0, 25.0, 20.0),
+        ("median",       [20.0, 15.0, 25.0, 20.0], 2, 15.0, 25.0, 20.0),
+        ("stdev",        [0.0,  5.0,  5.0,  8.164966], 2, 0.0, 8.164966, 4.541241),
+        ("count",        [1.0,  2.0,  2.0,  3.0],  1, 1.0,  3.0,  2.0),
+        ("lastbandhigh", [20.0, 10.0, 30.0, 10.0], 1, 10.0, 30.0, 17.5),
+        ("lastbandlow",  [20.0, 20.0, 20.0, 20.0], 1, 20.0, 20.0, 20.0),
+    ];
+
+    // 1. FF1(a): /mosaicjson/bbox/{bbox}/64x64.npy across all 9 methods + X-Assets
+    for (ps, expected_q, expected_nb, _, _, _) in cases {
+        let r = client
+            .get(format!(
+                "{base}/mosaicjson/bbox/{bbox_str}/64x64.npy?url={mp}&pixel_selection={ps}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "bbox {ps} failed");
+        let x_assets = r
+            .headers()
+            .get("x-assets")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            x_assets.contains("a.tif") && x_assets.contains("b.tif"),
+            "bbox {ps} missing X-Assets: {x_assets:?}"
+        );
+        let body = r.bytes().await.unwrap();
+        let vals = decode_npy_f32(&body);
+        assert_eq!(
+            vals.len(),
+            (expected_nb + 1) * 64 * 64,
+            "bbox {ps} unexpected npy plane count (data+mask)"
+        );
+        let b1 = &vals[..64 * 64];
+        let got_q = [
+            b1[16 * 64 + 16],
+            b1[16 * 64 + 48],
+            b1[48 * 64 + 16],
+            b1[48 * 64 + 48],
+        ];
+        for (i, (&g, &e)) in got_q.iter().zip(expected_q.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "bbox {ps} quadrant {i}: got {got_q:?}, expected {expected_q:?}"
+            );
+        }
+    }
+
+    // 2. FF1(b): GET /mosaicjson/statistics across all 9 methods + X-Assets
+    for (ps, _, expected_nb, exp_min, exp_max, exp_mean) in cases {
+        let r = client
+            .get(format!(
+                "{base}/mosaicjson/statistics?url={mp}&pixel_selection={ps}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET statistics {ps} failed");
+        let x_assets = r
+            .headers()
+            .get("x-assets")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            x_assets.contains("a.tif") && x_assets.contains("b.tif"),
+            "GET statistics {ps} missing X-Assets: {x_assets:?}"
+        );
+        if ps != "first" {
+            assert!(
+                x_assets.contains("c.tif"),
+                "GET statistics {ps} should include c.tif in X-Assets: {x_assets:?}"
+            );
+        }
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        let obj = j.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            expected_nb,
+            "GET statistics {ps}: expected {expected_nb} bands, got {j}"
+        );
+        let b1 = &obj["b1"];
+        assert!(
+            (b1["count"].as_f64().unwrap() - 4096.0).abs() < 1e-4,
+            "GET statistics {ps}: expected full mosaic count 4096, got {b1}"
+        );
+        assert!(
+            (b1["min"].as_f64().unwrap() - exp_min).abs() < 1e-3,
+            "GET statistics {ps}: min got {}, expected {exp_min}",
+            b1["min"]
+        );
+        assert!(
+            (b1["max"].as_f64().unwrap() - exp_max).abs() < 1e-3,
+            "GET statistics {ps}: max got {}, expected {exp_max}",
+            b1["max"]
+        );
+        assert!(
+            (b1["mean"].as_f64().unwrap() - exp_mean).abs() < 1e-3,
+            "GET statistics {ps}: mean got {}, expected {exp_mean}",
+            b1["mean"]
+        );
+    }
+
+    // 3. FF1(b): POST /mosaicjson/statistics with polygon covering the mosaic
+    let poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [bounds[0], bounds[1]],
+                [bounds[2], bounds[1]],
+                [bounds[2], bounds[3]],
+                [bounds[0], bounds[3]],
+                [bounds[0], bounds[1]]
+            ]]
+        }
+    });
+    for (ps, _, expected_nb, exp_min, exp_max, exp_mean) in cases {
+        let r = client
+            .post(format!(
+                "{base}/mosaicjson/statistics?url={mp}&pixel_selection={ps}"
+            ))
+            .header("content-type", "application/json")
+            .body(poly.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "POST statistics {ps} failed");
+        let x_assets = r
+            .headers()
+            .get("x-assets")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            x_assets.contains("a.tif") && x_assets.contains("b.tif"),
+            "POST statistics {ps} missing X-Assets: {x_assets:?}"
+        );
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        let stats = j["properties"]["statistics"].as_object().unwrap();
+        assert_eq!(
+            stats.len(),
+            expected_nb,
+            "POST statistics {ps}: expected {expected_nb} bands, got {j}"
+        );
+        let b1 = &stats["b1"];
+        assert!(
+            (b1["count"].as_f64().unwrap() - 4096.0).abs() < 1e-4,
+            "POST statistics {ps}: expected full mosaic count 4096, got {b1}"
+        );
+        assert!(
+            (b1["min"].as_f64().unwrap() - exp_min).abs() < 1e-3,
+            "POST statistics {ps}: min got {}, expected {exp_min}",
+            b1["min"]
+        );
+        assert!(
+            (b1["max"].as_f64().unwrap() - exp_max).abs() < 1e-3,
+            "POST statistics {ps}: max got {}, expected {exp_max}",
+            b1["max"]
+        );
+        assert!(
+            (b1["mean"].as_f64().unwrap() - exp_mean).abs() < 1e-3,
+            "POST statistics {ps}: mean got {}, expected {exp_mean}",
+            b1["mean"]
+        );
+    }
+
+    // 4. Unsupported routes refuse ?pixel_selection= with 400 (bogus value stays 422)
+    let cx = (bounds[0] + bounds[2]) / 2.0 + 0.01;
+    let cy = (bounds[1] + bounds[3]) / 2.0 - 0.01;
+    for unsupported in [
+        format!("{base}/mosaicjson/point/{cx},{cy}?url={mp}&pixel_selection=highest"),
+        format!("{base}/mosaicjson/info?url={mp}&pixel_selection=highest"),
+        format!("{base}/cog/bbox/{bbox_str}/32x32.npy?url={ap}&pixel_selection=highest"),
+        format!("{base}/cog/statistics?url={ap}&pixel_selection=highest"),
+    ] {
+        let r = client.get(&unsupported).send().await.unwrap();
+        assert_eq!(
+            r.status(),
+            400,
+            "expected 400 for unsupported pixel_selection on {unsupported}, got {}",
+            r.status()
+        );
+    }
+    let r_bogus = client
+        .get(format!(
+            "{base}/mosaicjson/bbox/{bbox_str}/32x32.npy?url={mp}&pixel_selection=bogus"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bogus.status(), 422, "bogus pixel_selection must stay 422");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -553,6 +553,11 @@ def main() -> int:
         o.check("png of 16 bits, one band", "image", f"{base12}.png?assets=red")
         o.check("png of 16 bits, one band and no mask", "image", f"{base12}.png?assets=red&return_mask=false")
         o.check("png of 16 bits, three bands", "image", f"{base12}.png?assets=red&assets=green&assets=blue&asset_as_band=true")
+        o.check("png of 16 bits, two bands and no mask", "image", f"{base12}.png?assets=red&assets=nir&asset_as_band=true&return_mask=false")
+        o.check("png of 16 bits, four bands and no mask", "image",
+                f"{base12}.png?assets=red&assets=green&assets=blue&assets=nir&asset_as_band=true&return_mask=false")
+        o.check("png of 16 bits, four bands and a mask", "status",
+                f"{base12}.png?assets=red&assets=green&assets=blue&assets=nir&asset_as_band=true")
         o.check("png of 16 bits, a bbox", "image", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75/64x64.png?assets=red")
         # Smoothed pixels on a grid in metres: one reader for all four.
         smoothed_shape = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
