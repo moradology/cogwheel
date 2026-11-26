@@ -3352,7 +3352,7 @@ pub async fn compute_statistics_with_options(
         engine.get_or_build_crs(cog)?
     };
     if let Some(pm) = poly_mask {
-        if opts.width.is_none() && opts.height.is_none() {
+        if pm.is_empty() || (opts.width.is_none() && opts.height.is_none()) {
             return crate::zonal::compute_native_exact_polygon_stats(
                 engine,
                 cog,
@@ -4002,6 +4002,23 @@ pub fn extract_geojson_crs(
 }
 
 impl PolygonMask {
+    /// Empty mask (e.g. RFC 7946 §3.2 Feature with `"geometry": null`), producing zero-count
+    /// null statistics identical to a feature outside the dataset.
+    pub fn empty() -> Self {
+        Self {
+            polygons: Vec::new(),
+            lines: Vec::new(),
+            points: Vec::new(),
+            bbox: [0.0; 4],
+            raw_bbox: [0.0; 4],
+            coord_crs_projected: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.polygons.is_empty() && self.lines.is_empty() && self.points.is_empty()
+    }
+
     pub fn from_geojson(val: &serde_json::Value) -> Result<(Self, [f64; 4]), EngineError> {
         Self::from_geojson_in_crs(val, None)
     }

@@ -3603,3 +3603,176 @@ async fn sweep18_w1_source_freshness_and_w2_referenced_asset_errors() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn sweep23_cc1_null_geometry_and_indexed_fc_errors() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep23_cc1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Synthetic 64x64 EPSG:32610 GeoTIFF at (500_000, 4_200_000), 30m px, filled with 42.0
+    let cog_path = tmp.join("scene.tif");
+    write_synthetic_f32_projected_geotiff(
+        &cog_path,
+        64,
+        64,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &vec![42.0f32; 64 * 64],
+    );
+    let cog_url = cog_path.to_string_lossy().to_string();
+
+    let stac_path = tmp.join("item.json");
+    std::fs::write(
+        &stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "cc1-item",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-123.5, 37.5], [-122.5, 37.5], [-122.5, 38.5], [-123.5, 38.5], [-123.5, 37.5]]]
+            },
+            "bbox": [-123.5, 37.5, -122.5, 38.5],
+            "properties": {"datetime": "2026-01-01T00:00:00Z"},
+            "assets": {
+                "data": {"href": cog_url, "type": "image/tiff; application=geotiff"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let stac_url = stac_path.to_string_lossy().to_string();
+
+    let mj_path = tmp.join("mosaic.json");
+    std::fs::write(
+        &mj_path,
+        serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 8,
+            "maxzoom": 12,
+            "quadkey_zoom": 8,
+            "bounds": [-124.0, 37.0, -122.0, 39.0],
+            "tiles": { "02301020": [cog_url] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mj_url = mj_path.to_string_lossy().to_string();
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(serve_listener(engine.clone(), listener));
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let poly_a = serde_json::json!({
+        "type": "Polygon",
+        "coordinates": [[[500_300.0, 4_199_100.0], [500_900.0, 4_199_100.0], [500_900.0, 4_199_700.0], [500_300.0, 4_199_700.0], [500_300.0, 4_199_100.0]]]
+    });
+    let poly_c = serde_json::json!({
+        "type": "Polygon",
+        "coordinates": [[[501_000.0, 4_198_500.0], [501_600.0, 4_198_500.0], [501_600.0, 4_199_000.0], [501_000.0, 4_199_000.0], [501_000.0, 4_198_500.0]]]
+    });
+    let fc_with_null = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "id": "f0", "properties": {"name": "first"}, "geometry": poly_a},
+            {"type": "Feature", "id": "f1-null", "properties": {"name": "middle"}, "geometry": null},
+            {"type": "Feature", "id": "f2", "properties": {"name": "last"}, "geometry": poly_c}
+        ]
+    });
+    let fc_malformed = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "id": "ok-0", "properties": {}, "geometry": poly_a},
+            {
+                "type": "Feature",
+                "id": "bad-parcel-42",
+                "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [[[500_300.0, 4_199_100.0], [500_900.0, 4_199_100.0]]]}
+            },
+            {"type": "Feature", "id": "ok-2", "properties": {}, "geometry": poly_c}
+        ]
+    });
+
+    let endpoints = [
+        ("cog", format!("{base}/cog/statistics?url={cog_url}&coord_crs=EPSG:32610"), "b1"),
+        (
+            "stac",
+            format!("{base}/stac/statistics?url={stac_url}&assets=data&coord_crs=EPSG:32610"),
+            "b1",
+        ),
+        (
+            "mosaicjson",
+            format!("{base}/mosaicjson/statistics?url={mj_url}&coord_crs=EPSG:32610"),
+            "b1",
+        ),
+    ];
+
+    for (label, url, band_key) in &endpoints {
+        // 1. 3-feature collection with null geometry in middle returns 3 features in order
+        let resp = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(fc_with_null.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{label}: null-geom FC must return 200");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let feats = body["features"].as_array().unwrap();
+        assert_eq!(feats.len(), 3, "{label}: expected 3 features");
+        assert_eq!(feats[0]["id"], "f0");
+        assert_eq!(feats[1]["id"], "f1-null");
+        assert_eq!(feats[2]["id"], "f2");
+        assert!(
+            feats[0]["properties"]["statistics"][band_key]["count"]
+                .as_f64()
+                .unwrap()
+                > 0.0,
+            "{label}: feature 0 must have positive count"
+        );
+        let mid_stats = &feats[1]["properties"]["statistics"][band_key];
+        assert_eq!(
+            mid_stats["count"].as_f64().unwrap(),
+            0.0,
+            "{label}: null-geometry feature must have count 0, got {mid_stats}"
+        );
+        assert!(
+            mid_stats["mean"].is_null(),
+            "{label}: null-geometry feature must have null mean, got {mid_stats}"
+        );
+        assert!(
+            feats[2]["properties"]["statistics"][band_key]["count"]
+                .as_f64()
+                .unwrap()
+                > 0.0,
+            "{label}: feature 2 must have positive count"
+        );
+
+        // 2. Malformed second feature returns 400 naming features[1] and its id
+        let bad = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(fc_malformed.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400, "{label}: malformed feature must return 400");
+        let bad_text = bad.text().await.unwrap();
+        assert!(
+            bad_text.contains("features[1]") && bad_text.contains("bad-parcel-42"),
+            "{label}: 400 detail must name features[1] and id, got: {bad_text}"
+        );
+    }
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
