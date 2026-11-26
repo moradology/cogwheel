@@ -93,7 +93,61 @@ const HIST_BYTES: u64 = (2048 * std::mem::size_of::<u32>()) as u64;
 const VAR_BYTES: u64 = (MAX_WG as u64) * (std::mem::size_of::<f32>() as u64);
 const READBACK_BYTES: u64 = RESOLVED_BYTES + HIST_BYTES + VAR_BYTES;
 
-/// Single-submit GPU weighted zonal statistics reducer.
+struct WeightedBandSlot {
+    src_buf: wgpu::Buffer,
+    src_cap_elems: usize,
+    partials_buf: wgpu::Buffer,
+    resolved_buf: wgpu::Buffer,
+    hist_buf: wgpu::Buffer,
+    var_buf: wgpu::Buffer,
+}
+
+impl WeightedBandSlot {
+    fn new(device: &wgpu::Device, init_cap: usize) -> Self {
+        let src_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wstats-src"),
+            size: (init_cap * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wstats-partials"),
+            size: (MAX_WG as u64) * (std::mem::size_of::<WeightedPartial>() as u64),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let resolved_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wstats-resolved"),
+            size: RESOLVED_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wstats-hist"),
+            size: HIST_BYTES,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let var_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wstats-var"),
+            size: VAR_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            src_buf,
+            src_cap_elems: init_cap,
+            partials_buf,
+            resolved_buf,
+            hist_buf,
+            var_buf,
+        }
+    }
+}
+
+/// Single-submit GPU weighted zonal statistics reducer (batches all bands of a polygon into 1 submit).
 pub struct GpuWeightedStatsReducer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -102,17 +156,13 @@ pub struct GpuWeightedStatsReducer {
     pipe_finalize1: wgpu::ComputePipeline,
     pipe_pass2: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
-    src_buf: wgpu::Buffer,
-    src_cap_elems: usize,
     cov_buf: wgpu::Buffer,
     cov_cap_elems: usize,
     row_area_buf: wgpu::Buffer,
     row_area_cap_elems: usize,
-    partials_buf: wgpu::Buffer,
-    resolved_buf: wgpu::Buffer,
-    hist_buf: wgpu::Buffer,
-    var_buf: wgpu::Buffer,
+    slots: Vec<WeightedBandSlot>,
     staging_buf: wgpu::Buffer,
+    staging_cap_bands: usize,
 }
 
 impl GpuWeightedStatsReducer {
@@ -239,12 +289,6 @@ impl GpuWeightedStatsReducer {
             mapped_at_creation: false,
         });
         let init_cap = 1024usize;
-        let src_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wstats-src"),
-            size: (init_cap * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let cov_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wstats-cov"),
             size: (init_cap * 4) as u64,
@@ -257,35 +301,10 @@ impl GpuWeightedStatsReducer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wstats-partials"),
-            size: (MAX_WG as u64) * (std::mem::size_of::<WeightedPartial>() as u64),
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let resolved_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wstats-resolved"),
-            size: RESOLVED_BYTES,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wstats-hist"),
-            size: HIST_BYTES,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let var_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wstats-var"),
-            size: VAR_BYTES,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let slots = vec![WeightedBandSlot::new(&device, init_cap)];
         let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wstats-staging"),
-            size: READBACK_BYTES,
+            size: READBACK_BYTES * 4,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -298,17 +317,13 @@ impl GpuWeightedStatsReducer {
             pipe_finalize1,
             pipe_pass2,
             params_buf,
-            src_buf,
-            src_cap_elems: init_cap,
             cov_buf,
             cov_cap_elems: init_cap,
             row_area_buf,
             row_area_cap_elems: init_cap,
-            partials_buf,
-            resolved_buf,
-            hist_buf,
-            var_buf,
+            slots,
             staging_buf,
+            staging_cap_bands: 4,
         }
     }
 
@@ -362,14 +377,29 @@ impl GpuWeightedStatsReducer {
         }
         let n_bins = num_bins.clamp(1, 1000);
         let num_wg = ((len as u32).div_ceil(256)).clamp(1, MAX_WG);
+        let n_bands = bands.len();
 
-        Self::ensure_buf(
-            &self.device,
-            &mut self.src_buf,
-            &mut self.src_cap_elems,
-            len,
-            "wstats-src",
-        );
+        while self.slots.len() < n_bands {
+            self.slots.push(WeightedBandSlot::new(&self.device, len.next_power_of_two().max(1024)));
+        }
+        if n_bands > self.staging_cap_bands {
+            self.staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wstats-staging"),
+                size: READBACK_BYTES * (n_bands as u64),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.staging_cap_bands = n_bands;
+        }
+        for slot in self.slots.iter_mut().take(n_bands) {
+            Self::ensure_buf(
+                &self.device,
+                &mut slot.src_buf,
+                &mut slot.src_cap_elems,
+                len,
+                "wstats-src",
+            );
+        }
         Self::ensure_buf(
             &self.device,
             &mut self.cov_buf,
@@ -385,7 +415,7 @@ impl GpuWeightedStatsReducer {
             "wstats-row-areas",
         );
 
-        // Upload shared coverage + row areas ONCE across all bands!
+        // Upload shared coverage + row areas + params ONCE across all bands!
         self.queue
             .write_buffer(&self.cov_buf, 0, bytemuck::cast_slice(covs));
         self.queue
@@ -412,63 +442,67 @@ impl GpuWeightedStatsReducer {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wstats-bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.src_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.cov_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.row_area_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.partials_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: self.resolved_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: self.hist_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: self.var_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut results = Vec::with_capacity(bands.len());
-        let var_copy_bytes = (num_wg as u64) * 4;
-        for &band in bands {
+        let mut bind_groups = Vec::with_capacity(n_bands);
+        for (bi, &band) in bands.iter().enumerate() {
+            let slot = &self.slots[bi];
             self.queue
-                .write_buffer(&self.src_buf, 0, bytemuck::cast_slice(band));
+                .write_buffer(&slot.src_buf, 0, bytemuck::cast_slice(band));
+            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wstats-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: slot.src_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.cov_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.row_area_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: slot.partials_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: slot.resolved_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: slot.hist_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: slot.var_buf.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
 
-            let mut enc = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("wstats-enc"),
-                });
-            enc.clear_buffer(&self.hist_buf, 0, None);
-            {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("wstats-3stage"),
-                    timestamp_writes: None,
-                });
-                pass.set_bind_group(0, &bg, &[]);
+        // Encode ALL B bands into ONE CommandEncoder -> ONE submit -> ONE map_async!
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wstats-batched-enc"),
+            });
+        for slot in self.slots.iter().take(n_bands) {
+            enc.clear_buffer(&slot.hist_buf, 0, None);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("wstats-3stage-batched"),
+                timestamp_writes: None,
+            });
+            for bg in &bind_groups {
+                pass.set_bind_group(0, bg, &[]);
                 pass.set_pipeline(&self.pipe_pass1);
                 pass.dispatch_workgroups(num_wg, 1, 1);
 
@@ -478,42 +512,56 @@ impl GpuWeightedStatsReducer {
                 pass.set_pipeline(&self.pipe_pass2);
                 pass.dispatch_workgroups(num_wg, 1, 1);
             }
-            enc.copy_buffer_to_buffer(&self.resolved_buf, 0, &self.staging_buf, 0, RESOLVED_BYTES);
+        }
+        let var_copy_bytes = (num_wg as u64) * 4;
+        let per_band_bytes = RESOLVED_BYTES + HIST_BYTES + var_copy_bytes;
+        for (bi, slot) in self.slots.iter().take(n_bands).enumerate() {
+            let dst_off = (bi as u64) * per_band_bytes;
+            enc.copy_buffer_to_buffer(&slot.resolved_buf, 0, &self.staging_buf, dst_off, RESOLVED_BYTES);
             enc.copy_buffer_to_buffer(
-                &self.hist_buf,
+                &slot.hist_buf,
                 0,
                 &self.staging_buf,
-                RESOLVED_BYTES,
+                dst_off + RESOLVED_BYTES,
                 HIST_BYTES,
             );
             enc.copy_buffer_to_buffer(
-                &self.var_buf,
+                &slot.var_buf,
                 0,
                 &self.staging_buf,
-                RESOLVED_BYTES + HIST_BYTES,
+                dst_off + RESOLVED_BYTES + HIST_BYTES,
                 var_copy_bytes,
             );
-
-            let sub_idx = self.queue.submit(Some(enc.finish()));
-            let slice = self
-                .staging_buf
-                .slice(0..(RESOLVED_BYTES + HIST_BYTES + var_copy_bytes));
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            self.device
-                .poll(wgpu::Maintain::WaitForSubmissionIndex(sub_idx));
-            rx.recv()
-                .map_err(|_| GpuError::BufferMap("wstats channel dropped".into()))?
-                .map_err(|e| GpuError::BufferMap(format!("{e:?}")))?;
-
-            let mapped = slice.get_mapped_range();
-            let stats = decode_weighted_readback(&mapped, num_wg as usize, n_bins, hist_range, percentiles);
-            drop(mapped);
-            self.staging_buf.unmap();
-            results.push(stats);
         }
+
+        let sub_idx = self.queue.submit(Some(enc.finish()));
+        let total_readback = per_band_bytes * (n_bands as u64);
+        let slice = self.staging_buf.slice(0..total_readback);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(sub_idx));
+        rx.recv()
+            .map_err(|_| GpuError::BufferMap("wstats channel dropped".into()))?
+            .map_err(|e| GpuError::BufferMap(format!("{e:?}")))?;
+
+        let mapped = slice.get_mapped_range();
+        let stride_bytes = per_band_bytes as usize;
+        let mut results = Vec::with_capacity(n_bands);
+        for bi in 0..n_bands {
+            let off = bi * stride_bytes;
+            results.push(decode_weighted_readback(
+                &mapped[off..off + stride_bytes],
+                num_wg as usize,
+                n_bins,
+                hist_range,
+                percentiles,
+            ));
+        }
+        drop(mapped);
+        self.staging_buf.unmap();
 
         Ok(results)
     }
