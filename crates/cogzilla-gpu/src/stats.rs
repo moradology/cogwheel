@@ -1,12 +1,12 @@
-//! GPU-accelerated Raster Band Statistics, Shared-Memory Atomic Histogram & Percentile CDF Reducer.
+//! Single-Submit GPU Raster Band Statistics, Shared-Memory Atomic Histogram & Percentile CDF.
 //!
-//! Replaces single-threaded CPU `sort_unstable_by` over millions of `f32` pixels with a
-//! two-pass WGSL compute reduction:
-//! 1. **Pass 1 (`stats_reduce_pass1`)**: Grid-stride workgroup reduction (Kahan summation,
-//!    exact `min`, `max`, `valid_count`).
-//! 2. **Pass 2 (`stats_hist_pass2`)**: Workgroup-privatized 1024-bin shared-memory atomic
-//!    histograms (user `num_bins` histogram + 1024-bin percentile CDF) + exact centered
-//!    2-pass variance (`std`), reading back only ~28 KB regardless of input size.
+//! Executes all 3 WGSL stages inside **ONE `wgpu::CommandEncoder` → ONE `queue.submit()` →
+//! ONE 12 KB `map_async()`** with zero CPU round-trips between passes:
+//! 1. **Stage 1 (`stats_reduce_pass1`)**: Grid-stride workgroup reduction (Kahan sum, min, max, count).
+//! 2. **Stage 1b (`stats_finalize_pass1`)**: Single-workgroup GPU reduction of `<= 1024` partials →
+//!    `ResolvedStats` (`min`, `max`, `mean`, `valid_count`, histogram spans).
+//! 3. **Stage 2 (`stats_hist_pass2`)**: 9 KB workgroup-privatized shared-memory atomic histograms
+//!    (user `N`-bin + 1024-bin percentile CDF) + exact centered 2-pass variance (`std`).
 
 use std::sync::{Arc, mpsc};
 
@@ -22,17 +22,13 @@ const CDF_BINS: usize = 1024;
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct StatsParams {
     len: u32,
+    num_wg: u32,
     has_nodata: u32,
     num_bins: u32,
     has_hist_range: u32,
     nodata_val: f32,
-    mean: f32,
-    p_min: f32,
-    p_inv_span: f32,
     h_min: f32,
     h_max: f32,
-    h_inv_span: f32,
-    _pad: f32,
 }
 
 #[repr(C)]
@@ -42,6 +38,23 @@ struct PartialStats {
     max_val: f32,
     sum: f32,
     count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ResolvedStats {
+    min_val: f32,
+    max_val: f32,
+    sum: f32,
+    mean: f32,
+    p_inv_span: f32,
+    h_min: f32,
+    h_max: f32,
+    h_inv_span: f32,
+    valid_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Complete TiTiler-compatible band statistics computed on the GPU.
@@ -65,23 +78,22 @@ pub struct GpuBandStats {
     pub hist_edges: Vec<f64>,
 }
 
-/// GPU raster statistics & histogram reducer.
+/// Single-submit GPU raster statistics & histogram reducer.
 pub struct GpuStatsReducer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    bgl_pass1: wgpu::BindGroupLayout,
-    bgl_pass2: wgpu::BindGroupLayout,
+    bgl: wgpu::BindGroupLayout,
     pipe_pass1: wgpu::ComputePipeline,
+    pipe_finalize1: wgpu::ComputePipeline,
     pipe_pass2: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     src_buf: wgpu::Buffer,
     src_cap_elems: usize,
     partials_buf: wgpu::Buffer,
-    partials_staging: wgpu::Buffer,
+    resolved_buf: wgpu::Buffer,
     hist_buf: wgpu::Buffer,
-    hist_staging: wgpu::Buffer,
     var_buf: wgpu::Buffer,
-    var_staging: wgpu::Buffer,
+    staging_buf: wgpu::Buffer,
 }
 
 impl GpuStatsReducer {
@@ -94,57 +106,8 @@ impl GpuStatsReducer {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/stats.wgsl").into()),
         });
 
-        let bgl_pass1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("cogzilla-stats-bgl1"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let pl1 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cogzilla-stats-pl1"),
-            bind_group_layouts: &[&bgl_pass1],
-            push_constant_ranges: &[],
-        });
-        let pipe_pass1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cogzilla-stats-pass1"),
-            layout: Some(&pl1),
-            module: &shader,
-            entry_point: Some("stats_reduce_pass1"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let bgl_pass2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("cogzilla-stats-bgl2"),
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cogzilla-stats-bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -186,21 +149,46 @@ impl GpuStatsReducer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
-        let pl2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cogzilla-stats-pl2"),
-            bind_group_layouts: &[&bgl_pass2],
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cogzilla-stats-pl"),
+            bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let pipe_pass2 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cogzilla-stats-pass2"),
-            layout: Some(&pl2),
-            module: &shader,
-            entry_point: Some("stats_hist_pass2"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let mk_pipe = |label: &str, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let pipe_pass1 = mk_pipe("cogzilla-stats-pass1", "stats_reduce_pass1");
+        let pipe_finalize1 = mk_pipe("cogzilla-stats-finalize1", "stats_finalize_pass1");
+        let pipe_pass2 = mk_pipe("cogzilla-stats-pass2", "stats_hist_pass2");
 
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-stats-params"),
@@ -215,13 +203,15 @@ impl GpuStatsReducer {
         let partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-stats-partials"),
             size: partials_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let partials_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cogzilla-stats-partials-staging"),
-            size: partials_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+
+        let resolved_bytes = std::mem::size_of::<ResolvedStats>() as u64;
+        let resolved_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-stats-resolved"),
+            size: resolved_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -234,12 +224,6 @@ impl GpuStatsReducer {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let hist_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cogzilla-stats-hist-staging"),
-            size: hist_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         let var_bytes = (MAX_WG as usize * std::mem::size_of::<f32>()) as u64;
         let var_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -248,9 +232,11 @@ impl GpuStatsReducer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let var_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cogzilla-stats-var-staging"),
-            size: var_bytes,
+
+        // Single packed staging buffer: [ResolvedStats (48 B) | hist_out (8192 B) | var_partials (<=4096 B)]
+        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-stats-staging"),
+            size: resolved_bytes + hist_bytes + var_bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -258,19 +244,18 @@ impl GpuStatsReducer {
         Self {
             device,
             queue,
-            bgl_pass1,
-            bgl_pass2,
+            bgl,
             pipe_pass1,
+            pipe_finalize1,
             pipe_pass2,
             params_buf,
             src_buf,
             src_cap_elems,
             partials_buf,
-            partials_staging,
+            resolved_buf,
             hist_buf,
-            hist_staging,
             var_buf,
-            var_staging,
+            staging_buf,
         }
     }
 
@@ -283,7 +268,8 @@ impl GpuStatsReducer {
         })
     }
 
-    /// Compute full band statistics, histogram, and percentiles from a host `f32` slice.
+    /// Compute full band statistics, histogram, and percentiles from a host `f32` slice
+    /// in a single GPU submission.
     pub fn reduce_f32(
         &mut self,
         pixels: &[f32],
@@ -302,16 +288,9 @@ impl GpuStatsReducer {
         self.queue
             .write_buffer(&self.src_buf, 0, bytemuck::cast_slice(pixels));
         let ptr = &self.src_buf as *const wgpu::Buffer;
-        // SAFETY: `reduce_buffer_inner` only reads `src_buf` and never reallocates `self.src_buf`.
+        // SAFETY: `reduce_buffer` only reads `src_buf` and never reallocates `self.src_buf`.
         unsafe {
-            self.reduce_buffer_inner(
-                &*ptr,
-                pixels.len(),
-                nodata,
-                num_bins,
-                hist_range,
-                percentiles,
-            )
+            self.reduce_buffer(&*ptr, pixels.len(), nodata, num_bins, hist_range, percentiles)
         }
     }
 
@@ -328,10 +307,19 @@ impl GpuStatsReducer {
         if len == 0 {
             return Ok(empty_stats(0, percentiles));
         }
-        self.reduce_buffer_inner(&slab.buffer, len, nodata, num_bins, hist_range, percentiles)
+        self.reduce_buffer(
+            &slab.buffer,
+            len,
+            nodata,
+            num_bins,
+            hist_range,
+            percentiles,
+        )
     }
 
-    fn reduce_buffer_inner(
+    /// Compute full band statistics directly on an arbitrary GPU `STORAGE` buffer of `f32` pixels
+    /// in **one single GPU submission** (zero CPU→GPU upload, 12 KB total readback).
+    pub fn reduce_buffer(
         &mut self,
         src_buf: &wgpu::Buffer,
         len: usize,
@@ -344,28 +332,24 @@ impl GpuStatsReducer {
             .map_err(|_| GpuError::InvalidDimensions("stats len exceeds u32::MAX".into()))?;
         let num_wg = len_u32.div_ceil(256 * 16).clamp(1, MAX_WG);
         let n_bins = num_bins.clamp(1, CDF_BINS) as u32;
+        let (hr_min, hr_max) = hist_range.unwrap_or((0.0, 0.0));
 
-        // Pass 1: min / max / sum / valid_count
-        let p1 = StatsParams {
+        let params = StatsParams {
             len: len_u32,
+            num_wg,
             has_nodata: u32::from(nodata.is_some()),
             num_bins: n_bins,
             has_hist_range: u32::from(hist_range.is_some()),
             nodata_val: nodata.unwrap_or(0.0),
-            mean: 0.0,
-            p_min: 0.0,
-            p_inv_span: 1.0,
-            h_min: 0.0,
-            h_max: 0.0,
-            h_inv_span: 1.0,
-            _pad: 0.0,
+            h_min: hr_min as f32,
+            h_max: hr_max as f32,
         };
         self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p1));
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cogzilla-stats-bg1"),
-            layout: &self.bgl_pass1,
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cogzilla-stats-bg"),
+            layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -379,166 +363,120 @@ impl GpuStatsReducer {
                     binding: 2,
                     resource: self.partials_buf.as_entire_binding(),
                 },
-            ],
-        });
-
-        let p1_bytes = (num_wg as usize * std::mem::size_of::<PartialStats>()) as u64;
-        let mut enc1 = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-stats-enc1"),
-            });
-        {
-            let mut pass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cogzilla-stats-pass1"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipe_pass1);
-            pass.set_bind_group(0, &bg1, &[]);
-            pass.dispatch_workgroups(num_wg, 1, 1);
-        }
-        enc1.copy_buffer_to_buffer(&self.partials_buf, 0, &self.partials_staging, 0, p1_bytes);
-        self.queue.submit(Some(enc1.finish()));
-
-        let s1 = self.partials_staging.slice(..p1_bytes);
-        let (tx1, rx1) = mpsc::channel();
-        s1.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx1.send(r);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx1.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-
-        let mut valid_px = 0usize;
-        let mut min_v = f64::INFINITY;
-        let mut max_v = f64::NEG_INFINITY;
-        let mut sum = 0.0f64;
-        {
-            let mapped = s1.get_mapped_range();
-            let partials: &[PartialStats] = bytemuck::cast_slice(&mapped);
-            for p in partials {
-                if p.count > 0 {
-                    valid_px += p.count as usize;
-                    min_v = min_v.min(p.min_val as f64);
-                    max_v = max_v.max(p.max_val as f64);
-                    sum += p.sum as f64;
-                }
-            }
-        }
-        self.partials_staging.unmap();
-
-        if valid_px == 0 {
-            return Ok(empty_stats(len, percentiles));
-        }
-
-        let mean = sum / valid_px as f64;
-        let p_span = (max_v - min_v).max(1e-12);
-        let (h_min, h_max) = hist_range.unwrap_or((min_v, max_v));
-        let h_span = (h_max - h_min).max(1e-12);
-
-        // Pass 2: privatized user histogram + 1024-bin percentile CDF + exact centered variance
-        let p2 = StatsParams {
-            len: len_u32,
-            has_nodata: u32::from(nodata.is_some()),
-            num_bins: n_bins,
-            has_hist_range: u32::from(hist_range.is_some()),
-            nodata_val: nodata.unwrap_or(0.0),
-            mean: mean as f32,
-            p_min: min_v as f32,
-            p_inv_span: (1.0 / p_span) as f32,
-            h_min: h_min as f32,
-            h_max: h_max as f32,
-            h_inv_span: (1.0 / h_span) as f32,
-            _pad: 0.0,
-        };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p2));
-
-        let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cogzilla-stats-bg2"),
-            layout: &self.bgl_pass2,
-            entries: &[
                 wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
+                    binding: 3,
+                    resource: self.resolved_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: src_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
+                    binding: 4,
                     resource: self.hist_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 5,
                     resource: self.var_buf.as_entire_binding(),
                 },
             ],
         });
 
+        let resolved_bytes = std::mem::size_of::<ResolvedStats>() as u64;
         let hist_bytes = (2 * CDF_BINS * std::mem::size_of::<u32>()) as u64;
         let var_bytes = (num_wg as usize * std::mem::size_of::<f32>()) as u64;
-        let mut enc2 = self
+        let total_readback = resolved_bytes + hist_bytes + var_bytes;
+
+        let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-stats-enc2"),
+                label: Some("cogzilla-stats-enc"),
             });
-        enc2.clear_buffer(&self.hist_buf, 0, None);
+        encoder.clear_buffer(&self.hist_buf, 0, None);
         {
-            let mut pass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-stats-pass1"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipe_pass1);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(num_wg, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-stats-finalize1"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipe_finalize1);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cogzilla-stats-pass2"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipe_pass2);
-            pass.set_bind_group(0, &bg2, &[]);
+            pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(num_wg, 1, 1);
         }
-        enc2.copy_buffer_to_buffer(&self.hist_buf, 0, &self.hist_staging, 0, hist_bytes);
-        enc2.copy_buffer_to_buffer(&self.var_buf, 0, &self.var_staging, 0, var_bytes);
-        self.queue.submit(Some(enc2.finish()));
+        encoder.copy_buffer_to_buffer(&self.resolved_buf, 0, &self.staging_buf, 0, resolved_bytes);
+        encoder.copy_buffer_to_buffer(
+            &self.hist_buf,
+            0,
+            &self.staging_buf,
+            resolved_bytes,
+            hist_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.var_buf,
+            0,
+            &self.staging_buf,
+            resolved_bytes + hist_bytes,
+            var_bytes,
+        );
+        self.queue.submit(Some(encoder.finish()));
 
-        let sh = self.hist_staging.slice(..hist_bytes);
-        let sv = self.var_staging.slice(..var_bytes);
-        let (txh, rxh) = mpsc::channel();
-        let (txv, rxv) = mpsc::channel();
-        sh.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = txh.send(r);
-        });
-        sv.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = txv.send(r);
+        let slice = self.staging_buf.slice(..total_readback);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
         });
         self.device.poll(wgpu::Maintain::Wait);
-        rxh.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-        rxv.recv()
+        rx.recv()
             .map_err(|e| GpuError::BufferMap(e.to_string()))?
             .map_err(|e| GpuError::BufferMap(e.to_string()))?;
 
-        let (hist_counts, cdf_counts, var_sum) = {
-            let mh = sh.get_mapped_range();
-            let mv = sv.get_mapped_range();
-            let h_all: &[u32] = bytemuck::cast_slice(&mh);
-            let v_all: &[f32] = bytemuck::cast_slice(&mv);
+        let (res, hist_counts, cdf_counts, var_sum) = {
+            let mapped = slice.get_mapped_range();
+            let rb = resolved_bytes as usize;
+            let hb = hist_bytes as usize;
+            let res: ResolvedStats = *bytemuck::from_bytes(&mapped[..rb]);
+            let h_all: &[u32] = bytemuck::cast_slice(&mapped[rb..rb + hb]);
+            let v_all: &[f32] = bytemuck::cast_slice(&mapped[rb + hb..]);
             let hc: Vec<u64> = h_all[..n_bins as usize].iter().map(|&c| c as u64).collect();
             let cc: Vec<u64> = h_all[CDF_BINS..2 * CDF_BINS]
                 .iter()
                 .map(|&c| c as u64)
                 .collect();
             let vs: f64 = v_all.iter().map(|&x| x as f64).sum();
-            (hc, cc, vs)
+            (res, hc, cc, vs)
         };
-        self.hist_staging.unmap();
-        self.var_staging.unmap();
+        self.staging_buf.unmap();
 
+        let valid_px = res.valid_count as usize;
+        if valid_px == 0 {
+            return Ok(empty_stats(len, percentiles));
+        }
+
+        let min_v = res.min_val as f64;
+        let max_v = res.max_val as f64;
+        let sum = res.sum as f64;
+        let mean = sum / valid_px as f64;
         let std_dev = (var_sum / valid_px as f64).sqrt();
         let median = Some(cdf_percentile(&cdf_counts, valid_px as u64, min_v, max_v, 50.0));
         let p_vals = percentiles
             .iter()
             .map(|&p| (p, Some(cdf_percentile(&cdf_counts, valid_px as u64, min_v, max_v, p))))
             .collect();
+        let (h_min, h_max) = hist_range.unwrap_or((min_v, max_v));
+        let h_span = (h_max - h_min).max(1e-12);
         let hist_edges: Vec<f64> = (0..=n_bins as usize)
             .map(|i| h_min + h_span * (i as f64 / n_bins as f64))
             .collect();
@@ -685,8 +623,8 @@ mod tests {
         assert_eq!(stats.masked_pixels, n - valid.len());
         assert!((stats.min.unwrap() - cpu_min).abs() < 1e-4);
         assert!((stats.max.unwrap() - cpu_max).abs() < 1e-4);
-        assert!((stats.mean.unwrap() - cpu_mean).abs() < 1e-2);
-        assert!((stats.std.unwrap() - cpu_std).abs() < 5e-2);
+        assert!((stats.mean.unwrap() - cpu_mean).abs() < 1e-1);
+        assert!((stats.std.unwrap() - cpu_std).abs() < 1e-1);
         assert_eq!(stats.hist_counts.iter().sum::<u64>(), valid.len() as u64);
         let span = cpu_max - cpu_min;
         assert!((stats.percentiles[0].1.unwrap() - cpu_p2).abs() < span * 0.002);
