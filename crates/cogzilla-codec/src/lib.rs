@@ -299,6 +299,7 @@ pub fn decode_tile_rows(
             st.scratch.resize(expected_bytes, 0);
         }
         let raw_slice = &mut st.scratch[..expected_bytes];
+        let mut lerc_int_mask: Option<Vec<u8>> = None;
 
         match ifd.compression {
             Compression::None => {
@@ -621,15 +622,17 @@ pub fn decode_tile_rows(
                 let lerc_blob: &[u8] = unwrapped.as_deref().unwrap_or(compressed);
                 // Pre-decode LERC1/LERC2 header dimension guard so a crafted tiny tile cannot
                 // trigger a multi-hundred-MiB allocation inside `lerc_reader::decode_first`.
-                if let Some((hdr_w, hdr_h)) = parse_lerc_header_dims(lerc_blob)
+                if let Some((hdr_w, hdr_h, hdr_d)) = parse_lerc_header_dims(lerc_blob)
                     && (hdr_w == 0
                         || hdr_h == 0
+                        || hdr_d == 0
                         || hdr_w > ifd.tile_width as usize
-                        || hdr_h > tile_h as usize)
+                        || hdr_h > tile_h as usize
+                        || hdr_d > bands_in_tile)
                 {
                     return Err(CodecError::Lerc(format!(
-                        "LERC header dimensions {}x{} exceed tile {}x{}",
-                        hdr_w, hdr_h, ifd.tile_width, tile_h
+                        "LERC header dimensions {}x{}x{} exceed tile {}x{}x{}",
+                        hdr_w, hdr_h, hdr_d, ifd.tile_width, tile_h, bands_in_tile
                     )));
                 }
                 let decoded = lerc_reader::decode_first(lerc_blob)
@@ -729,6 +732,22 @@ pub fn decode_tile_rows(
                             st
                         )));
                     }
+                }
+                // Preserve LERC per-pixel validity mask on integer dtypes even when no GDAL_NODATA
+                // is configured (or nodata is out of range for the integer type).
+                if !matches!(ifd.sample_type, SampleType::Float32 | SampleType::Float64)
+                    && let Some(m) = mask
+                    && m.contains(&0)
+                {
+                    let mut padded = vec![1u8; tile_w * tile_h as usize];
+                    for row in 0..h {
+                        for col in 0..w {
+                            if m.get(row * w + col).copied().unwrap_or(1) == 0 {
+                                padded[row * tile_w + col] = 0;
+                            }
+                        }
+                    }
+                    lerc_int_mask = Some(padded);
                 }
             }
         }
@@ -850,7 +869,11 @@ pub fn decode_tile_rows(
         };
 
         apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
-        Ok(DecodedTile { bands })
+        let mut tile = DecodedTile { bands };
+        if let Some(ref m) = lerc_int_mask {
+            apply_mask_to_tile(&mut tile, m);
+        }
+        Ok(tile)
     })
 }
 
@@ -870,25 +893,42 @@ pub fn alpha_channel_index(samples_per_pixel: usize, extra_samples: &[u16]) -> O
 /// e.g. 2-band Gray+Alpha or 4-band RGBA), mask transparent pixels (`alpha == 0`) to `f32::NAN`
 /// in the color bands and recompute their `BlockStats` so every downstream kernel renders alpha
 /// identically to TiTiler.
-/// Parse `(width, height)` directly from a LERC1 (`CntZImage `) or LERC2 (`Lerc2 `) header
+/// Parse `(width, height, depth)` directly from a LERC1 (`CntZImage`) or LERC2 (`Lerc2 `) header
 /// before calling `lerc_reader::decode_first`, preventing crafted tiny tiles from triggering
 /// multi-hundred-MiB allocations.
-fn parse_lerc_header_dims(blob: &[u8]) -> Option<(usize, usize)> {
-    if blob.len() >= 26 && blob.starts_with(b"Lerc2 ") {
-        let w = i32::from_le_bytes([blob[18], blob[19], blob[20], blob[21]]);
-        let h = i32::from_le_bytes([blob[22], blob[23], blob[24], blob[25]]);
-        if w < 0 || h < 0 {
-            return Some((usize::MAX, usize::MAX));
+fn parse_lerc_header_dims(blob: &[u8]) -> Option<(usize, usize, usize)> {
+    if blob.len() >= 10 && blob.starts_with(b"Lerc2 ") {
+        let version = i32::from_le_bytes([blob[6], blob[7], blob[8], blob[9]]);
+        if !(1..=6).contains(&version) {
+            return None;
         }
-        return Some((w as usize, h as usize));
+        let (h_off, w_off, d_off) = if version <= 2 {
+            if blob.len() < 18 {
+                return None;
+            }
+            (10usize, 14usize, None)
+        } else if version == 3 {
+            if blob.len() < 22 {
+                return None;
+            }
+            (14usize, 18usize, None)
+        } else {
+            if blob.len() < 26 {
+                return None;
+            }
+            (14usize, 18usize, Some(22usize))
+        };
+        let h = u32::from_le_bytes([blob[h_off], blob[h_off + 1], blob[h_off + 2], blob[h_off + 3]]) as usize;
+        let w = u32::from_le_bytes([blob[w_off], blob[w_off + 1], blob[w_off + 2], blob[w_off + 3]]) as usize;
+        let d = d_off
+            .map(|o| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]) as usize)
+            .unwrap_or(1);
+        return Some((w, h, d));
     }
-    if blob.len() >= 26 && blob.starts_with(b"CntZImage ") {
-        let h = i32::from_le_bytes([blob[18], blob[19], blob[20], blob[21]]);
-        let w = i32::from_le_bytes([blob[22], blob[23], blob[24], blob[25]]);
-        if w < 0 || h < 0 {
-            return Some((usize::MAX, usize::MAX));
-        }
-        return Some((w as usize, h as usize));
+    if blob.len() >= 26 && blob.starts_with(b"CntZImage") {
+        let h = u32::from_le_bytes([blob[18], blob[19], blob[20], blob[21]]) as usize;
+        let w = u32::from_le_bytes([blob[22], blob[23], blob[24], blob[25]]) as usize;
+        return Some((w, h, 1));
     }
     None
 }
@@ -1521,5 +1561,56 @@ mod tests {
         let tile_f32 = decode_tile(&raw_f32, &ifd_u8, ByteOrder::Little, Some(1.0)).unwrap();
         assert_eq!(tile_f32.bands[0].data.get_f32(0), 42.0);
         assert!(tile_f32.bands[0].data.get_f32(1).is_nan());
+    }
+
+    #[test]
+    fn parse_lerc_header_dims_respects_lerc1_and_lerc2_versions() {
+        // LERC2 v2: 0..6 magic, 6..10 version=2, 10..14 height, 14..18 width (depth=1)
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(b"Lerc2 ");
+        v2.extend_from_slice(&2i32.to_le_bytes());
+        v2.extend_from_slice(&256u32.to_le_bytes()); // height
+        v2.extend_from_slice(&128u32.to_le_bytes()); // width
+        v2.extend_from_slice(&32768u32.to_le_bytes()); // valid_pixel_count (must not be read as w/h)
+        assert_eq!(parse_lerc_header_dims(&v2), Some((128, 256, 1)));
+
+        // LERC2 v3: 10..14 checksum, 14..18 height, 18..22 width (depth=1)
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(b"Lerc2 ");
+        v3.extend_from_slice(&3i32.to_le_bytes());
+        v3.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        v3.extend_from_slice(&64u32.to_le_bytes()); // height
+        v3.extend_from_slice(&512u32.to_le_bytes()); // width
+        v3.extend_from_slice(&32768u32.to_le_bytes());
+        assert_eq!(parse_lerc_header_dims(&v3), Some((512, 64, 1)));
+
+        // LERC2 v4: 10..14 checksum, 14..18 height, 18..22 width, 22..26 depth
+        let mut v4 = Vec::new();
+        v4.extend_from_slice(b"Lerc2 ");
+        v4.extend_from_slice(&4i32.to_le_bytes());
+        v4.extend_from_slice(&0u32.to_le_bytes());
+        v4.extend_from_slice(&1u32.to_le_bytes()); // partial strip height=1
+        v4.extend_from_slice(&256u32.to_le_bytes()); // width=256
+        v4.extend_from_slice(&3u32.to_le_bytes()); // depth=3 RGB
+        assert_eq!(parse_lerc_header_dims(&v4), Some((256, 1, 3)));
+
+        // Crafted LERC2 v4 OOM attempt: height = 100_000_000, width = 1, depth = 1
+        let mut v4_oom = Vec::new();
+        v4_oom.extend_from_slice(b"Lerc2 ");
+        v4_oom.extend_from_slice(&4i32.to_le_bytes());
+        v4_oom.extend_from_slice(&0u32.to_le_bytes());
+        v4_oom.extend_from_slice(&100_000_000u32.to_le_bytes());
+        v4_oom.extend_from_slice(&1u32.to_le_bytes());
+        v4_oom.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_lerc_header_dims(&v4_oom), Some((1, 100_000_000, 1)));
+
+        // LERC1 with 9-byte prefix + NUL (no trailing space)
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(b"CntZImage\0");
+        v1.extend_from_slice(&11i32.to_le_bytes()); // version
+        v1.extend_from_slice(&8i32.to_le_bytes()); // image_type
+        v1.extend_from_slice(&1024u32.to_le_bytes()); // height
+        v1.extend_from_slice(&2048u32.to_le_bytes()); // width
+        assert_eq!(parse_lerc_header_dims(&v1), Some((2048, 1024, 1)));
     }
 }

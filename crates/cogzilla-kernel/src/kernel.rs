@@ -3882,7 +3882,10 @@ pub fn render_bandmath1<const N: usize>(
             render_eval_fn(plan, style, |u, v| expr.eval1(sample_cubic(src, u, v)))
         }
         (other, _) => {
-            render_eval_fn(plan, style, |u, v| expr.eval1(sample_general(src, u, v, other)))
+            let (scale_x, scale_y) = coord_plan_scale(plan);
+            render_eval_fn(plan, style, |u, v| {
+                expr.eval1(sample_general_scaled(src, u, v, scale_x, scale_y, other))
+            })
         }
     }
 }
@@ -3907,6 +3910,7 @@ pub fn render_sar_rgb<const N: usize>(
         255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
+    let (scale_x, scale_y) = coord_plan_scale(plan);
 
     let sample_pair = |u: f32, v: f32| -> (f32, f32, f32) {
         let (vv, vh) = match (style.resample, clean) {
@@ -3931,8 +3935,8 @@ pub fn render_sar_rgb<const N: usize>(
                 sample_nearest::<false>(&srcs[1], u, v),
             ),
             (other, _) => (
-                sample_general(&srcs[0], u, v, other),
-                sample_general(&srcs[1], u, v, other),
+                sample_general_scaled(&srcs[0], u, v, scale_x, scale_y, other),
+                sample_general_scaled(&srcs[1], u, v, scale_x, scale_y, other),
             ),
         };
         let vv_db = fast_db_from_power(vv);
@@ -4082,15 +4086,18 @@ pub fn render_bandmath2<const N: usize>(
                 expr.eval2(a, b)
             }
         }),
-        (other, _) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_general(&srcs[0], u, v, other);
-            let b = sample_general(&srcs[1], u, v, other);
-            if a.is_nan() || b.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval2(a, b)
-            }
-        }),
+        (other, _) => {
+            let (scale_x, scale_y) = coord_plan_scale(plan);
+            render_eval_fn(plan, style, |u, v| {
+                let a = sample_general_scaled(&srcs[0], u, v, scale_x, scale_y, other);
+                let b = sample_general_scaled(&srcs[1], u, v, scale_x, scale_y, other);
+                if a.is_nan() || b.is_nan() {
+                    f32::NAN
+                } else {
+                    expr.eval2(a, b)
+                }
+            })
+        }
     }
 }
 
@@ -4153,16 +4160,19 @@ pub fn render_bandmath3<const N: usize>(
                 expr.eval3(a, b, c)
             }
         }),
-        (other, _) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_general(&srcs[0], u, v, other);
-            let b = sample_general(&srcs[1], u, v, other);
-            let c = sample_general(&srcs[2], u, v, other);
-            if a.is_nan() || b.is_nan() || c.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval3(a, b, c)
-            }
-        }),
+        (other, _) => {
+            let (scale_x, scale_y) = coord_plan_scale(plan);
+            render_eval_fn(plan, style, |u, v| {
+                let a = sample_general_scaled(&srcs[0], u, v, scale_x, scale_y, other);
+                let b = sample_general_scaled(&srcs[1], u, v, scale_x, scale_y, other);
+                let c = sample_general_scaled(&srcs[2], u, v, scale_x, scale_y, other);
+                if a.is_nan() || b.is_nan() || c.is_nan() {
+                    f32::NAN
+                } else {
+                    expr.eval3(a, b, c)
+                }
+            })
+        }
     }
 }
 
@@ -4276,9 +4286,11 @@ pub fn render_expr_vm<const N: usize>(
                 });
             }
             (other, _) => {
+                let (scale_x, scale_y) = coord_plan_scale(plan);
                 for_each_pixel_in_row(plan, py, |px, u, v| {
                     for b in 0..nb {
-                        band_rows[b][px] = sample_general(&srcs[b], u, v, other);
+                        band_rows[b][px] =
+                            sample_general_scaled(&srcs[b], u, v, scale_x, scale_y, other);
                     }
                 });
             }
@@ -4488,6 +4500,7 @@ pub fn render_terrain_tile<const N: usize>(
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
     let encode_px = |v: f32| -> [u8; 3] { encoding.encode_rgb(v) };
+    let (scale_x, scale_y) = coord_plan_scale(plan);
 
     let sample_px = |u: f32, v: f32| -> f32 {
         match (resample, clean) {
@@ -4496,7 +4509,7 @@ pub fn render_terrain_tile<const N: usize>(
             (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
             (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
-            (other, _) => sample_general(src, u, v, other),
+            (other, _) => sample_general_scaled(src, u, v, scale_x, scale_y, other),
         }
     };
 
@@ -5036,6 +5049,7 @@ pub fn render_dem_algorithm<const N: usize>(
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
+    let (scale_x, scale_y) = coord_plan_scale(plan);
 
     let sample_px = |u: f32, v: f32| -> f32 {
         match (style.resample, clean) {
@@ -5044,7 +5058,7 @@ pub fn render_dem_algorithm<const N: usize>(
             (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
             (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
-            (other, _) => sample_general(src, u, v, other),
+            (other, _) => sample_general_scaled(src, u, v, scale_x, scale_y, other),
         }
     };
     // Sub-pixel bounds-checked sampler for the 1-pixel extrapolated border so tile edges
@@ -5054,7 +5068,7 @@ pub fn render_dem_algorithm<const N: usize>(
             ResampleMode::Bilinear => sample_bilinear::<false>(src, u, v),
             ResampleMode::Nearest => sample_nearest::<false>(src, u, v),
             ResampleMode::Cubic => sample_cubic(src, u, v),
-            other => sample_general(src, u, v, other),
+            other => sample_general_scaled(src, u, v, scale_x, scale_y, other),
         }
     };
 
