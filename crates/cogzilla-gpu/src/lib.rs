@@ -17,7 +17,7 @@ pub use coalesce::{CoalescedJob, CoalescedOutput, CoalescerStats, GpuCoalescer, 
 pub use colormap::{GpuColormapMode, GpuColormapRenderer, GpuCoordPlan, GpuPixelOutput};
 pub use context::{GpuAdapterInfo, GpuContext, GpuError, GpuOptions};
 pub use expr::{GpuColorFormula, GpuExprRenderer, GpuInstr, GpuMultiBandSlab, opcodes};
-pub use jpeg::GpuJpegEncoder;
+pub use jpeg::{GpuJpegEncoder, huffman_encode_coeffs};
 pub use mosaic::{GpuMosaicCompositor, GpuPixelSelection, GpuSceneStack};
 pub use policy::{
     DispatchDecision, DispatchPolicy, DispatchReason, DispatchRequest, GpuOp, GpuProfile,

@@ -448,6 +448,135 @@ impl GpuBackend {
         crate::titiler::encode_rgba_output(dst_w, dst_h, rgba, format, return_mask)
     }
 
+    fn fused_jpeg_quality(&self, dst_w: usize, dst_h: usize, format: OutputFormat) -> Option<u8> {
+        if let OutputFormat::Jpeg { quality } = format {
+            let min_px = if self.ctx.info.unified_memory {
+                1024 * 1024
+            } else {
+                512 * 512
+            };
+            if dst_w.saturating_mul(dst_h) >= min_px {
+                return Some(quality);
+            }
+        }
+        None
+    }
+
+    fn submit_rgba(
+        &self,
+        job: CoalescedJob,
+        dst_w: usize,
+        dst_h: usize,
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        if let Some(quality) = self.fused_jpeg_quality(dst_w, dst_h, format) {
+            let coeffs = self
+                .coalescer
+                .submit(CoalescedJob::WithJpeg {
+                    inner: Box::new(job),
+                    quality,
+                })
+                .ok()?;
+            return Some(Bytes::from(cogzilla_gpu::huffman_encode_coeffs(
+                &coeffs,
+                dst_w as u32,
+                dst_h as u32,
+                quality,
+            )));
+        }
+        let raw = self.coalescer.submit(job).ok()?;
+        Some(if format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            self.encode_rgba_output(dst_w, dst_h, &raw, format, return_mask)
+        })
+    }
+
+    async fn submit_rgba_async(
+        &self,
+        job: CoalescedJob,
+        dst_w: usize,
+        dst_h: usize,
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        if let Some(quality) = self.fused_jpeg_quality(dst_w, dst_h, format) {
+            let coeffs = self
+                .submit_coalesced_async(CoalescedJob::WithJpeg {
+                    inner: Box::new(job),
+                    quality,
+                })
+                .await?;
+            return Some(Bytes::from(cogzilla_gpu::huffman_encode_coeffs(
+                &coeffs,
+                dst_w as u32,
+                dst_h as u32,
+                quality,
+            )));
+        }
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(if format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            self.encode_rgba_output(dst_w, dst_h, &raw, format, return_mask)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_styled(
+        &self,
+        job: CoalescedJob,
+        out_kind: GpuPixelOutput,
+        dst_w: usize,
+        dst_h: usize,
+        style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        if out_kind == GpuPixelOutput::Rgba8 {
+            return self.submit_rgba(job, dst_w, dst_h, style.format, return_mask);
+        }
+        let raw = self.coalescer.submit(job).ok()?;
+        Some(self.finish_styled_output(
+            raw,
+            out_kind,
+            dst_w,
+            dst_h,
+            style,
+            rgb_lut,
+            return_mask,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_styled_async(
+        &self,
+        job: CoalescedJob,
+        out_kind: GpuPixelOutput,
+        dst_w: usize,
+        dst_h: usize,
+        style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        if out_kind == GpuPixelOutput::Rgba8 {
+            return self
+                .submit_rgba_async(job, dst_w, dst_h, style.format, return_mask)
+                .await;
+        }
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(self.finish_styled_output(
+            raw,
+            out_kind,
+            dst_w,
+            dst_h,
+            style,
+            rgb_lut,
+            return_mask,
+        ))
+    }
+
     fn finish_styled_output(
         &self,
         raw: Vec<u8>,
@@ -516,10 +645,7 @@ impl GpuBackend {
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
             cog_id, ifd_idx, band0, coords, src, style, rgb_lut, return_mask, active,
         )?;
-        let raw = self.coalescer.submit(job).ok()?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
-        ))
+        self.submit_styled(job, out_kind, dst_w, dst_h, style, rgb_lut, return_mask)
     }
 
     /// Attempt GPU-accelerated DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`) rendering for
@@ -722,10 +848,7 @@ impl GpuBackend {
             return_mask,
             active,
         )?;
-        let raw = self.coalescer.submit(job).ok()?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
-        ))
+        self.submit_styled(job, out_kind, dst_w, dst_h, style, rgb_lut, return_mask)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -833,12 +956,7 @@ impl GpuBackend {
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
             cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
         )?;
-        let raw = self.coalescer.submit(job).ok()?;
-        Some(if format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, format, return_mask)
-        })
+        self.submit_rgba(job, dst_w, dst_h, format, return_mask)
     }
 
     /// Attempt GPU-accelerated single-band tile rendering (non-blocking async coalesced).
@@ -878,10 +996,8 @@ impl GpuBackend {
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
             cog_id, ifd_idx, band0, coords, src, style, rgb_lut, true, active,
         )?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
-        ))
+        self.submit_styled_async(job, out_kind, dst_w, dst_h, style, rgb_lut, true)
+            .await
     }
 
     /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (non-blocking async coalesced).
@@ -934,10 +1050,8 @@ impl GpuBackend {
             true,
             active,
         )?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
-        ))
+        self.submit_styled_async(job, out_kind, dst_w, dst_h, style, rgb_lut, true)
+            .await
     }
 
     /// Attempt GPU-accelerated `Terrarium` / `TerrainRgb` tile rendering (non-blocking async coalesced).
@@ -978,12 +1092,7 @@ impl GpuBackend {
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
             cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
         )?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(if format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, format, true)
-        })
+        self.submit_rgba_async(job, dst_w, dst_h, format, true).await
     }
 
     /// Translate a compiled `cogzilla-kernel::ExprProgram` into GPU WGSL VM bytecode.
@@ -1313,10 +1422,8 @@ impl GpuBackend {
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
             cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
         )?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
-        ))
+        self.submit_styled_async(job, out_kind, dst_w, dst_h, style, rgb_lut, true)
+            .await
     }
 
     /// Attempt GPU-accelerated built-in `SpectralExpr` visual rendering for arbitrary
@@ -1410,10 +1517,8 @@ impl GpuBackend {
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
             cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
         )?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
-        ))
+        self.submit_styled_async(job, out_kind, dst_w, dst_h, style, rgb_lut, true)
+            .await
     }
 
     /// Attempt GPU-accelerated 3-band RGB tile rendering (non-blocking async coalesced).
@@ -1450,12 +1555,8 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
         let (job, dst_w, dst_h) =
             self.prepare_bbox_rgb(cache_key, coords, srcs, style, None, active)?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(if style.format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
-        })
+        self.submit_rgba_async(job, dst_w, dst_h, style.format, true)
+            .await
     }
 
     /// Attempt GPU-accelerated multi-band `ExprProgram` rendering for arbitrary `BboxCoordSource`
@@ -1520,10 +1621,7 @@ impl GpuBackend {
             return_mask,
             active,
         )?;
-        let raw = self.coalescer.submit(job).ok()?;
-        Some(self.finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
-        ))
+        self.submit_styled(job, out_kind, dst_w, dst_h, style, rgb_lut, return_mask)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1624,12 +1722,7 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
         let (job, dst_w, dst_h) =
             self.prepare_bbox_rgb(cache_key, coords, srcs, style, color_formula, active)?;
-        let raw = self.coalescer.submit(job).ok()?;
-        Some(if style.format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
-        })
+        self.submit_rgba(job, dst_w, dst_h, style.format, return_mask)
     }
 
     fn mosaic_policy_op(method: GpuPixelSelection, num_scenes: usize) -> GpuOp {
@@ -2222,12 +2315,8 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
         let (job, dst_w, dst_h) =
             self.prepare_bbox_sar_rgb(cache_key, coords, srcs, style, None, active)?;
-        let raw = self.submit_coalesced_async(job).await?;
-        Some(if style.format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
-        })
+        self.submit_rgba_async(job, dst_w, dst_h, style.format, true)
+            .await
     }
 
     /// Attempt GPU-accelerated Dual-Pol SAR False-Color RGB (with optional fused `ColorFormula`
@@ -2246,12 +2335,7 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
         let (job, dst_w, dst_h) =
             self.prepare_bbox_sar_rgb(cache_key, coords, srcs, style, color_formula, active)?;
-        let raw = self.coalescer.submit(job).ok()?;
-        Some(if style.format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
-        })
+        self.submit_rgba(job, dst_w, dst_h, style.format, return_mask)
     }
 
     /// Compile 3 `ExprProgram`s (`[R, G, B]`) into a single packed GPU instruction buffer
@@ -2361,24 +2445,17 @@ impl GpuBackend {
         }
         let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
-        let raw = self
-            .coalescer
-            .submit(CoalescedJob::ExprRgb {
-                slab,
-                plan,
-                mode: gpu_mode,
-                instrs,
-                lens,
-                rescale_min: style.rescale_min,
-                rescale_max: style.rescale_max,
-                formula: gpu_formula,
-            })
-            .ok()?;
-        Some(if style.format == OutputFormat::RawRgba {
-            Bytes::from(raw)
-        } else {
-            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
-        })
+        let job = CoalescedJob::ExprRgb {
+            slab,
+            plan,
+            mode: gpu_mode,
+            instrs,
+            lens,
+            rescale_min: style.rescale_min,
+            rescale_max: style.rescale_max,
+            formula: gpu_formula,
+        };
+        self.submit_rgba(job, dst_w, dst_h, style.format, return_mask)
     }
 
     /// Attempt GPU-accelerated multi-band planar `(num_bands, dst_h, dst_w)` Float32 resampling
