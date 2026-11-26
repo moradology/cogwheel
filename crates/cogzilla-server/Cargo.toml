@@ -76,3 +76,7 @@ required-features = ["gpu"]
 [[example]]
 name = "multi_cog_stac_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "lut_formula_bench"
+required-features = ["gpu"]
