@@ -206,6 +206,13 @@ pub enum CoalescedJob {
         instrs: Vec<GpuInstr>,
         lens: [u8; 3],
     },
+    /// Chains `jpeg_dct.wgsl` directly onto an RGBA8-producing inner job inside the same
+    /// `CommandEncoder` (zero RGBA8 readback, zero RGBA8 re-upload), returning packed
+    /// quantized `i16` MCU coefficients ready for `crate::jpeg::huffman_encode_coeffs`.
+    WithJpeg {
+        inner: Box<CoalescedJob>,
+        quality: u8,
+    },
 }
 
 /// Telemetry counters for `GpuCoalescer`.
@@ -235,6 +242,10 @@ struct JobSlot {
     v_cap: usize,
     out_buf: wgpu::Buffer,
     out_words_cap: usize,
+    jpeg_params_buf: wgpu::Buffer,
+    jpeg_inv_q_buf: wgpu::Buffer,
+    jpeg_out_buf: Option<wgpu::Buffer>,
+    jpeg_out_cap_words: usize,
 }
 
 impl JobSlot {
@@ -275,6 +286,18 @@ impl JobSlot {
         let v_buf = Self::alloc_coord(device, init_coord);
         let init_words = 256 * 256;
         let out_buf = Self::alloc_out(device, init_words);
+        let jpeg_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-jpeg-params"),
+            size: std::mem::size_of::<crate::jpeg::JpegParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let jpeg_inv_q_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-jpeg-inv-q"),
+            size: (128 * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             cm_params_buf,
             tr_params_buf,
@@ -287,6 +310,10 @@ impl JobSlot {
             v_cap: init_coord,
             out_buf,
             out_words_cap: init_words,
+            jpeg_params_buf,
+            jpeg_inv_q_buf,
+            jpeg_out_buf: None,
+            jpeg_out_cap_words: 0,
         }
     }
 
@@ -322,6 +349,13 @@ impl JobSlot {
             self.out_buf = Self::alloc_out(device, self.out_words_cap);
         }
     }
+
+    fn ensure_jpeg_caps(&mut self, device: &wgpu::Device, jpeg_words: usize) {
+        if jpeg_words > self.jpeg_out_cap_words || self.jpeg_out_buf.is_none() {
+            self.jpeg_out_cap_words = jpeg_words.next_power_of_two();
+            self.jpeg_out_buf = Some(Self::alloc_out(device, self.jpeg_out_cap_words));
+        }
+    }
 }
 
 struct PreparedJob {
@@ -337,6 +371,7 @@ struct PreparedJob {
     wg_z: u32,
     pipe_kind: u8,
     bind_group: wgpu::BindGroup,
+    jpeg_pass: Option<(u32, u32, wgpu::BindGroup)>,
     reply: ReplyFn,
 }
 
@@ -373,6 +408,7 @@ struct WorkerState {
     queue: Arc<wgpu::Queue>,
     bgl: wgpu::BindGroupLayout,
     expr_bgl: wgpu::BindGroupLayout,
+    jpeg_bgl: wgpu::BindGroupLayout,
     cm_rgba8: wgpu::ComputePipeline,
     cm_indexed: wgpu::ComputePipeline,
     cm_f32: wgpu::ComputePipeline,
@@ -388,6 +424,7 @@ struct WorkerState {
     expr_rgb_formula: wgpu::ComputePipeline,
     mb_resample_f32: wgpu::ComputePipeline,
     expr_rgb_f32: wgpu::ComputePipeline,
+    jpeg_fdct: wgpu::ComputePipeline,
     frames: Vec<RingFrame>,
     in_flight_order: VecDeque<usize>,
     free_frames: VecDeque<usize>,
@@ -605,6 +642,69 @@ impl WorkerState {
         let mb_resample_f32 = mk_expr_pipe("coal-mb-f32", "multiband_resample_f32");
         let expr_rgb_f32 = mk_expr_pipe("coal-expr-rgb-f32", "expr_rgb_f32");
 
+        let jpeg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cogzilla-coal-jpeg-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/jpeg_dct.wgsl").into()),
+        });
+        let jpeg_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cogzilla-coal-jpeg-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let jpeg_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cogzilla-coal-jpeg-pl"),
+            bind_group_layouts: &[&jpeg_bgl],
+            push_constant_ranges: &[],
+        });
+        let jpeg_fdct = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("coal-jpeg-fdct"),
+            layout: Some(&jpeg_pl),
+            module: &jpeg_shader,
+            entry_point: Some("jpeg_mcu_420_fdct"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let depth = ring_depth.clamp(1, 4);
         let frames: Vec<RingFrame> = (0..depth).map(|_| RingFrame::new(&device)).collect();
         let free_frames: VecDeque<usize> = (0..depth).collect();
@@ -614,6 +714,7 @@ impl WorkerState {
             queue,
             bgl,
             expr_bgl,
+            jpeg_bgl,
             cm_rgba8,
             cm_indexed,
             cm_f32,
@@ -629,6 +730,7 @@ impl WorkerState {
             expr_rgb_formula,
             mb_resample_f32,
             expr_rgb_f32,
+            jpeg_fdct,
             frames,
             in_flight_order: VecDeque::with_capacity(depth),
             free_frames,
@@ -660,7 +762,12 @@ impl WorkerState {
 
         for (slot_idx, req) in batch.into_iter().enumerate() {
             let reply = req.reply;
-            match req.job {
+            let (job, jpeg_quality) = match req.job {
+                CoalescedJob::WithJpeg { inner, quality } => (*inner, Some(quality)),
+                other => (other, None),
+            };
+            let prev_len = prepared.len();
+            match job {
                 CoalescedJob::Colormap {
                     slab,
                     plan,
@@ -782,6 +889,7 @@ impl WorkerState {
                         wg_z: 1,
                         pipe_kind,
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
                 }
@@ -940,6 +1048,7 @@ impl WorkerState {
                         wg_z: 1,
                         pipe_kind,
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
                 }
@@ -1069,6 +1178,7 @@ impl WorkerState {
                         wg_z: 1,
                         pipe_kind,
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
                 }
@@ -1209,6 +1319,7 @@ impl WorkerState {
                         wg_z: 1,
                         pipe_kind: if is_sar { 11u8 } else { 10u8 },
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
                 }
@@ -1350,6 +1461,7 @@ impl WorkerState {
                         wg_z: 1,
                         pipe_kind: 12u8,
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
                 }
@@ -1449,6 +1561,7 @@ impl WorkerState {
                         wg_z: slab.num_bands,
                         pipe_kind: 13u8,
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
                 }
@@ -1566,8 +1679,73 @@ impl WorkerState {
                         wg_z: 1,
                         pipe_kind: 14u8,
                         bind_group,
+                        jpeg_pass: None,
                         reply,
                     });
+                }
+                CoalescedJob::WithJpeg { .. } => {
+                    reply(Err(GpuError::InvalidDimensions(
+                        "nested CoalescedJob::WithJpeg is not supported".into(),
+                    )));
+                    continue;
+                }
+            }
+            if let Some(quality) = jpeg_quality {
+                if prepared.len() > prev_len {
+                    let pj = prepared.last_mut().unwrap();
+                    total_staging_words -= pj.out_words;
+                    let mcu_w = (pj.dst_w as u32).div_ceil(16);
+                    let mcu_h = (pj.dst_h as u32).div_ceil(16);
+                    let jpeg_words = (mcu_w as usize) * (mcu_h as usize) * 192;
+                    let slot = &mut frame.slots[pj.slot_idx];
+                    slot.ensure_jpeg_caps(&self.device, jpeg_words);
+                    let (_q_y, _q_c, inv_q) = crate::jpeg::build_inv_qtables(quality);
+                    let params = crate::jpeg::JpegParams {
+                        width: pj.dst_w as u32,
+                        height: pj.dst_h as u32,
+                        mcu_w,
+                        mcu_h,
+                    };
+                    self.queue.write_buffer(
+                        &slot.jpeg_params_buf,
+                        0,
+                        bytemuck::bytes_of(&params),
+                    );
+                    self.queue.write_buffer(
+                        &slot.jpeg_inv_q_buf,
+                        0,
+                        bytemuck::cast_slice(&inv_q),
+                    );
+                    let jpeg_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("cogzilla-coal-jpeg-bg"),
+                        layout: &self.jpeg_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: slot.jpeg_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: slot.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: slot.jpeg_inv_q_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: slot
+                                    .jpeg_out_buf
+                                    .as_ref()
+                                    .unwrap()
+                                    .as_entire_binding(),
+                            },
+                        ],
+                    });
+                    pj.out_words = jpeg_words;
+                    pj.output = CoalescedOutput::RawF32;
+                    pj.jpeg_pass = Some((mcu_w, mcu_h, jpeg_bg));
+                    total_staging_words += jpeg_words;
                 }
             }
         }
@@ -1615,10 +1793,32 @@ impl WorkerState {
                 pass.dispatch_workgroups(job.wg_x, job.wg_y, job.wg_z);
             }
         }
+        // Pass 2 (fused VRAM-only): chain jpeg_dct.wgsl directly onto slot.out_buf -> slot.jpeg_out_buf
+        if prepared.iter().any(|j| j.jpeg_pass.is_some()) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-coal-jpeg-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.jpeg_fdct);
+            for job in &prepared {
+                if let Some((mcu_w, mcu_h, ref bg)) = job.jpeg_pass {
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(mcu_w, mcu_h, 1);
+                }
+            }
+        }
         for job in &prepared {
             let bytes = (job.out_words * 4) as u64;
+            let src_buf = if job.jpeg_pass.is_some() {
+                frame.slots[job.slot_idx]
+                    .jpeg_out_buf
+                    .as_ref()
+                    .expect("jpeg_out_buf allocated")
+            } else {
+                &frame.slots[job.slot_idx].out_buf
+            };
             encoder.copy_buffer_to_buffer(
-                &frame.slots[job.slot_idx].out_buf,
+                src_buf,
                 0,
                 &frame.staging_buf,
                 job.staging_byte_off,

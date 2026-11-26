@@ -4,7 +4,7 @@
 //! DCT -> quantization -> zigzag reordering onto a single WGSL compute pass (`jpeg_dct.wgsl`),
 //! then runs a zero-allocation table-driven Annex K Huffman bitstream writer on CPU.
 
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -258,6 +258,126 @@ fn encode_block(
     }
 }
 
+pub(crate) fn build_inv_qtables(quality: u8) -> ([u8; 64], [u8; 64], [f32; 128]) {
+    let q_y = scale_qtable(&STD_LUMA_Q, quality);
+    let q_c = scale_qtable(&STD_CHROMA_Q, quality);
+    let mut inv_q = [0.0f32; 128];
+    for i in 0..64 {
+        inv_q[i] = 1.0 / (q_y[i] as f32);
+        inv_q[64 + i] = 1.0 / (q_c[i] as f32);
+    }
+    (q_y, q_c, inv_q)
+}
+
+struct StdHuffTables {
+    dc_luma: HuffTable,
+    dc_chroma: HuffTable,
+    ac_luma: HuffTable,
+    ac_chroma: HuffTable,
+}
+
+fn std_huff_tables() -> &'static StdHuffTables {
+    static TABLES: OnceLock<StdHuffTables> = OnceLock::new();
+    TABLES.get_or_init(|| StdHuffTables {
+        dc_luma: HuffTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS),
+        dc_chroma: HuffTable::build(&DC_CHROMA_BITS, &DC_CHROMA_VALS),
+        ac_luma: HuffTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS),
+        ac_chroma: HuffTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS),
+    })
+}
+
+/// Huffman-encode quantized zigzagged `i16` MCU coefficients produced by `jpeg_dct.wgsl`
+/// (e.g. from `CoalescedJob::WithJpeg`) into a complete Baseline JFIF `.jpg` byte vector.
+///
+/// Lock-free and uses SWAR 32-bit `BitWriter` + 128-bit zero-tail scan + multi-threaded
+/// `DRI`/`RST0..RST7` encoding for large images (`>= 8192` MCUs).
+pub fn huffman_encode_coeffs(coeffs_bytes: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
+    let mcu_w = width.div_ceil(16) as usize;
+    let mcu_h = height.div_ceil(16) as usize;
+    let total_mcus = mcu_w * mcu_h;
+    let coeffs: &[i16] = bytemuck::cast_slice(coeffs_bytes);
+    let q_y = scale_qtable(&STD_LUMA_Q, quality);
+    let q_c = scale_qtable(&STD_CHROMA_Q, quality);
+    let tbls = std_huff_tables();
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let use_parallel = total_mcus >= 8192 && n_threads >= 2;
+    let restart_interval: u16 = if use_parallel {
+        total_mcus.div_ceil(n_threads).clamp(512, 65535) as u16
+    } else {
+        0
+    };
+
+    let mut jpg = Vec::with_capacity((width as usize * height as usize) / 4 + 1024);
+    write_jfif_headers(
+        &mut jpg,
+        width as u16,
+        height as u16,
+        &q_y,
+        &q_c,
+        restart_interval,
+    );
+
+    let dc_luma = &tbls.dc_luma;
+    let ac_luma = &tbls.ac_luma;
+    let dc_chroma = &tbls.dc_chroma;
+    let ac_chroma = &tbls.ac_chroma;
+
+    if restart_interval > 0 {
+        let ri = restart_interval as usize;
+        let n_chunks = total_mcus.div_ceil(ri);
+        let mut chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_chunks);
+            for chunk_idx in 0..n_chunks {
+                let start_mcu = chunk_idx * ri;
+                let end_mcu = (start_mcu + ri).min(total_mcus);
+                let chunk_coeffs = &coeffs[start_mcu * 384..end_mcu * 384];
+                let is_last = chunk_idx + 1 == n_chunks;
+                handles.push(s.spawn(move || {
+                    let mcu_count = end_mcu - start_mcu;
+                    let mut buf = Vec::with_capacity(mcu_count * 32 + 64);
+                    encode_mcu_slice(
+                        &mut buf,
+                        chunk_coeffs,
+                        mcu_count,
+                        dc_luma,
+                        ac_luma,
+                        dc_chroma,
+                        ac_chroma,
+                    );
+                    if !is_last {
+                        buf.push(0xff);
+                        buf.push(0xd0 + ((chunk_idx & 7) as u8));
+                    }
+                    buf
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("jpeg huffman worker"))
+                .collect()
+        });
+        for c in chunks.drain(..) {
+            jpg.extend_from_slice(&c);
+        }
+    } else {
+        encode_mcu_slice(
+            &mut jpg,
+            coeffs,
+            total_mcus,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+        );
+    }
+    jpg.extend_from_slice(&[0xff, 0xd9]); // EOI
+    jpg
+}
+
 fn scale_qtable(base: &[u8; 64], quality: u8) -> [u8; 64] {
     let q = quality.clamp(1, 100) as u32;
     let scale = if q < 50 { 5000 / q } else { 200 - 2 * q };
@@ -346,11 +466,11 @@ fn write_jfif_headers(
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct JpegParams {
-    width: u32,
-    height: u32,
-    mcu_w: u32,
-    mcu_h: u32,
+pub(crate) struct JpegParams {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) mcu_w: u32,
+    pub(crate) mcu_h: u32,
 }
 
 /// GPU-accelerated Baseline JFIF (4:2:0) encoder.
@@ -366,10 +486,6 @@ pub struct GpuJpegEncoder {
     out_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     out_cap_words: usize,
-    dc_luma: HuffTable,
-    dc_chroma: HuffTable,
-    ac_luma: HuffTable,
-    ac_chroma: HuffTable,
 }
 
 impl GpuJpegEncoder {
@@ -470,10 +586,6 @@ impl GpuJpegEncoder {
             out_buf,
             staging_buf,
             out_cap_words,
-            dc_luma: HuffTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS),
-            dc_chroma: HuffTable::build(&DC_CHROMA_BITS, &DC_CHROMA_VALS),
-            ac_luma: HuffTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS),
-            ac_chroma: HuffTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS),
         }
     }
 
@@ -567,13 +679,7 @@ impl GpuJpegEncoder {
             self.staging_buf = s;
         }
 
-        let q_y = scale_qtable(&STD_LUMA_Q, quality);
-        let q_c = scale_qtable(&STD_CHROMA_Q, quality);
-        let mut inv_q = [0.0f32; 128];
-        for i in 0..64 {
-            inv_q[i] = 1.0 / (q_y[i] as f32);
-            inv_q[64 + i] = 1.0 / (q_c[i] as f32);
-        }
+        let (_q_y, _q_c, inv_q) = build_inv_qtables(quality);
         let params = JpegParams {
             width,
             height,
@@ -637,86 +743,7 @@ impl GpuJpegEncoder {
             .map_err(|e| GpuError::BufferMap(e.to_string()))?;
 
         let mapped = slice.get_mapped_range();
-        let coeffs: &[i16] = bytemuck::cast_slice(&mapped);
-
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 8);
-        // Only spawn OS worker threads when MCU count is large enough to amortize
-        // thread-spawn overhead (>= 8192 MCUs ≈ 2048×1024); smaller images finish
-        // sub-millisecond on 1 thread with the SWAR BitWriter + 128-bit tail scan.
-        let use_parallel = total_mcus >= 8192 && n_threads >= 2;
-        let restart_interval: u16 = if use_parallel {
-            total_mcus.div_ceil(n_threads).clamp(512, 65535) as u16
-        } else {
-            0
-        };
-
-        let mut jpg = Vec::with_capacity((width as usize * height as usize) / 4 + 1024);
-        write_jfif_headers(
-            &mut jpg,
-            width as u16,
-            height as u16,
-            &q_y,
-            &q_c,
-            restart_interval,
-        );
-
-        let dc_luma = &self.dc_luma;
-        let ac_luma = &self.ac_luma;
-        let dc_chroma = &self.dc_chroma;
-        let ac_chroma = &self.ac_chroma;
-
-        if restart_interval > 0 {
-            let ri = restart_interval as usize;
-            let n_chunks = total_mcus.div_ceil(ri);
-            let mut chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(n_chunks);
-                for chunk_idx in 0..n_chunks {
-                    let start_mcu = chunk_idx * ri;
-                    let end_mcu = (start_mcu + ri).min(total_mcus);
-                    let chunk_coeffs = &coeffs[start_mcu * 384..end_mcu * 384];
-                    let is_last = chunk_idx + 1 == n_chunks;
-                    handles.push(s.spawn(move || {
-                        let mcu_count = end_mcu - start_mcu;
-                        let mut buf = Vec::with_capacity(mcu_count * 32 + 64);
-                        encode_mcu_slice(
-                            &mut buf,
-                            chunk_coeffs,
-                            mcu_count,
-                            dc_luma,
-                            ac_luma,
-                            dc_chroma,
-                            ac_chroma,
-                        );
-                        if !is_last {
-                            buf.push(0xff);
-                            buf.push(0xd0 + ((chunk_idx & 7) as u8));
-                        }
-                        buf
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("jpeg huffman worker"))
-                    .collect()
-            });
-            for c in chunks.drain(..) {
-                jpg.extend_from_slice(&c);
-            }
-        } else {
-            encode_mcu_slice(
-                &mut jpg,
-                coeffs,
-                total_mcus,
-                dc_luma,
-                ac_luma,
-                dc_chroma,
-                ac_chroma,
-            );
-        }
-        jpg.extend_from_slice(&[0xff, 0xd9]); // EOI
+        let jpg = huffman_encode_coeffs(&mapped, width, height, quality);
         drop(mapped);
         self.staging_buf.unmap();
         Ok(jpg)

@@ -93,5 +93,9 @@ required-features = ["gpu"]
 name = "gpu_jpeg_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "fused_render_jpeg_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 zune-jpeg.workspace = true
