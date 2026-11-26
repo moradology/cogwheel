@@ -4622,7 +4622,7 @@ async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
     for (ps, _, expected_nb, exp_min, exp_max, exp_mean) in cases {
         let r = client
             .post(format!(
-                "{base}/mosaicjson/statistics?url={mp}&pixel_selection={ps}"
+                "{base}/mosaicjson/statistics?url={mp}&pixel_selection={ps}&area_weighted=false"
             ))
             .header("content-type", "application/json")
             .body(poly.to_string())
@@ -4804,6 +4804,270 @@ async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
         .await
         .unwrap();
     assert_eq!(r_2b_bad.status(), 400, "2-band visual PNG under highest must return 400");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Parity Sweep #31 GG1:
+/// - One-file mosaic POST /mosaicjson/statistics equals POST /cog/statistics to 1e-9
+///   (count, mean, std, sum, valid_pixels, valid_percent, masked_pixels, area, category_areas).
+/// - Same-grid and heterogeneous-grid multi-file mosaics keep exact coverage fractions,
+///   ellipsoidal area, and polygon-relative valid_percent == 100.0.
+/// - Heterogeneous-grid POST /stac/statistics with an expression also keeps exact coverage
+///   fractions, ellipsoidal area, and polygon-relative valid_percent == 100.0.
+#[tokio::test]
+async fn sweep31_gg1_mosaic_and_stac_exact_zonal_statistics() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep31_gg1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. One-file projected UTM 10N (EPSG:32610) COG with spatially varying values
+    let utm_path = tmp.join("utm10n.tif");
+    let mut utm_px = vec![0.0f32; 64 * 64];
+    for r in 0..64 {
+        for c in 0..64 {
+            utm_px[r * 64 + c] = ((r * 3 + c * 5) % 17 + 1) as f32;
+        }
+    }
+    write_synthetic_f32_projected_geotiff(
+        &utm_path,
+        64,
+        64,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &utm_px,
+    );
+    // Tile covering ~(500_000, 4_200_000) in EPSG:32610 -> ~(-123.0, 37.95)
+    // Querying quadkey at zoom 0 ("") matches any bbox in MosaicJSON.
+    let one_mj_path = tmp.join("one.json");
+    let one_mj = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 0,
+        "maxzoom": 14,
+        "quadkey_zoom": 0,
+        "bounds": [-124.0, 37.0, -122.0, 39.0],
+        "center": [-123.0, 38.0, 10],
+        "tiles": { "": [utm_path.to_str().unwrap()] }
+    });
+    std::fs::write(&one_mj_path, one_mj.to_string()).unwrap();
+
+    // 2. Heterogeneous-grid mosaic & STAC item: 64x64 (val=10) + 32x32 (val=20) over same 4326 bounds
+    let g_bounds = [-122.6953125, 37.71859032558816, -122.34375, 37.996162679728116];
+    let g64_path = tmp.join("g64.tif");
+    let g32_path = tmp.join("g32.tif");
+    write_synthetic_u16_2band_4326_geotiff(&g64_path, 64, 64, g_bounds, 10, 100, None);
+    write_synthetic_u16_2band_4326_geotiff(&g32_path, 32, 32, g_bounds, 20, 200, None);
+    let het_mj_path = tmp.join("het.json");
+    let het_mj = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 0,
+        "maxzoom": 14,
+        "quadkey_zoom": 0,
+        "bounds": g_bounds,
+        "center": [(g_bounds[0] + g_bounds[2]) / 2.0, (g_bounds[1] + g_bounds[3]) / 2.0, 10],
+        "tiles": { "": [g64_path.to_str().unwrap(), g32_path.to_str().unwrap()] }
+    });
+    std::fs::write(&het_mj_path, het_mj.to_string()).unwrap();
+
+    let stac_path = tmp.join("het_stac.json");
+    let stac = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "het-stac",
+        "bbox": g_bounds,
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [g_bounds[0], g_bounds[1]],
+                [g_bounds[2], g_bounds[1]],
+                [g_bounds[2], g_bounds[3]],
+                [g_bounds[0], g_bounds[3]],
+                [g_bounds[0], g_bounds[1]]
+            ]]
+        },
+        "properties": { "datetime": "2025-01-01T00:00:00Z" },
+        "assets": {
+            "hi": { "href": g64_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" },
+            "lo": { "href": g32_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+        }
+    });
+    std::fs::write(&stac_path, stac.to_string()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Small tilted quadrilateral in UTM 10N (fractional pixel coverage!)
+    let utm_quad = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_103.3, 4_200_121.6],
+                [500_412.7, 4_200_154.2],
+                [500_389.4, 4_200_487.8],
+                [500_124.1, 4_200_441.5],
+                [500_103.3, 4_200_121.6]
+            ]]
+        }
+    });
+
+    // A. One-file mosaic POST /mosaicjson/statistics == POST /cog/statistics to 1e-9
+    let utm_u = utm_path.to_string_lossy();
+    let one_u = one_mj_path.to_string_lossy();
+    for extra in ["", "&categorical=true"] {
+        let r_cog = client
+            .post(format!(
+                "{base}/cog/statistics?url={utm_u}&bidx=1&coord_crs=EPSG:32610{extra}"
+            ))
+            .header("content-type", "application/json")
+            .body(utm_quad.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_cog.status(), 200);
+        let j_cog: serde_json::Value = serde_json::from_str(&r_cog.text().await.unwrap()).unwrap();
+
+        let r_mos = client
+            .post(format!(
+                "{base}/mosaicjson/statistics?url={one_u}&bidx=1&coord_crs=EPSG:32610{extra}"
+            ))
+            .header("content-type", "application/json")
+            .body(utm_quad.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mos.status(), 200);
+        let j_mos: serde_json::Value = serde_json::from_str(&r_mos.text().await.unwrap()).unwrap();
+
+        let bc = &j_cog["properties"]["statistics"]["b1"];
+        let bm = &j_mos["properties"]["statistics"]["b1"];
+        for field in [
+            "count",
+            "mean",
+            "std",
+            "sum",
+            "min",
+            "max",
+            "valid_pixels",
+            "masked_pixels",
+            "valid_percent",
+            "area",
+        ] {
+            let vc = bc[field].as_f64().unwrap_or_else(|| panic!("cog missing {field}: {bc}"));
+            let vm = bm[field].as_f64().unwrap_or_else(|| panic!("mosaic missing {field}: {bm}"));
+            assert!(
+                (vc - vm).abs() <= 1e-9,
+                "GG1 one-file mosaic vs /cog/statistics mismatch on {field} ({extra}): cog={vc} mos={vm}"
+            );
+        }
+        assert_eq!(bm["valid_percent"].as_f64().unwrap(), 100.0);
+        assert!(bm["count"].as_f64().unwrap().fract().abs() > 1e-3, "count must be fractional");
+        if !extra.is_empty() {
+            let cc = bc["category_areas"].as_object().expect("cog category_areas");
+            let cm = bm["category_areas"].as_object().expect("mosaic category_areas");
+            assert_eq!(cc.len(), cm.len());
+            for (k, v) in cc {
+                let vc = v.as_f64().unwrap();
+                let vm = cm[k].as_f64().unwrap();
+                assert!(
+                    (vc - vm).abs() <= 1e-9,
+                    "GG1 category_areas[{k}] mismatch: cog={vc} mos={vm}"
+                );
+            }
+        }
+    }
+
+    // B. Heterogeneous-grid mosaic POST /mosaicjson/statistics keeps exact coverage & polygon valid_percent
+    let g_quad = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [-122.62, 37.76],
+                [-122.41, 37.78],
+                [-122.43, 37.94],
+                [-122.60, 37.91],
+                [-122.62, 37.76]
+            ]]
+        }
+    });
+    let het_u = het_mj_path.to_string_lossy();
+    let r_het = client
+        .post(format!(
+            "{base}/mosaicjson/statistics?url={het_u}&bidx=1&pixel_selection=highest"
+        ))
+        .header("content-type", "application/json")
+        .body(g_quad.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_het.status(), 200);
+    let j_het: serde_json::Value = serde_json::from_str(&r_het.text().await.unwrap()).unwrap();
+    let b_het = &j_het["properties"]["statistics"]["b1"];
+    assert!(
+        (b_het["mean"].as_f64().unwrap() - 20.0).abs() < 1e-6,
+        "heterogeneous mosaic highest mean expected 20.0, got {b_het}"
+    );
+    assert_eq!(
+        b_het["valid_percent"].as_f64().unwrap(),
+        100.0,
+        "heterogeneous mosaic valid_percent must be 100.0 against polygon, got {b_het}"
+    );
+    assert_eq!(b_het["masked_pixels"].as_f64().unwrap(), 0.0);
+    assert!(
+        b_het["area"].as_f64().unwrap() > 1e6,
+        "heterogeneous mosaic must include positive ellipsoidal area, got {b_het}"
+    );
+    assert!(
+        b_het["count"].as_f64().unwrap().fract().abs() > 1e-3,
+        "heterogeneous mosaic count must be fractional coverage sum, got {b_het}"
+    );
+
+    // C. Heterogeneous-grid POST /stac/statistics with expression keeps exact coverage & polygon valid_percent
+    let stac_u = stac_path.to_string_lossy();
+    let r_stac = client
+        .post(format!(
+            "{base}/stac/statistics?url={stac_u}&assets=hi&assets=lo&expression=b1%2Bb2"
+        ))
+        .header("content-type", "application/json")
+        .body(g_quad.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stac.status(), 200);
+    let j_stac: serde_json::Value = serde_json::from_str(&r_stac.text().await.unwrap()).unwrap();
+    let b_stac = &j_stac["properties"]["statistics"]["b1"];
+    assert!(
+        (b_stac["mean"].as_f64().unwrap() - 30.0).abs() < 1e-6,
+        "heterogeneous STAC expr mean expected 30.0, got {b_stac}"
+    );
+    assert_eq!(
+        b_stac["valid_percent"].as_f64().unwrap(),
+        100.0,
+        "heterogeneous STAC expr valid_percent must be 100.0 against polygon, got {b_stac}"
+    );
+    assert!(
+        b_stac["area"].as_f64().unwrap() > 1e6,
+        "heterogeneous STAC expr must include positive ellipsoidal area, got {b_stac}"
+    );
+    assert!(
+        b_stac["count"].as_f64().unwrap().fract().abs() > 1e-3,
+        "heterogeneous STAC expr count must be fractional coverage sum, got {b_stac}"
+    );
 
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
