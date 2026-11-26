@@ -10,7 +10,7 @@ pub mod resample;
 pub mod terrain;
 
 pub use batch::{GpuTileBatcher, TileCoordSlice};
-pub use cache::{GpuCacheStats, GpuSlabCache, SlabKey};
+pub use cache::{GpuCacheStats, GpuMultiBandCache, GpuSlabCache, MultiBandSlabKey, SlabKey};
 pub use colormap::{GpuColormapMode, GpuColormapRenderer, GpuCoordPlan, GpuPixelOutput};
 pub use context::{GpuAdapterInfo, GpuContext, GpuError, GpuOptions};
 pub use expr::{GpuColorFormula, GpuExprRenderer, GpuInstr, GpuMultiBandSlab, opcodes};

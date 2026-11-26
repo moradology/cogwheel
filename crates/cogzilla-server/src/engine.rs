@@ -323,6 +323,7 @@ impl TileEngine {
             #[cfg(feature = "gpu")]
             if let Some(gpu) = &self.gpu {
                 gpu.slab_cache.clear();
+                gpu.multi_slab_cache.clear();
             }
         }
     }
@@ -963,7 +964,7 @@ impl TileEngine {
                         }
                         #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu.try_render_rgb::<N>(&plan, &srcs, &style) {
+                            if let Some(bytes) = gpu.try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style) {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
@@ -1031,7 +1032,7 @@ impl TileEngine {
                         }
                         #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu.try_render_rgb::<N>(&plan, &srcs, &style) {
+                            if let Some(bytes) = gpu.try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style) {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
@@ -1356,7 +1357,7 @@ impl TileEngine {
                             .collect();
                         #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu.try_render_expr::<N>(&plan, &srcs, prog, &style) {
+                            if let Some(bytes) = gpu.try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style) {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
@@ -1406,7 +1407,7 @@ impl TileEngine {
                             .collect();
                         #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu.try_render_expr::<N>(&plan, &srcs, prog, &style) {
+                            if let Some(bytes) = gpu.try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style) {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
