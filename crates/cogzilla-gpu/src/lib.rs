@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod cache;
+pub mod coalesce;
 pub mod colormap;
 pub mod context;
 pub mod expr;
@@ -11,6 +12,7 @@ pub mod terrain;
 
 pub use batch::{GpuTileBatcher, TileCoordSlice};
 pub use cache::{GpuCacheStats, GpuMultiBandCache, GpuSlabCache, MultiBandSlabKey, SlabKey};
+pub use coalesce::{CoalescedJob, CoalescedOutput, CoalescerStats, GpuCoalescer, OwnedCoordPlan};
 pub use colormap::{GpuColormapMode, GpuColormapRenderer, GpuCoordPlan, GpuPixelOutput};
 pub use context::{GpuAdapterInfo, GpuContext, GpuError, GpuOptions};
 pub use expr::{GpuColorFormula, GpuExprRenderer, GpuInstr, GpuMultiBandSlab, opcodes};
