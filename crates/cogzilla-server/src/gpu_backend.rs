@@ -52,6 +52,7 @@ pub struct GpuBackend {
     colormap: Mutex<GpuColormapRenderer>,
     #[allow(dead_code)]
     terrain: Mutex<GpuTerrainRenderer>,
+    #[allow(dead_code)]
     expr: Mutex<GpuExprRenderer>,
     mosaic: Mutex<GpuMosaicCompositor>,
     batcher: Mutex<GpuTileBatcher>,
@@ -102,9 +103,8 @@ fn encode_indexed_u8_png(idx_bytes: &[u8], width: u32, height: u32, rgb: &[[u8; 
     encode_indexed_png(width, height, &plte, Some(&trns), &filtered)
 }
 
-/// Stitch any single- or multi-block `BandSource` (F32, U16, U8, sparse blocks, nodata override,
-/// scale/offset) into a contiguous `f32` slab `(data, base_col, base_row, width, height)`.
-pub fn stitch_band_source(src: &BandSource<'_>) -> Option<(Vec<f32>, u32, u32, u32, u32)> {
+/// Compute the stitched slab geometry `(base_col, base_row, width, height)` for a `BandSource`.
+pub fn stitch_band_source_geom(src: &BandSource<'_>) -> Option<(u32, u32, u32, u32)> {
     let base_col = src.tx0.checked_mul(src.tile_w)?;
     let base_row = src.ty0.checked_mul(src.tile_h)?;
     let max_w = (src.ifd_w.max(0) as u32).saturating_sub(base_col);
@@ -114,15 +114,216 @@ pub fn stitch_band_source(src: &BandSource<'_>) -> Option<(Vec<f32>, u32, u32, u
     if w == 0 || h == 0 || (w as u64) * (h as u64) > 64 * 1024 * 1024 {
         return None;
     }
+    Some((base_col, base_row, w, h))
+}
 
-    let mut out = vec![f32::NAN; (w as usize) * (h as usize)];
-    for row in 0..h {
-        let dst_row = &mut out[(row as usize) * (w as usize)..((row + 1) as usize) * (w as usize)];
-        let abs_y = base_row + row;
-        for col in 0..w {
-            dst_row[col as usize] = src.sample_inbounds(base_col + col, abs_y);
+/// Stitch any single- or multi-block `BandSource` (`F32`, `U16`, `U8`, `RgbU8Channel`,
+/// sparse blocks, nodata override, scale/offset) directly into a caller-provided `out` slice
+/// (e.g. a `mapped_at_creation` GPU buffer) using block-wise hoisted SIMD-friendly loops.
+pub fn stitch_band_source_into(src: &BandSource<'_>, w: u32, h: u32, out: &mut [f32]) {
+    use cogzilla_codec::BandData;
+
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let tw = src.tile_w as usize;
+    let th = src.tile_h as usize;
+    let nd_ovr = src.nodata_override;
+    let sc_off = src.scale_offset;
+
+    // Only pre-fill NaN if any block is missing/all_nodata or shorter than the tile grid.
+    let all_full = (src.grid_w as usize * tw == w_us)
+        && (src.grid_h as usize * th == h_us)
+        && src.blocks.iter().all(|b| {
+            b.is_some_and(|blk| {
+                !blk.stats.all_nodata && blk.width as usize == tw && blk.height as usize == th
+            })
+        });
+    if !all_full {
+        out[..w_us * h_us].fill(f32::NAN);
+    }
+
+    for gy in 0..src.grid_h as usize {
+        let dst_y0 = gy * th;
+        if dst_y0 >= h_us {
+            break;
+        }
+        let max_rows = (h_us - dst_y0).min(th);
+        for gx in 0..src.grid_w as usize {
+            let dst_x0 = gx * tw;
+            if dst_x0 >= w_us {
+                break;
+            }
+            let max_cols = (w_us - dst_x0).min(tw);
+            let Some(blk) = src.blocks[gy * (src.grid_w as usize) + gx] else {
+                continue;
+            };
+            if blk.stats.all_nodata {
+                continue;
+            }
+            let copy_h = max_rows.min(blk.height as usize);
+            let copy_w = max_cols.min(blk.width as usize);
+            if copy_h == 0 || copy_w == 0 {
+                continue;
+            }
+
+            match &blk.data {
+                BandData::F32(slab) => {
+                    let sdata = slab.as_slice();
+                    if nd_ovr.is_none() && sc_off.is_none() {
+                        for ly in 0..copy_h {
+                            let s0 = ly * tw;
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            out[d0..d0 + copy_w].copy_from_slice(&sdata[s0..s0 + copy_w]);
+                        }
+                    } else {
+                        for ly in 0..copy_h {
+                            let srow = &sdata[ly * tw..ly * tw + copy_w];
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (d, &v) in drow.iter_mut().zip(srow) {
+                                let mut val = v;
+                                if let Some(nd) = nd_ovr
+                                    && val == nd
+                                {
+                                    val = f32::NAN;
+                                }
+                                if let Some((sc, off)) = sc_off
+                                    && !val.is_nan()
+                                {
+                                    val = val * sc + off;
+                                }
+                                *d = val;
+                            }
+                        }
+                    }
+                }
+                BandData::U16 { data, nodata } => {
+                    let nd_u16 = *nodata;
+                    if nd_u16.is_none() && nd_ovr.is_none() && sc_off.is_none() {
+                        for ly in 0..copy_h {
+                            let srow = &data[ly * tw..ly * tw + copy_w];
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (d, &s) in drow.iter_mut().zip(srow) {
+                                *d = s as f32;
+                            }
+                        }
+                    } else {
+                        for ly in 0..copy_h {
+                            let srow = &data[ly * tw..ly * tw + copy_w];
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (d, &s) in drow.iter_mut().zip(srow) {
+                                let mut val = if nd_u16 == Some(s) {
+                                    f32::NAN
+                                } else {
+                                    s as f32
+                                };
+                                if let Some(nd) = nd_ovr
+                                    && val == nd
+                                {
+                                    val = f32::NAN;
+                                }
+                                if let Some((sc, off)) = sc_off
+                                    && !val.is_nan()
+                                {
+                                    val = val * sc + off;
+                                }
+                                *d = val;
+                            }
+                        }
+                    }
+                }
+                BandData::U8 { data, nodata } => {
+                    let nd_u8 = *nodata;
+                    if nd_u8.is_none() && nd_ovr.is_none() && sc_off.is_none() {
+                        for ly in 0..copy_h {
+                            let srow = &data[ly * tw..ly * tw + copy_w];
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (d, &s) in drow.iter_mut().zip(srow) {
+                                *d = s as f32;
+                            }
+                        }
+                    } else {
+                        for ly in 0..copy_h {
+                            let srow = &data[ly * tw..ly * tw + copy_w];
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (d, &s) in drow.iter_mut().zip(srow) {
+                                let mut val = if nd_u8 == Some(s) {
+                                    f32::NAN
+                                } else {
+                                    s as f32
+                                };
+                                if let Some(nd) = nd_ovr
+                                    && val == nd
+                                {
+                                    val = f32::NAN;
+                                }
+                                if let Some((sc, off)) = sc_off
+                                    && !val.is_nan()
+                                {
+                                    val = val * sc + off;
+                                }
+                                *d = val;
+                            }
+                        }
+                    }
+                }
+                BandData::RgbU8Channel {
+                    rgb,
+                    channel,
+                    nodata,
+                } => {
+                    let ch = *channel as usize;
+                    let nd_u8 = *nodata;
+                    if nd_u8.is_none() && nd_ovr.is_none() && sc_off.is_none() {
+                        for ly in 0..copy_h {
+                            let sbase = ly * tw * 3 + ch;
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (lx, d) in drow.iter_mut().enumerate() {
+                                *d = rgb[sbase + lx * 3] as f32;
+                            }
+                        }
+                    } else {
+                        for ly in 0..copy_h {
+                            let sbase = ly * tw * 3 + ch;
+                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                            let drow = &mut out[d0..d0 + copy_w];
+                            for (lx, d) in drow.iter_mut().enumerate() {
+                                let s = rgb[sbase + lx * 3];
+                                let mut val = if nd_u8 == Some(s) {
+                                    f32::NAN
+                                } else {
+                                    s as f32
+                                };
+                                if let Some(nd) = nd_ovr
+                                    && val == nd
+                                {
+                                    val = f32::NAN;
+                                }
+                                if let Some((sc, off)) = sc_off
+                                    && !val.is_nan()
+                                {
+                                    val = val * sc + off;
+                                }
+                                *d = val;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// Stitch any single- or multi-block `BandSource` into a newly allocated contiguous `Vec<f32>`.
+pub fn stitch_band_source(src: &BandSource<'_>) -> Option<(Vec<f32>, u32, u32, u32, u32)> {
+    let (base_col, base_row, w, h) = stitch_band_source_geom(src)?;
+    let mut out = vec![0.0f32; (w as usize) * (h as usize)];
+    stitch_band_source_into(src, w, h, &mut out);
     Some((out, base_col, base_row, w, h))
 }
 
@@ -1303,22 +1504,39 @@ impl GpuBackend {
             let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
             return Some((slab, bc, br));
         }
-        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
-        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-        for src in srcs {
-            let (buf, bc, br, w, h) = stitch_band_source(src)?;
-            if let Some(g) = common_geom {
-                if g != (bc, br, w, h) {
-                    return None;
-                }
-            } else {
-                common_geom = Some((bc, br, w, h));
+        let (base_col, base_row, w, h) = stitch_band_source_geom(&srcs[0])?;
+        for src in &srcs[1..] {
+            if stitch_band_source_geom(src)? != (base_col, base_row, w, h) {
+                return None;
             }
-            stitched_vecs.push(buf);
         }
-        let (base_col, base_row, w, h) = common_geom?;
-        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
-        let slab = Arc::new(self.expr.lock().ok()?.upload_bands(&refs, w, h, w).ok()?);
+        let plane = (w as usize) * (h as usize);
+        let slab = Arc::new(
+            cogzilla_gpu::GpuMultiBandSlab::from_mapped_fill(
+                &self.ctx.device,
+                srcs.len(),
+                w,
+                h,
+                w,
+                |dst| {
+                    if srcs.len() >= 2 && plane >= 262_144 {
+                        std::thread::scope(|s| {
+                            for (src, plane_dst) in srcs.iter().zip(dst.chunks_exact_mut(plane)) {
+                                s.spawn(move || {
+                                    stitch_band_source_into(src, w, h, plane_dst);
+                                });
+                            }
+                        });
+                    } else {
+                        for (src, plane_dst) in srcs.iter().zip(dst.chunks_exact_mut(plane)) {
+                            stitch_band_source_into(src, w, h, plane_dst);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .ok()?,
+        );
         if let Some(k) = cache_key {
             self.multi_slab_cache.insert(k, Arc::clone(&slab));
         }
