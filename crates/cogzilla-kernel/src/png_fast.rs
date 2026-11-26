@@ -264,6 +264,12 @@ pub fn filter_sub_ga_row(src_ga: &[u8], dst_filtered: &mut [u8]) {
 /// and frame into a complete valid PNG `Bytes` buffer.
 /// `color_type`: `0` = Gray8 (`L`), `2` = RGB8, `4` = GrayAlpha8 (`LA`), `6` = RGBA8.
 pub fn encode_filtered_png(width: u32, height: u32, color_type: u8, filtered: &[u8]) -> Bytes {
+    encode_filtered_png_depth(width, height, color_type, 8, filtered)
+}
+
+/// [`encode_filtered_png`] for samples of `bit_depth` bits: 8, or 16 with each sample
+/// big-endian as PNG has them. The scanlines are filtered already, a filter byte before each.
+pub fn encode_filtered_png_depth(width: u32, height: u32, color_type: u8, bit_depth: u8, filtered: &[u8]) -> Bytes {
     PNG_ENC.with(|cell| {
         let mut guard = cell.borrow_mut();
         let enc = &mut *guard;
@@ -282,7 +288,7 @@ pub fn encode_filtered_png(width: u32, height: u32, color_type: u8, filtered: &[
         let mut ihdr = [0u8; 13];
         ihdr[0..4].copy_from_slice(&width.to_be_bytes());
         ihdr[4..8].copy_from_slice(&height.to_be_bytes());
-        ihdr[8] = 8;
+        ihdr[8] = bit_depth;
         ihdr[9] = color_type;
         ihdr[10] = 0;
         ihdr[11] = 0;
@@ -370,5 +376,46 @@ pub fn empty_transparent_png(size: u32) -> Bytes {
             let raw = vec![0u8; (other as usize) * (1 + (other as usize) * 4)];
             encode_filtered_png(other, other, 6, &raw)
         }
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// The IHDR of a PNG: width, height, bit depth, colour type.
+    fn header(png: &[u8]) -> (u32, u32, u8, u8) {
+        assert_eq!(&png[..8], &PNG_SIG);
+        assert_eq!(&png[12..16], b"IHDR");
+        (
+            u32::from_be_bytes([png[16], png[17], png[18], png[19]]),
+            u32::from_be_bytes([png[20], png[21], png[22], png[23]]),
+            png[24],
+            png[25],
+        )
+    }
+
+    #[test]
+    fn eight_bits_is_what_it_was() {
+        // Two rows of three grey pixels, unfiltered.
+        let rows = [0u8, 1, 2, 3, 0, 4, 5, 6];
+        let plain = encode_filtered_png(3, 2, 0, &rows);
+        assert_eq!(plain, encode_filtered_png_depth(3, 2, 0, 8, &rows));
+        assert_eq!(header(&plain), (3, 2, 8, 0));
+    }
+
+    #[test]
+    fn sixteen_bits_says_so_and_holds_its_rows() {
+        // One row of two grey-and-alpha pixels of 16 bits: 0x0102 opaque, 0xfffe clear.
+        let rows = [0u8, 0x01, 0x02, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00];
+        let png = encode_filtered_png_depth(2, 1, 4, 16, &rows);
+        assert_eq!(header(&png), (2, 1, 16, 4));
+        // IDAT follows IHDR: length, tag, a zlib stream that inflates to the rows.
+        let at = 8 + 25;
+        assert_eq!(&png[at + 4..at + 8], b"IDAT");
+        let len = u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]) as usize;
+        let mut out = vec![0u8; rows.len()];
+        let n = libdeflater::Decompressor::new().zlib_decompress(&png[at + 8..at + 8 + len], &mut out).expect("a zlib stream");
+        assert_eq!(&out[..n], &rows);
     }
 }
