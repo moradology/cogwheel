@@ -1416,6 +1416,96 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(hi_v >= lo_v, "highest ({hi_v}) must be >= lowest ({lo_v})");
             assert!((cnt_v - 2.0).abs() < 1e-4, "count on 2 identical scenes must be 2.0, got {cnt_v}");
 
+            let ps_tile = format!("{base}/mosaic/tiles/WebMercatorQuad/12/657/1582");
+            let f32s = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            };
+            let sat_tile = format!("{base}/mosaic/tiles/WebMercatorQuad/12/652/1583");
+            let fetch = |tile: &str, query: String| {
+                let client = client.clone();
+                let url = format!("{tile}.f32?{query}");
+                async move {
+                    let resp = client.get(url).send().await.unwrap();
+                    (resp.status(), resp.bytes().await.unwrap())
+                }
+            };
+
+            // count is a number everywhere, zero where no scene has a value.
+            let counts = f32s(&cnt_bytes);
+            assert_eq!(counts.len(), 256 * 256);
+            assert!(counts.iter().all(|v| *v == 0.0 || *v == 2.0), "count is 0 or 2 over two identical scenes");
+
+            // Names: any case, and `std` for `stdev`; anything else is refused.
+            let (status, stdev) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=stdev")).await;
+            assert_eq!(status, 200);
+            for name in ["std", "STD", "Stdev"] {
+                let (status, body) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection={name}")).await;
+                assert_eq!(status, 200, "{name}");
+                assert_eq!(body, stdev, "{name}");
+            }
+            let (status, _) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=sum")).await;
+            assert_eq!(status, 422);
+
+            // The last-band methods leave the deciding band out, and need a band beside it.
+            for name in ["lastbandhigh", "lastbandlow"] {
+                let three = format!("url={sat_url}&url={sat_url}&bidx=1&bidx=2&bidx=3&pixel_selection={name}");
+                let (status, body) = fetch(&sat_tile, three).await;
+                assert_eq!(status, 200, "{name}");
+                assert_eq!(body.len(), 2 * 256 * 256 * 4, "{name} of three bands leaves two");
+                let (status, _) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&pixel_selection={name}")).await;
+                assert_eq!(status, 400, "{name} of one band");
+            }
+            // Over one scene the bands left are that scene's own.
+            let (_, kept) = fetch(&sat_tile, format!("url={sat_url}&bidx=1&bidx=2&bidx=3&pixel_selection=lastbandhigh")).await;
+            let (_, own) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&bidx=2&pixel_selection=highest")).await;
+            assert_eq!(kept, own);
+
+            // median holds its scenes, within 64 MiB: two three-band scenes at 2048 px are over it.
+            let over = format!("url={sat_url}&url={sat_url}&bidx=1&bidx=2&bidx=3&pixel_selection=median&tilesize=2048");
+            let (status, body) = fetch(&sat_tile, over).await;
+            assert_eq!(status, 400);
+            assert!(
+                String::from_utf8_lossy(&body).contains("pixel_selection=median exceeds memory budget (64 MiB limit)"),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let (status, body) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&pixel_selection=median")).await;
+            assert_eq!(status, 200);
+            let (_, one) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&pixel_selection=highest")).await;
+            assert_eq!(body, one, "the median of a scene taken twice is the scene");
+
+            // mean and median of whole numbers are whole numbers, the fraction dropped;
+            // of floats they keep it.
+            let (b2, b3) = (fixture("landsat_c2_B2.tif"), fixture("landsat_c2_B3.tif"));
+            if b2.exists() && b3.exists() {
+                let pair = format!(
+                    "url={}&url={}&bidx=1",
+                    b2.canonicalize().unwrap().to_string_lossy(),
+                    b3.canonicalize().unwrap().to_string_lossy()
+                );
+                let (_, hi) = fetch(&sat_tile, format!("{pair}&pixel_selection=highest")).await;
+                let (_, lo) = fetch(&sat_tile, format!("{pair}&pixel_selection=lowest")).await;
+                let (hi, lo) = (f32s(&hi), f32s(&lo));
+                let halves = hi.iter().zip(&lo).filter(|(h, l)| h.is_finite() && (**h + **l) % 2.0 == 1.0).count();
+                assert!(halves > 0, "some pixel's mean of two scenes has a half to drop");
+                for name in ["mean", "median"] {
+                    let (status, got) = fetch(&sat_tile, format!("{pair}&pixel_selection={name}")).await;
+                    assert_eq!(status, 200, "{name}");
+                    let got = f32s(&got);
+                    assert_eq!(got.len(), hi.len());
+                    for (i, v) in got.iter().enumerate() {
+                        if hi[i].is_finite() {
+                            let exact = (f64::from(hi[i]) + f64::from(lo[i])) / 2.0;
+                            assert_eq!(f64::from(*v), exact.trunc(), "{name} at {i}: of {} and {}", lo[i], hi[i]);
+                        } else {
+                            assert!(v.is_nan(), "{name} at {i}");
+                        }
+                    }
+                }
+            }
+            let (_, mean) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=mean")).await;
+            assert!(f32s(&mean).iter().any(|v| v.is_finite() && v.fract() != 0.0), "a float mean keeps its fraction");
+
             // Sweep #1 & #7 C1-C4, D2(validate), G1-G3 regression checks
             let cog_stac = get_json(
                 &client,
