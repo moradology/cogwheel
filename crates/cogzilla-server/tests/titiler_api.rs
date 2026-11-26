@@ -3773,6 +3773,31 @@ async fn sweep23_cc1_null_geometry_and_indexed_fc_errors() {
         );
     }
 
+    // 3. STAC DEM algorithm + resized expression with null-geometry FC must succeed (200)
+    for extra in ["&algorithm=hillshade", "&expression=data*2&width=32"] {
+        let r = client
+            .post(format!("{base}/stac/statistics?url={stac_url}&assets=data&coord_crs=EPSG:32610{extra}"))
+            .header("content-type", "application/json")
+            .body(fc_with_null.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "STAC {extra} with null-geom FC must return 200");
+        let b: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        assert_eq!(b["features"][1]["properties"]["statistics"]["b1"]["count"].as_f64().unwrap(), 0.0);
+    }
+
+    // 4. MosaicJSON null-geometry with invalid bidx=99 must return 400 (not swallowed 200)
+    let null_feat = serde_json::json!({"type": "Feature", "properties": {}, "geometry": null});
+    let r_bad_bidx = client
+        .post(format!("{base}/mosaicjson/statistics?url={mj_url}&bidx=99"))
+        .header("content-type", "application/json")
+        .body(null_feat.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bad_bidx.status(), 400, "mosaicjson null-geom with bidx=99 must return 400");
+
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }

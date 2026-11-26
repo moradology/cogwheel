@@ -3115,8 +3115,9 @@ fn point_coords(seg: &str) -> Result<(f64, f64), Resp> {
 }
 
 /// The `{width}x{height}[.{format}]` of a path. A zero is a side left to follow the other,
-/// or the data's own resolution when both are, as TiTiler has it.
-fn path_size(dims: &str) -> Result<(PartSize, Option<&str>), Resp> {
+/// or the data's own resolution when both are, as TiTiler has it; `max_size` in the query
+/// then bounds it, and only then, as in rio-tiler.
+fn path_size<'a>(dims: &'a str, pairs: &[(String, String)]) -> Result<(PartSize, Option<&'a str>), Resp> {
     let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
     let (sides, ext) = match dims.split_once('.') {
         Some((sides, ext)) => (sides, Some(ext)),
@@ -3130,7 +3131,10 @@ fn path_size(dims: &str) -> Result<(PartSize, Option<&str>), Resp> {
         return Err(not_found());
     }
     let size = match (w, h) {
-        (0, 0) => PartSize::Query { max_size: None, width: None, height: None },
+        (0, 0) => {
+            let max_size = query_value(pairs, "max_size").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0);
+            PartSize::Query { max_size, width: None, height: None }
+        }
         (w, 0) => PartSize::Query { max_size: None, width: Some(w), height: None },
         (0, h) => PartSize::Query { max_size: None, width: None, height: Some(h) },
         (w, h) => PartSize::Exact(w, h),
@@ -3660,7 +3664,7 @@ async fn feature_image(
     let (size, ext) = match rest {
         ["feature"] => (part_size_from_query(pairs), None),
         [one] => (part_size_from_query(pairs), one.strip_prefix("feature.")),
-        ["feature", dims] => match path_size(dims) {
+        ["feature", dims] => match path_size(dims, pairs) {
             Ok((size, ext)) => (Ok(size), ext),
             Err(resp) => return resp,
         },
@@ -6506,6 +6510,9 @@ fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
     let picture = match rest {
         ["tiles", "WebMercatorQuad", _, _, _] => true,
         ["bbox", seg] => matches!(super::parse_bbox4(seg), Some((_, Some(_)))),
+        // A side of zero follows the other, or the data's own resolution: a size the
+        // search routes work out and the `/stac` ones refuse.
+        ["bbox", _, dims] if matches!(path_size(dims, pairs), Ok((PartSize::Query { .. }, Some(_)))) => return true,
         ["bbox", _, dims] => matches!(super::parse_wxh_ext(dims), Ok((_, _, Some(_)))),
         _ => false,
     };
@@ -6617,7 +6624,7 @@ fn item_path_error(method: &Method, rest: &[&str], pq: &ParsedQuery, pairs: &[(S
         }),
         ["tiles", tms] | [tms, "tilejson.json" | "map.html"] => unknown_tms(tms),
         ["point", at] => point_coords(at).err(),
-        ["bbox", _, dims] => match path_size(dims) {
+        ["bbox", _, dims] => match path_size(dims, pairs) {
             Err(resp) if resp.status() == StatusCode::UNPROCESSABLE_ENTITY => Some(resp),
             _ => format_error(dims.split_once('.').map(|(_, ext)| ext)),
         },
@@ -6864,7 +6871,7 @@ async fn mosaic_route(
             let Some((bbox, None)) = parse_bbox4(seg) else {
                 return not_found();
             };
-            let (size, ext) = match path_size(dims) {
+            let (size, ext) = match path_size(dims, pairs) {
                 Ok(parsed) => parsed,
                 Err(resp) => return resp,
             };

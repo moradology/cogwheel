@@ -1214,6 +1214,12 @@ def main() -> int:
             ("item statistics of a width that is not a number", "GET", f"{it}/statistics?assets=red&width=abc"),
         ):
             o.check(name, "status", path, method, triangle if method == "POST" else None)
+        # A side of zero in the path follows the other; both, and `max_size` bounds the picture.
+        o.check("item bbox, a width of zero in the path", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/0x64.png?assets=visual")
+        o.check("item bbox, a height of zero in the path", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/64x0.tif?assets=visual")
+        o.check("item bbox, no size in the path and a max_size", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/0x0.png?assets=visual&max_size=200")
+        o.check("bbox, no size in the path and a max_size", "image", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75/0x0.png?assets=visual&max_size=100")
+        o.check("bbox, a width of zero in the path and a max_size", "image", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75/0x64.png?assets=visual&max_size=100")
         # A size of zero is a size not given.
         o.check("item preview, a width of zero", "status", f"{it}/preview.png?assets=red&rescale=0,3000&width=0&max_size=64")
         o.check("bbox, a max_size of zero", "status", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75.png?assets=red&rescale=0,3000&max_size=0")
