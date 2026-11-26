@@ -532,6 +532,8 @@ def main() -> int:
             t = tiles[z]
             o.check(f"z{z} png", "image", f"/searches/{sid}/tiles/WebMercatorQuad/{z}/{t.x}/{t.y}.png?assets=visual")
         o.check("format chosen from the pixels", "image", f"{base12}?assets=visual")
+        o.check("three results of band math, no range", "image", f"{base12}.png?assets=visual&expression=b3;b2;b1",
+                known="titiler-pgstac stretches the int32 result's whole range (every pixel 127); cogzilla draws three results in the raster's range, as its renderer draws an item's")
         o.check("jpg", "image", f"{base12}.jpg?assets=visual")
         o.check("tif", "image", f"{base12}.tif?assets=visual")
         o.check("tif, bilinear", "image", f"{base12}.tif?assets=visual&resampling=bilinear&reproject=bilinear")

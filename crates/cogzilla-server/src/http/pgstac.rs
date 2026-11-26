@@ -2433,13 +2433,16 @@ impl PlanesTile {
         let (rgba, bands, full) = match self.mosaic(engine, scenes).await? {
             None => (vec![0u8; pixels * 4], 1, false),
             Some((selected, sample_type, widest)) => {
-                // Without `rescale`: the type's own range for a raster's numbers, and the
-                // renderer's default for band math.
+                // Without `rescale`: the type's own range for a raster's numbers, and band math
+                // as the renderer draws it: three results (`b3;b2;b1`) in the range of the
+                // raster they were read from, one (an index such as `(b2-b1)/(b2+b1)`) from -1
+                // to 1. (TiTiler, without `rescale`, stretches the result type's whole range:
+                // every pixel 127, or 0.)
                 let math = self.expression.is_some() || self.assets.iter().any(|a| a.expression.is_some());
-                let default = if math {
-                    (-1.0, 1.0)
-                } else {
-                    super::default_rescale_for_dtype(sample_type, selected.bands == 1)
+                let default = match (math, selected.bands) {
+                    (false, bands) => super::default_rescale_for_dtype(sample_type, bands == 1),
+                    (true, 3) => super::default_rescale_for_dtype(widest, false),
+                    (true, _) => (-1.0, 1.0),
                 };
                 // A pixel is there when any band of it is.
                 let per_band = selected.values.len() / selected.bands.max(1);
