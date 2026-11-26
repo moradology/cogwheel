@@ -5717,6 +5717,61 @@ pub(super) fn item_drawn_placed(resp: Resp, sub: &[&str], drawn: Option<([f64; 4
     }
 }
 
+/// Band math on an item's statistics, as titiler-pgstac reads it: `b1..bn` over the bands
+/// of the assets stacked in order (one each with `asset_as_band`), and never an asset's name.
+/// `bands` is each asset's count of bands. The shared `/stac` reader takes `bN` as the Nth
+/// asset, or as the Nth band of a single asset: what both read alike is taken here, and the
+/// rest (several assets of more than one band, a band selection) refused.
+pub(super) fn check_item_statistics_expression(
+    expression: &str,
+    bands: &[usize],
+    as_band: bool,
+    selected: bool,
+) -> Result<(), EngineError> {
+    let stacked = if as_band { bands.len() } else { bands.iter().sum() };
+    Program::parse(expression, stacked).map_err(EngineError::BadRequest)?;
+    if selected || (!as_band && bands.len() > 1 && bands.iter().any(|&n| n > 1)) {
+        return Err(EngineError::BadRequest(
+            "band math on an item's statistics takes assets of one band each, or one asset, and no band selection".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The names titiler-pgstac gives an item's stacked bands, from the request alone: the asset
+/// with `asset_as_band`; `{asset}_b{k}` for the bands of a single asset; `{asset}_b1` for
+/// each of several, which [`check_item_statistics_expression`] holds to one band each.
+fn item_band_names(pairs: &[(String, String)]) -> Vec<String> {
+    let assets: Vec<String> = parse_assets(pairs).map(|specs| specs.into_iter().map(|s| s.name).collect()).unwrap_or_default();
+    let as_band = query_value(pairs, "asset_as_band").and_then(parse_bool).unwrap_or(false);
+    match assets.as_slice() {
+        _ if as_band => assets,
+        [one] => (1..=MAX_BANDS_PER_ITEM).map(|k| format!("{one}_b{k}")).collect(),
+        many => many.iter().map(|a| format!("{a}_b1")).collect(),
+    }
+}
+
+/// An item's statistics under band math, each result described as titiler-pgstac describes
+/// it: the expression with every `bN` replaced by that band's name.
+fn describe_item_statistics(doc: &mut Value, described: &[String]) {
+    match doc {
+        Value::Object(map) => {
+            let results = (1..=described.len()).all(|i| map.get(&format!("b{i}")).is_some_and(Value::is_object));
+            if results && map.len() == described.len() {
+                for (i, text) in described.iter().enumerate() {
+                    if let Some(Value::Object(stats)) = map.get_mut(&format!("b{}", i + 1)) {
+                        stats.insert("description".into(), Value::String(text.clone()));
+                    }
+                }
+            } else {
+                map.values_mut().for_each(|v| describe_item_statistics(v, described));
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| describe_item_statistics(v, described)),
+        _ => {}
+    }
+}
+
 /// Make a `/stac` answer read the way titiler-pgstac's item routes do.
 pub(super) fn item_fixup(
     sub: &[&str],
@@ -5731,6 +5786,19 @@ pub(super) fn item_fixup(
         && content_type == "image/jpeg"
     {
         return Ok((body, "image/jpg"));
+    }
+    // Statistics under band math: described in the names of titiler-pgstac's item routes.
+    if let ["statistics"] = sub {
+        let pairs = query_pairs(raw_query);
+        let names = item_band_names(&pairs);
+        let described = query_value(&pairs, "expression")
+            .and_then(|e| Program::parse(e, names.len()).ok())
+            .map(|program| program.describe(&names));
+        if let (Some(described), Ok(mut doc)) = (described, serde_json::from_slice::<Value>(&body)) {
+            describe_item_statistics(&mut doc, &described);
+            return Ok((Bytes::from(doc.to_string()), content_type));
+        }
+        return Ok((body, content_type));
     }
     let wants_json = matches!(sub, ["info" | "info.geojson"] | ["point", _] | [_, "tilejson.json"]);
     if !wants_json {
@@ -7886,6 +7954,32 @@ mod tests {
             let (algorithm, _, _) = asked(query, ext);
             assert!(algorithm.is_some(), "{query}");
         }
+    }
+
+    #[test]
+    fn band_math_on_an_item_s_statistics() {
+        // b1..bn over the stacked bands; an asset's name is not one, as in titiler-pgstac.
+        assert!(check_item_statistics_expression("(b1-b2)/(b1+b2)", &[1, 1], true, false).is_ok());
+        assert!(check_item_statistics_expression("b1-b3", &[3], false, false).is_ok());
+        let named = check_item_statistics_expression("(nir-red)/(nir+red)", &[1, 1], true, false).unwrap_err();
+        assert!(named.to_string().contains("Invalid band/asset name 'nir'"));
+        assert!(check_item_statistics_expression("b2", &[1], false, false).is_err());
+        // What the shared reader would read as other bands is refused.
+        assert!(check_item_statistics_expression("b1+b4", &[3, 1], false, false).is_err());
+        assert!(check_item_statistics_expression("b1", &[3], false, true).is_err());
+        // Described in the names titiler-pgstac gives the stacked bands.
+        let described = |query: &str| {
+            let pairs = query_pairs(query);
+            let names = item_band_names(&pairs);
+            Program::parse(query_value(&pairs, "expression").unwrap(), names.len()).unwrap().describe(&names)
+        };
+        assert_eq!(described("assets=nir&assets=red&asset_as_band=true&expression=(b1-b2)/(b1%2Bb2);b1"), ["(nir-red)/(nir+red)", "nir"]);
+        assert_eq!(described("assets=red&expression=b1*2"), ["red_b1*2"]);
+        assert_eq!(described("assets=visual&expression=b1-b3"), ["visual_b1-visual_b3"]);
+        assert_eq!(described("assets=nir&assets=red&expression=b1%2Bb2"), ["nir_b1+red_b1"]);
+        let mut doc = json!({"type": "Feature", "properties": {"statistics": {"b1": {"mean": 1.0, "description": "b1*2"}}}});
+        describe_item_statistics(&mut doc, &["red_b1*2".to_string()]);
+        assert_eq!(doc["properties"]["statistics"]["b1"]["description"], "red_b1*2");
     }
 
     #[test]
