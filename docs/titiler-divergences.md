@@ -12,10 +12,11 @@ This document is the living record of every intentional divergence, **why** it e
 
 - **TiTiler / `rio-tiler`:** Uses a binary pixel mask by default (overcounting thin slivers up to 5× and small/diagonal shapes), or an approximate `cover_scale=10` 10× supersampled rasterization (100× larger temporary boolean grid in RAM, still approximate). Pixel means are unweighted in the raster's CRS plane, which over-weights northern pixels by up to **53%** on a `40°N–60°N` polygon in `EPSG:4326`.
 - **`cogzilla`:** Computes **exact analytical pixel coverage fractions** in `[0, 1]` directly on the COG's native pixel grid (zero resampling, Green's-theorem edge traversal in `O(V + perimeter_cells)` + linear scanline fill), multiplied by each pixel's **WGS84 ellipsoidal ground area** (`w = cov × area_px`):
-  - `count`: exact sum of pixel coverage fractions (pixel units).
+  - `count`: exact sum of pixel coverage fractions for polygons (pixel units, snapped to integer within `1e-6`), exact clipped length in pixels for `LineString`/`MultiLineString` (e.g. `141.42` for a 100-px diagonal), or point count (`1.0` per point) for `Point`/`MultiPoint`.
   - `sum`: coverage-weighted sum of valid pixel values.
-  - `area`: new field giving exact ellipsoidal ground area in `m²` covered by valid data.
-  - `mean`, `std`, `median`, `percentiles`, `histogram`: weighted by `w = cov × area_px` when `?area_weighted=true` (default), or `w = cov` when `?area_weighted=false`.
+  - `area`: exact ellipsoidal ground area in `m²` covered by valid data for polygons; `null` for `Point`/`MultiPoint`/`LineString`/`MultiLineString` (points and lines have no area).
+  - `length`: exact WGS84 geodesic length in metres for `LineString`/`MultiLineString` features (omitted for polygons/points).
+  - `mean`, `std`, `median`, `percentiles`, `histogram`: weighted by `w = cov × area_px` for polygons (or geodesic segment length for lines) when `?area_weighted=true` (default), or `w = cov` when `?area_weighted=false`. Zero-coverage boundary neighbors (`cov ≤ 1e-12`) are excluded from `valid_pixels`, `masked_pixels`, `min`, `max`, `unique`, `majority`, and `minority`.
   - `?cover_scale=` and `?all_touched=` are accepted and ignored (since exact coverage is already strictly more accurate and faster).
 - **Client significance:** Strictly more accurate (max error `≤ 8.55e-9` px on analytic shapes vs up to 5× error on binary masks), zero supersampling RAM blowup, and **2.3×–7.9× faster** than in-process `rio-tiler`/GDAL even over HTTP:
 
@@ -80,6 +81,7 @@ This document is the living record of every intentional divergence, **why** it e
 
 | Area | TiTiler 2.4.1 | `cogzilla` | Why |
 |---|---|---|---|
+| **Uniform semantic HTTP statuses** (all routes, all 13 TMSs) | Out-of-matrix `x`/`y` returns `404`; out-of-footprint non-Mercator tiles can return `200` empty | **`400`** when tile address is invalid for the grid (`x`/`y`/`z` out of matrix, unknown TMS, unsupported CRS); **`404`** with JSON detail naming tile & dataset bounds when valid address lies outside dataset footprint (exact densified-outline test, independent of TMS, including `/point`, `/bbox`, `/feature`); **`204`** empty body when inside advertised mosaic/STAC bounds with no covering asset; **`200`** only when inside footprint (including all-nodata pixels) | Makes status codes a semantic fact about the request rather than a quirk of the TileMatrixSet or framework. |
 | **Mismatched `rescale` count** (`N4`, PR #161) | Silently accepts e.g. 2 rescale ranges for 3 bands | **`400 Bad Request`** naming the range count and band count (`0`, `1`, and `N` remain valid) | Silent leniency hides bugs on ambiguous input; explicit error is safer for clients. |
 | **Mosaic `/point` outside coverage** (`D1`/`M4`, PR #162) | `204 No Content` (empty body) | **`404 Not Found`** with JSON `{"detail": "No asset covers point (lon, lat)"}` (empty mosaic *tiles* stay `204`) | Point callers are scripts that benefit from a diagnostic body; `204` fits map tiles only. |
 | **Unsupported CRS on `/tiles`** (`M1`, PR #167) | Returns `404` or GDAL error depending on route | **`400 Bad Request`** (`unsupported CRS`) uniformly across `/info`, `/bounds`, `/preview`, `/point`, and `/tiles` | Debugging blank map tiles immediately reveals the unsupported CRS instead of claiming "outside image bounds". |

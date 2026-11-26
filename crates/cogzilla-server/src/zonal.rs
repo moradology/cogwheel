@@ -68,6 +68,59 @@ pub fn wgs84_geographic_cell_area_m2(lon0_deg: f64, lon1_deg: f64, lat0_deg: f64
     0.5 * WGS84_B2 * dlam * (wgs84_authalic_q(phi1) - wgs84_authalic_q(phi0)).abs()
 }
 
+/// Minimum per-pixel weight to treat a cell as touched (excludes zero-area floating-point
+/// boundary-touch residue from `valid_pixels`, `masked_pixels`, `min`, `max`, `unique`, etc.).
+const COV_EPS: f64 = 1e-12;
+
+/// Semantic geometry dimensionality for zonal statistics (`area` vs `length` vs point weights).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZonalGeomKind {
+    Polygon,
+    Line,
+    Point,
+}
+
+/// WGS84 ellipsoidal arc length (metres) of a short segment between two pixel coordinates
+/// `(px0, py0)` and `(px1, py1)` using WGS84 meridional and prime-vertical radii of curvature.
+#[inline]
+fn wgs84_segment_length_m(
+    crs: &CrsModel,
+    p2c: &Affine2D,
+    px0: f64,
+    py0: f64,
+    px1: f64,
+    py1: f64,
+) -> f64 {
+    let (sx0, sy0) = p2c.forward(px0, py0);
+    let (sx1, sy1) = p2c.forward(px1, py1);
+    let (lo0, la0) = crs.to_lonlat_deg(sx0, sy0);
+    let (lo1, la1) = crs.to_lonlat_deg(sx1, sy1);
+    if !(lo0.is_finite() && la0.is_finite() && lo1.is_finite() && la1.is_finite()) {
+        return 0.0;
+    }
+    let mut dlo = lo1 - lo0;
+    if dlo > 180.0 {
+        dlo -= 360.0;
+    } else if dlo < -180.0 {
+        dlo += 360.0;
+    }
+    let dla = la1 - la0;
+    let phi = (0.5 * (la0 + la1)).clamp(-89.9999, 89.9999).to_radians();
+    let s = phi.sin();
+    let denom = 1.0 - WGS84_E2 * s * s;
+    let rm = WGS84_A * (1.0 - WGS84_E2) / (denom * denom.sqrt());
+    let rn = WGS84_A / denom.sqrt();
+    let dx = dlo.to_radians() * rn * phi.cos().abs();
+    let dy = dla.to_radians() * rm;
+    dx.hypot(dy)
+}
+
+#[inline]
+fn snap_near_int(v: f64) -> f64 {
+    let r = v.round();
+    if (v - r).abs() < 1e-6 { r } else { v }
+}
+
 /// Local WGS84 ellipsoidal ground area (m²) of 1 pixel centered at `(col + 0.5, row + 0.5)` via
 /// central finite-difference Jacobian of `(col, row) -> (lon, lat)` and WGS84 principal radii of
 /// curvature `R_M * R_N * cos(phi)`.
@@ -605,26 +658,113 @@ pub fn rasterize_exact_coverage(
                     if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
                         let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
                         let seg_len = (tb - ta) * len;
-                        cov[idx] = (cov[idx] + seg_len).min(1.0);
+                        if polygons_px.is_empty() {
+                            cov[idx] += seg_len;
+                        } else {
+                            cov[idx] = (cov[idx] + seg_len).min(1.0);
+                        }
                     }
                 }
             }
         }
     });
 
-    // Point / MultiPoint: weight 1.0 at the containing pixel.
+    // Point / MultiPoint: weight 1.0 per point at its containing pixel.
     for &(px, py) in points_px {
         if px.is_finite() && py.is_finite() {
             let c = px.floor() as i64;
             let r = py.floor() as i64;
             if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
                 let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
-                cov[idx] = 1.0;
+                if polygons_px.is_empty() && lines_px.is_empty() {
+                    cov[idx] += 1.0;
+                } else {
+                    cov[idx] = 1.0;
+                }
             }
         }
     }
 
     cov
+}
+
+/// Compute per-cell WGS84 geodesic segment lengths (metres) for `LineString` / `MultiLineString`
+/// features over `[c0..c0+win_w) × [r0..r0+win_h)`.
+fn rasterize_line_geodesic_lengths_m(
+    lines_px: &[Vec<(f64, f64)>],
+    crs: &CrsModel,
+    p2c: &Affine2D,
+    c0: usize,
+    r0: usize,
+    win_w: usize,
+    win_h: usize,
+) -> Vec<f64> {
+    let mut len_m = vec![0.0_f64; win_w * win_h];
+    if win_w == 0 || win_h == 0 || lines_px.is_empty() {
+        return len_m;
+    }
+    let c0_i = c0 as i64;
+    let r0_i = r0 as i64;
+    let mut t_breaks: Vec<f64> = Vec::with_capacity(64);
+    for line in lines_px {
+        for seg in line.windows(2) {
+            let (x0, y0) = seg[0];
+            let (x1, y1) = seg[1];
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                continue;
+            }
+            let dx = x1 - x0;
+            let dy = y1 - y0;
+            if dx.hypot(dy) <= 1e-15 {
+                continue;
+            }
+            t_breaks.clear();
+            t_breaks.push(0.0);
+            t_breaks.push(1.0);
+            if dx != 0.0 {
+                let lo = x0.min(x1).ceil() as i64;
+                let hi = x0.max(x1).floor() as i64;
+                for cx in lo.max(c0_i)..=hi.min(c0_i + win_w as i64) {
+                    let t = (cx as f64 - x0) / dx;
+                    if t > 0.0 && t < 1.0 {
+                        t_breaks.push(t);
+                    }
+                }
+            }
+            if dy != 0.0 {
+                let lo = y0.min(y1).ceil() as i64;
+                let hi = y0.max(y1).floor() as i64;
+                for ry in lo.max(r0_i)..=hi.min(r0_i + win_h as i64) {
+                    let t = (ry as f64 - y0) / dy;
+                    if t > 0.0 && t < 1.0 {
+                        t_breaks.push(t);
+                    }
+                }
+            }
+            t_breaks.sort_unstable_by(|a, b| a.total_cmp(b));
+            for k in 0..t_breaks.len() - 1 {
+                let ta = t_breaks[k];
+                let tb = t_breaks[k + 1];
+                if tb - ta <= 1e-15 {
+                    continue;
+                }
+                let mid_t = 0.5 * (ta + tb);
+                let mx = x0 + mid_t * dx;
+                let my = y0 + mid_t * dy;
+                let c = mx.floor() as i64;
+                let r = my.floor() as i64;
+                if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
+                    let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
+                    let ax = x0 + ta * dx;
+                    let ay = y0 + ta * dy;
+                    let bx = x0 + tb * dx;
+                    let by = y0 + tb * dy;
+                    len_m[idx] += wgs84_segment_length_m(crs, p2c, ax, ay, bx, by);
+                }
+            }
+        }
+    }
+    len_m
 }
 
 /// Compute exact coverage-weighted & ellipsoidal area-weighted band statistics over a native window.
@@ -649,13 +789,45 @@ pub fn compute_weighted_band_stats(
     description: &str,
     opts: &StatsOptions,
 ) -> serde_json::Value {
-    let use_area_w = area_weighted && !area_model.is_constant();
+    compute_weighted_band_stats_with_geom(
+        pixels,
+        cov,
+        win_w,
+        win_h,
+        area_model,
+        area_weighted,
+        ZonalGeomKind::Polygon,
+        None,
+        description,
+        opts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_weighted_band_stats_with_geom(
+    pixels: &[f32],
+    cov: &[f64],
+    win_w: usize,
+    win_h: usize,
+    area_model: &PixelAreaModel,
+    area_weighted: bool,
+    geom_kind: ZonalGeomKind,
+    line_len_m: Option<&[f64]>,
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let use_area_w = geom_kind == ZonalGeomKind::Polygon
+        && area_weighted
+        && !area_model.is_constant();
+    let is_categorical =
+        opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty());
 
     let mut valid_pixels = 0usize;
     let mut masked_pixels = 0usize;
     let mut count_cov = 0.0_f64;
     let mut sum_cov = 0.0_f64;
     let mut area_valid_m2 = 0.0_f64;
+    let mut length_valid_m = 0.0_f64;
     let mut w_total = 0.0_f64;
     let mut w_sum = 0.0_f64;
     let mut min_v = f64::INFINITY;
@@ -669,7 +841,7 @@ pub fn compute_weighted_band_stats(
         for dx in 0..win_w {
             let i = row_off + dx;
             let c = cov[i];
-            if c <= 0.0 {
+            if c <= COV_EPS {
                 continue;
             }
             let v = pixels[i];
@@ -678,12 +850,22 @@ pub fn compute_weighted_band_stats(
                 continue;
             }
             let vf = v as f64;
-            let a_px = area_model.area_at(dx, dy);
-            let w = if use_area_w { c * a_px } else { c };
+            let w = match geom_kind {
+                ZonalGeomKind::Polygon => {
+                    let a_px = area_model.area_at(dx, dy);
+                    area_valid_m2 += c * a_px;
+                    if use_area_w { c * a_px } else { c }
+                }
+                ZonalGeomKind::Line => {
+                    let lm = line_len_m.map_or(c, |buf| buf[i]);
+                    length_valid_m += lm;
+                    if area_weighted && lm > 0.0 { lm } else { c }
+                }
+                ZonalGeomKind::Point => c,
+            };
             valid_pixels += 1;
             count_cov += c;
             sum_cov += c * vf;
-            area_valid_m2 += c * a_px;
             w_total += w;
             w_sum += w * vf;
             if vf < min_v {
@@ -693,7 +875,7 @@ pub fn compute_weighted_band_stats(
                 max_v = vf;
             }
             weighted_vals.push((vf, w));
-            if opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty()) {
+            if is_categorical {
                 *cat_weights.entry(vf.round() as i64).or_insert(0.0) += w;
             }
         }
@@ -703,7 +885,18 @@ pub fn compute_weighted_band_stats(
         let mut empty = compute_f32_band_stats(&[], description, opts);
         if let Some(obj) = empty.as_object_mut() {
             obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels as f64));
-            obj.insert("area".into(), serde_json::json!(0.0));
+            match geom_kind {
+                ZonalGeomKind::Polygon => {
+                    obj.insert("area".into(), serde_json::json!(0.0));
+                }
+                ZonalGeomKind::Line => {
+                    obj.insert("area".into(), serde_json::Value::Null);
+                    obj.insert("length".into(), serde_json::json!(0.0));
+                }
+                ZonalGeomKind::Point => {
+                    obj.insert("area".into(), serde_json::Value::Null);
+                }
+            }
         }
         return empty;
     }
@@ -813,22 +1006,60 @@ pub fn compute_weighted_band_stats(
         hist_w[bin] += w * scale_to_count;
     }
 
+    let count_out = snap_near_int(count_cov);
     let mut obj = serde_json::Map::new();
     obj.insert("min".into(), serde_json::json!(min_v));
     obj.insert("max".into(), serde_json::json!(max_v));
     obj.insert("mean".into(), serde_json::json!(mean));
-    obj.insert("count".into(), serde_json::json!(count_cov));
+    obj.insert("count".into(), serde_json::json!(count_out));
     obj.insert("sum".into(), serde_json::json!(sum_cov));
     obj.insert("std".into(), serde_json::json!(std));
     obj.insert("median".into(), serde_json::json!(median));
     obj.insert("majority".into(), serde_json::json!(maj_val));
     obj.insert("minority".into(), serde_json::json!(min_val_freq));
     obj.insert("unique".into(), serde_json::json!(unique_count as f64));
-    obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
+    if is_categorical {
+        let mut cat_counts: Vec<f64> = Vec::new();
+        let mut cat_vals: Vec<f64> = Vec::new();
+        let mut cats_obj = serde_json::Map::new();
+        if let Some(ref cats) = opts.categories
+            && !cats.is_empty()
+        {
+            for &c in cats {
+                let k = c.round() as i64;
+                let w = snap_near_int(cat_weights.get(&k).copied().unwrap_or(0.0) * scale_to_count);
+                cat_counts.push(w);
+                cat_vals.push(k as f64);
+                cats_obj.insert(k.to_string(), serde_json::json!(w));
+            }
+        } else {
+            for (k, w) in cat_weights {
+                let cw = snap_near_int(w * scale_to_count);
+                cat_counts.push(cw);
+                cat_vals.push(k as f64);
+                cats_obj.insert(k.to_string(), serde_json::json!(cw));
+            }
+        }
+        obj.insert("histogram".into(), serde_json::json!([cat_counts, cat_vals]));
+        obj.insert("categories".into(), serde_json::Value::Object(cats_obj));
+    } else {
+        obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
+    }
     obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
     obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels as f64));
     obj.insert("valid_pixels".into(), serde_json::json!(valid_pixels as f64));
-    obj.insert("area".into(), serde_json::json!(area_valid_m2));
+    match geom_kind {
+        ZonalGeomKind::Polygon => {
+            obj.insert("area".into(), serde_json::json!(area_valid_m2));
+        }
+        ZonalGeomKind::Line => {
+            obj.insert("area".into(), serde_json::Value::Null);
+            obj.insert("length".into(), serde_json::json!(length_valid_m));
+        }
+        ZonalGeomKind::Point => {
+            obj.insert("area".into(), serde_json::Value::Null);
+        }
+    }
 
     let pcts: Vec<f64> = if opts.percentiles.is_empty() {
         vec![2.0, 98.0]
@@ -842,23 +1073,6 @@ pub fn compute_weighted_band_stats(
             format!("percentile_{p}")
         };
         obj.insert(key, serde_json::json!(weighted_quantile(p)));
-    }
-    if opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty()) {
-        let mut cats_obj = serde_json::Map::new();
-        if let Some(ref cats) = opts.categories
-            && !cats.is_empty()
-        {
-            for &c in cats {
-                let k = c.round() as i64;
-                let w = cat_weights.get(&k).copied().unwrap_or(0.0) * scale_to_count;
-                cats_obj.insert(k.to_string(), serde_json::json!(w));
-            }
-        } else {
-            for (k, w) in cat_weights {
-                cats_obj.insert(k.to_string(), serde_json::json!(w * scale_to_count));
-            }
-        }
-        obj.insert("categories".into(), serde_json::Value::Object(cats_obj));
     }
     if !description.is_empty() {
         obj.insert("description".into(), serde_json::json!(description));
@@ -1221,21 +1435,39 @@ pub async fn compute_native_exact_polygon_stats(
         }
     }
 
-    // Compute exact coverage, ellipsoidal area model, and weighted statistics.
+    // Compute exact coverage, ellipsoidal area model (or geodesic line lengths), and weighted statistics.
     let crs_owned = crs.clone();
     let p2c = ifd.pixel_to_crs;
     let opts_owned = opts.clone();
     let descs_owned = cog.index.band_descriptions.clone();
+    let geom_kind = if !polys_px.is_empty() {
+        ZonalGeomKind::Polygon
+    } else if !lines_px.is_empty() {
+        ZonalGeomKind::Line
+    } else {
+        ZonalGeomKind::Point
+    };
     let compute_cpu = move || -> serde_json::Value {
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
-        let area_model = PixelAreaModel::build(&crs_owned, &p2c, c0, r0, win_w, win_h);
+        let line_len_m = if geom_kind == ZonalGeomKind::Line {
+            Some(rasterize_line_geodesic_lengths_m(
+                &lines_px, &crs_owned, &p2c, c0, r0, win_w, win_h,
+            ))
+        } else {
+            None
+        };
+        let area_model = if geom_kind == ZonalGeomKind::Polygon {
+            PixelAreaModel::build(&crs_owned, &p2c, c0, r0, win_w, win_h)
+        } else {
+            PixelAreaModel::Constant(0.0)
+        };
         let mut out = serde_json::Map::new();
         if let Some(ref exprs) = opts_owned.expressions {
             for (ei, (desc, prog)) in exprs.iter().enumerate() {
                 let mut expr_px = vec![f32::NAN; n_px];
                 let mut b_vals = [0.0_f32; 16];
                 for i in 0..n_px {
-                    if cov[i] <= 0.0 {
+                    if cov[i] <= COV_EPS {
                         continue;
                     }
                     let mut all_valid = true;
@@ -1259,13 +1491,15 @@ pub async fn compute_native_exact_polygon_stats(
                 }
                 out.insert(
                     format!("b{}", ei + 1),
-                    compute_weighted_band_stats(
+                    compute_weighted_band_stats_with_geom(
                         &expr_px,
                         &cov,
                         win_w,
                         win_h,
                         &area_model,
                         opts_owned.area_weighted,
+                        geom_kind,
+                        line_len_m.as_deref(),
                         desc,
                         &opts_owned,
                     ),
@@ -1281,13 +1515,15 @@ pub async fn compute_native_exact_polygon_stats(
                     .unwrap_or_else(|| format!("b{b1}"));
                 out.insert(
                     format!("b{b1}"),
-                    compute_weighted_band_stats(
+                    compute_weighted_band_stats_with_geom(
                         pixels,
                         &cov,
                         win_w,
                         win_h,
                         &area_model,
                         opts_owned.area_weighted,
+                        geom_kind,
+                        line_len_m.as_deref(),
                         &desc,
                         &opts_owned,
                     ),
@@ -1491,5 +1727,135 @@ mod tests {
         };
         let utm_model = PixelAreaModel::build(&utm, &p2c_utm, 0, 0, 10, 10);
         assert!(utm_model.is_constant(), "small UTM window must short-circuit to Constant");
+    }
+
+    #[test]
+    fn q1_q2_q3_zero_cov_categorical_and_point_line_semantics() {
+        // Q1: Grid-aligned 3x3 square surrounded by extreme outlier neighbors (-999, +999)
+        // with floating-point edge-touch perturbation (1e-15).
+        // valid_pixels must be 9 (not 15) and min/max must reflect only the 9 interior pixels.
+        let win = 5usize;
+        let mut pixels = vec![999.0f32; win * win];
+        pixels[0] = -999.0;
+        for r in 1..4 {
+            for c in 1..4 {
+                pixels[r * win + c] = (r * 10 + c) as f32; // 11..33
+            }
+        }
+        let ring = vec![
+            (1.0 - 1e-15, 1.0 - 1e-15),
+            (4.0 + 1e-15, 1.0 - 1e-15),
+            (4.0 + 1e-15, 4.0 + 1e-15),
+            (1.0 - 1e-15, 4.0 + 1e-15),
+            (1.0 - 1e-15, 1.0 - 1e-15),
+        ];
+        let cov = rasterize_exact_coverage(&[vec![ring]], &[], &[], 0, 0, win, win);
+        let opts = StatsOptions::default();
+        let st = compute_weighted_band_stats(
+            &pixels,
+            &cov,
+            win,
+            win,
+            &PixelAreaModel::Constant(900.0),
+            true,
+            "b1",
+            &opts,
+        );
+        assert_eq!(st["valid_pixels"].as_f64().unwrap(), 9.0);
+        assert_eq!(st["count"].as_f64().unwrap(), 9.0);
+        assert_eq!(st["min"].as_f64().unwrap(), 11.0);
+        assert_eq!(st["max"].as_f64().unwrap(), 33.0);
+
+        // Q2: categorical=true returns [[counts], [values]] histogram + categories map
+        let cat_px = vec![1.0f32; 1600];
+        let cat_cov = vec![1.0f64; 1600];
+        let cat_opts = StatsOptions {
+            categorical: true,
+            ..Default::default()
+        };
+        let st_cat = compute_weighted_band_stats(
+            &cat_px,
+            &cat_cov,
+            40,
+            40,
+            &PixelAreaModel::Constant(900.0),
+            true,
+            "b1",
+            &cat_opts,
+        );
+        assert_eq!(st_cat["histogram"], serde_json::json!([[1600.0], [1.0]]));
+        assert_eq!(st_cat["categories"]["1"], serde_json::json!(1600.0));
+
+        let cat_opts2 = StatsOptions {
+            categorical: true,
+            categories: Some(vec![1.0, 2.0]),
+            ..Default::default()
+        };
+        let st_cat2 = compute_weighted_band_stats(
+            &cat_px,
+            &cat_cov,
+            40,
+            40,
+            &PixelAreaModel::Constant(900.0),
+            true,
+            "b1",
+            &cat_opts2,
+        );
+        assert_eq!(st_cat2["histogram"], serde_json::json!([[1600.0, 0.0], [1.0, 2.0]]));
+
+        // Q3: Point -> count=1, area=null; 100-px diagonal LineString -> count=141.421..., area=null, length in m
+        let utm = CrsModel::from_epsg(32610).unwrap();
+        let p2c = Affine2D {
+            a: 30.0,
+            b: 0.0,
+            c: 500_000.0,
+            d: 0.0,
+            e: -30.0,
+            f: 4_200_000.0,
+        };
+        let pt_cov = rasterize_exact_coverage(&[], &[], &[(2.5, 2.5)], 0, 0, 5, 5);
+        let st_pt = compute_weighted_band_stats_with_geom(
+            &vec![42.0f32; 25],
+            &pt_cov,
+            5,
+            5,
+            &PixelAreaModel::Constant(0.0),
+            true,
+            ZonalGeomKind::Point,
+            None,
+            "b1",
+            &opts,
+        );
+        assert_eq!(st_pt["count"].as_f64().unwrap(), 1.0);
+        assert!(st_pt["area"].is_null(), "Point must have area=null, got {:?}", st_pt["area"]);
+
+        let diag = vec![(0.0, 0.0), (100.0, 100.0)];
+        let line_cov = rasterize_exact_coverage(&[], &[diag.clone()], &[], 0, 0, 100, 100);
+        let line_len_m = rasterize_line_geodesic_lengths_m(&[diag], &utm, &p2c, 0, 0, 100, 100);
+        let st_line = compute_weighted_band_stats_with_geom(
+            &vec![5.0f32; 10_000],
+            &line_cov,
+            100,
+            100,
+            &PixelAreaModel::Constant(0.0),
+            true,
+            ZonalGeomKind::Line,
+            Some(&line_len_m),
+            "b1",
+            &opts,
+        );
+        let expected_px = 100.0 * std::f64::consts::SQRT_2;
+        assert!(
+            (st_line["count"].as_f64().unwrap() - expected_px).abs() < 1e-6,
+            "100-px diagonal count expected {expected_px}, got {}",
+            st_line["count"]
+        );
+        assert!(st_line["area"].is_null(), "LineString must have area=null");
+        let len_m = st_line["length"].as_f64().unwrap();
+        let expected_m = expected_px * 30.0;
+        assert!(
+            (len_m - expected_m).abs() / expected_m < 2e-3,
+            "100-px 30m UTM diagonal geodesic length expected ~{expected_m} m, got {len_m} m"
+        );
     }
 }

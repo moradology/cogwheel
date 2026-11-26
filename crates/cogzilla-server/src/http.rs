@@ -1625,8 +1625,155 @@ fn query_mosaicjson_wgs84_bbox(mj: &crate::catalog::MosaicJsonCatalog, wgs_bbox:
     }
 }
 
-/// Check whether a requested tile intersects the dataset's WGS84 footprint (used to return
-/// TiTiler-compatible `404 Not Found` on out-of-bounds `/cog/tiles` and `/stac/tiles` requests).
+/// Check whether two WGS84 bounding boxes `[w, s, e, n]` intersect (handling antimeridian-crossing
+/// bboxes where `w > e` or `e > 180`).
+#[inline]
+fn wgs84_bboxes_intersect(a: [f64; 4], b: [f64; 4]) -> bool {
+    let [aw, as_, ae, an] = a;
+    let [bw, bs, be, bn] = b;
+    if !(aw.is_finite()
+        && as_.is_finite()
+        && ae.is_finite()
+        && an.is_finite()
+        && bw.is_finite()
+        && bs.is_finite()
+        && be.is_finite()
+        && bn.is_finite())
+    {
+        return false;
+    }
+    if an < bs || as_ > bn {
+        return false;
+    }
+    let lon_overlaps = |w1: f64, e1: f64, w2: f64, e2: f64| -> bool {
+        if w2 <= e2 {
+            e1 >= w2 && w1 <= e2
+        } else {
+            e1 >= w2 || w1 <= e2
+        }
+    };
+    if aw <= ae {
+        let primary = lon_overlaps(aw.max(-180.0), ae.min(180.0), bw, be);
+        let wrap_w = aw < -180.0 && lon_overlaps((aw + 360.0).max(-180.0), 180.0, bw, be);
+        let wrap_e = ae > 180.0 && lon_overlaps(-180.0, (ae - 360.0).min(180.0), bw, be);
+        primary || wrap_w || wrap_e
+    } else {
+        lon_overlaps(aw, 180.0, bw, be) || lon_overlaps(-180.0, ae, bw, be)
+    }
+}
+
+/// Exact geometric test: returns `true` iff at least one point of the tile box `tb` in `dst_crs`
+/// maps onto `[0..full.width, 0..full.height]` in `src_crs`, OR a corner/center of the dataset
+/// maps inside `tb`. Failed / non-finite reprojections are treated as outside (never as inside).
+fn tile_box_intersects_cog(
+    src_crs: &cogzilla_proj::CrsModel,
+    full: &cogzilla_tiff::IfdMeta,
+    dst_crs: &cogzilla_proj::CrsModel,
+    tb: [f64; 4],
+) -> bool {
+    let [tx0, ty0, tx1, ty1] = tb;
+    let wf = full.width as f64;
+    let hf = full.height as f64;
+    let wrap_lo = src_crs.geographic_0_360_min_lon(&full.pixel_to_crs, full.width);
+    let c2p = &full.crs_to_pixel;
+
+    let dst_pt_in_src = |dx: f64, dy: f64| -> bool {
+        let (mut sx, sy) = match dst_crs {
+            cogzilla_proj::CrsModel::Epsg3857 => src_crs.from_3857(dx, dy),
+            cogzilla_proj::CrsModel::Geographic => {
+                let lon = if dx > 180.0 { dx - 360.0 } else { dx };
+                src_crs.from_lonlat_deg(lon, dy)
+            }
+            other => {
+                let (lon, lat) = other.to_lonlat_deg(dx, dy);
+                if lon.is_finite() && lat.is_finite() {
+                    src_crs.from_lonlat_deg(lon, lat)
+                } else {
+                    return false;
+                }
+            }
+        };
+        if !sx.is_finite() || !sy.is_finite() {
+            return false;
+        }
+        if let Some(lo) = wrap_lo
+            && sx < lo
+        {
+            sx += 360.0;
+        }
+        let (col, row) = c2p.forward(sx, sy);
+        col.is_finite()
+            && row.is_finite()
+            && col >= -0.5
+            && col <= wf + 0.5
+            && row >= -0.5
+            && row <= hf + 0.5
+    };
+
+    // 1. O(1) fast-accept: tile center + 4 corners (hits immediately on 99%+ of in-bounds tiles)
+    let cx = 0.5 * (tx0 + tx1);
+    let cy = 0.5 * (ty0 + ty1);
+    for (dx, dy) in [(cx, cy), (tx0, ty0), (tx1, ty0), (tx0, ty1), (tx1, ty1)] {
+        if dst_pt_in_src(dx, dy) {
+            return true;
+        }
+    }
+
+    // 2. Densified tile outline (16 steps per edge) + 3x3 interior grid
+    const STEPS: usize = 16;
+    for i in 1..STEPS {
+        let t = (i as f64) / (STEPS as f64);
+        let x = tx0 + t * (tx1 - tx0);
+        let y = ty0 + t * (ty1 - ty0);
+        if dst_pt_in_src(x, ty0)
+            || dst_pt_in_src(x, ty1)
+            || dst_pt_in_src(tx0, y)
+            || dst_pt_in_src(tx1, y)
+        {
+            return true;
+        }
+    }
+    for iy in 1..=3 {
+        let y = ty0 + (iy as f64 / 4.0) * (ty1 - ty0);
+        for ix in 1..=3 {
+            let x = tx0 + (ix as f64 / 4.0) * (tx1 - tx0);
+            if dst_pt_in_src(x, y) {
+                return true;
+            }
+        }
+    }
+
+    // 3. Dataset anchor points (center + 4 corners + 4 edge midpoints) projected into dst_crs
+    //    (catches small datasets strictly contained inside a large low-zoom tile).
+    let anchors = [
+        (0.5 * wf, 0.5 * hf),
+        (0.0, 0.0),
+        (wf, 0.0),
+        (0.0, hf),
+        (wf, hf),
+        (0.5 * wf, 0.0),
+        (0.5 * wf, hf),
+        (0.0, 0.5 * hf),
+        (wf, 0.5 * hf),
+    ];
+    for (col, row) in anchors {
+        let (sx, sy) = full.pixel_to_crs.forward(col, row);
+        let (lon, lat) = src_crs.to_lonlat_deg(sx, sy);
+        if !lon.is_finite() || !lat.is_finite() {
+            continue;
+        }
+        let (dx, dy) = dst_crs.from_lonlat_deg(lon, lat);
+        if dx.is_finite() && dy.is_finite() && dx >= tx0 && dx <= tx1 && dy >= ty0 && dy <= ty1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether a requested tile intersects the dataset's footprint (used to return
+/// semantically exact `404 Not Found` on out-of-bounds `/cog/tiles` and `/stac/tiles` requests
+/// across all 13 TileMatrixSets). Uses an O(1) WGS84 fast-reject on Mercator/Geographic grids
+/// and an exact densified-outline footprint check whenever the cheap test is inconclusive.
 fn tile_intersects_cog(
     engine: &TileEngine,
     cog: &cogzilla_io::OpenedCog,
@@ -1638,70 +1785,72 @@ fn tile_intersects_cog(
     let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
     let [cw, cs, ce, cn] = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-    if !cw.is_finite() || !cs.is_finite() || !ce.is_finite() || !cn.is_finite() {
-        return Ok(true);
-    }
-    let [tw, ts, te, tn] = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
+    if let Some(tms_def) = crate::tms::lookup_tms(tms) {
         let Some(tb) = tms_def.tile_bounds(tile.z, tile.x, tile.y, buffer, tile_size) else {
             return Ok(false);
         };
-        let Ok(dst_crs) = tms_def.crs_model() else {
-            return Ok(true);
-        };
-        if !matches!(
-            dst_crs,
-            cogzilla_proj::CrsModel::Geographic | cogzilla_proj::CrsModel::Epsg3857
-        ) {
-            // Check intersection directly in the TMS's native projected CRS so polar
-            // (UPSArctic/Antarctic) and antimeridian (LINZ/NZTM) tiles never falsely 404.
-            return match reproject_wgs84_bounds([cw, cs, ce, cn], &dst_crs) {
-                Ok([cx0, cy0, cx1, cy1]) => {
-                    Ok(tb[2] >= cx0 && tb[0] <= cx1 && tb[3] >= cy0 && tb[1] <= cy1)
+        let dst_crs = tms_def.crs_model()?;
+        // Stage 1: O(1) cheap WGS84 fast-reject on WebMercatorQuad & WorldCRS84Quad
+        if cw.is_finite() && cs.is_finite() && ce.is_finite() && cn.is_finite() {
+            match dst_crs {
+                cogzilla_proj::CrsModel::Epsg3857 => {
+                    let (lon0, lat0) = mercator_to_lonlat_deg(tb[0], tb[1]);
+                    let (lon1, lat1) = mercator_to_lonlat_deg(tb[2], tb[3]);
+                    let tw = [lon0.min(lon1), lat0.min(lat1), lon0.max(lon1), lat0.max(lat1)];
+                    if !wgs84_bboxes_intersect(tw, [cw, cs, ce, cn]) {
+                        return Ok(false);
+                    }
+                    // For axis-aligned Mercator/Geographic/CEA rasters, the WGS84 box IS exact.
+                    if full.pixel_to_crs.is_axis_aligned()
+                        && matches!(
+                            crs,
+                            cogzilla_proj::CrsModel::Epsg3857
+                                | cogzilla_proj::CrsModel::Geographic
+                                | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+                        )
+                    {
+                        return Ok(true);
+                    }
                 }
-                Err(_) => Ok(true),
-            };
-        }
-        if matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857) {
-            let (lon0, lat0) = mercator_to_lonlat_deg(tb[0], tb[1]);
-            let (lon1, lat1) = mercator_to_lonlat_deg(tb[2], tb[3]);
-            let (ts, tn) = (lat0.min(lat1), lat0.max(lat1));
-            if tn < cs || ts > cn {
-                return Ok(false);
+                cogzilla_proj::CrsModel::Geographic => {
+                    if !wgs84_bboxes_intersect(tb, [cw, cs, ce, cn]) {
+                        return Ok(false);
+                    }
+                    if full.pixel_to_crs.is_axis_aligned()
+                        && matches!(
+                            crs,
+                            cogzilla_proj::CrsModel::Epsg3857
+                                | cogzilla_proj::CrsModel::Geographic
+                                | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+                        )
+                    {
+                        return Ok(true);
+                    }
+                }
+                _ => {}
             }
-            let (raw_w, raw_e) = (lon0.min(lon1), lon0.max(lon1));
-            let overlaps = |w: f64, e: f64| -> bool {
-                if cw <= ce {
-                    e >= cw && w <= ce
-                } else {
-                    e >= cw || w <= ce
-                }
-            };
-            let primary = overlaps(raw_w.max(-180.0), raw_e.min(180.0));
-            let wrap_west = raw_w < -180.0 && overlaps((raw_w + 360.0).max(-180.0), 180.0);
-            let wrap_east = raw_e > 180.0 && overlaps(-180.0, (raw_e - 360.0).min(180.0));
-            return Ok(primary || wrap_west || wrap_east);
         }
-        match bbox_to_wgs84(tb, Some(&dst_crs)) {
-            Ok(w) => w,
-            Err(_) => return Ok(true),
-        }
-    } else {
-        let [mx0, my0, mx1, my1] =
-            web_mercator_buffered_3857_bbox(tile.z, tile.x, tile.y, buffer, tile_size);
-        let (lon0, lat0) = mercator_to_lonlat_deg(mx0, my0);
-        let (lon1, lat1) = mercator_to_lonlat_deg(mx1, my1);
-        [lon0.min(lon1), lat0.min(lat1), lon0.max(lon1), lat0.max(lat1)]
-    };
-    if tn < cs || ts > cn {
-        return Ok(false);
+        // Stage 2: Exact densified-outline footprint test in source CRS (treats failed / infinite
+        // reprojections as outside; never depends on the TileMatrixSet).
+        return Ok(tile_box_intersects_cog(&crs, full, &dst_crs, tb));
     }
-    let lon_overlaps = if cw <= ce {
-        te >= cw && tw <= ce
-    } else {
-        // Antimeridian-crossing dataset: [cw..180] U [-180..ce]
-        te >= cw || tw <= ce
-    };
-    Ok(lon_overlaps)
+    let tb = web_mercator_buffered_3857_bbox(tile.z, tile.x, tile.y, buffer, tile_size);
+    if cw.is_finite() && cs.is_finite() && ce.is_finite() && cn.is_finite() {
+        let (lon0, lat0) = mercator_to_lonlat_deg(tb[0], tb[1]);
+        let (lon1, lat1) = mercator_to_lonlat_deg(tb[2], tb[3]);
+        if !wgs84_bboxes_intersect(
+            [lon0.min(lon1), lat0.min(lat1), lon0.max(lon1), lat0.max(lat1)],
+            [cw, cs, ce, cn],
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(tile_box_intersects_cog(
+        &crs,
+        full,
+        &cogzilla_proj::CrsModel::Epsg3857,
+        tb,
+    ))
 }
 
 /// Return true when a `.tif`/`.tiff` request should emit a native IEEE Float32 GeoTIFF
@@ -3116,7 +3265,7 @@ async fn render_mosaic_tile_pixel_selection(
             first_lut = resolve_custom_lut(pq, &cogs[0], &scene_bands)?;
         }
         let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
-        let raw = render_mercator_bbox(
+        let raw = match render_mercator_bbox(
             engine,
             &cogs,
             bbox_3857,
@@ -3131,7 +3280,12 @@ async fn render_mosaic_tile_pixel_selection(
             pq.return_mask,
             pq.unscale,
         )
-        .await?;
+        .await
+        {
+            Ok(b) => b,
+            Err(EngineError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
         if n_px == 0 || raw.len() % (n_px * 4) != 0 {
             continue;
         }
@@ -3504,7 +3658,7 @@ async fn render_mosaic_tile_styled(
                     apply_unscale_cogs(&mut scene_bands, &cogs);
                 }
                 let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
-                let raw = render_mercator_bbox(
+                let raw = match render_mercator_bbox(
                     engine,
                     &cogs,
                     bbox_3857,
@@ -3519,7 +3673,12 @@ async fn render_mosaic_tile_styled(
                     pq.return_mask,
                     pq.unscale,
                 )
-                .await?;
+                .await
+                {
+                    Ok(b) => b,
+                    Err(EngineError::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
                 if n_px == 0 || raw.len() % (n_px * 4) != 0 {
                     continue;
                 }
@@ -3606,7 +3765,7 @@ async fn render_mosaic_tile_styled(
             }
             let scene_lut = resolve_custom_lut(pq, &cogs[0], &scene_bands)?;
             let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
-            let scene_rgba = render_mercator_bbox(
+            let scene_rgba = match render_mercator_bbox(
                 engine,
                 &cogs,
                 bbox_3857,
@@ -3621,7 +3780,12 @@ async fn render_mosaic_tile_styled(
                 true,
                 pq.unscale,
             )
-            .await?;
+            .await
+            {
+                Ok(b) => b,
+                Err(EngineError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             if scene_rgba.len() != n_px * 4 {
                 continue;
             }
@@ -3930,7 +4094,7 @@ async fn render_mosaic_bbox_composite(
             ));
         }
         if is_f32_out {
-            let raw = render_crs_bbox(
+            let raw = match render_crs_bbox(
                 engine,
                 &cogs,
                 bbox,
@@ -3947,7 +4111,12 @@ async fn render_mosaic_bbox_composite(
                 pq.return_mask,
                 pq.unscale,
             )
-            .await?;
+            .await
+            {
+                Ok(b) => b,
+                Err(EngineError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             any_ok = true;
             if total_px == 0 || raw.len() % (total_px * 4) != 0 {
                 continue;
@@ -3995,7 +4164,7 @@ async fn render_mosaic_bbox_composite(
             }
             continue;
         }
-        let raw = render_crs_bbox(
+        let raw = match render_crs_bbox(
             engine,
             &cogs,
             bbox,
@@ -4012,7 +4181,12 @@ async fn render_mosaic_bbox_composite(
             true,
             pq.unscale,
         )
-        .await?;
+        .await
+        {
+            Ok(b) => b,
+            Err(EngineError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
         any_ok = true;
         if raw.len() != total_px * 4 {
             continue;
@@ -5577,6 +5751,12 @@ where
                                 treq.format = OutputFormat::RawRgba;
                             }
                             if urls.is_empty() {
+                                if !wgs84_bboxes_intersect(wgs, mj.bounds) {
+                                    return Err(EngineError::NotFound(format!(
+                                        "Tile {tms}/{z}/{x}/{y} is outside mosaic bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                                        mj.bounds[0], mj.bounds[1], mj.bounds[2], mj.bounds[3]
+                                    )));
+                                }
                                 return Err(EngineError::NoContent);
                             }
                             let data = render_mosaic_bbox_composite(
@@ -5636,7 +5816,17 @@ where
                                 None,
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
-                            Err(EngineError::NoContent)
+                            let (lo0, la0) = mercator_to_lonlat_deg(buf_bbox[0], buf_bbox[1]);
+                            let (lo1, la1) = mercator_to_lonlat_deg(buf_bbox[2], buf_bbox[3]);
+                            let tile_wgs = [lo0.min(lo1), la0.min(la1), lo0.max(lo1), la0.max(la1)];
+                            if !wgs84_bboxes_intersect(tile_wgs, mj.bounds) {
+                                Err(EngineError::NotFound(format!(
+                                    "Tile WebMercatorQuad/{z}/{x}/{y} is outside mosaic bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                                    mj.bounds[0], mj.bounds[1], mj.bounds[2], mj.bounds[3]
+                                )))
+                            } else {
+                                Err(EngineError::NoContent)
+                            }
                         } else {
                             let first_cog = open_first_mosaic_cog(&engine, &urls).await?;
                             let db = first_cog.index.full_res().samples_per_pixel;
@@ -7142,8 +7332,14 @@ where
                             }
                         }
                         if !any_intersects {
+                            let full = cogs[0].index.full_res();
+                            let b = engine
+                                .get_or_build_crs(&cogs[0])
+                                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                                .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
                             return Err(EngineError::NotFound(format!(
-                                "Tile {z}/{x}/{y} is outside image bounds"
+                                "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                                b[0], b[1], b[2], b[3]
                             )));
                         }
                         let needs_general = tms != "WebMercatorQuad"
@@ -8304,8 +8500,14 @@ where
                             }
                         }
                         if !any_intersects {
+                            let full = cogs[0].index.full_res();
+                            let b = engine
+                                .get_or_build_crs(&cogs[0])
+                                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                                .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
                             return Err(EngineError::NotFound(format!(
-                                "Tile {z}/{x}/{y} is outside image bounds"
+                                "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                                b[0], b[1], b[2], b[3]
                             )));
                         }
                         let needs_general_path = tms != "WebMercatorQuad"

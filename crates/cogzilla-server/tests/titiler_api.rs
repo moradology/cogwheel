@@ -930,15 +930,15 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let mj_bbox_bytes = mj_bbox.bytes().await.unwrap();
             assert_eq!(&mj_bbox_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
-            // Empty /mosaicjson/tiles returns 204 No Content (matching TiTiler 2.4 EmptyMosaicError)
-            let mj_empty_buf = client
+            // /mosaicjson/tiles outside mosaic bounds returns 404 Not Found with JSON detail
+            let mj_outside = client
                 .get(format!(
                     "{base}/mosaicjson/tiles/WebMercatorQuad/12/0/0.png?url={mj_url}&buffer=8"
                 ))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(mj_empty_buf.status(), 204);
+            assert_eq!(mj_outside.status(), 404);
 
             // Dynamic registration via POST /mosaic/register
             let reg_resp = client
@@ -1186,12 +1186,11 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(am_resp.status(), 200, "antimeridian /stac/map must not panic");
-            let am_bytes = am_resp.bytes().await.unwrap();
-            assert_eq!(&am_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            let am_w = u32::from_be_bytes([am_bytes[16], am_bytes[17], am_bytes[18], am_bytes[19]]);
-            let am_h = u32::from_be_bytes([am_bytes[20], am_bytes[21], am_bytes[22], am_bytes[23]]);
-            assert_eq!((am_w, am_h), (128, 102));
+            assert_eq!(
+                am_resp.status(),
+                404,
+                "antimeridian /stac/map outside asset bounds must return 404 without panicking"
+            );
 
             let inv_stac = serde_json::json!({
                 "type": "Feature",
@@ -2165,6 +2164,270 @@ async fn sweep11_l1_l2_and_sweep12_m1_self_contained() {
         (mean_aw - mean_un).abs() < 1e-12,
         "equal-area EPSG:6933 area_weighted=true ({mean_aw}) and false ({mean_un}) must match"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn uniform_semantic_http_statuses_across_all_tms() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_statuses_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Small UTM 10N raster in Northern California (~ -122.99..-122.97, 37.94..37.95)
+    let utm_path = tmp.join("small_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &utm_path,
+        32,
+        32,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &vec![123.0f32; 1024],
+    );
+
+    // All-NaN (nodata) raster at the exact same location
+    let nodata_path = tmp.join("all_nodata_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &nodata_path,
+        32,
+        32,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &vec![f32::NAN; 1024],
+    );
+
+    // MosaicJSON with wide advertised bounds [-125, 35, -120, 40] but only one tile covered
+    let mj_path = tmp.join("gap_mosaic.json");
+    let utm_url = utm_path.to_string_lossy().to_string();
+    let nodata_url = nodata_path.to_string_lossy().to_string();
+    let mj_json = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 8,
+        "maxzoom": 12,
+        "bounds": [-125.0, 35.0, -120.0, 40.0],
+        "quadkey_zoom": 8,
+        "tiles": {
+            "02301020": [utm_url]
+        }
+    });
+    std::fs::write(&mj_path, mj_json.to_string()).unwrap();
+    let mj_url = mj_path.to_string_lossy().to_string();
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. Out-of-matrix x returns 400 Bad Request
+    let bad_x = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/4/99/0.png?url={utm_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_x.status(), 400, "out-of-matrix x must return 400");
+
+    // 2. Every single one of the 13 TileMatrixSets returns 404 for a valid tile outside the UTM file
+    let outside_tiles = [
+        ("WebMercatorQuad", "4/15/15"),
+        ("WorldCRS84Quad", "4/31/15"),
+        ("WorldMercatorWGS84Quad", "4/15/15"),
+        ("WGS1984Quad", "4/31/15"),
+        ("UPSArcticWGS84Quad", "4/0/0"),
+        ("UPSAntarcticWGS84Quad", "4/0/0"),
+        ("CanadianNAD83_LCC", "4/0/0"),
+        ("EuropeanETRS89_LAEAQuad", "4/0/0"),
+        ("NZTM2000Quad", "4/0/0"),
+        ("LINZAntarticaMapTilegrid", "4/0/0"),
+        ("UTM31WGS84Quad", "4/0/0"),
+        ("CDB1GlobalGrid", "4/0/0"),
+        ("GNOSISGlobalGrid", "4/0/0"),
+    ];
+    for (tms, zxy) in outside_tiles {
+        let r = client
+            .get(format!("{base}/cog/tiles/{tms}/{zxy}.png?url={utm_url}"))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(
+            status, 404,
+            "TMS {tms}/{zxy} outside UTM file must return 404, got {status}: {body}"
+        );
+        assert!(
+            body.contains("outside") && body.contains(tms),
+            "404 body for {tms} should name tile & bounds, got: {body}"
+        );
+    }
+
+    // 3. All-nodata tile INSIDE dataset bounds returns 200 OK
+    // UTM 10N (500_000, 4_200_000) is (-123.000, 37.947) -> WebMercator tile 10/162/395
+    let nd_resp = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/162/395.png?url={nodata_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        nd_resp.status(),
+        200,
+        "all-nodata tile inside footprint must return 200"
+    );
+
+    // 4. Mosaic gap INSIDE advertised mj.bounds returns 204; tile OUTSIDE mj.bounds returns 404
+    // (-121.0, 36.0) is inside [-125, 35, -120, 40] -> WebMercator z=8 x=41, y=99 (uncovered gap)
+    let gap_resp = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/8/41/99.png?url={mj_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gap_resp.status(), 204, "mosaic gap inside bounds must return 204");
+    let out_mj = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/8/0/0.png?url={mj_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out_mj.status(), 404, "mosaic tile outside bounds must return 404");
+
+    // 5. /cog/point, /cog/bbox, and /cog/feature outside footprint all return 404 with detail
+    let pt_out = client
+        .get(format!("{base}/cog/point/0,0?url={utm_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pt_out.status(), 404);
+    let bbox_out = client
+        .get(format!("{base}/cog/bbox/0,0,1,1/32x32.png?url={utm_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bbox_out.status(), 404);
+    let feat_out = client
+        .post(format!("{base}/cog/feature.png?url={utm_url}&max_size=32"))
+        .header("content-type", "application/json")
+        .body(r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(feat_out.status(), 404);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn s1_cylindrical_equal_area_exact_in_worldcrs84_and_worldmercator() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_s1_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Global 512x256 ramp rasters in EPSG:6933 and EPSG:3410 (~67.8 km pixels):
+    // pixel value = row * 512 + col so any 1-row shift shows up immediately as delta=512.
+    let w = 512u32;
+    let h = 256u32;
+    let ramp: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
+
+    let g6933_path = tmp.join("g6933_ramp.tif");
+    write_synthetic_f32_projected_geotiff(
+        &g6933_path,
+        w,
+        h,
+        6933,
+        -17_367_520.0,
+        7_314_540.0,
+        34_735_040.0 / (w as f64),
+        &ramp,
+    );
+    let g3410_path = tmp.join("g3410_ramp.tif");
+    write_synthetic_f32_projected_geotiff(
+        &g3410_path,
+        w,
+        h,
+        3410,
+        -17_334_200.0,
+        7_344_784.0,
+        34_668_400.0 / (w as f64),
+        &ramp,
+    );
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    for (epsg, path, ox, oy, px_sz) in [
+        (6933u16, &g6933_path, -17_367_520.0, 7_314_540.0, 34_735_040.0 / (w as f64)),
+        (3410u16, &g3410_path, -17_334_200.0, 7_344_784.0, 34_668_400.0 / (w as f64)),
+    ] {
+        let crs = cogzilla_proj::CrsModel::from_epsg(epsg).unwrap();
+        let u = path.to_string_lossy().to_string();
+
+        // Check WorldCRS84Quad z2/2/1 (lon 0..45, lat 0..45) and WorldMercatorWGS84Quad z2/2/1
+        for (tms, z, x, y, dst_crs, tb) in [
+            (
+                "WorldCRS84Quad",
+                2u8,
+                2u32,
+                1u32,
+                cogzilla_proj::CrsModel::Geographic,
+                [-90.0, 0.0, -45.0, 45.0],
+            ),
+            (
+                "WorldMercatorWGS84Quad",
+                2u8,
+                2u32,
+                1u32,
+                cogzilla_proj::CrsModel::WorldMercator,
+                [0.0, 0.0, 10_018_754.171_394_622, 10_018_754.171_394_622],
+            ),
+        ] {
+            let resp = client
+                .get(format!(
+                    "{base}/cog/tiles/{tms}/{z}/{x}/{y}.npy?url={u}&bidx=1&resampling=nearest&reproject=nearest&return_mask=false"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "EPSG:{epsg} {tms} {z}/{x}/{y}");
+            let vals = decode_npy_f32(&resp.bytes().await.unwrap());
+            assert_eq!(vals.len(), 256 * 256);
+
+            let dlx = (tb[2] - tb[0]) / 256.0;
+            let dly = (tb[3] - tb[1]) / 256.0;
+            let mut mismatches = 0usize;
+            for py in 0..256usize {
+                let dy = tb[3] - (py as f64 + 0.5) * dly;
+                for px in 0..256usize {
+                    let dx = tb[0] + (px as f64 + 0.5) * dlx;
+                    let (lon, lat) = dst_crs.to_lonlat_deg(dx, dy);
+                    let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+                    let col = ((sx - ox) / px_sz).floor() as i64;
+                    let row = ((oy - sy) / px_sz).floor() as i64;
+                    if col >= 0 && col < w as i64 && row >= 0 && row < h as i64 {
+                        let expected = (row as u32 * w + col as u32) as f32;
+                        let got = vals[py * 256 + px];
+                        if (got - expected).abs() > 0.5 {
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                mismatches, 0,
+                "S1 EPSG:{epsg} in {tms} {z}/{x}/{y} had {mismatches} mismatched pixels (expected 0)"
+            );
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
