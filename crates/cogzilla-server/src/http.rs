@@ -7706,16 +7706,16 @@ where
             .await,
             // GET /stac/statistics (merged band dict: {b1: ..., b2: ...})
             (Method::GET, ["statistics"]) => async {
-                // An item's statistics take band math on the planes road or not at all:
-                // the names this branch reads (`red_b1`) are not titiler-pgstac's.
-                if stac_prefix != "stac" && pq.expr_raw.is_some() {
-                    return Err(EngineError::BadRequest(
-                        "parameter 'expression' is only supported on /cog/statistics routes".into(),
-                    ));
-                }
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                if stac_prefix != "stac"
+                    && let Some(expression) = pq.expr_raw.as_deref()
+                {
+                    let bands: Vec<usize> = cogs.iter().map(|c| usize::from(c.index.full_res().samples_per_pixel)).collect();
+                    let selected = !pq.bidx.is_empty() || pq.assets.iter().any(|a| stac_asset_selected_bands(&pq, a).is_some());
+                    pgstac::check_item_statistics_expression(expression, &bands, pq.asset_as_band, selected)?;
+                }
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
                     matches!(
                         a.to_ascii_lowercase().as_str(),
@@ -7928,14 +7928,15 @@ where
             (Method::POST, ["statistics"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
-                // As on GET: an item's statistics take no band math in these names.
-                if stac_prefix != "stac" && pq.expr_raw.is_some() {
-                    return Err(EngineError::BadRequest(
-                        "parameter 'expression' is only supported on /cog/statistics routes".into(),
-                    ));
-                }
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                if stac_prefix != "stac"
+                    && let Some(expression) = pq.expr_raw.as_deref()
+                {
+                    let bands: Vec<usize> = cogs.iter().map(|c| usize::from(c.index.full_res().samples_per_pixel)).collect();
+                    let selected = !pq.bidx.is_empty() || pq.assets.iter().any(|a| stac_asset_selected_bands(&pq, a).is_some());
+                    pgstac::check_item_statistics_expression(expression, &bands, pq.asset_as_band, selected)?;
+                }
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
 

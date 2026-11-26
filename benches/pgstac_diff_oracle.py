@@ -1413,6 +1413,12 @@ def main() -> int:
                 known="titiler-pgstac answers 500 for a point outside the item; cogzilla answers 404")
         o.check("item statistics", "stats", f"{it}/statistics?assets=visual&max_size=128")
         o.check("item asset statistics", "stats", f"{it}/asset_statistics?assets=red&max_size=128")
+        # Band math on an item's statistics: b1..bn over the stacked bands, described in their names.
+        o.check("item statistics, band math over two assets", "stats",
+                f"{it}/statistics?assets=nir&assets=red&asset_as_band=true&max_size=64&expression=(b1-b2)/(b1%2Bb2);b1")
+        o.check("item statistics, band math on one asset", "stats", f"{it}/statistics?assets=visual&max_size=64&expression=b1-b3;where(b1%3Eb2,1,0)")
+        o.check("item statistics, band math by an asset's name", "status",
+                f"{it}/statistics?assets=nir&assets=red&asset_as_band=true&max_size=64&expression=(nir-red)/(nir%2Bred)")
         o.check("item wmts", "wmts", f"{it}/WMTSCapabilities.xml?assets=visual")
         o.check("item wmts, jpg and EPSG codes", "wmts",
                 f"{it}/WMTSCapabilities.xml?assets=visual&tile_format=jpg&use_epsg=true&minzoom=9&maxzoom=10")
