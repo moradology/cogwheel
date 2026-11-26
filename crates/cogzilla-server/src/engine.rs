@@ -199,13 +199,66 @@ pub(crate) fn resample_fetch_margin(resample: ResampleMode, is_dem: bool) -> (i3
         ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Gauss => (1, 2),
         ResampleMode::Lanczos => (2, 3),
         // Footprint modes (Average/Mode/Rms/Min/Max/Med/Q1/Q3/Sum) use exact footprint bounds in
-        // `render_bbox_impl` and 1-px neighborhood padding on tile routes.
+        // `render_bbox_impl` and `tile_fetch_range_for_plan`.
         _ => (1, 2),
     };
     if is_dem {
         (lo + 2, hi + 2)
     } else {
         (lo, hi)
+    }
+}
+
+/// Compute the inclusive source tile range `(tx0, tx1, ty0, ty1)` required to sample `plan`
+/// under `resample` (using the exact `coord_plan_scale` half-footprint for footprint modes so
+/// overview-less COGs or coarse overview jumps never under-fetch adjacent internal tiles).
+fn tile_fetch_range_for_plan<const N: usize>(
+    plan: &CoordPlan<N>,
+    resample: ResampleMode,
+    is_dem: bool,
+    ifd: &cogzilla_tiff::IfdMeta,
+) -> (u32, u32, u32, u32) {
+    let is_footprint = matches!(
+        resample,
+        ResampleMode::Average
+            | ResampleMode::Mode
+            | ResampleMode::Rms
+            | ResampleMode::Min
+            | ResampleMode::Max
+            | ResampleMode::Med
+            | ResampleMode::Q1
+            | ResampleMode::Q3
+            | ResampleMode::Sum
+    );
+    let (pad_lo_x, pad_hi_x, pad_lo_y, pad_hi_y) = if is_footprint {
+        let (sx, sy) = cogzilla_kernel::coord_plan_scale(plan);
+        let hx = (0.5 * sx).ceil().max(1.0) as i32;
+        let hy = (0.5 * sy).ceil().max(1.0) as i32;
+        if is_dem {
+            (hx + 2, hx + 3, hy + 2, hy + 3)
+        } else {
+            (hx, hx + 1, hy, hy + 1)
+        }
+    } else {
+        let (lo, hi) = resample_fetch_margin(resample, is_dem);
+        (lo, hi, lo, hi)
+    };
+    if pad_lo_x > 0 || pad_hi_x > 1 || pad_lo_y > 0 || pad_hi_y > 1 {
+        // CoordPlan::src_pixel_bounds() is the exact bilinear footprint [floor(min), floor(max)+1].
+        let extra_lo_x = pad_lo_x;
+        let extra_hi_x = (pad_hi_x - 1).max(0);
+        let extra_lo_y = pad_lo_y;
+        let extra_hi_y = (pad_hi_y - 1).max(0);
+        let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+        let d_tx0 = (c0.saturating_sub(extra_lo_x).max(0) as u32) / ifd.tile_width;
+        let d_tx1 = ((c1.saturating_add(extra_hi_x).max(0) as u32) / ifd.tile_width)
+            .min(ifd.tiles_across.saturating_sub(1));
+        let d_ty0 = (r0.saturating_sub(extra_lo_y).max(0) as u32) / ifd.tile_height;
+        let d_ty1 = ((r1.saturating_add(extra_hi_y).max(0) as u32) / ifd.tile_height)
+            .min(ifd.tiles_down.saturating_sub(1));
+        (d_tx0, d_tx1, d_ty0, d_ty1)
+    } else {
+        plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down)
     }
 }
 
@@ -455,23 +508,12 @@ impl TileEngine {
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
         };
 
-        let (pad_lo, pad_hi) =
-            resample_fetch_margin(req.resample, matches!(req.bands, BandRequest::Dem { .. }));
-        let (tx0, tx1, ty0, ty1) = if pad_lo > 0 || pad_hi > 1 {
-            // CoordPlan::src_pixel_bounds() is the exact bilinear footprint [floor(min), floor(max)+1].
-            let extra_lo = pad_lo;
-            let extra_hi = (pad_hi - 1).max(0);
-            let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-            let d_tx0 = (c0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_width;
-            let d_tx1 = ((c1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_width)
-                .min(ifd.tiles_across.saturating_sub(1));
-            let d_ty0 = (r0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_height;
-            let d_ty1 = ((r1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_height)
-                .min(ifd.tiles_down.saturating_sub(1));
-            (d_tx0, d_tx1, d_ty0, d_ty1)
-        } else {
-            plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down)
-        };
+        let (tx0, tx1, ty0, ty1) = tile_fetch_range_for_plan(
+            &plan,
+            req.resample,
+            matches!(req.bands, BandRequest::Dem { .. }),
+            ifd,
+        );
         let grid_w = tx1 - tx0 + 1;
         let grid_h = ty1 - ty0 + 1;
         let grid_len = (grid_w * grid_h) as usize;
@@ -1422,23 +1464,12 @@ impl TileEngine {
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
         };
 
-        let (pad_lo, pad_hi) =
-            resample_fetch_margin(req.resample, matches!(req.bands, BandRequest::Dem { .. }));
-        let (tx0, tx1, ty0, ty1) = if pad_lo > 0 || pad_hi > 1 {
-            // CoordPlan::src_pixel_bounds() is the exact bilinear footprint [floor(min), floor(max)+1].
-            let extra_lo = pad_lo;
-            let extra_hi = (pad_hi - 1).max(0);
-            let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-            let d_tx0 = (c0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_width;
-            let d_tx1 = ((c1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_width)
-                .min(ifd.tiles_across.saturating_sub(1));
-            let d_ty0 = (r0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_height;
-            let d_ty1 = ((r1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_height)
-                .min(ifd.tiles_down.saturating_sub(1));
-            (d_tx0, d_tx1, d_ty0, d_ty1)
-        } else {
-            plan.src_tile_range(ifd.tile_width, ifd.tile_height, ifd.tiles_across, ifd.tiles_down)
-        };
+        let (tx0, tx1, ty0, ty1) = tile_fetch_range_for_plan(
+            &plan,
+            req.resample,
+            matches!(req.bands, BandRequest::Dem { .. }),
+            ifd,
+        );
         let grid_w = tx1 - tx0 + 1;
         let grid_h = ty1 - ty0 + 1;
         let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
@@ -1973,6 +2004,16 @@ impl TileEngine {
                 BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
                 _ => 1,
             };
+            if req.format == OutputFormat::Npy {
+                let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
+                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    f32_bands,
+                    req.tile_size,
+                    req.tile_size,
+                    true,
+                ));
+            }
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
         self.render_mosaic_tile(&urls, req).await
@@ -2335,5 +2376,69 @@ mod tests {
         assert_eq!(engine.stats.passthrough_hits.load(Ordering::Relaxed), 1);
         assert_eq!(engine.store.cache.hits.load(Ordering::Relaxed), 0);
         assert_eq!(engine.store.cache.misses.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn catalog_mosaic_empty_npy_includes_mask_plane() {
+        struct EmptyCatalog;
+        impl SceneCatalog for EmptyCatalog {
+            fn query_bbox_3857(&self, _min_x: f64, _min_y: f64, _max_x: f64, _max_y: f64) -> Vec<String> {
+                Vec::new()
+            }
+            fn len(&self) -> usize {
+                0
+            }
+        }
+        let engine = TileEngine::new(1024 * 1024);
+        let req = TileRequest {
+            tile: TileCoord { z: 2, x: 1, y: 1 },
+            tile_size: 64,
+            bands: BandRequest::Single {
+                band_1based: 1,
+                rescale: (0.0, 1.0),
+                colormap: ColormapName::Grayscale,
+            },
+            resample: ResampleMode::Bilinear,
+            format: OutputFormat::Npy,
+            unscale: false,
+        };
+        let out = engine
+            .render_catalog_mosaic_tile(&EmptyCatalog, &req)
+            .await
+            .unwrap();
+        // Parse NPY header to confirm shape is (2, 64, 64) (1 data band + 1 mask plane).
+        assert_eq!(&out[..6], b"\x93NUMPY");
+        let hdr_len = u16::from_le_bytes([out[8], out[9]]) as usize;
+        let hdr = std::str::from_utf8(&out[10..10 + hdr_len]).unwrap();
+        assert!(
+            hdr.contains("(2, 64, 64)"),
+            "expected empty catalog mosaic .npy to include mask plane (2, 64, 64), got: {hdr}"
+        );
+    }
+
+    #[test]
+    fn tile_fetch_range_for_plan_pads_large_footprint() {
+        // Construct a Separable1D plan spanning u in [260..=4340] across 256 samples (sx = 16.0).
+        // Tile width = 256: u=260 is 4 px inside tile 1, so half-footprint = 8 px reaches into tile 0!
+        let mut u = [0.0f32; 256];
+        let mut v = [0.0f32; 256];
+        for i in 0..256 {
+            u[i] = 260.0 + (i as f32) * 16.0;
+            v[i] = 260.0 + (i as f32) * 16.0;
+        }
+        let plan = CoordPlan::Separable1D {
+            u: Box::new(u),
+            v: Box::new(v),
+            src_min_col: 260,
+            src_max_col: 4341,
+            src_min_row: 260,
+            src_max_row: 4341,
+            all_in_bounds: true,
+        };
+        let ifd = make_aligned_ifd(TileCoord { z: 8, x: 0, y: 0 }, Compression::None, 256, 32, 32);
+        let (tx0, _tx1, ty0, _ty1) =
+            tile_fetch_range_for_plan(&plan, ResampleMode::Average, false, &ifd);
+        assert_eq!(tx0, 0, "footprint sx=16 at u=260 must fetch left neighbor tile 0");
+        assert_eq!(ty0, 0, "footprint sy=16 at v=260 must fetch top neighbor tile 0");
     }
 }
