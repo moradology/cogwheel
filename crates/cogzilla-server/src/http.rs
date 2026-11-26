@@ -10764,8 +10764,7 @@ mod tests {
     fn a_pixel_selection_is_painted_by_rio_tilers_rules() {
         let pq = parse_query(None);
         let nan = f32::NAN;
-        // One band without a colour map: the byte is the grey, also where the kernel's
-        // grey table is a level below (33 is 32 there).
+        // One band without a colour map: the byte is the grey.
         let grey = single((0.0, 255.0), ColormapName::Grayscale);
         let rgba = paint_selected(selected(1, &[33.0, 244.0, nan]), 3, &grey, &pq, None).unwrap();
         assert_eq!(rgba, [33, 33, 33, 255, 244, 244, 244, 255, 0, 0, 0, 0]);
