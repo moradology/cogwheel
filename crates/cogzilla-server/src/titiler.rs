@@ -91,7 +91,8 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .collect();
 
     let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
-    let (nodata_type, nodata_value) = match cog.index.nodata {
+    let nodata_exact = cog.index.nodata_f64.or_else(|| cog.index.nodata.map(|v| v as f64));
+    let (nodata_type, nodata_value) = match nodata_exact {
         Some(v) if v.is_nan() => ("Nodata", Some(serde_json::Value::Null)),
         Some(v) => ("Nodata", Some(serde_json::json!(v))),
         None if has_alpha => ("Alpha", None),
@@ -396,7 +397,7 @@ pub fn build_cog_validate(
     let offsets: Vec<f64> = (0..count)
         .map(|i| cog.index.offsets_f64.get(i).copied().unwrap_or(0.0))
         .collect();
-    let nodata_json = match cog.index.nodata {
+    let nodata_json = match cog.index.nodata_f64.or_else(|| cog.index.nodata.map(|v| v as f64)) {
         Some(v) if v.is_nan() => serde_json::json!("nan"),
         Some(v) => serde_json::json!(v),
         None => serde_json::Value::Null,
@@ -2176,14 +2177,25 @@ impl BandStatsAcc {
                 if run_cnt < min_cnt {
                     min_val = run_val;
                 }
-                let mean = sum / (valid_px as f64);
+                let n_f = valid_px as f64;
+                let mean = if sum.is_finite() {
+                    sum / n_f
+                } else {
+                    vals.iter().map(|&v| v / n_f).sum::<f64>()
+                };
+                // Scale variance accumulation when values exceed ~1e150 so `(v - mean)^2` never
+                // overflows `f64::MAX` to `+inf` (which JSON serializes as `null`).
+                let max_abs = min.abs().max(max.abs());
+                let var_scale = if max_abs > 1e150 { max_abs } else { 1.0 };
+                let inv_var_scale = 1.0 / var_scale;
+                let mean_scaled = mean * inv_var_scale;
                 let mut var_sum = 0.0f64;
                 let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
                     && custom_edges.len() >= 2
                 {
                     let mut counts = vec![0u64; custom_edges.len() - 1];
                     for &v in &vals {
-                        let d = v - mean;
+                        let d = v * inv_var_scale - mean_scaled;
                         var_sum += d * d;
                         if let Some(bin) = bin_into_edges(custom_edges, v) {
                             counts[bin] += 1;
@@ -2201,7 +2213,7 @@ impl BandStatsAcc {
                         (h_max / (n_bins as f64)) - (h_min / (n_bins as f64))
                     };
                     for &v in &vals {
-                        let d = v - mean;
+                        let d = v * inv_var_scale - mean_scaled;
                         var_sum += d * d;
                         if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
                             let bin = if step.is_finite() && step > 0.0 {
@@ -2219,16 +2231,21 @@ impl BandStatsAcc {
                     }
                     let edges: Vec<f64> = (0..=n_bins)
                         .map(|i| {
-                            if i == n_bins {
+                            if i == 0 {
+                                h_min
+                            } else if i == n_bins {
                                 h_max
-                            } else {
+                            } else if raw_span.is_finite() {
                                 h_min + step * (i as f64)
+                            } else {
+                                let t = (i as f64) / (n_bins as f64);
+                                h_min * (1.0 - t) + h_max * t
                             }
                         })
                         .collect();
                     (counts, edges)
                 };
-                let std = (var_sum / (valid_px as f64)).sqrt();
+                let std = (var_sum / n_f).sqrt() * var_scale;
 
                 let med_idx = valid_px / 2;
                 let median = vals[med_idx];
@@ -4959,7 +4976,7 @@ pub(crate) fn encode_rgba_output(
             }
         }
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
-        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::RawRgba => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 | OutputFormat::RawRgba => {
             Bytes::copy_from_slice(rgba)
         }
     }
@@ -4986,6 +5003,7 @@ pub async fn render_exact_f64_array(
     out_kind: cogzilla_tiff::SampleType,
     return_mask: bool,
     as_raw_f64: bool,
+    allow_empty: bool,
 ) -> Result<Bytes, EngineError> {
     if !native_preview {
         if !bbox.iter().all(|v| v.is_finite()) || bbox[1] >= bbox[3] {
@@ -5084,23 +5102,36 @@ pub async fn render_exact_f64_array(
             }
         }
     } else {
+        if let Some(pm) = poly_mask {
+            pm.check_work_budget(w * h)?;
+        }
+        let touched_mask: Option<Vec<bool>> =
+            poly_mask.map(|pm| pm.rasterize_all_touched(w, h, bbox, dst_crs));
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
         let wrap_hi = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width);
         for py in 0..h {
             let y = bbox[3] - (py as f64 + 0.5) * dly;
             for px in 0..w {
-                let x = bbox[0] + (px as f64 + 0.5) * dlx;
-                if let Some(pm) = poly_mask {
-                    let (plon, plat) = match dst_crs {
-                        cogzilla_proj::CrsModel::Geographic => (if x > 180.0 { x - 360.0 } else { x }, y),
-                        other => other.to_lonlat_deg(x, y),
-                    };
-                    if !pm.contains(plon, plat) {
-                        continue;
-                    }
+                if let Some(ref mask) = touched_mask
+                    && !mask[py * w + px]
+                {
+                    continue;
                 }
+                let x = bbox[0] + (px as f64 + 0.5) * dlx;
                 let (sx, sy) = match dst_crs {
-                    cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                    cogzilla_proj::CrsModel::Epsg3857 => {
+                        if wrap_lo.is_some() || wrap_hi.is_some() {
+                            let (mut lon, lat) = cogzilla_proj::mercator_to_lonlat_deg(x, y);
+                            if let Some(lo) = wrap_lo && lon < lo {
+                                lon += 360.0;
+                            } else if let Some(hi) = wrap_hi && lon > hi {
+                                lon -= 360.0;
+                            }
+                            crs.from_lonlat_deg(lon, lat)
+                        } else {
+                            crs.from_3857(x, y)
+                        }
+                    }
                     cogzilla_proj::CrsModel::Geographic => {
                         let mut lon = if x > 180.0 { x - 360.0 } else { x };
                         if let Some(lo) = wrap_lo && lon < lo {
@@ -5144,7 +5175,7 @@ pub async fn render_exact_f64_array(
     }
 
     let pixels = w * h;
-    if !native_preview && (!min_u.is_finite() || !min_v.is_finite()) {
+    if !native_preview && !allow_empty && (!min_u.is_finite() || !min_v.is_finite()) {
         let full = cog.index.full_res();
         if !crate::http::tile_box_intersects_cog(&crs, full, dst_crs, bbox) {
             return Err(EngineError::NotFound(format!(
@@ -5448,7 +5479,7 @@ async fn render_bbox_impl(
         }
     }
     if let BandRequest::MultiBand { bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
     {
         return Err(EngineError::BadRequest(format!(
             "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
@@ -5462,8 +5493,9 @@ async fn render_bbox_impl(
         && !unscale
         && color_formula.is_none()
         && custom_lut.is_none()
+        && matches!(resample, ResampleMode::Nearest | ResampleMode::Bilinear)
         && cogs[0].index.full_res().sample_type.needs_f64()
-        && matches!(format, OutputFormat::RawF64 | OutputFormat::Npy)
+        && matches!(format, OutputFormat::RawF64 | OutputFormat::NpyF64)
     {
         let bands_1based: Option<Vec<u16>> = match bands {
             BandRequest::Single { band_1based, .. } => Some(vec![*band_1based]),
@@ -5489,6 +5521,7 @@ async fn render_bbox_impl(
                 kind,
                 return_mask,
                 matches!(format, OutputFormat::RawF64),
+                false,
             )
             .await;
         }

@@ -595,6 +595,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         let mut ifd_color_map: Option<Vec<[u8; 4]>> = None;
         let mut ifd_gdal_metadata_xml: Option<String> = None;
         let mut ifd_nodata: Option<f32> = None;
+        let mut ifd_nodata_f64: Option<f64> = None;
 
         let to_u32 = |v: u64| -> Result<u32, TiffError> {
             u32::try_from(v).map_err(|_| TiffError::Corrupt("IFD integer tag exceeds u32::MAX"))
@@ -808,10 +809,10 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     let s = entry.read_ascii(&r)?;
                     if s.eq_ignore_ascii_case("nan") {
                         ifd_nodata = Some(f32::NAN);
-                        nodata_f64 = Some(f64::NAN);
+                        ifd_nodata_f64 = Some(f64::NAN);
                     } else if let Ok(v) = s.parse::<f64>() {
                         ifd_nodata = Some(v as f32);
-                        nodata_f64 = Some(v);
+                        ifd_nodata_f64 = Some(v);
                     }
                 }
                 _ => {}
@@ -916,6 +917,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             }
             if nodata.is_none() {
                 nodata = ifd_nodata;
+            }
+            if nodata_f64.is_none() {
+                nodata_f64 = ifd_nodata_f64;
             }
         }
 
