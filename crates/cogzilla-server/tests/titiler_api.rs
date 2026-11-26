@@ -5829,3 +5829,129 @@ async fn sweeps_34_to_37_kk1_ii1_jj1_hh1_self_contained() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn sweep40_mm1_validate_ungeoreferenced_and_rpc_tiffs() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep40_mm1_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a minimal 16x16 uint8 TIFF with no GeoTransform/GCPs and optional RPCCoefficientTag (50844).
+    let write_plain_or_rpc_tiff = |path: &std::path::Path, include_rpc: bool| {
+        let w = 16u32;
+        let h = 16u32;
+        let pixels = vec![42u8; (w * h) as usize];
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        let num_entries: u16 = 10 + u16::from(include_rpc);
+        let data_start = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
+        let rpc_bytes = if include_rpc { 92 * 8u32 } else { 0 };
+        let rpc_off = data_start;
+        let pixel_off = data_start + rpc_bytes;
+
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w); // ImageWidth
+        push_entry(&mut buf, 257, 4, 1, h); // ImageLength
+        push_entry(&mut buf, 258, 3, 1, 8); // BitsPerSample
+        push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+        push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+        push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+        push_entry(&mut buf, 277, 3, 1, 1); // SamplesPerPixel
+        push_entry(&mut buf, 278, 4, 1, h); // RowsPerStrip
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32); // StripByteCounts
+        push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+        if include_rpc {
+            push_entry(&mut buf, 50844, 12, 92, rpc_off); // RPCCoefficientTag
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+        if include_rpc {
+            for _ in 0..92 {
+                buf.extend_from_slice(&0.0f64.to_le_bytes());
+            }
+        }
+        buf.extend_from_slice(&pixels);
+        std::fs::write(path, buf).unwrap();
+    };
+
+    let plain_path = tmp.join("ungeoref.tif");
+    let rpc_path = tmp.join("rpc_only.tif");
+    write_plain_or_rpc_tiff(&plain_path, false);
+    write_plain_or_rpc_tiff(&rpc_path, true);
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // 1. Plain ungeoreferenced TIFF: /cog/validate returns 200 with structural report & warning,
+    //    and /cog/point returns 400 naming GeoTransform/GCPs/RPCs.
+    let r_val = client
+        .get(format!("{base}/cog/validate?url={}", plain_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_val.status(), 200, "MM1 /cog/validate must return 200 on ungeoreferenced TIFF");
+    let j_val: serde_json::Value = serde_json::from_str(&r_val.text().await.unwrap()).unwrap();
+    assert_eq!(j_val["COG"], serde_json::json!(true));
+    assert_eq!(j_val["Profile"]["Width"], serde_json::json!(16));
+    assert!(j_val["GEO"]["CRS"].is_null());
+    assert!(j_val["GEO"]["BoundingBox"].is_null());
+    let warns = j_val["COG_warnings"].as_array().unwrap();
+    assert!(
+        warns.iter().any(|w| w.as_str().unwrap_or("").contains("georeferencing")),
+        "expected missing-georeferencing warning, got {warns:?}"
+    );
+    let r_pt = client
+        .get(format!("{base}/cog/point/0,0?url={}", plain_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pt.status(), 400);
+    let pt_body = r_pt.text().await.unwrap();
+    assert!(pt_body.contains("GeoTransform/GCPs") && pt_body.contains("RPC"), "got {pt_body}");
+
+    // 2. RPC-only TIFF (tag 50844): /cog/validate returns 200 with RPC warning,
+    //    and /cog/point returns 400 naming RPCs.
+    let r_rpc_val = client
+        .get(format!("{base}/cog/validate?url={}", rpc_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_rpc_val.status(), 200, "MM1 /cog/validate must return 200 on RPC-only TIFF");
+    let j_rpc: serde_json::Value = serde_json::from_str(&r_rpc_val.text().await.unwrap()).unwrap();
+    assert_eq!(j_rpc["COG"], serde_json::json!(true));
+    let rpc_warns = j_rpc["COG_warnings"].as_array().unwrap();
+    assert!(
+        rpc_warns.iter().any(|w| w.as_str().unwrap_or("").contains("RPC")),
+        "expected RPC warning in COG_warnings, got {rpc_warns:?}"
+    );
+    let r_rpc_pt = client
+        .get(format!("{base}/cog/point/0,0?url={}", rpc_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_rpc_pt.status(), 400);
+    let rpc_pt_body = r_rpc_pt.text().await.unwrap();
+    assert!(rpc_pt_body.contains("RPC"), "400 on RPC TIFF must name RPCs, got {rpc_pt_body}");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

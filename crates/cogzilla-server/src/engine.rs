@@ -408,9 +408,12 @@ impl TileEngine {
 
     pub fn get_or_build_crs(&self, cog: &OpenedCog) -> Result<CrsModel, EngineError> {
         if !cog.index.is_georeferenced {
-            return Err(EngineError::BadRequest(
-                "dataset has no georeferencing (missing GeoTransform/GCPs); geographic operations require a georeferenced raster".into(),
-            ));
+            let msg = if cog.index.has_rpc {
+                "dataset has no supported georeferencing (missing GeoTransform/GCPs; RPC georeferencing is not supported); geographic operations require a georeferenced raster"
+            } else {
+                "dataset has no georeferencing (missing GeoTransform/GCPs; RPCs are not supported); geographic operations require a georeferenced raster"
+            };
+            return Err(EngineError::BadRequest(msg.into()));
         }
         if let Some(c) = self.crs_cache.get(&cog.id) {
             return Ok(c.clone());
@@ -2330,6 +2333,7 @@ mod tests {
             byte_order: cogzilla_tiff::ByteOrder::Little,
             is_bigtiff: false,
             is_georeferenced: true,
+            has_rpc: false,
             gcp_residual_px: None,
             geo_keys,
             nodata: None,
