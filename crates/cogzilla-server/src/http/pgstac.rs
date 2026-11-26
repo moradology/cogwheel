@@ -268,9 +268,13 @@ fn py_whole(s: &str) -> bool {
 
 /// A tile's `tilesize`, `padding` and `buffer` are more than zero, as titiler-pgstac has them.
 fn tile_bounds_error(pairs: &[(String, String)]) -> Option<Resp> {
-    for (key, value) in pairs {
+    // Of a parameter given twice, the last is the one read.
+    for key in ["tilesize", "padding", "buffer"] {
+        let Some((_, value)) = pairs.iter().rev().find(|(k, _)| k == key) else {
+            continue;
+        };
         let positive = py_number(value).is_some_and(|n| n > 0.0);
-        let wrong = match key.as_str() {
+        let wrong = match key {
             "tilesize" | "padding" => (!(py_whole(value) && positive)).then_some("Input should be a whole number greater than 0"),
             "buffer" => (!positive).then_some("Input should be a number greater than 0"),
             _ => None,

@@ -886,6 +886,9 @@ def main() -> int:
             o.check(f"tile with {bad}", "status", f"{base12}.png?assets=red&{bad}")
             o.check(f"tilejson with {bad}", "status", f"/searches/{sid}/WebMercatorQuad/tilejson.json?assets=red&{bad}")
             o.check(f"WMTS with {bad}", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=red&{bad}")
+        for twice in ("buffer=0&buffer=1", "padding=0&padding=1", "buffer=1&buffer=0"):
+            o.check(f"tile with {twice}", "status", f"{base12}.png?assets=red&{twice}")
+            o.check(f"tilejson with {twice}", "status", f"/searches/{sid}/WebMercatorQuad/tilejson.json?assets=red&{twice}")
         for fmt in ("tif", "tiff", "pngraw"):
             o.check(f"WMTS with tile_format={fmt}", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=red&tile_format={fmt}")
         for date in ("20241201", "2024-12-01_00:00:00Z", "", "../.."):
