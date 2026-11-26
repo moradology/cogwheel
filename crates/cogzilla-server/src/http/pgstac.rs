@@ -3007,6 +3007,7 @@ async fn part_image_of(
     if let Some(resp) = format_error(ext) {
         return resp;
     }
+    normalized_index_as_band_math(&mut pq, ext);
     // A GeoTIFF is the array with a place on the ground: made as the array, wrapped at the end.
     // (With `algorithm` no array is written on these routes yet: there it stays the picture.)
     let tiff = matches!(ext.or(pq.format_param.as_deref()), Some("tif" | "tiff")) && pq.algorithm.is_none();
@@ -4638,6 +4639,27 @@ async fn point_values(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `normalizedIndex` over several assets is rio-tiler's `(b2 - b1) / (b2 + b1)` of the first
+/// two bands: band math, which planes read as TiTiler's pixels, where the renderer reads one
+/// raster's bands only. A picture is drawn from -1 to 1 unless `rescale` says otherwise, as the
+/// renderer draws the algorithm. (TiTiler, without `rescale`, paints every pixel 127.) An array
+/// is left to the algorithm: TiTiler writes it as float32, where band math gives doubles.
+fn normalized_index_as_band_math(pq: &mut ParsedQuery, ext: Option<&str>) {
+    let array = matches!(ext.or(pq.format_param.as_deref()), Some("npy" | "tif" | "tiff" | "bin" | "raw" | "f32"));
+    if pq.algorithm.as_deref() == Some("normalizedindex")
+        && pq.expr_raw.is_none()
+        && pq.asset_exprs.is_empty()
+        && pq.assets.len() > 1
+        && !array
+    {
+        pq.algorithm = None;
+        pq.expr_raw = Some("(b2-b1)/(b2+b1)".into());
+        if pq.rescale.is_empty() {
+            pq.rescale.push((-1.0, 1.0));
+        }
+    }
+}
+
 async fn tile(
     ctx: &Ctx<'_>,
     pg: &PgStac,
@@ -4648,6 +4670,7 @@ async fn tile(
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
+    normalized_index_as_band_math(&mut pq, Some(ext).filter(|e| !e.is_empty()));
     // A tile with a `buffer` is the tile's box grown by that many pixels on every side,
     // at a size grown as much: to rio-tiler, and here, a box in Web Mercator like any other.
     if pq.buffer > 0.0 {
@@ -7793,6 +7816,34 @@ mod tests {
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
+    }
+
+    #[test]
+    fn a_normalized_index_over_assets_is_band_math() {
+        let asked = |query: &str, ext: Option<&str>| {
+            let mut pq = super::super::parse_query(Some(query));
+            normalized_index_as_band_math(&mut pq, ext);
+            (pq.algorithm, pq.expr_raw, pq.rescale)
+        };
+        let math = (None, Some("(b2-b1)/(b2+b1)".to_string()));
+        let (algorithm, expression, rescale) = asked("assets=red&assets=nir&algorithm=normalizedIndex", Some("png"));
+        assert_eq!((algorithm, expression), math.clone());
+        assert_eq!(rescale, vec![(-1.0, 1.0)]);
+        // A range asked for is kept; without an extension the picture is still a picture.
+        let (algorithm, expression, rescale) = asked("assets=red&assets=nir&algorithm=normalizedIndex&rescale=0,1", None);
+        assert_eq!((algorithm, expression), math);
+        assert_eq!(rescale, vec![(0.0, 1.0)]);
+        // One asset is the renderer's; an array keeps the algorithm's float32; band math asked for wins.
+        for (query, ext) in [
+            ("assets=visual&algorithm=normalizedIndex", Some("png")),
+            ("assets=red&assets=nir&algorithm=normalizedIndex", Some("npy")),
+            ("assets=red&assets=nir&algorithm=normalizedIndex&format=tif", None),
+            ("assets=red&assets=nir&algorithm=normalizedIndex&expression=b1", Some("png")),
+            ("assets=red&assets=nir&algorithm=hillshade", Some("png")),
+        ] {
+            let (algorithm, _, _) = asked(query, ext);
+            assert!(algorithm.is_some(), "{query}");
+        }
     }
 
     #[test]

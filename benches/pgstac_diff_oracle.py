@@ -559,6 +559,12 @@ def main() -> int:
                 f"/searches/{sid}/bbox/930000,5700000,960000,5730000/200x200.png?coord_crs=epsg:3857&assets=red&algorithm=contours")
         o.check("bbox drawn in metres, terrarium", "image",
                 f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/200x200.png?dst_crs=epsg:3857&assets=red&algorithm=terrarium")
+        # normalizedIndex over two assets is rio-tiler's band math of the first two bands.
+        ndi = "assets=red&assets=nir&algorithm=normalizedIndex"
+        o.check("normalizedIndex over two assets", "image", f"{base12}.png?{ndi}&rescale=-1,1")
+        o.check("normalizedIndex over two assets as bands, a colour map", "image", f"{base12}.png?{ndi}&asset_as_band=true&rescale=-1,1&colormap_name=rdylgn")
+        o.check("normalizedIndex over two assets, highest", "image", f"{base12}.png?{ndi}&rescale=0,1&pixel_selection=highest")
+        o.check("bbox, normalizedIndex over two assets", "image", f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.png?{ndi}&rescale=-1,1")
         o.check("algorithm parameters of the wrong type", "status",
                 f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%22x%22%7D")
         # Band math read with a smoothing resampling: whole numbers stay whole, rescaled is bytes.
