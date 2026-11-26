@@ -460,7 +460,7 @@ impl ExprProgram {
                             let d = stack[base + i] as f64 - mean;
                             sq += d * d;
                         }
-                        let var = sq / ((k - 1) as f64);
+                        let var = sq / (k as f64);
                         if matches!(op, Op::Std(_)) {
                             var.sqrt() as f32
                         } else {
@@ -960,7 +960,7 @@ impl ExprProgram {
                                 let d = stack[base + j][i] as f64 - mean;
                                 sq += d * d;
                             }
-                            let var = sq / ((k - 1) as f64);
+                            let var = sq / (k as f64);
                             if is_std { var.sqrt() as f32 } else { var as f32 }
                         };
                     }
@@ -1478,6 +1478,16 @@ mod tests {
         let std1 = ExprProgram::compile("std(b1)").unwrap();
         assert_eq!(std1.eval(&[42.0]), 0.0);
         assert!(std1.eval(&[f32::NAN]).is_nan());
+        // Audit #68 #1: population variance/stdev (ddof=0) matching numpy.var / numpy.std
+        let var2 = ExprProgram::compile("var(b1, b2)").unwrap();
+        let std2 = ExprProgram::compile("std(b1, b2)").unwrap();
+        assert!((var2.eval(&[10.0, 20.0]) - 25.0).abs() < 1e-6);
+        assert!((std2.eval(&[10.0, 20.0]) - 5.0).abs() < 1e-6);
+        let mut r_out = [0.0f32; 4];
+        var2.eval_row::<4>(&[[10.0; 4], [20.0; 4]], &mut r_out);
+        assert!((r_out[0] - 25.0).abs() < 1e-6);
+        std2.eval_row::<4>(&[[10.0; 4], [20.0; 4]], &mut r_out);
+        assert!((r_out[0] - 5.0).abs() < 1e-6);
         let mut rows = [[0.0f32; 256]; 3];
         for i in 0..256 {
             rows[0][i] = if i % 17 == 0 { f32::NAN } else if i == 5 { 0.0 } else { (i as f32 + 1.0) * 0.01 };

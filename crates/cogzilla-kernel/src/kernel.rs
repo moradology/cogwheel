@@ -1068,9 +1068,9 @@ fn sample_footprint_exact(
     }
 
     let ix0 = x0.floor() as i32;
-    let ix1 = (x1 - 1e-12).floor() as i32;
+    let ix1 = x1.next_down().floor() as i32;
     let iy0 = y0.floor() as i32;
-    let iy1 = (y1 - 1e-12).floor() as i32;
+    let iy1 = y1.next_down().floor() as i32;
 
     // Fast 1-pixel path: exact 1:1 overview read or upsampling strictly inside one source pixel.
     if ix0 == ix1 && iy0 == iy1 {
@@ -1315,16 +1315,41 @@ pub fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
             )
         }
         CoordPlan::Exact2D { u, v, .. } => {
-            let mid = N / 2;
-            let i00 = mid * N + mid;
-            let i10 = i00 + 1;
-            let i01 = (mid + 1).min(N - 1) * N + mid;
-            let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
-            let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
-            (
-                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
-                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
-            )
+            if N <= 1 {
+                return (1.0, 1.0);
+            }
+            let probe = |py: usize, px: usize| -> Option<(f32, f32)> {
+                let i00 = py * N + px;
+                let i10 = i00 + 1;
+                let i01 = (py + 1) * N + px;
+                let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
+                let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
+                if sx.is_finite() && sx > 1e-4 && sy.is_finite() && sy > 1e-4 {
+                    Some((sx, sy))
+                } else {
+                    None
+                }
+            };
+            let mid = (N / 2).min(N - 2);
+            if let Some(s) = probe(mid, mid) {
+                return s;
+            }
+            let step = (N / 16).max(1);
+            for py in (0..N - 1).step_by(step) {
+                for px in (0..N - 1).step_by(step) {
+                    if let Some(s) = probe(py, px) {
+                        return s;
+                    }
+                }
+            }
+            for py in 0..N - 1 {
+                for px in 0..N - 1 {
+                    if let Some(s) = probe(py, px) {
+                        return s;
+                    }
+                }
+            }
+            (1.0, 1.0)
         }
     }
 }
@@ -2039,7 +2064,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                                 row_idx[px] = 0;
                             } else {
                                 let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                                row_idx[px] = 1 + (t as u8);
+                                row_idx[px] = 1 + (t.round() as u8);
                             }
                         });
                         filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
@@ -3867,41 +3892,75 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
             out.freeze()
         }
         OutputFormat::Png => {
-            let lut: &ColormapLut = style.colormap.lut();
-            let plte = build_plte_nodata(lut);
-            let inv_range_254 = 254.0 / range;
-            SCRATCH.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let sc = &mut *guard;
-                let stride = 1 + N;
-                let total = N * stride;
-                if sc.img_buf.len() < total {
-                    sc.img_buf.resize(total, 0);
-                }
-                if sc.row_buf.len() < N {
-                    sc.row_buf.resize(N, 0);
-                }
-                for py in 0..N {
-                    let row_idx = &mut sc.row_buf[..N];
-                    for_each_pixel_in_row(plan, py, |px, u, v| {
-                        let val = eval_uv(u, v);
-                        row_idx[px] = if val.is_nan() {
-                            0
-                        } else {
-                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                            1 + (t as u8)
-                        };
-                    });
-                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
-                }
-                encode_indexed_png(
-                    N as u32,
-                    N as u32,
-                    &plte,
-                    Some(&[0u8]),
-                    &sc.img_buf[..total],
-                )
-            })
+            if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
+                    }
+                    if sc.row_buf.len() < N * 2 {
+                        sc.row_buf.resize(N * 2, 0);
+                    }
+                    for py in 0..N {
+                        let row_ga = &mut sc.row_buf[..N * 2];
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let val = eval_uv(u, v);
+                            let off = px * 2;
+                            if val.is_nan() {
+                                row_ga[off] = 0;
+                                row_ga[off + 1] = 0;
+                            } else {
+                                row_ga[off] = rescale_u8(val, inv_range, min_val);
+                                row_ga[off + 1] = 255;
+                            }
+                        });
+                        filter_sub_ga_row(
+                            row_ga,
+                            &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride],
+                        );
+                    }
+                    encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
+                })
+            } else {
+                let lut: &ColormapLut = style.colormap.lut();
+                let plte = build_plte_nodata(lut);
+                let inv_range_254 = 254.0 / range;
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let stride = 1 + N;
+                    let total = N * stride;
+                    if sc.img_buf.len() < total {
+                        sc.img_buf.resize(total, 0);
+                    }
+                    if sc.row_buf.len() < N {
+                        sc.row_buf.resize(N, 0);
+                    }
+                    for py in 0..N {
+                        let row_idx = &mut sc.row_buf[..N];
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let val = eval_uv(u, v);
+                            row_idx[px] = if val.is_nan() {
+                                0
+                            } else {
+                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
+                                1 + (t.round() as u8)
+                            };
+                        });
+                        filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                    }
+                    encode_indexed_png(
+                        N as u32,
+                        N as u32,
+                        &plte,
+                        Some(&[0u8]),
+                        &sc.img_buf[..total],
+                    )
+                })
+            }
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
             let lut: &ColormapLut = style.colormap.lut();
@@ -4036,20 +4095,21 @@ pub fn render_sar_rgb<const N: usize>(
 
     match style.format {
         OutputFormat::RawF32 | OutputFormat::Npy => {
-            let mut out = BytesMut::with_capacity(N * N * 3 * 4);
-            let mut g_plane = Vec::with_capacity(N * N * 4);
-            let mut b_plane = Vec::with_capacity(N * N * 4);
+            let plane_bytes = N * N * 4;
+            let mut out = vec![0u8; plane_bytes * 3];
+            let (r_plane, rest) = out.split_at_mut(plane_bytes);
+            let (g_plane, b_plane) = rest.split_at_mut(plane_bytes);
             for py in 0..N {
-                for_each_pixel_in_row(plan, py, |_px, u, v| {
+                let row_off = py * N;
+                for_each_pixel_in_row(plan, py, |px, u, v| {
                     let (r, g, b) = sample_pair(u, v);
-                    out.put_slice(&r.to_le_bytes());
-                    g_plane.extend_from_slice(&g.to_le_bytes());
-                    b_plane.extend_from_slice(&b.to_le_bytes());
+                    let off = (row_off + px) * 4;
+                    r_plane[off..off + 4].copy_from_slice(&r.to_le_bytes());
+                    g_plane[off..off + 4].copy_from_slice(&g.to_le_bytes());
+                    b_plane[off..off + 4].copy_from_slice(&b.to_le_bytes());
                 });
             }
-            out.put_slice(&g_plane);
-            out.put_slice(&b_plane);
-            out.freeze()
+            Bytes::from(out)
         }
         OutputFormat::Png => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
@@ -4423,42 +4483,78 @@ pub fn render_expr_vm<const N: usize>(
             out.freeze()
         }
         OutputFormat::Png => {
-            let lut: &ColormapLut = style.colormap.lut();
-            let plte = build_plte_nodata(lut);
-            SCRATCH.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let sc = &mut *guard;
-                let stride = 1 + N;
-                let total = N * stride;
-                if sc.img_buf.len() < total {
-                    sc.img_buf.resize(total, 0);
-                }
-                if sc.row_buf.len() < N {
-                    sc.row_buf.resize(N, 0);
-                }
-                for py in 0..N {
-                    sample_row(py, &mut band_rows);
-                    eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
-                    let row_idx = &mut sc.row_buf[..N];
-                    for px in 0..N {
-                        let val = out_row[px];
-                        row_idx[px] = if val.is_nan() {
-                            0
-                        } else {
-                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                            1 + (t as u8)
-                        };
+            if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
                     }
-                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
-                }
-                encode_indexed_png(
-                    N as u32,
-                    N as u32,
-                    &plte,
-                    Some(&[0u8]),
-                    &sc.img_buf[..total],
-                )
-            })
+                    if sc.row_buf.len() < N * 2 {
+                        sc.row_buf.resize(N * 2, 0);
+                    }
+                    for py in 0..N {
+                        sample_row(py, &mut band_rows);
+                        eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
+                        let row_ga = &mut sc.row_buf[..N * 2];
+                        for px in 0..N {
+                            let val = out_row[px];
+                            let off = px * 2;
+                            if val.is_nan() {
+                                row_ga[off] = 0;
+                                row_ga[off + 1] = 0;
+                            } else {
+                                row_ga[off] = rescale_u8(val, inv_range, min_val);
+                                row_ga[off + 1] = 255;
+                            }
+                        }
+                        filter_sub_ga_row(
+                            row_ga,
+                            &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride],
+                        );
+                    }
+                    encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
+                })
+            } else {
+                let lut: &ColormapLut = style.colormap.lut();
+                let plte = build_plte_nodata(lut);
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let stride = 1 + N;
+                    let total = N * stride;
+                    if sc.img_buf.len() < total {
+                        sc.img_buf.resize(total, 0);
+                    }
+                    if sc.row_buf.len() < N {
+                        sc.row_buf.resize(N, 0);
+                    }
+                    for py in 0..N {
+                        sample_row(py, &mut band_rows);
+                        eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
+                        let row_idx = &mut sc.row_buf[..N];
+                        for px in 0..N {
+                            let val = out_row[px];
+                            row_idx[px] = if val.is_nan() {
+                                0
+                            } else {
+                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
+                                1 + (t.round() as u8)
+                            };
+                        }
+                        filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                    }
+                    encode_indexed_png(
+                        N as u32,
+                        N as u32,
+                        &plte,
+                        Some(&[0u8]),
+                        &sc.img_buf[..total],
+                    )
+                })
+            }
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
             let lut: &ColormapLut = style.colormap.lut();
@@ -4695,27 +4791,29 @@ pub fn render_terrain_tile<const N: usize>(
             }
         }),
         OutputFormat::RawF32 | OutputFormat::Npy => {
-            let mut r_plane = BytesMut::with_capacity(N * N * 4);
-            let mut g_plane = Vec::with_capacity(N * N * 4);
-            let mut b_plane = Vec::with_capacity(N * N * 4);
+            let plane_bytes = N * N * 4;
+            let mut out = vec![0u8; plane_bytes * 3];
+            let (r_plane, rest) = out.split_at_mut(plane_bytes);
+            let (g_plane, b_plane) = rest.split_at_mut(plane_bytes);
             for py in 0..N {
-                for_each_pixel_in_row(plan, py, |_px, u, v| {
+                let row_off = py * N;
+                for_each_pixel_in_row(plan, py, |px, u, v| {
                     let elev = sample_px(u, v);
+                    let off = (row_off + px) * 4;
                     if elev.is_nan() {
-                        r_plane.put_slice(&f32::NAN.to_le_bytes());
-                        g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
-                        b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
+                        let nan_b = f32::NAN.to_le_bytes();
+                        r_plane[off..off + 4].copy_from_slice(&nan_b);
+                        g_plane[off..off + 4].copy_from_slice(&nan_b);
+                        b_plane[off..off + 4].copy_from_slice(&nan_b);
                     } else {
                         let [r, g, b] = encode_px(elev);
-                        r_plane.put_slice(&(r as f32).to_le_bytes());
-                        g_plane.extend_from_slice(&(g as f32).to_le_bytes());
-                        b_plane.extend_from_slice(&(b as f32).to_le_bytes());
+                        r_plane[off..off + 4].copy_from_slice(&(r as f32).to_le_bytes());
+                        g_plane[off..off + 4].copy_from_slice(&(g as f32).to_le_bytes());
+                        b_plane[off..off + 4].copy_from_slice(&(b as f32).to_le_bytes());
                     }
                 });
             }
-            r_plane.put_slice(&g_plane);
-            r_plane.put_slice(&b_plane);
-            r_plane.freeze()
+            Bytes::from(out)
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } if clean => {
             SCRATCH.with(|cell| {
@@ -5366,6 +5464,9 @@ pub fn render_dem_algorithm<const N: usize>(
                                 &mut sc.img_buf[py * stride..(py + 1) * stride],
                             );
                         }
+                        if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                            return encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total]);
+                        }
                         let plte = build_plte_opaque(lut);
                         return encode_indexed_png(
                             N as u32,
@@ -5376,6 +5477,8 @@ pub fn render_dem_algorithm<const N: usize>(
                         );
                     }
                 }
+                let is_opaque_dem = clean && !matches!(alg, DemAlgorithm::Aspect);
+                let inv_range_254 = inv_range * (254.0 / 255.0);
                 for py in 0..N {
                     let r0 = py * pad;
                     let r1 = (py + 1) * pad;
@@ -5399,20 +5502,22 @@ pub fn render_dem_algorithm<const N: usize>(
                         if val.is_nan() {
                             has_nodata = true;
                             row_idx[px] = 0;
+                        } else if is_opaque_dem {
+                            row_idx[px] = rescale_u8(val, inv_range, min_val);
                         } else {
-                            let idx = rescale_u8(val, inv_range, min_val);
-                            row_idx[px] = if clean && !matches!(alg, DemAlgorithm::Aspect) {
-                                idx
-                            } else {
-                                idx.max(1)
-                            };
+                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
+                            row_idx[px] = 1 + (t.round() as u8);
                         }
                     }
                     filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
-                if !has_nodata && clean && !matches!(alg, DemAlgorithm::Aspect) {
-                    let plte = build_plte_opaque(lut);
-                    encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                if !has_nodata && is_opaque_dem {
+                    if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                        encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
+                    } else {
+                        let plte = build_plte_opaque(lut);
+                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                    }
                 } else {
                     let plte = build_plte_nodata(lut);
                     let trns = has_nodata.then_some(&[0u8][..]);
@@ -6732,5 +6837,42 @@ mod npy_typed_tests {
             hs.iter().all(|&b| b == hs[0] && b != 0xEE),
             "tail pixel in eval_horn_hillshade_row_clean::<5> was not written: {hs:?}"
         );
+    }
+
+    #[test]
+    fn exact2d_coord_plan_scale_handles_nan_center_and_n1() {
+        // Audit #68 #2: N == 1 must not panic OOB
+        let plan1 = CoordPlan::Exact2D {
+            u: vec![5.0].into_boxed_slice(),
+            v: vec![5.0].into_boxed_slice(),
+            all_in_bounds: true,
+            src_min_col: 0,
+            src_max_col: 10,
+            src_min_row: 0,
+            src_max_row: 10,
+        };
+        assert_eq!(coord_plan_scale::<1>(&plan1), (1.0, 1.0));
+
+        // Exact2D with NaN center (N/2, N/2) but valid 16x downscale in top-left quadrant
+        let n = 8usize;
+        let mut u = vec![f32::NAN; n * n];
+        let mut v = vec![f32::NAN; n * n];
+        for py in 0..3 {
+            for px in 0..3 {
+                u[py * n + px] = (px as f32) * 16.0;
+                v[py * n + px] = (py as f32) * 16.0;
+            }
+        }
+        let plan8 = CoordPlan::Exact2D {
+            u: u.into_boxed_slice(),
+            v: v.into_boxed_slice(),
+            all_in_bounds: false,
+            src_min_col: 0,
+            src_max_col: 48,
+            src_min_row: 0,
+            src_max_row: 48,
+        };
+        let (sx, sy) = coord_plan_scale::<8>(&plan8);
+        assert!((sx - 16.0).abs() < 1e-4 && (sy - 16.0).abs() < 1e-4, "got ({sx}, {sy})");
     }
 }
