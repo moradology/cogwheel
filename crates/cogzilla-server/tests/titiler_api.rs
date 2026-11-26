@@ -4050,3 +4050,194 @@ async fn audit55_admin_clear_cache_and_mosaic_tile_cache_freshness() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn sweep26_dd1_antimeridian_bbox_and_dd2_partial_polygon_valid_percent() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_sweep26_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // --- DD1 fixture: EPSG:32701 (UTM 1S, central meridian 177W) spanning ~179E..176W, 16S..18S ---
+    // At 179E, 16S -> UTM 1S easting ~ 72_000, northing ~ 8_230_000.
+    // 500 m pixels x 1024 cols = 512 km (~4.8 deg) -> crosses 180 deg into 176W.
+    let am_w = 1024u32;
+    let am_h = 512u32;
+    let mut am_px = Vec::with_capacity((am_w * am_h) as usize);
+    for _r in 0..am_h {
+        for c in 0..am_w {
+            am_px.push((c + 1) as f32);
+        }
+    }
+    let am_path = tmp.join("am32701.tif");
+    write_synthetic_f32_projected_geotiff(
+        &am_path,
+        am_w,
+        am_h,
+        32701,
+        70_000.0,
+        8_230_000.0,
+        500.0,
+        &am_px,
+    );
+
+    // --- DD2 fixture: 64x64 EPSG:32610 (10 m pixels, x in 500000..500640, y in 4200000..4200640) ---
+    let z_path = tmp.join("dd2_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &z_path,
+        64,
+        64,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &vec![42.0f32; 64 * 64],
+    );
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let am_url = am_path.to_string_lossy().to_string();
+    let z_url = z_path.to_string_lossy().to_string();
+
+    // DD1a: /cog/bbox/{west>east}.npy must match {west,south,east+360,north}.npy byte-for-byte
+    let r_wrap = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_wrap.status(), 200, "DD1: geographic west>east bbox must succeed");
+    let b_wrap = r_wrap.bytes().await.unwrap();
+    let r_unwrap = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,181.5,-16.5.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_unwrap.status(), 200);
+    let b_unwrap = r_unwrap.bytes().await.unwrap();
+    assert_eq!(b_wrap, b_unwrap, "DD1: wrapped and +360 unwrapped /cog/bbox must match identically");
+
+    // DD1b: /cog/bbox/{west>east}/200x100.npy must match {west,south,east+360,north}/200x100.npy
+    let r_wrap_wh = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5/200x100.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_wrap_wh.status(), 200);
+    let b_wrap_wh = r_wrap_wh.bytes().await.unwrap();
+    let r_unwrap_wh = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,181.5,-16.5/200x100.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_unwrap_wh.status(), 200);
+    let b_unwrap_wh = r_unwrap_wh.bytes().await.unwrap();
+    assert_eq!(b_wrap_wh, b_unwrap_wh, "DD1: wrapped and +360 /cog/bbox/200x100 must match identically");
+
+    // DD1c: /cog/map?bbox=179.5,-17.5,-178.5,-16.5 must match 181.5 form
+    let r_map_wrap = client
+        .get(format!(
+            "{base}/cog/map?url={am_url}&bbox=179.5,-17.5,-178.5,-16.5&width=64&height=32&format=npy"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_map_wrap.status(), 200);
+    let b_map_wrap = r_map_wrap.bytes().await.unwrap();
+    let r_map_unwrap = client
+        .get(format!(
+            "{base}/cog/map?url={am_url}&bbox=179.5,-17.5,181.5,-16.5&width=64&height=32&format=npy"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_map_unwrap.status(), 200);
+    assert_eq!(b_map_wrap, r_map_unwrap.bytes().await.unwrap());
+
+    // DD1d: projected coord_crs with minx > maxx must return 400 with one clear message
+    for path in [
+        format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5.npy?url={am_url}&coord_crs=EPSG:3857"),
+        format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5/200x100.npy?url={am_url}&coord_crs=EPSG:3857"),
+    ] {
+        let r_proj = client.get(&path).send().await.unwrap();
+        assert_eq!(r_proj.status(), 400, "projected minx>maxx must return 400 for {path}");
+        let msg = r_proj.text().await.unwrap();
+        assert!(
+            msg.contains("minx") && msg.contains("maxx"),
+            "projected minx>maxx 400 must clearly name minx and maxx, got: {msg}"
+        );
+    }
+
+    // DD2a: fully inside polygon stays at valid_percent == 100.0, masked_pixels == 0.0
+    let poly_inside = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_100.0, 4_200_100.0],
+                [500_300.0, 4_200_100.0],
+                [500_300.0, 4_200_300.0],
+                [500_100.0, 4_200_300.0],
+                [500_100.0, 4_200_100.0]
+            ]]
+        }
+    });
+    let r_in = client
+        .post(format!("{base}/cog/statistics?url={z_url}&coord_crs=EPSG:32610&max_size=0"))
+        .header("content-type", "application/json")
+        .body(poly_inside.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_in.status(), 200);
+    let j_in: serde_json::Value = serde_json::from_str(&r_in.text().await.unwrap()).unwrap();
+    let b_in = &j_in["properties"]["statistics"]["b1"];
+    assert_eq!(b_in["valid_percent"].as_f64().unwrap(), 100.0);
+    assert_eq!(b_in["masked_pixels"].as_f64().unwrap(), 0.0);
+
+    // DD2b: half-inside, half-off-file polygon (40x20 = 800 px, 400 px inside file):
+    // native path must report valid_percent == 50.0 and masked_pixels == 400.0 (matching width/height).
+    let poly_half = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_440.0, 4_200_100.0],
+                [500_840.0, 4_200_100.0],
+                [500_840.0, 4_200_300.0],
+                [500_440.0, 4_200_300.0],
+                [500_440.0, 4_200_100.0]
+            ]]
+        }
+    });
+    let r_half = client
+        .post(format!("{base}/cog/statistics?url={z_url}&coord_crs=EPSG:32610&max_size=0"))
+        .header("content-type", "application/json")
+        .body(poly_half.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_half.status(), 200);
+    let j_half: serde_json::Value = serde_json::from_str(&r_half.text().await.unwrap()).unwrap();
+    let b_half = &j_half["properties"]["statistics"]["b1"];
+    assert!(
+        (b_half["count"].as_f64().unwrap() - 400.0).abs() < 1e-4,
+        "expected count 400, got {b_half}"
+    );
+    assert!(
+        (b_half["valid_percent"].as_f64().unwrap() - 50.0).abs() < 1e-4,
+        "DD2: expected valid_percent 50.0 for half-off-file polygon, got {b_half}"
+    );
+    assert!(
+        (b_half["masked_pixels"].as_f64().unwrap() - 400.0).abs() < 1e-4,
+        "DD2: expected masked_pixels 400.0 for half-off-file polygon, got {b_half}"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

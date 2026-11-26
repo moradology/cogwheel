@@ -891,9 +891,40 @@ pub fn compute_weighted_band_stats(
         area_weighted,
         ZonalGeomKind::Polygon,
         None,
+        None,
         description,
         opts,
     )
+}
+
+/// Exact shoelace area (in squared native IFD pixels) of a single polygon ring.
+fn ring_area_px(ring: &[(f64, f64)]) -> f64 {
+    if ring.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    for i in 0..ring.len() {
+        let (x0, y0) = ring[i];
+        let (x1, y1) = ring[(i + 1) % ring.len()];
+        sum += x0 * y1 - x1 * y0;
+    }
+    0.5 * sum.abs()
+}
+
+/// Total unclipped area (in squared native IFD pixels) of a polygon / MultiPolygon in IFD pixel
+/// coordinates, including any portion extending outside the raster extent.
+fn polygon_total_area_px(polys_px: &[Vec<Vec<(f64, f64)>>]) -> f64 {
+    let mut total = 0.0_f64;
+    for poly in polys_px {
+        if let Some(outer) = poly.first() {
+            let mut a = ring_area_px(outer);
+            for hole in poly.iter().skip(1) {
+                a -= ring_area_px(hole);
+            }
+            total += a.max(0.0);
+        }
+    }
+    total
 }
 
 #[inline(always)]
@@ -973,6 +1004,7 @@ pub fn compute_weighted_band_stats_with_geom(
     area_weighted: bool,
     geom_kind: ZonalGeomKind,
     line_len_m: Option<&[f64]>,
+    total_geom_area_px: Option<f64>,
     description: &str,
     opts: &StatsOptions,
 ) -> serde_json::Value {
@@ -1195,7 +1227,10 @@ pub fn compute_weighted_band_stats_with_geom(
     if valid_pixels == 0 || w_total <= 0.0 {
         let mut empty = compute_f32_band_stats(&[], description, opts);
         if let Some(obj) = empty.as_object_mut() {
-            obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels as f64));
+            let masked_out = total_geom_area_px
+                .filter(|&a| a > COV_EPS)
+                .unwrap_or(masked_pixels as f64);
+            obj.insert("masked_pixels".into(), serde_json::json!(masked_out));
             match geom_kind {
                 ZonalGeomKind::Polygon => {
                     obj.insert("area".into(), serde_json::json!(0.0));
@@ -1237,11 +1272,23 @@ pub fn compute_weighted_band_stats_with_geom(
     };
     let std = (var_acc / w_total).max(0.0).sqrt();
 
-    let total_touched = valid_pixels + masked_pixels;
-    let valid_percent = if total_touched > 0 {
-        ((valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+    let (valid_percent, masked_pixels_out) = if let Some(poly_area) = total_geom_area_px
+        && poly_area > COV_EPS
+    {
+        let diff = (poly_area - count_cov).max(0.0);
+        if masked_pixels == 0 && diff <= 1e-6 * poly_area.max(1.0) {
+            (100.0, 0.0)
+        } else {
+            (((count_cov / poly_area) * 100.0).clamp(0.0, 100.0), diff)
+        }
     } else {
-        0.0
+        let total_touched = valid_pixels + masked_pixels;
+        let vp = if total_touched > 0 {
+            ((valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        (vp, masked_pixels as f64)
     };
 
     // Radix-sort once for weighted quantiles, unique count, majority/minority, and histogram.
@@ -1539,7 +1586,7 @@ pub fn compute_weighted_band_stats_with_geom(
         obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
     }
     obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
-    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels as f64));
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels_out));
     obj.insert("valid_pixels".into(), serde_json::json!(valid_pixels as f64));
     match geom_kind {
         ZonalGeomKind::Polygon => {
@@ -2011,6 +2058,8 @@ pub async fn compute_native_exact_polygon_stats(
         ZonalGeomKind::Point
     };
     let compute_cpu = move || -> serde_json::Value {
+        let total_poly_area_px =
+            (geom_kind == ZonalGeomKind::Polygon).then(|| polygon_total_area_px(&polys_px));
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
         let line_len_m = if geom_kind == ZonalGeomKind::Line {
             Some(rasterize_line_geodesic_lengths_m(
@@ -2075,6 +2124,7 @@ pub async fn compute_native_exact_polygon_stats(
                         opts_owned.area_weighted,
                         geom_kind,
                         line_len_m.as_deref(),
+                        total_poly_area_px,
                         desc,
                         &opts_owned,
                     ),
@@ -2147,6 +2197,7 @@ pub async fn compute_native_exact_polygon_stats(
                         opts_owned.area_weighted,
                         geom_kind,
                         line_len_m.as_deref(),
+                        total_poly_area_px,
                         &desc,
                         &opts_owned,
                     ),
@@ -2171,6 +2222,7 @@ pub async fn compute_native_exact_polygon_stats(
                         opts_owned.area_weighted,
                         geom_kind,
                         line_len_m.as_deref(),
+                        total_poly_area_px,
                         &desc,
                         &opts_owned,
                     ),
@@ -2496,6 +2548,8 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let opts_owned = opts.clone();
     let exprs_owned = exprs.to_vec();
     let compute_cpu = move || -> serde_json::Value {
+        let total_poly_area_px =
+            (geom_kind == ZonalGeomKind::Polygon).then(|| polygon_total_area_px(&polys_px));
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
         let line_len_m = if geom_kind == ZonalGeomKind::Line {
             Some(rasterize_line_geodesic_lengths_m(
@@ -2559,6 +2613,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                     opts_owned.area_weighted,
                     geom_kind,
                     line_len_m.as_deref(),
+                    total_poly_area_px,
                     desc,
                     &opts_owned,
                 ),
@@ -2858,6 +2913,7 @@ mod tests {
             true,
             ZonalGeomKind::Point,
             None,
+            None,
             "b1",
             &opts,
         );
@@ -2876,6 +2932,7 @@ mod tests {
             true,
             ZonalGeomKind::Line,
             Some(&line_len_m),
+            None,
             "b1",
             &opts,
         );

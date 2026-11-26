@@ -174,10 +174,51 @@ fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
         parts[2].trim().parse::<f64>().ok()?,
         parts[3].trim().parse::<f64>().ok()?,
     ];
-    if !b.iter().all(|v| v.is_finite()) || b[0] >= b[2] || b[1] >= b[3] {
+    if !b.iter().all(|v| v.is_finite()) {
         return None;
     }
     Some((b, ext))
+}
+
+/// Validate and normalize a parsed bbox `[minx, miny, maxx, maxy]` against its coordinate CRS.
+/// - For geographic `coord_crs` (`None` or `CrsModel::Geographic`), `minx > maxx` with longitudes
+///   in `[-180, 180]` is unwrapped across the antimeridian per RFC 7946 §5.2 (`maxx += 360.0`),
+///   producing the exact same bbox as the `[minx, miny, maxx + 360, maxy]` form.
+/// - For projected `coord_crs`, `minx >= maxx` is rejected with `400 Bad Request` stating that
+///   `minx` must be less than `maxx`.
+fn resolve_input_bbox(
+    mut bbox: [f64; 4],
+    coord_crs: Option<&cogzilla_proj::CrsModel>,
+) -> Result<[f64; 4], EngineError> {
+    if !bbox.iter().all(|v| v.is_finite()) {
+        return Err(EngineError::BadRequest(
+            "invalid bbox: coordinates must be finite".into(),
+        ));
+    }
+    if bbox[1] >= bbox[3] {
+        return Err(EngineError::BadRequest(format!(
+            "invalid bbox: miny ({}) must be less than maxy ({})",
+            bbox[1], bbox[3]
+        )));
+    }
+    let is_geo = matches!(coord_crs, None | Some(cogzilla_proj::CrsModel::Geographic));
+    if bbox[0] > bbox[2] {
+        if is_geo && bbox[0] >= -180.0 && bbox[0] <= 180.0 && bbox[2] >= -180.0 && bbox[2] <= 180.0
+        {
+            bbox[2] += 360.0;
+        } else {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: minx ({}) must be less than maxx ({})",
+                bbox[0], bbox[2]
+            )));
+        }
+    } else if bbox[0] == bbox[2] {
+        return Err(EngineError::BadRequest(format!(
+            "invalid bbox: minx ({}) must be less than maxx ({})",
+            bbox[0], bbox[2]
+        )));
+    }
+    Ok(bbox)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5541,8 +5582,9 @@ where
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let assets: Vec<String> = if let Some(b) = pq.bbox_param {
-                    let [mx0, my0, mx1, my1] = crate::catalog::wgs84_bbox_to_3857(b);
-                    mj.query_bbox_3857(mx0, my0, mx1, my1)
+                    let b = resolve_input_bbox(b, pq.coord_crs.as_ref())?;
+                    let wgs_bbox = bbox_to_wgs84(b, pq.coord_crs.as_ref())?;
+                    query_mosaicjson_wgs84_bbox(&mj, wgs_bbox)
                 } else {
                     let [mx0, my0, mx1, my1] = crate::catalog::wgs84_bbox_to_3857(mj.bounds);
                     mj.query_bbox_3857(mx0, my0, mx1, my1)
@@ -5609,9 +5651,10 @@ where
             }
             .await,
             ["mosaicjson", "bbox", bbox_seg] => async {
-                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
@@ -5641,9 +5684,10 @@ where
             }
             .await,
             ["mosaicjson", "bbox", bbox_seg, "assets"] => async {
-                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
@@ -5652,9 +5696,10 @@ where
             }
             .await,
             ["mosaicjson", "bbox", bbox_seg, dims_ext] => async {
-                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
@@ -7579,6 +7624,8 @@ where
                     .or_else(|| pq_stac.bounds_crs.clone())
                     .unwrap_or((cogzilla_proj::CrsModel::Geographic, 4326));
                 let out_bbox = if let Some(raw_bbox) = pq_stac.bbox_param {
+                    let raw_bbox =
+                        resolve_input_bbox(raw_bbox, pq_stac.bbox_crs.as_ref().map(|(c, _)| c))?;
                     if pq_stac.bbox_crs.as_ref().map(|(_, e)| *e) == Some(dst_epsg)
                         || (pq_stac.bbox_crs.is_none() && dst_epsg == 4326)
                     {
@@ -8214,9 +8261,10 @@ where
 
             // GET /stac/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{ext}]
             (Method::GET, ["bbox", bbox_seg]) => async {
-                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
@@ -8307,9 +8355,10 @@ where
             }
             .await,
             (Method::GET, ["bbox", bbox_seg, dims_ext]) => async {
-                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
@@ -9398,6 +9447,8 @@ where
                     .clone()
                     .unwrap_or((native_crs.clone(), native_epsg));
                 let (wgs_bbox, out_bbox) = if let Some(raw_bbox) = pq.bbox_param {
+                    let raw_bbox =
+                        resolve_input_bbox(raw_bbox, pq.bbox_crs.as_ref().map(|(c, _)| c))?;
                     let wb = bbox_to_wgs84(
                         raw_bbox,
                         pq.bbox_crs.as_ref().map(|(c, _)| c),
@@ -9774,9 +9825,10 @@ where
 
             // 12. GET /cog/bbox/{minx},{miny},{maxx},{maxy}[.{format}] & /cog/bbox/{...}/{w}x{h}.{format}
             (Method::GET, ["bbox", bbox_seg]) => async {
-                let Some((bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, ext_opt)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("expected /cog/bbox/{minx},{miny},{maxx},{maxy}.{ext}".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
@@ -9857,9 +9909,10 @@ where
             }
             .await,
             (Method::GET, ["bbox", bbox_seg, dims_ext]) => async {
-                let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
+                let Some((raw_bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox coordinates".into()));
                 };
+                let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
