@@ -2429,6 +2429,113 @@ fn compute_statistics_cpu(
         );
     }
 
+    // 1-pass fused GPU fast path for unmasked float/int `/cog/statistics`:
+    // skips CPU pixel extraction and per-band Vec<f32> allocations completely, and
+    // submits multi-band requests concurrently so GpuCoalescer packs all bands into 1 submit.
+    #[cfg(feature = "gpu")]
+    {
+        let tile_masks_none = match &fetched {
+            StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => {
+                tile_masks.is_none()
+            }
+        };
+        if poly_mask.is_none()
+            && tile_masks_none
+            && !opts.categorical
+            && opts.histogram_edges.is_none()
+            && !matches!(
+                ifd.sample_type,
+                cogzilla_tiff::SampleType::Uint8 | cogzilla_tiff::SampleType::Uint16
+            )
+            && let Some(gpu_ref) = gpu
+        {
+            let alpha_idx = cogzilla_codec::alpha_channel_index(count, &ifd.extra_samples);
+            let selected_bands: Option<&[u16]> = opts.bidx.as_deref().filter(|b| !b.is_empty());
+            let sel_bands: Vec<usize> = (0..count)
+                .filter(|&b| {
+                    let b1 = (b + 1) as u16;
+                    if let Some(sel) = selected_bands {
+                        sel.contains(&b1)
+                    } else {
+                        Some(b) != alpha_idx
+                    }
+                })
+                .collect();
+            let (u_cols, v_rows) = build_stats_separable_coords(ifd, step, &tile_xs, &tile_ys);
+            if !sel_bands.is_empty()
+                && u_cols.len().saturating_mul(v_rows.len()) == total_pixels
+                && !u_cols.is_empty()
+                && !v_rows.is_empty()
+            {
+                let coords = crate::gpu_backend::BboxCoordSource::Separable {
+                    u: &u_cols,
+                    v: &v_rows,
+                };
+                let hist_bins = opts.histogram_bins.clamp(1, 1000);
+                let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+                let eval_band = |b: usize| -> Option<(String, serde_json::Value)> {
+                    let blocks = stats_band_blocks(&fetched, n_tiles, b);
+                    let (sc, off) = if unscale {
+                        (
+                            cog.index.scales.get(b).copied().unwrap_or(1.0),
+                            cog.index.offsets.get(b).copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    let src = BandSource::new(
+                        ifd.width,
+                        ifd.height,
+                        ifd.tile_width,
+                        ifd.tile_height,
+                        0,
+                        0,
+                        ifd.tiles_across,
+                        ifd.tiles_down,
+                        &blocks,
+                    )
+                    .with_nodata_override(nodata_override)
+                    .with_scale_offset(sc, off);
+                    let gs = gpu_ref.try_render_bbox_single_band_stats(
+                        cog.id,
+                        ifd_idx,
+                        b as u16,
+                        coords,
+                        &src,
+                        ResampleMode::Nearest,
+                        hist_bins,
+                        opts.histogram_range,
+                        &opts.percentiles,
+                    )?;
+                    let bname = format!("b{}", b + 1);
+                    let json = gpu_band_stats_to_json(&gs, total_pixels, &bname, opts);
+                    Some((bname, json))
+                };
+                let results: Vec<Option<(String, serde_json::Value)>> = if sel_bands.len() == 1 {
+                    vec![eval_band(sel_bands[0])]
+                } else {
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = sel_bands
+                            .iter()
+                            .map(|&b| s.spawn(move || eval_band(b)))
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().ok().flatten())
+                            .collect()
+                    })
+                };
+                if results.iter().all(Option::is_some) {
+                    let mut gpu_out = serde_json::Map::new();
+                    for item in results.into_iter().flatten() {
+                        gpu_out.insert(item.0, item.1);
+                    }
+                    return serde_json::Value::Object(gpu_out);
+                }
+            }
+        }
+    }
+
     let mut per_band: Vec<BandStatsAcc> = (0..count)
         .map(|_| BandStatsAcc::for_sample_type(ifd.sample_type, capacity_hint))
         .collect();
@@ -2697,6 +2804,76 @@ fn compute_statistics_cpu(
     serde_json::Value::Object(out)
 }
 
+#[cfg(feature = "gpu")]
+fn build_stats_separable_coords(
+    ifd: &cogzilla_tiff::IfdMeta,
+    step: usize,
+    tile_xs: &Option<Vec<Vec<usize>>>,
+    tile_ys: &Option<Vec<Vec<usize>>>,
+) -> (Vec<f32>, Vec<f32>) {
+    if let (Some(xs_all), Some(ys_all)) = (tile_xs, tile_ys) {
+        let mut u = Vec::new();
+        for (tx, xs) in xs_all.iter().enumerate() {
+            let base_x = tx as u32 * ifd.tile_width;
+            for &lx in xs {
+                u.push((base_x + lx as u32) as f32);
+            }
+        }
+        let mut v = Vec::new();
+        for (ty, ys) in ys_all.iter().enumerate() {
+            let base_y = ty as u32 * ifd.tile_height;
+            for &ly in ys {
+                v.push((base_y + ly as u32) as f32);
+            }
+        }
+        (u, v)
+    } else {
+        let st = step.max(1);
+        let u = (0..ifd.width as usize)
+            .step_by(st)
+            .map(|x| x as f32)
+            .collect();
+        let v = (0..ifd.height as usize)
+            .step_by(st)
+            .map(|y| y as f32)
+            .collect();
+        (u, v)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn stats_band_blocks<'a>(
+    fetched: &'a StatsTiles,
+    n_tiles: usize,
+    bi: usize,
+) -> Vec<Option<&'a cogzilla_codec::DecodedBand>> {
+    match fetched {
+        StatsTiles::Chunky { tiles, .. } => tiles
+            .iter()
+            .take(n_tiles)
+            .map(|o| {
+                o.as_ref()
+                    .and_then(|t| t.bands.get(bi))
+                    .filter(|tb| !tb.stats.all_nodata)
+            })
+            .collect(),
+        StatsTiles::Planar { band_tiles, .. } => {
+            if let Some(bt) = band_tiles.get(bi) {
+                bt.iter()
+                    .take(n_tiles)
+                    .map(|o| {
+                        o.as_ref()
+                            .and_then(|t| t.bands.first())
+                            .filter(|tb| !tb.stats.all_nodata)
+                    })
+                    .collect()
+            } else {
+                vec![None; n_tiles]
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_expression_statistics_cpu(
     cog: &OpenedCog,
@@ -2739,45 +2916,18 @@ fn compute_expression_statistics_cpu(
             .iter()
             .all(|(_, prog)| !prog.used_bands.is_empty() && prog.used_bands.len() <= 8)
     {
-        let (u_cols, v_rows): (Vec<f32>, Vec<f32>) =
-            if let (Some(xs_all), Some(ys_all)) = (tile_xs, tile_ys) {
-                let mut u = Vec::new();
-                for (tx, xs) in xs_all.iter().enumerate() {
-                    let base_x = tx as u32 * ifd.tile_width;
-                    for &lx in xs {
-                        u.push((base_x + lx as u32) as f32);
-                    }
-                }
-                let mut v = Vec::new();
-                for (ty, ys) in ys_all.iter().enumerate() {
-                    let base_y = ty as u32 * ifd.tile_height;
-                    for &ly in ys {
-                        v.push((base_y + ly as u32) as f32);
-                    }
-                }
-                (u, v)
-            } else {
-                let st = step.max(1);
-                let u = (0..ifd.width as usize)
-                    .step_by(st)
-                    .map(|x| x as f32)
-                    .collect();
-                let v = (0..ifd.height as usize)
-                    .step_by(st)
-                    .map(|y| y as f32)
-                    .collect();
-                (u, v)
-            };
-        if u_cols.len().saturating_mul(v_rows.len()) == denom_pixels && !u_cols.is_empty() && !v_rows.is_empty() {
+        let (u_cols, v_rows) = build_stats_separable_coords(ifd, step, tile_xs, tile_ys);
+        if u_cols.len().saturating_mul(v_rows.len()) == denom_pixels
+            && !u_cols.is_empty()
+            && !v_rows.is_empty()
+        {
             let coords = crate::gpu_backend::BboxCoordSource::Separable {
                 u: &u_cols,
                 v: &v_rows,
             };
             let hist_bins = opts.histogram_bins.clamp(1, 1000);
             let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
-            let mut gpu_out = serde_json::Map::new();
-            let mut all_ok = true;
-            for (i, (expr_str, prog)) in exprs.iter().enumerate() {
+            let eval_expr = |i: usize, expr_str: &str, prog: &cogzilla_kernel::ExprProgram| -> Option<(String, serde_json::Value)> {
                 let ref_vecs: Vec<(Vec<Option<&cogzilla_codec::DecodedBand>>, (f32, f32))> = prog
                     .used_bands
                     .iter()
@@ -2791,32 +2941,7 @@ fn compute_expression_statistics_cpu(
                         } else {
                             (1.0, 0.0)
                         };
-                        let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = match &fetched {
-                            StatsTiles::Chunky { tiles, .. } => tiles
-                                .iter()
-                                .take(n_tiles)
-                                .map(|o| {
-                                    o.as_ref()
-                                        .and_then(|t| t.bands.get(bi))
-                                        .filter(|tb| !tb.stats.all_nodata)
-                                })
-                                .collect(),
-                            StatsTiles::Planar { band_tiles, .. } => {
-                                if let Some(bt) = band_tiles.get(bi) {
-                                    bt.iter()
-                                        .take(n_tiles)
-                                        .map(|o| {
-                                            o.as_ref()
-                                                .and_then(|t| t.bands.first())
-                                                .filter(|tb| !tb.stats.all_nodata)
-                                        })
-                                        .collect()
-                                } else {
-                                    vec![None; n_tiles]
-                                }
-                            }
-                        };
-                        (blocks, so)
+                        (stats_band_blocks(&fetched, n_tiles, bi), so)
                     })
                     .collect();
                 let srcs: Vec<BandSource<'_>> = ref_vecs
@@ -2843,7 +2968,7 @@ fn compute_expression_statistics_cpu(
                     &prog.used_bands,
                     &srcs,
                 );
-                if let Some(gs) = gpu_ref.try_render_bbox_expr_stats(
+                let gs = gpu_ref.try_render_bbox_expr_stats(
                     cache_key,
                     coords,
                     &srcs,
@@ -2852,17 +2977,32 @@ fn compute_expression_statistics_cpu(
                     hist_bins,
                     opts.histogram_range,
                     &opts.percentiles,
-                ) {
-                    gpu_out.insert(
-                        format!("b{}", i + 1),
-                        gpu_band_stats_to_json(&gs, denom_pixels, expr_str, opts),
-                    );
-                } else {
-                    all_ok = false;
-                    break;
+                )?;
+                Some((
+                    format!("b{}", i + 1),
+                    gpu_band_stats_to_json(&gs, denom_pixels, expr_str, opts),
+                ))
+            };
+            let results: Vec<Option<(String, serde_json::Value)>> = if exprs.len() == 1 {
+                vec![eval_expr(0, &exprs[0].0, &exprs[0].1)]
+            } else {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = exprs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (expr_str, prog))| s.spawn(move || eval_expr(i, expr_str, prog)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().ok().flatten())
+                        .collect()
+                })
+            };
+            if results.iter().all(Option::is_some) {
+                let mut gpu_out = serde_json::Map::new();
+                for item in results.into_iter().flatten() {
+                    gpu_out.insert(item.0, item.1);
                 }
-            }
-            if all_ok {
                 return serde_json::Value::Object(gpu_out);
             }
         }
