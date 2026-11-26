@@ -5,7 +5,7 @@ use cogzilla_proj::{CoordPlan, GRID_DIM};
 use cogzilla_tiff::SampleType;
 
 use crate::bandmath::{SpectralExpr, fast_db_from_power};
-use crate::colormap::{ColormapLut, ColormapName};
+use crate::colormap::{nodata_index, ColormapLut, ColormapName};
 use crate::expr_vm::ExprProgram;
 use crate::jpeg_fast::{empty_black_jpeg, encode_jpeg_rgb, encode_jpeg_rgba};
 use crate::png_fast::{
@@ -24,18 +24,13 @@ fn build_plte_opaque(lut: &ColormapLut) -> [u8; 768] {
     plte
 }
 
+/// A palette for a colour-mapped tile that may have empty pixels, and the colour-map entry
+/// that gives up its index (see `ColormapLut::nodata_plte`; `nodata_index` places a byte value).
 #[inline]
-fn build_plte_nodata(lut: &ColormapLut) -> [u8; 768] {
-    let mut plte = [0u8; 768];
-    // Index 0 = transparent nodata (paired with tRNS = [0]); indices 1..=255 span lut[0..=255].
-    for i in 1..256 {
-        let src_idx = ((i - 1) * 255 + 127) / 254;
-        plte[i * 3] = lut.rgb[src_idx][0];
-        plte[i * 3 + 1] = lut.rgb[src_idx][1];
-        plte[i * 3 + 2] = lut.rgb[src_idx][2];
-    }
-    plte
+fn build_plte_nodata(lut: &ColormapLut) -> ([u8; 768], u8) {
+    (lut.nodata_plte, lut.nodata_merged)
 }
+
 use crate::source::BandSource;
 use crate::webp_fast::{empty_transparent_webp, encode_webp_rgb, encode_webp_rgba};
 
@@ -2254,8 +2249,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                     }
                     encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
                 } else {
-                    let plte = build_plte_nodata(lut);
-                    let inv_range_254 = 254.0 / range;
+                    let (plte, merged) = build_plte_nodata(lut);
                     for py in 0..N {
                         let row_idx = &mut sc.row_buf[..N];
                         for_each_pixel_in_row(plan, py, |px, u, v| {
@@ -2263,8 +2257,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             if val.is_nan() {
                                 row_idx[px] = 0;
                             } else {
-                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                                row_idx[px] = 1 + (t.round() as u8);
+                                row_idx[px] = nodata_index(rescale_u8(val, inv_range, min_val), merged);
                             }
                         });
                         filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
@@ -4128,8 +4121,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                 })
             } else {
                 let lut: &ColormapLut = style.colormap.lut();
-                let plte = build_plte_nodata(lut);
-                let inv_range_254 = 254.0 / range;
+                let (plte, merged) = build_plte_nodata(lut);
                 SCRATCH.with(|cell| {
                     let mut guard = cell.borrow_mut();
                     let sc = &mut *guard;
@@ -4148,8 +4140,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                             row_idx[px] = if val.is_nan() {
                                 0
                             } else {
-                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                                1 + (t.round() as u8)
+                                nodata_index(rescale_u8(val, inv_range, min_val), merged)
                             };
                         });
                         filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
@@ -4553,7 +4544,6 @@ pub fn render_expr_vm<const N: usize>(
         plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
     let range = safe_rescale_denom(style.rescale_min, style.rescale_max);
     let inv_range = 255.0 / range;
-    let inv_range_254 = 254.0 / range;
     let min_val = style.rescale_min;
 
     let single_bands: Vec<Option<SingleBlockRef<'_>>> =
@@ -4721,7 +4711,7 @@ pub fn render_expr_vm<const N: usize>(
                 })
             } else {
                 let lut: &ColormapLut = style.colormap.lut();
-                let plte = build_plte_nodata(lut);
+                let (plte, merged) = build_plte_nodata(lut);
                 SCRATCH.with(|cell| {
                     let mut guard = cell.borrow_mut();
                     let sc = &mut *guard;
@@ -4742,8 +4732,7 @@ pub fn render_expr_vm<const N: usize>(
                             row_idx[px] = if val.is_nan() {
                                 0
                             } else {
-                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                                1 + (t.round() as u8)
+                                nodata_index(rescale_u8(val, inv_range, min_val), merged)
                             };
                         }
                         filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
@@ -5686,7 +5675,7 @@ pub fn render_dem_algorithm<const N: usize>(
                     }
                 }
                 let is_opaque_dem = clean && !matches!(alg, DemAlgorithm::Aspect);
-                let inv_range_254 = inv_range * (254.0 / 255.0);
+                let (nodata_plte, merged) = build_plte_nodata(lut);
                 for py in 0..N {
                     let r0 = py * pad;
                     let r1 = (py + 1) * pad;
@@ -5713,8 +5702,7 @@ pub fn render_dem_algorithm<const N: usize>(
                         } else if is_opaque_dem {
                             row_idx[px] = rescale_u8(val, inv_range, min_val);
                         } else {
-                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                            row_idx[px] = 1 + (t.round() as u8);
+                            row_idx[px] = nodata_index(rescale_u8(val, inv_range, min_val), merged);
                         }
                     }
                     filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
@@ -5727,9 +5715,8 @@ pub fn render_dem_algorithm<const N: usize>(
                         encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
                     }
                 } else {
-                    let plte = build_plte_nodata(lut);
                     let trns = has_nodata.then_some(&[0u8][..]);
-                    encode_indexed_png(N as u32, N as u32, &plte, trns, &sc.img_buf[..total])
+                    encode_indexed_png(N as u32, N as u32, &nodata_plte, trns, &sc.img_buf[..total])
                 }
             }
             OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
@@ -5783,6 +5770,31 @@ pub fn render_dem_algorithm<const N: usize>(
 mod tests {
     use super::*;
     use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
+
+    #[test]
+    fn a_nodata_palette_keeps_the_colour_map_s_colours() {
+        use crate::colormap::ColormapName;
+        for name in [ColormapName::Viridis, ColormapName::Terrain, ColormapName::Grayscale] {
+            let lut = name.lut();
+            let (plte, merged) = build_plte_nodata(lut);
+            let mut off = 0;
+            for v in 0..=255u8 {
+                let at = usize::from(nodata_index(v, merged));
+                assert!(at >= 1, "index 0 is the transparent one");
+                if plte[at * 3..at * 3 + 3] != lut.rgb[usize::from(v)] {
+                    off += 1;
+                    assert_eq!(v, merged, "only the merged entry may take another colour");
+                    let got = &plte[at * 3..at * 3 + 3];
+                    let want = lut.rgb[usize::from(v)];
+                    assert!((0..3).all(|k| got[k].abs_diff(want[k]) <= 4), "{name:?}: {got:?} for {want:?}");
+                }
+            }
+            // Viridis repeats a colour next to itself, so it is drawn exactly.
+            if matches!(name, ColormapName::Viridis) {
+                assert_eq!(off, 0);
+            }
+        }
+    }
 
     fn make_plan_32() -> CoordPlan<32> {
         let mut u = [0.0f32; 32];
