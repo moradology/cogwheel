@@ -442,7 +442,18 @@ impl TmsDef {
         let Ok(dst_crs) = self.crs_model() else {
             return (0, max_c, 0, max_r);
         };
-        let [w, s, e, n] = wgs84_bounds;
+        let [mut w, s, mut e, n] = wgs84_bounds;
+        // Normalize wholly-shifted 0..360 or -360..0 regional intervals (e.g. CONUS [235, 295])
+        // before checking for antimeridian crossing.
+        if w <= e && (e - w) < 360.0 - 1e-9 {
+            if w >= 180.0 - 1e-9 && e > 180.0 + 1e-9 {
+                w -= 360.0;
+                e -= 360.0;
+            } else if e <= -180.0 + 1e-9 && w < -180.0 - 1e-9 {
+                w += 360.0;
+                e += 360.0;
+            }
+        }
         let (w_eff, e_eff, crosses_am) = if w > e {
             (w, e + 360.0, true)
         } else if e > 180.0 + 1e-9 || w < -180.0 - 1e-9 {
