@@ -1371,10 +1371,11 @@ impl GpuCoalescer {
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
         let window = Duration::from_micros(env_us.unwrap_or(coalesce_window_us));
+        let default_depth = if ctx.info.unified_memory { 2 } else { 3 };
         let ring_depth = std::env::var("COGZILLA_GPU_RING_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
+            .unwrap_or(default_depth)
             .clamp(1, 4);
 
         let (tx, rx) = mpsc::channel::<PendingRequest>();
