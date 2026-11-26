@@ -881,6 +881,13 @@ def main() -> int:
                 if route.startswith("WMTS") and good == "tile_format=tiff":
                     continue
                 o.check(f"{route} with {good}", "status", f"/searches/{sid}/{route}?assets=red&{good}")
+        # A tile's size, padding and buffer are more than zero; the WMTS document offers the tiles' formats.
+        for bad in ("tilesize=0", "tilesize=-1", "buffer=0", "buffer=-1", "buffer=nan", "padding=0", "padding=-1"):
+            o.check(f"tile with {bad}", "status", f"{base12}.png?assets=red&{bad}")
+            o.check(f"tilejson with {bad}", "status", f"/searches/{sid}/WebMercatorQuad/tilejson.json?assets=red&{bad}")
+            o.check(f"WMTS with {bad}", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=red&{bad}")
+        for fmt in ("tif", "tiff", "pngraw"):
+            o.check(f"WMTS with tile_format={fmt}", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=red&tile_format={fmt}")
         for date in ("20241201", "2024-12-01_00:00:00Z", "", "../.."):
             o.check(f"collection tilejson with datetime={date!r}", "status",
                     f"/collections/{collection}/WebMercatorQuad/tilejson.json?assets=red&datetime={date}")

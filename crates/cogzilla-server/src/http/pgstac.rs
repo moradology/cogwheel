@@ -266,11 +266,30 @@ fn py_whole(s: &str) -> bool {
         && py_number(whole).is_some()
 }
 
+/// A tile's `tilesize`, `padding` and `buffer` are more than zero, as titiler-pgstac has them.
+fn tile_bounds_error(pairs: &[(String, String)]) -> Option<Resp> {
+    for (key, value) in pairs {
+        let positive = py_number(value).is_some_and(|n| n > 0.0);
+        let wrong = match key.as_str() {
+            "tilesize" | "padding" => (!(py_whole(value) && positive)).then_some("Input should be a whole number greater than 0"),
+            "buffer" => (!positive).then_some("Input should be a number greater than 0"),
+            _ => None,
+        };
+        if let Some(msg) = wrong {
+            return Some(invalid_param("query", key, msg));
+        }
+    }
+    None
+}
+
 /// What FastAPI refuses of a picture's parameters before anything is drawn. The routes
 /// that only describe a mosaic (`tilejson.json`, `map.html`, the WMTS document) take the
 /// same parameters as its tiles, and titiler-pgstac checks them there too.
 fn render_query_error(pairs: &[(String, String)]) -> Option<Resp> {
     let bad = |name: &str, msg: &str| Some(invalid_param("query", name, msg));
+    if let Some(resp) = tile_bounds_error(pairs) {
+        return Some(resp);
+    }
     if let Some(map) = query_value(pairs, "colormap")
         && !map.is_empty()
         && !matches!(map.trim(), "NaN" | "Infinity" | "-Infinity")
@@ -323,8 +342,7 @@ fn render_query_error(pairs: &[(String, String)]) -> Option<Resp> {
             "unscale" | "return_mask" | "asset_as_band" | "exitwhenfull" | "skipcovered" => {
                 parse_bool(value).is_none().then_some("Input should be a valid boolean")
             }
-            "tilesize" | "items_limit" | "time_limit" | "scan_limit" | "padding" => (!whole()).then_some("Input should be a valid integer"),
-            "buffer" => (!number()).then_some("Input should be a valid number"),
+            "items_limit" | "time_limit" | "scan_limit" => (!whole()).then_some("Input should be a valid integer"),
             "algorithm" => super::get_algorithm_json(value).is_err().then_some("Input should be the name of an algorithm"),
             "algorithm_params" => serde_json::from_str::<Value>(value).is_err().then_some("Input should be valid JSON"),
             _ => None,
@@ -1174,10 +1192,13 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         "jpg" => "image/jpg",
         "webp" => "image/webp",
         "npy" => "application/x-binary",
-        "tif" | "tiff" | "jp2" | "pngraw" => {
+        // The tiles are served in these too.
+        "tif" | "tiff" => "image/tiff; application=geotiff",
+        "pngraw" => "image/png",
+        "jp2" => {
             return detail(
                 StatusCode::BAD_REQUEST,
-                format!("tile_format={tile_format} is not supported on pgSTAC routes (use png, jpg, jpeg, webp or npy)"),
+                format!("tile_format={tile_format} is not supported on pgSTAC routes (use png, pngraw, jpg, jpeg, webp, tif, tiff or npy)"),
             );
         }
         _ => {
@@ -5986,6 +6007,9 @@ pub(super) async fn item_route(
         _ => {}
     }
 
+    if let (["tiles", _, _, _, _], Some(resp)) = (rest, tile_bounds_error(&pairs)) {
+        return Done(resp);
+    }
     if item_route_needs_assets(rest) {
         if pq.assets.is_empty() {
             return Done(missing_query_param("assets"));
@@ -6281,6 +6305,7 @@ async fn mosaic_route(
                 Ok(Some(t)) => tile_assets(pg, &rec.hash, t, pairs).await,
             }
         }
+        ["tiles", _, _, _, _] if tile_bounds_error(pairs).is_some() => tile_bounds_error(pairs).unwrap_or_else(not_found),
         ["tiles", _, zs, xs, ys] => {
             let Some((y, scale, ext)) = parse_y_scale_ext(ys) else {
                 return detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
@@ -6758,7 +6783,8 @@ mod tests {
         assert_eq!(wmts(&ctx, "/searches/abc", bare, &[]).status(), StatusCode::BAD_REQUEST);
         let status = |q: &str| wmts(&ctx, "/searches/abc", source(), &query_pairs(q)).status();
         assert_eq!(status("tile_format=nope"), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(status("tile_format=tif"), StatusCode::BAD_REQUEST);
+        assert_eq!(status("tile_format=jp2"), StatusCode::BAD_REQUEST);
+        assert_eq!(status("tile_format=tif"), StatusCode::OK);
         assert_eq!(status("use_epsg=maybe"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("zooms=WebMercatorQuad"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status(""), StatusCode::OK);
