@@ -5383,6 +5383,44 @@ enum BboxRenderOutput {
     Stats(serde_json::Value),
 }
 
+/// Source pixel coordinate representation for `render_bbox_core`.
+///
+/// Keeping separable 1D axes compact (`w + h` floats = 32 KB at 4096²) instead of eagerly
+/// broadcasting to 2D (`2 × w × h` floats = 128 MB) avoids 128 MB CPU allocations, 16.7M-pixel
+/// broadcast loops, and 128 MB PCIe `Exact2D` uploads on `/cog/preview`, `/cog/bbox`, `/cog/crop`,
+/// `WorldCRS84Quad`, and `WebMercatorQuad` renders. Only materialized to dense 2D if the CPU
+/// fallback path is actually taken.
+enum BboxCoordMap {
+    Separable { u_cols: Vec<f32>, v_rows: Vec<f32> },
+    Exact2D { u_map: Vec<f32>, v_map: Vec<f32> },
+}
+
+impl BboxCoordMap {
+    fn into_dense(self, w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
+        match self {
+            Self::Exact2D { u_map, v_map } => (u_map, v_map),
+            Self::Separable { u_cols, v_rows } => {
+                let mut u_map = vec![f32::NAN; w * h];
+                let mut v_map = vec![f32::NAN; w * h];
+                for py in 0..h {
+                    let vv = v_rows[py];
+                    if !vv.is_finite() {
+                        continue;
+                    }
+                    let row_off = py * w;
+                    u_map[row_off..row_off + w].copy_from_slice(&u_cols);
+                    for px in 0..w {
+                        if u_cols[px].is_finite() {
+                            v_map[row_off + px] = vv;
+                        }
+                    }
+                }
+                (u_map, v_map)
+            }
+        }
+    }
+}
+
 /// 1-pass fused GPU (with seamless CPU/2-pass fallback) native-preview band/expression statistics.
 #[allow(clippy::too_many_arguments)]
 pub async fn render_native_preview_stats(
@@ -5708,24 +5746,109 @@ async fn render_bbox_core(
     // For native preview (`native_preview == true`), map directly in source pixel space without
     // reprojecting through an axis-aligned WGS84 bbox (matching `rio-tiler`'s `Reader.preview()`).
     // Otherwise use a coarse 16-px projection grid + bilinear interpolation.
-    let (u_map, v_map, min_u, max_u, min_v, max_v) = if native_preview {
-        let mut u_map = vec![0.0f32; w * h];
-        let mut v_map = vec![0.0f32; w * h];
+    let (coord_map, min_u, max_u, min_v, max_v) = if native_preview {
         let sx = (ifd.width as f64) / (w as f64);
         let sy = (ifd.height as f64) / (h as f64);
         let u_cols: Vec<f32> = (0..w).map(|px| ((px as f64 + 0.5) * sx - 0.5) as f32).collect();
-        for py in 0..h {
-            let vv = ((py as f64 + 0.5) * sy - 0.5) as f32;
-            let row_off = py * w;
-            u_map[row_off..row_off + w].copy_from_slice(&u_cols);
-            v_map[row_off..row_off + w].fill(vv);
-        }
+        let v_rows: Vec<f32> = (0..h).map(|py| ((py as f64 + 0.5) * sy - 0.5) as f32).collect();
         let min_u = u_cols.first().copied().unwrap_or(0.0);
         let max_u = u_cols.last().copied().unwrap_or(0.0);
-        let min_v = ((0.5 * sy) - 0.5) as f32;
-        let max_v = (((h as f64 - 0.5) * sy) - 0.5) as f32;
-        (u_map, v_map, min_u, max_u, min_v, max_v)
+        let min_v = v_rows.first().copied().unwrap_or(0.0);
+        let max_v = v_rows.last().copied().unwrap_or(0.0);
+        (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
     } else {
+        let is_separable_unmasked = poly_mask.is_none()
+            && ifd.gcp_poly.is_none()
+            && ifd.crs_to_pixel.is_axis_aligned()
+            && matches!(
+                dst_crs,
+                cogzilla_proj::CrsModel::Geographic
+                    | cogzilla_proj::CrsModel::Epsg3857
+                    | cogzilla_proj::CrsModel::WorldMercator
+                    | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+            )
+            && matches!(
+                crs,
+                cogzilla_proj::CrsModel::Geographic
+                    | cogzilla_proj::CrsModel::Epsg3857
+                    | cogzilla_proj::CrsModel::WorldMercator
+                    | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+            );
+        if is_separable_unmasked {
+            // O(w + h) fast path: zero 2D allocation, zero spawn_blocking overhead, and
+            // enables 32 KB `BboxCoordSource::Separable` GPU uploads instead of 128 MB `Exact2D`.
+            let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+            let crs_to_pixel = ifd.crs_to_pixel;
+            let ifd_w_f = ifd.width as f32;
+            let ifd_h_f = ifd.height as f32;
+            let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
+                let (mut sx, sy) = match dst_crs {
+                    cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                    cogzilla_proj::CrsModel::Geographic => {
+                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        crs.from_lonlat_deg(lon, y)
+                    }
+                    other => {
+                        let (lon, lat) = other.to_lonlat_deg(x, y);
+                        if lon.is_finite() && lat.is_finite() {
+                            crs.from_lonlat_deg(lon, lat)
+                        } else {
+                            (f64::NAN, f64::NAN)
+                        }
+                    }
+                };
+                if let Some(lo) = wrap_lo
+                    && sx.is_finite()
+                    && sx < lo
+                {
+                    sx += 360.0;
+                }
+                (sx, sy)
+            };
+            let (origin_x, origin_y) = match dst_crs {
+                cogzilla_proj::CrsModel::CylindricalEqualArea(cea) => {
+                    (cea.false_easting, cea.false_northing)
+                }
+                _ => (0.0, 0.0),
+            };
+            let mut u_cols = vec![f32::NAN; w];
+            let mut min_u = f32::INFINITY;
+            let mut max_u = f32::NEG_INFINITY;
+            for (px, slot) in u_cols.iter_mut().enumerate() {
+                let x_coord = bbox[0] + (px as f64 + 0.5) * dlx;
+                let (sx, _) = to_src_crs(x_coord, origin_y);
+                if sx.is_finite() {
+                    let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
+                    if uu >= -1.0 && uu <= ifd_w_f {
+                        *slot = uu;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                    }
+                }
+            }
+            let mut v_rows = vec![f32::NAN; h];
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+            for (py, slot) in v_rows.iter_mut().enumerate() {
+                let y_coord = bbox[3] - (py as f64 + 0.5) * dly;
+                let (_, sy) = to_src_crs(origin_x, y_coord);
+                if sy.is_finite() {
+                    let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
+                    if vv >= -1.0 && vv <= ifd_h_f {
+                        *slot = vv;
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
+            }
+            if !min_u.is_finite() || !min_v.is_finite() {
+                min_u = f32::INFINITY;
+                max_u = f32::NEG_INFINITY;
+                min_v = f32::INFINITY;
+                max_v = f32::NEG_INFINITY;
+            }
+            (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
+        } else {
         let build_uv_maps = {
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
@@ -6052,7 +6175,8 @@ async fn render_bbox_core(
     } else {
         build_uv_maps()
     };
-    (u_map, v_map, min_u, max_u, min_v, max_v)
+    (BboxCoordMap::Exact2D { u_map, v_map }, min_u, max_u, min_v, max_v)
+    }
     };
 
     // Empty check: zero source pixels mapped into the requested tile/bbox/feature.
@@ -6340,8 +6464,7 @@ async fn render_bbox_core(
         .gpu
         .as_ref()
         .map(|g| (Arc::clone(g), Arc::clone(&engine.stats), primary.id));
-    let render_cpu = move |u_map: Vec<f32>,
-                           v_map: Vec<f32>,
+    let render_cpu = move |coord_map: BboxCoordMap,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
                            bands: &BandRequest,
                            custom_lut: Option<&CustomColormap>,
@@ -6498,7 +6621,7 @@ async fn render_bbox_core(
         // Sample a (w + 2) x (h + 2) elevation ring by linearly extrapolating (u, v) 1 px past
         // each edge so Horn 3x3 gradients stay seamless across adjacent tiles (WorldCRS84Quad /
         // render_mercator_bbox) and non-square bboxes.
-        let sample_dem_ring = |src: &BandSource<'_>| -> Vec<f32> {
+        let sample_dem_ring = |src: &BandSource<'_>, u_map: &[f32], v_map: &[f32]| -> Vec<f32> {
             let rw = w + 2;
             let rh = h + 2;
             let mut ring = vec![f32::NAN; rw * rh];
@@ -6602,22 +6725,20 @@ async fn render_bbox_core(
         if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
             #[cfg(feature = "gpu")]
             if let Some((ref gpu, ref stats, primary_id)) = gpu_ctx {
-                let v_rows: Vec<f32> = if native_preview {
-                    (0..h).map(|py| v_map[py * w]).collect()
-                } else {
-                    Vec::new()
-                };
-                let coords = if native_preview {
-                    crate::gpu_backend::BboxCoordSource::Separable {
-                        u: &u_map[..w],
-                        v: &v_rows,
+                let coords = match &coord_map {
+                    BboxCoordMap::Separable { u_cols, v_rows } => {
+                        crate::gpu_backend::BboxCoordSource::Separable {
+                            u: u_cols,
+                            v: v_rows,
+                        }
                     }
-                } else {
-                    crate::gpu_backend::BboxCoordSource::Exact2D {
-                        dst_w: w,
-                        dst_h: h,
-                        u_map: &u_map,
-                        v_map: &v_map,
+                    BboxCoordMap::Exact2D { u_map, v_map } => {
+                        crate::gpu_backend::BboxCoordSource::Exact2D {
+                            dst_w: w,
+                            dst_h: h,
+                            u_map,
+                            v_map,
+                        }
                     }
                 };
                 if format == OutputFormat::RawF32
@@ -6996,6 +7117,7 @@ async fn render_bbox_core(
                 }
             }
 
+            let (u_map, v_map) = coord_map.into_dense(w, h);
             let mut out = BytesMut::with_capacity(w * h * 4);
             match bands {
                 BandRequest::Dem {
@@ -7005,7 +7127,7 @@ async fn render_bbox_core(
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    let ring = sample_dem_ring(&src);
+                    let ring = sample_dem_ring(&src, &u_map, &v_map);
                     let rw = w + 2;
                     let (inv_8dx, inv_8dy) = dem_inv_8dxy();
                     for py in 0..h {
@@ -7252,22 +7374,20 @@ async fn render_bbox_core(
                 | OutputFormat::RawRgba
         ) && let Some((ref gpu, ref stats, primary_id)) = gpu_ctx
         {
-            let v_rows: Vec<f32> = if native_preview {
-                (0..h).map(|py| v_map[py * w]).collect()
-            } else {
-                Vec::new()
-            };
-            let coords = if native_preview {
-                crate::gpu_backend::BboxCoordSource::Separable {
-                    u: &u_map[..w],
-                    v: &v_rows,
+            let coords = match &coord_map {
+                BboxCoordMap::Separable { u_cols, v_rows } => {
+                    crate::gpu_backend::BboxCoordSource::Separable {
+                        u: u_cols,
+                        v: v_rows,
+                    }
                 }
-            } else {
-                crate::gpu_backend::BboxCoordSource::Exact2D {
-                    dst_w: w,
-                    dst_h: h,
-                    u_map: &u_map,
-                    v_map: &v_map,
+                BboxCoordMap::Exact2D { u_map, v_map } => {
+                    crate::gpu_backend::BboxCoordSource::Exact2D {
+                        dst_w: w,
+                        dst_h: h,
+                        u_map,
+                        v_map,
+                    }
                 }
             };
             let gpu_out: Option<Bytes> = match bands {
@@ -7648,6 +7768,7 @@ async fn render_bbox_core(
             }
         }
 
+        let (u_map, v_map) = coord_map.into_dense(w, h);
         let mut rgba = vec![0u8; w * h * 4];
         match bands {
             BandRequest::Single {
@@ -7695,7 +7816,7 @@ async fn render_bbox_core(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                let ring = sample_dem_ring(&src);
+                let ring = sample_dem_ring(&src, &u_map, &v_map);
                 let rw = w + 2;
                 let (inv_8dx, inv_8dy) = dem_inv_8dxy();
                 for py in 0..h {
@@ -7968,8 +8089,7 @@ async fn render_bbox_core(
             .store
             .run_heavy_cpu(move || {
                 render_cpu(
-                    u_map,
-                    v_map,
+                    coord_map,
                     cog_tiles,
                     &bands_owned,
                     lut_owned.as_ref(),
@@ -7981,8 +8101,7 @@ async fn render_bbox_core(
         Ok(out)
     } else {
         Ok(render_cpu(
-            u_map,
-            v_map,
+            coord_map,
             cog_tiles,
             bands,
             custom_lut,
