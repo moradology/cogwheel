@@ -4770,6 +4770,35 @@ async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
         .unwrap();
     assert_eq!(r_resamp_case.status(), 200, "mixed-case resampling=Bilinear must return 200");
 
+    // Audit #73: lastbandhigh without explicit bidx on 2-band WebMercator mosaic tile -> 200;
+    // GET /mosaicjson/assets?coord_crs=... -> 200; GET / has Vary: Accept; GET /stats not public cached
+    let r_lbh_nobidx = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.png?url={mp}&pixel_selection=lastbandhigh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_lbh_nobidx.status(), 200, "2-band visual lastbandhigh without bidx must return 200");
+    let r_mj_assets_crs = client
+        .get(format!("{base}/mosaicjson/assets?url={mp}&bbox={bbox_str}&coord_crs=EPSG:4326"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_mj_assets_crs.status(), 200, "GET /mosaicjson/assets?coord_crs=... must return 200");
+    let r_root = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(r_root.status(), 200);
+    let vary = r_root
+        .headers()
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(vary.to_ascii_lowercase().contains("accept"), "GET / must include Vary: Accept, got {vary:?}");
+    let r_stats_ep = client.get(format!("{base}/stats")).send().await.unwrap();
+    assert_eq!(r_stats_ep.status(), 200);
+    assert!(
+        r_stats_ep.headers().get("cache-control").is_none(),
+        "GET /stats must not carry public Cache-Control"
+    );
+
     // (c) POST /mosaicjson/statistics on Point and horizontal LineString with pixel_selection=count
     let pt = serde_json::json!({
         "type": "Feature",
