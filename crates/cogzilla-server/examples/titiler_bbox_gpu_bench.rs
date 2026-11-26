@@ -285,6 +285,19 @@ async fn main() {
             w: 1024,
             h: 1024,
             bands: BandRequest::CustomExpr {
+                prog: ndvi.clone(),
+                rescale: (-0.2, 0.8),
+                colormap: ColormapName::Viridis,
+            },
+            resample: ResampleMode::Lanczos,
+        },
+        Case {
+            name: "/cog/bbox (Exact2D) Expr NDVI Lanczos3",
+            native_preview: false,
+            bbox: sub_bbox,
+            w: 1024,
+            h: 1024,
+            bands: BandRequest::CustomExpr {
                 prog: ndvi,
                 rescale: (-0.2, 0.8),
                 colormap: ColormapName::Viridis,
@@ -295,6 +308,19 @@ async fn main() {
             name: "/cog/preview RGB 3-band Lanczos3 PNG",
             native_preview: true,
             bbox: full_bbox,
+            w: 1024,
+            h: 1024,
+            bands: BandRequest::Rgb {
+                bands_1based: [1, 2, 3],
+                rescale_min: [0.0; 3],
+                rescale_max: [2500.0, 1500.0, 1000.0],
+            },
+            resample: ResampleMode::Lanczos,
+        },
+        Case {
+            name: "/cog/bbox (Exact2D) RGB 3-band Lanczos3",
+            native_preview: false,
+            bbox: sub_bbox,
             w: 1024,
             h: 1024,
             bands: BandRequest::Rgb {
