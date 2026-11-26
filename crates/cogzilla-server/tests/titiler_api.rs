@@ -1908,11 +1908,43 @@ fn write_synthetic_f32_projected_geotiff(
 fn decode_npy_f32(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.starts_with(b"\x93NUMPY"), "not an npy payload");
     let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let hdr = std::str::from_utf8(&bytes[10..10 + hlen]).unwrap();
     let payload = &bytes[10 + hlen..];
-    payload
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    if hdr.contains("'|u1'") {
+        payload.iter().map(|&b| b as f32).collect()
+    } else if hdr.contains("'|i1'") {
+        payload.iter().map(|&b| (b as i8) as f32).collect()
+    } else if hdr.contains("'<u2'") {
+        payload
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
+            .collect()
+    } else if hdr.contains("'<i2'") {
+        payload
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+            .collect()
+    } else if hdr.contains("'<u4'") {
+        payload
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect()
+    } else if hdr.contains("'<i4'") {
+        payload
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect()
+    } else if hdr.contains("'<f8'") {
+        payload
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect()
+    } else {
+        payload
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
 }
 
 #[tokio::test]
@@ -5477,6 +5509,322 @@ async fn audit77_shown_npy_multiband_palette_and_invalid_formula() {
         .await
         .unwrap();
     assert_eq!(r_bad.status(), 400, "invalid color_formula on RGB .npy tile must return 400");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn sweeps_34_to_37_kk1_ii1_jj1_hh1_self_contained() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweeps34_37_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. Float32 EPSG:3857 GeoTIFF covering WebMercator tile 10/164/395 (San Francisco) for KK1.
+    let tile_b = cogzilla_proj::tile_bounds_3857(cogzilla_proj::TileCoord { z: 10, x: 164, y: 395 });
+    let f32_path = tmp.join("kk1_f32.tif");
+    {
+        let w = 32u32;
+        let h = 32u32;
+        let raw: Vec<u8> = (0..(w * h))
+            .flat_map(|i| (100.0f32 + (i % 32) as f32).to_le_bytes())
+            .collect();
+        let tif = cogzilla_server::titiler::encode_geotiff_f32(w, h, &raw, tile_b.into(), 3857, false);
+        std::fs::write(&f32_path, tif).unwrap();
+    }
+    let f32_stac_path = tmp.join("kk1_stac.json");
+    let f32_wgs = [-122.4, 37.7, -122.0, 38.0];
+    std::fs::write(
+        &f32_stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "kk1-f32",
+            "bbox": f32_wgs,
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-122.4, 37.7], [-122.0, 37.7], [-122.0, 38.0], [-122.4, 38.0], [-122.4, 37.7]]]
+            },
+            "properties": {},
+            "assets": { "data": { "href": f32_path.to_string_lossy() } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let f32_mj_path = tmp.join("kk1_mosaic.json");
+    // Quadkey for z=10, x=164, y=395
+    let mut qk_sf = String::new();
+    for i in (0..10).rev() {
+        let mut d = 0u8;
+        if (164u32 >> i) & 1 != 0 { d |= 1; }
+        if (395u32 >> i) & 1 != 0 { d |= 2; }
+        qk_sf.push((b'0' + d) as char);
+    }
+    std::fs::write(
+        &f32_mj_path,
+        serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 10,
+            "maxzoom": 10,
+            "bounds": [-122.7, 37.4, -121.9, 38.1],
+            "quadkey_zoom": 10,
+            "tiles": { qk_sf: [f32_path.to_string_lossy()] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 2. EPSG:32701 antimeridian GeoTIFF spanning ~179E..176W (UTM Zone 1S, ~70000..600000 E, ~8000000..8230000 N)
+    //    for II1 (dateline feature at 64x64 / 512x64 / unsized) and JJ1 (symmetric lon norm).
+    let am_path = tmp.join("am32701.tif");
+    {
+        let w = 64u32;
+        let h = 64u32;
+        // Column-coded pixel values so different longitudes return distinct known values.
+        let mut raw = Vec::with_capacity((w * h * 4) as usize);
+        for _r in 0..h {
+            for c in 0..w {
+                raw.extend_from_slice(&((c as f32) * 10.0 + 1.0).to_le_bytes());
+            }
+        }
+        // In EPSG:32701 (central meridian -177°):
+        // lon=179°E (-181°) at lat=-17° -> x ≈ 74_300 m; lon=-176°W at lat=-17° -> x ≈ 606_500 m
+        // lat=-18° -> y ≈ 8_009_000 m; lat=-16° -> y ≈ 8_231_000 m
+        let utm_bbox = [74_300.0, 8_009_000.0, 606_500.0, 8_231_000.0];
+        let tif = cogzilla_server::titiler::encode_geotiff_f32(w, h, &raw, utm_bbox, 32701, false);
+        std::fs::write(&am_path, tif).unwrap();
+    }
+    let am_stac_path = tmp.join("am_stac.json");
+    std::fs::write(
+        &am_stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "am32701",
+            "bbox": [-180.0, -18.0, 180.0, -16.0],
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-180.0, -18.0], [180.0, -18.0], [180.0, -16.0], [-180.0, -16.0], [-180.0, -18.0]]]
+            },
+            "properties": {},
+            "assets": { "data": { "href": am_path.to_string_lossy() } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let am_mj_path = tmp.join("am_mosaic.json");
+    // Quadkeys at z=0 ("") cover the whole world so both sides of antimeridian resolve am32701.tif.
+    std::fs::write(
+        &am_mj_path,
+        serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 0,
+            "maxzoom": 12,
+            "bounds": [-180.0, -18.0, 180.0, -16.0],
+            "quadkey_zoom": 0,
+            "tiles": { "": [am_path.to_string_lossy()] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 3. File with space in its name ("my scene.tif", 2-band uint16 with b1=10, b2=20) for HH1.
+    let space_path = tmp.join("my scene.tif");
+    write_synthetic_u16_2band_4326_geotiff(
+        &space_path,
+        16,
+        16,
+        [-122.5, 37.7, -122.3, 37.9],
+        10,
+        20,
+        None,
+    );
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // --- KK1: /cog, /stac, and /mosaicjson share identical .npy mask (f32::MAX) and .tif nodata (None) ---
+    let parse_npy_hdr_and_mask_first = |bytes: &[u8]| -> (String, f32) {
+        let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let hdr = std::str::from_utf8(&bytes[10..10 + hlen]).unwrap().to_string();
+        let vals = decode_npy_f32(bytes);
+        let half = vals.len() / 2;
+        (hdr, vals[half])
+    };
+    let mut npy_masks = Vec::new();
+    for url in [
+        format!("{base}/cog/tiles/WebMercatorQuad/10/164/395.npy?url={}", f32_path.to_string_lossy()),
+        format!("{base}/stac/tiles/WebMercatorQuad/10/164/395.npy?url={}&assets=data", f32_stac_path.to_string_lossy()),
+        format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/164/395.npy?url={}", f32_mj_path.to_string_lossy()),
+        format!("{base}/mosaicjson/bbox/-122.3,37.75,-122.1,37.9/32x32.npy?url={}", f32_mj_path.to_string_lossy()),
+    ] {
+        let r = client.get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200, "KK1 npy {url} failed");
+        let b = r.bytes().await.unwrap();
+        let (hdr, m0) = parse_npy_hdr_and_mask_first(&b);
+        assert!(hdr.contains("'<f4'"), "KK1 expected <f4 for {url}, got {hdr}");
+        assert_eq!(m0, f32::MAX, "KK1 expected f32::MAX mask for {url}, got {m0}");
+        npy_masks.push(m0);
+    }
+    assert!(npy_masks.iter().all(|&m| m == f32::MAX));
+
+    for url in [
+        format!("{base}/cog/tiles/WebMercatorQuad/10/164/395.tif?url={}", f32_path.to_string_lossy()),
+        format!("{base}/stac/tiles/WebMercatorQuad/10/164/395.tif?url={}&assets=data", f32_stac_path.to_string_lossy()),
+        format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/164/395.tif?url={}", f32_mj_path.to_string_lossy()),
+    ] {
+        let r = client.get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200, "KK1 tif {url} failed");
+        let tif = r.bytes().await.unwrap();
+        let idx = cogzilla_tiff::parse_cog(&tif).unwrap();
+        assert_eq!(idx.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+        assert_eq!(idx.nodata, None, "KK1 expected nodata=None for {url}, got {:?}", idx.nodata);
+    }
+    // Styled mosaic .npy with rescale returns |u1 matching /cog
+    let r_mj_styled = client
+        .get(format!(
+            "{base}/mosaicjson/tiles/WebMercatorQuad/10/164/395.npy?url={}&rescale=100,131",
+            f32_mj_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_mj_styled.status(), 200);
+    let b_mj_styled = r_mj_styled.bytes().await.unwrap();
+    let hlen = u16::from_le_bytes([b_mj_styled[8], b_mj_styled[9]]) as usize;
+    assert!(std::str::from_utf8(&b_mj_styled[10..10 + hlen]).unwrap().contains("'|u1'"));
+
+    // --- II1: literal 358-degree dateline ring renders 200 at unsized, 512x64, and 64x64 across /cog, /stac, /mosaicjson ---
+    let dateline_ring = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [179.5, -17.5],
+                [-178.5, -17.5],
+                [-178.5, -16.5],
+                [179.5, -16.5],
+                [179.5, -17.5]
+            ]]
+        }
+    });
+    for url in [
+        format!("{base}/cog/feature.npy?url={}", am_path.to_string_lossy()),
+        format!("{base}/cog/feature/512x64.npy?url={}", am_path.to_string_lossy()),
+        format!("{base}/cog/feature/64x64.npy?url={}", am_path.to_string_lossy()),
+        format!("{base}/cog/feature.npy?url={}&max_size=64", am_path.to_string_lossy()),
+        format!("{base}/cog/feature/64x64.png?url={}", am_path.to_string_lossy()),
+        format!("{base}/stac/feature/64x64.npy?url={}&assets=data", am_stac_path.to_string_lossy()),
+        format!("{base}/mosaicjson/feature/64x64.npy?url={}", am_mj_path.to_string_lossy()),
+    ] {
+        let r = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(dateline_ring.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "II1 expected 200 for {url}, got {}", r.status());
+    }
+    // Genuinely non-overlapping polygon still returns 404
+    let disjoint_poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[10.0, 10.0], [11.0, 10.0], [11.0, 11.0], [10.0, 11.0], [10.0, 10.0]]]
+        }
+    });
+    let r_disjoint = client
+        .post(format!("{base}/cog/feature/64x64.npy?url={}", am_path.to_string_lossy()))
+        .header("content-type", "application/json")
+        .body(disjoint_poly.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_disjoint.status(), 404, "disjoint polygon must still 404");
+
+    // --- JJ1: symmetric ±2-turn longitude normalisation across /cog/point and /mosaicjson/point ---
+    let mut vals_by_lon = std::collections::HashMap::new();
+    for lon in ["179.5", "180.5", "-180.5", "181.5", "-540.5", "540.5"] {
+        let r_cog = client
+            .get(format!("{base}/cog/point/{lon},-17?url={}", am_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_cog.status(), 200, "JJ1 /cog/point/{lon},-17 failed");
+        let j_cog: serde_json::Value = serde_json::from_str(&r_cog.text().await.unwrap()).unwrap();
+        let v_cog = j_cog["values"][0].as_f64().unwrap();
+
+        let r_mj = client
+            .get(format!("{base}/mosaicjson/point/{lon},-17?url={}", am_mj_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mj.status(), 200, "JJ1 /mosaicjson/point/{lon},-17 failed");
+        let j_mj: serde_json::Value = serde_json::from_str(&r_mj.text().await.unwrap()).unwrap();
+        let v_mj = j_mj["assets"][0]["values"][0].as_f64().unwrap();
+
+        assert_eq!(v_cog, v_mj, "JJ1 /cog vs /mosaicjson mismatch at lon={lon}");
+        vals_by_lon.insert(lon, v_cog);
+    }
+    // Periodic equivalence: 179.5 == -180.5 == -540.5, and 180.5 == 540.5
+    assert_eq!(vals_by_lon["179.5"], vals_by_lon["-180.5"]);
+    assert_eq!(vals_by_lon["179.5"], vals_by_lon["-540.5"]);
+    assert_eq!(vals_by_lon["180.5"], vals_by_lon["540.5"]);
+    // Beyond ±720° returns 404 symmetrically on both routes
+    for far_lon in ["900.5", "-900.5"] {
+        let rc = client
+            .get(format!("{base}/cog/point/{far_lon},-17?url={}", am_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rc.status(), 404, "JJ1 /cog/point/{far_lon} must 404");
+        let rm = client
+            .get(format!("{base}/mosaicjson/point/{far_lon},-17?url={}", am_mj_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rm.status(), 404, "JJ1 /mosaicjson/point/{far_lon} must 404");
+    }
+
+    // --- HH1: `+` in url= decoded as space (quote_plus / httpx params), while raw + and %2B in expression= both work ---
+    let plus_url = space_path.to_string_lossy().replace(' ', "+");
+    let pct_url = space_path.to_string_lossy().replace(' ', "%20");
+    let r_plus = client
+        .get(format!("{base}/cog/info?url={plus_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_plus.status(), 200, "HH1 url with '+' space encoding must return 200");
+    let r_pct = client
+        .get(format!("{base}/cog/info?url={pct_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pct.status(), 200);
+    for expr in ["b1+b2", "b1%2Bb2"] {
+        let r_expr = client
+            .get(format!("{base}/cog/statistics?url={plus_url}&expression={expr}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_expr.status(), 200, "HH1 expression={expr} failed");
+        let j: serde_json::Value = serde_json::from_str(&r_expr.text().await.unwrap()).unwrap();
+        assert!((j["b1"]["mean"].as_f64().unwrap() - 30.0).abs() < 1e-6, "HH1 {expr} got {j}");
+    }
 
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
