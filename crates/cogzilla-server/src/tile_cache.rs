@@ -85,6 +85,7 @@ pub struct TileCache {
     current_bytes: AtomicUsize,
     clock: AtomicU64,
     evicting: AtomicBool,
+    clear_epoch: AtomicU64,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub coalesced: AtomicU64,
@@ -99,6 +100,7 @@ impl TileCache {
             current_bytes: AtomicUsize::new(0),
             clock: AtomicU64::new(1),
             evicting: AtomicBool::new(false),
+            clear_epoch: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             coalesced: AtomicU64::new(0),
@@ -114,6 +116,7 @@ impl TileCache {
     }
 
     pub fn clear(&self) {
+        self.clear_epoch.fetch_add(1, Ordering::AcqRel);
         let mut removed = 0usize;
         self.ready.retain(|_, entry| {
             removed += entry.byte_len;
@@ -283,6 +286,7 @@ impl TileCache {
                             slot,
                             completed: false,
                         };
+                        let start_epoch = self.clear_epoch.load(Ordering::Acquire);
                         let f = render_opt.take().expect("render_fn called once");
                         return match f().await {
                             Ok((bytes, content_type)) => {
@@ -298,7 +302,10 @@ impl TileCache {
                                 };
                                 // Wake all singleflight waiters immediately BEFORE any LRU eviction scan.
                                 guard.complete(Ok(tile.clone()));
-                                self.insert_ready(key, tile.clone());
+                                // Skip caching if `clear()` fired while this render was in flight.
+                                if self.clear_epoch.load(Ordering::Acquire) == start_epoch {
+                                    self.insert_ready(key, tile.clone());
+                                }
                                 Ok(tile)
                             }
                             Err(e) => {
@@ -429,5 +436,41 @@ mod tests {
                 .unwrap();
         }
         assert!(cache.current_bytes() <= 1024);
+    }
+
+    #[tokio::test]
+    async fn clear_during_inflight_render_does_not_poison_ready_cache() {
+        let cache = Arc::new(TileCache::new(64 * 1024));
+        let started = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+
+        let c1 = cache.clone();
+        let s1 = started.clone();
+        let p1 = proceed.clone();
+        let h1 = tokio::spawn(async move {
+            c1.get_or_render("tile_k".into(), || async move {
+                s1.notify_one();
+                p1.notified().await;
+                Ok((Bytes::from_static(b"STALE_V1"), "image/png"))
+            })
+            .await
+            .unwrap()
+        });
+
+        started.notified().await;
+        // Source changed / admin clear fires while v1 render is still in flight.
+        cache.clear();
+        proceed.notify_one();
+
+        let v1 = h1.await.unwrap();
+        assert_eq!(v1.bytes.as_ref(), b"STALE_V1");
+        // Subsequent request must NOT get cached STALE_V1; it must render FRESH_V2.
+        let v2 = cache
+            .get_or_render("tile_k".into(), || async move {
+                Ok((Bytes::from_static(b"FRESH_V2"), "image/png"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(v2.bytes.as_ref(), b"FRESH_V2");
     }
 }

@@ -1008,12 +1008,21 @@ pub async fn query_point(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
+    let Some(norm_lon) = cogzilla_proj::normalize_geographic_lon(lon) else {
+        return Err(EngineError::NotFound(format!(
+            "point ({lon}, {lat}) is outside dataset bounds"
+        )));
+    };
     let q_lon = if let Some(lo) = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width)
-        && lon < lo
+        && norm_lon < lo
     {
-        lon + 360.0
+        norm_lon + 360.0
+    } else if let Some(hi) = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width)
+        && norm_lon > hi
+    {
+        norm_lon - 360.0
     } else {
-        lon
+        norm_lon
     };
     let (sx, sy) = crs.from_lonlat_deg(q_lon, lat);
     let (col_f, row_f) = ifd.crs_to_pixel_pt(sx, sy);
@@ -4956,6 +4965,7 @@ async fn render_bbox_impl(
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let wrap_hi = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
         let gcp_poly = ifd.gcp_poly.clone();
         let ifd_width = ifd.width;
@@ -4976,7 +4986,13 @@ async fn render_bbox_impl(
                 let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
                     cogzilla_proj::CrsModel::Geographic => {
-                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        let lon = if x > 180.0 {
+                            x - 360.0
+                        } else if x < -180.0 {
+                            x + 360.0
+                        } else {
+                            x
+                        };
                         crs.from_lonlat_deg(lon, y)
                     }
                     other => {
@@ -4988,11 +5004,16 @@ async fn render_bbox_impl(
                         }
                     }
                 };
-                if let Some(lo) = wrap_lo
-                    && sx.is_finite()
-                    && sx < lo
-                {
-                    sx += 360.0;
+                if sx.is_finite() {
+                    if let Some(lo) = wrap_lo
+                        && sx < lo
+                    {
+                        sx += 360.0;
+                    } else if let Some(hi) = wrap_hi
+                        && sx > hi
+                    {
+                        sx -= 360.0;
+                    }
                 }
                 (sx, sy)
             };
@@ -5281,15 +5302,23 @@ async fn render_bbox_impl(
     (u_map, v_map, min_u, max_u, min_v, max_v)
     };
 
-    // Empty check: zero source pixels mapped into the requested tile/bbox/feature.
-    if !min_u.is_finite() {
+    // Empty check: zero source pixel centers mapped into the requested tile/bbox/feature.
+    // Only return 404 when the requested bbox genuinely does not intersect the dataset footprint;
+    // coarse grids over wide/dateline-spanning polygons whose pixel centers miss narrow edge
+    // overlaps still overlap the dataset and should render an empty (all-nodata) 200 image.
+    let empty_but_overlapping = if !min_u.is_finite() {
         let full = primary.index.full_res();
-        let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-        return Err(EngineError::NotFound(format!(
-            "request is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
-            rb[0], rb[1], rb[2], rb[3]
-        )));
-    }
+        if !crate::http::tile_box_intersects_cog(&crs, full, dst_crs, bbox) {
+            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            return Err(EngineError::NotFound(format!(
+                "request is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                rb[0], rb[1], rb[2], rb[3]
+            )));
+        }
+        true
+    } else {
+        false
+    };
 
     let (footprint_sx, footprint_sy) = if native_preview {
         (
@@ -5326,7 +5355,9 @@ async fn render_bbox_impl(
     let max_c = (ifd.width as i32 - 1).max(0);
     let max_r = (ifd.height as i32 - 1).max(0);
     let is_dem = matches!(bands, BandRequest::Dem { .. });
-    let (c0, c1, r0, r1) = if is_dem {
+    let (c0, c1, r0, r1) = if empty_but_overlapping {
+        (0u32, 0u32, 0u32, 0u32)
+    } else if is_dem {
         let (lo, hi) = crate::engine::resample_fetch_margin(resample, true);
         (
             (min_u.floor() as i32).saturating_sub(lo).clamp(0, max_c) as u32,
