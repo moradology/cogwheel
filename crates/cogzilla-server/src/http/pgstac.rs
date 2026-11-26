@@ -7084,9 +7084,9 @@ mod tests {
         assert_eq!(rescale_byte(1168.0, 0.0, 4000.0), 74);
         assert_eq!(rescale_byte(-5.0, 0.0, 100.0), 0);
         assert_eq!(rescale_byte(500.0, 0.0, 100.0), 255);
-        // A range of nothing, or one that runs backwards, is not a panic.
+        // A range of nothing is not a panic; one that runs backwards is the ramp inverted.
         assert_eq!(rescale_byte(3.0, 3.0, 3.0), 0);
-        let _ = rescale_byte(3.0, 10.0, 0.0);
+        assert_eq!(rescale_byte(3.0, 10.0, 0.0), 178);
         // Grey is the byte itself, for every level.
         let grey = Paint::Gray { min: 0.0, max: 255.0, colormap: ColormapName::Grayscale };
         let all: Vec<f32> = (0..=255).map(|v| v as f32).collect();

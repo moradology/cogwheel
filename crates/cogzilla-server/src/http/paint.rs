@@ -21,12 +21,18 @@ use crate::engine::BandRequest;
 ///
 /// The cast is numpy's and the clamp besides: it drops the fraction, and takes what is
 /// under 0 (or not a number) as 0 and what is over 255 as 255.
+///
+/// A range given upside down (`rescale=255,0`) is the one place this leaves rio-tiler,
+/// which has no such stretch: numpy's `clip` with its bounds crossed answers the upper
+/// one, so every pixel comes out 255. Here it is the ramp inverted, as the renderer
+/// draws it for a single scene (`safe_rescale_denom`).
 #[inline(always)]
 pub(super) fn rescale_byte(v: f32, min: f32, max: f32) -> u8 {
     let (v, min, max) = (f64::from(v), f64::from(min), f64::from(max));
     let span = if (max - min).abs() < 1e-12 { 1e-12 } else { max - min };
-    let share = (v.max(min).min(max) - min) / span;
-    (share * 255.0) as u8
+    // Either way, what is not a number lands on `min` and so on 0.
+    let within = if min <= max { v.max(min).min(max) } else { v.min(min).max(max) };
+    ((within - min) / span * 255.0) as u8
 }
 
 /// What a colour formula makes of each grey level.
@@ -75,31 +81,6 @@ impl Paint {
     /// a formula for red, green and blue is applied to the finished picture.
     pub(super) fn rgba_through(&self, selected: &Selected, pixels: usize, levels: &[u8; 256]) -> Vec<u8> {
         self.paint(selected, pixels, |byte| levels[usize::from(byte)])
-    }
-
-    /// A range given upside down (`rescale=255,0`) as the same stretch the right way up:
-    /// the band's values and its range both negated, which is the same share of the range
-    /// for every value. rio-tiler has no such stretch (numpy's `clip` with its bounds
-    /// crossed answers the upper one, so every pixel comes out 255); the renderer has, and
-    /// the routes that paint a single scene with it keep it here.
-    pub(super) fn upright(mut self, selected: &mut Selected, pixels: usize) -> Self {
-        let mut turn = |band: usize, min: &mut f32, max: &mut f32| {
-            if *min > *max {
-                (*min, *max) = (-*min, -*max);
-                for v in selected.values.iter_mut().skip(band * pixels).take(pixels) {
-                    *v = -*v;
-                }
-            }
-        };
-        match &mut self {
-            Self::Gray { min, max, .. } => turn(0, min, max),
-            Self::Rgb { min, max } => {
-                for band in 0..3 {
-                    turn(band, &mut min[band], &mut max[band]);
-                }
-            }
-        }
-        self
     }
 
     /// Every pixel is written once and none is decided by a branch: a pixel without a
@@ -191,9 +172,17 @@ mod tests {
         assert_eq!(rescale_byte(3.0, 3.0, 3.0), 0);
         assert_eq!(rescale_byte(9.0, 3.0, 3.0), 0);
         assert_eq!(rescale_byte(f32::NAN, 0.0, 100.0), 0);
-        // A range upside down: numpy's clip answers its upper bound, so everything is 255.
-        assert_eq!(rescale_byte(3.0, 10.0, 0.0), 255);
+        // A range upside down is the ramp inverted, where numpy's clip would answer its
+        // upper bound and make everything 255.
+        assert_eq!(rescale_byte(3.0, 10.0, 0.0), 178);
         assert_eq!(rescale_byte(0.0, 255.0, 0.0), 255);
+        assert_eq!(rescale_byte(255.0, 255.0, 0.0), 0);
+        assert_eq!(rescale_byte(-5.0, 10.0, 0.0), 255);
+        assert_eq!(rescale_byte(50.0, 10.0, 0.0), 0);
+        assert_eq!(rescale_byte(f32::NAN, 10.0, 0.0), 0);
+        for level in 0..=255u8 {
+            assert_eq!(rescale_byte(f32::from(level), 255.0, 0.0), 255 - level);
+        }
     }
 
     #[test]
@@ -290,18 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn a_range_upside_down_is_turned_the_right_way_up() {
-        let mut values = one(&[0.0, 51.0, 255.0, f32::NAN]);
-        let grey = Paint::Gray { min: 255.0, max: 0.0, colormap: ColormapName::Grayscale }.upright(&mut values, 4);
-        assert_eq!(grey, Paint::Gray { min: -255.0, max: 0.0, colormap: ColormapName::Grayscale });
-        let rgba = grey.rgba(&values, 4);
+    fn a_range_upside_down_is_the_ramp_inverted() {
+        let values = one(&[0.0, 51.0, 255.0, f32::NAN]);
+        let rgba = Paint::Gray { min: 255.0, max: 0.0, colormap: ColormapName::Grayscale }.rgba(&values, 4);
         assert_eq!([rgba[0], rgba[4], rgba[8]], [255, 204, 0]);
         assert_eq!(rgba[12..], [0, 0, 0, 0]);
-        // Only the bands whose range is upside down; a range the right way up is left alone.
-        let mut three = Selected { bands: 3, values: vec![10.0, 10.0, 10.0] };
-        let rgb = Paint::Rgb { min: [0.0, 20.0, 0.0], max: [20.0, 0.0, 20.0] }.upright(&mut three, 1);
-        assert_eq!(rgb, Paint::Rgb { min: [0.0, -20.0, 0.0], max: [20.0, 0.0, 20.0] });
-        assert_eq!(three.values, [10.0, -10.0, 10.0]);
+        // Only the bands whose range is upside down.
+        let three = Selected { bands: 3, values: vec![10.0, 10.0, 10.0] };
+        let rgb = Paint::Rgb { min: [0.0, 20.0, 0.0], max: [20.0, 0.0, 20.0] };
         assert_eq!(rgb.rgba(&three, 1), [127, 127, 127, 255]);
     }
 
@@ -411,7 +396,8 @@ mod tests {
                 let clamped = {
                     let (v, min, max) = (f64::from(*v), f64::from(min), f64::from(max));
                     let span = if (max - min).abs() < 1e-12 { 1e-12 } else { max - min };
-                    (((v.max(min).min(max) - min) / span) * 255.0).clamp(0.0, 255.0) as u8
+                    let (low, high) = if min <= max { (min, max) } else { (max, min) };
+                    if v.is_nan() { 0 } else { (((v.max(low).min(high) - min) / span) * 255.0).clamp(0.0, 255.0) as u8 }
                 };
                 assert_eq!(rescale_byte(*v, min, max), clamped, "{v} over {min}..{max}");
             }
