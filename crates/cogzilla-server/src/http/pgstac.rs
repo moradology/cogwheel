@@ -110,6 +110,15 @@ fn invalid_param(location: &str, name: &str, msg: impl Into<String>) -> Resp {
     )
 }
 
+/// A 405 that says which method the route does take.
+fn method_not_allowed(takes: Option<Method>) -> Resp {
+    let mut resp = detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+    if let Some(Ok(allow)) = takes.map(|m| HeaderValue::from_str(m.as_str())) {
+        resp.headers_mut().insert(hyper::header::ALLOW, allow);
+    }
+    resp
+}
+
 fn no_content() -> Resp {
     let mut resp = Response::new(Full::new(Bytes::new()));
     *resp.status_mut() = StatusCode::NO_CONTENT;
@@ -1866,7 +1875,13 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
         ));
     }
     if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
-        return Err(detail(StatusCode::BAD_REQUEST, e.clone()));
+        return Err(parse_error(e));
+    }
+    // The shared parser reads any word as a flag; FastAPI reads only the ones that are.
+    for flag in ["unscale", "return_mask"] {
+        if query_value(pairs, flag).is_some_and(|v| parse_bool(v).is_none()) {
+            return Err(invalid_param("query", flag, "Input should be a valid boolean"));
+        }
     }
     let assets = parse_assets(pairs)?;
     if assets.is_empty() {
@@ -1968,6 +1983,20 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
         .filter_map(|b| b.trim().parse().ok())
         .collect();
     Ok(Some((specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect(), own)))
+}
+
+/// The answer to a complaint of the shared parser. A value it could not read, of a
+/// parameter FastAPI checks in titiler-pgstac, is a 422 as there; anything else (what is
+/// not supported here, above all) stays the 400 it was.
+fn parse_error(e: &str) -> Resp {
+    const CHECKED: [&str; 9] = ["coord_crs", "dst_crs", "crs", "max_size", "nodata", "unscale", "return_mask", "buffer", "padding"];
+    match error_parameter(e) {
+        Some(name) if e.starts_with("invalid ") && CHECKED.contains(&name) => {
+            let msg = if name.ends_with("crs") { "Value error, invalid CRS format" } else { "Input should be a valid value" };
+            invalid_param("query", name, msg)
+        }
+        _ => detail(StatusCode::BAD_REQUEST, e.to_string()),
+    }
 }
 
 /// Whether the shared parser's complaint is about something these routes read for
@@ -4730,10 +4759,7 @@ async fn point_values(
         return resp;
     }
     if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
-        if error_parameter(e) == Some("coord_crs") {
-            return invalid_param("query", "coord_crs", "Value error, invalid CRS format");
-        }
-        return detail(StatusCode::BAD_REQUEST, e.clone());
+        return parse_error(e);
     }
     // A point is one pixel whatever the method; one that is not a method is still refused.
     if let Err(resp) = parse_resample(pairs, "reproject") {
@@ -6456,6 +6482,10 @@ where
         ["searches"] | ["searches", ""] | ["searches", "list"] if get => list(&ctx, pg, &pairs).await,
         // Item routes with a path are answered before this is reached.
         ["collections", _, "items", ..] => not_found(),
+        // A route asked with a method it does not take is a 405 before anything is looked up.
+        ["searches" | "collections", _, rest @ ..] if route_method(rest).is_some_and(|takes| takes != *method) => {
+            method_not_allowed(route_method(rest))
+        }
         [family @ ("searches" | "collections"), id, rest @ ..]
             if (get || *method == Method::POST) && !rest.is_empty() =>
         {
@@ -6492,6 +6522,19 @@ where
     }
 }
 
+/// The method each route of a mosaic takes, by the shape of its path; `None` for a path
+/// that is no route. The one table the dispatcher and its 405s read.
+fn route_method(rest: &[&str]) -> Option<Method> {
+    match rest {
+        ["statistics"] => Some(Method::POST),
+        [first, ..] if *first == "feature" || first.starts_with("feature.") => Some(Method::POST),
+        ["info"] | ["WMTSCapabilities.xml"] | [_, "tilejson.json" | "map.html"] => Some(Method::GET),
+        ["tiles"] | ["tiles", _] | ["tiles", _, _, _, _] | ["tiles", _, _, _, _, "assets"] => Some(Method::GET),
+        ["point", _] | ["point", _, "assets"] | ["bbox", _] | ["bbox", _, _] => Some(Method::GET),
+        _ => None,
+    }
+}
+
 /// The routes shared by a registered search and a collection's mosaic.
 #[allow(clippy::too_many_arguments)]
 async fn mosaic_route(
@@ -6505,17 +6548,11 @@ async fn mosaic_route(
     pairs: &[(String, String)],
 ) -> Resp {
     let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
-    // The routes that take a body.
-    let takes_body = |rest: &[&str]| {
-        rest == ["statistics"]
-            || rest.first().is_some_and(|f| *f == "feature" || f.starts_with("feature."))
-    };
-    if body.is_some() != takes_body(rest) {
-        return if body.is_some() {
-            not_found()
-        } else {
-            detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
-        };
+    // A body where a route takes none, or none where it takes one. (The dispatcher has
+    // answered these for a search and a collection; an item's routes come straight here.)
+    let takes_body = route_method(rest) == Some(Method::POST);
+    if body.is_some() != takes_body {
+        return if body.is_some() && route_method(rest).is_none() { not_found() } else { method_not_allowed(route_method(rest)) };
     }
     match rest {
         ["info"] => {

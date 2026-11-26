@@ -781,6 +781,15 @@ def main() -> int:
         dot = {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": triangle["geometry"]["coordinates"][0][0]}}
         o.check("feature, a point", "status", f"/searches/{sid}/feature.png?assets=visual&max_size=64", "POST", dot)
         o.check("feature, a point, exact size", "status", f"/searches/{sid}/feature/64x64.png?assets=visual", "POST", dot)
+        # A route asked with a method it does not take, and values FastAPI cannot read.
+        o.check("info, posted to", "status", f"/searches/{sid}/info", "POST", triangle)
+        o.check("tilesets, posted to", "status", f"/searches/{sid}/tiles", "POST", triangle)
+        o.check("a path that is no route, posted to", "status", f"/searches/{sid}/nope", "POST", triangle)
+        for bad in ("max_size=abc", "dst_crs=nope", "unscale=maybe"):
+            o.check(f"statistics with {bad}", "status", f"/searches/{sid}/statistics?assets=red&max_size=64&{bad}", "POST", triangle)
+        for bad in ("unscale=maybe", "return_mask=maybe", "nodata=abc"):
+            o.check(f"tile with {bad}", "status", f"{base12}.png?assets=red&{bad}")
+        o.check("bbox in a system that is not one", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/32x32.png?assets=red&coord_crs=nope")
         o.check("statistics pass a colour map over", "status", f"/searches/{sid}/statistics?assets=red&colormap_name=nope&max_size=64", "POST", triangle)
         # Arrays keep the data's type and carry the mask as a band of their own.
         o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)

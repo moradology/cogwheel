@@ -325,7 +325,9 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("feature?assets=visual", 204),
         ("feature/64x32.png?assets=visual", 204),
         ("feature.png", 422),
-        ("info", 404),
+        // A route that takes no body, as Starlette answers it; a path that is no route.
+        ("info", 405),
+        ("nope", 404),
     ] {
         let resp = post_json(&client, format!("{base}/searches/{id}/{path}"), &triangle).await;
         assert_eq!(resp.status().as_u16(), status, "POST {path}");
