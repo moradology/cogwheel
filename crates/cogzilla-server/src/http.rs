@@ -713,7 +713,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "resample" | "resampling" => {
-                match parse_resample_mode(v) {
+                let dec = percent_decode(v).to_ascii_lowercase();
+                match parse_resample_mode(&dec) {
                     Some(m) => pq.resample = m,
                     None => {
                         bad("unsupported resampling method");
@@ -722,7 +723,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "reproject" => {
-                match parse_resample_mode(v) {
+                let dec = percent_decode(v).to_ascii_lowercase();
+                match parse_resample_mode(&dec) {
                     Some(m) => pq.reproject = m,
                     None => {
                         bad("unsupported reproject method");
@@ -967,16 +969,23 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     if pq.colormap_name_set {
         pq.custom_colormap_json = None;
     }
-    // TiTiler HillShade/Slope crop `algorithm_params.buffer` (default 3) back out of the buffered
-    // input tile; since cogzilla's Horn 3×3 already fetches its own neighbor halo seamlessly,
-    // subtract that crop from `pq.buffer` so `?algorithm=hillshade&buffer=3` outputs 256×256.
+    // TiTiler HillShade (default buffer 3) and Slope/Aspect (default buffer 0) crop
+    // `algorithm_params.buffer` back out of the buffered input tile; since cogzilla's Horn 3×3
+    // already fetches its own neighbor halo seamlessly, subtract that crop from `pq.buffer`
+    // so `?algorithm=hillshade&buffer=3` outputs 256×256 while `?algorithm=slope&buffer=3`
+    // keeps the requested 262×262 unless `algorithm_params.buffer` is explicitly set.
     if pq.buffer > 0.0
-        && pq
-            .algorithm
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case("hillshade") || a.eq_ignore_ascii_case("slope"))
+        && let Some(alg) = pq.algorithm.as_deref()
+        && (alg.eq_ignore_ascii_case("hillshade")
+            || alg.eq_ignore_ascii_case("slope")
+            || alg.eq_ignore_ascii_case("aspect"))
     {
-        let crop = pq.alg_buffer.unwrap_or(3.0).min(pq.buffer);
+        let default_crop = if alg.eq_ignore_ascii_case("hillshade") {
+            3.0
+        } else {
+            0.0
+        };
+        let crop = pq.alg_buffer.unwrap_or(default_crop).min(pq.buffer);
         pq.buffer = (pq.buffer - crop).max(0.0);
     }
     pq.errors = pq_errors;
@@ -1079,6 +1088,15 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             Some(segs[segs.len() - 2])
         } else {
             match segs.iter().position(|s| *s == "tiles") {
+                Some(i) if last == "assets" => {
+                    // `/mosaicjson/tiles/{tms}/{z}/{x}/{y}/assets` has len - i == 6;
+                    // `/mosaicjson/tiles/{z}/{x}/{y}/assets` (len - i == 5) has no TMS segment.
+                    if segs.len() - i == 6 {
+                        Some(segs[i + 1])
+                    } else {
+                        None
+                    }
+                }
                 Some(i) if matches!(segs.len() - i, 2 | 5) => Some(segs[i + 1]),
                 _ => None,
             }
@@ -2259,7 +2277,7 @@ fn build_band_request(
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::Contours {
-                        increment: pq.contour_increment.round() as i32,
+                        increment: (pq.contour_increment.round() as i32).max(1),
                         thickness: pq.contour_thickness.min(255) as u8,
                         minz: pq.contour_minz.round() as i32,
                         maxz: pq.contour_maxz.round() as i32,
@@ -3582,12 +3600,22 @@ async fn render_mosaic_tile_styled(
         if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
             let mut acc_f32: Option<(usize, Vec<f32>)> = None;
             let mut filled = 0usize;
+            let mut any_ok = false;
+            let mut last_err: Option<EngineError> = None;
             for (scene_i, url) in urls.iter().enumerate() {
                 if scene_i > 0 {
                     tokio::task::consume_budget().await;
                 }
-                let Ok(cog) = engine.store.open_uri(url).await else {
-                    continue;
+                let cog = match engine.store.open_uri(url).await {
+                    Ok(c) => c,
+                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        return Err(EngineError::Io(e));
+                    }
+                    Err(e) => {
+                        failed_out.push(url.clone());
+                        last_err = Some(crate::engine::asset_fetch_error(url, e));
+                        continue;
+                    }
                 };
                 let cogs = vec![cog];
                 let mut scene_bands = treq.bands.clone();
@@ -3613,9 +3641,22 @@ async fn render_mosaic_tile_styled(
                 .await
                 {
                     Ok(b) => b,
-                    Err(EngineError::NotFound(_)) => continue,
-                    Err(e) => return Err(e),
+                    Err(EngineError::NotFound(_)) => {
+                        any_ok = true;
+                        continue;
+                    }
+                    Err(EngineError::Io(e))
+                        if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                    {
+                        return Err(EngineError::Io(e));
+                    }
+                    Err(e) => {
+                        failed_out.push(url.clone());
+                        last_err = Some(e);
+                        continue;
+                    }
                 };
+                any_ok = true;
                 if n_px == 0 || raw.len() % (n_px * 4) != 0 {
                     continue;
                 }
@@ -3661,6 +3702,11 @@ async fn render_mosaic_tile_styled(
                     break;
                 }
             }
+            if !any_ok
+                && let Some(err) = last_err
+            {
+                return Err(err);
+            }
             let default_nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
             let (nb, acc) = acc_f32.unwrap_or_else(|| (default_nb, vec![f32::NAN; default_nb * n_px]));
             let mut out = bytes::BytesMut::with_capacity(acc.len() * 4);
@@ -3687,13 +3733,23 @@ async fn render_mosaic_tile_styled(
             .map_err(EngineError::BadRequest)?;
         let mut comp = vec![0u8; n_px * 4];
         let mut filled = 0usize;
+        let mut any_ok = false;
+        let mut last_err: Option<EngineError> = None;
 
         for (scene_i, url) in urls.iter().enumerate() {
             if scene_i > 0 {
                 tokio::task::consume_budget().await;
             }
-            let Ok(cog) = engine.store.open_uri(url).await else {
-                continue;
+            let cog = match engine.store.open_uri(url).await {
+                Ok(c) => c,
+                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    return Err(EngineError::Io(e));
+                }
+                Err(e) => {
+                    failed_out.push(url.clone());
+                    last_err = Some(crate::engine::asset_fetch_error(url, e));
+                    continue;
+                }
             };
             let cogs = vec![cog];
             let mut scene_bands = treq.bands.clone();
@@ -3720,9 +3776,22 @@ async fn render_mosaic_tile_styled(
             .await
             {
                 Ok(b) => b,
-                Err(EngineError::NotFound(_)) => continue,
-                Err(e) => return Err(e),
+                Err(EngineError::NotFound(_)) => {
+                    any_ok = true;
+                    continue;
+                }
+                Err(EngineError::Io(e))
+                    if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                {
+                    return Err(EngineError::Io(e));
+                }
+                Err(e) => {
+                    failed_out.push(url.clone());
+                    last_err = Some(e);
+                    continue;
+                }
             };
+            any_ok = true;
             if scene_rgba.len() != n_px * 4 {
                 continue;
             }
@@ -3736,6 +3805,11 @@ async fn render_mosaic_tile_styled(
             if filled >= n_px {
                 break;
             }
+        }
+        if !any_ok
+            && let Some(err) = last_err
+        {
+            return Err(err);
         }
         return Ok(encode_rgba_output(
             out_dim as usize,
