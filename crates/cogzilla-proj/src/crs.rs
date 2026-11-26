@@ -1372,6 +1372,7 @@ impl<const N: usize> CoordPlan<N> {
                 CrsModel::EqualEarth(p) => Some(p.lon0),
                 CrsModel::Albers(p) => Some(p.lon0),
                 CrsModel::LambertConformalConic(p) => Some(p.lon0),
+                CrsModel::CylindricalEqualArea(p) => Some(p.lon0),
                 _ => None,
             };
             let straddles_branch_cut = branch_lon0.is_some_and(|lon0| {

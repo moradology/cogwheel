@@ -46,11 +46,21 @@ pub fn wgs84_bbox_to_3857(bbox: [f64; 4]) -> [f64; 4] {
         ((std::f64::consts::FRAC_PI_4 + clamped * 0.5).tan().ln() * WEB_MERCATOR_R)
             .clamp(-ORIGIN_SHIFT, ORIGIN_SHIFT)
     };
-    let (min_x, max_x) = if bbox[0] > bbox[2] || bbox[0] < -180.0 || bbox[2] > 180.0 {
+    let (mut w, mut e) = (bbox[0], bbox[2]);
+    if w <= e && (e - w) < 360.0 - 1e-9 {
+        if w >= 180.0 - 1e-9 && e > 180.0 + 1e-9 {
+            w -= 360.0;
+            e -= 360.0;
+        } else if e <= -180.0 + 1e-9 && w < -180.0 - 1e-9 {
+            w += 360.0;
+            e += 360.0;
+        }
+    }
+    let (min_x, max_x) = if w > e || w < -180.0 || e > 180.0 {
         // Antimeridian-crossing bbox: cover full WebMercator X span conservatively.
         (-ORIGIN_SHIFT, ORIGIN_SHIFT)
     } else {
-        (lon_to_x(bbox[0]), lon_to_x(bbox[2]))
+        (lon_to_x(w), lon_to_x(e))
     };
     let min_y = lat_to_y(bbox[1]);
     let max_y = lat_to_y(bbox[3]);
@@ -350,11 +360,19 @@ fn extract_stac_feature_uri(feat: &serde_json::Value) -> Option<String> {
         }
     }
     for asset in assets.values() {
-        if let Some(href) = asset.get("href").and_then(|v| v.as_str()) {
-            let lower = href.to_ascii_lowercase();
-            if lower.ends_with(".tif") || lower.ends_with(".tiff") {
-                return Some(href.to_string());
-            }
+        let Some(href) = asset.get("href").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let is_tiff_mime = asset
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| {
+                let tl = t.to_ascii_lowercase();
+                tl.contains("geotiff") || tl.contains("image/tiff")
+            });
+        let path_part = href.split(['?', '#']).next().unwrap_or(href).to_ascii_lowercase();
+        if is_tiff_mime || path_part.ends_with(".tif") || path_part.ends_with(".tiff") {
+            return Some(href.to_string());
         }
     }
     assets
@@ -834,6 +852,30 @@ mod tests {
         assert_eq!(
             gcat.query_bbox_3857(0.0, -ORIGIN_SHIFT, 0.0, -ORIGIN_SHIFT),
             vec!["/world.tif".to_string()]
+        );
+
+        // Audit #70 #3: wholly-shifted 0..360 regional bbox (CONUS [235, 25, 295, 50]) must
+        // normalize to [-125, 25, -65, 50] instead of expanding to full-world [-ORIGIN_SHIFT, +ORIGIN_SHIFT].
+        let conus = wgs84_bbox_to_3857([235.0, 25.0, 295.0, 50.0]);
+        let conus_norm = wgs84_bbox_to_3857([-125.0, 25.0, -65.0, 50.0]);
+        for i in 0..4 {
+            assert!((conus[i] - conus_norm[i]).abs() < 1e-6);
+        }
+
+        // Audit #70 #8: signed GeoTIFF URL with query string beats non-raster .xml/.png assets
+        let feat = serde_json::json!({
+            "type": "Feature",
+            "assets": {
+                "a_metadata": { "href": "https://example.com/meta.xml", "type": "application/xml" },
+                "z_band": {
+                    "href": "https://pc.example.com/B08.tif?se=2026-01-01&sig=abc",
+                    "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+                }
+            }
+        });
+        assert_eq!(
+            extract_stac_feature_uri(&feat).as_deref(),
+            Some("https://pc.example.com/B08.tif?se=2026-01-01&sig=abc")
         );
     }
 }
