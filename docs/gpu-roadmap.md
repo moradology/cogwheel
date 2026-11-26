@@ -20,8 +20,8 @@ This document tracks GPU acceleration experiments and PRs targeting the `gpu-imp
 
 | # | Area | Target Workload | Status | PR |
 | :--- | :--- | :--- | :--- | :--- |
-| 1 | `cogzilla-gpu` crate foundation | `wgpu` device/queue init, adapter selection (Metal + Vulkan RTX 3090 Ti), buffer pool, Cubic & Lanczos3 compute kernels + benchmark harness | In PR (`gpu-foundation`) | — |
-| 2 | Heavy resamplers & large crops | `cubic`, `cubic_spline`, `lanczos`, `gauss` on `@2x`/`@4x` tiles and `/preview`, `/bbox`, `/feature` (512–4096 px) | Planned | — |
+| 1 | `cogzilla-gpu` crate foundation | `wgpu` device/queue init, adapter selection (Metal + Vulkan RTX 3090 Ti), buffer pool, Cubic & Lanczos3 compute kernels + benchmark harness | Merged | #210 |
+| 2 | Adaptive `DispatchPolicy` + fused colormap | Startup-calibrated cost model (`COGZILLA_GPU_POLICY`), queue backpressure, fused Bilinear/Cubic/Lanczos3 → rescale → RGBA8 / 4×-smaller packed `IndexedU8` | Merged | (this PR) |
 | 3 | DEM / terrain compute shaders | `hillshade`, `slope`, `aspect`, `contours`, `terrarium`, `terrainrgb` (3×3 Horn stencil + resampling fused) | Planned | — |
 | 4 | GPU-resident block cache + micro-batching | Persistent VRAM/unified slab atlas + batched 16–64 tile command buffers for pan bursts & pyramid seeding | Planned | — |
 | 5 | Fused `expr_vm` + `color_formula` + colormap | Compile `ExprProgram` IR to WGSL compute shaders; fuse multi-band math, gamma/sigmoidal, and LUT lookup | Planned | — |
