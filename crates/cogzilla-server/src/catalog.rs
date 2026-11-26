@@ -544,12 +544,28 @@ impl SceneCatalog for MosaicJsonCatalog {
         } else {
             0.0
         };
-        let x0 = (((min_x + eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
-        let x1 = (((max_x - eps) + ORIGIN_SHIFT) / tile_span).floor() as i64;
-        // WebMercator Y increases northwards while XYZ tile y increases southwards.
-        let y0 = ((ORIGIN_SHIFT - (max_y - eps)) / tile_span).floor() as i64;
-        let y1 = ((ORIGIN_SHIFT - (min_y + eps)) / tile_span).floor() as i64;
         let max_idx = (1i64 << qz) - 1;
+        let x0 = if min_x == max_x && min_x >= ORIGIN_SHIFT - 1e-6 && min_x <= ORIGIN_SHIFT + 1e-6 {
+            max_idx
+        } else {
+            (((min_x + eps) + ORIGIN_SHIFT) / tile_span).floor() as i64
+        };
+        let x1 = if min_x == max_x && min_x >= ORIGIN_SHIFT - 1e-6 && min_x <= ORIGIN_SHIFT + 1e-6 {
+            max_idx
+        } else {
+            (((max_x - eps) + ORIGIN_SHIFT) / tile_span).floor() as i64
+        };
+        // WebMercator Y increases northwards while XYZ tile y increases southwards.
+        let y0 = if min_y == max_y && min_y >= -ORIGIN_SHIFT - 1e-6 && min_y <= -ORIGIN_SHIFT + 1e-6 {
+            max_idx
+        } else {
+            ((ORIGIN_SHIFT - (max_y - eps)) / tile_span).floor() as i64
+        };
+        let y1 = if min_y == max_y && min_y >= -ORIGIN_SHIFT - 1e-6 && min_y <= -ORIGIN_SHIFT + 1e-6 {
+            max_idx
+        } else {
+            ((ORIGIN_SHIFT - (min_y + eps)) / tile_span).floor() as i64
+        };
         if x1 < 0 || x0 > max_idx || y1 < 0 || y0 > max_idx || x0 > x1 || y0 > y1 {
             return Vec::new();
         }
@@ -799,5 +815,25 @@ mod tests {
         // Unrelated tile returns empty
         let (ox0, oy0, ox1, oy1) = tile_bounds_3857(TileCoord { z: 12, x: 10, y: 10 });
         assert!(cat.query_bbox_3857(ox0, oy0, ox1, oy1).is_empty());
+
+        // Global z=0 MosaicJSON must still match degenerate point queries on +180° / -85.0511° edges
+        let global_json = serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 0,
+            "maxzoom": 4,
+            "quadkey_zoom": 0,
+            "bounds": [-180.0, -85.05112878, 180.0, 85.05112878],
+            "tiles": { "": ["/world.tif"] }
+        })
+        .to_string();
+        let gcat = MosaicJsonCatalog::from_json_str(&global_json).unwrap();
+        assert_eq!(
+            gcat.query_bbox_3857(ORIGIN_SHIFT, 0.0, ORIGIN_SHIFT, 0.0),
+            vec!["/world.tif".to_string()]
+        );
+        assert_eq!(
+            gcat.query_bbox_3857(0.0, -ORIGIN_SHIFT, 0.0, -ORIGIN_SHIFT),
+            vec!["/world.tif".to_string()]
+        );
     }
 }
