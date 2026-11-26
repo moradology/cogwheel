@@ -552,7 +552,8 @@ impl GpuBackend {
         }
     }
 
-    /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (single- or multi-block, any dtype).
+    /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (single- or multi-block, any dtype,
+    /// and all `CoordPlan` variants: `Separable1D`, `Grid2D`, `Exact2D`).
     #[allow(clippy::too_many_arguments)]
     pub fn try_render_dem<const N: usize>(
         &self,
@@ -567,21 +568,114 @@ impl GpuBackend {
         pixel_size_m: f32,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
-        let CoordPlan::Separable1D { u, v, .. } = plan else {
-            return None;
-        };
-        self.try_render_crop_dem(
-            cog_id,
-            ifd_idx,
-            band0,
-            u.as_slice(),
-            v.as_slice(),
-            src,
-            alg,
-            pixel_size_m,
-            pixel_size_m,
-            style,
-        )
+        match plan {
+            CoordPlan::Separable1D { u, v, .. } => self.try_render_crop_dem(
+                cog_id,
+                ifd_idx,
+                band0,
+                u.as_slice(),
+                v.as_slice(),
+                src,
+                alg,
+                pixel_size_m,
+                pixel_size_m,
+                style,
+            ),
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => {
+                let gpu_mode = map_resample(style.resample)?;
+                let gpu_alg = match alg {
+                    DemAlgorithm::Hillshade {
+                        azimuth_deg,
+                        altitude_deg,
+                        z_factor,
+                    } => GpuDemAlgorithm::Hillshade {
+                        azimuth_deg,
+                        altitude_deg,
+                        z_factor,
+                    },
+                    DemAlgorithm::Slope { z_factor } => GpuDemAlgorithm::Slope { z_factor },
+                    DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
+                    DemAlgorithm::Contours { .. } => return None,
+                };
+                let out_kind = match style.format {
+                    OutputFormat::Png => GpuPixelOutput::IndexedU8,
+                    OutputFormat::Webp { .. }
+                    | OutputFormat::Jpeg { .. }
+                    | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
+                    _ => return None,
+                };
+                let key = source_slab_key(cog_id, ifd_idx, band0, src);
+                let warm_slab = self.slab_cache.get(&key);
+                let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
+                let readback_bytes = match out_kind {
+                    GpuPixelOutput::IndexedU8 => N * N,
+                    GpuPixelOutput::Rgba8 => N * N * 4,
+                };
+                let op = match gpu_mode {
+                    GpuColormapMode::Lanczos3 => GpuOp::DemHornLanczos3,
+                    _ => GpuOp::DemHornCubic,
+                };
+                let decision = self.policy.decide(&DispatchRequest {
+                    op,
+                    dst_pixels: N * N,
+                    upload_bytes,
+                    readback_bytes,
+                    batch_size: 1,
+                    in_flight: self.in_flight.load(Ordering::Relaxed),
+                });
+                if !decision.use_gpu {
+                    return None;
+                }
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
+                let _guard = InFlightGuard(&self.in_flight);
+                let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+                let bc = base_col as f32;
+                let br = base_row as f32;
+                let mut gu = [0.0f32; 289];
+                let mut gv = [0.0f32; 289];
+                for i in 0..289 {
+                    gu[i] = grid_u[i] - bc;
+                    gv[i] = grid_v[i] - br;
+                }
+                let lut = style.colormap.lut();
+                let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+                let raw = self
+                    .terrain
+                    .lock()
+                    .ok()?
+                    .render_slab_with_plan(
+                        &slab,
+                        GpuCoordPlan::Grid2D {
+                            dst_w: N,
+                            dst_h: N,
+                            grid_u: &gu,
+                            grid_v: &gv,
+                        },
+                        gpu_mode,
+                        gpu_alg,
+                        pixel_size_m,
+                        pixel_size_m,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?;
+                Some(match out_kind {
+                    GpuPixelOutput::IndexedU8 => {
+                        encode_indexed_u8_png(&raw, N as u32, N as u32, lut)
+                    }
+                    GpuPixelOutput::Rgba8 => {
+                        if style.format == OutputFormat::RawRgba {
+                            Bytes::from(raw)
+                        } else {
+                            encode_rgba_tile(&raw, N as u32, false, style.format)
+                        }
+                    }
+                })
+            }
+            CoordPlan::Exact2D { .. } => None,
+        }
     }
 
     /// Attempt GPU-accelerated `Terrarium` / `TerrainRgb` tile rendering (single- or multi-block).

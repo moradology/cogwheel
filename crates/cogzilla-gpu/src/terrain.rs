@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::colormap::{GpuColormapMode, GpuPixelOutput};
+use crate::colormap::{GpuColormapMode, GpuCoordPlan, GpuPixelOutput};
 use crate::context::{GpuContext, GpuError};
 use crate::resample::GpuSlab;
 
@@ -34,7 +34,7 @@ struct TerrainParams {
     dst_h: u32,
     resample_mode: u32,
     alg_mode: u32,
-    _pad0: u32,
+    coord_mode: u32,
     inv_8dx: f32,
     inv_8dy: f32,
     z_factor: f32,
@@ -264,10 +264,7 @@ impl GpuTerrainRenderer {
         }
     }
 
-    /// Render a DEM/terrain product from a GPU-resident `GpuSlab`.
-    ///
-    /// Note: `Terrarium` and `TerrainRgb` always emit `RGBA8` (`dst_w * dst_h * 4` bytes).
-    /// `Hillshade`, `Slope`, and `Aspect` support both `Rgba8` and 4×-smaller `IndexedU8`.
+    /// Render a DEM/terrain product from a GPU-resident `GpuSlab` using separable 1D coordinates.
     #[allow(clippy::too_many_arguments)]
     pub fn render_slab(
         &mut self,
@@ -283,8 +280,56 @@ impl GpuTerrainRenderer {
         lut_rgba_u32: &[u32; 256],
         output: GpuPixelOutput,
     ) -> Result<Vec<u8>, GpuError> {
-        let dst_w = u_coords.len();
-        let dst_h = v_coords.len();
+        self.render_slab_with_plan(
+            slab,
+            GpuCoordPlan::Separable1D { u_coords, v_coords },
+            resample,
+            alg,
+            pixel_size_x_m,
+            pixel_size_y_m,
+            rescale_min,
+            rescale_max,
+            lut_rgba_u32,
+            output,
+        )
+    }
+
+    /// Render a DEM/terrain product from a GPU-resident `GpuSlab` for any `GpuCoordPlan`
+    /// (`Separable1D`, 17×17 `Grid2D` UTM/Albers/Polar, or `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_slab_with_plan(
+        &mut self,
+        slab: &GpuSlab,
+        plan: GpuCoordPlan<'_>,
+        resample: GpuColormapMode,
+        alg: GpuDemAlgorithm,
+        pixel_size_x_m: f32,
+        pixel_size_y_m: f32,
+        rescale_min: f32,
+        rescale_max: f32,
+        lut_rgba_u32: &[u32; 256],
+        output: GpuPixelOutput,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D { u_coords, v_coords } => {
+                    (u_coords.len(), v_coords.len(), 0, u_coords, v_coords)
+                }
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() < dst_w * dst_h || v.len() < dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v buffers shorter than dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
         if dst_w == 0 || dst_h == 0 {
             return Err(GpuError::InvalidDimensions(
                 "destination width/height must be > 0".into(),
@@ -306,7 +351,7 @@ impl GpuTerrainRenderer {
             GpuPixelOutput::IndexedU8 => dst_w.div_ceil(4),
         };
         let out_words = words_per_row * dst_h;
-        self.ensure_capacities(dst_w, dst_h, out_words);
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
 
         let (alg_mode, z_factor, sun_e, sun_n, sun_u) = match alg {
             GpuDemAlgorithm::Hillshade {
@@ -351,7 +396,7 @@ impl GpuTerrainRenderer {
             dst_h: dst_h as u32,
             resample_mode,
             alg_mode,
-            _pad0: 0,
+            coord_mode,
             inv_8dx: 1.0 / (8.0 * pixel_size_x_m.max(1e-6)),
             inv_8dy: 1.0 / (8.0 * pixel_size_y_m.max(1e-6)),
             z_factor,
@@ -369,9 +414,9 @@ impl GpuTerrainRenderer {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
-            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_coords));
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
         self.queue
-            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_coords));
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
         if !is_terrain_rgb && eff_output == GpuPixelOutput::Rgba8 {
             self.queue
                 .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
@@ -691,5 +736,132 @@ mod tests {
                 "{alg:?} 24-bit encoding diff {max_b_diff} > 2 LSB"
             );
         }
+    }
+
+    #[test]
+    fn gpu_curved_grid2d_hillshade_matches_cpu() {
+        let ctx = match GpuContext::new_default() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping GPU curved terrain test (no adapter): {e}");
+                return;
+            }
+        };
+        let resampler = GpuResampler::new(&ctx);
+        let mut terrain = GpuTerrainRenderer::new(&ctx);
+
+        let src_w = 512u32;
+        let src_h = 512u32;
+        let mut src = vec![0.0f32; (src_w * src_h) as usize];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let fx = x as f32 * 0.025;
+                let fy = y as f32 * 0.021;
+                src[(y * src_w + x) as usize] = 1500.0 + 700.0 * fx.sin() * fy.cos();
+            }
+        }
+        let mut slab_cpu = AlignedF32Slab::new_uninit(src.len());
+        slab_cpu.as_mut_slice().copy_from_slice(&src);
+        let band = DecodedBand {
+            data: BandData::F32(slab_cpu),
+            width: src_w,
+            height: src_h,
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 700.0,
+                max: 2300.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        let bs = BandSource::new(src_w, src_h, src_w, src_h, 0, 0, 1, 1, &blocks);
+        let gpu_slab = resampler.upload_slab(&src, src_w, src_h, src_w).unwrap();
+
+        let mut grid_u = [0.0f32; 289];
+        let mut grid_v = [0.0f32; 289];
+        let cos_a = 0.9659f32;
+        let sin_a = 0.2588f32;
+        for gy in 0..17 {
+            for gx in 0..17 {
+                let nx = (gx as f32 / 16.0) - 0.5;
+                let ny = (gy as f32 / 16.0) - 0.5;
+                grid_u[gy * 17 + gx] = 256.0 + 300.0 * (nx * cos_a - ny * sin_a);
+                grid_v[gy * 17 + gx] = 256.0 + 300.0 * (nx * sin_a + ny * cos_a) + 6.0 * nx * nx;
+            }
+        }
+
+        let n = 256usize;
+        let lut = ColormapName::Viridis.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let px_m = 30.0f32;
+
+        let gpu_hs = terrain
+            .render_slab_with_plan(
+                &gpu_slab,
+                GpuCoordPlan::Grid2D {
+                    dst_w: n,
+                    dst_h: n,
+                    grid_u: &grid_u,
+                    grid_v: &grid_v,
+                },
+                GpuColormapMode::Cubic,
+                GpuDemAlgorithm::Hillshade {
+                    azimuth_deg: 315.0,
+                    altitude_deg: 45.0,
+                    z_factor: 1.5,
+                },
+                px_m,
+                px_m,
+                0.0,
+                255.0,
+                &lut_u32,
+                GpuPixelOutput::IndexedU8,
+            )
+            .unwrap();
+
+        // Build CPU interior elevation grid and check interior pixels (1..n-1)
+        let cell_px = n / 16;
+        let inv_cell = 1.0 / cell_px as f32;
+        let mut elev = vec![0.0f32; n * n];
+        for py in 0..n {
+            let gy = (py / cell_px).min(15);
+            let ty = (py - gy * cell_px) as f32 * inv_cell;
+            let r0 = gy * 17;
+            let r1 = (gy + 1) * 17;
+            for px in 0..n {
+                let gx = (px / cell_px).min(15);
+                let tx = (px - gx * cell_px) as f32 * inv_cell;
+                let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+                let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+                let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+                let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+                elev[py * n + px] = sample_cubic(&bs, u_l + (u_r - u_l) * tx, v_l + (v_r - v_l) * tx);
+            }
+        }
+        let inv_8d = 1.0 / (8.0 * px_m);
+        let inv254 = 254.0 / 255.0;
+        let cpu_alg = DemAlgorithm::Hillshade {
+            azimuth_deg: 315.0,
+            altitude_deg: 45.0,
+            z_factor: 1.5,
+        };
+        let mut max_diff = 0i32;
+        for py in 1..(n - 1) {
+            for px in 1..(n - 1) {
+                let r0 = (py - 1) * n + (px - 1);
+                let r1 = py * n + (px - 1);
+                let r2 = (py + 1) * n + (px - 1);
+                let val = eval_horn_3x3_aniso(
+                    elev[r0], elev[r0 + 1], elev[r0 + 2],
+                    elev[r1], elev[r1 + 1], elev[r1 + 2],
+                    elev[r2], elev[r2 + 1], elev[r2 + 2],
+                    inv_8d, inv_8d, cpu_alg,
+                );
+                let c = 1 + (val * inv254).clamp(0.0, 254.0) as i32;
+                let g = gpu_hs[py * n + px] as i32;
+                max_diff = max_diff.max((c - g).abs());
+            }
+        }
+        assert!(max_diff <= 1, "curved Grid2D hillshade max diff {max_diff} > 1 LSB");
     }
 }
