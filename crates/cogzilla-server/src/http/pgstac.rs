@@ -298,7 +298,7 @@ fn engine_gathers_too_little(crs: &CrsModel, cog: &cogzilla_io::OpenedCog, resam
     }
     let full = cog.index.full_res();
     let coarsest = cog.index.ifds.iter().map(|ifd| ifd.width).min().unwrap_or(full.width).max(1);
-    let covered = mercator_resolution(crs, cog).map(|res| res * f64::from(full.width) / f64::from(coarsest));
+    let covered = warped_resolution(crs, cog, true).map(|res| res * f64::from(full.width) / f64::from(coarsest));
     let of_tile = 40_075_016.685_578_49 / (256.0 * f64::from(1u32 << u32::from(zoom).min(30)));
     covered.is_none_or(|covered| of_tile > 2.0 * covered)
 }
@@ -348,10 +348,8 @@ fn render_query_error(pairs: &[(String, String)]) -> Option<Resp> {
     {
         return Some(detail(StatusCode::BAD_REQUEST, "Could not parse the colormap value."));
     }
-    if let Some(name) = query_value(pairs, "colormap_name")
-        && (ColormapName::from_str_opt(name).is_none() || name.chars().any(char::is_uppercase))
-    {
-        return bad("colormap_name", "Input should be the name of a colour map (see /colorMaps)");
+    if let Some(resp) = colormap_name_error(pairs) {
+        return Some(resp);
     }
     for (key, value) in pairs {
         let number = || py_number(value).is_some();
@@ -369,17 +367,7 @@ fn render_query_error(pairs: &[(String, String)]) -> Option<Resp> {
                 };
                 (!good).then_some("Input should be a range, as min,max")
             }
-            "resampling" => (!matches!(
-                value.as_str(),
-                "nearest" | "bilinear" | "cubic" | "cubic_spline" | "lanczos" | "average" | "mode" | "gauss" | "rms"
-            ))
-            .then_some("Input should be a resampling method"),
-            "reproject" => (!matches!(
-                value.as_str(),
-                "nearest" | "bilinear" | "cubic" | "cubic_spline" | "lanczos" | "average" | "mode" | "rms"
-                    | "max" | "min" | "med" | "q1" | "q3" | "sum"
-            ))
-            .then_some("Input should be a resampling method"),
+            "resampling" | "reproject" => resample_method(key, value).is_none().then_some("Input should be a resampling method"),
             "pixel_selection" => Selection::parse(value).is_none().then_some("Input should be a pixel selection method"),
             // Only the operation is looked at here; what follows it is the tile's to refuse.
             "color_formula" => (value.is_empty()
@@ -1821,21 +1809,41 @@ impl Paint {
 /// TiTiler's two resampling parameters. Both default to nearest neighbour.
 fn parse_resample(pairs: &[(String, String)], name: &str) -> Result<ResampleMode, Resp> {
     match query_value(pairs, name) {
-        None | Some("nearest") => Ok(ResampleMode::Nearest),
-        Some("bilinear") => Ok(ResampleMode::Bilinear),
-        Some("cubic" | "cubic_spline" | "lanczos") => Ok(ResampleMode::Cubic),
-        // The methods that gather a pixel's whole footprint; the last six are the warp's alone.
-        // `gauss` is not one of the warp's, nor the warp's six one of a read's: a 422, as there.
-        Some("gauss") if name == "reproject" => Err(invalid_param("query", name, "Input should be a resampling method")),
-        Some("max" | "min" | "med" | "q1" | "q3" | "sum") if name != "reproject" => {
-            Err(invalid_param("query", name, "Input should be a resampling method"))
-        }
-        Some(method @ ("average" | "mode" | "gauss" | "rms")) => Ok(super::parse_resample_mode(method).unwrap_or(ResampleMode::Nearest)),
-        Some(method @ ("max" | "min" | "med" | "q1" | "q3" | "sum")) if name == "reproject" => {
-            Ok(super::parse_resample_mode(method).unwrap_or(ResampleMode::Nearest))
-        }
-        Some(_) => Err(invalid_param("query", name, "Input should be a resampling method")),
+        None => Ok(ResampleMode::Nearest),
+        Some(method) => resample_method(name, method).ok_or_else(|| invalid_param("query", name, "Input should be a resampling method")),
     }
+}
+
+/// The method a `resampling` or `reproject` names, of those rasterio has for each: the
+/// shared parser's, but that `gauss` is a read's alone and `max`, `min`, `med`, `q1`, `q3`
+/// and `sum` the warp's alone, as titiler-pgstac has them.
+fn resample_method(parameter: &str, method: &str) -> Option<ResampleMode> {
+    let of_the_warp = parameter == "reproject";
+    match method {
+        "gauss" if of_the_warp => None,
+        "max" | "min" | "med" | "q1" | "q3" | "sum" if !of_the_warp => None,
+        // A spelling the shared routes take and rasterio has not.
+        "cubicspline" => None,
+        // Drawn with the cubic kernel on these routes.
+        "cubic_spline" | "lanczos" => Some(ResampleMode::Cubic),
+        _ => super::parse_resample_mode(method),
+    }
+}
+
+/// A `colormap_name` nobody has, or one not in lower case, as FastAPI refuses it.
+fn colormap_name_error(pairs: &[(String, String)]) -> Option<Resp> {
+    let name = query_value(pairs, "colormap_name")?;
+    (ColormapName::from_str_opt(name).is_none() || name.chars().any(char::is_uppercase)).then(|| {
+        json_resp(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({ "detail": [{
+                "type": "literal_error",
+                "loc": ["query", "colormap_name"],
+                "msg": "Input should be the name of a colour map (see /colorMaps)",
+                "input": name,
+            }] }),
+        )
+    })
 }
 
 fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<MosaicQuery, Resp> {
@@ -1849,18 +1857,8 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
     {
         return Err(detail(StatusCode::BAD_REQUEST, "Could not parse the colormap value."));
     }
-    if let Some(name) = query_value(pairs, "colormap_name")
-        && (ColormapName::from_str_opt(name).is_none() || name.chars().any(char::is_uppercase))
-    {
-        return Err(json_resp(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &json!({ "detail": [{
-                "type": "literal_error",
-                "loc": ["query", "colormap_name"],
-                "msg": "Input should be the name of a colour map (see /colorMaps)",
-                "input": name,
-            }] }),
-        ));
+    if let Some(resp) = colormap_name_error(pairs) {
+        return Err(resp);
     }
     if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
         return Err(parse_error(e));
@@ -2143,7 +2141,7 @@ impl Window {
                 let cog = engine.store.open_uri(href).await?;
                 let crs = engine.get_or_build_crs(&cog)?;
                 let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
-                let Some(res) = mercator_resolution(&crs, &cog).filter(|_| resample == ResampleMode::Nearest) else {
+                let Some(res) = warped_resolution(&crs, &cog, true).filter(|_| resample == ResampleMode::Nearest) else {
                     // The tile engine reads the raster's own `nodata` and tiles of 256 and
                     // 512; a `nodata` of the request's, or another size, is read as a box
                     // over the tile's bounds is.
@@ -2235,7 +2233,7 @@ impl Window {
                 }
             } else {
             let crs = engine.get_or_build_crs(&cog)?;
-            let res = if mercator { mercator_resolution(&crs, &cog) } else { wgs84_resolution(&crs, &cog) }
+            let res = warped_resolution(&crs, &cog, mercator)
                 .ok_or_else(|| EngineError::BadRequest("cannot place an asset in WGS84".into()))?;
             let native = part_dims(PartSize::Query { max_size: None, width: None, height: None }, bbox, res);
             let (w, h) = part_dims(size, bbox, res);
@@ -3159,14 +3157,15 @@ fn part_dims(size: PartSize, bbox: [f64; 4], res: f64) -> (u64, u64) {
     (w.max(1.0) as u64, h.max(1.0) as u64)
 }
 
-/// The resolution, in degrees, GDAL would give a raster warped to WGS84: the length of
-/// its warped diagonal over the length of its diagonal in pixels.
-fn wgs84_resolution(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<f64> {
+/// A raster's resolution on a grid in degrees, or in Web Mercator metres, as GDAL's warp
+/// works it out: the raster's diagonal there over its diagonal in pixels.
+fn warped_resolution(crs: &CrsModel, cog: &cogzilla_io::OpenedCog, mercator: bool) -> Option<f64> {
     let full = cog.index.full_res();
     let (w, h) = (f64::from(full.width), f64::from(full.height));
     let corner = |col: f64, row: f64| {
         let (x, y) = full.pixel_to_crs.forward(col, row);
-        crs.to_lonlat_deg(x, y)
+        let (lon, lat) = crs.to_lonlat_deg(x, y);
+        if mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) }
     };
     let (ul, lr) = (corner(0.0, 0.0), corner(w, h));
     let res = (lr.0 - ul.0).hypot(lr.1 - ul.1) / w.hypot(h);
@@ -3365,7 +3364,7 @@ async fn part_image_of(
             let mut res = f64::INFINITY;
             for cog in &first {
                 let crs = engine.get_or_build_crs(cog)?;
-                let own = if mercator { mercator_resolution(&crs, cog) } else { wgs84_resolution(&crs, cog) };
+                let own = warped_resolution(&crs, cog, mercator);
                 res = res.min(own.ok_or_else(|| EngineError::BadRequest("cannot place the first item in WGS84".into()))?);
             }
             let (w, h) = part_dims(size, bbox, res);
@@ -3418,7 +3417,7 @@ async fn part_image_of(
             }
             if n == 0 {
                 // The first item sets the size; the others are drawn onto its grid.
-                let res = wgs84_resolution(&crs, &cogs[0]).ok_or_else(|| {
+                let res = warped_resolution(&crs, &cogs[0], false).ok_or_else(|| {
                     EngineError::BadRequest("cannot place the first item in WGS84".into())
                 })?;
                 let (w, h) = part_dims(size, bbox, res);
@@ -3657,7 +3656,7 @@ struct Wgs84Grid {
 /// of [`wgs84_resolution`]. With `mercator` the same for a raster warped to Web Mercator:
 /// the corner and the pixel size are then in metres.
 fn warped_grid(crs: &CrsModel, cog: &cogzilla_io::OpenedCog, mercator: bool) -> Option<Wgs84Grid> {
-    let res = if mercator { mercator_resolution(crs, cog)? } else { wgs84_resolution(crs, cog)? };
+    let res = warped_resolution(crs, cog, mercator)?;
     let full = cog.index.full_res();
     let (w, h) = (f64::from(full.width), f64::from(full.height));
     let (mut west, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -3890,21 +3889,6 @@ enum WarpPath {
     /// Only some bands are: the warped raster is read block by block, 512 pixels wide,
     /// through its own overview when the output is smaller, and that is then resized.
     Blocks,
-}
-
-/// The resolution GDAL gives a raster warped to Web Mercator, in metres: as
-/// [`wgs84_resolution`], the diagonal there over the diagonal in pixels.
-fn mercator_resolution(crs: &CrsModel, cog: &cogzilla_io::OpenedCog) -> Option<f64> {
-    let full = cog.index.full_res();
-    let (w, h) = (f64::from(full.width), f64::from(full.height));
-    let corner = |col: f64, row: f64| {
-        let (x, y) = full.pixel_to_crs.forward(col, row);
-        let (lon, lat) = crs.to_lonlat_deg(x, y);
-        lonlat_deg_to_mercator(lon, lat)
-    };
-    let (ul, lr) = (corner(0.0, 0.0), corner(w, h));
-    let res = (lr.0 - ul.0).hypot(lr.1 - ul.1) / w.hypot(h);
-    (res.is_finite() && res > 0.0).then_some(res)
 }
 
 /// Every band of one raster on a WGS84 grid, or with `mercator` on a Web Mercator one, read the way GDAL's nearest-neighbour warp
