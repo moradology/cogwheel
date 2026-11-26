@@ -2307,7 +2307,7 @@ async fn mosaic_array_in_its_type(
                 return array_in_its_type(data, Some(cogzilla_tiff::SampleType::Float32), *mask);
             }
             pixel_selection::Selection::Count => {
-                let kind = if urls.len() <= 255 {
+                let kind = if urls.len().min(64) <= 255 {
                     cogzilla_tiff::SampleType::Uint8
                 } else {
                     cogzilla_tiff::SampleType::Uint16
@@ -2317,8 +2317,9 @@ async fn mosaic_array_in_its_type(
             _ => {}
         }
     }
-    let mut cogs = Vec::with_capacity(urls.len());
-    for u in urls {
+    let cap = urls.len().min(64);
+    let mut cogs = Vec::with_capacity(cap);
+    for u in urls.iter().take(cap) {
         if let Ok(cog) = engine.store.open_uri(u).await {
             cogs.push(cog);
         }
@@ -2386,7 +2387,11 @@ fn attach_x_failed_assets(resp: &mut Response<Full<Bytes>>, failed: &[String]) {
     if failed.is_empty() || !resp.status().is_success() {
         return;
     }
-    let joined = failed.join(",");
+    let joined = failed
+        .iter()
+        .map(|u| cogzilla_io::redact_http_url(u))
+        .collect::<Vec<_>>()
+        .join(",");
     if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
         resp.headers_mut().insert("x-failed-assets", hv);
     }
@@ -3758,8 +3763,10 @@ async fn render_mosaic_tile_pixel_selection(
         let data_bands = data_band_count(cogs[0].index.full_res());
         if method.by_last_band()
             && pq.bidx.is_empty()
+            && pq.expr_raw.is_none()
+            && pq.algorithm.is_none()
             && data_bands >= 2
-            && !matches!(scene_bands, BandRequest::MultiBand { .. })
+            && matches!(scene_bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
         {
             scene_bands = BandRequest::MultiBand {
                 bands_1based: (1..=data_bands).collect(),
@@ -4496,8 +4503,10 @@ async fn render_mosaic_bbox_composite(
         }
         if method.by_last_band()
             && pq.bidx.is_empty()
+            && pq.expr_raw.is_none()
+            && pq.algorithm.is_none()
             && data_bands >= 2
-            && !matches!(bands, BandRequest::MultiBand { .. })
+            && matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
         {
             bands = BandRequest::MultiBand {
                 bands_1based: (1..=data_bands).collect(),
@@ -5338,6 +5347,9 @@ async fn open_first_mosaic_cog(
     for u in urls.iter().take(16) {
         match engine.store.open_uri(u).await {
             Ok(c) => return Ok(c),
+            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                return Err(EngineError::Io(e));
+            }
             Err(e) => last_err = Some(crate::engine::asset_fetch_error(u, e)),
         }
     }
@@ -6481,6 +6493,9 @@ where
                         Ok(c) => {
                             opened_any = true;
                             c
+                        }
+                        Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                            return Err(EngineError::Io(e));
                         }
                         Err(e) => {
                             last_open_err = Some(crate::engine::asset_fetch_error(&asset_url, e));
@@ -12132,5 +12147,23 @@ mod tests {
         assert!(header_accepts_gzip("br, *;q=0.5"));
         assert!(header_accepts_gzip("x-gzip;q=0.1"));
         assert!(header_accepts_gzip("gzip, deflate"));
+    }
+
+    #[test]
+    fn audit88_attach_x_failed_assets_redacts_credentials_and_presigned_queries() {
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        attach_x_failed_assets(
+            &mut resp,
+            &[
+                "https://user:secret@s3.example.com/bucket/a.tif?X-Amz-Signature=deadbeef".into(),
+                "/local/ok.tif".into(),
+            ],
+        );
+        let hv = resp.headers().get("x-failed-assets").unwrap().to_str().unwrap();
+        assert!(!hv.contains("secret") && !hv.contains("deadbeef"), "leaked creds in x-failed-assets: {hv}");
+        assert!(hv.contains("https://s3.example.com/bucket/a.tif") && hv.contains("/local/ok.tif"), "{hv}");
     }
 }

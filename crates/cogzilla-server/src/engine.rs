@@ -1832,6 +1832,9 @@ impl TileEngine {
                         opened_any = true;
                         c
                     }
+                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        return Err(EngineError::Io(e));
+                    }
                     Err(e) => {
                         failed_assets.push(cogzilla_io::redact_http_url(url));
                         last_open_err = Some(asset_fetch_error(url, e));
@@ -1849,7 +1852,6 @@ impl TileEngine {
                         continue;
                     }
                     let mut all_valid = true;
-                    let mut vals = [f32::NAN; 3];
                     for b in 0..f32_bands {
                         let byte_off = (b * total_pixels + i) * 4;
                         let v = f32::from_le_bytes([
@@ -1862,11 +1864,16 @@ impl TileEngine {
                             all_valid = false;
                             break;
                         }
-                        vals[b] = v;
                     }
                     if all_valid {
                         for b in 0..f32_bands {
-                            canvas[b * total_pixels + i] = vals[b];
+                            let byte_off = (b * total_pixels + i) * 4;
+                            canvas[b * total_pixels + i] = f32::from_le_bytes([
+                                src[byte_off],
+                                src[byte_off + 1],
+                                src[byte_off + 2],
+                                src[byte_off + 3],
+                            ]);
                         }
                         filled += 1;
                     }
@@ -1938,6 +1945,9 @@ impl TileEngine {
                 Ok(c) => {
                     opened_any = true;
                     c
+                }
+                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    return Err(EngineError::Io(e));
                 }
                 Err(e) => {
                     failed_assets.push(cogzilla_io::redact_http_url(url));
