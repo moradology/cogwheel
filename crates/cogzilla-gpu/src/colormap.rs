@@ -11,6 +11,7 @@ pub enum GpuColormapMode {
     Bilinear,
     Cubic,
     Lanczos3,
+    Nearest,
 }
 
 impl GpuColormapMode {
@@ -19,12 +20,13 @@ impl GpuColormapMode {
             Self::Bilinear => 0,
             Self::Cubic => 1,
             Self::Lanczos3 => 2,
+            Self::Nearest => 3,
         }
     }
 
     pub fn to_policy_op(self) -> GpuOp {
         match self {
-            Self::Bilinear => GpuOp::FusedColormapBilinear,
+            Self::Bilinear | Self::Nearest => GpuOp::FusedColormapBilinear,
             Self::Cubic => GpuOp::FusedColormapCubic,
             Self::Lanczos3 => GpuOp::FusedColormapLanczos3,
         }

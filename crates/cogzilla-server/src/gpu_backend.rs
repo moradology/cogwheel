@@ -69,6 +69,7 @@ impl Drop for InFlightGuard<'_> {
 
 fn map_resample(mode: ResampleMode) -> Option<GpuColormapMode> {
     match mode {
+        ResampleMode::Nearest => Some(GpuColormapMode::Nearest),
         ResampleMode::Bilinear => Some(GpuColormapMode::Bilinear),
         ResampleMode::Cubic => Some(GpuColormapMode::Cubic),
         ResampleMode::Lanczos => Some(GpuColormapMode::Lanczos3),
@@ -1379,7 +1380,7 @@ impl GpuBackend {
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
         };
         let decision = self.policy.decide(&DispatchRequest {
             op,
@@ -1703,7 +1704,7 @@ impl GpuBackend {
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
         };
         let decision = self.policy.decide(&DispatchRequest {
             op,
@@ -1933,6 +1934,158 @@ impl GpuBackend {
         Some(Bytes::from(raw))
     }
 
+    /// 1-pass fused GPU single-band resampling + band statistics/histogram/percentiles
+    /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_single_band_stats(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        resample: ResampleMode,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
+        let gpu_mode = map_resample(resample)?;
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        let min_px = if self.ctx.info.unified_memory {
+            512 * 1024
+        } else {
+            512 * 512
+        };
+        if dst_w.saturating_mul(dst_h) < min_px {
+            return None;
+        }
+        let key = source_slab_key(cog_id, ifd_idx, band0, src);
+        let warm_slab = self.slab_cache.get(&key);
+        let _ = coord_upload_bytes;
+        let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::WithStats {
+                inner: Box::new(CoalescedJob::Colormap {
+                    slab,
+                    plan,
+                    mode: gpu_mode,
+                    rescale_min: 0.0,
+                    rescale_max: 1.0,
+                    lut_u32: [0u32; 256],
+                    output: CoalescedOutput::RawF32,
+                }),
+                nodata: None,
+                num_bins,
+                hist_range,
+            })
+            .ok()?;
+        Some(cogzilla_gpu::decode_stats_readback(
+            &raw,
+            dst_w * dst_h,
+            num_bins,
+            hist_range,
+            percentiles,
+        ))
+    }
+
+    /// 1-pass fused GPU expression evaluation + band statistics/histogram/percentiles
+    /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_expr_stats(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        prog: &ExprProgram,
+        resample: ResampleMode,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        let gpu_mode = map_resample(resample)?;
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
+            return None;
+        }
+        let min_px = if self.ctx.info.unified_memory {
+            512 * 1024
+        } else {
+            512 * 512
+        };
+        if dst_w.saturating_mul(dst_h) < min_px {
+            return None;
+        }
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let _ = coord_upload_bytes;
+        let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::WithStats {
+                inner: Box::new(CoalescedJob::Expr {
+                    slab,
+                    plan,
+                    mode: gpu_mode,
+                    instrs,
+                    rescale_min: 0.0,
+                    rescale_max: 1.0,
+                    lut_u32: [0u32; 256],
+                    output: CoalescedOutput::RawF32,
+                }),
+                nodata: None,
+                num_bins,
+                hist_range,
+            })
+            .ok()?;
+        Some(cogzilla_gpu::decode_stats_readback(
+            &raw,
+            dst_w * dst_h,
+            num_bins,
+            hist_range,
+            percentiles,
+        ))
+    }
+
     /// Attempt GPU-accelerated raw `f32` DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`)
     /// evaluation for `.npy`, `.tif`, `.f32`, and mosaic routes.
     #[allow(clippy::too_many_arguments)]
@@ -2077,7 +2230,7 @@ impl GpuBackend {
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
         };
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
@@ -2278,7 +2431,7 @@ impl GpuBackend {
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
         };
         let decision = self.policy.decide(&DispatchRequest {
             op,
@@ -2455,7 +2608,7 @@ impl GpuBackend {
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
         };
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
@@ -2596,7 +2749,7 @@ impl GpuBackend {
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
         };
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
@@ -3779,5 +3932,124 @@ mod tests {
             }
             assert!(max_err < 1e-2, "CustomExprRgb RawF32 max err {max_err} >= 1e-2");
         }
+    }
+
+    #[test]
+    fn nearest_resample_and_fused_bbox_stats_match_cpu() {
+        use cogzilla_codec::{BandData, BlockStats, DecodedBand};
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping nearest + fused stats test (no GPU adapter)");
+            return;
+        };
+        let sw = 512usize;
+        let sh = 512usize;
+        let mk_band = |bias: u16, mx: usize, my: usize, modulo: usize| {
+            let mut vals = Vec::with_capacity(sw * sh);
+            for y in 0..sh {
+                for x in 0..sw {
+                    vals.push(bias + ((x * mx + y * my) % modulo) as u16);
+                }
+            }
+            DecodedBand {
+                width: sw as u32,
+                height: sh as u32,
+                data: BandData::U16 {
+                    data: vals.into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: bias as f32,
+                    max: (bias as usize + modulo) as f32,
+                },
+            }
+        };
+        let b0 = mk_band(500, 7, 13, 1000);
+        let b1 = mk_band(1800, 11, 5, 1200);
+        let g0 = [Some(&b0)];
+        let g1 = [Some(&b1)];
+        let s0 = BandSource::new(sw as u32, sh as u32, sw as u32, sh as u32, 0, 0, 1, 1, &g0);
+        let s1 = BandSource::new(sw as u32, sh as u32, sw as u32, sh as u32, 0, 0, 1, 1, &g1);
+
+        let n = 1024usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| (i as f32 / n as f32) * (sw as f32 - 1.0)).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| (i as f32 / n as f32) * (sh as f32 - 1.0)).collect();
+
+        // 1. Verify bit-exact ResampleMode::Nearest via try_render_bbox_single_band_f32
+        if let Some(raw) = gpu.try_render_bbox_single_band_f32(
+            777,
+            0,
+            0,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &s0,
+            ResampleMode::Nearest,
+        ) {
+            assert_eq!(raw.len(), n * n * 4);
+            for py in (0..n).step_by(31) {
+                for px in (0..n).step_by(31) {
+                    let expected = cogzilla_kernel::sample_general_scaled(
+                        &s0,
+                        u_coords[px],
+                        v_coords[py],
+                        1.0,
+                        1.0,
+                        ResampleMode::Nearest,
+                    );
+                    let off = (py * n + px) * 4;
+                    let gv = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                    assert_eq!(gv.to_bits(), expected.to_bits(), "Nearest mismatch at ({px},{py})");
+                }
+            }
+        }
+
+        // 2. Verify 1-pass fused try_render_bbox_single_band_stats (Nearest)
+        if let Some(st) = gpu.try_render_bbox_single_band_stats(
+            777,
+            0,
+            0,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &s0,
+            ResampleMode::Nearest,
+            10,
+            None,
+            &[2.0, 50.0, 98.0],
+        ) {
+            assert_eq!(st.valid_pixels, n * n);
+            assert!((st.min.unwrap() - 500.0).abs() < 1.0);
+            assert!((st.max.unwrap() - 1499.0).abs() < 1.0);
+        }
+
+        // 3. Verify 1-pass fused try_render_bbox_expr_stats (NDVI, Nearest)
+        let prog = ExprProgram::compile("(b1-b2)/(b1+b2)").expect("compile ndvi");
+        let st = gpu
+            .try_render_bbox_expr_stats(
+                None,
+                BboxCoordSource::Separable {
+                    u: &u_coords,
+                    v: &v_coords,
+                },
+                &[s1, s0],
+                &prog,
+                ResampleMode::Nearest,
+                10,
+                None,
+                &[2.0, 50.0, 98.0],
+            )
+            .expect("fused expr stats");
+        assert_eq!(st.valid_pixels, n * n);
+        assert!(
+            st.min.unwrap() > 0.0 && st.max.unwrap() < 1.0,
+            "unexpected NDVI range: min={:?}, max={:?}",
+            st.min,
+            st.max
+        );
+        assert_eq!(st.hist_counts.iter().sum::<u64>(), (n * n) as u64);
     }
 }

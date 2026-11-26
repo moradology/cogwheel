@@ -199,6 +199,11 @@ fn sample_elev(u: f32, v: f32) -> f32 {
         return sample_bilinear_raw(u, v);
     } else if (params.resample_mode == 1u) {
         return sample_cubic(u, v);
+    } else if (params.resample_mode == 3u) {
+        if (!is_finite_f32(u) || !is_finite_f32(v)) {
+            return nan_f32();
+        }
+        return sample_checked(i32(floor(u + 0.5)), i32(floor(v + 0.5)));
     } else {
         return sample_lanczos3(u, v);
     }

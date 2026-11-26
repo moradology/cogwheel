@@ -302,6 +302,7 @@ impl GpuTileBatcher {
             GpuColormapMode::Bilinear => 0u32,
             GpuColormapMode::Cubic => 1u32,
             GpuColormapMode::Lanczos3 => 2u32,
+            GpuColormapMode::Nearest => 3u32,
         };
         let params = BatchParams {
             src_w: slab.width,
