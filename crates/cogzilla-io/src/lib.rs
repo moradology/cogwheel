@@ -8,7 +8,10 @@ pub mod s3;
 pub mod store;
 
 pub use allowlist::{ALLOWED_URL_PREFIXES_ENV, allowlist_enabled, check_uri_allowed};
-pub use backend::{CogSource, IoError, IoMetrics, TileByteReq, coalesce_ranges, redact_http_url};
+pub use backend::{
+    CogSource, IoError, IoMetrics, RangeResponse, RemoteValidator, TileByteReq, coalesce_ranges,
+    redact_http_url,
+};
 pub use cache::{BlockKey, SingleflightBlockCache};
 pub use cloud::{
     AzureConfig, AzureTarget, GcsConfig, GcsTokenCache, fetch_azure_object_capped,

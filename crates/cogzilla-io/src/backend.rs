@@ -27,6 +27,8 @@ pub enum IoError {
     HttpStatus { status: u16, url: String },
     #[error("origin does not support HTTP range requests: {url}")]
     RangeNotSupported { url: String },
+    #[error("remote source changed while reading: {url}")]
+    SourceChanged { url: String },
     #[error("remote response exceeded limit of {limit} bytes")]
     ResponseTooLarge { limit: usize, actual: Option<u64> },
     #[error("TIFF parse error: {0}")]
@@ -56,6 +58,21 @@ impl IoError {
 pub struct IoMetrics {
     pub remote_range_requests: AtomicU64,
     pub remote_bytes_fetched: AtomicU64,
+}
+
+/// HTTP cache validators (`ETag` and `Last-Modified`) captured when opening a remote source.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteValidator {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// Byte slice returned by a range read together with any HTTP validators present on the response.
+#[derive(Debug, Clone)]
+pub struct RangeResponse {
+    pub bytes: Bytes,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
 }
 
 #[derive(Clone)]
@@ -297,14 +314,34 @@ impl CogSource {
 
     /// Fetch a byte range `[start, end)` (exclusive end) from a remote source.
     pub async fn fetch_range(&self, start: u64, end: u64) -> Result<Bytes, IoError> {
+        Ok(self.fetch_range_with_meta(start, end, None).await?.bytes)
+    }
+
+    /// Fetch a byte range `[start, end)` (exclusive end), optionally sending `If-Match` and
+    /// verifying that the response's `ETag` / `Last-Modified` match `validator` so a single read
+    /// can never mix bytes from two versions of a replaced remote file.
+    pub async fn fetch_range_with_meta(
+        &self,
+        start: u64,
+        end: u64,
+        validator: Option<&RemoteValidator>,
+    ) -> Result<RangeResponse, IoError> {
         if start >= end {
-            return Ok(Bytes::new());
+            return Ok(RangeResponse {
+                bytes: Bytes::new(),
+                etag: None,
+                last_modified: None,
+            });
         }
         match self {
             Self::LocalMmap { mmap } => {
                 let s = usize::try_from(start).unwrap_or(usize::MAX).min(mmap.len());
                 let e = usize::try_from(end).unwrap_or(usize::MAX).min(mmap.len());
-                Ok(Bytes::copy_from_slice(&mmap[s..e]))
+                Ok(RangeResponse {
+                    bytes: Bytes::copy_from_slice(&mmap[s..e]),
+                    etag: None,
+                    last_modified: None,
+                })
             }
             Self::RemoteS3 {
                 bucket,
@@ -332,7 +369,11 @@ impl CogSource {
                 metrics
                     .remote_bytes_fetched
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                Ok(data)
+                Ok(RangeResponse {
+                    bytes: data,
+                    etag: None,
+                    last_modified: None,
+                })
             }
             Self::RemoteHttp {
                 url,
@@ -342,11 +383,18 @@ impl CogSource {
                 limiter,
             } => {
                 let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
+                let strong_etag = validator
+                    .and_then(|v| v.etag.as_deref())
+                    .filter(|e| !e.trim_start().starts_with("W/"));
                 let mut attempt = 0u32;
                 loop {
                     let permit = limiter.acquire().await;
                     metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-                    let resp = match client.get(url).header("Range", &range_hdr).send().await {
+                    let mut req = client.get(url).header("Range", &range_hdr);
+                    if let Some(etag) = strong_etag {
+                        req = req.header("If-Match", etag);
+                    }
+                    let resp = match req.send().await {
                         Ok(r) => r,
                         Err(e) if attempt < *max_retries && is_retryable_transport_error(&e) => {
                             permit.on_throttle();
@@ -362,6 +410,40 @@ impl CogSource {
                         }
                     };
                     let status = resp.status().as_u16();
+                    if status == 412 {
+                        return Err(IoError::SourceChanged {
+                            url: redact_http_url(url),
+                        });
+                    }
+                    let resp_etag = resp
+                        .headers()
+                        .get("etag")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let resp_lm = resp
+                        .headers()
+                        .get("last-modified")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    if (status == 200 || status == 206)
+                        && let Some(v) = validator
+                    {
+                        let etag_changed = matches!(
+                            (&v.etag, &resp_etag),
+                            (Some(exp), Some(got)) if exp != got
+                        );
+                        let lm_changed = matches!(
+                            (&v.last_modified, &resp_lm),
+                            (Some(exp), Some(got)) if exp != got
+                        );
+                        if etag_changed || lm_changed {
+                            return Err(IoError::SourceChanged {
+                                url: redact_http_url(url),
+                            });
+                        }
+                    }
                     let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
                     if status == 200
                         && (start > 0
@@ -404,7 +486,11 @@ impl CogSource {
                         metrics
                             .remote_bytes_fetched
                             .fetch_add(data.len() as u64, Ordering::Relaxed);
-                        return Ok(data);
+                        return Ok(RangeResponse {
+                            bytes: data,
+                            etag: resp_etag,
+                            last_modified: resp_lm,
+                        });
                     }
                     if attempt < *max_retries && is_retryable_status(status) {
                         let retry_after = resp
@@ -435,7 +521,7 @@ impl CogSource {
                 metrics,
                 limiter,
             } => {
-                fetch_gcs_range(
+                let bytes = fetch_gcs_range(
                     client,
                     bucket,
                     key,
@@ -446,7 +532,12 @@ impl CogSource {
                     metrics,
                     limiter,
                 )
-                .await
+                .await?;
+                Ok(RangeResponse {
+                    bytes,
+                    etag: None,
+                    last_modified: None,
+                })
             }
             Self::RemoteAzure {
                 target,
@@ -454,8 +545,80 @@ impl CogSource {
                 cfg,
                 metrics,
                 limiter,
-            } => fetch_azure_range(client, target, cfg, start, end, metrics, limiter).await,
+            } => {
+                let bytes =
+                    fetch_azure_range(client, target, cfg, start, end, metrics, limiter).await?;
+                Ok(RangeResponse {
+                    bytes,
+                    etag: None,
+                    last_modified: None,
+                })
+            }
         }
+    }
+
+    /// Revalidate a cached remote HTTP source using `If-None-Match` / `If-Modified-Since` on a
+    /// 1-byte `Range: bytes=0-0` GET (avoiding `HEAD`, which some origins forbid).
+    /// Returns `Ok(true)` if unchanged, `Ok(false)` if modified and must be re-opened, or `Err`
+    /// if the origin reports an error (e.g. `404` when deleted).
+    pub async fn revalidate_remote(&self, validator: &RemoteValidator) -> Result<bool, IoError> {
+        let Self::RemoteHttp {
+            url,
+            client,
+            metrics,
+            limiter,
+            ..
+        } = self
+        else {
+            return Ok(false);
+        };
+        if validator.etag.is_none() && validator.last_modified.is_none() {
+            return Ok(false);
+        }
+        let permit = limiter.acquire().await;
+        metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
+        let mut req = client.get(url).header("Range", "bytes=0-0");
+        if let Some(ref etag) = validator.etag {
+            req = req.header("If-None-Match", etag);
+        } else if let Some(ref lm) = validator.last_modified {
+            req = req.header("If-Modified-Since", lm);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return Err(IoError::Http(e.without_url())),
+        };
+        let status = resp.status().as_u16();
+        if status == 304 {
+            permit.on_success();
+            return Ok(true);
+        }
+        if status == 200 || status == 206 {
+            let resp_etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let resp_lm = resp
+                .headers()
+                .get("last-modified")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            permit.on_success();
+            let unchanged = match (&validator.etag, &resp_etag) {
+                (Some(exp), Some(got)) => exp == got,
+                _ => match (&validator.last_modified, &resp_lm) {
+                    (Some(exp), Some(got)) => exp == got,
+                    _ => false,
+                },
+            };
+            return Ok(unchanged);
+        }
+        Err(IoError::HttpStatus {
+            status,
+            url: redact_http_url(url),
+        })
     }
 
     /// Zero-copy slice read when backed by local `mmap`.

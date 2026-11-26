@@ -602,6 +602,44 @@ impl CrsModel {
         self.geographic_0_360_min_lon(pixel_to_crs, width).is_some()
     }
 
+    /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]`, using a
+    /// nonlinear `GcpPoly` when present or delegating directly to `wgs84_bounds` otherwise.
+    pub fn wgs84_bounds_with_gcp(
+        &self,
+        pixel_to_crs: &Affine2D,
+        gcp_poly: Option<&cogzilla_tiff::GcpPoly>,
+        width: u32,
+        height: u32,
+    ) -> [f64; 4] {
+        let Some(poly) = gcp_poly else {
+            return self.wgs84_bounds(pixel_to_crs, width, height);
+        };
+        let w = width as f64;
+        let h = height as f64;
+        let mut min_lon = f64::INFINITY;
+        let mut min_lat = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+        let steps = 16;
+        for i in 0..=steps {
+            let t = (i as f64) / (steps as f64);
+            for (col, row) in [(t * w, 0.0), (t * w, h), (0.0, t * h), (w, t * h)] {
+                let (sx, sy) = poly.pixel_to_crs(col, row);
+                let (lon, lat) = self.to_lonlat_deg(sx, sy);
+                if lon.is_finite() && lat.is_finite() {
+                    min_lon = min_lon.min(lon);
+                    max_lon = max_lon.max(lon);
+                    min_lat = min_lat.min(lat);
+                    max_lat = max_lat.max(lat);
+                }
+            }
+        }
+        if !min_lon.is_finite() || !min_lat.is_finite() {
+            return self.wgs84_bounds(pixel_to_crs, width, height);
+        }
+        [min_lon, min_lat, max_lon, max_lat]
+    }
+
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
     /// 32 points along the 4 edges of the raster plus checking whether either pole lies inside.
     pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
@@ -1127,6 +1165,74 @@ pub enum CoordPlan<const N: usize> {
 
 impl<const N: usize> CoordPlan<N> {
     /// Build a `CoordPlan` for output XYZ `tile` into an IFD with `crs_to_pixel` affine.
+    /// Build a coordinate plan for a tile, using a nonlinear `GcpPoly` when present or delegating
+    /// directly to the zero-overhead `build()` path when `gcp_poly` is `None`.
+    pub fn build_with_gcp(
+        crs: &CrsModel,
+        crs_to_pixel: &Affine2D,
+        gcp_poly: Option<&cogzilla_tiff::GcpPoly>,
+        ifd_w: u32,
+        ifd_h: u32,
+        tile: TileCoord,
+    ) -> Option<Self> {
+        let Some(poly) = gcp_poly else {
+            return Self::build(crs, crs_to_pixel, ifd_w, ifd_h, tile);
+        };
+        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
+        let step_x = (max_x - min_x) / (N as f64);
+        let step_y = (max_y - min_y) / (N as f64);
+        let mut u = vec![f32::NAN; N * N].into_boxed_slice();
+        let mut v = vec![f32::NAN; N * N].into_boxed_slice();
+        let mut min_u = f32::INFINITY;
+        let mut max_u = f32::NEG_INFINITY;
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut any_in = false;
+        let fw = ifd_w as f32;
+        let fh = ifd_h as f32;
+        for py in 0..N {
+            let my = max_y - (py as f64 + 0.5) * step_y;
+            let row_off = py * N;
+            for px in 0..N {
+                let mx = min_x + (px as f64 + 0.5) * step_x;
+                let (sx, sy) = crs.from_3857(mx, my);
+                if sx.is_finite() && sy.is_finite() {
+                    let (col, row) = poly.crs_to_pixel(sx, sy);
+                    let uu = (col - 0.5) as f32;
+                    let vv = (row - 0.5) as f32;
+                    u[row_off + px] = uu;
+                    v[row_off + px] = vv;
+                    if uu >= -1.0 && uu <= fw && vv >= -1.0 && vv <= fh {
+                        any_in = true;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
+            }
+        }
+        if !any_in {
+            return None;
+        }
+        let src_min_col = (min_u.floor() as i32).max(0);
+        let src_max_col = (max_u.floor() as i32).saturating_add(1).min(ifd_w as i32 - 1);
+        let src_min_row = (min_v.floor() as i32).max(0);
+        let src_max_row = (max_v.floor() as i32).saturating_add(1).min(ifd_h as i32 - 1);
+        if src_min_col > src_max_col || src_min_row > src_max_row {
+            return None;
+        }
+        Some(Self::Exact2D {
+            u,
+            v,
+            src_min_col,
+            src_max_col,
+            src_min_row,
+            src_max_row,
+            all_in_bounds: false,
+        })
+    }
+
     /// Returns `None` if the tile lies completely outside `[0..ifd_w, 0..ifd_h]`.
     pub fn build(
         crs: &CrsModel,

@@ -377,15 +377,17 @@ pub async fn resolve_stac_assets(
     for (idx, href) in hrefs.into_iter().enumerate() {
         let store = engine.store.clone();
         js.spawn(async move {
-            let cog = store.open_uri(&href).await?;
-            Ok::<_, cogzilla_io::IoError>((idx, cog))
+            let cog = store
+                .open_uri(&href)
+                .await
+                .map_err(|e| crate::engine::asset_fetch_error(&href, e))?;
+            Ok::<_, EngineError>((idx, cog))
         });
     }
     let mut opened: Vec<Option<Arc<OpenedCog>>> = vec![None; names.len()];
     while let Some(res) = js.join_next().await {
         let (idx, cog) = res
-            .map_err(|e| EngineError::BadRequest(format!("join error: {e}")))?
-            .map_err(EngineError::Io)?;
+            .map_err(|e| EngineError::BadRequest(format!("join error: {e}")))??;
         opened[idx] = Some(cog);
     }
     let cogs: Vec<Arc<OpenedCog>> = opened.into_iter().map(|o| o.unwrap()).collect();
