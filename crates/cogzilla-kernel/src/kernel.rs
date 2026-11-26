@@ -1472,8 +1472,10 @@ pub fn npy_descr(kind: SampleType) -> &'static str {
 /// A value that is not there is written as `absent`, or as zero without one. Integers take
 /// the value truncated toward zero and held to the type's range (a NaN `absent` is zero);
 /// the float types hold an infinity to their largest finite number. With `mask`, one more
-/// plane follows the bands: the type's largest number (`255` for `u1`, `65535` for `u2`,
-/// `f32::MAX` for `f4`, ...) where any band has a value, zero elsewhere. Only the first
+/// plane follows the bands, as rio-tiler's `ImageData.mask` is: the type's largest number
+/// (`255` for `u1`, `65535` for `u2`, `f32::MAX` for `f4`, ...) where any band has a value,
+/// and its smallest elsewhere (`0` for the unsigned types, `-32768` for `i2`, `f32::MIN`
+/// for `f4`, ...). Only the first
 /// `bands * height * width` of `values` are written, and a shorter slice makes a shorter
 /// body under a header that still names every plane.
 ///
@@ -1506,7 +1508,7 @@ pub fn encode_npy_typed(
             if mask {
                 for i in 0..pixels {
                     let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
-                    let x: $t = if there { <$t>::MAX } else { cast(0.0) };
+                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
                     out.extend_from_slice(&x.to_le_bytes());
                 }
             }
@@ -6710,20 +6712,21 @@ mod npy_typed_tests {
                 out
             }};
         }
-        // Truncated toward zero, held to the range, absent as zero; then the mask.
+        // Truncated toward zero, held to the range, absent as zero; then the mask, the
+        // type's largest number where there is a value and its smallest where there is not.
         assert_eq!(body(&values, SampleType::Uint8, None, true), le!(u8, 1, 0, 0, 255, 255, 0, 255, 255));
-        assert_eq!(body(&values, SampleType::Int8, None, true), le!(i8, 1, 0, -2, 127, 127, 0, 127, 127));
+        assert_eq!(body(&values, SampleType::Int8, None, true), le!(i8, 1, 0, -2, 127, 127, -128, 127, 127));
         assert_eq!(body(&values, SampleType::Uint16, None, true), le!(u16, 1, 0, 0, 65535, 65535, 0, 65535, 65535));
-        assert_eq!(body(&values, SampleType::Int16, None, true), le!(i16, 1, 0, -2, 32767, 32767, 0, 32767, 32767));
+        assert_eq!(body(&values, SampleType::Int16, None, true), le!(i16, 1, 0, -2, 32767, 32767, -32768, 32767, 32767));
         assert_eq!(body(&values, SampleType::Uint32, None, true), le!(u32, 1, 0, 0, 70000, u32::MAX, 0, u32::MAX, u32::MAX));
-        assert_eq!(body(&values, SampleType::Int32, None, true), le!(i32, 1, 0, -2, 70000, i32::MAX, 0, i32::MAX, i32::MAX));
+        assert_eq!(body(&values, SampleType::Int32, None, true), le!(i32, 1, 0, -2, 70000, i32::MAX, i32::MIN, i32::MAX, i32::MAX));
         assert_eq!(
             body(&values, SampleType::Float32, None, true),
-            le!(f32, 1.9, 0.0, -2.9, 70000.0, f32::MAX, 0.0, f32::MAX, f32::MAX)
+            le!(f32, 1.9, 0.0, -2.9, 70000.0, f32::MAX, f32::MIN, f32::MAX, f32::MAX)
         );
         assert_eq!(
             body(&values, SampleType::Float64, None, true),
-            le!(f64, f64::from(1.9f32), 0.0, f64::from(-2.9f32), 70000.0, f64::MAX, 0.0, f64::MAX, f64::MAX)
+            le!(f64, f64::from(1.9f32), 0.0, f64::from(-2.9f32), 70000.0, f64::MAX, f64::MIN, f64::MAX, f64::MAX)
         );
         // Without the mask the body is the bands alone.
         assert_eq!(body(&values, SampleType::Uint16, None, false), le!(u16, 1, 0, 0, 65535));
@@ -6780,9 +6783,9 @@ mod npy_typed_tests {
         let (_, _, shape, start) = parse(&npy);
         assert_eq!(shape, [2, 2, 2]);
         assert_eq!(&npy[start..], [1, 2, 3, 255, 255, 255, 0]);
-        // No bands: a mask of zeros.
+        // No bands: a mask of nothing there, the type's smallest number.
         let npy = encode_npy_typed(&[], 0, 2, 2, SampleType::Int16, None, true);
-        assert_eq!(&npy[parse(&npy).3..], [0u8; 8]);
+        assert_eq!(&npy[parse(&npy).3..], i16::MIN.to_le_bytes().repeat(4).as_slice());
     }
 
     #[test]
