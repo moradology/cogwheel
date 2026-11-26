@@ -2137,14 +2137,18 @@ impl Window {
             CrsModel::Epsg3857 if mercator => resampling,
             _ => reproject,
         };
-        if resample == ResampleMode::Nearest || mercator {
+        // The renderer burns a line one pixel to a column and leaves points out; GDAL burns
+        // every pixel a line crosses and the one a point is in, as the shape is burned below.
+        let lines_or_points = mask.as_ref().is_some_and(|(m, _)| !m.lines.is_empty() || !m.points.is_empty());
+        if resample == ResampleMode::Nearest || mercator || lines_or_points {
             // As rio-tiler does: the raster is read at the size its own resolution gives
             // for what was asked, the way GDAL's warp reads it, and brought to the
             // picture's size afterwards.
             let out = (width as usize, height as usize);
             let mut planes: Vec<Vec<f32>> = if resample != ResampleMode::Nearest {
-                // Smoothed on a grid in metres: the box renderer, and the shape burned below.
-                match resampled_planes(engine, &cog, bbox, true, out, &wanted, None, resample, unscale, nodata).await {
+                // Smoothed on a grid in metres, or under lines or points: the box renderer,
+                // and the shape burned below.
+                match resampled_planes(engine, &cog, bbox, mercator, out, &wanted, None, resample, unscale, nodata).await {
                     Ok(planes) => in_raster_type(planes, sample_type, unscale),
                     // The item's footprint meets the box but this raster does not.
                     Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; out.0 * out.1]; wanted.len()],
@@ -2198,8 +2202,8 @@ impl Window {
                                 // shape: a pixel is inside when its centre is, or when an
                                 // edge passes through it. Each polygon is burned on its own,
                                 // so two that overlap are their union.
-                                let polygons = rings_on_grid(&mask, bbox, out, mercator);
-                                let burned = zonal::cover_counts(&polygons, out.0, out.1, 1).map_err(EngineError::BadRequest)?;
+                                let shape = rings_on_grid(&mask, bbox, out, mercator);
+                                let burned = zonal::shape_cover_counts(&shape, out.0, out.1, 1).map_err(EngineError::BadRequest)?;
                                 let inside: Vec<bool> = burned.into_iter().map(|n| n > 0).collect();
                                 Ok::<_, EngineError>(inside)
                             })
@@ -3961,15 +3965,19 @@ async fn warp_nearest(
     Ok(if pool { engine.store.run_heavy_cpu(work).await? } else { work() })
 }
 
-/// A shape's rings in the pixels of a grid over `bounds`, which is in degrees or Web
-/// Mercator metres; the shape is in degrees whatever the grid is in.
-fn rings_on_grid(mask: &PolygonMask, bounds: [f64; 4], (width, height): (usize, usize), mercator: bool) -> Vec<Vec<zonal::Ring>> {
+/// A shape's rings, lines and points in the pixels of a grid over `bounds`, which is in
+/// degrees or Web Mercator metres; the shape is in degrees whatever the grid is in.
+fn rings_on_grid(mask: &PolygonMask, bounds: [f64; 4], (width, height): (usize, usize), mercator: bool) -> zonal::GridShape {
     let (dx, dy) = ((bounds[2] - bounds[0]) / width as f64, (bounds[3] - bounds[1]) / height as f64);
     let on_grid = |&(lon, lat): &(f64, f64)| {
         let (across, up) = if mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) };
         ((across - bounds[0]) / dx, (bounds[3] - up) / dy)
     };
-    mask.polygons.iter().map(|polygon| polygon.iter().map(|ring| ring.iter().map(on_grid).collect()).collect()).collect()
+    zonal::GridShape {
+        polygons: mask.polygons.iter().map(|polygon| polygon.iter().map(|ring| ring.iter().map(on_grid).collect()).collect()).collect(),
+        lines: mask.lines.iter().map(|line| line.iter().map(on_grid).collect()).collect(),
+        points: mask.points.iter().map(on_grid).collect(),
+    }
 }
 
 /// Little-endian `f32` values as the renderer hands them over.
@@ -4363,9 +4371,9 @@ async fn feature_statistics(
         let stats = engine
             .store
             .run_heavy_cpu(move || {
-                let inside = zonal::cover_counts(&rings, width, height, 1).map_err(EngineError::BadRequest)?;
+                let inside = zonal::shape_cover_counts(&rings, width, height, 1).map_err(EngineError::BadRequest)?;
                 let cells = (cover_scale * cover_scale) as f32;
-                let coverage: Vec<f32> = zonal::cover_counts(&rings, width, height, cover_scale)
+                let coverage: Vec<f32> = zonal::shape_cover_counts(&rings, width, height, cover_scale)
                     .map_err(EngineError::BadRequest)?
                     .iter()
                     .map(|c| *c as f32 / cells)
