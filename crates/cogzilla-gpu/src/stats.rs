@@ -57,6 +57,9 @@ pub struct GpuBandStats {
     pub sum: f64,
     pub std: Option<f64>,
     pub median: Option<f64>,
+    pub majority: Option<f64>,
+    pub minority: Option<f64>,
+    pub unique_bins: usize,
     pub percentiles: Vec<(f64, Option<f64>)>,
     pub hist_counts: Vec<u64>,
     pub hist_edges: Vec<f64>,
@@ -542,6 +545,28 @@ impl GpuStatsReducer {
         let masked_pixels = len.saturating_sub(valid_px);
         let valid_percent = ((valid_px as f64 / len as f64) * 100.0 * 100.0).round() / 100.0;
 
+        let mut maj_cnt = 0u64;
+        let mut maj_bin = 0usize;
+        let mut min_cnt = u64::MAX;
+        let mut min_bin = 0usize;
+        let mut unique_bins = 0usize;
+        for (i, &c) in cdf_counts.iter().enumerate() {
+            if c > 0 {
+                unique_bins += 1;
+                if c > maj_cnt {
+                    maj_cnt = c;
+                    maj_bin = i;
+                }
+                if c < min_cnt {
+                    min_cnt = c;
+                    min_bin = i;
+                }
+            }
+        }
+        let bin_w = (max_v - min_v) / (CDF_BINS as f64);
+        let majority = Some(min_v + (maj_bin as f64 + 0.5) * bin_w);
+        let minority = Some(min_v + (min_bin as f64 + 0.5) * bin_w);
+
         Ok(GpuBandStats {
             total_pixels: len,
             valid_pixels: valid_px,
@@ -553,6 +578,9 @@ impl GpuStatsReducer {
             sum,
             std: Some(std_dev),
             median,
+            majority,
+            minority,
+            unique_bins,
             percentiles: p_vals,
             hist_counts,
             hist_edges,
@@ -594,6 +622,9 @@ fn empty_stats(total: usize, percentiles: &[f64]) -> GpuBandStats {
         sum: 0.0,
         std: None,
         median: None,
+        majority: None,
+        minority: None,
+        unique_bins: 0,
         percentiles: percentiles.iter().map(|&p| (p, None)).collect(),
         hist_counts: Vec::new(),
         hist_edges: Vec::new(),

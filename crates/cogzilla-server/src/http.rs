@@ -30,7 +30,7 @@ use crate::stac::{
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, build_wmts_capabilities_multi,
-    compute_f32_band_stats,
+    compute_f32_band_stats, compute_f32_band_stats_with_engine,
     compute_statistics_with_options,
     encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
     get_algorithm_json,
@@ -4364,6 +4364,13 @@ async fn render_mosaic_bbox_composite(
         ));
     }
     let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
+    #[cfg(feature = "gpu")]
+    let data = if let Some(gpu) = engine.gpu.as_ref() {
+        gpu.encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
+    } else {
+        encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
+    };
+    #[cfg(not(feature = "gpu"))]
     let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask);
     Ok(wrap_geotiff_fmt(
         data,
@@ -6981,7 +6988,7 @@ where
                         };
                         map.insert(
                             format!("b{}", b + 1),
-                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &plane, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
@@ -7062,7 +7069,7 @@ where
                             .collect();
                         map.insert(
                             format!("b{}", idx + 1),
-                            compute_f32_band_stats(&pixels, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &pixels, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
@@ -7243,7 +7250,7 @@ where
                                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                         .collect();
                                     let desc = if nb == 1 { alg_name.to_string() } else { format!("{alg_name}_b{}", b + 1) };
-                                    map.insert(format!("b{}", b + 1), compute_f32_band_stats(&plane, &desc, &stats_opts));
+                                    map.insert(format!("b{}", b + 1), compute_f32_band_stats_with_engine(&eng, &plane, &desc, &stats_opts));
                                 }
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
@@ -7299,7 +7306,7 @@ where
                                     .chunks_exact(4)
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                     .collect();
-                                map.insert(format!("b{}", idx + 1), compute_f32_band_stats(&pixels, &desc, &stats_opts));
+                                map.insert(format!("b{}", idx + 1), compute_f32_band_stats_with_engine(&eng, &pixels, &desc, &stats_opts));
                             }
                             return Ok::<_, EngineError>(serde_json::Value::Object(map));
                         }
@@ -8687,7 +8694,7 @@ where
                         };
                         map.insert(
                             format!("b{}", b + 1),
-                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &plane, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
