@@ -3160,7 +3160,8 @@ async fn part_image_of(
     pairs: &[(String, String)],
 ) -> Resp {
     // A GeoTIFF is the array with a place on the ground: made as the array, wrapped at the end.
-    let tiff = matches!(ext.or(pq.format_param.as_deref()), Some("tif" | "tiff"));
+    // (With `algorithm` no array is written on these routes yet: there it stays the picture.)
+    let tiff = matches!(ext.or(pq.format_param.as_deref()), Some("tif" | "tiff")) && pq.algorithm.is_none();
     let ext = if tiff { Some("npy") } else { ext };
     // `width` and `height` are read here; the shared parser does not know them.
     pq.errors.retain(|e| !own_size_error(e));
@@ -3529,12 +3530,18 @@ async fn part_image_of(
         } else {
             (encode_rgba_output_colour(width, height, &canvas, format, pq.return_mask), content_type)
         };
+        // The renderer's picture under `algorithm`, asked for as a GeoTIFF: its RGBA, placed.
+        if made.1 == super::GEOTIFF_CONTENT_TYPE && made.0.len() == width * height * 4 {
+            let body = crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &made.0, bbox, 4326, pq.return_mask);
+            return Ok((body, made.1));
+        }
         Ok(made)
     }
     .await;
     match rendered {
         Ok(made) => {
-            let (body, content_type) = as_geotiff(made, tiff, bbox, if mercator { 3857 } else { 4326 }, pq.return_mask);
+            let epsg = if mercator { 3857 } else { 4326 };
+            let (body, content_type) = as_geotiff(made, tiff, bbox, epsg, pq.return_mask);
             let mut resp = Response::new(Full::new(body));
             resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
             resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
@@ -5422,9 +5429,9 @@ fn npy_as_geotiff(npy: &[u8], bounds: [f64; 4], epsg: u16, mask: bool) -> Option
         return None;
     }
     let shown = bands - usize::from(mask && bands > 1);
-    // Three bands and no more are a colour picture; otherwise the first is grey and the
-    // rest are extra, the mask an alpha that is not multiplied in.
-    let colour = shown == 3;
+    // Three bands of bytes and no more are a colour picture, as GDAL writes them; otherwise
+    // the first is grey and the rest are extra, the mask an alpha that is not multiplied in.
+    let colour = shown == 3 && descr == "|u1";
     let extra: Vec<u16> = (if colour { 3 } else { 1 }..bands).map(|band| if mask && band + 1 == bands { 2 } else { 0 }).collect();
     let entries: u16 = 14 + u16::from(!extra.is_empty());
     // After the directory: the arrays that do not fit in an entry, then the geo tags.
@@ -5473,7 +5480,8 @@ fn npy_as_geotiff(npy: &[u8], bounds: [f64; 4], epsg: u16, mask: bool) -> Option
     entry(277, SHORT, 1, n);
     entry(278, LONG, 1, height as u32);
     entry(279, LONG, n, if bands == 1 { strip as u32 } else { counts_at });
-    entry(284, SHORT, 1, 2);
+    // One band is one strip either way, and said to be chunky, which every reader takes.
+    entry(284, SHORT, 1, if bands == 1 { 1 } else { 2 });
     if !extra.is_empty() {
         entry(338, SHORT, extra.len() as u32, extra_value);
     }

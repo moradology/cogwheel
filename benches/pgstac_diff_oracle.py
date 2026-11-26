@@ -515,6 +515,8 @@ def main() -> int:
         o.check("tif of two assets", "image", f"{base12}.tif?assets=red&assets=nir&asset_as_band=true")
         o.check("tif of band math", "image", f"{base12}.tif?assets=red&assets=nir&asset_as_band=true&expression=(b2-b1)/(b2%2Bb1)")
         o.check("tif, rescaled under a colour map", "image", f"{base12}.tif?assets=red&rescale=0,3000&colormap_name=viridis")
+        o.check("tif of three assets that are not bytes", "image", f"{base12}.tif?assets=red&assets=green&assets=blue&asset_as_band=true")
+        o.check("bbox, tif under an algorithm", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x64.tif?assets=red&algorithm=hillshade")
         o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
         o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
         o.check("bbox, tif of one band", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.tif?assets=red")
