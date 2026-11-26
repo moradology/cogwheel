@@ -1456,6 +1456,7 @@ pub struct StatsOptions {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub max_size_explicit: bool,
+    pub area_weighted: bool,
 }
 
 impl Default for StatsOptions {
@@ -1472,6 +1473,7 @@ impl Default for StatsOptions {
             width: None,
             height: None,
             max_size_explicit: false,
+            area_weighted: true,
         }
     }
 }
@@ -3317,6 +3319,19 @@ pub async fn compute_statistics_with_options(
     const MAX_STATS_MASK_TILES: usize = 65_536;
     let crs = engine.get_or_build_crs(cog)?;
     if let Some(pm) = poly_mask {
+        if opts.width.is_none() && opts.height.is_none() {
+            return crate::zonal::compute_native_exact_polygon_stats(
+                engine,
+                cog,
+                &crs,
+                pm,
+                max_size,
+                unscale,
+                nodata_override,
+                opts,
+            )
+            .await;
+        }
         let full = cog.index.full_res();
         let count = full.samples_per_pixel;
         // Pad degenerate zero-span axes (e.g. Point or axis-aligned LineString) by half a source pixel.
@@ -3875,6 +3890,8 @@ pub struct PolygonMask {
     pub points: Vec<(f64, f64)>,
     /// Precomputed `[min_lon, min_lat, max_lon, max_lat]` for fast bounding-box rejection.
     pub bbox: [f64; 4],
+    /// True when the incoming GeoJSON coordinates were provided in a projected `coord_crs`.
+    pub coord_crs_projected: bool,
 }
 
 impl PolygonMask {
@@ -4152,7 +4169,9 @@ impl PolygonMask {
             ));
         }
         let bbox = [min_x, min_y, max_x, max_y];
-        Ok((Self { polygons, lines, points, bbox }, bbox))
+        let coord_crs_projected =
+            coord_crs.is_some_and(|c| !matches!(c, cogzilla_proj::CrsModel::Geographic));
+        Ok((Self { polygons, lines, points, bbox, coord_crs_projected }, bbox))
     }
 
     fn ring_contains(ring: &[(f64, f64)], x: f64, y: f64) -> bool {

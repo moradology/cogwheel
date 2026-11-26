@@ -496,7 +496,9 @@ fn add_family_routes(
         sp.extend(stats_params());
         let mut post_sp = sp.clone();
         post_sp.push(q_str("coord_crs", false, "CRS of incoming GeoJSON geometry"));
-        post_sp.push(q_int("cover_scale", "Subpixel polygon coverage supersampling scale"));
+        post_sp.push(q_bool("area_weighted", false, "Weight statistics by ellipsoidal pixel ground area (default true)"));
+        post_sp.push(q_int("cover_scale", "Accepted for TiTiler compatibility (ignored; exact analytical coverage needs no supersampling)"));
+        post_sp.push(q_bool("all_touched", false, "Accepted for compatibility (ignored; exact analytical coverage weights all touched pixels)"));
         paths.insert(
             format!("{prefix}/statistics"),
             json!({
