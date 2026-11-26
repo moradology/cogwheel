@@ -273,6 +273,8 @@ struct ParsedQuery {
     colormap_explicit: bool,
     colormap_name_set: bool,
     colormap_type_linear: bool,
+    /// True when `?max_size=0` was explicitly requested (full native resolution, no overview step-down).
+    max_size_zero: bool,
     /// Parameter names present in the query, for per-route validation.
     keys: Vec<String>,
     /// Values that could not be parsed or name something unsupported.
@@ -342,6 +344,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         colormap_explicit: false,
         colormap_name_set: false,
         colormap_type_linear: false,
+        max_size_zero: false,
         keys: Vec::new(),
         errors: Vec::new(),
     };
@@ -704,7 +707,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             },
             "max_size" => {
                 if let Some(ms) = parse_u32_like(v) {
-                    // TiTiler treats max_size=0 as full native resolution (capped at 4096).
+                    // TiTiler treats max_size=0 as full native resolution (capped at 4096 for image routes).
+                    pq.max_size_zero = ms == 0;
                     pq.max_size = if ms == 0 { 4096 } else { ms.clamp(1, 4096) };
                 } else {
                     bad("expected a number");
@@ -1563,10 +1567,16 @@ fn bbox_to_wgs84(
     }
     // Polar-centered projected bboxes (e.g. EPSG:3413 / EPSG:3031) contain a pole in their interior:
     // if either pole projects inside [x0..=x1, y0..=y1], span full [-180, 180] and extend to ±90°.
-    if !matches!(
+    // Exclude cylindrical / pseudocylindrical projections where poles are horizontal lines (not points).
+    let is_line_pole = matches!(
         crs,
-        cogzilla_proj::CrsModel::Geographic | cogzilla_proj::CrsModel::Epsg3857
-    ) {
+        cogzilla_proj::CrsModel::Geographic
+            | cogzilla_proj::CrsModel::Epsg3857
+            | cogzilla_proj::CrsModel::WorldMercator
+            | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+            | cogzilla_proj::CrsModel::EqualEarth(_)
+    );
+    if !is_line_pole {
         let (bx0, bx1) = (x0.min(x1), x0.max(x1));
         let (by0, by1) = (y0.min(y1), y0.max(y1));
         for pole_lat in [90.0_f64, -90.0_f64] {
@@ -1647,8 +1657,12 @@ fn wgs84_bboxes_intersect(a: [f64; 4], b: [f64; 4]) -> bool {
         if w > e {
             // RFC 7946 antimeridian-crossing [w..180] U [-180..e]
             [(w.clamp(-180.0, 180.0), 180.0), (-180.0, e.clamp(-180.0, 180.0))]
+        } else if w < -180.0 && e <= -180.0 {
+            [((w + 360.0).max(-180.0), (e + 360.0).min(180.0)), (f64::NAN, f64::NAN)]
         } else if w < -180.0 {
             [(-180.0, e.min(180.0)), ((w + 360.0).max(-180.0), 180.0)]
+        } else if e > 180.0 && w >= 180.0 {
+            [((w - 360.0).max(-180.0), (e - 360.0).min(180.0)), (f64::NAN, f64::NAN)]
         } else if e > 180.0 {
             [(w.max(-180.0), 180.0), (-180.0, (e - 360.0).min(180.0))]
         } else {
@@ -2603,10 +2617,15 @@ fn build_ogc_tileset_json(
     minzoom: Option<u8>,
     maxzoom: Option<u8>,
 ) -> serde_json::Value {
-    let origin = if host.starts_with("http://") || host.starts_with("https://") {
-        format!("{host}{forwarded_prefix}")
+    let suffix = if !forwarded_prefix.is_empty() && !host.ends_with(forwarded_prefix) {
+        forwarded_prefix
     } else {
-        format!("http://{host}{forwarded_prefix}")
+        ""
+    };
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        format!("{host}{suffix}")
+    } else {
+        format!("http://{host}{suffix}")
     };
     let q_suffix = if raw_query.is_empty() {
         String::new()
@@ -2746,10 +2765,15 @@ fn build_stac_render_entry(
     render_id: &str,
     render: &serde_json::Value,
 ) -> serde_json::Value {
-    let origin = if host.starts_with("http://") || host.starts_with("https://") {
-        format!("{host}{forwarded_prefix}")
+    let suffix = if !forwarded_prefix.is_empty() && !host.ends_with(forwarded_prefix) {
+        forwarded_prefix
     } else {
-        format!("http://{host}{forwarded_prefix}")
+        ""
+    };
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        format!("{host}{suffix}")
+    } else {
+        format!("http://{host}{suffix}")
     };
     let mut qs_parts = vec![format!("url={stac_url}")];
     if let Some(obj) = render.as_object() {
@@ -3037,7 +3061,7 @@ fn build_stats_options_with_bands(
     }
     opts.width = pq.width;
     opts.height = pq.height;
-    opts.max_size_explicit = pq.keys.iter().any(|k| k == "max_size");
+    opts.max_size_explicit = !pq.max_size_zero && pq.keys.iter().any(|k| k == "max_size");
     opts.area_weighted = pq.area_weighted;
     if allow_expr
         && let Some(raw) = pq.expr_raw.as_deref()
@@ -4065,7 +4089,7 @@ async fn render_mosaic_bbox_composite(
         let cog = match engine.store.open_uri(u).await {
             Ok(c) => c,
             Err(e) => {
-                last_err = Some(e.into());
+                last_err = Some(crate::engine::asset_fetch_error(u, e));
                 continue;
             }
         };
@@ -5076,7 +5100,7 @@ where
                                         Err(e) => last_err = Some(e),
                                     }
                                 }
-                                Err(e) => last_err = Some(e.into()),
+                                Err(e) => last_err = Some(crate::engine::asset_fetch_error(cand, e)),
                             }
                         }
                         if let Some(empty) = first_empty {
@@ -5309,7 +5333,7 @@ where
                                 Err(e) => last_err = Some(e),
                             }
                         }
-                        Err(e) => last_err = Some(e.into()),
+                        Err(e) => last_err = Some(crate::engine::asset_fetch_error(cand, e)),
                     }
                 }
                 if let Some(empty) = first_empty {
@@ -5990,6 +6014,8 @@ where
             (None, _) => Err(EngineError::NotFound(format!("mosaic catalog '{cat_name}'"))),
             (Some(catalog), (Some(z), Some(x), Some((y, sc, ext)))) => {
                 let cache_key = format!("{path}?{raw_query}");
+                let failed_assets = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let failed_assets_c = failed_assets.clone();
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
@@ -6090,6 +6116,11 @@ where
                                 &mut failed,
                             )
                             .await?;
+                            if !failed.is_empty()
+                                && let Ok(mut guard) = failed_assets_c.lock()
+                            {
+                                *guard = failed;
+                            }
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
@@ -6106,6 +6137,9 @@ where
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
+                if let Ok(guard) = failed_assets.lock() {
+                    attach_x_failed_assets(&mut resp, &guard);
+                }
                 return Ok(resp);
             }
             _ => Err(EngineError::BadRequest(
@@ -6851,18 +6885,21 @@ where
                             }
                             let compiled = expr_progs_c.unwrap();
                             // Fast exact analytical coverage + ellipsoidal area-weighted native-grid path
-                            // (shared with POST /cog/statistics) whenever assets share the same pixel grid.
-                            if let Some(exact) = crate::zonal::compute_native_exact_multi_cog_expr_stats(
-                                &eng,
-                                &cogs_c,
-                                &mask,
-                                max_size,
-                                unscale,
-                                nodata,
-                                &compiled,
-                                &stats_opts,
-                            )
-                            .await?
+                            // (shared with POST /cog/statistics) whenever assets share the same pixel grid
+                            // and no explicit output width/height resampling was requested.
+                            if width_opt.is_none()
+                                && height_opt.is_none()
+                                && let Some(exact) = crate::zonal::compute_native_exact_multi_cog_expr_stats(
+                                    &eng,
+                                    &cogs_c,
+                                    &mask,
+                                    max_size,
+                                    unscale,
+                                    nodata,
+                                    &compiled,
+                                    &stats_opts,
+                                )
+                                .await?
                             {
                                 return Ok::<_, EngineError>(exact);
                             }
@@ -7088,10 +7125,15 @@ where
             (Method::GET, ["renders"]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                let origin = if host.starts_with("http://") || host.starts_with("https://") {
-                    format!("{host}{forwarded_prefix}")
+                let suffix = if !forwarded_prefix.is_empty() && !host.ends_with(&forwarded_prefix) {
+                    forwarded_prefix.as_str()
                 } else {
-                    format!("http://{host}{forwarded_prefix}")
+                    ""
+                };
+                let origin = if host.starts_with("http://") || host.starts_with("https://") {
+                    format!("{host}{suffix}")
+                } else {
+                    format!("http://{host}{suffix}")
                 };
                 let mut renders_map = serde_json::Map::new();
                 for (rid, rval) in &item.renders {
@@ -8108,7 +8150,12 @@ where
                 if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
-                    let wgs = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let wgs = crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
                     let rep = reproject_wgs84_bounds(wgs, dst)?;
                     json["bounds"] = serde_json::json!(rep);
                     json["crs"] = serde_json::json!(format!("http://www.opengis.net/def/crs/EPSG/0/{dst_epsg}"));
@@ -8124,7 +8171,12 @@ where
                 if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
-                    let wgs = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let wgs = crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
                     let rep = reproject_wgs84_bounds(wgs, dst)?;
                     json["properties"]["bounds"] = serde_json::json!(rep);
                     json["properties"]["crs"] = serde_json::json!(format!("http://www.opengis.net/def/crs/EPSG/0/{dst_epsg}"));
@@ -8138,7 +8190,12 @@ where
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let bounds = crs.wgs84_bounds_with_gcp(
+                    &full.pixel_to_crs,
+                    full.gcp_poly.as_deref(),
+                    full.width,
+                    full.height,
+                );
                 let bounds = if let Some((ref dst, _)) = pq.bounds_crs {
                     reproject_wgs84_bounds(bounds, dst)?
                 } else {
@@ -8636,7 +8693,12 @@ where
                 let (crs, native_epsg, native_bounds) =
                     dataset_native_crs_and_bounds(&engine, cog)?;
                 let full = cog.index.full_res();
-                let wgs_bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let wgs_bbox = crs.wgs84_bounds_with_gcp(
+                    &full.pixel_to_crs,
+                    full.gcp_poly.as_deref(),
+                    full.width,
+                    full.height,
+                );
                 let [w, s, e, n] = wgs_bbox;
                 let [nw, ns, ne, nn] = native_bounds;
                 let mut q_id: Option<String> = None;
@@ -8952,7 +9014,12 @@ where
                     let cogs = open_query_urls(&engine, &pq.urls).await?;
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
-                    let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let bounds = crs.wgs84_bounds_with_gcp(
+                    &full.pixel_to_crs,
+                    full.gcp_poly.as_deref(),
+                    full.width,
+                    full.height,
+                );
                     let coarsest = cogs[0].index.ifds.last().unwrap();
                     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
                         .max(full.height as f64 / coarsest.height.max(1) as f64);
@@ -10346,5 +10413,51 @@ mod tests {
         assert_eq!(polar_wgs[2], 180.0);
         assert_eq!(polar_wgs[3], 90.0);
         assert!(reproject_wgs84_bounds([0.0, 89.5, 10.0, 90.0], &utm31).is_err());
+
+        // 17. Narrow polar strip in Cylindrical Equal Area (EPSG:6933) must NOT expand to [-180, 180]
+        let cea = cogzilla_proj::CrsModel::from_epsg(6933).unwrap();
+        let cea_strip = bbox_to_wgs84([-100_000.0, 7_000_000.0, 100_000.0, 7_400_000.0], Some(&cea))
+            .unwrap();
+        assert!(
+            cea_strip[2] - cea_strip[0] < 10.0,
+            "narrow EPSG:6933 strip must not expand to [-180, 180], got {cea_strip:?}"
+        );
+
+        // 18. wgs84_bboxes_intersect handles regional 0..360 and -360..0 bboxes without false positives
+        assert!(!wgs84_bboxes_intersect(
+            [235.0, 32.0, 245.0, 42.0],
+            [-170.0, 35.0, -160.0, 40.0]
+        ));
+        assert!(wgs84_bboxes_intersect(
+            [235.0, 32.0, 245.0, 42.0],
+            [-122.0, 35.0, -118.0, 40.0]
+        ));
+        assert!(!wgs84_bboxes_intersect(
+            [-245.0, 32.0, -235.0, 42.0],
+            [160.0, 35.0, 170.0, 40.0]
+        ));
+        assert!(wgs84_bboxes_intersect(
+            [-245.0, 32.0, -235.0, 42.0],
+            [118.0, 35.0, 122.0, 40.0]
+        ));
+
+        // 19. OGC tileset & STAC render links must never double X-Forwarded-Prefix
+        let tms = crate::tms::lookup_tms("WebMercatorQuad").unwrap();
+        let ts_json = build_ogc_tileset_json(
+            "https://api.example.com/prod",
+            "/prod",
+            "cog",
+            tms,
+            "url=a.tif",
+            Some([-122.5, 37.5, -122.0, 38.0]),
+            Some(0),
+            Some(12),
+        );
+        let ts_str = ts_json.to_string();
+        assert!(
+            !ts_str.contains("/prod/prod"),
+            "OGC tileset links doubled X-Forwarded-Prefix: {ts_str}"
+        );
+        assert!(ts_str.contains("https://api.example.com/prod/cog/"));
     }
 }
