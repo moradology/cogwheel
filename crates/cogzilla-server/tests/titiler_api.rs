@@ -2953,3 +2953,186 @@ async fn upstream_http_faults_and_uri_schemes_return_semantic_statuses() {
     mock_task.abort();
     srv_task.abort();
 }
+
+
+#[tokio::test]
+async fn sweep17_v4_non_cog_ifd_seeking_and_v5_tight_block_fetch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Build a 512x512 float32 tiled (256x256 blocks -> 2x2 = 4 blocks) GeoTIFF in non-COG layout:
+    // header (8 B) -> 4 blocks of 256 KiB (1 MiB) -> 1 MiB padding -> IFD at offset > 2 MiB!
+    let mut tif: Vec<u8> = Vec::new();
+    tif.extend_from_slice(b"II");
+    tif.extend_from_slice(&42u16.to_le_bytes());
+    let first_ifd_patch_pos = tif.len();
+    tif.extend_from_slice(&0u32.to_le_bytes()); // patched later
+
+    let block_bytes = 256usize * 256 * 4; // 262,144 bytes per block
+    let mut tile_offsets = [0u32; 4];
+    let tile_counts = [block_bytes as u32; 4];
+    for (b, off_slot) in tile_offsets.iter_mut().enumerate() {
+        *off_slot = tif.len() as u32;
+        let val = (b as f32 + 1.0) * 10.0;
+        let vb = val.to_le_bytes();
+        for _ in 0..(256 * 256) {
+            tif.extend_from_slice(&vb);
+        }
+    }
+    // Pad to > 2 MiB before writing IFD so a contiguous header read would have to fetch > 2 MiB.
+    tif.resize(2 * 1024 * 1024 + 4096, 0u8);
+
+    // Out-of-line tag payloads placed right next to the IFD.
+    let offsets_pos = tif.len() as u32;
+    for o in tile_offsets {
+        tif.extend_from_slice(&o.to_le_bytes());
+    }
+    let counts_pos = tif.len() as u32;
+    for c in tile_counts {
+        tif.extend_from_slice(&c.to_le_bytes());
+    }
+    let scale_pos = tif.len() as u32;
+    for v in [0.001f64, 0.001, 0.0] {
+        tif.extend_from_slice(&v.to_le_bytes());
+    }
+    let tie_pos = tif.len() as u32;
+    for v in [0.0f64, 0.0, 0.0, 10.0, 45.0, 0.0] {
+        tif.extend_from_slice(&v.to_le_bytes());
+    }
+    let gkd_pos = tif.len() as u32;
+    // GeoKeyDirectory: WGS84 Geographic (EPSG:4326)
+    for k in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+        tif.extend_from_slice(&k.to_le_bytes());
+    }
+
+    let ifd_off = tif.len() as u32;
+    tif[first_ifd_patch_pos..first_ifd_patch_pos + 4].copy_from_slice(&ifd_off.to_le_bytes());
+
+    let entries: Vec<(u16, u16, u32, u32)> = vec![
+        (256, 4, 1, 512),         // ImageWidth
+        (257, 4, 1, 512),         // ImageLength
+        (258, 3, 1, 32),          // BitsPerSample
+        (259, 3, 1, 1),           // Compression = None
+        (262, 3, 1, 1),           // Photometric = MinIsBlack
+        (277, 3, 1, 1),           // SamplesPerPixel
+        (284, 3, 1, 1),           // PlanarConfiguration = Chunky
+        (322, 4, 1, 256),         // TileWidth
+        (323, 4, 1, 256),         // TileLength
+        (324, 4, 4, offsets_pos), // TileOffsets
+        (325, 4, 4, counts_pos),  // TileByteCounts
+        (339, 3, 1, 3),           // SampleFormat = IEEEFP
+        (33550, 12, 3, scale_pos),
+        (33922, 12, 6, tie_pos),
+        (34735, 3, 12, gkd_pos),
+    ];
+    tif.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, ty, count, val) in entries {
+        tif.extend_from_slice(&tag.to_le_bytes());
+        tif.extend_from_slice(&ty.to_le_bytes());
+        tif.extend_from_slice(&count.to_le_bytes());
+        tif.extend_from_slice(&val.to_le_bytes());
+    }
+    tif.extend_from_slice(&0u32.to_le_bytes()); // next_ifd = 0
+
+    let tif_arc = Arc::new(tif);
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let bytes_sent = Arc::new(AtomicUsize::new(0));
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let tif_srv = tif_arc.clone();
+    let rc_srv = req_count.clone();
+    let bs_srv = bytes_sent.clone();
+    let mock_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = mock_listener.accept().await else {
+                break;
+            };
+            let data = tif_srv.clone();
+            let rc = rc_srv.clone();
+            let bs = bs_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let range_line = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .unwrap_or("");
+                let total = data.len();
+                let (s, e) = if let Some(spec) = range_line.split("bytes=").nth(1) {
+                    let mut parts = spec.trim().split('-');
+                    let s: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let e: usize = parts
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(total - 1)
+                        .min(total - 1);
+                    (s, e)
+                } else {
+                    (0, total - 1)
+                };
+                let slice = &data[s..=e];
+                rc.fetch_add(1, Ordering::Relaxed);
+                bs.fetch_add(slice.len(), Ordering::Relaxed);
+                let hdr = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(slice).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let url = format!("http://{mock_addr}/noncog.tif");
+
+    // V4: Opening non-COG with IFD > 2 MiB should jump directly to IFD (~160 KiB total, not > 2 MiB)
+    let r = client
+        .get(format!("{base}/cog/info?url={url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let open_reqs = req_count.load(Ordering::Relaxed);
+    let open_bytes = bytes_sent.load(Ordering::Relaxed);
+    assert!(
+        open_bytes < 256 * 1024,
+        "V4 failed: non-COG open fetched {open_bytes} bytes in {open_reqs} reqs (expected < 256 KiB)"
+    );
+
+    // V5: A 1-block 256x256 native window (top-left block: lon 10.0..10.256, lat 44.744..45.0)
+    // must fetch ONLY 1 block (262,144 bytes in 1 range request), not 2x2 blocks!
+    req_count.store(0, Ordering::Relaxed);
+    bytes_sent.store(0, Ordering::Relaxed);
+    let r = client
+        .get(format!(
+            "{base}/cog/bbox/10.0,44.744,10.256,45.0/256x256.npy?url={url}&coord_crs=EPSG:4326&dst_crs=EPSG:4326"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let win_reqs = req_count.load(Ordering::Relaxed);
+    let win_bytes = bytes_sent.load(Ordering::Relaxed);
+    assert_eq!(win_reqs, 1, "V5 failed: expected 1 range request, got {win_reqs}");
+    assert_eq!(
+        win_bytes, block_bytes,
+        "V5 failed: expected exactly 1 block ({block_bytes} bytes), got {win_bytes} bytes"
+    );
+
+    mock_task.abort();
+    srv_task.abort();
+}
