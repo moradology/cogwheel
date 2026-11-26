@@ -1540,6 +1540,24 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 color_type == 0 || color_type == 4,
                 "single-band mosaic with color_formula must encode grayscale PNG (color_type 0 or 4), got {color_type}"
             );
+            // Mosaic point outside coverage returns 404 with JSON detail (not empty 204)
+            let mj_pt_oob = client
+                .get(format!(
+                    "{base}/mosaicjson/point/0,0?url={}",
+                    mj_root_path.to_str().unwrap()
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_pt_oob.status(), 404);
+            let mj_pt_json: serde_json::Value =
+                serde_json::from_slice(&mj_pt_oob.bytes().await.unwrap()).unwrap();
+            assert!(
+                mj_pt_json["detail"]
+                    .as_str()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("no asset")),
+                "expected 404 JSON detail naming missing coverage, got {mj_pt_json}"
+            );
             let _ = std::fs::remove_file(&mj_root_path);
 
             // Sweep #1 D4, D6, E2 regression checks

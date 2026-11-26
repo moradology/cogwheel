@@ -5249,7 +5249,9 @@ where
                     }
                 }
                 if assets_out.is_empty() {
-                    return Err(EngineError::NoContent);
+                    return Err(EngineError::NotFound(format!(
+                        "No asset covers point ({lon}, {lat})"
+                    )));
                 }
                 let body = serde_json::json!({
                     "coordinates": [x, y],
