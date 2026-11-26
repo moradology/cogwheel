@@ -6237,3 +6237,153 @@ mod tests {
         assert_eq!(in_w, 5.0, "in-bounds pixel for where(1, 5, b1) must be 5.0");
     }
 }
+
+/// Golden bytes of the `.npy` float32 writers: the header in full for a spread of shapes,
+/// and the length and SHA-256 of whole arrays. These pin the response bytes, so a change
+/// here is a change to what clients receive.
+#[cfg(test)]
+mod npy_golden_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The header as it must be written: magic, version 1.0, dict length, the dict, `pad`
+    /// spaces and a newline.
+    fn header(dict: &str, pad: usize) -> Vec<u8> {
+        let mut out = b"\x93NUMPY\x01\x00".to_vec();
+        out.extend_from_slice(&((dict.len() + pad + 1) as u16).to_le_bytes());
+        out.extend_from_slice(dict.as_bytes());
+        out.extend(std::iter::repeat_n(b' ', pad));
+        out.push(b'\n');
+        out
+    }
+
+    /// Reproducible float32 planes with NaN, both infinities, negatives and fractions.
+    fn planes(bands: usize, height: u32, width: u32, seed: u32) -> Vec<u8> {
+        let count = bands * height as usize * width as usize;
+        let mut state = seed;
+        let mut out = Vec::with_capacity(count * 4);
+        for _ in 0..count {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = match (state >> 16) % 11 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                _ => ((state >> 8) as i32 - (1 << 23)) as f32 / 1000.0,
+            };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn f32_header_bytes_are_pinned() {
+        // (bands, height, width), the dict, and the spaces that pad it.
+        let cases: [(usize, u32, u32, &str, usize); 7] = [
+            (1, 2, 2, "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 2, 2), }", 55),
+            (3, 256, 256, "{'descr': '<f4', 'fortran_order': False, 'shape': (3, 256, 256), }", 51),
+            (4, 7, 13, "{'descr': '<f4', 'fortran_order': False, 'shape': (4, 7, 13), }", 54),
+            (10, 1024, 512, "{'descr': '<f4', 'fortran_order': False, 'shape': (10, 1024, 512), }", 49),
+            (2, 12345, 1, "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 12345, 1), }", 51),
+            (0, 0, 0, "{'descr': '<f4', 'fortran_order': False, 'shape': (0, 0, 0), }", 55),
+            (
+                usize::MAX,
+                u32::MAX,
+                u32::MAX,
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (18446744073709551615, 4294967295, 4294967295), }",
+                18,
+            ),
+        ];
+        for (bands, height, width, dict, pad) in cases {
+            let got = encode_npy_f32_header(bands, height, width);
+            assert_eq!(got.len(), 128, "header length for ({bands}, {height}, {width})");
+            assert_eq!(got, header(dict, pad), "header bytes for ({bands}, {height}, {width})");
+        }
+    }
+
+    #[test]
+    fn f32_small_arrays_are_pinned_in_full() {
+        let le = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let nan = f32::NAN;
+
+        // One band, 2x2: the planes follow the header untouched, then the mask.
+        let values = [1.5, nan, f32::NEG_INFINITY, -2.0];
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (1, 2, 2), }", 55);
+        exp.extend_from_slice(&le(&values));
+        let got = wrap_raw_f32_as_npy(Bytes::from(le(&values)), 1, 2, 2);
+        assert_eq!(got.as_ref(), exp.as_slice());
+        let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(le(&values)), 1, 2, 2, false);
+        assert_eq!(got.as_ref(), exp.as_slice());
+
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }", 55);
+        exp.extend_from_slice(&le(&values));
+        exp.extend_from_slice(&le(&[255.0, 0.0, 0.0, 255.0]));
+        let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(le(&values)), 1, 2, 2, true);
+        assert_eq!(got.as_ref(), exp.as_slice());
+
+        // Three bands, 1 row of 2: a pixel is masked out only when no band is finite there.
+        let values = [nan, 1.0, f32::INFINITY, nan, nan, -0.0];
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (4, 1, 2), }", 55);
+        exp.extend_from_slice(&le(&values));
+        exp.extend_from_slice(&le(&[0.0, 255.0]));
+        let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(le(&values)), 3, 1, 2, true);
+        assert_eq!(got.as_ref(), exp.as_slice());
+
+        // An empty tile is the header and NaN throughout.
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3, 3), }", 55);
+        exp.extend_from_slice(&le(&[nan; 18]));
+        assert_eq!(empty_tile_bytes(3, OutputFormat::Npy, 2).as_ref(), exp.as_slice());
+    }
+
+    #[test]
+    fn f32_arrays_are_pinned_by_length_and_digest() {
+        // bands, height, width, mask, bytes cut from the end of the planes, length, SHA-256.
+        let cases: [(usize, u32, u32, bool, usize, usize, &str); 14] = [
+            (1, 2, 2, false, 0, 144, "a2f108947a23fd0bf4a45863a61642c8737f4a737de4ae562e04a90bc71c05f4"),
+            (1, 2, 2, true, 0, 160, "d0037009d0ba0f13e146d568787c345a423ec2907d6cb00b31000ec65258a30b"),
+            (3, 1, 5, true, 0, 208, "bf56f2c2b8000609fb42496e22e5f943de6b0a877470fe254d27cb89cab7e05f"),
+            (3, 7, 13, false, 0, 1220, "17cdaaea973e5db420409f60adeab2ee13586b2544a1a5fc1ba1ef7f07e74e6d"),
+            (3, 7, 13, true, 0, 1584, "9d14efff4748fd24de1c2a71c6ad4847fa1ea5b8f5f522fcfe69edefd28c9a39"),
+            (1, 256, 256, false, 0, 262272, "7d0665ee74caf962f474512cae016c2846cd45d6196a7f1651a73156b3dcc705"),
+            (1, 256, 256, true, 0, 524416, "020d46b447418a8fe60c40d93f4fc624d2149590ad38d6d38ee90130a725a835"),
+            (3, 256, 256, true, 0, 1048704, "2eb4f63e99fb4a12b94f3a397ed4bd1e6e33e7ce715ad8de64aa5eca21adc716"),
+            (3, 512, 512, false, 0, 3145856, "87028dd38eb31c700fef51f6918423e0674e54af6bf0106d9cef4eedbd1e7337"),
+            (1, 1000, 3, true, 0, 24128, "0ec5029e87634968585a837ed56567549724a34e4a8c77bb196626a3269fe510"),
+            (2, 1, 1024, true, 0, 12416, "58b72da7c4d034a04afe596f22dda8eea4c670780a1258d5629959694db7ac6f"),
+            (4, 12345, 1, true, 0, 247028, "8e8bf86438d0a349a9780d8e920d24537ea1292fbf9e629eb88273ef25ba4c34"),
+            (3, 9, 17, true, 150, 2426, "530137fad2f5a61fa10aa1043ed85832f2155ed0a9624fd94ecb8a9e1b9c4e33"),
+            (0, 5, 6, true, 0, 248, "7225ef713825a642977bb6c7f903da5f140d1920d95aae073503dd2be4fdcc62"),
+        ];
+        for (i, (bands, height, width, mask, cut, len, digest)) in cases.into_iter().enumerate() {
+            let mut raw = planes(bands, height, width, 0x9E37_79B9 ^ i as u32);
+            raw.truncate(raw.len() - cut);
+            let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(raw.clone()), bands, height, width, mask);
+            let what = format!("case {i}: ({bands}, {height}, {width}), mask {mask}, cut {cut}");
+            assert_eq!(got.len(), len, "{what}");
+            assert_eq!(sha256_hex(&got), digest, "{what}");
+            if !mask {
+                assert_eq!(got, wrap_raw_f32_as_npy(Bytes::from(raw), bands, height, width));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_npy_tiles_are_pinned_by_length_and_digest() {
+        // tile size, bands, length, SHA-256.
+        let cases: [(u32, usize, usize, &str); 5] = [
+            (256, 1, 262272, "820ec7e5f3dfd5b867b3fd2e8d56e43f8c6afe3bde4a76720a77eafefdfd002f"),
+            (256, 3, 786560, "803f28ae94e98efe8807f4fe51b0772f36d8318ba550ec45e5135cb70496d5de"),
+            (512, 1, 1048704, "845324c7127f73c5a480b5b24d1a9b228c802e837171d77a33994bae555550cd"),
+            (64, 2, 32896, "85a5dff8aa70b4e8df6b7455d9c44fcce85905cec33692d1b4c2776edfee5cee"),
+            (1, 5, 148, "a5497f607d665ebcbf609c18495d17f61a4f30eb9107430f00f8c94f791dc6a5"),
+        ];
+        for (size, bands, len, digest) in cases {
+            let got = empty_tile_bytes(size, OutputFormat::Npy, bands);
+            assert_eq!(got.len(), len, "empty {size} tile of {bands} bands");
+            assert_eq!(sha256_hex(&got), digest, "empty {size} tile of {bands} bands");
+        }
+    }
+}
