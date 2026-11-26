@@ -16,6 +16,8 @@ pub enum TiffError {
     NotTiled,
     #[error("missing georeferencing tags (ModelPixelScale/Tiepoint or ModelTransformation)")]
     MissingGeoTransform,
+    #[error("file is georeferenced by {0} ground control points (GCPs), which is not supported yet")]
+    UnsupportedGcpGeoreferencing(usize),
     #[error("corrupt TIFF structure: {0}")]
     Corrupt(&'static str),
 }

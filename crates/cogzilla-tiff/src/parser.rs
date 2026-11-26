@@ -924,7 +924,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     e: m[5],
                     f,
                 }
-            } else if let (Some(ps), Some(tp)) = (pixel_scale, tiepoint) {
+            } else if let (Some(ps), Some(tp)) = (pixel_scale.as_ref(), tiepoint.as_ref()) {
                 if ps.len() < 2 || tp.len() < 6 {
                     return Err(TiffError::MissingGeoTransform);
                 }
@@ -945,6 +945,10 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     e: sy,
                     f,
                 }
+            } else if let Some(tp) = tiepoint
+                && tp.len() >= 12
+            {
+                return Err(TiffError::UnsupportedGcpGeoreferencing(tp.len() / 6));
             } else {
                 return Err(TiffError::MissingGeoTransform);
             };
