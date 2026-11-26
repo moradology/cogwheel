@@ -4027,28 +4027,29 @@ mod tests {
         }
 
         // 3. Verify 1-pass fused try_render_bbox_expr_stats (NDVI, Nearest)
-        let prog = ExprProgram::compile("(b2-b1)/(b2+b1)").expect("compile ndvi");
-        if let Some(st) = gpu.try_render_bbox_expr_stats(
-            None,
-            BboxCoordSource::Separable {
-                u: &u_coords,
-                v: &v_coords,
-            },
-            &[s0, s1],
-            &prog,
-            ResampleMode::Nearest,
-            10,
-            None,
-            &[2.0, 50.0, 98.0],
-        ) {
-            assert_eq!(st.valid_pixels, n * n);
-            assert!(
-                st.min.unwrap() > 0.0 && st.max.unwrap() < 1.0,
-                "unexpected NDVI range: min={:?}, max={:?}",
-                st.min,
-                st.max
-            );
-            assert_eq!(st.hist_counts.iter().sum::<u64>(), (n * n) as u64);
-        }
+        let prog = ExprProgram::compile("(b1-b2)/(b1+b2)").expect("compile ndvi");
+        let st = gpu
+            .try_render_bbox_expr_stats(
+                None,
+                BboxCoordSource::Separable {
+                    u: &u_coords,
+                    v: &v_coords,
+                },
+                &[s1, s0],
+                &prog,
+                ResampleMode::Nearest,
+                10,
+                None,
+                &[2.0, 50.0, 98.0],
+            )
+            .expect("fused expr stats");
+        assert_eq!(st.valid_pixels, n * n);
+        assert!(
+            st.min.unwrap() > 0.0 && st.max.unwrap() < 1.0,
+            "unexpected NDVI range: min={:?}, max={:?}",
+            st.min,
+            st.max
+        );
+        assert_eq!(st.hist_counts.iter().sum::<u64>(), (n * n) as u64);
     }
 }
