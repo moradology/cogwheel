@@ -2320,3 +2320,114 @@ async fn uniform_semantic_http_statuses_across_all_tms() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn s1_cylindrical_equal_area_exact_in_worldcrs84_and_worldmercator() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_s1_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Global 512x256 ramp rasters in EPSG:6933 and EPSG:3410 (~67.8 km pixels):
+    // pixel value = row * 512 + col so any 1-row shift shows up immediately as delta=512.
+    let w = 512u32;
+    let h = 256u32;
+    let ramp: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
+
+    let g6933_path = tmp.join("g6933_ramp.tif");
+    write_synthetic_f32_projected_geotiff(
+        &g6933_path,
+        w,
+        h,
+        6933,
+        -17_367_520.0,
+        7_314_540.0,
+        34_735_040.0 / (w as f64),
+        &ramp,
+    );
+    let g3410_path = tmp.join("g3410_ramp.tif");
+    write_synthetic_f32_projected_geotiff(
+        &g3410_path,
+        w,
+        h,
+        3410,
+        -17_334_200.0,
+        7_344_784.0,
+        34_668_400.0 / (w as f64),
+        &ramp,
+    );
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    for (epsg, path, ox, oy, px_sz) in [
+        (6933u16, &g6933_path, -17_367_520.0, 7_314_540.0, 34_735_040.0 / (w as f64)),
+        (3410u16, &g3410_path, -17_334_200.0, 7_344_784.0, 34_668_400.0 / (w as f64)),
+    ] {
+        let crs = cogzilla_proj::CrsModel::from_epsg(epsg).unwrap();
+        let u = path.to_string_lossy().to_string();
+
+        // Check WorldCRS84Quad z2/2/1 (lon 0..45, lat 0..45) and WorldMercatorWGS84Quad z2/2/1
+        for (tms, z, x, y, dst_crs, tb) in [
+            (
+                "WorldCRS84Quad",
+                2u8,
+                2u32,
+                1u32,
+                cogzilla_proj::CrsModel::Geographic,
+                [-90.0, 0.0, -45.0, 45.0],
+            ),
+            (
+                "WorldMercatorWGS84Quad",
+                2u8,
+                2u32,
+                1u32,
+                cogzilla_proj::CrsModel::WorldMercator,
+                [0.0, 0.0, 10_018_754.171_394_622, 10_018_754.171_394_622],
+            ),
+        ] {
+            let resp = client
+                .get(format!(
+                    "{base}/cog/tiles/{tms}/{z}/{x}/{y}.npy?url={u}&bidx=1&resampling=nearest&reproject=nearest&return_mask=false"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "EPSG:{epsg} {tms} {z}/{x}/{y}");
+            let vals = decode_npy_f32(&resp.bytes().await.unwrap());
+            assert_eq!(vals.len(), 256 * 256);
+
+            let dlx = (tb[2] - tb[0]) / 256.0;
+            let dly = (tb[3] - tb[1]) / 256.0;
+            let mut mismatches = 0usize;
+            for py in 0..256usize {
+                let dy = tb[3] - (py as f64 + 0.5) * dly;
+                for px in 0..256usize {
+                    let dx = tb[0] + (px as f64 + 0.5) * dlx;
+                    let (lon, lat) = dst_crs.to_lonlat_deg(dx, dy);
+                    let (sx, sy) = crs.from_lonlat_deg(lon, lat);
+                    let col = ((sx - ox) / px_sz).floor() as i64;
+                    let row = ((oy - sy) / px_sz).floor() as i64;
+                    if col >= 0 && col < w as i64 && row >= 0 && row < h as i64 {
+                        let expected = (row as u32 * w + col as u32) as f32;
+                        let got = vals[py * 256 + px];
+                        if (got - expected).abs() > 0.5 {
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                mismatches, 0,
+                "S1 EPSG:{epsg} in {tms} {z}/{x}/{y} had {mismatches} mismatched pixels (expected 0)"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
