@@ -1506,6 +1506,25 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let (_, mean) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=mean")).await;
             assert!(f32s(&mean).iter().any(|v| v.is_finite() && v.fract() != 0.0), "a float mean keeps its fraction");
 
+            // What a pixel selection leaves is painted and encoded like any other picture:
+            // every format, with and without the mask, under a colour map and a formula.
+            let formats: [(&str, &[u8]); 3] = [("png", &[0x89, b'P', b'N', b'G']), ("jpg", &[0xff, 0xd8]), ("webp", b"RIFF")];
+            for (ext, magic) in formats {
+                for look in ["", "&return_mask=false", "&rescale=0,100&colormap_name=viridis", "&color_formula=gamma%20rgb%202"] {
+                    for bands in ["bidx=1", "bidx=1&bidx=2&bidx=3"] {
+                        // A colour map is for one band; it is refused over three.
+                        if look.contains("colormap_name") && bands != "bidx=1" {
+                            continue;
+                        }
+                        let url = format!("{sat_tile}.{ext}?url={sat_url}&url={sat_url}&{bands}&pixel_selection=highest{look}");
+                        let resp = client.get(&url).send().await.unwrap();
+                        assert_eq!(resp.status(), 200, "{url}");
+                        let body = resp.bytes().await.unwrap();
+                        assert!(body.starts_with(magic), "{url}");
+                    }
+                }
+            }
+
             // Sweep #1 & #7 C1-C4, D2(validate), G1-G3 regression checks
             let cog_stac = get_json(
                 &client,

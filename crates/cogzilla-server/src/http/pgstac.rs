@@ -30,6 +30,7 @@ use super::{
     parse_ext_format, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
+use super::paint::{Paint, formula_levels, rescale_byte};
 use super::pixel_selection::{Fold, Selected, Selection};
 use super::point_expr::Program;
 use super::zonal::{self, Bins, StatsOptions};
@@ -1723,81 +1724,6 @@ fn check_working_bytes(bytes: usize) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// A value as a byte, by rio-tiler's `linear_rescale` step for step and in its double
-/// precision: clip to the range, take the share of it, scale to 255, drop the fraction.
-/// Done in another order or in single precision, a value on a boundary lands a level off.
-fn rescale_byte(v: f32, min: f32, max: f32) -> u8 {
-    let (v, min, max) = (f64::from(v), f64::from(min), f64::from(max));
-    let span = if (max - min).abs() < 1e-12 { 1e-12 } else { max - min };
-    let share = (v.max(min).min(max) - min) / span;
-    (share * 255.0).clamp(0.0, 255.0) as u8
-}
-
-/// How the values a pixel selection leaves become colours: the request's own rescaling
-/// and colour map, applied as the renderer applies them to a single scene.
-enum Paint {
-    Gray { min: f32, max: f32, colormap: ColormapName },
-    Rgb { min: [f32; 3], max: [f32; 3] },
-}
-
-impl Paint {
-    /// `None` for a request whose pixels are not values put through a rescale (a terrain encoding).
-    fn of(bands: &BandRequest) -> Option<Self> {
-        Some(match bands {
-            BandRequest::Single { rescale, colormap, .. }
-            | BandRequest::Spectral1 { rescale, colormap, .. }
-            | BandRequest::Spectral2 { rescale, colormap, .. }
-            | BandRequest::Spectral3 { rescale, colormap, .. }
-            | BandRequest::CustomExpr { rescale, colormap, .. }
-            | BandRequest::Dem { rescale, colormap, .. } => Self::Gray { min: rescale.0, max: rescale.1, colormap: *colormap },
-            BandRequest::Rgb { rescale_min, rescale_max, .. }
-            | BandRequest::SarRgb { rescale_min, rescale_max, .. } => Self::Rgb { min: *rescale_min, max: *rescale_max },
-            BandRequest::Terrain { .. } | BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => return None,
-        })
-    }
-
-    /// RGBA for `pixels` pixels. A pixel is transparent when no band of it has a value.
-    fn rgba(&self, selected: &Selected, pixels: usize) -> Vec<u8> {
-        let byte = rescale_byte;
-        let mut out = vec![0u8; pixels * 4];
-        match (self, selected.bands) {
-            (Self::Rgb { min, max }, 3) => {
-                for (i, px) in out.chunks_exact_mut(4).enumerate() {
-                    let v = [selected.values[i], selected.values[pixels + i], selected.values[2 * pixels + i]];
-                    if v.iter().all(|v| v.is_nan()) {
-                        continue;
-                    }
-                    for k in 0..3 {
-                        px[k] = if v[k].is_nan() { 0 } else { byte(v[k], min[k], max[k]) };
-                    }
-                    px[3] = 255;
-                }
-            }
-            _ => {
-                // One band: the request's colour map, or grey for the count of an RGB request.
-                let (min, max, colormap) = match self {
-                    Self::Gray { min, max, colormap } => (*min, *max, *colormap),
-                    Self::Rgb { min, max } => (min[0], max[0], ColormapName::Grayscale),
-                };
-                // Without a colour map the byte is the grey, as in TiTiler. The kernel's grey
-                // table is not that: some of its entries are a level below their index.
-                let lut = (colormap != ColormapName::Grayscale).then(|| colormap.lut());
-                for (px, v) in out.chunks_exact_mut(4).zip(&selected.values) {
-                    if !v.is_nan() {
-                        let level = byte(*v, min, max);
-                        match lut {
-                            Some(lut) => px[..3].copy_from_slice(&lut.rgb[usize::from(level)]),
-                            None => px[..3].fill(level),
-                        }
-                        px[3] = 255;
-                    }
-                }
-            }
-        }
-        out
-    }
-}
-
 /// TiTiler's two resampling parameters. Both default to nearest neighbour.
 fn parse_resample(pairs: &[(String, String)], name: &str) -> Result<ResampleMode, Resp> {
     match query_value(pairs, name) {
@@ -2811,17 +2737,6 @@ fn one_grey_band(bands: &BandRequest) -> bool {
             | BandRequest::Spectral3 { colormap: ColormapName::Grayscale, .. }
             | BandRequest::CustomExpr { colormap: ColormapName::Grayscale, .. }
     )
-}
-
-/// What a colour formula makes of each grey level.
-fn formula_levels(formula: &cogzilla_kernel::ColorFormula) -> [u8; 256] {
-    let mut levels = [0u8; 256];
-    for (level, out) in levels.iter_mut().enumerate() {
-        let mut px = [level as u8, level as u8, level as u8, 255];
-        formula.apply_buffer_in_place(&mut px, 4);
-        *out = px[0];
-    }
-    levels
 }
 
 /// Colours for the bands a mosaic of planes leaves, as TiTiler encodes them: one band
