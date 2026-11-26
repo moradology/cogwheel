@@ -75,12 +75,109 @@ impl LzwDecoder {
             Some(((chunk << bit_off) >> (64 - code_bits)) as u16)
         }
 
+        // Emit one normal code (`code < next_code && (code & !1) != CLEAR_CODE`) when
+        // `prev_code != CLEAR_CODE` is already guaranteed.
+        macro_rules! emit_normal_12 {
+            ($code:expr, $insert_table:expr) => {{
+                let entry = unsafe { *entries.get_unchecked($code as usize) };
+                let len = (entry >> 48) as usize;
+                let first = entry as u8;
+                if len <= 6 {
+                    unsafe {
+                        (out_ptr.add(out_pos) as *mut u64).write_unaligned(entry);
+                    }
+                } else if out_pos + len <= out_len {
+                    let off = ((entry >> 16) & 0xFFFF_FFFF) as usize;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            out_ptr.add(off),
+                            out_ptr.add(out_pos),
+                            len,
+                        );
+                    }
+                } else {
+                    let avail = out_len - out_pos;
+                    let off = ((entry >> 16) & 0xFFFF_FFFF) as usize;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            out_ptr.add(off),
+                            out_ptr.add(out_pos),
+                            avail,
+                        );
+                    }
+                    return Ok(out_len);
+                }
+                if $insert_table && (next_code as usize) < MAX_TABLE {
+                    let prev_len = prev_entry >> 48;
+                    let new_entry = if prev_len < 6 {
+                        (prev_entry + (1u64 << 48)) | ((first as u64) << (prev_len * 8))
+                    } else {
+                        ((prev_len + 1) << 48)
+                            | ((prev_out_pos as u64) << 16)
+                            | (prev_entry & 0xFF)
+                    };
+                    unsafe { *entries.get_unchecked_mut(next_code as usize) = new_entry };
+                    next_code += 1;
+                }
+                prev_out_pos = out_pos;
+                prev_entry = entry;
+                out_pos += len;
+            }};
+        }
+
         // Fast inner loop: guaranteed `byte_pos + 8 <= src_len` and `out_pos + 16 <= out_len`
         // so bit reading is completely branchless and inline 8-byte stores need zero bounds checks.
         // Crucially, literals `0..256` and dictionary entries `258..next_code` share the EXACT
         // same `entries[code]` fast path, eliminating the 50/50 unpredictable `code < 256` branch
         // misprediction storm on high-entropy `LZW_P1` blocks!
-        while (bit_pos >> 3) + 8 <= src_len && out_pos + 16 <= out_len {
+        'main: while (bit_pos >> 3) + 8 <= src_len && out_pos + 16 <= out_len {
+            // Specialized 4-code 12-bit batch fast path: 4 * 12 + (<=7) = 55 <= 64 bits, so a
+            // single `u64::from_be_bytes` load feeds 4 codes with zero refill branches, constant
+            // shifts, and no `code_bits` growth checks.
+            if code_bits == 12 && prev_code != CLEAR_CODE {
+                while (bit_pos >> 3) + 8 <= src_len && out_pos + 40 <= out_len {
+                    let byte_pos = bit_pos >> 3;
+                    let bit_off = (bit_pos & 7) as u32;
+                    let aligned = u64::from_be_bytes(unsafe {
+                        (src_ptr.add(byte_pos) as *const [u8; 8]).read_unaligned()
+                    }) << bit_off;
+
+                    let c0 = (aligned >> 52) as u16;
+                    let c1 = ((aligned >> 40) & 0xFFF) as u16;
+                    let c2 = ((aligned >> 28) & 0xFFF) as u16;
+                    let c3 = ((aligned >> 16) & 0xFFF) as u16;
+
+                    if c0 < next_code
+                        && (c0 & !1) != CLEAR_CODE
+                        && c1 < next_code
+                        && (c1 & !1) != CLEAR_CODE
+                        && c2 < next_code
+                        && (c2 & !1) != CLEAR_CODE
+                        && c3 < next_code
+                        && (c3 & !1) != CLEAR_CODE
+                    {
+                        if (next_code as usize) == MAX_TABLE {
+                            emit_normal_12!(c0, false);
+                            emit_normal_12!(c1, false);
+                            emit_normal_12!(c2, false);
+                            emit_normal_12!(c3, false);
+                        } else {
+                            emit_normal_12!(c0, true);
+                            emit_normal_12!(c1, true);
+                            emit_normal_12!(c2, true);
+                            emit_normal_12!(c3, true);
+                        }
+                        prev_code = c3;
+                        bit_pos += 48;
+                        continue;
+                    }
+                    break;
+                }
+                if (bit_pos >> 3) + 8 > src_len || out_pos + 16 > out_len {
+                    break 'main;
+                }
+            }
+
             let byte_pos = bit_pos >> 3;
             let bit_off = (bit_pos & 7) as u32;
             let chunk = u64::from_be_bytes(unsafe {
