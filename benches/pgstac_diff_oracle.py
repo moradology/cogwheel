@@ -532,6 +532,22 @@ def main() -> int:
         low7 = f"/searches/{sid}/tiles/WebMercatorQuad/7/66/45"
         o.check("tile far below the overviews, average", "image", f"{low7}.npy?assets=red&resampling=average&reproject=average")
         o.check("tile far below the overviews, rms, three bands", "image", f"{low7}.png?assets=visual&resampling=rms&reproject=rms")
+        # A GeometryCollection: of more members and deeper than the shared parser's limits,
+        # and one holding a line beside a polygon.
+        def collection_square(k):
+            x, y = 8.40 + 0.01 * (k % 10), 45.70 + 0.01 * (k // 10)
+            return {"type": "Polygon", "coordinates": [[[x, y], [x + 0.004, y], [x + 0.004, y + 0.004], [x, y + 0.004], [x, y]]]}
+        many = {"type": "Feature", "properties": {}, "geometry": {
+            "type": "GeometryCollection", "geometries": [collection_square(k) for k in range(100)]}}
+        deep = collection_square(0)
+        for _ in range(12):
+            deep = {"type": "GeometryCollection", "geometries": [deep]}
+        deep = {"type": "Feature", "properties": {}, "geometry": deep}
+        mixed = {"type": "Feature", "properties": {}, "geometry": {"type": "GeometryCollection", "geometries": [
+            collection_square(0), {"type": "LineString", "coordinates": [[8.5, 45.7], [8.6, 45.8]]}]}}
+        for name, shape in (("of a hundred polygons", many), ("nested twelve deep", deep), ("of a polygon and a line", mixed)):
+            o.check(f"statistics, a collection {name}", "status", f"/searches/{sid}/statistics?assets=red&max_size=128", "POST", shape)
+            o.check(f"feature, a collection {name}", "status", f"/searches/{sid}/feature/96x96.npy?assets=red", "POST", shape)
         # Smoothed pixels on a grid in metres: one reader for all four.
         smoothed_shape = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
             [8.40, 45.70], [8.52, 45.71], [8.50, 45.78], [8.41, 45.76], [8.40, 45.70]]]}}

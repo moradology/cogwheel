@@ -3599,6 +3599,40 @@ fn drawn_in_mercator(pairs: &[(String, String)], unset: bool) -> Result<bool, Re
     }
 }
 
+/// A feature whose geometry is a GeometryCollection of polygons alone, as the one
+/// MultiPolygon the mask reads: GDAL burns every member, which is their union. Read this
+/// way a collection is bounded by the mask's limits on rings and vertices, as any shape is,
+/// and not by its limits on members (64) and nesting (8), which titiler-pgstac has not got.
+/// Any other feature, a collection with a line or a point in it among them, is returned
+/// as it is for the mask's own parser.
+fn polygons_of_collection(feature: &Value) -> std::borrow::Cow<'_, Value> {
+    fn gather<'a>(geometry: &'a Value, into: &mut Vec<&'a Value>, depth: usize) -> bool {
+        match geometry.get("type").and_then(Value::as_str) {
+            Some("Polygon") => {
+                into.push(&geometry["coordinates"]);
+                true
+            }
+            Some("MultiPolygon") => geometry["coordinates"].as_array().is_some_and(|polygons| {
+                into.extend(polygons);
+                true
+            }),
+            Some("GeometryCollection") if depth < 16 => geometry["geometries"]
+                .as_array()
+                .is_some_and(|members| members.iter().all(|member| gather(member, into, depth + 1))),
+            _ => false,
+        }
+    }
+    let geometry = &feature["geometry"];
+    let mut polygons = Vec::new();
+    if geometry.get("type").and_then(Value::as_str) == Some("GeometryCollection")
+        && gather(geometry, &mut polygons, 0)
+        && !polygons.is_empty()
+    {
+        return std::borrow::Cow::Owned(json!({ "type": "MultiPolygon", "coordinates": polygons }));
+    }
+    std::borrow::Cow::Borrowed(feature)
+}
+
 fn bbox_polygon([w, s, e, n]: [f64; 4]) -> Value {
     json!({ "type": "Polygon", "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]] })
 }
@@ -3635,7 +3669,7 @@ async fn feature_image(
     if geojson.get("type").and_then(Value::as_str) != Some("Feature") || !geojson["geometry"].is_object() {
         return not_a_feature();
     }
-    let (mask, bbox) = match PolygonMask::from_geojson(&geojson) {
+    let (mask, bbox) = match PolygonMask::from_geojson(&polygons_of_collection(&geojson)) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
     };
@@ -4276,7 +4310,7 @@ async fn feature_statistics(
     feature: &Value,
     req: &StatsRequest<'_>,
 ) -> Result<Option<(Value, Vec<String>)>, Resp> {
-    let (mask, bbox) = PolygonMask::from_geojson(feature).map_err(|e| engine_error(&e))?;
+    let (mask, bbox) = PolygonMask::from_geojson(&polygons_of_collection(feature)).map_err(|e| engine_error(&e))?;
     // As in titiler-pgstac, the items are those of the feature's bounding box. Each raster
     // is read on a grid of its own, which no one set of sample points stands for, so the
     // numbers come from pgSTAC's list unless the request asks for the lean one.
