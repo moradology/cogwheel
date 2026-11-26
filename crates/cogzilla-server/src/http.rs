@@ -21,6 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
 mod paint;
@@ -2030,6 +2031,74 @@ fn wrap_geotiff_fmt(
         }
     } else {
         data
+    }
+}
+
+/// Whether `data` is a float32 `.npy`, the renderers' array.
+fn is_f32_npy(data: &[u8]) -> bool {
+    data.starts_with(b"\x93NUMPY") && data.get(10..80).is_some_and(|dict| dict.windows(4).any(|w| w == b"<f4'"))
+}
+
+/// An array the renderers wrote in float32, rewritten in `kind`, the type TiTiler writes it
+/// in ([`array_type`]); with `mask`, its last plane is the mask. Left as it is without a
+/// type, or when it is not an array of the planes it says.
+fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
+    kind.and_then(|kind| cogzilla_kernel::retype_f32_npy(&data, kind, mask)).unwrap_or(data)
+}
+
+/// What a `/cog` or `/stac` array's type is decided by: the rule, the assets asked for (none
+/// on `/cog`), the band math, and whether a mask was asked for.
+type ArrayAsked = (array_type::ArrayRule, Vec<String>, Option<String>, bool);
+
+fn array_asked(pq: &ParsedQuery) -> Option<ArrayAsked> {
+    array_type::ArrayRule::of(pq).map(|rule| (rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask))
+}
+
+/// A `/cog` answer in the type TiTiler writes its array in: the rasters at `urls` are
+/// opened again (they are cached) for their types. Anything but a float32 array, and an
+/// array whose rasters cannot be opened, is left as it is.
+async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
+    let Some((rule, _, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
+    let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
+    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+}
+
+/// A `/stac` answer in the type TiTiler writes its array in, from the types of the item's
+/// assets that were read and the band math as it was rewritten over them. As
+/// [`cog_array_in_its_type`].
+async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
+    let Some((rule, assets, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
+        return data;
+    };
+    let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
+    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+}
+
+/// A rendered `/cog` tile, its array in its type: what the tile cache keeps.
+async fn cog_tile_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    urls: &[String],
+    rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let (data, ct) = rendered.await?;
+    Ok((cog_array_in_its_type(engine, asked, urls, data).await, ct))
+}
+
+/// A rendered `/stac` tile, its array in its type: what the tile cache keeps.
+async fn stac_tile_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    url: Option<String>,
+    rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let (data, ct) = rendered.await?;
+    let Some(url) = url.filter(|_| asked.is_some() && is_f32_npy(&data)) else { return Ok((data, ct)) };
+    match load_stac_item(&engine.stac_cache, &engine.store, &url).await {
+        Ok(item) => Ok((stac_array_in_its_type(engine, asked, &item, data).await, ct)),
+        Err(_) => Ok((data, ct)),
     }
 }
 
@@ -6990,6 +7059,7 @@ where
         let stac_url_hdr = stac_url.clone();
         let stac_req_assets = pq.assets.clone();
         let stac_req_expr = pq.expr_raw.clone();
+        let stac_array = array_asked(&pq);
         let attach_resolved_stac_assets = |resp: &mut Response<Full<Bytes>>| {
             if !resp.status().is_success() {
                 return;
@@ -8018,9 +8088,10 @@ where
                     engine.sync_tile_cache_epoch();
                 }
                 let stac_tile_geo = TileGeoOpts::from_pq(&pq);
+                let stac_tile_url = stac_url.clone();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || async {
+                    .get_or_render(cache_key, || stac_tile_in_its_type(&engine, stac_array.clone(), stac_tile_url, async {
                         let u = stac_url
                             .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                         let item =
@@ -8221,7 +8292,7 @@ where
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.jpeg_quality, pq_stac.return_mask))
                         }
-                    })
+                    }))
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_resolved_stac_assets(&mut resp);
@@ -8829,6 +8900,19 @@ where
 
             _ => Err(EngineError::NotFound(path.clone())),
         };
+        let res = match res {
+            Ok((data, ct)) if stac_array.is_some() && is_f32_npy(&data) => {
+                let item = match &stac_url_hdr {
+                    Some(u) => load_stac_item(&engine.stac_cache, &engine.store, u).await.ok(),
+                    None => None,
+                };
+                match item {
+                    Some(item) => Ok((stac_array_in_its_type(&engine, stac_array, &item, data).await, ct)),
+                    None => Ok((data, ct)),
+                }
+            }
+            res => res,
+        };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if !matches!(
             sub,
@@ -8855,6 +8939,8 @@ where
     if segs.first() == Some(&"cog") {
         let sub = &segs[1..];
         let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
+        let cog_array = array_asked(&pq);
+        let cog_urls = pq.urls.clone();
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // 1. GET /cog/info
             (Method::GET, ["info"]) => async {
@@ -9252,7 +9338,7 @@ where
                 engine.sync_tile_cache_epoch();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || async {
+                    .get_or_render(cache_key, || cog_tile_in_its_type(&engine, cog_array.clone(), &cog_urls, async {
                         let cogs = open_query_urls(&engine, &pq.urls).await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
                             parse_u8_like(zs),
@@ -9436,7 +9522,7 @@ where
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq.jpeg_quality, pq.return_mask))
                         }
-                    })
+                    }))
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 if let (Some(z), Some(x), Some((y, sc, _))) =
@@ -10364,6 +10450,10 @@ where
             }
 
             _ => Err(EngineError::NotFound(path)),
+        };
+        let res = match res {
+            Ok((data, ct)) => Ok((cog_array_in_its_type(&engine, cog_array, &cog_urls, data).await, ct)),
+            Err(e) => Err(e),
         };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if let Some((bbox, epsg, is_crs84)) = geo_meta {

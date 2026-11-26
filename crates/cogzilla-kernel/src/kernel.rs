@@ -1527,6 +1527,76 @@ pub fn encode_npy_typed(
     Bytes::from(out)
 }
 
+/// The shape of a float32 `.npy` this crate wrote (`<f4`, C order), and where its data starts.
+fn f32_npy_shape(npy: &[u8]) -> Option<(Vec<usize>, usize)> {
+    if npy.len() < 10 || &npy[..8] != b"\x93NUMPY\x01\x00" {
+        return None;
+    }
+    let start = 10 + usize::from(u16::from_le_bytes([npy[8], npy[9]]));
+    let dict = std::str::from_utf8(npy.get(10..start)?).ok()?;
+    if !dict.contains("'descr': '<f4'") || !dict.contains("'fortran_order': False") {
+        return None;
+    }
+    let from = dict.find("'shape': (")? + "'shape': (".len();
+    let shape = dict[from..from + dict[from..].find(')')?]
+        .split(',')
+        .map(str::trim)
+        .filter(|dim| !dim.is_empty())
+        .map(|dim| dim.parse().ok())
+        .collect::<Option<Vec<usize>>>()?;
+    Some((shape, start))
+}
+
+/// A float32 `.npy` of CHW planes rewritten in the dtype of `kind`, or `None` when `npy` is
+/// not such an array or its body is not the size its header names.
+///
+/// The values are cast as [`encode_npy_typed`] casts them: integers truncated toward zero
+/// and held to the type's range (NaN as zero), floats with an infinity held to their largest
+/// finite number. With `mask` the last plane is a validity mask (any value but zero where a
+/// pixel is there), written as the type's largest number there and its smallest elsewhere,
+/// as rio-tiler's `ImageData.mask` is. The values under the mask are kept as they are: what
+/// the renderer put there is the raster's own fill.
+pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes> {
+    let (shape, start) = f32_npy_shape(npy)?;
+    let [planes, height, width] = shape[..] else { return None };
+    let body = &npy[start..];
+    let pixels = height.checked_mul(width)?;
+    if planes == 0 || body.len() != planes.checked_mul(pixels)?.checked_mul(4)? {
+        return None;
+    }
+    let values = body.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+    let bands = planes - usize::from(mask);
+    let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
+    out.extend_from_slice(&hdr);
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for (i, v) in values.enumerate() {
+                let x: $t = if i < bands * pixels {
+                    cast(f64::from(v))
+                } else if v != 0.0 {
+                    <$t>::MAX
+                } else {
+                    <$t>::MIN
+                };
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+    Some(Bytes::from(out))
+}
+
 /// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes.
 pub fn wrap_raw_f32_as_npy(raw: Bytes, bands: usize, height: u32, width: u32) -> Bytes {
     wrap_raw_f32_as_npy_with_mask(raw, bands, height, width, false)
@@ -6770,6 +6840,38 @@ mod npy_typed_tests {
         let (_, _, shape, start) = parse(&npy);
         assert_eq!(shape, [4, 1, 3]);
         assert_eq!(&npy[start + 18..], [0u16.to_le_bytes(), u16::MAX.to_le_bytes(), u16::MAX.to_le_bytes()].concat().as_slice());
+    }
+
+    #[test]
+    fn a_float32_array_is_rewritten_in_another_type() {
+        // Two planes of a band and its mask, as the float32 writer makes them.
+        let raw: Vec<u8> = [1.9f32, 70000.0, -2.5, 0.0, 255.0, 255.0, 0.0, 255.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_npy = wrap_raw_f32_as_npy(Bytes::from(raw), 2, 2, 2);
+        let typed = retype_f32_npy(&f32_npy, SampleType::Uint16, true).unwrap();
+        let (descr, _, shape, start) = parse(&typed);
+        assert_eq!((descr.as_str(), shape), ("<u2", vec![2, 2, 2]));
+        let words: Vec<u16> = typed[start..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words, [1, 65535, 0, 0, 65535, 65535, 0, 65535]);
+        // Signed: the mask's nothing is the smallest number; the value under it is kept.
+        let typed = retype_f32_npy(&f32_npy, SampleType::Int16, true).unwrap();
+        let start = parse(&typed).3;
+        let words: Vec<i16> = typed[start..].chunks_exact(2).map(|w| i16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words, [1, 32767, -2, 0, 32767, 32767, -32768, 32767]);
+        // Without a mask every plane is a band.
+        let typed = retype_f32_npy(&f32_npy, SampleType::Uint8, false).unwrap();
+        assert_eq!(&typed[parse(&typed).3..], [1, 255, 0, 0, 255, 255, 0, 255]);
+        // float32 to float32 changes only the mask.
+        let typed = retype_f32_npy(&f32_npy, SampleType::Float32, true).unwrap();
+        let start = parse(&typed).3;
+        let floats: Vec<f32> = typed[start..].chunks_exact(4).map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        assert_eq!(floats, [1.9, 70000.0, -2.5, 0.0, f32::MAX, f32::MAX, f32::MIN, f32::MAX]);
+        // What is not a float32 array of three dimensions, or is cut short, is left alone.
+        let typed_already = encode_npy_typed(&[1.0], 1, 1, 1, SampleType::Uint8, None, false);
+        assert!(retype_f32_npy(&typed_already, SampleType::Uint16, false).is_none());
+        assert!(retype_f32_npy(&f32_npy[..f32_npy.len() - 1], SampleType::Uint16, true).is_none());
+        assert!(retype_f32_npy(b"not an array", SampleType::Uint16, true).is_none());
+        let flat = [encode_npy_header("<f4", &[2]), 1f32.to_le_bytes().repeat(2)].concat();
+        assert!(retype_f32_npy(&flat, SampleType::Uint16, false).is_none());
     }
 
     #[test]
