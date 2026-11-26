@@ -745,6 +745,8 @@ def main() -> int:
             o.check(f"tile, resampling={method}", "image", f"{base12}.png?assets=red&rescale=0,3000&resampling={method}")
         o.check("bbox, reproject=average", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/256x256.npy?assets=red&resampling=nearest&reproject=average")
         o.check("tile at zoom 9, reproject=sum", "image", f"/searches/{sid}/tiles/WebMercatorQuad/9/268/182.npy?assets=red&resampling=nearest&reproject=sum")
+        o.check("tile, a resampling nobody has", "status", f"{base12}.png?assets=red&resampling=nope")
+        o.check("bbox, a reproject nobody has", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x64.png?assets=red&reproject=nope")
         o.check("tile, reproject=gauss", "status", f"{base12}.png?assets=red&reproject=gauss")
         o.check("tile, resampling=max", "status", f"{base12}.png?assets=red&resampling=max")
         o.check("tile as an array, bilinear, three bands", "image", f"{base12}.npy?assets=visual&resampling=bilinear&reproject=bilinear")

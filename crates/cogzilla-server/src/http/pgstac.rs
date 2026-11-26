@@ -1837,10 +1837,7 @@ fn parse_resample(pairs: &[(String, String)], name: &str) -> Result<ResampleMode
         Some(method @ ("max" | "min" | "med" | "q1" | "q3" | "sum")) if name == "reproject" => {
             Ok(super::parse_resample_mode(method).unwrap_or(ResampleMode::Nearest))
         }
-        Some(other) => Err(detail(
-            StatusCode::BAD_REQUEST,
-            format!("{name} method '{other}' is not supported (use nearest, bilinear or cubic)"),
-        )),
+        Some(_) => Err(invalid_param("query", name, "Input should be a resampling method")),
     }
 }
 
@@ -1983,7 +1980,7 @@ fn own_error(e: &str) -> bool {
         return true;
     }
     match error_parameter(e) {
-        Some("reproject" | "asset_as_band" | "histogram_bins") => true,
+        Some("reproject" | "resampling" | "asset_as_band" | "histogram_bins") => true,
         Some("assets") => e.ends_with("in |bidx="),
         _ => false,
     }
