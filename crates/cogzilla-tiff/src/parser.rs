@@ -1181,12 +1181,15 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         return Err(TiffError::Corrupt("no valid float32 image IFDs found"));
     }
 
-    // Sort IFDs from highest resolution (smallest pixel size) to coarsest overview
-    ifds.sort_by(|a, b| {
+    // Sort IFDs from highest resolution (smallest pixel size) to coarsest overview,
+    // keeping `ifd_offsets` 1:1 aligned with `ifds`.
+    let mut paired: Vec<(IfdMeta, u64)> = ifds.into_iter().zip(ifd_offsets).collect();
+    paired.sort_by(|(a, _), (b, _)| {
         let ra = a.pixel_resolution().0;
         let rb = b.pixel_resolution().0;
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
     });
+    let (mut ifds, ifd_offsets): (Vec<IfdMeta>, Vec<u64>) = paired.into_iter().unzip();
 
     // Attach internal transparency mask IFDs to matching image IFDs by (width, height)
     for m in mask_ifds {

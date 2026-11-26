@@ -3053,6 +3053,24 @@ pub fn native_bbox_dims_in_crs(
     wgs_bbox: [f64; 4],
     dst_bbox: [f64; 4],
 ) -> (u32, u32) {
+    // Scale `(w_f, h_f)` proportionally into `[1, 4096]` without squashing aspect ratio on
+    // large non-square rasters (e.g. a 21600x10800 global COG must stay 2:1, not 4096x4096).
+    let scale_dims_to_cap = |w_f: f64, h_f: f64| -> (u32, u32) {
+        let max_d = w_f.max(h_f);
+        if max_d > 4096.0 && max_d.is_finite() {
+            let s = 4096.0 / max_d;
+            (
+                (w_f * s).round().clamp(1.0, 4096.0) as u32,
+                (h_f * s).round().clamp(1.0, 4096.0) as u32,
+            )
+        } else {
+            (
+                w_f.round().clamp(1.0, 4096.0) as u32,
+                h_f.round().clamp(1.0, 4096.0) as u32,
+            )
+        }
+    };
+
     let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
         (dst_bbox[2] + 360.0) - dst_bbox[0]
     } else {
@@ -3066,6 +3084,20 @@ pub fn native_bbox_dims_in_crs(
     if dx > 1e-12 && dy > 1e-12 && ifd.width > 0 && ifd.height > 0 && ifd.gcp_poly.is_none() {
         let (sx0, sy0) = ifd.pixel_to_crs.forward(0.0, 0.0);
         let (sx1, sy1) = ifd.pixel_to_crs.forward(ifd.width as f64, ifd.height as f64);
+        let both_geographic = matches!(
+            (src_crs, dst_crs),
+            (
+                cogzilla_proj::CrsModel::Geographic,
+                cogzilla_proj::CrsModel::Geographic
+            )
+        );
+        if both_geographic {
+            let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+            let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+            if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
+                return scale_dims_to_cap(dx / w_res, dy / h_res);
+            }
+        }
         let (lon0, mut lat0) = src_crs.to_lonlat_deg(sx0, sy0);
         let (lon1, mut lat1) = src_crs.to_lonlat_deg(sx1, sy1);
         let mut eff_h = ifd.height as f64;
@@ -3089,16 +3121,23 @@ pub fn native_bbox_dims_in_crs(
                 let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
                 let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
                 if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
-                    return (
-                        (dx / w_res).round().clamp(1.0, 4096.0) as u32,
-                        (dy / h_res).round().clamp(1.0, 4096.0) as u32,
-                    );
+                    return scale_dims_to_cap(dx / w_res, dy / h_res);
                 }
             }
-            let mut ddx = dx1 - dx0;
+            let mut ddx = if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
+                && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
+            {
+                // Preserve full unwrapped span for 0..360° global geographic rasters -> 3857.
+                (sx1 - sx0) * (20_037_508.342_789_244 / 180.0)
+            } else {
+                dx1 - dx0
+            };
             if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && ddx.abs() > 180.0 {
                 let (lon_mid, _) = src_crs.to_lonlat_deg(0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1));
-                if (lon_mid - lon0).abs() > 90.0 && (lon_mid - lon1).abs() > 90.0 {
+                // Wrap only when the midpoint lies on the opposite hemisphere from the arithmetic
+                // mean of endpoints (antimeridian-crossing scene), NOT on wide/global scenes
+                // centered near 0° longitude.
+                if (lon_mid - 0.5 * (lon0 + lon1)).abs() > 90.0 {
                     ddx = if ddx > 0.0 { ddx - 360.0 } else { ddx + 360.0 };
                 }
             }
@@ -3106,10 +3145,7 @@ pub fn native_bbox_dims_in_crs(
             let px_diag = (ifd.width as f64).hypot(eff_h);
             let res = ddx.hypot(ddy) / px_diag;
             if res.is_finite() && res > 0.0 {
-                return (
-                    (dx / res).round().clamp(1.0, 4096.0) as u32,
-                    (dy / res).round().clamp(1.0, 4096.0) as u32,
-                );
+                return scale_dims_to_cap(dx / res, dy / res);
             }
         }
     }
@@ -3170,14 +3206,9 @@ pub fn native_bbox_dims_in_crs(
     let area_px = (nat_w * nat_h).max(1.0);
     let res = ((dx * dy) / area_px).sqrt();
     if !res.is_finite() || res <= 0.0 {
-        return (
-            nat_w.round().clamp(1.0, 4096.0) as u32,
-            nat_h.round().clamp(1.0, 4096.0) as u32,
-        );
+        return scale_dims_to_cap(nat_w, nat_h);
     }
-    let ow = (dx / res).round().clamp(1.0, 4096.0) as u32;
-    let oh = (dy / res).round().clamp(1.0, 4096.0) as u32;
-    (ow, oh)
+    scale_dims_to_cap(dx / res, dy / res)
 }
 
 fn polygon_window_dims(

@@ -194,6 +194,16 @@ pub fn decode_tile_rows(
             expected: MAX_DECODED_TILE_BYTES,
             got: compressed.len(),
         })?;
+    // For sub-byte types (`Uint1`/`Uint4`), also bound the unpacked 1-byte-per-sample allocation.
+    let _unpacked_bytes = (ifd.tile_width as usize)
+        .checked_mul(tile_h as usize)
+        .and_then(|n| n.checked_mul(bands_in_tile))
+        .and_then(|n| n.checked_mul(ifd.sample_type.bytes_per_sample()))
+        .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+        .ok_or(CodecError::SizeMismatch {
+            expected: MAX_DECODED_TILE_BYTES,
+            got: compressed.len(),
+        })?;
 
     // Never apply GDAL_NODATA to an ExtraSamples alpha channel (e.g. GDAL_NODATA=255 on RGBA
     // would turn opaque alpha=255 into NaN and blank every pixel). For U8/U16, raw samples stay
