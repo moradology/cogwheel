@@ -405,10 +405,66 @@ impl PixelAreaModel {
     }
 }
 
+/// Compute uniform `360°` longitude shifts (`0.0`, `+360.0`, `-360.0`) for a whole ring so that
+/// every overlapping shift intersects a geographic raster's native `[x_lo, x_hi]` longitude span
+/// without tearing or inverting rings that cross `0°` or `±180°`.
+fn geo_ring_lon_shifts(
+    ring: &[(f64, f64)],
+    ifd: &cogzilla_tiff::IfdMeta,
+    is_geo_dataset: bool,
+) -> Vec<f64> {
+    if !is_geo_dataset || ring.is_empty() {
+        return vec![0.0];
+    }
+    let a = ifd.pixel_to_crs.forward(0.0, 0.0).0;
+    let b = ifd.pixel_to_crs.forward(ifd.width as f64, 0.0).0;
+    let (x_lo, x_hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut r_lo = f64::INFINITY;
+    let mut r_hi = f64::NEG_INFINITY;
+    for &(lon, _) in ring {
+        if lon.is_finite() {
+            r_lo = r_lo.min(lon);
+            r_hi = r_hi.max(lon);
+        }
+    }
+    if !r_lo.is_finite() || !r_hi.is_finite() {
+        return vec![0.0];
+    }
+    let mut shifts = Vec::with_capacity(2);
+    for shift in [0.0_f64, 360.0, -360.0] {
+        if r_lo + shift < x_hi && r_hi + shift > x_lo {
+            shifts.push(shift);
+        }
+    }
+    if shifts.is_empty() {
+        shifts.push(0.0);
+    }
+    shifts
+}
+
+/// Shift a single point's longitude by `±360°` if needed to land inside a geographic raster's
+/// native `[x_lo, x_hi]` span.
+fn geo_point_lon_shift(lon: f64, ifd: &cogzilla_tiff::IfdMeta, is_geo_dataset: bool) -> f64 {
+    if !is_geo_dataset || !lon.is_finite() {
+        return lon;
+    }
+    let a = ifd.pixel_to_crs.forward(0.0, 0.0).0;
+    let b = ifd.pixel_to_crs.forward(ifd.width as f64, 0.0).0;
+    let (x_lo, x_hi) = if a <= b { (a, b) } else { (b, a) };
+    if lon < x_lo && lon + 360.0 <= x_hi {
+        lon + 360.0
+    } else if lon > x_hi && lon - 360.0 >= x_lo {
+        lon - 360.0
+    } else {
+        lon
+    }
+}
+
 /// Densify a ring in WGS84 `(lon, lat)` degrees before transforming into a non-geographic dataset CRS,
 /// so straight GeoJSON edges do not introduce boundary projection error.
 /// Tolerance: `0.01°` (~1.1 km) for normal polygons (`<= 2048` vertices), relaxed to `0.1°` for
 /// high-vertex polygons (`> 2048` vertices), capped at 64 subdivisions per edge.
+#[allow(clippy::too_many_arguments)]
 pub fn densify_ring_lonlat_to_pixel(
     ring: &[(f64, f64)],
     crs: &CrsModel,
@@ -416,19 +472,14 @@ pub fn densify_ring_lonlat_to_pixel(
     gcp_poly: Option<&cogzilla_tiff::GcpPoly>,
     is_geo_dataset: bool,
     densify_lonlat: bool,
-    wrap_lo: Option<f64>,
+    lon_shift_deg: f64,
     total_vertices_hint: usize,
 ) -> Vec<(f64, f64)> {
     if ring.len() < 2 {
         return Vec::new();
     }
     let map_pt = |lon: f64, lat: f64| -> (f64, f64) {
-        let mut adj_lon = lon;
-        if let Some(lo) = wrap_lo
-            && adj_lon < lo
-        {
-            adj_lon += 360.0;
-        }
+        let adj_lon = lon + lon_shift_deg;
         let (sx, sy) = if is_geo_dataset {
             (adj_lon, lat)
         } else {
@@ -1721,6 +1772,7 @@ pub async fn compute_native_exact_polygon_stats(
     let project_to_ifd = |ifd: &cogzilla_tiff::IfdMeta| -> Result<
         (
             Vec<Vec<Vec<(f64, f64)>>>,
+            f64,
             Vec<Vec<(f64, f64)>>,
             Vec<(f64, f64)>,
             usize,
@@ -1733,70 +1785,76 @@ pub async fn compute_native_exact_polygon_stats(
         let c2p = ifd.pixel_to_crs.invert().ok_or_else(|| {
             EngineError::BadRequest("dataset has singular affine transform".into())
         })?;
-        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
         let mut min_c = f64::INFINITY;
         let mut max_c = f64::NEG_INFINITY;
         let mut min_r = f64::INFINITY;
         let mut max_r = f64::NEG_INFINITY;
 
         let mut polys_px = Vec::with_capacity(pm.polygons.len());
+        let mut poly_area_px = 0.0_f64;
         for poly in &pm.polygons {
-            let mut rings_px = Vec::with_capacity(poly.len());
-            for ring in poly {
-                let rp = densify_ring_lonlat_to_pixel(
-                    ring,
+            let shifts = poly
+                .first()
+                .map(|outer| geo_ring_lon_shifts(outer, ifd, is_geo_dataset))
+                .unwrap_or_else(|| vec![0.0]);
+            for (si, shift) in shifts.into_iter().enumerate() {
+                let mut rings_px = Vec::with_capacity(poly.len());
+                for ring in poly {
+                    let rp = densify_ring_lonlat_to_pixel(
+                        ring,
+                        crs,
+                        &c2p,
+                        ifd.gcp_poly.as_deref(),
+                        is_geo_dataset,
+                        densify_lonlat,
+                        shift,
+                        total_verts,
+                    );
+                    for &(c, r) in &rp {
+                        if c.is_finite() && r.is_finite() {
+                            min_c = min_c.min(c);
+                            max_c = max_c.max(c);
+                            min_r = min_r.min(r);
+                            max_r = max_r.max(r);
+                        }
+                    }
+                    rings_px.push(rp);
+                }
+                if si == 0 {
+                    poly_area_px += polygon_total_area_px(std::slice::from_ref(&rings_px));
+                }
+                polys_px.push(rings_px);
+            }
+        }
+
+        let mut lines_px = Vec::with_capacity(pm.lines.len());
+        for line in &pm.lines {
+            for shift in geo_ring_lon_shifts(line, ifd, is_geo_dataset) {
+                let lp = densify_ring_lonlat_to_pixel(
+                    line,
                     crs,
                     &c2p,
                     ifd.gcp_poly.as_deref(),
                     is_geo_dataset,
                     densify_lonlat,
-                    wrap_lo,
+                    shift,
                     total_verts,
                 );
-                for &(c, r) in &rp {
+                for &(c, r) in &lp {
                     if c.is_finite() && r.is_finite() {
                         min_c = min_c.min(c);
-                        max_c = max_c.max(c);
+                        max_c = max_c.max(c + 1.0);
                         min_r = min_r.min(r);
-                        max_r = max_r.max(r);
+                        max_r = max_r.max(r + 1.0);
                     }
                 }
-                rings_px.push(rp);
+                lines_px.push(lp);
             }
-            polys_px.push(rings_px);
-        }
-
-        let mut lines_px = Vec::with_capacity(pm.lines.len());
-        for line in &pm.lines {
-            let lp = densify_ring_lonlat_to_pixel(
-                line,
-                crs,
-                &c2p,
-                ifd.gcp_poly.as_deref(),
-                is_geo_dataset,
-                densify_lonlat,
-                wrap_lo,
-                total_verts,
-            );
-            for &(c, r) in &lp {
-                if c.is_finite() && r.is_finite() {
-                    min_c = min_c.min(c);
-                    max_c = max_c.max(c + 1.0);
-                    min_r = min_r.min(r);
-                    max_r = max_r.max(r + 1.0);
-                }
-            }
-            lines_px.push(lp);
         }
 
         let mut pts_px = Vec::with_capacity(pm.points.len());
         for &(lon, lat) in &pm.points {
-            let mut adj_lon = lon;
-            if let Some(lo) = wrap_lo
-                && adj_lon < lo
-            {
-                adj_lon += 360.0;
-            }
+            let adj_lon = geo_point_lon_shift(lon, ifd, is_geo_dataset);
             let (sx, sy) = if is_geo_dataset {
                 (adj_lon, lat)
             } else {
@@ -1813,27 +1871,36 @@ pub async fn compute_native_exact_polygon_stats(
         }
 
         if !min_c.is_finite() || !min_r.is_finite() {
-            return Ok((polys_px, lines_px, pts_px, 0, 0, 0, 0));
+            return Ok((polys_px, poly_area_px, lines_px, pts_px, 0, 0, 0, 0));
         }
         let c0 = min_c.floor().clamp(0.0, ifd.width as f64) as usize;
         let c1 = max_c.ceil().clamp(c0 as f64, ifd.width as f64) as usize;
         let r0 = min_r.floor().clamp(0.0, ifd.height as f64) as usize;
         let r1 = max_r.ceil().clamp(r0 as f64, ifd.height as f64) as usize;
-        Ok((polys_px, lines_px, pts_px, c0, c1, r0, r1))
+        Ok((polys_px, poly_area_px, lines_px, pts_px, c0, c1, r0, r1))
     };
 
     // Start on full-resolution IFD 0; only step down to an overview if explicit max_size > 0 requests it.
     let mut ifd_idx = 0usize;
-    let (mut polys_px, mut lines_px, mut pts_px, mut c0, mut c1, mut r0, mut r1) =
-        project_to_ifd(full)?;
+    let (
+        mut polys_px,
+        mut total_poly_area_px_val,
+        mut lines_px,
+        mut pts_px,
+        mut c0,
+        mut c1,
+        mut r0,
+        mut r1,
+    ) = project_to_ifd(full)?;
     if c1 <= c0 || r1 <= r0 {
         return Ok(empty_result());
     }
     if opts.max_size_explicit && max_size > 0 && (c1 - c0).max(r1 - r0) > max_size as usize {
         for (i, ov) in cog.index.ifds.iter().enumerate().skip(1) {
-            let (pp, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov)?;
+            let (pp, pa, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov)?;
             ifd_idx = i;
             polys_px = pp;
+            total_poly_area_px_val = pa;
             lines_px = lp;
             pts_px = ptp;
             c0 = oc0;
@@ -2059,7 +2126,7 @@ pub async fn compute_native_exact_polygon_stats(
     };
     let compute_cpu = move || -> serde_json::Value {
         let total_poly_area_px =
-            (geom_kind == ZonalGeomKind::Polygon).then(|| polygon_total_area_px(&polys_px));
+            (geom_kind == ZonalGeomKind::Polygon).then_some(total_poly_area_px_val);
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
         let line_len_m = if geom_kind == ZonalGeomKind::Line {
             Some(rasterize_line_geodesic_lengths_m(
@@ -2282,45 +2349,51 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let total_verts = pm.vertex_count();
 
     let project_to_ifd = |ifd: &cogzilla_tiff::IfdMeta| {
-        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
         let mut polys_px: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(pm.polygons.len());
+        let mut poly_area_px = 0.0_f64;
         for poly in &pm.polygons {
-            let mut rings_px = Vec::with_capacity(poly.len());
-            for ring in poly {
-                rings_px.push(densify_ring_lonlat_to_pixel(
-                    ring,
+            let shifts = poly
+                .first()
+                .map(|outer| geo_ring_lon_shifts(outer, ifd, is_geo))
+                .unwrap_or_else(|| vec![0.0]);
+            for (si, shift) in shifts.into_iter().enumerate() {
+                let mut rings_px = Vec::with_capacity(poly.len());
+                for ring in poly {
+                    rings_px.push(densify_ring_lonlat_to_pixel(
+                        ring,
+                        &crs,
+                        &ifd.crs_to_pixel,
+                        ifd.gcp_poly.as_deref(),
+                        is_geo,
+                        densify_lonlat,
+                        shift,
+                        total_verts,
+                    ));
+                }
+                if si == 0 {
+                    poly_area_px += polygon_total_area_px(std::slice::from_ref(&rings_px));
+                }
+                polys_px.push(rings_px);
+            }
+        }
+        let mut lines_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(pm.lines.len());
+        for line in &pm.lines {
+            for shift in geo_ring_lon_shifts(line, ifd, is_geo) {
+                lines_px.push(densify_ring_lonlat_to_pixel(
+                    line,
                     &crs,
                     &ifd.crs_to_pixel,
                     ifd.gcp_poly.as_deref(),
                     is_geo,
                     densify_lonlat,
-                    wrap_lo,
+                    shift,
                     total_verts,
                 ));
             }
-            polys_px.push(rings_px);
-        }
-        let mut lines_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(pm.lines.len());
-        for line in &pm.lines {
-            lines_px.push(densify_ring_lonlat_to_pixel(
-                line,
-                &crs,
-                &ifd.crs_to_pixel,
-                ifd.gcp_poly.as_deref(),
-                is_geo,
-                densify_lonlat,
-                wrap_lo,
-                total_verts,
-            ));
         }
         let mut pts_px: Vec<(f64, f64)> = Vec::with_capacity(pm.points.len());
         for &(lo, la) in &pm.points {
-            let mut adj_lo = lo;
-            if let Some(low) = wrap_lo
-                && adj_lo < low
-            {
-                adj_lo += 360.0;
-            }
+            let adj_lo = geo_point_lon_shift(lo, ifd, is_geo);
             let (sx, sy) = if is_geo { (adj_lo, la) } else { crs.from_lonlat_deg(adj_lo, la) };
             let (c, r) = ifd.crs_to_pixel_pt(sx, sy);
             pts_px.push((c, r));
@@ -2361,13 +2434,13 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             }
         }
         if !min_c.is_finite() || !min_r.is_finite() {
-            return (polys_px, lines_px, pts_px, 0usize, 0usize, 0usize, 0usize);
+            return (polys_px, poly_area_px, lines_px, pts_px, 0usize, 0usize, 0usize, 0usize);
         }
         let c0 = min_c.floor().clamp(0.0, ifd.width as f64) as usize;
         let c1 = max_c.ceil().clamp(c0 as f64, ifd.width as f64) as usize;
         let r0 = min_r.floor().clamp(0.0, ifd.height as f64) as usize;
         let r1 = max_r.ceil().clamp(r0 as f64, ifd.height as f64) as usize;
-        (polys_px, lines_px, pts_px, c0, c1, r0, r1)
+        (polys_px, poly_area_px, lines_px, pts_px, c0, c1, r0, r1)
     };
 
     let geom_kind = if !pm.polygons.is_empty() {
@@ -2407,8 +2480,16 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     if crate::engine::validate_multi_cog_grid(cogs, 0).is_err() {
         return Ok(None);
     }
-    let (mut polys_px, mut lines_px, mut pts_px, mut c0, mut c1, mut r0, mut r1) =
-        project_to_ifd(&primary.index.ifds[0]);
+    let (
+        mut polys_px,
+        mut total_poly_area_px_val,
+        mut lines_px,
+        mut pts_px,
+        mut c0,
+        mut c1,
+        mut r0,
+        mut r1,
+    ) = project_to_ifd(&primary.index.ifds[0]);
     if c1 <= c0 || r1 <= r0 {
         return Ok(Some(empty_expr_result()));
     }
@@ -2417,9 +2498,10 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             if crate::engine::validate_multi_cog_grid(cogs, i).is_err() {
                 break;
             }
-            let (pp, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov);
+            let (pp, pa, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov);
             ifd_idx = i;
             polys_px = pp;
+            total_poly_area_px_val = pa;
             lines_px = lp;
             pts_px = ptp;
             c0 = oc0;
@@ -2549,7 +2631,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let exprs_owned = exprs.to_vec();
     let compute_cpu = move || -> serde_json::Value {
         let total_poly_area_px =
-            (geom_kind == ZonalGeomKind::Polygon).then(|| polygon_total_area_px(&polys_px));
+            (geom_kind == ZonalGeomKind::Polygon).then_some(total_poly_area_px_val);
         let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
         let line_len_m = if geom_kind == ZonalGeomKind::Line {
             Some(rasterize_line_geodesic_lengths_m(
