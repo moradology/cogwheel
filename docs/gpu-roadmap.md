@@ -27,5 +27,6 @@ This document tracks GPU acceleration experiments and PRs targeting the `gpu-imp
 | 5 | Fused `expr_vm` + `color_formula` + colormap | Multi-band WGSL bytecode VM (zero shader recompile) + fused 3-band RGB `Gamma`/`Sigmoidal`/CIE LCH `Saturation` | Merged | #217 |
 | 6 | Multi-COG / STAC / Mosaic compositing | `GpuSceneStack` + `GpuMosaicCompositor` (`First`/`Highest`/`Lowest`/`Mean`/`Median`/`Stdev`/`Count`) with fused `f32`/`RGBA8`/`IndexedU8` | Merged | #219 |
 | 7 | `cogzilla-server` `--features gpu` integration | Opt-in `GpuBackend` in `TileEngine` (adaptive `DispatchPolicy`, `GpuSlabCache`, fused colormap + DEM/terrain PNG/WebP/JPEG) | Merged | #221 |
-| 8 | GPU TIFF Predictor 2/3 unshuffle | Bit-exact zero-scratch single-pass WGSL Predictor 2 & 3 unshuffle + nodata normalization (66.8 GB/s VRAM-only on RTX 3090 Ti) | Merged | (this PR) |
-| 9 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
+| 8 | GPU TIFF Predictor 2/3 unshuffle | Bit-exact zero-scratch single-pass WGSL Predictor 2 & 3 unshuffle + nodata normalization (66.8 GB/s VRAM-only on RTX 3090 Ti) | Merged | #223 |
+| 9 | Multi-block stitching & large-crop GPU API | Multi-block `BandSource` stitching (all dtypes: `F32`/`U16`/`U8`/sparse/scale) + arbitrary-size `/preview`/`/bbox` crop PNG acceleration (up to 87.6× at 4096²) | Merged | (this PR) |
+| 10 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
