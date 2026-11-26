@@ -9708,8 +9708,50 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
             e @ cogzilla_io::IoError::Forbidden(_) => {
                 json_error_resp(StatusCode::FORBIDDEN, &e.to_string())
             }
+            cogzilla_io::IoError::HttpStatus {
+                status: status @ (401 | 403),
+                url,
+            } => json_error_resp(
+                StatusCode::FORBIDDEN,
+                &format!("origin refused access (HTTP {status}) fetching {url}"),
+            ),
             e @ cogzilla_io::IoError::HttpStatus { status: 404, .. } => {
                 json_error_resp(StatusCode::NOT_FOUND, &e.to_string())
+            }
+            e @ cogzilla_io::IoError::HttpStatus {
+                status: 408 | 504, ..
+            } => json_error_resp(StatusCode::GATEWAY_TIMEOUT, &e.to_string()),
+            e @ cogzilla_io::IoError::HttpStatus { .. } => {
+                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+            }
+            e @ cogzilla_io::IoError::RangeNotSupported { .. } => {
+                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+            }
+            e @ cogzilla_io::IoError::ResponseTooLarge { .. } => {
+                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+            }
+            e @ cogzilla_io::IoError::Http(req_err) => {
+                let mut src: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(req_err);
+                while let Some(s) = src {
+                    if let Some(cogzilla_io::IoError::Forbidden(u)) =
+                        s.downcast_ref::<cogzilla_io::IoError>()
+                    {
+                        return json_error_resp(
+                            StatusCode::FORBIDDEN,
+                            &cogzilla_io::IoError::Forbidden(u.clone()).to_string(),
+                        );
+                    }
+                    src = s.source();
+                }
+                if req_err.is_timeout() {
+                    json_error_resp(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        &format!("upstream timeout: {e}"),
+                    )
+                } else {
+                    json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+                }
             }
             e @ cogzilla_io::IoError::Fs(io_err)
                 if io_err.kind() == std::io::ErrorKind::NotFound =>

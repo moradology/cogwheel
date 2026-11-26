@@ -349,9 +349,10 @@ pub async fn read_response_capped(
     if let Some(cl) = resp.content_length()
         && cl > max_bytes as u64
     {
-        return Err(IoError::Fs(std::io::Error::other(format!(
-            "remote response Content-Length {cl} exceeds limit of {max_bytes} bytes"
-        ))));
+        return Err(IoError::ResponseTooLarge {
+            limit: max_bytes,
+            actual: Some(cl),
+        });
     }
     let init = resp
         .content_length()
@@ -360,9 +361,10 @@ pub async fn read_response_capped(
     let mut out = bytes::BytesMut::with_capacity(init);
     while let Some(chunk) = resp.chunk().await.map_err(|e| IoError::Http(e.without_url()))? {
         if out.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(IoError::Fs(std::io::Error::other(format!(
-                "remote response exceeded limit of {max_bytes} bytes"
-            ))));
+            return Err(IoError::ResponseTooLarge {
+                limit: max_bytes,
+                actual: None,
+            });
         }
         out.extend_from_slice(&chunk);
     }
@@ -489,11 +491,13 @@ async fn fetch_gcs_inner(
             });
         }
         if status == 200
-            && let Some((start, _)) = range
-            && start > 0
+            && let Some((start, end)) = range
+            && (start > 0
+                || resp
+                    .content_length()
+                    .is_some_and(|cl| cl > end.saturating_sub(start).min(64 * 1024 * 1024)))
         {
-            return Err(IoError::HttpStatus {
-                status: 200,
+            return Err(IoError::RangeNotSupported {
                 url: crate::backend::redact_http_url(&url),
             });
         }
@@ -673,13 +677,13 @@ async fn fetch_azure_inner(
             });
         }
         if status == 200
-            && let Some((start, _)) = range
-            && start > 0
+            && let Some((start, end)) = range
+            && (start > 0
+                || resp
+                    .content_length()
+                    .is_some_and(|cl| cl > end.saturating_sub(start).min(64 * 1024 * 1024)))
         {
-            return Err(IoError::HttpStatus {
-                status: 200,
-                url: clean_url,
-            });
+            return Err(IoError::RangeNotSupported { url: clean_url });
         }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus {
