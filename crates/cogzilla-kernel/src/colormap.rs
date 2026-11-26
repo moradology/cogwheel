@@ -407,6 +407,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_band_with_no_colour_map_is_drawn_as_its_own_byte() {
+        let lut = ColormapName::Grayscale.lut();
+        for level in 0..=255u8 {
+            assert_eq!(lut.rgb[usize::from(level)], [level; 3], "grey {level}");
+            assert_eq!(lut.rgba_u32[usize::from(level)], u32::from_le_bytes([level, level, level, 255]), "grey {level}");
+        }
+        // The colour map TiTiler calls `gray` is another table, matplotlib's, and stays so.
+        let named = ColormapName::from_str_opt("gray").expect("a colour map called gray");
+        assert_ne!(named, ColormapName::Grayscale);
+        assert_eq!(named.lut().rgb[33], [32; 3]);
+    }
+
+    #[test]
     fn custom_colormap_discrete_direct_and_extra_keys_work_without_rescaling() {
         let json = r##"{"-1":[1,2,3,255],"10":[0,100,0,255],"80":[0,100,200,255],"300":"#ff880080"}"##;
         // Without explicit `?rescale=`, Uint16 rescale (0, 65535) must NOT crush classes into idx 0.

@@ -131,8 +131,8 @@ impl Paint {
                 };
                 let values = selected.values.iter().take(pixels);
                 if colormap == ColormapName::Grayscale {
-                    // Without a colour map the byte is the grey, as in TiTiler. The kernel's grey
-                    // table is not that: some of its entries are a level below their index.
+                    // Without a colour map the byte is the grey, as in TiTiler: written as it
+                    // is, with no table to look it up in.
                     values
                         .map(|v| {
                             let level = after(rescale_byte(*v, min, max));
@@ -223,15 +223,10 @@ mod tests {
         for (level, px) in rgba.chunks_exact(4).enumerate() {
             assert_eq!(px, [level as u8, level as u8, level as u8, 255], "level {level}");
         }
-        // The kernel's grey table is matplotlib's `gray`, a level below the index at these.
+        // And what the kernel's grey table holds, which draws the same band on its own road.
         let table = ColormapName::Grayscale.lut();
-        let low: Vec<usize> = (0..256).filter(|i| usize::from(table.rgb[*i][0]) != *i).collect();
-        assert_eq!(
-            low,
-            [33, 37, 41, 45, 49, 53, 57, 61, 66, 74, 82, 90, 98, 106, 114, 122, 132, 148, 164, 180, 196, 212, 228, 244]
-        );
-        for level in low {
-            assert_eq!(usize::from(table.rgb[level][0]), level - 1);
+        for level in 0..256 {
+            assert_eq!(usize::from(table.rgb[level][0]), level);
             assert_eq!(rgba[level * 4], level as u8);
         }
     }
