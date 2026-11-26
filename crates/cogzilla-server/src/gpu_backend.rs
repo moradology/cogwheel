@@ -5,9 +5,10 @@ use bytes::Bytes;
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer, GpuColorFormula,
     GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
-    GpuExprRenderer, GpuInstr, GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput,
-    GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer, GpuTileBatcher,
-    MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
+    GpuExprRenderer, GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
+    GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer,
+    GpuTileBatcher, MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice,
+    opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -54,6 +55,7 @@ pub struct GpuBackend {
     expr: Mutex<GpuExprRenderer>,
     mosaic: Mutex<GpuMosaicCompositor>,
     batcher: Mutex<GpuTileBatcher>,
+    jpeg: Mutex<GpuJpegEncoder>,
     in_flight: AtomicUsize,
 }
 
@@ -208,6 +210,7 @@ impl GpuBackend {
         let expr = Mutex::new(GpuExprRenderer::new(&ctx));
         let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
         let batcher = Mutex::new(GpuTileBatcher::new(&ctx));
+        let jpeg = Mutex::new(GpuJpegEncoder::new(&ctx));
         Some(Arc::new(Self {
             ctx,
             policy,
@@ -220,6 +223,7 @@ impl GpuBackend {
             expr,
             mosaic,
             batcher,
+            jpeg,
             in_flight: AtomicUsize::new(0),
         }))
     }
@@ -414,7 +418,38 @@ impl GpuBackend {
         ))
     }
 
+    /// Encode an RGBA8 image buffer, automatically routing large `.jpg` outputs through
+    /// `GpuJpegEncoder` (WGSL 4:2:0 YCbCr + 8×8 FDCT + Annex K Huffman) above the
+    /// adapter-calibrated pixel crossover:
+    /// - Discrete / Vulkan (`!unified_memory`): `>= 512×512` (`262_144` px, 2.12×–3.23× faster)
+    /// - Unified / Metal (`unified_memory`): `>= 1024×1024` (`1_048_576` px, 1.01×–2.48× faster)
+    pub fn encode_rgba_output(
+        &self,
+        dst_w: usize,
+        dst_h: usize,
+        rgba: &[u8],
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Bytes {
+        if let OutputFormat::Jpeg { quality } = format {
+            let min_px = if self.ctx.info.unified_memory {
+                1024 * 1024
+            } else {
+                512 * 512
+            };
+            if dst_w.saturating_mul(dst_h) >= min_px {
+                if let Ok(mut enc) = self.jpeg.lock() {
+                    if let Ok(jpg) = enc.encode_rgba8(rgba, dst_w as u32, dst_h as u32, quality) {
+                        return Bytes::from(jpg);
+                    }
+                }
+            }
+        }
+        crate::titiler::encode_rgba_output(dst_w, dst_h, rgba, format, return_mask)
+    }
+
     fn finish_styled_output(
+        &self,
         raw: Vec<u8>,
         out_kind: GpuPixelOutput,
         dst_w: usize,
@@ -431,7 +466,7 @@ impl GpuBackend {
                 if style.format == OutputFormat::RawRgba {
                     Bytes::from(raw)
                 } else {
-                    crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+                    self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
                 }
             }
         }
@@ -482,7 +517,7 @@ impl GpuBackend {
             cog_id, ifd_idx, band0, coords, src, style, rgb_lut, return_mask, active,
         )?;
         let raw = self.coalescer.submit(job).ok()?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
         ))
     }
@@ -688,7 +723,7 @@ impl GpuBackend {
             active,
         )?;
         let raw = self.coalescer.submit(job).ok()?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
         ))
     }
@@ -802,7 +837,7 @@ impl GpuBackend {
         Some(if format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, format, return_mask)
+            self.encode_rgba_output(dst_w, dst_h, &raw, format, return_mask)
         })
     }
 
@@ -844,7 +879,7 @@ impl GpuBackend {
             cog_id, ifd_idx, band0, coords, src, style, rgb_lut, true, active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
@@ -900,7 +935,7 @@ impl GpuBackend {
             active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
@@ -947,7 +982,7 @@ impl GpuBackend {
         Some(if format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, format, true)
+            self.encode_rgba_output(dst_w, dst_h, &raw, format, true)
         })
     }
 
@@ -1279,7 +1314,7 @@ impl GpuBackend {
             cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
@@ -1376,7 +1411,7 @@ impl GpuBackend {
             cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
@@ -1419,7 +1454,7 @@ impl GpuBackend {
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
+            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
         })
     }
 
@@ -1486,7 +1521,7 @@ impl GpuBackend {
             active,
         )?;
         let raw = self.coalescer.submit(job).ok()?;
-        Some(Self::finish_styled_output(
+        Some(self.finish_styled_output(
             raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
         ))
     }
@@ -1593,7 +1628,7 @@ impl GpuBackend {
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
         })
     }
 
@@ -2191,7 +2226,7 @@ impl GpuBackend {
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
+            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
         })
     }
 
@@ -2215,7 +2250,7 @@ impl GpuBackend {
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
         })
     }
 
@@ -2342,7 +2377,7 @@ impl GpuBackend {
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+            self.encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
         })
     }
 
