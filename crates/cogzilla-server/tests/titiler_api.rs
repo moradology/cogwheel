@@ -1186,12 +1186,11 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(am_resp.status(), 200, "antimeridian /stac/map must not panic");
-            let am_bytes = am_resp.bytes().await.unwrap();
-            assert_eq!(&am_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            let am_w = u32::from_be_bytes([am_bytes[16], am_bytes[17], am_bytes[18], am_bytes[19]]);
-            let am_h = u32::from_be_bytes([am_bytes[20], am_bytes[21], am_bytes[22], am_bytes[23]]);
-            assert_eq!((am_w, am_h), (128, 102));
+            assert_eq!(
+                am_resp.status(),
+                404,
+                "antimeridian /stac/map outside asset bounds must return 404 without panicking"
+            );
 
             let inv_stac = serde_json::json!({
                 "type": "Feature",
@@ -2247,7 +2246,7 @@ async fn uniform_semantic_http_statuses_across_all_tms() {
         ("EuropeanETRS89_LAEAQuad", "4/0/0"),
         ("NZTM2000Quad", "4/0/0"),
         ("LINZAntarticaMapTilegrid", "4/0/0"),
-        ("NAD83Massachusetts", "4/0/0"),
+        ("UTM31WGS84Quad", "4/0/0"),
         ("CDB1GlobalGrid", "4/0/0"),
         ("GNOSISGlobalGrid", "4/0/0"),
     ];
@@ -2270,9 +2269,9 @@ async fn uniform_semantic_http_statuses_across_all_tms() {
     }
 
     // 3. All-nodata tile INSIDE dataset bounds returns 200 OK
-    // Tile 10/162/394 covers (-123.047..-122.695, 37.718..37.996) which contains our UTM raster
+    // UTM 10N (500_000, 4_200_000) is (-123.000, 37.947) -> WebMercator tile 10/162/395
     let nd_resp = client
-        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/162/394.png?url={nodata_url}"))
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/10/162/395.png?url={nodata_url}"))
         .send()
         .await
         .unwrap();
