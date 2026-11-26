@@ -246,22 +246,45 @@ pub fn build_cog_info_geojson(
 }
 
 /// TiTiler / `rio-cogeo`-compatible `/cog/validate` JSON payload.
+///
+/// Structural COG validation (tiling, overviews, IFD/block layout) works for any readable TIFF,
+/// including ungeoreferenced and RPC-only TIFFs; missing/unsupported georeferencing is reported
+/// as a warning in `COG_warnings` with `GEO` fields set to `null` rather than failing with 400.
 pub fn build_cog_validate(
     engine: &TileEngine,
     cog: &OpenedCog,
     url: &str,
     strict: bool,
 ) -> Result<serde_json::Value, EngineError> {
-    let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
     let coarsest = cog.index.ifds.last().unwrap();
     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
         .max(full.height as f64 / coarsest.height.max(1) as f64);
-    let (minzoom, maxzoom) =
-        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
 
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+
+    let crs_opt = if cog.index.is_georeferenced {
+        match engine.get_or_build_crs(cog) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warnings.push(format!("Unsupported CRS metadata: {e}"));
+                None
+            }
+        }
+    } else {
+        let msg = if cog.index.has_rpc {
+            "Dataset has no supported georeferencing (missing GeoTransform/GCPs; RPC georeferencing is not supported)"
+        } else {
+            "Dataset has no georeferencing (missing GeoTransform/GCPs; RPCs are not supported)"
+        };
+        warnings.push(msg.into());
+        None
+    };
+
+    let zoom_range = crs_opt
+        .as_ref()
+        .map(|crs| crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor));
 
     if full.is_stripped && (full.width > 512 || full.height > 512) {
         errors.push(
@@ -350,46 +373,66 @@ pub fn build_cog_validate(
         None => serde_json::Value::Null,
     };
 
-    let gk = &cog.index.geo_keys;
-    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
-    let is_user_defined_projected = std_proj_epsg.is_none()
-        && (gk.model_type == Some(1)
-            || gk.projected_cs_type == Some(32767)
-            || gk.proj_coord_trans.is_some());
-    let crs_str = if let Some(epsg) = std_proj_epsg {
-        format!("EPSG:{epsg}")
-    } else if !is_user_defined_projected
-        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
-    {
-        format!("EPSG:{epsg}")
-    } else {
-        "EPSG:4326".to_string()
-    };
+    let geo_json = if crs_opt.is_some() {
+        let gk = &cog.index.geo_keys;
+        let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+        let is_user_defined_projected = std_proj_epsg.is_none()
+            && (gk.model_type == Some(1)
+                || gk.projected_cs_type == Some(32767)
+                || gk.proj_coord_trans.is_some());
+        let crs_str = if let Some(epsg) = std_proj_epsg {
+            format!("EPSG:{epsg}")
+        } else if !is_user_defined_projected
+            && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
+        {
+            format!("EPSG:{epsg}")
+        } else {
+            "EPSG:4326".to_string()
+        };
 
-    let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
-    let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
-    let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
-    let (x11, y11) = full
-        .pixel_to_crs
-        .forward(full.width as f64, full.height as f64);
-    let native_bounds = if is_user_defined_projected {
-        cogzilla_proj::CrsModel::from_geo_keys(gk)
-            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
-            .unwrap_or([
+        let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
+        let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
+        let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
+        let (x11, y11) = full
+            .pixel_to_crs
+            .forward(full.width as f64, full.height as f64);
+        let native_bounds = if is_user_defined_projected {
+            cogzilla_proj::CrsModel::from_geo_keys(gk)
+                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                .unwrap_or([
+                    x00.min(x10).min(x01).min(x11),
+                    y00.min(y10).min(y01).min(y11),
+                    x00.max(x10).max(x01).max(x11),
+                    y00.max(y10).max(y01).max(y11),
+                ])
+        } else {
+            [
                 x00.min(x10).min(x01).min(x11),
                 y00.min(y10).min(y01).min(y11),
                 x00.max(x10).max(x01).max(x11),
                 y00.max(y10).max(y01).max(y11),
-            ])
+            ]
+        };
+        let (res_x, res_y) = full.pixel_resolution();
+        let (minzoom, maxzoom) = zoom_range.unwrap_or((0, 0));
+        serde_json::json!({
+            "CRS": crs_str,
+            "BoundingBox": native_bounds,
+            "Origin": [full.pixel_to_crs.c, full.pixel_to_crs.f],
+            "Resolution": [res_x, res_y],
+            "MinZoom": minzoom,
+            "MaxZoom": maxzoom,
+        })
     } else {
-        [
-            x00.min(x10).min(x01).min(x11),
-            y00.min(y10).min(y01).min(y11),
-            x00.max(x10).max(x01).max(x11),
-            y00.max(y10).max(y01).max(y11),
-        ]
+        serde_json::json!({
+            "CRS": null,
+            "BoundingBox": null,
+            "Origin": null,
+            "Resolution": null,
+            "MinZoom": null,
+            "MaxZoom": null,
+        })
     };
-    let (res_x, res_y) = full.pixel_resolution();
 
     let ifds: Vec<serde_json::Value> = cog
         .index
@@ -435,14 +478,7 @@ pub fn build_cog_validate(
             "Scales": scales,
             "Offsets": offsets,
         },
-        "GEO": {
-            "CRS": crs_str,
-            "BoundingBox": native_bounds,
-            "Origin": [full.pixel_to_crs.c, full.pixel_to_crs.f],
-            "Resolution": [res_x, res_y],
-            "MinZoom": minzoom,
-            "MaxZoom": maxzoom,
-        },
+        "GEO": geo_json,
         "Tags": {},
         "IFD": ifds,
     }))

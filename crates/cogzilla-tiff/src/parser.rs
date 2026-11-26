@@ -29,6 +29,7 @@ const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_JPEG_TABLES: u16 = 347;
 const TAG_LERC_PARAMETERS: u16 = 50674;
+const TAG_RPC_COEFFICIENT: u16 = 50844;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
@@ -540,6 +541,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
     let mut base_dims: Option<(u32, u32)> = None;
     let mut base_gcp_poly: Option<crate::gcp::GcpPoly> = None;
     let mut is_georeferenced = true;
+    let mut has_rpc = false;
     let mut gcp_residual_px: Option<f64> = None;
 
     // Guard against cyclic IFD chains, runaway IFD counts, and cumulative heap amplification DoS.
@@ -769,6 +771,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                             Err(_) => {}
                         }
                     }
+                }
+                TAG_RPC_COEFFICIENT if ifds.is_empty() => {
+                    has_rpc = true;
                 }
                 TAG_MODEL_PIXEL_SCALE if ifds.is_empty() => {
                     charge_tag(entry.count, 8)?;
@@ -1206,6 +1211,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         byte_order: bo,
         is_bigtiff,
         is_georeferenced,
+        has_rpc,
         gcp_residual_px,
         nodata,
         scales,

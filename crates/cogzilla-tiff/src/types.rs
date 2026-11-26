@@ -366,8 +366,11 @@ pub struct CogIndex {
     pub byte_order: ByteOrder,
     pub is_bigtiff: bool,
     /// False for ungeoreferenced TIFFs (no GeoTransform and no GCPs); pixel-space routes
-    /// (`/cog/info`, `/cog/preview`, `GET /cog/statistics`) work while geographic routes return 400.
+    /// (`/cog/info`, `/cog/preview`, `GET /cog/statistics`, `/cog/validate`) work while geographic
+    /// routes return 400.
     pub is_georeferenced: bool,
+    /// True when the primary IFD carries `RPCCoefficientTag` (TIFF tag 50844).
+    pub has_rpc: bool,
     /// Max pixel residual when georeferenced via Ground Control Points (`ModelTiepointTag`).
     pub gcp_residual_px: Option<f64>,
     /// `None` means no explicit GDAL_NODATA tag (NaN is still always treated as nodata).
