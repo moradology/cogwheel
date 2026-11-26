@@ -5402,21 +5402,21 @@ fn npy_as_geotiff(npy: &[u8], bounds: [f64; 4], epsg: u16, mask: bool) -> Option
     let head = std::str::from_utf8(npy.get(10..10 + head_len)?).ok()?;
     let data = npy.get(10 + head_len..)?;
     let descr = head.split("'descr': '").nth(1)?.split('\'').next()?;
-    // SampleFormat: 1 unsigned, 2 signed, 3 IEEE.
-    let (bits, format): (u16, u16) = match descr {
-        "|u1" => (8, 1),
-        "|i1" => (8, 2),
-        "<u2" => (16, 1),
-        "<i2" => (16, 2),
-        "<u4" => (32, 1),
-        "<i4" => (32, 2),
-        "<f4" => (32, 3),
-        "<f8" => (64, 3),
+    use crate::geotiff::{GeoTiffLayout, GeoTiffPhotometric, GeoTiffSample, GeoTiffSpec, write_geotiff};
+    let sample = match descr {
+        "|u1" => GeoTiffSample::U8,
+        "|i1" => GeoTiffSample::I8,
+        "<u2" => GeoTiffSample::U16,
+        "<i2" => GeoTiffSample::I16,
+        "<u4" => GeoTiffSample::U32,
+        "<i4" => GeoTiffSample::I32,
+        "<f4" => GeoTiffSample::F32,
+        "<f8" => GeoTiffSample::F64,
         _ => return None,
     };
     let mut shape = head.split("'shape': (").nth(1)?.split(')').next()?.split(',').filter_map(|n| n.trim().parse::<usize>().ok());
     let (bands, height, width) = (shape.next()?, shape.next()?, shape.next()?);
-    let strip = width.checked_mul(height)?.checked_mul(usize::from(bits / 8))?;
+    let strip = width.checked_mul(height)?.checked_mul(usize::from(sample.bits() / 8))?;
     if bands == 0 || bands > 64 || strip == 0 || data.len() != strip.checked_mul(bands)? || u32::try_from(data.len()).is_err() {
         return None;
     }
@@ -5425,80 +5425,21 @@ fn npy_as_geotiff(npy: &[u8], bounds: [f64; 4], epsg: u16, mask: bool) -> Option
     // the first is grey and the rest are extra, the mask an alpha that is not multiplied in.
     let colour = shown == 3 && descr == "|u1";
     let extra: Vec<u16> = (if colour { 3 } else { 1 }..bands).map(|band| if mask && band + 1 == bands { 2 } else { 0 }).collect();
-    let entries: u16 = 14 + u16::from(!extra.is_empty());
-    // After the directory: the arrays that do not fit in an entry, then the geo tags.
-    let mut next = 8 + 2 + 12 * u32::from(entries) + 4;
-    let mut tail: Vec<u8> = Vec::new();
-    let mut shorts = |values: &[u16]| -> u32 {
-        match values {
-            [one] => u32::from(*one),
-            [a, b] => u32::from(*a) | (u32::from(*b) << 16),
-            many => {
-                let at = next + tail.len() as u32;
-                many.iter().for_each(|v| tail.extend_from_slice(&v.to_le_bytes()));
-                at
-            }
-        }
+    // The array is band after band already: one strip a band, written as it is.
+    let spec = GeoTiffSpec {
+        width: u32::try_from(width).ok()?,
+        height: u32::try_from(height).ok()?,
+        bands: bands as u16,
+        sample,
+        sample_format_tag: true,
+        layout: GeoTiffLayout::Planar,
+        photometric: if colour { GeoTiffPhotometric::Rgb } else { GeoTiffPhotometric::MinIsBlack },
+        extra_samples: &extra,
+        nodata: None,
+        bbox: bounds,
+        epsg,
     };
-    let bits_value = shorts(&vec![bits; bands]);
-    let extra_value = shorts(&extra);
-    let format_value = shorts(&vec![format; bands]);
-    next += tail.len() as u32;
-    let (offsets_at, counts_at) = (next, next + 4 * bands as u32);
-    let geo_at = if bands == 1 { next } else { next + 8 * bands as u32 };
-    let (scale_at, tie_at, keys_at) = (geo_at, geo_at + 24, geo_at + 72);
-    let pixels_at = keys_at + 32;
-    let mut out = Vec::with_capacity(pixels_at as usize + data.len());
-    out.extend_from_slice(b"II");
-    out.extend_from_slice(&42u16.to_le_bytes());
-    out.extend_from_slice(&8u32.to_le_bytes());
-    out.extend_from_slice(&entries.to_le_bytes());
-    const SHORT: u16 = 3;
-    const LONG: u16 = 4;
-    const DOUBLE: u16 = 12;
-    let mut entry = |tag: u16, kind: u16, count: u32, value: u32| {
-        out.extend_from_slice(&tag.to_le_bytes());
-        out.extend_from_slice(&kind.to_le_bytes());
-        out.extend_from_slice(&count.to_le_bytes());
-        out.extend_from_slice(&value.to_le_bytes());
-    };
-    let n = bands as u32;
-    entry(256, LONG, 1, width as u32);
-    entry(257, LONG, 1, height as u32);
-    entry(258, SHORT, n, bits_value);
-    entry(259, SHORT, 1, 1);
-    entry(262, SHORT, 1, if colour { 2 } else { 1 });
-    entry(273, LONG, n, if bands == 1 { pixels_at } else { offsets_at });
-    entry(277, SHORT, 1, n);
-    entry(278, LONG, 1, height as u32);
-    entry(279, LONG, n, if bands == 1 { strip as u32 } else { counts_at });
-    // One band is one strip either way, and said to be chunky, which every reader takes.
-    entry(284, SHORT, 1, if bands == 1 { 1 } else { 2 });
-    if !extra.is_empty() {
-        entry(338, SHORT, extra.len() as u32, extra_value);
-    }
-    entry(339, SHORT, n, format_value);
-    entry(33550, DOUBLE, 3, scale_at);
-    entry(33922, DOUBLE, 6, tie_at);
-    entry(34735, SHORT, 16, keys_at);
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&tail);
-    if bands > 1 {
-        (0..bands).for_each(|band| out.extend_from_slice(&(pixels_at + (band * strip) as u32).to_le_bytes()));
-        (0..bands).for_each(|_| out.extend_from_slice(&(strip as u32).to_le_bytes()));
-    }
-    let across = ((bounds[2] - bounds[0]).abs() / width as f64).max(1e-12);
-    let down = ((bounds[3] - bounds[1]).abs() / height as f64).max(1e-12);
-    for v in [across, down, 0.0, 0.0, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    let (model, key): (u16, u16) = if epsg == 4326 { (2, 2048) } else { (1, 3072) };
-    for k in [1u16, 1, 0, 3, 1024, 0, 1, model, 1025, 0, 1, 1, key, 0, 1, epsg] {
-        out.extend_from_slice(&k.to_le_bytes());
-    }
-    debug_assert_eq!(out.len(), pixels_at as usize);
-    out.extend_from_slice(data);
-    Some(Bytes::from(out))
+    Some(write_geotiff(&spec, |out| out.extend_from_slice(data)))
 }
 
 /// [`npy_as_geotiff`] of a route's answer when a GeoTIFF was asked for: the one place a
