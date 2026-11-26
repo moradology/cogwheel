@@ -243,6 +243,7 @@ struct ParsedQuery {
     histogram_range: Option<(f64, f64)>,
     categorical: bool,
     categories: Vec<f64>,
+    area_weighted: bool,
     webp_quality: Option<f32>,
     jpeg_quality: u8,
     expr_raw: Option<String>,
@@ -311,6 +312,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         histogram_range: None,
         categorical: false,
         categories: Vec::new(),
+        area_weighted: true,
         webp_quality: None,
         jpeg_quality: 85,
         expr_raw: None,
@@ -647,6 +649,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "shape_mask" => {
                 pq.shape_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
             }
+            "area_weighted" => {
+                pq.area_weighted = !(v.eq_ignore_ascii_case("false") || v == "0");
+            }
+            "cover_scale" | "all_touched" => {
+                // Exact analytical coverage weighting needs no supersampling or binary all_touched toggle;
+                // accepted and ignored for TiTiler/rasterio client compatibility.
+            }
             "buffer" => {
                 if let Ok(buf) = v.parse::<f32>()
                     && buf.is_finite()
@@ -913,9 +922,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     "explicit" | "discrete" | "" => pq.colormap_type_linear = false,
                     _ => bad("expected colormap_type=explicit or linear"),
                 }
-            }
-            "cover_scale" => {
-                pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
         }
@@ -1241,7 +1247,7 @@ const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
 
 /// Parse a TiTiler CRS string (`EPSG:32610`, `EPSG:900913`, `CRS84`, `http://.../EPSG/0/32610`,
 /// `urn:ogc:def:crs:EPSG::32610`, etc.) into `(CrsModel, epsg_code)` using our 3,260+ EPSG table.
-fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16), String> {
+pub(crate) fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16), String> {
     let raw_trimmed = raw.trim();
     let trimmed = raw_trimmed
         .strip_prefix('[')
@@ -2862,6 +2868,7 @@ fn build_stats_options_with_bands(
     opts.width = pq.width;
     opts.height = pq.height;
     opts.max_size_explicit = pq.keys.iter().any(|k| k == "max_size");
+    opts.area_weighted = pq.area_weighted;
     if allow_expr
         && let Some(raw) = pq.expr_raw.as_deref()
     {
@@ -4866,6 +4873,10 @@ where
                 let stats_opts = build_stats_options(&pq, false)?;
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
+                let fc_crs = match pq.coord_crs.as_ref() {
+                    Some(c) => Some(c.clone()),
+                    None => crate::titiler::extract_geojson_crs(&geojson)?,
+                };
                 let compute_for_geom = |geom: &serde_json::Value| {
                     let eng = engine.clone();
                     let mj_c = mj.clone();
@@ -4873,7 +4884,7 @@ where
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    let coord_crs_c = pq.coord_crs.clone();
+                    let coord_crs_c = fc_crs.clone();
                     let geom_owned = geom.clone();
                     async move {
                         let (mask, bbox) =
@@ -6757,6 +6768,10 @@ where
                 };
 
                 if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                    let fc_crs = match pq.coord_crs.as_ref() {
+                        Some(c) => Some(c.clone()),
+                        None => crate::titiler::extract_geojson_crs(&geojson)?,
+                    };
                     let features = geojson
                         .get_mut("features")
                         .and_then(|v| v.as_array_mut())
@@ -6771,7 +6786,7 @@ where
                     }
                     for feat in features.iter_mut() {
                         let (mask, poly_bbox) =
-                            PolygonMask::from_geojson_in_crs(feat, pq.coord_crs.as_ref())?;
+                            PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
                         let stats = compute_stac_merged_stats(Arc::new(mask), poly_bbox).await?;
                         if let Some(props) =
                             feat.get_mut("properties").and_then(|v| v.as_object_mut())
@@ -7107,10 +7122,20 @@ where
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
-                        let any_intersects = cogs.iter().any(|c| {
-                            tile_intersects_cog(&engine, c, tms, TileCoord { z, x, y }, pq_stac.buffer, treq.tile_size)
-                                .unwrap_or(false)
-                        });
+                        let mut any_intersects = false;
+                        for c in &cogs {
+                            if tile_intersects_cog(
+                                &engine,
+                                c,
+                                tms,
+                                TileCoord { z, x, y },
+                                pq_stac.buffer,
+                                treq.tile_size,
+                            )? {
+                                any_intersects = true;
+                                break;
+                            }
+                        }
                         if !any_intersects {
                             return Err(EngineError::NotFound(format!(
                                 "Tile {z}/{x}/{y} is outside image bounds"
@@ -8082,6 +8107,10 @@ where
                     let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                         .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                     if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
+                        let fc_crs = match pq.coord_crs.as_ref() {
+                            Some(c) => Some(c.clone()),
+                            None => crate::titiler::extract_geojson_crs(&geojson)?,
+                        };
                         let features = geojson
                             .get_mut("features")
                             .and_then(|v| v.as_array_mut())
@@ -8098,7 +8127,7 @@ where
                         }
                         for feat in features.iter_mut() {
                             let (mask, _) =
-                                PolygonMask::from_geojson_in_crs(feat, pq.coord_crs.as_ref())?;
+                                PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
                             let stats = compute_statistics_with_options(
                                 &engine,
                                 &cogs[0],
@@ -8255,10 +8284,20 @@ where
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
 
-                        let any_intersects = cogs.iter().any(|c| {
-                            tile_intersects_cog(&engine, c, tms, TileCoord { z, x, y }, pq.buffer, treq.tile_size)
-                                .unwrap_or(false)
-                        });
+                        let mut any_intersects = false;
+                        for c in &cogs {
+                            if tile_intersects_cog(
+                                &engine,
+                                c,
+                                tms,
+                                TileCoord { z, x, y },
+                                pq.buffer,
+                                treq.tile_size,
+                            )? {
+                                any_intersects = true;
+                                break;
+                            }
+                        }
                         if !any_intersects {
                             return Err(EngineError::NotFound(format!(
                                 "Tile {z}/{x}/{y} is outside image bounds"
