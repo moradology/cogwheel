@@ -28,6 +28,10 @@ pub enum EngineError {
     Proj(#[from] ProjError),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+    #[error("request timeout: {0}")]
+    RequestTimeout(String),
     #[error("dataset not found: {0}")]
     NotFound(String),
     #[error("upstream error: {0}")]
