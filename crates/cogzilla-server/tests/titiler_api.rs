@@ -56,7 +56,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("unsupported reproject", format!("{tile}&reproject=bogus")),
         ("bad rescale", format!("{tile}&rescale=abc")),
         ("unknown colormap", format!("{tile}&bidx=1&colormap_name=nope")),
-        ("bad tilesize", format!("{tile}&tilesize=7")),
+        ("bad tilesize", format!("{tile}&tilesize=0")),
         ("unknown tms tile", format!("{base}/cog/tiles/FakeQuad/10/163/395.png?url={sat_url}")),
         ("unknown tms tilejson", format!("{base}/cog/FakeQuad/tilejson.json?url={sat_url}")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
@@ -1520,6 +1520,26 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(mj_root.get("name").is_none());
             assert!(mj_root.get("attribution").is_none());
             assert!(mj_root["tiles"].is_object());
+
+            // Sweep #8 H3: color_formula on single-band mosaic stays grayscale PNG (no red tint)
+            // Quadkey "0230102033" corresponds to WebMercatorQuad tile 10/163/395.
+            let mj_cf_resp = client
+                .get(format!(
+                    "{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.png?url={}&rescale=0,1000&color_formula=gamma%20r%201.6",
+                    mj_root_path.to_str().unwrap()
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mj_cf_resp.status(), 200);
+            let mj_cf_bytes = mj_cf_resp.bytes().await.unwrap();
+            assert!(mj_cf_bytes.len() > 26 && &mj_cf_bytes[..8] == b"\x89PNG\r\n\x1a\n");
+            // PNG IHDR color_type byte at offset 25: 0 = Grayscale (L), 4 = Grayscale+Alpha (LA)
+            let color_type = mj_cf_bytes[25];
+            assert!(
+                color_type == 0 || color_type == 4,
+                "single-band mosaic with color_formula must encode grayscale PNG (color_type 0 or 4), got {color_type}"
+            );
             let _ = std::fs::remove_file(&mj_root_path);
 
             // Sweep #1 D4, D6, E2 regression checks
@@ -1543,6 +1563,84 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(mna2.status(), 405);
             let mna3 = client.delete(format!("{base}/healthz")).send().await.unwrap();
             assert_eq!(mna3.status(), 405);
+
+            // Sweep #1 E1 & D5 regression checks: gzip + Vary + Cache-Control on metadata, and 13-TMS WMTS
+            let gz_resp = client
+                .get(format!("{base}/tileMatrixSets/WebMercatorQuad"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(gz_resp.status(), 200);
+            assert_eq!(
+                gz_resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+                Some("gzip")
+            );
+            assert!(
+                gz_resp
+                    .headers()
+                    .get("vary")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("accept-encoding"))
+            );
+            assert!(gz_resp.headers().get("cache-control").is_some());
+            let gz_bytes = gz_resp.bytes().await.unwrap();
+            let decomp = cogzilla_codec::decompress_gzip_limited(&gz_bytes, 1024 * 1024).unwrap();
+            let tms_decomp: serde_json::Value = serde_json::from_slice(&decomp).unwrap();
+            assert_eq!(tms_decomp["id"], "WebMercatorQuad");
+
+            let wmts_all = client
+                .get(format!("{base}/cog/WMTSCapabilities.xml?url={sat_url}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wmts_all.status(), 200);
+            assert!(wmts_all.headers().get("cache-control").is_some());
+            let wmts_body = wmts_all.text().await.unwrap();
+            assert_eq!(wmts_body.matches("<Layer>").count(), 13);
+            assert_eq!(wmts_body.matches("<TileMatrixSet>").count(), 26); // 13 links + 13 definitions
+
+            // Sweep #9 J1-J6 regression checks
+            // J1: empty expression= is treated as absent
+            let j1 = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat_url}&expression="))
+                .send().await.unwrap();
+            assert_eq!(j1.status(), 200);
+            // J2 & J3: float-int params (bidx=1.0, tilesize=16.0, z=12.0) and tilesize < 64
+            let j23 = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12.0/652/1583.png?url={sat_url}&bidx=1.0&tilesize=16.0"))
+                .send().await.unwrap();
+            assert_eq!(j23.status(), 200);
+            // J4: space after comma in /point and /bbox path coordinates
+            let j4p = client
+                .get(format!("{base}/cog/point/-122.65,%2037.773?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(j4p.status(), 200);
+            let j4b = client
+                .get(format!("{base}/cog/bbox/-122.8,%2037.6,-122.5,37.9/32x32.png?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(j4b.status(), 200);
+            // J5: EPSG:4979, ESRI:102100, and PROJ string CRS forms
+            for crs in [
+                "EPSG:4979",
+                "ESRI:102100",
+                "+proj=longlat%20+datum=WGS84",
+            ] {
+                let r = client
+                    .get(format!("{base}/cog/preview/32x32.png?url={sat_url}&dst_crs={crs}"))
+                    .send().await.unwrap();
+                assert_eq!(r.status(), 200, "dst_crs={crs} should succeed");
+            }
+            // J6: /cog/preview/5000x5000.png error message states size exceeds limit
+            let j6 = client
+                .get(format!("{base}/cog/preview/5000x5000.png?url={sat_url}"))
+                .send().await.unwrap();
+            assert_eq!(j6.status(), 400);
+            let j6_body = j6.text().await.unwrap();
+            assert!(
+                j6_body.contains("4096") && j6_body.to_ascii_lowercase().contains("exceed"),
+                "expected size-limit message, got: {j6_body}"
+            );
         }
     }
 }

@@ -3344,7 +3344,7 @@ async fn feature_image(
     let (size, ext) = match rest {
         ["feature"] => (part_size_from_query(pairs), None),
         [one] => (part_size_from_query(pairs), one.strip_prefix("feature.")),
-        ["feature", dims] => match parse_wxh_ext(dims) {
+        ["feature", dims] => match parse_wxh_ext(dims).ok() {
             Some((w, h, ext)) if w > 0 && h > 0 => (Ok(PartSize::Exact(w, h)), ext),
             _ => return detail(StatusCode::NOT_FOUND, "Not Found"),
         },
@@ -5955,7 +5955,7 @@ fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
     let picture = match rest {
         ["tiles", "WebMercatorQuad", _, _, _] => true,
         ["bbox", seg] => matches!(super::parse_bbox4(seg), Some((_, Some(_)))),
-        ["bbox", _, dims] => matches!(super::parse_wxh_ext(dims), Some((_, _, Some(_)))),
+        ["bbox", _, dims] => matches!(super::parse_wxh_ext(dims), Ok((_, _, Some(_)))),
         _ => false,
     };
     if !picture {
@@ -6168,7 +6168,7 @@ async fn mosaic_route(
             geometry_assets(pg, &rec.hash, polygon, limits, pairs, part_grid(size, [w, s, e, n])).await
         }
         ["bbox", seg, dims] => {
-            let (Some((bbox, None)), Some((w, h, ext))) = (parse_bbox4(seg), parse_wxh_ext(dims))
+            let (Some((bbox, None)), Some((w, h, ext))) = (parse_bbox4(seg), parse_wxh_ext(dims).ok())
             else {
                 return not_found();
             };

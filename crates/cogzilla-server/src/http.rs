@@ -35,7 +35,8 @@ use crate::stac::{
 };
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
-    build_map_html, build_tilejson, build_wmts_capabilities, compute_f32_band_stats,
+    build_map_html, build_tilejson, build_wmts_capabilities, build_wmts_capabilities_multi,
+    compute_f32_band_stats,
     compute_statistics_with_options,
     encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
     get_algorithm_json,
@@ -72,39 +73,89 @@ fn percent_decode_opts(input: &str, plus_as_space: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Parse an unsigned integer string, also accepting integer-valued decimal strings such as
+/// `"256.0"` or `"12.0"` (matching TiTiler / Pydantic coercion).
+fn parse_u32_like(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if let Ok(v) = t.parse::<u32>() {
+        return Some(v);
+    }
+    if t.contains('.')
+        && let Ok(f) = t.parse::<f64>()
+        && f.is_finite()
+        && f >= 0.0
+        && f <= u32::MAX as f64
+        && f.fract() == 0.0
+    {
+        return Some(f as u32);
+    }
+    None
+}
+
+fn parse_u16_like(s: &str) -> Option<u16> {
+    parse_u32_like(s).and_then(|v| u16::try_from(v).ok())
+}
+
+fn parse_u8_like(s: &str) -> Option<u8> {
+    parse_u32_like(s).and_then(|v| u8::try_from(v).ok())
+}
+
 /// Parse TiTiler's `{y}[@{scale}x][.{ext}]` segment into `(y, scale_opt, ext_opt)`.
 fn parse_y_scale_ext(seg: &str) -> Option<(u32, Option<u32>, Option<&str>)> {
-    let (left, ext) = match seg.split_once('.') {
-        Some((l, e)) => (l, Some(e)),
-        None => (seg, None),
+    // Handle `1583.0.png` or `1583.0` as well as `1583.png` / `1583@2x.png`.
+    let (left, ext) = if let Some(dot) = seg.rfind('.') {
+        let after = &seg[dot + 1..];
+        if !after.is_empty() && after.bytes().all(|b| b.is_ascii_alphabetic() || b == b'3' || b == b'2') && !after.bytes().all(|b| b.is_ascii_digit()) {
+            (&seg[..dot], Some(after))
+        } else {
+            (seg, None)
+        }
+    } else {
+        (seg, None)
     };
     let (y_str, scale) = match left.split_once('@') {
         Some((ys, sc)) => {
-            let s_num = sc.trim_end_matches('x').parse::<u32>().ok()?;
+            let s_num = parse_u32_like(sc.trim_end_matches('x'))?;
             (ys, Some(s_num))
         }
         None => (left, None),
     };
-    let y = y_str.parse::<u32>().ok()?;
+    let y = parse_u32_like(y_str)?;
     Some((y, scale, ext))
 }
 
-fn parse_wxh_ext(seg: &str) -> Option<(u32, u32, Option<&str>)> {
+fn parse_wxh_ext(seg: &str) -> Result<(u32, u32, Option<&str>), String> {
     let (dims, ext) = match seg.split_once('.') {
         Some((d, e)) => (d, Some(e)),
         None => (seg, None),
     };
-    let (ws, hs) = dims.split_once('x')?;
-    let w = ws.parse::<u32>().ok()?;
-    let h = hs.parse::<u32>().ok()?;
-    if w == 0 || h == 0 || w > 4096 || h > 4096 {
-        return None;
+    let Some((ws, hs)) = dims.split_once('x') else {
+        return Err(format!("invalid dimensions '{seg}', expected {{w}}x{{h}}[.{{ext}}]"));
+    };
+    let (Some(w), Some(h)) = (parse_u32_like(ws), parse_u32_like(hs)) else {
+        return Err(format!("invalid dimensions '{seg}', expected {{w}}x{{h}}[.{{ext}}]"));
+    };
+    if w == 0 || h == 0 {
+        return Err(format!("requested dimensions {w}x{h} must be >= 1x1"));
     }
-    Some((w, h, ext))
+    if w > 4096 || h > 4096 {
+        return Err(format!(
+            "requested dimensions {w}x{h} exceed maximum allowed size 4096x4096"
+        ));
+    }
+    Ok((w, h, ext))
+}
+
+fn parse_point_coord(coord: &str) -> Option<(f64, f64)> {
+    let dec = percent_decode(coord);
+    let (lons, lats) = dec.split_once(',')?;
+    let x = lons.trim().parse::<f64>().ok()?;
+    let y = lats.trim().parse::<f64>().ok()?;
+    (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 
 fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
-    // Handle `minx,miny,maxx,maxy.png` or `minx,miny,maxx,maxy`
+    // Handle `minx,miny,maxx,maxy.png` or `minx,miny,maxx,maxy` (allowing %20 spaces around commas)
     let (coords_str, ext) = if let Some(dot) = seg.rfind('.') {
         let after = &seg[dot + 1..];
         if matches!(
@@ -118,15 +169,16 @@ fn parse_bbox4(seg: &str) -> Option<([f64; 4], Option<&str>)> {
     } else {
         (seg, None)
     };
-    let parts: Vec<&str> = coords_str.split(',').collect();
+    let dec = percent_decode(coords_str);
+    let parts: Vec<&str> = dec.split(',').collect();
     if parts.len() != 4 {
         return None;
     }
     let b = [
-        parts[0].parse::<f64>().ok()?,
-        parts[1].parse::<f64>().ok()?,
-        parts[2].parse::<f64>().ok()?,
-        parts[3].parse::<f64>().ok()?,
+        parts[0].trim().parse::<f64>().ok()?,
+        parts[1].trim().parse::<f64>().ok()?,
+        parts[2].trim().parse::<f64>().ok()?,
+        parts[3].trim().parse::<f64>().ok()?,
     ];
     if !b.iter().all(|v| v.is_finite()) || b[0] >= b[2] || b[1] >= b[3] {
         return None;
@@ -520,10 +572,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             }
             "bidx" | "indexes" => {
                 for part in percent_decode(v).split(',') {
-                    match part.parse::<u16>() {
-                        Ok(0) => bad("band indices are 1-based (>= 1)"),
-                        Ok(b) => pq.bidx.push(b),
-                        Err(_) => bad("expected band numbers"),
+                    match parse_u16_like(part) {
+                        Some(0) => bad("band indices are 1-based (>= 1)"),
+                        Some(b) => pq.bidx.push(b),
+                        None => bad("expected band numbers"),
                     }
                 }
             }
@@ -634,21 +686,21 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "tile_size" | "tilesize" | "size" => {
-                match v.parse::<u32>() {
-                    Ok(sz) if (64..=2048).contains(&sz) => pq.tile_size = sz,
-                    _ => bad("expected a tile size from 64 to 2048"),
+                match parse_u32_like(v) {
+                    Some(sz) if (1..=2048).contains(&sz) => pq.tile_size = sz,
+                    _ => bad("expected a tile size from 1 to 2048"),
                 }
             }
-            "scale" => match v.parse::<u32>() {
-                Ok(sc) if (1..=4).contains(&sc) => pq.tile_size = sc * 256,
+            "scale" => match parse_u32_like(v) {
+                Some(sc) if (1..=4).contains(&sc) => pq.tile_size = sc * 256,
                 _ => bad("expected scale in 1..=4"),
             },
-            "tile_scale" => match v.parse::<u32>() {
-                Ok(sc) if (1..=4).contains(&sc) => pq.tile_scale = Some(sc),
+            "tile_scale" => match parse_u32_like(v) {
+                Some(sc) if (1..=4).contains(&sc) => pq.tile_scale = Some(sc),
                 _ => bad("expected tile_scale in 1..=4"),
             },
             "max_size" => {
-                if let Ok(ms) = v.parse::<u32>() {
+                if let Some(ms) = parse_u32_like(v) {
                     // TiTiler treats max_size=0 as full native resolution (capped at 4096).
                     pq.max_size = if ms == 0 { 4096 } else { ms.clamp(1, 4096) };
                 } else {
@@ -715,10 +767,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     || lower.contains("+!")
                     || lower.contains("+;")
                     || lower.contains(";+");
-                pq.expr_raw = Some(percent_decode_opts(v, plus_is_space));
+                let decoded = percent_decode_opts(v, plus_is_space);
+                if !decoded.trim().is_empty() {
+                    pq.expr_raw = Some(decoded);
+                }
             }
-            "padding" => match v.parse::<u32>() {
-                Ok(p) if p <= 64 => {}
+            "padding" => match parse_u32_like(v) {
+                Some(p) if p <= 64 => {}
                 _ => bad("expected padding in 0..=64"),
             },
             "dst_crs" => {
@@ -742,12 +797,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     Err(msg) => bad(&msg),
                 }
             }
-            "minzoom" => match v.parse::<u8>() {
-                Ok(z) if z <= 30 => pq.minzoom = Some(z),
+            "minzoom" => match parse_u8_like(v) {
+                Some(z) if z <= 30 => pq.minzoom = Some(z),
                 _ => bad("expected minzoom in 0..=30"),
             },
-            "maxzoom" => match v.parse::<u8>() {
-                Ok(z) if z <= 30 => pq.maxzoom = Some(z),
+            "maxzoom" => match parse_u8_like(v) {
+                Some(z) if z <= 30 => pq.maxzoom = Some(z),
                 _ => bad("expected maxzoom in 0..=30"),
             },
             "tile_format" => {
@@ -758,12 +813,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("unsupported tile_format (use png, webp, jpg, f32, or npy)");
                 }
             }
-            "width" => match v.parse::<u32>() {
-                Ok(n) if (1..=4096).contains(&n) => pq.width = Some(n),
+            "width" => match parse_u32_like(v) {
+                Some(n) if (1..=4096).contains(&n) => pq.width = Some(n),
                 _ => bad("expected width in 1..=4096"),
             },
-            "height" => match v.parse::<u32>() {
-                Ok(n) if (1..=4096).contains(&n) => pq.height = Some(n),
+            "height" => match parse_u32_like(v) {
+                Some(n) if (1..=4096).contains(&n) => pq.height = Some(n),
                 _ => bad("expected height in 1..=4096"),
             },
             "orientation" => match v.to_ascii_lowercase().as_str() {
@@ -1197,6 +1252,49 @@ fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16)
     if lower == "crs84" || lower.ends_with(":crs84") || lower.ends_with("/crs84") {
         return Ok((cogzilla_proj::CrsModel::Geographic, 4326));
     }
+    if lower == "esri:102100" || lower == "esri:102113" {
+        return Ok((cogzilla_proj::CrsModel::Epsg3857, 3857));
+    }
+    // Common PROJ4 strings (both `%2Bproj=...` and raw `+proj=...` where `+` was decoded as space)
+    if lower.contains("proj=") || lower.contains("init=epsg:") {
+        let tokens: Vec<&str> = lower
+            .split_whitespace()
+            .map(|t| t.trim_start_matches('+'))
+            .collect();
+        if let Some(digits) = tokens.iter().find_map(|tok| tok.strip_prefix("init=epsg:")) {
+            if digits == "900913" {
+                return Ok((cogzilla_proj::CrsModel::Epsg3857, 3857));
+            }
+            if let Ok(code) = digits.parse::<u16>() {
+                let model = cogzilla_proj::CrsModel::from_epsg(code)
+                    .map_err(|e| format!("unsupported CRS '{raw}': {e}"))?;
+                return Ok((model, code));
+            }
+        }
+        let proj_name = tokens
+            .iter()
+            .find_map(|tok| tok.strip_prefix("proj="))
+            .unwrap_or("");
+        match proj_name {
+            "longlat" | "latlong" => return Ok((cogzilla_proj::CrsModel::Geographic, 4326)),
+            "merc" => return Ok((cogzilla_proj::CrsModel::Epsg3857, 3857)),
+            "utm" => {
+                if let Some(zone) = tokens
+                    .iter()
+                    .find_map(|tok| tok.strip_prefix("zone="))
+                    .and_then(|z| z.parse::<u16>().ok())
+                    .filter(|&z| (1..=60).contains(&z))
+                {
+                    let is_south = tokens.contains(&"south");
+                    let code = if is_south { 32700 + zone } else { 32600 + zone };
+                    let model = cogzilla_proj::CrsModel::from_epsg(code)
+                        .map_err(|e| format!("unsupported CRS '{raw}': {e}"))?;
+                    return Ok((model, code));
+                }
+            }
+            _ => {}
+        }
+    }
     let digits = if let Some(rest) = lower.strip_prefix("epsg:") {
         rest.trim()
     } else if let Some(pos) = lower.find("epsg:") {
@@ -1207,11 +1305,14 @@ fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16)
         lower[pos + 6..].rsplit('/').next().unwrap_or("").trim()
     } else {
         return Err(format!(
-            "unsupported CRS '{raw}' (expected EPSG:<code> or CRS84)"
+            "unsupported CRS '{raw}' (expected EPSG:<code>, CRS84, or PROJ string)"
         ));
     };
     if digits == "900913" {
         return Ok((cogzilla_proj::CrsModel::Epsg3857, 3857));
+    }
+    if digits == "4979" {
+        return Ok((cogzilla_proj::CrsModel::Geographic, 4979));
     }
     let Ok(code) = digits.parse::<u16>() else {
         return Err(format!("unsupported CRS '{raw}' (expected EPSG:<code> or CRS84)"));
@@ -3335,6 +3436,14 @@ async fn render_mosaic_tile_styled(
         || pq.custom_colormap_json.is_some()
         || pq.buffer > 0.0
         || matches!(treq.format, OutputFormat::Npy)
+        || (pq.color_formula.is_some()
+            && !matches!(
+                treq.bands,
+                BandRequest::Rgb { .. }
+                    | BandRequest::SarRgb { .. }
+                    | BandRequest::CustomExprRgb { .. }
+                    | BandRequest::Terrain { .. }
+            ))
         || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
         || (treq.tile_size != 256 && treq.tile_size != 512);
     if !needs_bbox_mosaic
@@ -3485,7 +3594,7 @@ async fn render_mosaic_tile_styled(
                 OutputFormat::RawRgba,
                 pq.nodata,
                 scene_lut.as_ref(),
-                None,
+                cf.as_ref(),
                 true,
                 pq.unscale,
             )
@@ -3503,9 +3612,6 @@ async fn render_mosaic_tile_styled(
             if filled >= n_px {
                 break;
             }
-        }
-        if let Some(cf) = cf {
-            cf.apply_buffer_in_place(&mut comp, 4);
         }
         return Ok(encode_rgba_output(
             out_dim as usize,
@@ -4138,6 +4244,41 @@ pub async fn handle_bytes_request(
     Response::from_parts(rparts, bytes)
 }
 
+fn header_accepts_gzip(val: &str) -> bool {
+    for part in val.split(',') {
+        let mut iter = part.split(';');
+        let enc = iter.next().unwrap_or("").trim();
+        if !enc.eq_ignore_ascii_case("gzip") && !enc.eq_ignore_ascii_case("x-gzip") {
+            continue;
+        }
+        let mut q_ok = true;
+        for param in iter {
+            let p = param.trim();
+            if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                if let Ok(q) = qv.trim().parse::<f32>() {
+                    if q <= 0.0 {
+                        q_ok = false;
+                    }
+                }
+            }
+        }
+        if q_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_compressible_content_type(ct: &str) -> bool {
+    let media = ct.split(';').next().unwrap_or("").trim();
+    media.eq_ignore_ascii_case("application/json")
+        || media.eq_ignore_ascii_case("application/geo+json")
+        || media.eq_ignore_ascii_case("application/xml")
+        || media.eq_ignore_ascii_case("application/vnd.oai.openapi+json")
+        || media.eq_ignore_ascii_case("image/svg+xml")
+        || media.starts_with("text/")
+}
+
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
     req: Request<B>,
@@ -4149,6 +4290,13 @@ where
     let t0 = std::time::Instant::now();
     let is_head = *req.method() == Method::HEAD;
     let is_post = *req.method() == Method::POST;
+    let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
+    let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics");
+    let accepts_gzip = req
+        .headers()
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(header_accepts_gzip);
     let mut resp = handle_request_inner(engine, req, is_head).await?;
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
@@ -4161,7 +4309,60 @@ where
         // RFC 9110: POST responses depend on the request body and must not carry public Cache-Control/ETag.
         resp.headers_mut().remove(CACHE_CONTROL);
         resp.headers_mut().remove(ETAG);
+    } else if is_get_or_head
+        && resp.status() == StatusCode::OK
+        && !is_health_or_metrics
+        && !resp.headers().contains_key(CACHE_CONTROL)
+    {
+        resp.headers_mut()
+            .insert(CACHE_CONTROL, cache_control_header().clone());
     }
+
+    let compressible = resp.status() == StatusCode::OK
+        && resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_compressible_content_type);
+    if compressible {
+        if let Some(existing) = resp.headers().get(hyper::header::VARY).and_then(|v| v.to_str().ok()) {
+            if !existing.to_ascii_lowercase().contains("accept-encoding") {
+                if let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
+                    resp.headers_mut().insert(hyper::header::VARY, hv);
+                }
+            }
+        } else {
+            resp.headers_mut()
+                .insert(hyper::header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
+        if accepts_gzip
+            && !is_head
+            && !resp.headers().contains_key(hyper::header::CONTENT_ENCODING)
+        {
+            let (mut parts, body) = resp.into_parts();
+            let raw = body
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            if raw.len() >= 500
+                && let Ok(gz) = cogzilla_codec::compress_gzip(&raw)
+                && gz.len() < raw.len()
+            {
+                parts.headers.insert(
+                    hyper::header::CONTENT_ENCODING,
+                    HeaderValue::from_static("gzip"),
+                );
+                if let Ok(hv) = HeaderValue::from_str(&gz.len().to_string()) {
+                    parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
+                }
+                resp = Response::from_parts(parts, Full::new(Bytes::from(gz)));
+            } else {
+                resp = Response::from_parts(parts, Full::new(raw));
+            }
+        }
+    }
+
     if is_head {
         let (mut parts, body) = resp.into_parts();
         if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT {
@@ -4337,54 +4538,21 @@ where
     }
 
     if method == Method::GET && (path == "/openapi.json" || path == "/api") {
-        let mut spec = serde_json::json!({
-            "openapi": "3.1.0",
-            "info": {
-                "title": "cogzilla",
-                "version": env!("CARGO_PKG_VERSION"),
-                "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG & STAC tile server"
-            },
-            "paths": {
-                "/": { "get": { "summary": "Landing page with live demo maps" } },
-                "/healthz": { "get": { "summary": "Health check" } },
-                "/cog/info": { "get": { "summary": "COG metadata" } },
-                "/cog/info.geojson": { "get": { "summary": "COG GeoJSON metadata" } },
-                "/cog/bounds": { "get": { "summary": "COG WGS84 bounds" } },
-                "/cog/validate": { "get": { "summary": "Validate COG structure and layout" } },
-                "/cog/statistics": { "get": { "summary": "COG statistics" }, "post": { "summary": "Polygon-clipped COG statistics" } },
-                "/cog/tiles": { "get": { "summary": "List COG tilesets" } },
-                "/cog/tiles/{tileMatrixSetId}": { "get": { "summary": "COG tileset metadata" } },
-                "/cog/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render COG map tile" } },
-                "/cog/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "COG TileJSON 3.0" } },
-                "/cog/{tileMatrixSetId}/map.html": { "get": { "summary": "Interactive Leaflet map viewer" } },
-                "/cog/point/{lon},{lat}": { "get": { "summary": "Sample pixel values at point" } },
-                "/cog/preview.{format}": { "get": { "summary": "Render COG preview" } },
-                "/cog/bbox/{minx},{miny},{maxx},{maxy}/{width}x{height}.{format}": { "get": { "summary": "Render COG bbox crop" } },
-                "/cog/feature/{width}x{height}.{format}": { "post": { "summary": "Render GeoJSON feature crop" } },
-                "/stac/assets": { "get": { "summary": "List STAC Item raster assets" } },
-                "/stac/bounds": { "get": { "summary": "STAC Item WGS84 bounds" } },
-                "/stac/info": { "get": { "summary": "STAC assets metadata" } },
-                "/stac/info.geojson": { "get": { "summary": "STAC GeoJSON metadata" } },
-                "/stac/asset_statistics": { "get": { "summary": "Per-asset STAC statistics" } },
-                "/stac/statistics": { "get": { "summary": "Merged STAC statistics" }, "post": { "summary": "Polygon-clipped STAC statistics" } },
-                "/stac/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}": { "get": { "summary": "Render STAC multi-asset tile" } },
-                "/stac/{tileMatrixSetId}/tilejson.json": { "get": { "summary": "STAC TileJSON 3.0" } },
-                "/stac/point/{lon},{lat}": { "get": { "summary": "Sample STAC asset values at point" } },
-                "/stac/preview/{width}x{height}.{format}": { "get": { "summary": "Render STAC preview" } },
-                "/algorithms": { "get": { "summary": "List available raster algorithms" } },
-                "/algorithms/{algorithmId}": { "get": { "summary": "Get algorithm metadata and parameters" } },
-                "/colorMaps": { "get": { "summary": "List all 211 rio-tiler colormaps" } },
-                "/colorMaps/{colorMapId}": { "get": { "summary": "Get colormap RGBA LUT JSON or ?f=png colorbar" } },
-                "/tileMatrixSets": { "get": { "summary": "List OGC TileMatrixSets" } },
-                "/tileMatrixSets/{tileMatrixSetId}": { "get": { "summary": "Get OGC TileMatrixSet 2.0 definition" } }
-            }
-        });
-        if let (Some(paths), serde_json::Value::Object(extra)) =
-            (spec["paths"].as_object_mut(), pgstac::openapi_paths())
+        let ct = if path == "/api" {
+            "application/vnd.oai.openapi+json;version=3.1"
+        } else {
+            "application/json"
+        };
+        // The shared document, with the pgSTAC routes' paths beside its own.
+        let mut body = crate::openapi::openapi_json_bytes();
+        if let Ok(mut spec) = serde_json::from_slice::<serde_json::Value>(&body)
+            && let (Some(paths), serde_json::Value::Object(extra)) =
+                (spec["paths"].as_object_mut(), pgstac::openapi_paths())
         {
             paths.extend(extra);
+            body = Bytes::from(spec.to_string());
         }
-        return Ok(plain_resp(StatusCode::OK, Bytes::from(spec.to_string()), "application/json"));
+        return Ok(plain_resp(StatusCode::OK, body, ct));
     }
 
     if method == Method::GET && (path == "/docs" || path == "/api.html") {
@@ -4835,9 +5003,7 @@ where
             }
             .await,
             ["mosaicjson", "feature", dims_ext] => async {
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected /mosaicjson/feature/{w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
@@ -5029,9 +5195,7 @@ where
                 let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
                 let wgs_bbox = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
@@ -5110,13 +5274,10 @@ where
             ["mosaicjson", "point", coord] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let Some((lons, lats)) = coord.split_once(',') else {
+                let Some((x, y)) = parse_point_coord(coord) else {
                     return Err(EngineError::BadRequest(
                         "expected /mosaicjson/point/{lon},{lat}".into(),
                     ));
-                };
-                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
-                    return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
                 let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
                 let (mx, my) = if pq.coord_crs_3857 {
@@ -5163,8 +5324,10 @@ where
             .await,
             ["mosaicjson", _, "WMTSCapabilities.xml"] | ["mosaicjson", "WMTSCapabilities.xml"] => {
                 async {
-                    let tms = if segs.len() == 3 { segs[1] } else { "WebMercatorQuad" };
-                    if crate::tms::lookup_tms(tms).is_none() {
+                    let explicit_tms = (segs.len() == 3).then_some(segs[1]);
+                    if let Some(tms) = explicit_tms
+                        && crate::tms::lookup_tms(tms).is_none()
+                    {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
                     let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
@@ -5174,20 +5337,40 @@ where
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
-                    let xml = build_wmts_capabilities(
-                        &host,
-                        "mosaicjson",
-                        tms,
-                        "MosaicJSON",
-                        mj.bounds,
-                        minz,
-                        maxz,
-                        fmt,
-                        scale,
-                        &tile_q,
-                        &raw_query,
-                        pq.use_epsg,
-                    );
+                    let xml = if let Some(tms) = explicit_tms {
+                        build_wmts_capabilities(
+                            &host,
+                            "mosaicjson",
+                            tms,
+                            "MosaicJSON",
+                            mj.bounds,
+                            minz,
+                            maxz,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    } else {
+                        let entries: Vec<(&str, u8, u8)> = crate::tms::ALL_TMS
+                            .iter()
+                            .map(|t| (t.id, minz, maxz))
+                            .collect();
+                        build_wmts_capabilities_multi(
+                            &host,
+                            "mosaicjson",
+                            &entries,
+                            None,
+                            "MosaicJSON",
+                            mj.bounds,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    };
                     Ok((Bytes::from(xml), "application/xml"))
                 }
                 .await
@@ -5224,11 +5407,8 @@ where
             ["mosaicjson", "point", coord, "assets"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let Some((lons, lats)) = coord.split_once(',') else {
+                let Some((x, y)) = parse_point_coord(coord) else {
                     return Err(EngineError::BadRequest("expected /mosaicjson/point/{lon},{lat}/assets".into()));
-                };
-                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
-                    return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
                 let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
                 let (mx, my) = lonlat_deg_to_mercator(lon, lat);
@@ -5240,7 +5420,7 @@ where
             ["mosaicjson", "tiles", tms, zs, xs, ys, "assets"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let (Ok(z), Ok(x), Ok(y)) = (zs.parse::<u8>(), xs.parse::<u32>(), ys.parse::<u32>()) else {
+                let (Some(z), Some(x), Some(y)) = (parse_u8_like(zs), parse_u32_like(xs), parse_u32_like(ys)) else {
                     return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
                 };
                 if z > 30 {
@@ -5275,7 +5455,7 @@ where
             | ["mosaicjson", zs, xs, ys, "assets"] => async {
                 let u = mj_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let mj = load_mosaicjson(&engine, &u).await?;
-                let (Ok(z), Ok(x), Ok(y)) = (zs.parse::<u8>(), xs.parse::<u32>(), ys.parse::<u32>()) else {
+                let (Some(z), Some(x), Some(y)) = (parse_u8_like(zs), parse_u32_like(xs), parse_u32_like(ys)) else {
                     return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
                 };
                 if z > 30 {
@@ -5303,8 +5483,8 @@ where
                             .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                         let mj = load_mosaicjson(&engine, &u).await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
-                            zs.parse::<u8>().ok(),
-                            xs.parse::<u32>().ok(),
+                            parse_u8_like(zs),
+                            parse_u32_like(xs),
                             parse_y_scale_ext(ys),
                         ) else {
                             return Err(EngineError::BadRequest(
@@ -5467,8 +5647,8 @@ where
                     })
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
-                if let (Ok(z), Ok(x), Some((y, sc, _))) =
-                    (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+                if let (Some(z), Some(x), Some((y, sc, _))) =
+                    (parse_u8_like(zs), parse_u32_like(xs), parse_y_scale_ext(ys))
                 {
                     attach_tile_geo_headers(&mut resp, tms, z, x, y, sc, &pq);
                 }
@@ -5495,8 +5675,8 @@ where
         let coords = match segs.as_slice() {
             ["mosaic", "tiles", "WebMercatorQuad", zs, xs, ys]
             | ["mosaic", "tiles", zs, xs, ys] => (
-                zs.parse::<u8>().ok(),
-                xs.parse::<u32>().ok(),
+                parse_u8_like(zs),
+                parse_u32_like(xs),
                 parse_y_scale_ext(ys),
             ),
             _ => (None, None, None),
@@ -5578,8 +5758,8 @@ where
         let coords = match segs.as_slice() {
             ["mosaic", _, "tiles", "WebMercatorQuad", zs, xs, ys]
             | ["mosaic", _, "tiles", zs, xs, ys] => (
-                zs.parse::<u8>().ok(),
-                xs.parse::<u32>().ok(),
+                parse_u8_like(zs),
+                parse_u32_like(xs),
                 parse_y_scale_ext(ys),
             ),
             _ => (None, None, None),
@@ -5717,8 +5897,8 @@ where
     if method == Method::GET && segs.first() == Some(&"tiles") && segs.len() == 5 {
         let ds = segs[1];
         let parsed = (
-            segs[2].parse::<u8>().ok(),
-            segs[3].parse::<u32>().ok(),
+            parse_u8_like(segs[2]),
+            parse_u32_like(segs[3]),
             parse_y_scale_ext(segs[4]),
         );
         let cache_key = format!("{path}?{raw_query}");
@@ -6769,8 +6949,10 @@ where
             .await,
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
-                    let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                    if crate::tms::lookup_tms(tms).is_none() {
+                    let explicit_tms = (sub.len() == 2).then_some(sub[0]);
+                    if let Some(tms) = explicit_tms
+                        && crate::tms::lookup_tms(tms).is_none()
+                    {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
                     let item = stac_source.load(&engine).await?;
@@ -6785,30 +6967,60 @@ where
                     let coarsest = cogs[0].index.ifds.last().unwrap();
                     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
                         .max(full.height as f64 / coarsest.height.max(1) as f64);
-                    let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
-                        tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
-                    } else {
-                        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
-                    };
-                    let (minz, maxz) =
-                        resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
-                    let xml = build_wmts_capabilities(
-                        &host,
-                        "stac",
-                        tms,
-                        &item.id,
-                        bounds,
-                        minz,
-                        maxz,
-                        fmt,
-                        scale,
-                        &tile_q,
-                        &raw_query,
-                        pq.use_epsg,
-                    );
+                    let xml = if let Some(tms) = explicit_tms {
+                        let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
+                            tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
+                        } else {
+                            crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                        };
+                        let (minz, maxz) =
+                            resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
+                        build_wmts_capabilities(
+                            &host,
+                            "stac",
+                            tms,
+                            &item.id,
+                            bounds,
+                            minz,
+                            maxz,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    } else {
+                        let entries: Vec<(&str, u8, u8)> = crate::tms::ALL_TMS
+                            .iter()
+                            .map(|t| {
+                                let (dmin, dmax) = t.zoom_range_for_cog(
+                                    &crs,
+                                    &full.pixel_to_crs,
+                                    full.width,
+                                    full.height,
+                                    ov_factor,
+                                );
+                                let (z0, z1) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                                (t.id, z0, z1)
+                            })
+                            .collect();
+                        build_wmts_capabilities_multi(
+                            &host,
+                            "stac",
+                            &entries,
+                            None,
+                            &item.id,
+                            bounds,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    };
                     Ok((Bytes::from(xml), "application/xml"))
                 }
                 .await
@@ -6839,8 +7051,8 @@ where
                         )
                         .await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
-                            zs.parse::<u8>().ok(),
-                            xs.parse::<u32>().ok(),
+                            parse_u8_like(zs),
+                            parse_u32_like(xs),
                             parse_y_scale_ext(ys),
                         ) else {
                             return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
@@ -7038,8 +7250,8 @@ where
                 }
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_resolved_stac_assets(&mut resp);
-                if let (Ok(z), Ok(x), Some((y, sc, _))) =
-                    (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+                if let (Some(z), Some(x), Some((y, sc, _))) =
+                    (parse_u8_like(zs), parse_u32_like(xs), parse_y_scale_ext(ys))
                 {
                     attach_tile_geo_headers_opts(&mut resp, tms, z, x, y, sc, stac_tile_geo);
                 }
@@ -7055,11 +7267,8 @@ where
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
-                let Some((lons, lats)) = coord.split_once(',') else {
+                let Some((x, y)) = parse_point_coord(coord) else {
                     return Err(EngineError::BadRequest("expected /stac/point/{lon},{lat}".into()));
-                };
-                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
-                    return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
                 let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
                 let n = names.len();
@@ -7263,9 +7472,7 @@ where
             }
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected /stac/preview/{w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
@@ -7436,9 +7643,7 @@ where
                 let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox".into()));
                 };
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
@@ -7515,9 +7720,7 @@ where
 
             // POST /stac/feature/{w}x{h}[.{ext}] and POST /stac/feature[.{ext}]
             (Method::POST, ["feature", dims_ext]) => async {
-                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).ok_or_else(|| {
-                    EngineError::BadRequest("expected /stac/feature/{w}x{h}.{ext}".into())
-                })?;
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -8004,8 +8207,8 @@ where
                     .get_or_render(cache_key, || async {
                         let cogs = open_query_urls(&engine, &pq.urls).await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
-                            zs.parse::<u8>().ok(),
-                            xs.parse::<u32>().ok(),
+                            parse_u8_like(zs),
+                            parse_u32_like(xs),
                             parse_y_scale_ext(ys),
                         ) else {
                             return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
@@ -8172,8 +8375,8 @@ where
                     })
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
-                if let (Ok(z), Ok(x), Some((y, sc, _))) =
-                    (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
+                if let (Some(z), Some(x), Some((y, sc, _))) =
+                    (parse_u8_like(zs), parse_u32_like(xs), parse_y_scale_ext(ys))
                 {
                     attach_tile_geo_headers(&mut resp, tms, z, x, y, sc, &pq);
                 }
@@ -8517,8 +8720,10 @@ where
             .await,
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
-                    let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                    if crate::tms::lookup_tms(tms).is_none() {
+                    let explicit_tms = (sub.len() == 2).then_some(sub[0]);
+                    if let Some(tms) = explicit_tms
+                        && crate::tms::lookup_tms(tms).is_none()
+                    {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
                     let cogs = open_query_urls(&engine, &pq.urls).await?;
@@ -8528,30 +8733,60 @@ where
                     let coarsest = cogs[0].index.ifds.last().unwrap();
                     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
                         .max(full.height as f64 / coarsest.height.max(1) as f64);
-                    let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
-                        tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
-                    } else {
-                        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
-                    };
-                    let (minz, maxz) =
-                        resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
                     let fmt = pq.tile_format.as_deref().unwrap_or("png");
                     let scale = pq.tile_scale.unwrap_or(1);
                     let tile_q = filter_tile_template_query(&raw_query);
-                    let xml = build_wmts_capabilities(
-                        &host,
-                        "cog",
-                        tms,
-                        "Cloud Optimized GeoTIFF",
-                        bounds,
-                        minz,
-                        maxz,
-                        fmt,
-                        scale,
-                        &tile_q,
-                        &raw_query,
-                        pq.use_epsg,
-                    );
+                    let xml = if let Some(tms) = explicit_tms {
+                        let (def_min, def_max) = if let Some(tms_def) = crate::tms::lookup_tms(tms) {
+                            tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov_factor)
+                        } else {
+                            crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor)
+                        };
+                        let (minz, maxz) =
+                            resolve_zoom_range(def_min, def_max, pq.minzoom, pq.maxzoom);
+                        build_wmts_capabilities(
+                            &host,
+                            "cog",
+                            tms,
+                            "Cloud Optimized GeoTIFF",
+                            bounds,
+                            minz,
+                            maxz,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    } else {
+                        let entries: Vec<(&str, u8, u8)> = crate::tms::ALL_TMS
+                            .iter()
+                            .map(|t| {
+                                let (dmin, dmax) = t.zoom_range_for_cog(
+                                    &crs,
+                                    &full.pixel_to_crs,
+                                    full.width,
+                                    full.height,
+                                    ov_factor,
+                                );
+                                let (z0, z1) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                                (t.id, z0, z1)
+                            })
+                            .collect();
+                        build_wmts_capabilities_multi(
+                            &host,
+                            "cog",
+                            &entries,
+                            None,
+                            "Cloud Optimized GeoTIFF",
+                            bounds,
+                            fmt,
+                            scale,
+                            &tile_q,
+                            &raw_query,
+                            pq.use_epsg,
+                        )
+                    };
                     Ok((Bytes::from(xml), "application/xml"))
                 }
                 .await
@@ -8560,11 +8795,8 @@ where
             // 10. GET /cog/point/{lon},{lat} (supports coord_crs=EPSG:3857)
             (Method::GET, ["point", coord]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let Some((lons, lats)) = coord.split_once(',') else {
+                let Some((x, y)) = parse_point_coord(coord) else {
                     return Err(EngineError::BadRequest("expected /cog/point/{lon},{lat}".into()));
-                };
-                let (Ok(x), Ok(y)) = (lons.parse::<f64>(), lats.parse::<f64>()) else {
-                    return Err(EngineError::BadRequest("invalid lon,lat floats".into()));
                 };
                 let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
                 let mut json =
@@ -8656,9 +8888,7 @@ where
             }
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected /cog/preview/{w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
@@ -8810,9 +9040,7 @@ where
                 let Some((bbox, _)) = parse_bbox4(bbox_seg) else {
                     return Err(EngineError::BadRequest("invalid bbox coordinates".into()));
                 };
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected {w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
@@ -8936,9 +9164,7 @@ where
             }
             .await,
             (Method::POST, ["feature", dims_ext]) => async {
-                let Some((out_w, out_h, ext_opt)) = parse_wxh_ext(dims_ext) else {
-                    return Err(EngineError::BadRequest("expected /cog/feature/{w}x{h}.{ext}".into()));
-                };
+                let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
