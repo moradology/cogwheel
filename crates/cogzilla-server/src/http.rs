@@ -21,6 +21,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+#[cfg(test)]
+mod asset_query_pins;
 mod paint;
 #[allow(dead_code)]
 mod pixel_selection;
