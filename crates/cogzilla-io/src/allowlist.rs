@@ -18,7 +18,7 @@ pub const ALLOWLIST_RESOLVE_SYMLINKS_ENV: &str = "COGZILLA_ALLOWLIST_RESOLVE_SYM
 /// Normalize `file:///path` and `file://localhost/path` to `/path` (rejecting non-local hosts
 /// like `file://evil/share`). Returns `Ok(Some(path))` if `uri` is a local `file://` URI,
 /// `Ok(None)` if `uri` does not start with `file://`, or `Err(())` for a non-localhost `file://` host.
-pub(crate) fn strip_file_uri_prefix(uri: &str) -> Result<Option<&str>, ()> {
+pub fn strip_file_uri_prefix(uri: &str) -> Result<Option<&str>, ()> {
     let Some(rest) = uri.strip_prefix("file://") else {
         return Ok(None);
     };
@@ -46,8 +46,15 @@ fn resolve_symlinks_enabled() -> bool {
     })
 }
 
+fn is_vsi_uri(uri: &str) -> bool {
+    uri.starts_with("/vsicurl/")
+        || uri.starts_with("/vsis3/")
+        || uri.starts_with("/vsigs/")
+        || uri.starts_with("/vsiaz/")
+}
+
 fn is_local_candidate(uri: &str) -> bool {
-    !uri.contains("://") && !uri.starts_with("/vsi")
+    !uri.contains("://") && !is_vsi_uri(uri)
 }
 
 fn parse_prefixes(raw: &str) -> Vec<String> {
@@ -126,13 +133,17 @@ pub fn matches_any_prefix_with_opts(
         Err(()) => return false,
     };
 
-    // Unwrap GDAL `/vsicurl/http(s)://...` so it receives the exact same HTTP(S) canonicalization
-    // and prefix checks as bare `http(s)://` URLs; reject malformed `/vsicurl/` targets.
-    let (is_vsicurl, effective_uri) = if let Some(rest) = normalized_uri.strip_prefix("/vsicurl/") {
-        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
-            return false;
+    // Unwrap GDAL `/vsicurl/http(s)://...` only for non-`file://` URIs so `file:///vsicurl/...`
+    // is never treated as HTTP by the allowlist while opened as a local path by the backend.
+    let (is_vsicurl, effective_uri) = if !is_file_uri {
+        if let Some(rest) = normalized_uri.strip_prefix("/vsicurl/") {
+            if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+                return false;
+            }
+            (true, rest)
+        } else {
+            (false, normalized_uri)
         }
-        (true, rest)
     } else {
         (false, normalized_uri)
     };
@@ -167,12 +178,15 @@ pub fn matches_any_prefix_with_opts(
         cur = next;
     }
 
-    let matches_boundary = |candidate: &str| -> bool {
+    let matches_boundary = |candidate: &str, local_only: bool| -> bool {
         prefixes.iter().any(|raw_p| {
             let p = match strip_file_uri_prefix(raw_p.as_str()) {
                 Ok(Some(local_p)) => local_p,
                 _ => raw_p.as_str(),
             };
+            if local_only && !is_local_candidate(p) {
+                return false;
+            }
             match candidate.strip_prefix(p) {
                 Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
                 None => false,
@@ -180,40 +194,71 @@ pub fn matches_any_prefix_with_opts(
         })
     };
 
-    if !(matches_boundary(uri)
-        || (is_file_uri && matches_boundary(normalized_uri))
-        || (is_vsicurl && matches_boundary(effective_uri)))
-    {
+    let matched = if is_file_uri {
+        matches_boundary(normalized_uri, true)
+    } else {
+        matches_boundary(uri, false) || (is_vsicurl && matches_boundary(effective_uri, false))
+    };
+    if !matched {
         return false;
     }
 
-    // Opt-in symlink hardening (Z3): canonicalize local paths so symlinks inside an allowed
-    // directory pointing outside it are refused with 403.
-    if resolve_symlinks && is_local_candidate(effective_uri) {
+    // Opt-in symlink hardening (Z3): canonicalize local paths (and, when the leaf does not exist,
+    // the deepest existing ancestor) so symlinks inside an allowed directory pointing outside it
+    // are refused with 403 without leaking existence of files under an escaping symlinked parent.
+    if resolve_symlinks && (is_file_uri || is_local_candidate(effective_uri)) {
+        let canon_matches_local_prefix = |canon_str: &str| -> bool {
+            prefixes.iter().any(|raw_p| {
+                let p = match strip_file_uri_prefix(raw_p.as_str()) {
+                    Ok(Some(local_p)) => local_p,
+                    _ => raw_p.as_str(),
+                };
+                if !is_local_candidate(p) {
+                    return false;
+                }
+                let cp = std::fs::canonicalize(p)
+                    .map(|pb| pb.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| p.to_string());
+                match canon_str.strip_prefix(cp.as_str()) {
+                    Some(rest) => rest.is_empty() || cp.ends_with('/') || rest.starts_with('/'),
+                    None => false,
+                }
+            })
+        };
         match std::fs::canonicalize(effective_uri) {
             Ok(canon) => {
-                let canon_str = canon.to_string_lossy();
-                let canon_ok = prefixes.iter().any(|raw_p| {
-                    let p = match strip_file_uri_prefix(raw_p.as_str()) {
-                        Ok(Some(local_p)) => local_p,
-                        _ => raw_p.as_str(),
-                    };
-                    if !is_local_candidate(p) {
-                        return false;
-                    }
-                    let cp = std::fs::canonicalize(p)
-                        .map(|pb| pb.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| p.to_string());
-                    match canon_str.strip_prefix(cp.as_str()) {
-                        Some(rest) => rest.is_empty() || cp.ends_with('/') || rest.starts_with('/'),
-                        None => false,
-                    }
-                });
-                if !canon_ok {
+                if !canon_matches_local_prefix(&canon.to_string_lossy()) {
                     return false;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Reject dangling symlinks outright (target could be outside the allowlist).
+                if let Ok(meta) = std::fs::symlink_metadata(effective_uri)
+                    && meta.file_type().is_symlink()
+                {
+                    return false;
+                }
+                // Walk up to the deepest existing ancestor and verify it stays inside an allowed
+                // local prefix (prevents `/allowed/link/missing` -> 404 vs `/allowed/link/exist` -> 403).
+                let mut cur_path = std::path::Path::new(effective_uri);
+                while let Some(parent) = cur_path.parent() {
+                    if parent.as_os_str().is_empty() {
+                        break;
+                    }
+                    match std::fs::canonicalize(parent) {
+                        Ok(canon_parent) => {
+                            if !canon_matches_local_prefix(&canon_parent.to_string_lossy()) {
+                                return false;
+                            }
+                            break;
+                        }
+                        Err(pe) if pe.kind() == std::io::ErrorKind::NotFound => {
+                            cur_path = parent;
+                        }
+                        Err(_) => return false,
+                    }
+                }
+            }
             Err(_) => return false,
         }
     }
@@ -227,8 +272,8 @@ pub fn matches_any_prefix_with_opts(
         if parsed.path().split('/').any(|seg| seg == "..") {
             return false;
         }
-        let parsed_ok = matches_boundary(parsed.as_str())
-            || (is_vsicurl && matches_boundary(&format!("/vsicurl/{}", parsed.as_str())));
+        let parsed_ok = matches_boundary(parsed.as_str(), false)
+            || (is_vsicurl && matches_boundary(&format!("/vsicurl/{}", parsed.as_str()), false));
         if !parsed_ok {
             return false;
         }
@@ -372,6 +417,18 @@ mod tests {
         assert!(matches_any_prefix(&p_file, "file:///allowed/dir/a.tif"));
         assert!(matches_any_prefix(&p_file, "file://localhost/allowed/dir/a.tif"));
         assert!(!matches_any_prefix(&p_file, "/allowed/other/a.tif"));
+
+        // `file://` URIs must never match remote HTTP or GDAL VSI prefixes (parser differential).
+        let p_remote = list(&["https://allowed.example/", "/vsis3/bucket/"]);
+        assert!(!matches_any_prefix(
+            &p_remote,
+            "file:///vsicurl/https://allowed.example/a.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &p_remote,
+            "file://localhost/vsicurl/https://allowed.example/a.tif"
+        ));
+        assert!(!matches_any_prefix(&p_remote, "file:///vsis3/bucket/a.tif"));
     }
 
     #[cfg(unix)]
@@ -416,6 +473,30 @@ mod tests {
         assert!(matches_any_prefix_with_opts(
             &prefixes,
             &missing.to_string_lossy(),
+            true
+        ));
+
+        // Symlinked parent dir pointing outside: both existing and missing leaves are refused (403),
+        // preventing a 403-vs-404 existence oracle.
+        let dir_link = allowed.join("dir_link");
+        symlink(&outside, &dir_link).unwrap();
+        assert!(!matches_any_prefix_with_opts(
+            &prefixes,
+            &dir_link.join("secret.tif").to_string_lossy(),
+            true
+        ));
+        assert!(!matches_any_prefix_with_opts(
+            &prefixes,
+            &dir_link.join("does_not_exist.tif").to_string_lossy(),
+            true
+        ));
+
+        // Dangling symlink pointing outside is refused (403).
+        let dangling = allowed.join("dangling.tif");
+        symlink(outside.join("nonexistent.tif"), &dangling).unwrap();
+        assert!(!matches_any_prefix_with_opts(
+            &prefixes,
+            &dangling.to_string_lossy(),
             true
         ));
 

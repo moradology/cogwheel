@@ -9,6 +9,7 @@ pub mod store;
 
 pub use allowlist::{
     ALLOWED_URL_PREFIXES_ENV, ALLOWLIST_RESOLVE_SYMLINKS_ENV, allowlist_enabled, check_uri_allowed,
+    strip_file_uri_prefix,
 };
 pub use backend::{
     CogSource, IoError, IoMetrics, RangeResponse, RemoteValidator, TileByteReq, coalesce_ranges,
