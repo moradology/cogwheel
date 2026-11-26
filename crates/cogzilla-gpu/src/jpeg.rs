@@ -661,13 +661,23 @@ impl GpuJpegEncoder {
         self.encode_rgba8_from_buffer_inner(src_buf, width, height, quality)
     }
 
-    fn encode_rgba8_from_buffer_inner(
+    /// Record the GPU 4:2:0 YCbCr + 8×8 FDCT + Quantize + Zigzag compute pass and staging copy
+    /// directly into an existing `CommandEncoder` reading from a GPU-resident RGBA8 `STORAGE`
+    /// buffer. Returns the staging byte count to pass to [`Self::readback_jpeg`] after submitting
+    /// the encoder.
+    pub fn record_encode_rgba8_from_buffer(
         &mut self,
+        encoder: &mut wgpu::CommandEncoder,
         src_buf: &wgpu::Buffer,
         width: u32,
         height: u32,
         quality: u8,
-    ) -> Result<Vec<u8>, GpuError> {
+    ) -> Result<u64, GpuError> {
+        if width == 0 || height == 0 || width > 65535 || height > 65535 {
+            return Err(GpuError::InvalidDimensions(
+                "invalid RGBA8 dimensions for GPU JPEG".into(),
+            ));
+        }
         let mcu_w = width.div_ceil(16);
         let mcu_h = height.div_ceil(16);
         let total_mcus = (mcu_w as usize) * (mcu_h as usize);
@@ -715,11 +725,6 @@ impl GpuJpegEncoder {
         });
 
         let out_bytes = (total_words * 4) as u64;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-jpeg-enc"),
-            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cogzilla-jpeg-pass"),
@@ -730,8 +735,18 @@ impl GpuJpegEncoder {
             pass.dispatch_workgroups(mcu_w, mcu_h, 1);
         }
         encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging_buf, 0, out_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        Ok(out_bytes)
+    }
 
+    /// Map the JPEG staging buffer after submitting an encoder recorded with
+    /// [`Self::record_encode_rgba8_from_buffer`] and emit the Baseline JFIF `.jpg` bytes.
+    pub fn readback_jpeg(
+        &self,
+        out_bytes: u64,
+        width: u32,
+        height: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, GpuError> {
         let slice = self.staging_buf.slice(..out_bytes);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -747,6 +762,24 @@ impl GpuJpegEncoder {
         drop(mapped);
         self.staging_buf.unmap();
         Ok(jpg)
+    }
+
+    fn encode_rgba8_from_buffer_inner(
+        &mut self,
+        src_buf: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, GpuError> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cogzilla-jpeg-enc"),
+            });
+        let out_bytes =
+            self.record_encode_rgba8_from_buffer(&mut encoder, src_buf, width, height, quality)?;
+        self.queue.submit(Some(encoder.finish()));
+        self.readback_jpeg(out_bytes, width, height, quality)
     }
 }
 
