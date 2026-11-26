@@ -339,6 +339,9 @@ impl TagEntry {
     }
 
     fn read_ascii(&self, r: &Reader<'_>) -> Result<String, TiffError> {
+        if !matches!(self.ty, TYPE_ASCII | TYPE_BYTE | TYPE_UNDEFINED) {
+            return Err(TiffError::Corrupt("unexpected TIFF field type for ASCII tag"));
+        }
         if self.count > MAX_TAG_ARRAY_BYTES {
             return Err(TiffError::Corrupt("ASCII tag exceeds max size"));
         }
@@ -669,7 +672,12 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
                 TAG_COLOR_MAP => {
-                    if color_map.is_none() && entry.count > 0 && entry.count % 3 == 0 && entry.count <= 3 * 65_536 {
+                    if ifds.is_empty()
+                        && color_map.is_none()
+                        && entry.count > 0
+                        && entry.count % 3 == 0
+                        && entry.count <= 3 * 65_536
+                    {
                         charge_tag(entry.count, 2)?;
                         let vals = entry.read_u16_vec(&r)?;
                         let n = vals.len() / 3;
@@ -1021,10 +1029,14 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     },
                     None,
                 )
-            } else if let (Some(ps), Some(tp)) = (pixel_scale.as_ref(), tiepoint.as_ref()) {
-                if ps.len() < 2 || tp.len() < 6 {
-                    return Err(TiffError::MissingGeoTransform);
-                }
+            } else if let (Some(ps), Some(tp)) = (pixel_scale.as_ref(), tiepoint.as_ref())
+                && ps.len() >= 2
+                && ps[0].is_finite()
+                && ps[1].is_finite()
+                && ps[0] != 0.0
+                && ps[1] != 0.0
+                && tp.len() >= 6
+            {
                 let sx = ps[0];
                 let sy = -ps[1];
                 let mut c = tp[3] - tp[0] * sx;
@@ -1364,5 +1376,24 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes());
         let err = parse_cog(&buf).unwrap_err();
         assert!(matches!(err, TiffError::Corrupt("duplicate TIFF tag in IFD")), "got {err:?}");
+    }
+
+    #[test]
+    fn unknown_field_type_on_ascii_tag_is_rejected_without_range_fetch() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+        buf.extend_from_slice(&TAG_GDAL_NODATA.to_le_bytes());
+        buf.extend_from_slice(&99u16.to_le_bytes()); // unknown TIFF field type
+        buf.extend_from_slice(&33_554_432u32.to_le_bytes()); // 32 MiB count
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(
+            matches!(err, TiffError::Corrupt("unexpected TIFF field type for ASCII tag")),
+            "expected Corrupt(unexpected TIFF field type for ASCII tag), got {err:?}"
+        );
     }
 }
