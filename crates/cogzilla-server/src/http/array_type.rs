@@ -56,7 +56,10 @@ pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> +
             }
             rest = &rest[at + 1 + digits..];
         }
-        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
+        !e.contains("**")
+            && !e
+                .bytes()
+                .any(|c| c == b'/' || c == b'.' || c == b'^' || (c.is_ascii_alphabetic() && c != b'b'))
     };
     // float32 stays float32 through operations and functions alike; a literal with a
     // fraction or an exponent is a double and makes the result one.
@@ -76,6 +79,16 @@ pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> +
     }
 }
 
+/// Whether a request turns values into a picture's bytes: a rescale, a colour map, a colour
+/// formula. TiTiler's array of such a request is those bytes.
+pub(super) fn shown(pq: &ParsedQuery) -> bool {
+    !pq.rescale.is_empty()
+        || pq.colormap_explicit
+        || pq.colormap_name_set
+        || pq.custom_colormap_json.is_some()
+        || pq.color_formula.is_some()
+}
+
 /// What decides the type of a `/cog` or `/stac` array, read from the request.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ArrayRule {
@@ -90,12 +103,7 @@ impl ArrayRule {
     /// picture's bytes (a rescale, a colour map, a colour formula) or into an algorithm's
     /// output, or does band math on single assets: those arrays are written as they are.
     pub(super) fn of(pq: &ParsedQuery) -> Option<Self> {
-        let shown = !pq.rescale.is_empty()
-            || pq.colormap_explicit
-            || pq.colormap_name_set
-            || pq.custom_colormap_json.is_some()
-            || pq.color_formula.is_some();
-        if shown || pq.algorithm.is_some() || !pq.asset_exprs.is_empty() {
+        if shown(pq) || pq.algorithm.is_some() || !pq.asset_exprs.is_empty() {
             return None;
         }
         Some(match pq.expr_raw {
@@ -151,6 +159,10 @@ mod tests {
         assert_eq!(kind("b1/2", T::Float32), T::Float32);
         assert_eq!(kind("b1*0.5", T::Float32), T::Float64);
         assert_eq!(kind("b1*2", T::Int32), T::Float64);
+        assert_eq!(kind("b1**-1", T::Uint16), T::Float64);
+        assert_eq!(kind("b1^-1", T::Uint8), T::Float64);
+        assert_eq!(kind("b1**3", T::Uint16), T::Float64);
+        assert_eq!(kind("b1**-1", T::Float32), T::Float32);
     }
 
     #[test]

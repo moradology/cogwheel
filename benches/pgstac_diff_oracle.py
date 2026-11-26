@@ -1268,6 +1268,8 @@ def main() -> int:
         o.check("item preview as an array, three bands of bytes", "image", f"{it}/preview.npy?assets=visual&max_size=128")
         o.check("item preview as an array, two assets", "image", f"{it}/preview.npy?assets=red&assets=nir&max_size=128")
         o.check("item preview as a GeoTIFF, in the data's type", "image", f"{it}/preview.tif?assets=red&max_size=128")
+        o.check("item preview as an array, rescaled", "image", f"{it}/preview.npy?assets=red&rescale=0,3000&max_size=128")
+        o.check("item preview as an array, under a colour map", "image", f"{it}/preview.npy?assets=red&rescale=0,3000&colormap_name=viridis&max_size=128")
         o.check("item preview as a GeoTIFF, band math", "image", f"{it}/preview.tif?assets=red&assets=nir&asset_as_band=true&expression=b2-b1&max_size=128")
         o.check("item tile as an array, in the data's type", "image", f"{itile}.npy?assets=red")
         o.check("item tile as an array, three bands of bytes", "image", f"{itile}.npy?assets=visual")
