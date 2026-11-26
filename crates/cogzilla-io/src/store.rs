@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cogzilla_codec::{
-    DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile_rows,
-    decode_tile_rows,
+    BandData, DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile_rows,
+    decode_tile_rows_exact as decode_tile_rows,
 };
 use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog, parse_cog_sparse};
 use dashmap::DashMap;
@@ -32,7 +32,11 @@ enum SidecarTileRange {
 
 fn mark_tile_all_nodata(tile: &mut DecodedTile) {
     for b in &mut tile.bands {
-        b.data.make_f32_mut().fill(f32::NAN);
+        if let BandData::F64(ref mut s) = b.data {
+            s.fill(f64::NAN);
+        } else {
+            b.data.make_f32_mut().fill(f32::NAN);
+        }
         b.stats = cogzilla_codec::BlockStats::ALL_NODATA;
     }
 }
@@ -1069,7 +1073,7 @@ impl CogStore {
                             slice,
                             ifd,
                             cog.index.byte_order,
-                            cog.index.nodata,
+                            cog.index.nodata_f64,
                             rows,
                         )?;
                         if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
@@ -1304,7 +1308,7 @@ impl CogStore {
                 if heavy_block && no_sidecar_mask {
                     let decode_meta = Arc::new(clone_for_decode(ifd));
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     let mut decode_set = tokio::task::JoinSet::new();
                     let mut decode_err: Option<IoError> = None;
 
@@ -1381,7 +1385,7 @@ impl CogStore {
                 {
                     let decode_meta = Arc::new(clone_for_decode(ifd));
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     let mut decode_set = tokio::task::JoinSet::new();
                     let mut decode_err: Option<IoError> = None;
 
@@ -1453,7 +1457,7 @@ impl CogStore {
                     // Zero-copy inline mmap decode (covers single-block, 1-vCPU, trivial
                     // uncompressed blocks, and local COGs with an internal mask_ifd).
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
                         let decode_res: Result<DecodedTile, IoError> = (|| {
                             let Some(slice) = cog.source.local_slice(offset, count) else {
@@ -1573,7 +1577,7 @@ impl CogStore {
                         if !disk_candidates.is_empty() {
                             let meta = Arc::new(clone_for_decode(ifd));
                             let byte_order = cog.index.byte_order;
-                            let nodata = cog.index.nodata;
+                            let nodata = cog.index.nodata_f64;
                             let max_disk_conc = std::thread::available_parallelism()
                                 .map(|n| n.get())
                                 .unwrap_or(4)
@@ -1683,7 +1687,7 @@ impl CogStore {
                     > = tokio::task::JoinSet::new();
                     let mut decode_meta_opt: Option<Arc<IfdMeta>> = None;
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     let mut fetch_err: Option<IoError> = None;
 
                     let remote_val = cog.remote_validator().cloned();

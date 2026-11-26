@@ -66,7 +66,9 @@ pub enum OutputFormat {
     /// JPEG (lossy quality `1..=100`, default `85`).
     Jpeg { quality: u8 },
     RawF32,
-    /// NumPy v1.0 `.npy` float32 array (`shape = (C, H, W)`, little-endian `<f4`).
+    /// Raw CHW little-endian `f64` array (`8` bytes/sample), used for unstyled wide-dtype GeoTIFFs.
+    RawF64,
+    /// NumPy v1.0 `.npy` array (`shape = (C, H, W)`).
     Npy,
     /// Uncompressed RGBA8 (`N * N * 4` bytes), used internally for multi-scene mosaic compositing.
     RawRgba,
@@ -1614,6 +1616,115 @@ pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes>
     Some(Bytes::from(out))
 }
 
+/// Like [`encode_npy_typed`], taking full-precision CHW `f64` values (preserving exact
+/// `uint32`/`int32`/`int64` up to ±2^53 and 17-digit `float64` without `f32` quantization).
+pub fn encode_npy_typed_f64(
+    values: &[f64],
+    bands: usize,
+    height: usize,
+    width: usize,
+    kind: SampleType,
+    absent: Option<f64>,
+    mask: bool,
+) -> Bytes {
+    let pixels = width * height;
+    let planes = bands + usize::from(mask);
+    let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
+    out.extend_from_slice(&hdr);
+    let absent = absent.unwrap_or(0.0);
+    let data = &values[..(bands * pixels).min(values.len())];
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for &v in data {
+                let x: $t = cast(if v.is_nan() { absent } else { v });
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if mask {
+                for i in 0..pixels {
+                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+    Bytes::from(out)
+}
+
+/// Full-precision `f64` point/resampling sampler for wide dtypes (`Uint32`, `Int32`, `Uint64`,
+/// `Int64`, `Float64`) on data-array routes (`.npy` / unstyled data `.tif`).
+#[inline]
+pub fn sample_f64_general(
+    src: &BandSource<'_>,
+    u: f64,
+    v: f64,
+    mode: ResampleMode,
+) -> f64 {
+    if !u.is_finite() || !v.is_finite() {
+        return f64::NAN;
+    }
+    if u < -0.5 || v < -0.5 || u > src.ifd_w as f64 - 0.5 || v > src.ifd_h as f64 - 0.5 {
+        return f64::NAN;
+    }
+    match mode {
+        ResampleMode::Nearest => {
+            let ix = (u + 0.5).floor() as i32;
+            let iy = (v + 0.5).floor() as i32;
+            src.sample_f64_checked(ix, iy)
+        }
+        ResampleMode::Bilinear => {
+            let x0 = u.floor() as i32;
+            let y0 = v.floor() as i32;
+            let fx = u - x0 as f64;
+            let fy = v - y0 as f64;
+            let s00 = src.sample_f64_checked(x0, y0);
+            let s10 = src.sample_f64_checked(x0 + 1, y0);
+            let s01 = src.sample_f64_checked(x0, y0 + 1);
+            let s11 = src.sample_f64_checked(x0 + 1, y0 + 1);
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w10 = fx * (1.0 - fy);
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+            let mut sum = 0.0f64;
+            let mut wsum = 0.0f64;
+            for (s, w) in [(s00, w00), (s10, w10), (s01, w01), (s11, w11)] {
+                if !s.is_nan() {
+                    sum += s * w;
+                    wsum += w;
+                }
+            }
+            if wsum > 1e-12 { sum / wsum } else { f64::NAN }
+        }
+        _ => {
+            // For higher-order / footprint modes on wide dtypes, fall back to nearest when exact
+            // 1:1 or bilinear in f64 to avoid f32 quantization on large integers/doubles.
+            let x0 = u.floor() as i32;
+            let y0 = v.floor() as i32;
+            let fx = u - x0 as f64;
+            let fy = v - y0 as f64;
+            if fx.abs() < 1e-6 && fy.abs() < 1e-6 {
+                src.sample_f64_checked(x0, y0)
+            } else {
+                sample_f64_general(src, u, v, ResampleMode::Bilinear)
+            }
+        }
+    }
+}
+
 /// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes.
 pub fn wrap_raw_f32_as_npy(raw: Bytes, bands: usize, height: u32, width: u32) -> Bytes {
     wrap_raw_f32_as_npy_with_mask(raw, bands, height, width, false)
@@ -1668,7 +1779,7 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
         OutputFormat::Png => empty_transparent_png(tile_size),
         OutputFormat::Webp { .. } => empty_transparent_webp(tile_size),
         OutputFormat::Jpeg { .. } => empty_black_jpeg(tile_size),
-        OutputFormat::RawF32 => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 => {
             let build = |sz: u32, nb: usize| -> Bytes {
                 let count = (sz as usize) * (sz as usize) * nb;
                 let mut buf = BytesMut::with_capacity(count * 4);
@@ -1778,7 +1889,7 @@ pub fn encode_rgba_tile(rgba: &[u8], size: u32, all_opaque: bool, format: Output
         }
         OutputFormat::Webp { quality } => encode_webp_rgba(size, size, rgba, quality),
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(size, size, rgba, quality),
-        OutputFormat::RawRgba | OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawRgba | OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             Bytes::copy_from_slice(rgba)
         }
     }
@@ -1807,7 +1918,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
             let max_y = (blk.height() as i32 - 1).max(0);
             let br_f = blk.base_row() as f32;
             match style.format {
-                OutputFormat::RawF32 | OutputFormat::Npy => {
+                OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
                     let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
@@ -1989,7 +2100,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
             (plan, SingleBlockRef::from_source(src))
         {
             match style.format {
-                OutputFormat::RawF32 | OutputFormat::Npy => {
+                OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
                     let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
@@ -2076,7 +2187,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
     }
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -3270,6 +3381,14 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
                         )
                     }
                 }
+                cogzilla_codec::BandData::F64(s) => unsafe {
+                    (
+                        *s.get_unchecked(p00) as f32,
+                        *s.get_unchecked(p00 + 1) as f32,
+                        *s.get_unchecked(p01) as f32,
+                        *s.get_unchecked(p01 + 1) as f32,
+                    )
+                },
                 cogzilla_codec::BandData::U16 { data, .. } => unsafe {
                     (
                         *data.get_unchecked(p00) as f32,
@@ -3670,7 +3789,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
     let mins = style.rescale_min;
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 3 * 4);
             for b in 0..3 {
                 for py in 0..N {
@@ -3874,7 +3993,7 @@ fn render_rgb_cubic<const N: usize>(
         }
     };
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 12);
             for b in 0..3 {
                 for py in 0..N {
@@ -3965,7 +4084,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
     let min_val = style.rescale_min;
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -4177,7 +4296,7 @@ pub fn render_sar_rgb<const N: usize>(
     };
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let plane_bytes = N * N * 4;
             let mut out = vec![0u8; plane_bytes * 3];
             let (r_plane, rest) = out.split_at_mut(plane_bytes);
@@ -4554,7 +4673,7 @@ pub fn render_expr_vm<const N: usize>(
     };
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 sample_row(py, &mut band_rows);
@@ -4873,7 +4992,7 @@ pub fn render_terrain_tile<const N: usize>(
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             }
         }),
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
             let plane_bytes = N * N * 4;
             let mut out = vec![0u8; plane_bytes * 3];
             let (r_plane, rest) = out.split_at_mut(plane_bytes);
@@ -5488,7 +5607,7 @@ pub fn render_dem_algorithm<const N: usize>(
         let lut = style.colormap.lut();
 
         match style.format {
-            OutputFormat::RawF32 | OutputFormat::Npy => {
+            OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy => {
                 let mut out = BytesMut::with_capacity(N * N * 4);
                 for py in 0..N {
                     let r0 = py * pad;

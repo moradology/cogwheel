@@ -1117,15 +1117,15 @@ pub async fn query_point(
     let ly = (row as u32) % ifd.tile_height;
     let pidx = (ly as usize) * (ifd.tile_width as usize) + (lx as usize);
 
-    let maybe_unscale = |b: usize, v: f32| -> f32 {
+    let maybe_unscale = |b: usize, v: f64| -> f64 {
         if let Some(nd) = nodata_override {
-            if !nd.is_nan() && v == nd {
-                return f32::NAN;
+            if !nd.is_nan() && v == nd as f64 {
+                return f64::NAN;
             }
         }
         if unscale && !v.is_nan() {
-            let sc = cog.index.scales.get(b).copied().unwrap_or(1.0);
-            let off = cog.index.offsets.get(b).copied().unwrap_or(0.0);
+            let sc = cog.index.scales_f64.get(b).copied().unwrap_or(1.0);
+            let off = cog.index.offsets_f64.get(b).copied().unwrap_or(0.0);
             v * sc + off
         } else {
             v
@@ -1143,8 +1143,8 @@ pub async fn query_point(
                     tiles[0]
                         .as_ref()
                         .and_then(|t| t.bands.get(b))
-                        .map(|band| band.data.get_f32(pidx))
-                        .unwrap_or(f32::NAN),
+                        .map(|band| band.data.get_f64(pidx))
+                        .unwrap_or(f64::NAN),
                 );
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
@@ -1165,8 +1165,8 @@ pub async fn query_point(
                     tiles[slot]
                         .as_ref()
                         .and_then(|t| t.bands.first())
-                        .map(|band| band.data.get_f32(pidx))
-                        .unwrap_or(f32::NAN),
+                        .map(|band| band.data.get_f64(pidx))
+                        .unwrap_or(f64::NAN),
                 );
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
@@ -1191,6 +1191,7 @@ enum BandStatsAcc {
     HistU8([u64; 256]),
     HistU16(Vec<u64>),
     Floats(Vec<f32>),
+    Floats64(Vec<f64>),
 }
 
 impl BandStatsAcc {
@@ -1200,6 +1201,7 @@ impl BandStatsAcc {
             | cogzilla_tiff::SampleType::Uint4
             | cogzilla_tiff::SampleType::Uint8 => Self::HistU8([0u64; 256]),
             cogzilla_tiff::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
+            s if s.needs_f64() => Self::Floats64(Vec::with_capacity(capacity_hint)),
             _ => Self::Floats(Vec::with_capacity(capacity_hint)),
         }
     }
@@ -1304,6 +1306,23 @@ impl BandStatsAcc {
                             if v.is_finite() && nd_ov != Some(v) {
                                 vals.push(v);
                             }
+                        }
+                    }
+                }
+            }
+            (Self::Floats64(vals), other) => {
+                let nd_ov = nodata_override.filter(|v| !v.is_nan()).map(|v| v as f64);
+                let sc = scale as f64;
+                let off = offset as f64;
+                for ly in 0..y_max {
+                    let base = ly * tw;
+                    for lx in 0..x_max {
+                        let mut v = other.get_f64(base + lx);
+                        if v.is_finite() && nd_ov != Some(v) {
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            vals.push(v);
                         }
                     }
                 }
@@ -1434,6 +1453,26 @@ impl BandStatsAcc {
                     }
                 }
             }
+            (Self::Floats64(vals), other) => {
+                let nd_ov = nodata_override.filter(|v| !v.is_nan()).map(|v| v as f64);
+                let sc = scale as f64;
+                let off = offset as f64;
+                for ly in 0..y_max {
+                    let mrow = &mask_bits[ly * x_max..(ly + 1) * x_max];
+                    let base = ly * tw;
+                    for lx in 0..x_max {
+                        if mrow[lx] != 0 {
+                            let mut v = other.get_f64(base + lx);
+                            if v.is_finite() && nd_ov != Some(v) {
+                                if unscale {
+                                    v = v * sc + off;
+                                }
+                                vals.push(v);
+                            }
+                        }
+                    }
+                }
+            }
             (acc, other) => {
                 let nd_ov = nodata_override.filter(|v| !v.is_nan());
                 for ly in 0..y_max {
@@ -1454,6 +1493,7 @@ impl BandStatsAcc {
                                         }
                                         vals.push(v);
                                     }
+                                    Self::Floats64(_) => unreachable!(),
                                 }
                             }
                         }
@@ -1498,16 +1538,27 @@ impl BandStatsAcc {
                     None => true,
                 };
                 if keep {
-                    let mut v = data.get_f32(base + lx);
-                    if v.is_finite() && nd_ov != Some(v) {
-                        match self {
-                            Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
-                            Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
-                            Self::Floats(vals) => {
-                                if unscale {
-                                    v = v * scale + offset;
+                    if let Self::Floats64(vals) = self {
+                        let mut v = data.get_f64(base + lx);
+                        if v.is_finite() && nd_ov.map(|n| n as f64) != Some(v) {
+                            if unscale {
+                                v = v * (scale as f64) + (offset as f64);
+                            }
+                            vals.push(v);
+                        }
+                    } else {
+                        let mut v = data.get_f32(base + lx);
+                        if v.is_finite() && nd_ov != Some(v) {
+                            match self {
+                                Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
+                                Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
+                                Self::Floats(vals) => {
+                                    if unscale {
+                                        v = v * scale + offset;
+                                    }
+                                    vals.push(v);
                                 }
-                                vals.push(v);
+                                Self::Floats64(_) => unreachable!(),
                             }
                         }
                     }
@@ -1533,16 +1584,27 @@ impl BandStatsAcc {
         for &ly in ys {
             let base = ly * tw;
             for &lx in xs {
-                let mut v = data.get_f32(base + lx);
-                if v.is_finite() && nd_ov != Some(v) {
-                    match self {
-                        Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
-                        Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
-                        Self::Floats(vals) => {
-                            if unscale {
-                                v = v * scale + offset;
+                if let Self::Floats64(vals) = self {
+                    let mut v = data.get_f64(base + lx);
+                    if v.is_finite() && nd_ov.map(|n| n as f64) != Some(v) {
+                        if unscale {
+                            v = v * (scale as f64) + (offset as f64);
+                        }
+                        vals.push(v);
+                    }
+                } else {
+                    let mut v = data.get_f32(base + lx);
+                    if v.is_finite() && nd_ov != Some(v) {
+                        match self {
+                            Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
+                            Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
+                            Self::Floats(vals) => {
+                                if unscale {
+                                    v = v * scale + offset;
+                                }
+                                vals.push(v);
                             }
-                            vals.push(v);
+                            Self::Floats64(_) => unreachable!(),
                         }
                     }
                 }
@@ -2011,6 +2073,158 @@ impl BandStatsAcc {
                     }
                     let edges: Vec<f64> = (0..=n_bins)
                         .map(|i| h_min + span * (i as f64 / n_bins as f64))
+                        .collect();
+                    (counts, edges)
+                };
+                let std = (var_sum / (valid_px as f64)).sqrt();
+
+                let med_idx = valid_px / 2;
+                let median = vals[med_idx];
+                let mut obj = serde_json::Map::new();
+                obj.insert("min".into(), serde_json::json!(min));
+                obj.insert("max".into(), serde_json::json!(max));
+                obj.insert("mean".into(), serde_json::json!(mean));
+                obj.insert("count".into(), serde_json::json!(valid_px));
+                obj.insert("sum".into(), serde_json::json!(sum));
+                obj.insert("std".into(), serde_json::json!(std));
+                obj.insert("median".into(), serde_json::json!(median));
+                obj.insert("majority".into(), serde_json::json!(maj_val));
+                obj.insert("minority".into(), serde_json::json!(min_val));
+                obj.insert("unique".into(), serde_json::json!(unique));
+                obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
+                obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
+                obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
+                for &p in &opts.percentiles {
+                    let idx = (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize)
+                        .min(valid_px - 1);
+                    obj.insert(percentile_key(p), serde_json::json!(vals[idx]));
+                }
+                if let Some(cats) = categories {
+                    obj.insert(
+                        "histogram".into(),
+                        build_categorical_histogram(&cat_observed, &opts.categories),
+                    );
+                    obj.insert("categories".into(), serde_json::Value::Object(cats));
+                } else {
+                    obj.insert("histogram".into(), serde_json::json!([counts, edges]));
+                }
+                obj.insert("description".into(), serde_json::json!(description));
+                serde_json::Value::Object(obj)
+            }
+            Self::Floats64(mut vals) => {
+                let valid_px = vals.len();
+                let masked_px = denom_pixels.saturating_sub(valid_px);
+                let valid_pct = if denom_pixels > 0 {
+                    (valid_px as f64 / denom_pixels as f64) * 100.0
+                } else {
+                    0.0
+                };
+                if valid_px == 0 {
+                    return empty_band_stats_json(masked_px, description, opts);
+                }
+                vals.sort_unstable_by(|a, b| a.total_cmp(b));
+                let min = vals[0];
+                let max = vals[valid_px - 1];
+                let mut sum = 0.0f64;
+                let mut unique = 0usize;
+                let mut maj_val = min;
+                let mut maj_cnt = 0usize;
+                let mut min_val = min;
+                let mut min_cnt = usize::MAX;
+                let mut run_val = min;
+                let mut run_cnt = 0usize;
+                let mut categories = if opts.categorical {
+                    Some(serde_json::Map::new())
+                } else {
+                    None
+                };
+                let mut cat_observed: Vec<(f64, u64)> = Vec::new();
+                for &v in &vals {
+                    sum += v;
+                    if v == run_val {
+                        run_cnt += 1;
+                    } else {
+                        unique += 1;
+                        if let Some(ref mut cats) = categories {
+                            cat_observed.push((run_val, run_cnt as u64));
+                            if matches_category_filter(run_val, &opts.categories) {
+                                cats.insert(format_category_key(run_val), serde_json::json!(run_cnt));
+                            }
+                        }
+                        if run_cnt > maj_cnt {
+                            maj_cnt = run_cnt;
+                            maj_val = run_val;
+                        }
+                        if run_cnt < min_cnt {
+                            min_cnt = run_cnt;
+                            min_val = run_val;
+                        }
+                        run_val = v;
+                        run_cnt = 1;
+                    }
+                }
+                unique += 1;
+                if let Some(ref mut cats) = categories {
+                    cat_observed.push((run_val, run_cnt as u64));
+                    if matches_category_filter(run_val, &opts.categories) {
+                        cats.insert(format_category_key(run_val), serde_json::json!(run_cnt));
+                    }
+                }
+                if run_cnt > maj_cnt {
+                    maj_val = run_val;
+                }
+                if run_cnt < min_cnt {
+                    min_val = run_val;
+                }
+                let mean = sum / (valid_px as f64);
+                let mut var_sum = 0.0f64;
+                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
+                    && custom_edges.len() >= 2
+                {
+                    let mut counts = vec![0u64; custom_edges.len() - 1];
+                    for &v in &vals {
+                        let d = v - mean;
+                        var_sum += d * d;
+                        if let Some(bin) = bin_into_edges(custom_edges, v) {
+                            counts[bin] += 1;
+                        }
+                    }
+                    (counts, custom_edges.clone())
+                } else {
+                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min, max));
+                    let n_bins = opts.histogram_bins.clamp(1, 1000);
+                    let mut counts = vec![0u64; n_bins];
+                    let raw_span = h_max - h_min;
+                    let step = if raw_span.is_finite() {
+                        raw_span.max(1e-12) / (n_bins as f64)
+                    } else {
+                        (h_max / (n_bins as f64)) - (h_min / (n_bins as f64))
+                    };
+                    for &v in &vals {
+                        let d = v - mean;
+                        var_sum += d * d;
+                        if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
+                            let bin = if step.is_finite() && step > 0.0 {
+                                let off = if (v - h_min).is_finite() {
+                                    (v - h_min) / step
+                                } else {
+                                    (v / step) - (h_min / step)
+                                };
+                                off.floor().clamp(0.0, (n_bins - 1) as f64) as usize
+                            } else {
+                                0
+                            };
+                            counts[bin] += 1;
+                        }
+                    }
+                    let edges: Vec<f64> = (0..=n_bins)
+                        .map(|i| {
+                            if i == n_bins {
+                                h_max
+                            } else {
+                                h_min + step * (i as f64)
+                            }
+                        })
                         .collect();
                     (counts, edges)
                 };
@@ -4745,10 +4959,289 @@ pub(crate) fn encode_rgba_output(
             }
         }
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
-        OutputFormat::RawF32 | OutputFormat::Npy | OutputFormat::RawRgba => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::RawRgba => {
             Bytes::copy_from_slice(rgba)
         }
     }
+}
+
+/// Full-precision `f64` data-array renderer for wide TIFF sample types (`Uint32`, `Int32`,
+/// `Uint64`, `Int64`, `Float64`) on unstyled `.npy` and `.tif` routes (`/cog/preview`,
+/// `/cog/bbox`, `/cog/feature`, `/cog/tiles`), bypassing `f32` quantization while leaving the
+/// hot 8-bit/f32 render path untouched.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_exact_f64_array(
+    engine: &TileEngine,
+    cog: &OpenedCog,
+    mut bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    native_preview: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands_1based: &[u16],
+    resample: ResampleMode,
+    nodata_override: Option<f32>,
+    unscale: bool,
+    out_kind: cogzilla_tiff::SampleType,
+    return_mask: bool,
+    as_raw_f64: bool,
+) -> Result<Bytes, EngineError> {
+    if !native_preview {
+        if !bbox.iter().all(|v| v.is_finite()) || bbox[1] >= bbox[3] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+            bbox[2] += 360.0;
+        }
+        if bbox[0] >= bbox[2] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+    }
+    let w = width.clamp(1, 4096) as usize;
+    let h = height.clamp(1, 4096) as usize;
+    let crs = if native_preview && !cog.index.is_georeferenced {
+        cogzilla_proj::CrsModel::Geographic
+    } else {
+        engine.get_or_build_crs(cog)?
+    };
+    let dlx = (bbox[2] - bbox[0]) / (w as f64);
+    let dly = (bbox[3] - bbox[1]) / (h as f64);
+    let ifd_idx = if native_preview {
+        let full = cog.index.full_res();
+        let rx0 = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d);
+        let ry0 = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e);
+        cog.index
+            .select_ifd(rx0 * (full.width as f64) / (w as f64), ry0 * (full.height as f64) / (h as f64))
+    } else {
+        let cx = 0.5 * (bbox[0] + bbox[2]);
+        let cy = 0.5 * (bbox[1] + bbox[3]);
+        let to_src = |x: f64, y: f64| -> (f64, f64) {
+            match dst_crs {
+                cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                cogzilla_proj::CrsModel::Geographic => {
+                    let lon = if x > 180.0 { x - 360.0 } else { x };
+                    crs.from_lonlat_deg(lon, y)
+                }
+                other => {
+                    let (lon, lat) = other.to_lonlat_deg(x, y);
+                    if lon.is_finite() && lat.is_finite() {
+                        crs.from_lonlat_deg(lon, lat)
+                    } else {
+                        (f64::NAN, f64::NAN)
+                    }
+                }
+            }
+        };
+        let (s0x, s0y) = to_src(cx, cy);
+        let (s1x, s1y) = to_src(cx + dlx, cy);
+        let (s2x, s2y) = to_src(cx, cy + dly);
+        let rx = (s1x - s0x).hypot(s1y - s0y);
+        let ry = (s2x - s0x).hypot(s2y - s0y);
+        if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+            cog.index.select_ifd(rx, ry)
+        } else {
+            0
+        }
+    };
+    let ifd = &cog.index.ifds[ifd_idx];
+    let n_bands = bands_1based.len();
+    for &b in bands_1based {
+        if b == 0 || b > ifd.samples_per_pixel {
+            return Err(EngineError::BadRequest(format!(
+                "bidx {b} out of range (dataset has {} bands)",
+                ifd.samples_per_pixel
+            )));
+        }
+    }
+
+    let mut us = vec![f64::NAN; w * h];
+    let mut vs = vec![f64::NAN; w * h];
+    let mut min_u = f64::INFINITY;
+    let mut max_u = f64::NEG_INFINITY;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+
+    if native_preview {
+        let sx = (ifd.width as f64) / (w as f64);
+        let sy = (ifd.height as f64) / (h as f64);
+        for py in 0..h {
+            let v = (py as f64 + 0.5) * sy - 0.5;
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            for px in 0..w {
+                let u = (px as f64 + 0.5) * sx - 0.5;
+                min_u = min_u.min(u);
+                max_u = max_u.max(u);
+                us[py * w + px] = u;
+                vs[py * w + px] = v;
+            }
+        }
+    } else {
+        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let wrap_hi = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width);
+        for py in 0..h {
+            let y = bbox[3] - (py as f64 + 0.5) * dly;
+            for px in 0..w {
+                let x = bbox[0] + (px as f64 + 0.5) * dlx;
+                if let Some(pm) = poly_mask {
+                    let (plon, plat) = match dst_crs {
+                        cogzilla_proj::CrsModel::Geographic => (if x > 180.0 { x - 360.0 } else { x }, y),
+                        other => other.to_lonlat_deg(x, y),
+                    };
+                    if !pm.contains(plon, plat) {
+                        continue;
+                    }
+                }
+                let (sx, sy) = match dst_crs {
+                    cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                    cogzilla_proj::CrsModel::Geographic => {
+                        let mut lon = if x > 180.0 { x - 360.0 } else { x };
+                        if let Some(lo) = wrap_lo && lon < lo {
+                            lon += 360.0;
+                        } else if let Some(hi) = wrap_hi && lon > hi {
+                            lon -= 360.0;
+                        }
+                        crs.from_lonlat_deg(lon, y)
+                    }
+                    other => {
+                        let (mut lon, lat) = other.to_lonlat_deg(x, y);
+                        if !lon.is_finite() || !lat.is_finite() {
+                            continue;
+                        }
+                        if let Some(lo) = wrap_lo && lon < lo {
+                            lon += 360.0;
+                        } else if let Some(hi) = wrap_hi && lon > hi {
+                            lon -= 360.0;
+                        }
+                        crs.from_lonlat_deg(lon, lat)
+                    }
+                };
+                if !sx.is_finite() || !sy.is_finite() {
+                    continue;
+                }
+                let (col, row) = ifd.crs_to_pixel_pt(sx, sy);
+                let u = col - 0.5;
+                let v = row - 0.5;
+                if u.is_finite() && v.is_finite() {
+                    us[py * w + px] = u;
+                    vs[py * w + px] = v;
+                    if u >= -1.0 && v >= -1.0 && u <= ifd.width as f64 && v <= ifd.height as f64 {
+                        min_u = min_u.min(u);
+                        max_u = max_u.max(u);
+                        min_v = min_v.min(v);
+                        max_v = max_v.max(v);
+                    }
+                }
+            }
+        }
+    }
+
+    let pixels = w * h;
+    if !native_preview && (!min_u.is_finite() || !min_v.is_finite()) {
+        let full = cog.index.full_res();
+        if !crate::http::tile_box_intersects_cog(&crs, full, dst_crs, bbox) {
+            return Err(EngineError::NotFound(format!(
+                "bbox [{}, {}, {}, {}] is outside dataset bounds",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+    }
+    let mut out_f64 = vec![f64::NAN; n_bands * pixels];
+    if min_u.is_finite() && min_v.is_finite() {
+        let c0 = (min_u.floor() as i32 - 1).clamp(0, ifd.width as i32 - 1) as u32;
+        let c1 = (max_u.ceil() as i32 + 1).clamp(0, ifd.width as i32 - 1) as u32;
+        let r0 = (min_v.floor() as i32 - 1).clamp(0, ifd.height as i32 - 1) as u32;
+        let r1 = (max_v.ceil() as i32 + 1).clamp(0, ifd.height as i32 - 1) as u32;
+        let tx0 = c0 / ifd.tile_width;
+        let tx1 = c1 / ifd.tile_width;
+        let ty0 = r0 / ifd.tile_height;
+        let ty1 = r1 / ifd.tile_height;
+        let gw = tx1 - tx0 + 1;
+        let gh = ty1 - ty0 + 1;
+
+        match ifd.planar_config {
+            PlanarConfig::Chunky => {
+                let mut indices = Vec::with_capacity((gw * gh) as usize);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                    }
+                }
+                let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+                for (bi, &b1) in bands_1based.iter().enumerate() {
+                    let b0 = (b1 - 1) as usize;
+                    let band_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                        .iter()
+                        .map(|t| t.as_ref().and_then(|dt| dt.bands.get(b0)))
+                        .collect();
+                    let mut src = cogzilla_kernel::BandSource::new(
+                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height,
+                        tx0, ty0, gw, gh, &band_refs,
+                    )
+                    .with_nodata_override(nodata_override);
+                    if unscale {
+                        let sc = cog.index.scales.get(b0).copied().unwrap_or(1.0);
+                        let off = cog.index.offsets.get(b0).copied().unwrap_or(0.0);
+                        src = src.with_scale_offset(sc, off);
+                    }
+                    let dst = &mut out_f64[bi * pixels..(bi + 1) * pixels];
+                    for i in 0..pixels {
+                        dst[i] = cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample);
+                    }
+                }
+            }
+            PlanarConfig::Planar => {
+                for (bi, &b1) in bands_1based.iter().enumerate() {
+                    let b0 = (b1 - 1) as usize;
+                    let mut indices = Vec::with_capacity((gw * gh) as usize);
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            indices.push(Some(ifd.tile_index(tx, ty, b0 as u16) as u32));
+                        }
+                    }
+                    let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+                    let band_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                        .iter()
+                        .map(|t| t.as_ref().and_then(|dt| dt.bands.first()))
+                        .collect();
+                    let mut src = cogzilla_kernel::BandSource::new(
+                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height,
+                        tx0, ty0, gw, gh, &band_refs,
+                    )
+                    .with_nodata_override(nodata_override);
+                    if unscale {
+                        let sc = cog.index.scales.get(b0).copied().unwrap_or(1.0);
+                        let off = cog.index.offsets.get(b0).copied().unwrap_or(0.0);
+                        src = src.with_scale_offset(sc, off);
+                    }
+                    let dst = &mut out_f64[bi * pixels..(bi + 1) * pixels];
+                    for i in 0..pixels {
+                        dst[i] = cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample);
+                    }
+                }
+            }
+        }
+    }
+
+    let bytes = if as_raw_f64 {
+        let mut raw = Vec::with_capacity(out_f64.len() * 8);
+        for &v in &out_f64 {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        Bytes::from(raw)
+    } else {
+        cogzilla_kernel::encode_npy_typed_f64(
+            &out_f64, n_bands, h, w, out_kind, None, return_mask,
+        )
+    };
+    Ok(bytes)
 }
 
 /// Native pixel-space preview renderer backing `/cog/preview*` and `/stac/preview*`,
@@ -4955,12 +5448,50 @@ async fn render_bbox_impl(
         }
     }
     if let BandRequest::MultiBand { bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
     {
         return Err(EngineError::BadRequest(format!(
             "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
             bands_1based.len()
         )));
+    }
+    // Exact f64 data path for wide sample types (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`)
+    // on unstyled `.npy` / `.tif` requests: bypasses `f32` quantization while leaving the hot
+    // 8-bit / f32 render path completely untouched.
+    if cogs.len() == 1
+        && !unscale
+        && color_formula.is_none()
+        && custom_lut.is_none()
+        && cogs[0].index.full_res().sample_type.needs_f64()
+        && matches!(format, OutputFormat::RawF64 | OutputFormat::Npy)
+    {
+        let bands_1based: Option<Vec<u16>> = match bands {
+            BandRequest::Single { band_1based, .. } => Some(vec![*band_1based]),
+            BandRequest::Rgb { bands_1based, .. } => Some(bands_1based.to_vec()),
+            BandRequest::MultiBand { bands_1based } => Some(bands_1based.clone()),
+            _ => None,
+        };
+        if let Some(b1) = bands_1based {
+            let kind = cogs[0].index.full_res().sample_type;
+            return render_exact_f64_array(
+                engine,
+                &cogs[0],
+                bbox,
+                dst_crs,
+                native_preview,
+                width,
+                height,
+                poly_mask,
+                &b1,
+                resample,
+                nodata_override,
+                unscale,
+                kind,
+                return_mask,
+                matches!(format, OutputFormat::RawF64),
+            )
+            .await;
+        }
     }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;

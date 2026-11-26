@@ -2058,7 +2058,20 @@ fn geotiff_render_format(
     sample_type: cogzilla_tiff::SampleType,
 ) -> OutputFormat {
     if wants_f32_geotiff(ct, pq, source_cog, bands, sample_type) {
-        OutputFormat::RawF32
+        if sample_type.needs_f64()
+            && !pq.unscale
+            && !array_type::shown(pq)
+            && pq.algorithm.is_none()
+            && pq.expr_raw.is_none()
+            && matches!(
+                bands,
+                BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
+            )
+        {
+            OutputFormat::RawF64
+        } else {
+            OutputFormat::RawF32
+        }
     } else {
         fmt
     }
@@ -2075,7 +2088,24 @@ fn wrap_geotiff_fmt(
     return_mask: bool,
 ) -> Bytes {
     if ct == GEOTIFF_CONTENT_TYPE {
-        if matches!(fmt, OutputFormat::RawF32) {
+        if matches!(fmt, OutputFormat::RawF64) {
+            let n_px = (w as usize).saturating_mul(h as usize).max(1);
+            let n_bands = (data.len() / (n_px * 8)).max(1);
+            let vals: Vec<f64> = data
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            crate::geotiff::write_geotiff_typed_f64(
+                &vals,
+                n_bands,
+                w,
+                h,
+                cogzilla_tiff::SampleType::Float64,
+                bbox,
+                epsg,
+                return_mask,
+            )
+        } else if matches!(fmt, OutputFormat::RawF32) {
             encode_geotiff_f32(w, h, &data, bbox, epsg, return_mask)
         } else {
             encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
@@ -3428,7 +3458,7 @@ fn build_tile_request_for_tms(
     let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
     if let BandRequest::MultiBand { ref bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
         && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4))
     {
         return Err(EngineError::BadRequest(
@@ -4232,7 +4262,7 @@ async fn render_mosaic_tile_styled(
     }
 
     if (pq.color_formula.is_some() || !pq.return_mask)
-        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
     {
         let cf = pq
             .color_formula
@@ -7319,7 +7349,7 @@ where
                                 );
                                 Ok((data, ct))
                             } else if (pq.color_formula.is_some() || !pq.return_mask)
-                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
                             {
                                 let cf = pq
                                     .color_formula
@@ -8672,7 +8702,7 @@ where
                             };
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq_stac.jpeg_quality, pq_stac.return_mask))
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
-                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
                         {
                             let cf = pq_stac
                                 .color_formula
@@ -9905,7 +9935,7 @@ where
                             };
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq.jpeg_quality, pq.return_mask))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
-                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
                         {
                             let cf = pq
                                 .color_formula

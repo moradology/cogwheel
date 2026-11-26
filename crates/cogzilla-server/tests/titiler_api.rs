@@ -6174,3 +6174,173 @@ async fn parity_nn1_r2_raster_layers_and_f2_sample_types() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_sweep43_oo1_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Write a minimal 8x8 tiled EPSG:4326 GeoTIFF (bounds [0, 0, 8, 8], 1 deg/px).
+    let write_8x8 = |path: &std::path::Path, bps: u16, sample_fmt: u16, payload: &[u8]| {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let after_ifd = 8 + 2 + 15 * 12 + 4;
+        buf.resize(after_ifd, 0);
+        let scale_off = buf.len() as u32;
+        for v in [1.0f64, 1.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let tie_off = buf.len() as u32;
+        for v in [0.0f64, 0.0, 0.0, 0.0, 8.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let gk_off = buf.len() as u32;
+        let gks: [u16; 16] = [
+            1, 1, 0, 3,
+            1024, 0, 1, 2,
+            1025, 0, 1, 1,
+            2048, 0, 1, 4326,
+        ];
+        for k in gks {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        let tile_off = buf.len() as u32;
+        buf.extend_from_slice(payload);
+
+        let mut ifd: Vec<u8> = Vec::new();
+        let push = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        ifd.extend_from_slice(&15u16.to_le_bytes());
+        push(&mut ifd, 256, 4, 1, 8);
+        push(&mut ifd, 257, 4, 1, 8);
+        push(&mut ifd, 258, 3, 1, bps as u32);
+        push(&mut ifd, 259, 3, 1, 1);
+        push(&mut ifd, 262, 3, 1, 1);
+        push(&mut ifd, 277, 3, 1, 1);
+        push(&mut ifd, 284, 3, 1, 1);
+        push(&mut ifd, 322, 4, 1, 8);
+        push(&mut ifd, 323, 4, 1, 8);
+        push(&mut ifd, 324, 4, 1, tile_off);
+        push(&mut ifd, 325, 4, 1, payload.len() as u32);
+        push(&mut ifd, 339, 3, 1, sample_fmt as u32);
+        push(&mut ifd, 33550, 12, 3, scale_off);
+        push(&mut ifd, 33922, 12, 6, tie_off);
+        push(&mut ifd, 34735, 3, 16, gk_off);
+        ifd.extend_from_slice(&0u32.to_le_bytes());
+        buf[8..8 + ifd.len()].copy_from_slice(&ifd);
+        std::fs::write(path, &buf).unwrap();
+    };
+
+    // 1. uint32: [16777217, 2147483647, 4294967295, ...]
+    let mut u32_vals = [16_777_217u32; 64];
+    u32_vals[1] = 2_147_483_647;
+    u32_vals[2] = u32::MAX;
+    let u32_bytes: Vec<u8> = u32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let u32_path = tmp.join("u32_big.tif");
+    write_8x8(&u32_path, 32, 1, &u32_bytes);
+
+    // 2. int32: [16777217, 16777219, -2147483648, ...]
+    let mut i32_vals = [16_777_217i32; 64];
+    i32_vals[1] = 16_777_219;
+    i32_vals[2] = i32::MIN;
+    let i32_bytes: Vec<u8> = i32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let i32_path = tmp.join("i32_big.tif");
+    write_8x8(&i32_path, 32, 2, &i32_bytes);
+
+    // 3. int64: [1000000000001, 2^53 - 1, ...]
+    let mut i64_vals = [1_000_000_000_001i64; 64];
+    i64_vals[1] = (1i64 << 53) - 1;
+    let i64_bytes: Vec<u8> = i64_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let i64_path = tmp.join("i64_big.tif");
+    write_8x8(&i64_path, 64, 2, &i64_bytes);
+
+    // 4. float64: [12345678901.234568, -1.7976931348623157e308, ...]
+    let mut f64_vals = [12_345_678_901.234_568_f64; 64];
+    f64_vals[1] = f64::MIN;
+    let f64_bytes: Vec<u8> = f64_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let f64_path = tmp.join("f64_big.tif");
+    write_8x8(&f64_path, 64, 3, &f64_bytes);
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_engine = engine.clone();
+    let srv_task = tokio::spawn(async move {
+        let _ = cogzilla_server::http::serve_listener(srv_engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    fn npy_body(b: &[u8]) -> &[u8] {
+        let hlen = u16::from_le_bytes([b[8], b[9]]) as usize;
+        &b[10 + hlen..]
+    }
+
+    // uint32: point, statistics max == 4294967295, bbox .npy and .tif exact
+    let p_u32 = u32_path.to_string_lossy();
+    let pt: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/point/0.5,7.5?url={p_u32}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert_eq!(pt["values"][0].as_f64().unwrap(), 16_777_217.0);
+
+    let st: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/statistics?url={p_u32}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert_eq!(st["b1"]["max"].as_f64().unwrap(), 4_294_967_295.0);
+
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_u32}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 16_777_217);
+    assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 2_147_483_647);
+    assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap()), u32::MAX);
+
+    let tif = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.tif?url={p_u32}&resampling=nearest&return_mask=false")).send().await.unwrap().bytes().await.unwrap();
+    let parsed = cogzilla_tiff::parse_cog(&tif).unwrap();
+    assert_eq!(parsed.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    let dec = cogzilla_codec::decode_tile(
+        &tif[parsed.full_res().tile_offsets[0] as usize..parsed.full_res().tile_offsets[0] as usize + parsed.full_res().tile_byte_counts[0] as usize],
+        parsed.full_res(),
+        parsed.byte_order,
+        None,
+    ).unwrap();
+    assert_eq!(dec.bands[0].data.get_f64(0), 16_777_217.0);
+    assert_eq!(dec.bands[0].data.get_f64(1), 2_147_483_647.0);
+    assert_eq!(dec.bands[0].data.get_f64(2), 4_294_967_295.0);
+
+    // int32: exact 16777217, 16777219, i32::MIN
+    let p_i32 = i32_path.to_string_lossy();
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_i32}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(i32::from_le_bytes(body[0..4].try_into().unwrap()), 16_777_217);
+    assert_eq!(i32::from_le_bytes(body[4..8].try_into().unwrap()), 16_777_219);
+    assert_eq!(i32::from_le_bytes(body[8..12].try_into().unwrap()), i32::MIN);
+
+    // int64: exact 1000000000001 and 2^53 - 1
+    let p_i64 = i64_path.to_string_lossy();
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_i64}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(i64::from_le_bytes(body[0..8].try_into().unwrap()), 1_000_000_000_001);
+    assert_eq!(i64::from_le_bytes(body[8..16].try_into().unwrap()), (1i64 << 53) - 1);
+
+    // float64: exact 17-sig-digit value and f64::MIN (-1.7976931348623157e308)
+    let p_f64 = f64_path.to_string_lossy();
+    let st_f64: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/statistics?url={p_f64}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert_eq!(st_f64["b1"]["min"].as_f64().unwrap(), f64::MIN);
+
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_f64}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(f64::from_le_bytes(body[0..8].try_into().unwrap()), 12_345_678_901.234_568_f64);
+    assert_eq!(f64::from_le_bytes(body[8..16].try_into().unwrap()), f64::MIN);
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
