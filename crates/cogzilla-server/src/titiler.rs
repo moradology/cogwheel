@@ -6357,7 +6357,7 @@ async fn render_bbox_impl(
                     prog,
                     rescale,
                     colormap,
-                } if native_preview => {
+                } => {
                     let ref_vecs: Vec<_> = prog
                         .used_bands
                         .iter()
@@ -6371,13 +6371,13 @@ async fn render_bbox_impl(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_expr(&u_map[..w], &v_rows, &srcs, prog, &style, return_mask)
+                    gpu.try_render_bbox_expr(coords, &srcs, prog, &style, return_mask)
                 }
                 BandRequest::Rgb {
                     bands_1based,
                     rescale_min,
                     rescale_max,
-                } if native_preview => {
+                } => {
                     let r0 = get_band_refs(bands_1based[0], 0);
                     let r1 = get_band_refs(bands_1based[1], 1);
                     let r2 = get_band_refs(bands_1based[2], 2);
@@ -6388,7 +6388,7 @@ async fn render_bbox_impl(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_rgb(&u_map[..w], &v_rows, &srcs, &style, return_mask)
+                    gpu.try_render_bbox_rgb(coords, &srcs, &style, return_mask)
                 }
                 _ => None,
             };

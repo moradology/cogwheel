@@ -11,7 +11,8 @@ struct ExprParams {
     resample_mode: u32,
     /// Bit 0: apply RGB LUT, Bit 1: apply LCH saturation
     formula_flags: u32,
-    _pad0: u32,
+    /// 0 = Separable1D, 1 = Grid2D (17x17 bilinear), 2 = Exact2D (dst_w * dst_h)
+    coord_mode: u32,
     _pad1: u32,
     rescale_min: f32,
     inv_range_255: f32,
@@ -370,6 +371,32 @@ fn eval_expr_vm(u: f32, v: f32) -> f32 {
     return stack[sp - 1u];
 }
 
+fn eval_uv(px: u32, py: u32) -> vec2<f32> {
+    if (params.coord_mode == 0u) {
+        return vec2<f32>(u_coords[px], v_coords[py]);
+    }
+    if (params.coord_mode == 2u) {
+        let idx = py * params.dst_w + px;
+        return vec2<f32>(u_coords[idx], v_coords[idx]);
+    }
+    // Grid2D (17x17 coarse warp grid matching cogzilla-proj::CoordPlan::Grid2D)
+    let gx_f = (f32(px) + 0.5) * 16.0 / f32(params.dst_w);
+    let gy_f = (f32(py) + 0.5) * 16.0 / f32(params.dst_h);
+    let gx0 = min(u32(gx_f), 15u);
+    let gy0 = min(u32(gy_f), 15u);
+    let fx = gx_f - f32(gx0);
+    let fy = gy_f - f32(gy0);
+    let i00 = gy0 * 17u + gx0;
+    let i10 = i00 + 1u;
+    let i01 = i00 + 17u;
+    let i11 = i01 + 1u;
+    let u0 = u_coords[i00] + (u_coords[i10] - u_coords[i00]) * fx;
+    let u1 = u_coords[i01] + (u_coords[i11] - u_coords[i01]) * fx;
+    let v0 = v_coords[i00] + (v_coords[i10] - v_coords[i00]) * fx;
+    let v1 = v_coords[i01] + (v_coords[i11] - v_coords[i01]) * fx;
+    return vec2<f32>(u0 + (u1 - u0) * fy, v0 + (v1 - v0) * fy);
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn expr_eval_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x;
@@ -377,7 +404,8 @@ fn expr_eval_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (px >= params.dst_w || py >= params.dst_h) {
         return;
     }
-    let val = eval_expr_vm(u_coords[px], v_coords[py]);
+    let uv = eval_uv(px, py);
+    let val = eval_expr_vm(uv.x, uv.y);
     let out_idx = py * params.dst_w + px;
     if (!is_finite_f32(val)) {
         dst_words[out_idx] = 0u;
@@ -397,12 +425,12 @@ fn expr_eval_indexed_u8(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let base_x = word_x * 4u;
-    let v = v_coords[py];
     var packed: u32 = 0u;
     for (var k: u32 = 0u; k < 4u; k = k + 1u) {
         let px = base_x + k;
         if (px < params.dst_w) {
-            let val = eval_expr_vm(u_coords[px], v);
+            let uv = eval_uv(px, py);
+            let val = eval_expr_vm(uv.x, uv.y);
             var idx: u32 = 0u;
             if (is_finite_f32(val)) {
                 let scaled = clamp((val - params.rescale_min) * params.inv_range_254, 0.0, 254.0);
@@ -485,11 +513,10 @@ fn rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let u = u_coords[px];
-    let v = v_coords[py];
-    let vr = sample_band(0u, u, v);
-    let vg = sample_band(1u, u, v);
-    let vb = sample_band(2u, u, v);
+    let uv = eval_uv(px, py);
+    let vr = sample_band(0u, uv.x, uv.y);
+    let vg = sample_band(1u, uv.x, uv.y);
+    let vb = sample_band(2u, uv.x, uv.y);
     let out_idx = py * params.dst_w + px;
 
     if (!is_finite_f32(vr) || !is_finite_f32(vg) || !is_finite_f32(vb)) {

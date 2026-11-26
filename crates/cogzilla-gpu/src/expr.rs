@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::colormap::{GpuColormapMode, GpuPixelOutput};
+use crate::colormap::{GpuColormapMode, GpuCoordPlan, GpuPixelOutput};
 use crate::context::{GpuContext, GpuError};
 
 /// GPU-resident stacked multi-band `f32` slab (`num_bands` contiguous `height * stride` planes).
@@ -132,7 +132,7 @@ struct ExprParams {
     num_instrs: u32,
     resample_mode: u32,
     formula_flags: u32,
-    _pad0: u32,
+    coord_mode: u32,
     _pad1: u32,
     rescale_min: f32,
     inv_range_255: f32,
@@ -429,8 +429,56 @@ impl GpuExprRenderer {
         lut_rgba_u32: &[u32; 256],
         output: GpuPixelOutput,
     ) -> Result<Vec<u8>, GpuError> {
-        let dst_w = u_coords.len();
-        let dst_h = v_coords.len();
+        self.render_expr_with_plan(
+            slab,
+            GpuCoordPlan::Separable1D {
+                u_coords,
+                v_coords,
+            },
+            resample,
+            instrs,
+            rescale_min,
+            rescale_max,
+            lut_rgba_u32,
+            output,
+        )
+    }
+
+    /// Evaluate a bytecode expression with an arbitrary `GpuCoordPlan` (`Separable1D`, `Grid2D` 17×17,
+    /// or `Exact2D`) over a GPU-resident `GpuMultiBandSlab`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_expr_with_plan(
+        &mut self,
+        slab: &GpuMultiBandSlab,
+        plan: GpuCoordPlan<'_>,
+        resample: GpuColormapMode,
+        instrs: &[GpuInstr],
+        rescale_min: f32,
+        rescale_max: f32,
+        lut_rgba_u32: &[u32; 256],
+        output: GpuPixelOutput,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D {
+                    u_coords: u,
+                    v_coords: v,
+                } => (u.len(), v.len(), 0, u, v),
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v slice lengths must equal dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
         if dst_w == 0 || dst_h == 0 || instrs.is_empty() || instrs.len() > 256 {
             return Err(GpuError::InvalidDimensions(
                 "invalid expr dimensions or instruction count".into(),
@@ -442,7 +490,7 @@ impl GpuExprRenderer {
             GpuPixelOutput::IndexedU8 => dst_w.div_ceil(4),
         };
         let out_words = words_per_row * dst_h;
-        self.ensure_capacities(dst_w, dst_h, out_words);
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
 
         let range = rescale_max - rescale_min;
         let safe_range = if range.is_finite() && range.abs() > 1e-20 {
@@ -466,7 +514,7 @@ impl GpuExprRenderer {
             num_instrs: instrs.len() as u32,
             resample_mode,
             formula_flags: 0,
-            _pad0: 0,
+            coord_mode,
             _pad1: 0,
             rescale_min,
             inv_range_255: 255.0 / safe_range,
@@ -479,9 +527,9 @@ impl GpuExprRenderer {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
-            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_coords));
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
         self.queue
-            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_coords));
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
         self.queue
             .write_buffer(&self.instr_buf, 0, bytemuck::cast_slice(instrs));
         if output == GpuPixelOutput::Rgba8 {
@@ -516,15 +564,59 @@ impl GpuExprRenderer {
         rescale_max: [f32; 3],
         formula: &GpuColorFormula,
     ) -> Result<Vec<u8>, GpuError> {
-        let dst_w = u_coords.len();
-        let dst_h = v_coords.len();
+        self.render_rgb_formula_with_plan(
+            slab,
+            GpuCoordPlan::Separable1D {
+                u_coords,
+                v_coords,
+            },
+            resample,
+            rescale_min,
+            rescale_max,
+            formula,
+        )
+    }
+
+    /// Fused 3-band RGB resample + `GpuColorFormula` with an arbitrary `GpuCoordPlan`
+    /// (`Separable1D`, `Grid2D` 17×17, or `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_rgb_formula_with_plan(
+        &mut self,
+        slab: &GpuMultiBandSlab,
+        plan: GpuCoordPlan<'_>,
+        resample: GpuColormapMode,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        formula: &GpuColorFormula,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D {
+                    u_coords: u,
+                    v_coords: v,
+                } => (u.len(), v.len(), 0, u, v),
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v slice lengths must equal dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
         if slab.num_bands < 3 || dst_w == 0 || dst_h == 0 {
             return Err(GpuError::InvalidDimensions(
                 "render_rgb_formula requires >= 3 bands and non-zero output dims".into(),
             ));
         }
         let out_words = dst_w * dst_h;
-        self.ensure_capacities(dst_w, dst_h, out_words);
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
 
         let inv = |min: f32, max: f32| {
             let d = max - min;
@@ -558,7 +650,7 @@ impl GpuExprRenderer {
             num_instrs: 0,
             resample_mode,
             formula_flags: flags,
-            _pad0: 0,
+            coord_mode,
             _pad1: 0,
             rescale_min: 0.0,
             inv_range_255: 1.0,
@@ -576,9 +668,9 @@ impl GpuExprRenderer {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
-            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_coords));
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
         self.queue
-            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_coords));
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
 
         self.dispatch_and_readback(
             slab,
@@ -871,5 +963,186 @@ mod tests {
             max_ch_diff <= 2,
             "RGB color_formula max channel diff {max_ch_diff} > 2 LSB"
         );
+    }
+
+    #[test]
+    fn curved_grid2d_and_exact2d_expr_and_rgb_match_cpu() {
+        let Ok(ctx) = GpuContext::new_default() else {
+            eprintln!("skipping curved expr test (no hardware GPU)");
+            return;
+        };
+        let mut renderer = GpuExprRenderer::new(&ctx);
+
+        let w = 256usize;
+        let h = 256usize;
+        let mut b0 = vec![0.0f32; w * h];
+        let mut b1 = vec![0.0f32; w * h];
+        let mut b2 = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                b0[y * w + x] = 1200.0 + 700.0 * (fx * 9.0).sin() + 300.0 * (fy * 7.0).cos();
+                b1[y * w + x] = 600.0 + 350.0 * (fx * 6.0 + 0.5).cos() + 200.0 * (fy * 10.0).sin();
+                b2[y * w + x] = 450.0 + 250.0 * ((fx + fy) * 8.0).sin();
+            }
+        }
+        let slab = renderer
+            .upload_bands(&[&b0, &b1, &b2], w as u32, h as u32, w as u32)
+            .unwrap();
+
+        let mk_band = |vals: &[f32]| -> DecodedBand {
+            let mut s = AlignedF32Slab::filled(w * h, 0.0);
+            s.as_mut_slice().copy_from_slice(vals);
+            DecodedBand {
+                data: BandData::F32(s),
+                width: w as u32,
+                height: h as u32,
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 0.0,
+                    max: 2500.0,
+                },
+            }
+        };
+        let db0 = mk_band(&b0);
+        let db1 = mk_band(&b1);
+        let db2 = mk_band(&b2);
+        let bl0 = [Some(&db0)];
+        let bl1 = [Some(&db1)];
+        let bl2 = [Some(&db2)];
+        let bs0 = BandSource::new(w as u32, h as u32, w as u32, h as u32, 0, 0, 1, 1, &bl0);
+        let bs1 = BandSource::new(w as u32, h as u32, w as u32, h as u32, 0, 0, 1, 1, &bl1);
+        let bs2 = BandSource::new(w as u32, h as u32, w as u32, h as u32, 0, 0, 1, 1, &bl2);
+
+        // 17x17 curved UTM-like warp grid
+        let n = 128usize;
+        let mut grid_u = [0.0f32; 289];
+        let mut grid_v = [0.0f32; 289];
+        for gy in 0..17 {
+            for gx in 0..17 {
+                let fx = gx as f32 / 16.0;
+                let fy = gy as f32 / 16.0;
+                grid_u[gy * 17 + gx] = 10.0 + fx * 230.0 + 4.0 * (fy * 3.14).sin();
+                grid_v[gy * 17 + gx] = 10.0 + fy * 230.0 - 4.0 * (fx * 3.14).sin();
+            }
+        }
+        let eval_grid = |px: usize, py: usize| -> (f32, f32) {
+            let gxf = (px as f32 + 0.5) * 16.0 / n as f32;
+            let gyf = (py as f32 + 0.5) * 16.0 / n as f32;
+            let gx0 = (gxf as usize).min(15);
+            let gy0 = (gyf as usize).min(15);
+            let fx = gxf - gx0 as f32;
+            let fy = gyf - gy0 as f32;
+            let i00 = gy0 * 17 + gx0;
+            let u0 = grid_u[i00] + (grid_u[i00 + 1] - grid_u[i00]) * fx;
+            let u1 = grid_u[i00 + 17] + (grid_u[i00 + 18] - grid_u[i00 + 17]) * fx;
+            let v0 = grid_v[i00] + (grid_v[i00 + 1] - grid_v[i00]) * fx;
+            let v1 = grid_v[i00 + 17] + (grid_v[i00 + 18] - grid_v[i00 + 17]) * fx;
+            (u0 + (u1 - u0) * fy, v0 + (v1 - v0) * fy)
+        };
+
+        // NDVI Grid2D IndexedU8 + Rgba8
+        let ndvi = vec![
+            GpuInstr::load_band(0),
+            GpuInstr::load_band(1),
+            GpuInstr::op(opcodes::SUB),
+            GpuInstr::load_band(0),
+            GpuInstr::load_band(1),
+            GpuInstr::op(opcodes::ADD),
+            GpuInstr::op(opcodes::DIV),
+        ];
+        let lut = ColormapName::Viridis.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let gpu_rgba = renderer
+            .render_expr_with_plan(
+                &slab,
+                GpuCoordPlan::Grid2D {
+                    dst_w: n,
+                    dst_h: n,
+                    grid_u: &grid_u,
+                    grid_v: &grid_v,
+                },
+                GpuColormapMode::Cubic,
+                &ndvi,
+                -0.2,
+                0.8,
+                &lut_u32,
+                GpuPixelOutput::Rgba8,
+            )
+            .unwrap();
+        let mut max_expr_diff = 0i32;
+        for py in (0..n).step_by(3) {
+            for px in (0..n).step_by(3) {
+                let (u, v) = eval_grid(px, py);
+                let s0 = sample_cubic(&bs0, u, v);
+                let s1 = sample_cubic(&bs1, u, v);
+                let nd = (s0 - s1) / (s0 + s1);
+                let ci = ((nd + 0.2) * 255.0).clamp(0.0, 255.0) as usize;
+                let off = (py * n + px) * 4;
+                assert_eq!(gpu_rgba[off + 3], 255);
+                for ch in 0..3 {
+                    max_expr_diff =
+                        max_expr_diff.max((lut.rgb[ci][ch] as i32 - gpu_rgba[off + ch] as i32).abs());
+                }
+            }
+        }
+        assert!(max_expr_diff <= 3, "Grid2D NDVI max channel diff {max_expr_diff} > 3");
+
+        // Exact2D with NaN mask on 3-band RGB
+        let mut u_exact = vec![f32::NAN; n * n];
+        let mut v_exact = vec![f32::NAN; n * n];
+        for py in 0..n {
+            for px in 0..n {
+                if px >= 16 && px < n - 16 && py >= 16 && py < n - 16 {
+                    let (u, v) = eval_grid(px, py);
+                    u_exact[py * n + px] = u;
+                    v_exact[py * n + px] = v;
+                }
+            }
+        }
+        let identity = GpuColorFormula {
+            rgb_lut: None,
+            saturation: None,
+        };
+        let gpu_rgb = renderer
+            .render_rgb_formula_with_plan(
+                &slab,
+                GpuCoordPlan::Exact2D {
+                    dst_w: n,
+                    dst_h: n,
+                    u: &u_exact,
+                    v: &v_exact,
+                },
+                GpuColormapMode::Cubic,
+                [0.0; 3],
+                [2500.0, 1500.0, 1000.0],
+                &identity,
+            )
+            .unwrap();
+        let mut max_rgb_diff = 0i32;
+        for py in (0..n).step_by(3) {
+            for px in (0..n).step_by(3) {
+                let i = py * n + px;
+                let off = i * 4;
+                if u_exact[i].is_nan() {
+                    assert_eq!(gpu_rgb[off + 3], 0);
+                } else {
+                    assert_eq!(gpu_rgb[off + 3], 255);
+                    let sr = sample_cubic(&bs0, u_exact[i], v_exact[i]);
+                    let sg = sample_cubic(&bs1, u_exact[i], v_exact[i]);
+                    let sb = sample_cubic(&bs2, u_exact[i], v_exact[i]);
+                    let r = (sr * (255.0 / 2500.0)).clamp(0.0, 255.0) as i32;
+                    let g = (sg * (255.0 / 1500.0)).clamp(0.0, 255.0) as i32;
+                    let b = (sb * (255.0 / 1000.0)).clamp(0.0, 255.0) as i32;
+                    max_rgb_diff = max_rgb_diff
+                        .max((r - gpu_rgb[off] as i32).abs())
+                        .max((g - gpu_rgb[off + 1] as i32).abs())
+                        .max((b - gpu_rgb[off + 2] as i32).abs());
+                }
+            }
+        }
+        assert!(max_rgb_diff <= 2, "Exact2D RGB max channel diff {max_rgb_diff} > 2");
     }
 }
