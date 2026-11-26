@@ -6398,7 +6398,8 @@ async fn render_bbox_impl(
 
         #[cfg(feature = "gpu")]
         if custom_lut.is_none()
-            && (color_formula.is_none() || matches!(bands, BandRequest::Rgb { .. }))
+            && (color_formula.is_none()
+                || matches!(bands, BandRequest::Rgb { .. } | BandRequest::SarRgb { .. }))
             && matches!(
                 format,
                 OutputFormat::Png
@@ -6556,6 +6557,39 @@ async fn render_bbox_impl(
                         None
                     };
                     gpu.try_render_bbox_rgb(
+                        cache_key,
+                        coords,
+                        &srcs,
+                        &style,
+                        color_formula,
+                        return_mask,
+                    )
+                }
+                BandRequest::SarRgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let srcs = [make_src!(&r0), make_src!(&r1)];
+                    let style = cogzilla_kernel::RgbStyle {
+                        rescale_min: *rescale_min,
+                        rescale_max: *rescale_max,
+                        resample,
+                        format,
+                    };
+                    let cache_key = if num_cogs == 1 {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id,
+                            ifd_idx,
+                            bands_1based,
+                            &srcs,
+                        )
+                    } else {
+                        None
+                    };
+                    gpu.try_render_bbox_sar_rgb(
                         cache_key,
                         coords,
                         &srcs,

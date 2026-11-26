@@ -60,3 +60,7 @@ required-features = ["gpu"]
 [[example]]
 name = "batch_server_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "sar_rgb_server_bench"
+required-features = ["gpu"]

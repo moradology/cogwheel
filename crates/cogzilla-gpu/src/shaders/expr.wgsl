@@ -554,3 +554,46 @@ fn rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
 }
+
+/// Fused Dual-Pol SAR False-Color RGB ([VV_dB, VH_dB, VV_dB - VH_dB]) -> rescale ->
+/// Gamma/Sigmoidal LUT -> CIE LCH Saturation -> RGBA8.
+@compute @workgroup_size(16, 16, 1)
+fn sar_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.dst_w || py >= params.dst_h) {
+        return;
+    }
+
+    let uv = eval_uv(px, py);
+    let p_vv = sample_band(0u, uv.x, uv.y);
+    let p_vh = sample_band(1u, uv.x, uv.y);
+    let out_idx = py * params.dst_w + px;
+
+    if (!is_finite_f32(p_vv) || !is_finite_f32(p_vh) || p_vv <= 0.0 || p_vh <= 0.0) {
+        dst_words[out_idx] = 0u;
+        return;
+    }
+
+    let vv = 10.0 * log(p_vv) * INV_LN10;
+    let vh = 10.0 * log(p_vh) * INV_LN10;
+    let diff = vv - vh;
+
+    var r = u32(clamp((vv - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
+    var g = u32(clamp((vh - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
+    var b = u32(clamp((diff - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
+
+    if ((params.formula_flags & 1u) != 0u) {
+        r = lut_u32[r] & 0xffu;
+        g = (lut_u32[g] >> 8u) & 0xffu;
+        b = (lut_u32[b] >> 16u) & 0xffu;
+    }
+    if ((params.formula_flags & 2u) != 0u) {
+        let sat_rgb = apply_lch_sat(r, g, b, params.saturation);
+        r = sat_rgb.x;
+        g = sat_rgb.y;
+        b = sat_rgb.z;
+    }
+
+    dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+}
