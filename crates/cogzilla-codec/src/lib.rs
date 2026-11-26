@@ -180,6 +180,25 @@ pub fn decode_tile_rows(
     nodata: Option<f32>,
     actual_rows: u32,
 ) -> Result<DecodedTile, CodecError> {
+    decode_tile_rows_exact(
+        compressed,
+        ifd,
+        byte_order,
+        nodata.map(|v| v as f64),
+        actual_rows,
+    )
+}
+
+/// Like [`decode_tile_rows`], accepting full-precision `Option<f64>` nodata for wide sample types
+/// (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`).
+pub fn decode_tile_rows_exact(
+    compressed: &[u8],
+    ifd: &IfdMeta,
+    byte_order: ByteOrder,
+    nodata_f64: Option<f64>,
+    actual_rows: u32,
+) -> Result<DecodedTile, CodecError> {
+    let nodata: Option<f32> = nodata_f64.map(|v| v as f32);
     let tile_h = actual_rows.min(ifd.tile_height).max(1);
     let bands_in_tile = match ifd.planar_config {
         PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
@@ -189,6 +208,16 @@ pub fn decode_tile_rows(
         .sample_type
         .row_bytes(ifd.tile_width as usize, bands_in_tile)
         .and_then(|rb| rb.checked_mul(tile_h as usize))
+        .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+        .ok_or(CodecError::SizeMismatch {
+            expected: MAX_DECODED_TILE_BYTES,
+            got: compressed.len(),
+        })?;
+    // For sub-byte types (`Uint1`/`Uint4`), also bound the unpacked 1-byte-per-sample allocation.
+    let _unpacked_bytes = (ifd.tile_width as usize)
+        .checked_mul(tile_h as usize)
+        .and_then(|n| n.checked_mul(bands_in_tile))
+        .and_then(|n| n.checked_mul(ifd.sample_type.bytes_per_sample()))
         .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
         .ok_or(CodecError::SizeMismatch {
             expected: MAX_DECODED_TILE_BYTES,
@@ -208,7 +237,8 @@ pub fn decode_tile_rows(
         && nodata.is_some()
         && !matches!(ifd.sample_type, SampleType::Uint8 | SampleType::Uint16);
     let recon_nodata = if defer_color_nodata { None } else { nodata };
-    let deferred_nodata = if defer_color_nodata { nodata } else { None };
+    let recon_nodata_f64 = if defer_color_nodata { None } else { nodata_f64 };
+    let deferred_nodata = if defer_color_nodata { nodata_f64 } else { None };
 
     // Fast path: Uncompressed + Predictor::None avoids touching thread-local scratch completely!
     if ifd.compression == Compression::None
@@ -266,7 +296,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 false,
                 false,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             SampleType::Int32 => predictor::reconstruct_int32(
                 &compressed[..expected_bytes],
@@ -276,7 +306,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 true,
                 false,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             SampleType::Uint1 => predictor::reconstruct_subbyte(
                 &compressed[..expected_bytes],
@@ -302,7 +332,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 false,
                 false,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             SampleType::Int64 => predictor::reconstruct_int64(
                 &compressed[..expected_bytes],
@@ -312,7 +342,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 true,
                 false,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             SampleType::Float64 => predictor::reconstruct_f64_uncompressed(
                 &compressed[..expected_bytes],
@@ -320,7 +350,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 byte_order,
-                recon_nodata,
+                recon_nodata_f64,
             ),
         };
         apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
@@ -908,7 +938,7 @@ pub fn decode_tile_rows(
                 eff_byte_order,
                 false,
                 p == Predictor::HorizontalInt,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             (SampleType::Int32, p) => predictor::reconstruct_int32(
                 raw_slice,
@@ -918,7 +948,7 @@ pub fn decode_tile_rows(
                 eff_byte_order,
                 true,
                 p == Predictor::HorizontalInt,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             (SampleType::Uint1, _) => predictor::reconstruct_subbyte(
                 raw_slice,
@@ -944,7 +974,7 @@ pub fn decode_tile_rows(
                 eff_byte_order,
                 false,
                 p == Predictor::HorizontalInt,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             (SampleType::Int64, p) => predictor::reconstruct_int64(
                 raw_slice,
@@ -954,7 +984,7 @@ pub fn decode_tile_rows(
                 eff_byte_order,
                 true,
                 p == Predictor::HorizontalInt,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             (SampleType::Float64, p) => predictor::reconstruct_f64(
                 raw_slice,
@@ -963,7 +993,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 eff_byte_order,
                 p,
-                recon_nodata,
+                recon_nodata_f64,
             ),
         };
 
@@ -1035,7 +1065,7 @@ fn parse_lerc_header_dims(blob: &[u8]) -> Option<(usize, usize, usize)> {
 fn apply_rgba_alpha_if_present(
     bands: &mut [DecodedBand],
     ifd: &IfdMeta,
-    deferred_color_nodata: Option<f32>,
+    deferred_color_nodata: Option<f64>,
 ) {
     if ifd.planar_config != PlanarConfig::Chunky {
         return;
@@ -1097,10 +1127,34 @@ fn apply_rgba_alpha_if_present(
         _ => {}
     }
 
-    // Apply deferred GDAL_NODATA to non-alpha F32-backed color bands only.
-    if let Some(nd_f32) = deferred_color_nodata {
+    // Apply deferred GDAL_NODATA to non-alpha color bands only.
+    if let Some(nd_f64) = deferred_color_nodata {
+        let nd_f32 = nd_f64 as f32;
         for (idx, b) in bands.iter_mut().enumerate() {
             if idx == alpha_idx {
+                continue;
+            }
+            if let BandData::F64(ref mut slice) = b.data {
+                let mut all_nd = true;
+                let mut no_nd = true;
+                let mut mn = f64::INFINITY;
+                let mut mx = f64::NEG_INFINITY;
+                for v in slice.iter_mut() {
+                    if v.is_nan() || (!nd_f64.is_nan() && *v == nd_f64) {
+                        *v = f64::NAN;
+                        no_nd = false;
+                    } else {
+                        all_nd = false;
+                        if *v < mn { mn = *v; }
+                        if *v > mx { mx = *v; }
+                    }
+                }
+                b.stats = BlockStats {
+                    all_nodata: all_nd,
+                    no_nodata: no_nd,
+                    min: if all_nd { f32::NAN } else { (mn as f32).clamp(f32::MIN, f32::MAX) },
+                    max: if all_nd { f32::NAN } else { (mx as f32).clamp(f32::MIN, f32::MAX) },
+                };
                 continue;
             }
             let slice = b.data.make_f32_mut();
@@ -1164,6 +1218,38 @@ pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
 
 fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
     let n = alpha.len();
+    if let BandData::F64(ref mut slice) = b.data {
+        let mut all_nd = true;
+        let mut no_nd = true;
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for i in 0..n.min(slice.len()) {
+            let a = alpha.get_f32(i);
+            if a == 0.0 || a.is_nan() {
+                slice[i] = f64::NAN;
+                no_nd = false;
+            } else {
+                let v = slice[i];
+                if v.is_nan() {
+                    no_nd = false;
+                } else {
+                    all_nd = false;
+                    if v < mn { mn = v; }
+                    if v > mx { mx = v; }
+                }
+            }
+        }
+        b.stats.all_nodata = all_nd;
+        b.stats.no_nodata = no_nd;
+        if all_nd {
+            b.stats.min = f32::NAN;
+            b.stats.max = f32::NAN;
+        } else {
+            b.stats.min = (mn as f32).clamp(f32::MIN, f32::MAX);
+            b.stats.max = (mx as f32).clamp(f32::MIN, f32::MAX);
+        }
+        return;
+    }
     let slice = b.data.make_f32_mut();
     let mut all_nd = true;
     let mut no_nd = true;
@@ -1339,6 +1425,38 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
         return;
     }
     for b in &mut tile.bands {
+        if let BandData::F64(ref mut slice) = b.data {
+            let n = slice.len().min(mask.len());
+            let mut all_nd = true;
+            let mut no_nd = true;
+            let mut mn = f64::INFINITY;
+            let mut mx = f64::NEG_INFINITY;
+            for i in 0..n {
+                if mask[i] == 0 {
+                    slice[i] = f64::NAN;
+                    no_nd = false;
+                } else {
+                    let v = slice[i];
+                    if v.is_nan() {
+                        no_nd = false;
+                    } else {
+                        all_nd = false;
+                        if v < mn { mn = v; }
+                        if v > mx { mx = v; }
+                    }
+                }
+            }
+            b.stats.all_nodata = all_nd;
+            b.stats.no_nodata = no_nd;
+            if all_nd {
+                b.stats.min = f32::NAN;
+                b.stats.max = f32::NAN;
+            } else {
+                b.stats.min = (mn as f32).clamp(f32::MIN, f32::MAX);
+                b.stats.max = (mx as f32).clamp(f32::MIN, f32::MAX);
+            }
+            continue;
+        }
         let slice = b.data.make_f32_mut();
         let n = slice.len().min(mask.len());
         let mut all_nd = true;
