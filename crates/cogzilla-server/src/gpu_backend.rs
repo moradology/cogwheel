@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use cogzilla_gpu::{
-    CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer, GpuColorFormula,
-    GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
+    CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuBandStats, GpuCoalescer,
+    GpuColorFormula, GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
     GpuExprRenderer, GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
-    GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer,
-    GpuTileBatcher, MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice,
-    opcodes,
+    GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuStatsReducer,
+    GpuTerrainRenderer, GpuTileBatcher, MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey,
+    TileCoordSlice, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -56,6 +56,7 @@ pub struct GpuBackend {
     mosaic: Mutex<GpuMosaicCompositor>,
     batcher: Mutex<GpuTileBatcher>,
     jpeg: Mutex<GpuJpegEncoder>,
+    stats: Mutex<GpuStatsReducer>,
     in_flight: AtomicUsize,
 }
 
@@ -211,6 +212,7 @@ impl GpuBackend {
         let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
         let batcher = Mutex::new(GpuTileBatcher::new(&ctx));
         let jpeg = Mutex::new(GpuJpegEncoder::new(&ctx));
+        let stats = Mutex::new(GpuStatsReducer::new(&ctx));
         Some(Arc::new(Self {
             ctx,
             policy,
@@ -224,6 +226,7 @@ impl GpuBackend {
             mosaic,
             batcher,
             jpeg,
+            stats,
             in_flight: AtomicUsize::new(0),
         }))
     }
@@ -446,6 +449,30 @@ impl GpuBackend {
             }
         }
         crate::titiler::encode_rgba_output(dst_w, dst_h, rgba, format, return_mask)
+    }
+
+    /// Compute GPU-accelerated band statistics, histogram, and percentiles for large `f32`
+    /// rasters (`>= 262_144` pixels on discrete/Vulkan, `>= 524_288` on unified/Metal).
+    pub fn try_reduce_f32_stats(
+        &self,
+        pixels: &[f32],
+        nodata: Option<f32>,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
+        let min_px = if self.ctx.info.unified_memory {
+            512 * 1024
+        } else {
+            512 * 512
+        };
+        if pixels.len() < min_px {
+            return None;
+        }
+        let mut guard = self.stats.lock().ok()?;
+        guard
+            .reduce_f32(pixels, nodata, num_bins, hist_range, percentiles)
+            .ok()
     }
 
     fn fused_jpeg_quality(&self, dst_w: usize, dst_h: usize, format: OutputFormat) -> Option<u8> {
