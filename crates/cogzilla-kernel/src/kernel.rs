@@ -5088,7 +5088,7 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
         let r0 = row0.as_ptr();
         let r1 = row1.as_ptr();
         let r2 = row2.as_ptr();
-        let mut tmp = [0u32; 4];
+        let out_ptr = out_idx.as_mut_ptr();
         let mut px = 0usize;
         while px + 4 <= N {
             let nw = vld1q_f32(r0.add(px));
@@ -5110,14 +5110,19 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
 
             let len_sq = vfmaq_f32(vfmaq_f32(v_one, nx, nx), ny, ny);
             let num = vfmaq_f32(vfmaq_f32(v_su, nx, v_se), ny, v_sn);
-            let dot = vdivq_f32(num, vsqrtq_f32(len_sq));
+            // Hardware reciprocal-sqrt + 1 Newton-Raphson step (~23-bit mantissa accuracy,
+            // ~4x lower latency than `vsqrtq_f32` + `vdivq_f32`; `len_sq >= 1.0` always).
+            let r = vrsqrteq_f32(len_sq);
+            let inv_len = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(len_sq, r), r));
+            let dot = vmulq_f32(num, inv_len);
             let hs = vminq_f32(vmulq_f32(vmaxq_f32(dot, v_zero), v_255), v_255);
             let scaled = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(hs, v_min), v_inv_r), v_zero), v_255);
-            vst1q_u32(tmp.as_mut_ptr(), vcvtq_u32_f32(vaddq_f32(scaled, v_half)));
-            *out_idx.get_unchecked_mut(px) = tmp[0] as u8;
-            *out_idx.get_unchecked_mut(px + 1) = tmp[1] as u8;
-            *out_idx.get_unchecked_mut(px + 2) = tmp[2] as u8;
-            *out_idx.get_unchecked_mut(px + 3) = tmp[3] as u8;
+            // Narrow 4x u32 -> 4x u8 in registers and emit a single unaligned u32 store.
+            let u32_v = vcvtq_u32_f32(vaddq_f32(scaled, v_half));
+            let u16_v = vmovn_u32(u32_v);
+            let u8_v = vmovn_u16(vcombine_u16(u16_v, u16_v));
+            let packed = vget_lane_u32::<0>(vreinterpret_u32_u8(u8_v));
+            (out_ptr.add(px) as *mut u32).write_unaligned(packed);
             px += 4;
         }
         start_px = px;
@@ -5179,6 +5184,7 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     let v_zero = _mm256_setzero_ps();
     let v_255 = _mm256_set1_ps(255.0);
     let v_half = _mm256_set1_ps(0.5);
+    let v_one_half = _mm256_set1_ps(1.5);
     let v_neg_zs = _mm256_set1_ps(neg_z_scale);
     let v_pos_zs = _mm256_set1_ps(pos_z_scale);
     let v_se = _mm256_set1_ps(sun_e);
@@ -5187,7 +5193,7 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     let v_inv_r = _mm256_set1_ps(inv_range);
     let v_min = _mm256_set1_ps(min_val);
 
-    let mut tmp = [0i32; 8];
+    let out_ptr = out_idx.as_mut_ptr();
     let mut px = 0usize;
     while px + 8 <= N {
         let nw = _mm256_loadu_ps(r0.add(px));
@@ -5209,19 +5215,24 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
 
         let len_sq = _mm256_fmadd_ps(ny, ny, _mm256_fmadd_ps(nx, nx, v_one));
         let num = _mm256_fmadd_ps(ny, v_sn, _mm256_fmadd_ps(nx, v_se, v_su));
-        let dot = _mm256_div_ps(num, _mm256_sqrt_ps(len_sq));
+        // Hardware reciprocal-sqrt + 1 Newton-Raphson step: r * (1.5 - 0.5 * len_sq * r * r)
+        let r = _mm256_rsqrt_ps(len_sq);
+        let r2 = _mm256_mul_ps(r, r);
+        let inv_len = _mm256_mul_ps(r, _mm256_fnmadd_ps(_mm256_mul_ps(v_half, len_sq), r2, v_one_half));
+        let dot = _mm256_mul_ps(num, inv_len);
         let hs = _mm256_min_ps(_mm256_mul_ps(_mm256_max_ps(dot, v_zero), v_255), v_255);
         let scaled = _mm256_min_ps(
             _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(hs, v_min), v_inv_r), v_zero),
             v_255,
         );
-        _mm256_storeu_si256(
-            tmp.as_mut_ptr() as *mut __m256i,
-            _mm256_cvttps_epi32(_mm256_add_ps(scaled, v_half)),
-        );
-        for k in 0..8 {
-            *out_idx.get_unchecked_mut(px + k) = tmp[k] as u8;
-        }
+        // Narrow 8x i32 -> 8x u8 in registers and emit a single unaligned u64 store.
+        let i32_v = _mm256_cvttps_epi32(_mm256_add_ps(scaled, v_half));
+        let lo128 = _mm256_castsi256_si128(i32_v);
+        let hi128 = _mm256_extracti128_si256::<1>(i32_v);
+        let u16_v = _mm_packus_epi32(lo128, hi128);
+        let u8_v = _mm_packus_epi16(u16_v, u16_v);
+        let packed = _mm_cvtsi128_si64(u8_v) as u64;
+        (out_ptr.add(px) as *mut u64).write_unaligned(packed);
         px += 8;
     }
 }
