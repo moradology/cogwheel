@@ -524,6 +524,16 @@ def main() -> int:
         o.check("tif, rescaled under a colour map", "image", f"{base12}.tif?assets=red&rescale=0,3000&colormap_name=viridis")
         o.check("tif of three assets that are not bytes", "image", f"{base12}.tif?assets=red&assets=green&assets=blue&asset_as_band=true")
         o.check("bbox, tif under an algorithm", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x64.tif?assets=red&algorithm=hillshade")
+        # An algorithm's parameters on a mosaic. Contours are drawn as titiler-pgstac draws them;
+        # hillshade is shaded another way (see the plan), so only that it is answered is checked.
+        o.check("contours with their parameters", "image",
+                f"{base12}.png?assets=red&algorithm=contours&algorithm_params=%7B%22increment%22%3A500%2C%22thickness%22%3A2%7D")
+        o.check("hillshade with its parameters", "status",
+                f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A200%2C%22angle_altitude%22%3A20%7D")
+        o.check("bbox, hillshade with its parameters", "status",
+                f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A90%7D")
+        o.check("algorithm parameters of the wrong type", "status",
+                f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%22x%22%7D")
         # Band math read with a smoothing resampling: whole numbers stay whole, rescaled is bytes.
         band_math = "assets=red&assets=nir&asset_as_band=true&resampling=bilinear&reproject=bilinear&expression="
         o.check("array of whole band math, bilinear", "image", f"{base12}.npy?{band_math}b1*2")
