@@ -1599,6 +1599,43 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             let wmts_body = wmts_all.text().await.unwrap();
             assert_eq!(wmts_body.matches("<Layer>").count(), 13);
             assert_eq!(wmts_body.matches("<TileMatrixSet>").count(), 26); // 13 links + 13 definitions
+            // Sweep #10 K1 & K3: TileMatrixSetLimits, ServiceMetadataURL, EPSG:xxxx on use_epsg=true, zooms stripped
+            assert_eq!(wmts_body.matches("<TileMatrixSetLimits>").count(), 13);
+            assert!(wmts_body.contains("<MinTileRow>"));
+            assert!(wmts_body.contains("<ServiceMetadataURL"));
+            let wmts_epsg = client
+                .get(format!("{base}/cog/WMTSCapabilities.xml?url={sat_url}&use_epsg=true&zooms=WebMercatorQuad::9,10"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(wmts_epsg.contains("<ows:SupportedCRS>EPSG:3857</ows:SupportedCRS>"));
+            assert!(wmts_epsg.contains("<ows:SupportedCRS>EPSG:4326</ows:SupportedCRS>"));
+            assert!(
+                wmts_epsg
+                    .lines()
+                    .filter(|l| l.contains("<ResourceURL"))
+                    .all(|l| !l.contains("zooms=")),
+                "ResourceURL templates must not include zooms="
+            );
+
+            // Sweep #10 K2: binary .npy tile gzip-compressed when Accept-Encoding: gzip or *
+            let npy_gz = client
+                .get(format!("{base}/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={sat_url}"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(npy_gz.status(), 200);
+            assert_eq!(
+                npy_gz.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+                Some("gzip")
+            );
+            let npy_gz_bytes = npy_gz.bytes().await.unwrap();
+            let npy_raw = cogzilla_codec::decompress_gzip_limited(&npy_gz_bytes, 8 * 1024 * 1024).unwrap();
+            assert!(npy_raw.starts_with(b"\x93NUMPY"));
 
             // Sweep #9 J1-J6 regression checks
             // J1: empty expression= is treated as absent

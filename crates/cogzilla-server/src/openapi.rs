@@ -166,9 +166,12 @@ fn wmts_params() -> Vec<Value> {
     vec![
         q_int("minzoom", "Override minimum zoom level"),
         q_int("maxzoom", "Override maximum zoom level"),
+        q_arr("zooms", "string", false, "Per-TMS zoom overrides"),
         q_str("tile_format", false, "Tile image format (png, jpg, webp, tif)"),
         q_int("tile_scale", "Tile scale factor (1..4)"),
-        q_bool("use_epsg", false, "Emit urn:ogc:def:crs:EPSG::xxxx instead of OGC URI"),
+        q_num("buffer", "Tile buffer in pixels"),
+        q_int("padding", "Source read padding in pixels"),
+        q_bool("use_epsg", false, "Emit EPSG:<code> instead of OGC URI"),
     ]
 }
 
@@ -267,6 +270,7 @@ fn add_family_routes(
     {
         let mut p = tile_path_base();
         p.extend(tile_query());
+        p.push(q_str("format", false, "Output image format override (png, jpg, webp, tif, npy)"));
         paths.insert(
             format!("{prefix}/tiles/{{tileMatrixSetId}}/{{z}}/{{x}}/{{y}}"),
             json!({ "get": op(tag, &format!("Render {tag} tile (auto format)"), p, "image/png") }),
@@ -285,6 +289,7 @@ fn add_family_routes(
         let mut p = tile_path_base();
         p.push(path_param("scale", "integer", "Tile scale factor (1..4)"));
         p.extend(tile_query());
+        p.push(q_str("format", false, "Output image format override (png, jpg, webp, tif, npy)"));
         paths.insert(
             format!("{prefix}/tiles/{{tileMatrixSetId}}/{{z}}/{{x}}/{{y}}@{{scale}}x"),
             json!({ "get": op(tag, &format!("Render scaled {tag} tile (auto format)"), p, "image/png") }),
@@ -360,6 +365,7 @@ fn add_family_routes(
         p.push(q_str("nodata", false, "Override nodata value"));
         p.push(q_bool("unscale", false, "Apply dataset scale/offset"));
         p.push(q_str("resampling", false, "Resampling method"));
+        p.push(q_str("reproject", false, "Warp resampling method"));
         p.push(q_str("coord_crs", false, "CRS of lon,lat coordinates (default EPSG:4326)"));
         paths.insert(
             format!("{prefix}/point/{{lon}},{{lat}}"),
@@ -419,9 +425,11 @@ fn add_family_routes(
             v.push(q_int("height", "Explicit output height"));
             v
         };
+        let mut f_auto = fq();
+        f_auto.push(q_str("format", false, "Output image format override"));
         paths.insert(
             format!("{prefix}/feature"),
-            json!({ "post": post_op(tag, &format!("Render {tag} GeoJSON feature crop (auto format)"), fq(), "#/components/schemas/GeoJSONFeature", "image/png") }),
+            json!({ "post": post_op(tag, &format!("Render {tag} GeoJSON feature crop (auto format)"), f_auto, "#/components/schemas/GeoJSONFeature", "image/png") }),
         );
         let mut pf = vec![path_param("format", "string", "Output image format")];
         pf.extend(fq());
@@ -452,9 +460,11 @@ fn add_family_routes(
             v.push(q_str("dst_crs", false, "Target CRS for preview"));
             v
         };
+        let mut p_auto = prev_q();
+        p_auto.push(q_str("format", false, "Output image format override"));
         paths.insert(
             format!("{prefix}/preview"),
-            json!({ "get": op(tag, &format!("Render {tag} preview (auto format)"), prev_q(), "image/png") }),
+            json!({ "get": op(tag, &format!("Render {tag} preview (auto format)"), p_auto, "image/png") }),
         );
         let mut pf = vec![path_param("format", "string", "Output image format")];
         pf.extend(prev_q());
@@ -486,6 +496,7 @@ fn add_family_routes(
         sp.extend(stats_params());
         let mut post_sp = sp.clone();
         post_sp.push(q_str("coord_crs", false, "CRS of incoming GeoJSON geometry"));
+        post_sp.push(q_int("cover_scale", "Subpixel polygon coverage supersampling scale"));
         paths.insert(
             format!("{prefix}/statistics"),
             json!({
@@ -532,15 +543,18 @@ pub fn build_openapi_spec() -> Value {
     // Algorithms, ColorMaps, TileMatrixSets
     paths.insert(
         "/algorithms".into(),
-        json!({ "get": op("Algorithms", "List available raster algorithms", vec![], "application/json") }),
+        json!({ "get": op("Algorithms", "List available raster algorithms", vec![q_str("f", false, "Response format (json or html)")], "application/json") }),
     );
     paths.insert(
         "/algorithms/{algorithmId}".into(),
-        json!({ "get": op("Algorithms", "Get algorithm metadata and parameters", vec![path_param("algorithmId", "string", "Algorithm identifier")], "application/json") }),
+        json!({ "get": op("Algorithms", "Get algorithm metadata and parameters", vec![
+            path_param("algorithmId", "string", "Algorithm identifier"),
+            q_str("f", false, "Response format (json or html)"),
+        ], "application/json") }),
     );
     paths.insert(
         "/colorMaps".into(),
-        json!({ "get": op("ColorMaps", "List all 211 rio-tiler colormaps", vec![], "application/json") }),
+        json!({ "get": op("ColorMaps", "List all 211 rio-tiler colormaps", vec![q_str("f", false, "Response format (json or html)")], "application/json") }),
     );
     paths.insert(
         "/colorMaps/{colorMapId}".into(),
@@ -589,6 +603,9 @@ pub fn build_openapi_spec() -> Value {
             q_bool("with_proj", false, "Include proj extension properties"),
             q_bool("with_raster", false, "Include raster extension band stats"),
             q_bool("with_eo", false, "Include eo extension properties"),
+            q_arr("extensions", "string", false, "Additional STAC extension URIs"),
+            q_int("geometry_densify", "Boundary densification points per edge"),
+            q_int("geometry_precision", "Coordinate decimal precision"),
             q_int("max_size", "Maximum size for raster statistics"),
         ], "application/geo+json") }),
     );
@@ -614,9 +631,9 @@ pub fn build_openapi_spec() -> Value {
         json!({ "get": op("SpatioTemporal Asset Catalog", "List STAC Item render definitions", vec![q_str("url", true, "STAC Item URL")], "application/json") }),
     );
     paths.insert(
-        "/stac/renders/{renderId}".into(),
+        "/stac/renders/{render_id}".into(),
         json!({ "get": op("SpatioTemporal Asset Catalog", "Get a STAC Item render definition", vec![
-            path_param("renderId", "string", "Render identifier"),
+            path_param("render_id", "string", "Render identifier"),
             q_str("url", true, "STAC Item URL"),
         ], "application/json") }),
     );
@@ -739,7 +756,7 @@ mod tests {
             "/cog/stac",
             "/cog/WMTSCapabilities.xml",
             "/stac/renders",
-            "/stac/renders/{renderId}",
+            "/stac/renders/{render_id}",
             "/mosaicjson/",
             "/mosaicjson/validate",
             "/mosaicjson/WMTSCapabilities.xml",
