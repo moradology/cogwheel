@@ -1037,6 +1037,8 @@ def main() -> int:
         o.check("tile, pixel_selection and a colour formula", "image",
                 f"{base12}.png?assets=visual&pixel_selection=mean&color_formula={opt('gamma rgb 1.8')}{every}")
         o.check("tile, a colour formula", "image", f"{base12}.png?assets=visual&color_formula={opt('gamma rgb 1.8')}")
+        o.check("tile, a colour formula with saturation", "image",
+                f"{base12}.png?assets=visual&color_formula={opt('gamma rgb 3.5 saturation 1.7 sigmoidal rgb 15 0.35')}")
         # The routes that describe a mosaic check its tiles' parameters as the tiles do.
         for route in ("WebMercatorQuad/tilejson.json", "WebMercatorQuad/map.html", "WMTSCapabilities.xml"):
             for bad in ("colormap_name=nope", "rescale=abc", "resampling=nope", "nodata=abc", "unscale=maybe", "algorithm=nope", "items_limit=abc"):
