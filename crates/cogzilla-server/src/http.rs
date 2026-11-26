@@ -237,6 +237,7 @@ struct ParsedQuery {
     histogram_range: Option<(f64, f64)>,
     categorical: bool,
     categories: Vec<f64>,
+    area_weighted: bool,
     webp_quality: Option<f32>,
     jpeg_quality: u8,
     expr_raw: Option<String>,
@@ -305,6 +306,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         histogram_range: None,
         categorical: false,
         categories: Vec::new(),
+        area_weighted: true,
         webp_quality: None,
         jpeg_quality: 85,
         expr_raw: None,
@@ -641,6 +643,13 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "shape_mask" => {
                 pq.shape_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
             }
+            "area_weighted" => {
+                pq.area_weighted = !(v.eq_ignore_ascii_case("false") || v == "0");
+            }
+            "cover_scale" | "all_touched" => {
+                // Exact analytical coverage weighting needs no supersampling or binary all_touched toggle;
+                // accepted and ignored for TiTiler/rasterio client compatibility.
+            }
             "buffer" => {
                 if let Ok(buf) = v.parse::<f32>()
                     && buf.is_finite()
@@ -907,9 +916,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     "explicit" | "discrete" | "" => pq.colormap_type_linear = false,
                     _ => bad("expected colormap_type=explicit or linear"),
                 }
-            }
-            "cover_scale" => {
-                pq_errors.push(format!("parameter '{k}' is not supported by cogzilla"));
             }
             _ => {}
         }
@@ -2856,6 +2862,7 @@ fn build_stats_options_with_bands(
     opts.width = pq.width;
     opts.height = pq.height;
     opts.max_size_explicit = pq.keys.iter().any(|k| k == "max_size");
+    opts.area_weighted = pq.area_weighted;
     if allow_expr
         && let Some(raw) = pq.expr_raw.as_deref()
     {
