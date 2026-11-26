@@ -3469,8 +3469,8 @@ async fn render_mosaic_tile_pixel_selection(
 /// [`paint`]. Three bands or more are red, green and blue (the first three); fewer are the
 /// first band under the request's colour map. Kept from the single-scene renderer, where
 /// rio-tiler has no equivalent or does otherwise: a raster's own palette and a colour map
-/// given as JSON (`custom`, which the kernel looks up from the value), and a range given
-/// upside down.
+/// given as JSON (`custom`, which the kernel looks up from the value). A range given
+/// upside down is the ramp inverted, which is `rescale_byte`'s doing.
 fn paint_selected(
     mut selected: Selected,
     pixels: usize,
@@ -3508,7 +3508,6 @@ fn paint_selected(
     };
     if three {
         selected.bands = 3;
-        let paint = paint.upright(&mut selected, pixels);
         let mut rgba = paint.rgba(&selected, pixels);
         if let Some(formula) = &formula {
             formula.apply_buffer_in_place(&mut rgba, 4);
@@ -3530,7 +3529,6 @@ fn paint_selected(
         }
         return Ok(rgba);
     }
-    let paint = paint.upright(&mut selected, pixels);
     Ok(match &formula {
         Some(formula) => paint.rgba_through(&selected, pixels, &paint::formula_levels(formula)),
         None => paint.rgba(&selected, pixels),
