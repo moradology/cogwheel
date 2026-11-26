@@ -2694,59 +2694,7 @@ fn npy_array(
     mask: bool,
     absent: Option<f32>,
 ) -> Bytes {
-    let pixels = width * height;
-    let (descr, size) = match kind {
-        SampleType::Uint8 => ("|u1", 1),
-        SampleType::Int8 => ("|i1", 1),
-        SampleType::Uint16 => ("<u2", 2),
-        SampleType::Int16 => ("<i2", 2),
-        SampleType::Uint32 => ("<u4", 4),
-        SampleType::Int32 => ("<i4", 4),
-        SampleType::Float32 => ("<f4", 4),
-        SampleType::Float64 => ("<f8", 8),
-    };
-    let planes = bands + usize::from(mask);
-    let mut dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({planes}, {height}, {width}), }}");
-    // The header ends on a multiple of 64 bytes, in spaces and a newline.
-    let pad = (64 - (10 + dict.len() + 1) % 64) % 64;
-    dict.extend(std::iter::repeat_n(' ', pad));
-    dict.push('\n');
-    let mut out = Vec::with_capacity(10 + dict.len() + planes * pixels * size);
-    out.extend_from_slice(b"\x93NUMPY\x01\x00");
-    out.extend_from_slice(&(dict.len() as u16).to_le_bytes());
-    out.extend_from_slice(dict.as_bytes());
-    let absent = f64::from(absent.unwrap_or(0.0));
-    let data = &values[..(bands * pixels).min(values.len())];
-    // The values in the array's type, then the mask: the type's largest number where any
-    // band has a value. One loop for each type, so the type is not asked about per value.
-    macro_rules! write {
-        ($t:ty, $cast:expr) => {{
-            let cast = $cast;
-            for v in data {
-                let x: $t = cast(if v.is_nan() { absent } else { f64::from(*v) });
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-            if mask {
-                for i in 0..pixels {
-                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
-                    let x: $t = if there { <$t>::MAX } else { cast(0.0) };
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-            }
-        }};
-    }
-    match kind {
-        SampleType::Uint8 => write!(u8, |v: f64| v as u8),
-        SampleType::Int8 => write!(i8, |v: f64| v as i8),
-        SampleType::Uint16 => write!(u16, |v: f64| v as u16),
-        SampleType::Int16 => write!(i16, |v: f64| v as i16),
-        SampleType::Uint32 => write!(u32, |v: f64| v as u32),
-        SampleType::Int32 => write!(i32, |v: f64| v as i32),
-        // Band math's largest number is an infinity once it has been through a plane of f32.
-        SampleType::Float32 => write!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
-        SampleType::Float64 => write!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
-    }
-    Bytes::from(out)
+    cogzilla_kernel::encode_npy_typed(values, bands, height, width, kind, absent, mask)
 }
 
 /// A colour map given in the request as JSON, read the way rio-tiler applies one.
