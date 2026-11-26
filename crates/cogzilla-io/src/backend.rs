@@ -114,11 +114,17 @@ pub enum CogSource {
     },
 }
 
-/// Strip `file://` for local paths, or reject any unrecognized `<scheme>://` URI with
-/// [`IoError::InvalidUri`] naming the unsupported scheme and the supported ones.
+/// Strip `file://` / `file://localhost` for local paths, or reject any unrecognized `<scheme>://`
+/// URI with [`IoError::InvalidUri`] naming the unsupported scheme and the supported ones.
 pub(crate) fn resolve_local_or_reject_scheme(uri: &str) -> Result<&str, IoError> {
-    if let Some(local) = uri.strip_prefix("file://") {
-        return Ok(local);
+    match crate::allowlist::strip_file_uri_prefix(uri) {
+        Ok(Some(local)) => return Ok(local),
+        Ok(None) => {}
+        Err(()) => {
+            return Err(IoError::InvalidUri(format!(
+                "non-local host in file:// URI '{uri}' (expected file:///path or file://localhost/path)"
+            )));
+        }
     }
     if let Some(idx) = uri.find("://") {
         let scheme = &uri[..idx];
