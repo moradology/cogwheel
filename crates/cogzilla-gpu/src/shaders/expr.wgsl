@@ -654,3 +654,46 @@ fn expr_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
 }
+
+/// Multi-band planar `(num_bands, dst_h, dst_w)` Float32 resampling for scientific `.npy` / `.tif`
+/// ML tensor cubes (3D Z-dispatch over `gid.z in 0..params.num_bands`).
+@compute @workgroup_size(16, 16, 1)
+fn multiband_resample_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    let band = gid.z;
+    if (px >= params.dst_w || py >= params.dst_h || band >= params.num_bands) {
+        return;
+    }
+    let uv = eval_uv(px, py);
+    let val = sample_band(band, uv.x, uv.y);
+    let plane_pix = params.dst_w * params.dst_h;
+    dst_words[band * plane_pix + py * params.dst_w + px] = bitcast<u32>(val);
+}
+
+/// Planar `(3, dst_h, dst_w)` Float32 evaluation for 3-expression `CustomExprRgb` `.npy` / `.tif`.
+@compute @workgroup_size(16, 16, 1)
+fn expr_rgb_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.dst_w || py >= params.dst_h) {
+        return;
+    }
+    let uv = eval_uv(px, py);
+    var bvals: array<f32, 8>;
+    let nb = min(params.num_bands, 8u);
+    for (var b: u32 = 0u; b < nb; b = b + 1u) {
+        bvals[b] = sample_band(b, uv.x, uv.y);
+    }
+    let len0 = params.num_instrs & 0xffu;
+    let len1 = (params.num_instrs >> 8u) & 0xffu;
+    let len2 = (params.num_instrs >> 16u) & 0xffu;
+    let vr = eval_expr_vm_range(&bvals, 0u, len0);
+    let vg = eval_expr_vm_range(&bvals, len0, len0 + len1);
+    let vb = eval_expr_vm_range(&bvals, len0 + len1, len0 + len1 + len2);
+    let plane_pix = params.dst_w * params.dst_h;
+    let pix = py * params.dst_w + px;
+    dst_words[pix] = bitcast<u32>(vr);
+    dst_words[plane_pix + pix] = bitcast<u32>(vg);
+    dst_words[2u * plane_pix + pix] = bitcast<u32>(vb);
+}

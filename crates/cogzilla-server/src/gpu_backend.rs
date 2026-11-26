@@ -2345,6 +2345,147 @@ impl GpuBackend {
             crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
         })
     }
+
+    /// Attempt GPU-accelerated multi-band planar `(num_bands, dst_h, dst_w)` Float32 resampling
+    /// for `.npy`, Float32 `.tif`, and `.f32` scientific ML tensor cubes (`1..=8` bands).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_multiband_f32(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        resample: ResampleMode,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(resample)?;
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        let nb = srcs.len();
+        if dst_w == 0 || dst_h == 0 || nb == 0 || nb > 8 {
+            return None;
+        }
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let upload_bytes = band_upload_bytes + coord_upload_bytes;
+        let readback_bytes = dst_w * dst_h * nb * 4;
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let decision = self.policy.decide(&DispatchRequest {
+            op: gpu_mode.to_policy_op(),
+            dst_pixels: dst_w * dst_h * nb,
+            upload_bytes,
+            readback_bytes,
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 32,
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::MultiBandF32 {
+                slab,
+                plan,
+                mode: gpu_mode,
+            })
+            .ok()?;
+        Some(Bytes::from(raw))
+    }
+
+    /// Attempt GPU-accelerated planar `(3, dst_h, dst_w)` Float32 evaluation for 3-expression
+    /// `CustomExprRgb` `.npy` / Float32 `.tif` / `.f32` exports.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_expr_rgb_f32(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        unique_bands: &[u16],
+        srcs: &[BandSource<'_>],
+        progs: &[ExprProgram; 3],
+        resample: ResampleMode,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(resample)?;
+        let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {
+            return None;
+        }
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let upload_bytes = band_upload_bytes + coord_upload_bytes;
+        let readback_bytes = dst_w * dst_h * 3 * 4;
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: dst_w * dst_h * 3,
+            upload_bytes,
+            readback_bytes,
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 32,
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::ExprRgbF32 {
+                slab,
+                plan,
+                mode: gpu_mode,
+                instrs,
+                lens,
+            })
+            .ok()?;
+        Some(Bytes::from(raw))
+    }
 }
 
 #[cfg(test)]
@@ -3374,6 +3515,130 @@ mod tests {
                 max_diff <= 4,
                 "CustomExprRgb + ColorFormula max channel diff {max_diff} > 4"
             );
+        }
+    }
+
+    #[test]
+    fn multiband_and_expr_rgb_raw_f32_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU MultiBand/ExprRgb RawF32 test (no adapter)");
+            return;
+        };
+        let w = 256u32;
+        let h = 256u32;
+        let mk_band = |base: u16, sx: u16, sy: u16| {
+            let vals: Vec<u16> = (0..(w * h))
+                .map(|i| base + ((i % w) as u16 * sx) + ((i / w) as u16 * sy))
+                .collect();
+            DecodedBand {
+                width: w,
+                height: h,
+                data: BandData::U16 {
+                    data: vals.into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 10.0,
+                    max: 2500.0,
+                },
+            }
+        };
+        let b0 = mk_band(400, 3, 2);
+        let b1 = mk_band(200, 2, 3);
+        let b2 = mk_band(100, 1, 2);
+        let b3 = mk_band(500, 2, 1);
+        let bl = [[Some(&b0)], [Some(&b1)], [Some(&b2)], [Some(&b3)]];
+        let srcs: Vec<_> = bl
+            .iter()
+            .map(|r| BandSource::new(w, h, w, h, 0, 0, 1, 1, r))
+            .collect();
+        let n = 512usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * (246.0 / n as f32)).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * (246.0 / n as f32)).collect();
+
+        // 1. 4-band planar RawF32 cube
+        if let Some(raw) = gpu.try_render_bbox_multiband_f32(
+            None,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &srcs,
+            ResampleMode::Lanczos,
+        ) {
+            assert_eq!(raw.len(), 4 * n * n * 4);
+            let mut max_err = 0.0f32;
+            for band in 0..4 {
+                for py in (8..n - 8).step_by(37) {
+                    for px in (8..n - 8).step_by(37) {
+                        let off = (band * n * n + py * n + px) * 4;
+                        let gv = f32::from_le_bytes([
+                            raw[off],
+                            raw[off + 1],
+                            raw[off + 2],
+                            raw[off + 3],
+                        ]);
+                        let cv = cogzilla_kernel::sample_general_scaled(
+                            &srcs[band],
+                            u_coords[px],
+                            v_coords[py],
+                            1.0,
+                            1.0,
+                            ResampleMode::Lanczos,
+                        );
+                        max_err = max_err.max((gv - cv).abs());
+                    }
+                }
+            }
+            assert!(max_err < 1e-2, "4-band MultiBand RawF32 max err {max_err} >= 1e-2");
+        }
+
+        // 2. 3-expression CustomExprRgb planar RawF32 cube
+        let progs = [
+            ExprProgram::compile("(b1-b2)/(b1+b2)").unwrap(),
+            ExprProgram::compile("b2*0.001").unwrap(),
+            ExprProgram::compile("sqrt(b3)").unwrap(),
+        ];
+        if let Some(raw) = gpu.try_render_bbox_expr_rgb_f32(
+            None,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &[1, 2, 3],
+            &srcs[..3],
+            &progs,
+            ResampleMode::Lanczos,
+        ) {
+            assert_eq!(raw.len(), 3 * n * n * 4);
+            let mut max_err = 0.0f32;
+            for py in (8..n - 8).step_by(37) {
+                for px in (8..n - 8).step_by(37) {
+                    let s0 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[0], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let s1 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[1], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let s2 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[2], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let expected = [(s0 - s1) / (s0 + s1), s1 * 0.001, s2.sqrt()];
+                    for (c, &exp) in expected.iter().enumerate() {
+                        let off = (c * n * n + py * n + px) * 4;
+                        let gv = f32::from_le_bytes([
+                            raw[off],
+                            raw[off + 1],
+                            raw[off + 2],
+                            raw[off + 3],
+                        ]);
+                        max_err = max_err.max((gv - exp).abs());
+                    }
+                }
+            }
+            assert!(max_err < 1e-2, "CustomExprRgb RawF32 max err {max_err} >= 1e-2");
         }
     }
 }
