@@ -238,25 +238,7 @@ pub async fn load_stac_item(
         return Ok(hit.clone());
     }
 
-    let raw_bytes = store
-        .fetch_uri_bytes(uri, MAX_STAC_JSON_BYTES)
-        .await
-        .map_err(|e| match e.root() {
-            cogzilla_io::IoError::Forbidden(u) => {
-                EngineError::Io(cogzilla_io::IoError::Forbidden(u.clone()))
-            }
-            cogzilla_io::IoError::HttpStatus { status: 404, url } => {
-                EngineError::NotFound(format!("STAC item HTTP 404: {url}"))
-            }
-            cogzilla_io::IoError::Fs(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => {
-                let safe_uri = cogzilla_io::redact_http_url(uri);
-                EngineError::NotFound(format!("cannot read STAC item '{safe_uri}': {ioe}"))
-            }
-            other => {
-                let safe_uri = cogzilla_io::redact_http_url(uri);
-                EngineError::BadRequest(format!("failed to fetch STAC item '{safe_uri}': {other}"))
-            }
-        })?;
+    let raw_bytes = store.fetch_uri_bytes(uri, MAX_STAC_JSON_BYTES).await?;
 
     let val: serde_json::Value = serde_json::from_slice(&raw_bytes)
         .map_err(|e| EngineError::BadRequest(format!("invalid STAC JSON: {e}")))?;

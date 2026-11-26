@@ -8,7 +8,7 @@ use cogzilla_codec::{
     DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile_rows,
     decode_tile_rows,
 };
-use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog};
+use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog, parse_cog_sparse};
 use dashmap::DashMap;
 
 /// Return the 0-based alpha plane index if this IFD is a `PlanarConfig::Planar` COG with an
@@ -601,21 +601,26 @@ impl CogStore {
                     | CogSource::RemoteHttp { .. }
                     | CogSource::RemoteGcs { .. }
                     | CogSource::RemoteAzure { .. } => {
-                        // Speculative 128 KiB single-RTT header read; bounded at 32 MiB to prevent
-                        // crafted non-COG / BigTIFF offsets from causing OOM or u64 overflow.
+                        // Speculative 128 KiB single-RTT header read for COGs; if any IFD or tag
+                        // array lies further in the file (e.g. non-COG GeoTIFFs with trailing IFDs),
+                        // jump directly to its offset with a bounded range request instead of
+                        // downloading the intervening pixel data.
                         const MAX_HEADER_FETCH_BYTES: u64 = 32 * 1024 * 1024;
-                        const MAX_HEADER_FETCH_ITERS: u32 = 16;
-                        let mut hdr = source
+                        const MAX_HEADER_FETCH_ITERS: u32 = 64;
+                        const MIN_SEEK_WINDOW: u64 = 32 * 1024;
+                        let first_chunk = source
                             .fetch_range(0, INITIAL_HEADER_FETCH_BYTES)
                             .await?
                             .to_vec();
+                        let mut total_fetched = first_chunk.len() as u64;
+                        let mut chunks: Vec<(u64, Vec<u8>)> = vec![(0, first_chunk)];
                         let mut header_fetches = 0u32;
                         loop {
-                            match parse_cog(&hdr) {
+                            match parse_cog_sparse(&chunks) {
                                 Ok(idx) => break idx,
-                                Err(TiffError::NeedMoreBytes { required, .. }) => {
-                                    let cur_len = hdr.len() as u64;
-                                    if required > MAX_HEADER_FETCH_BYTES {
+                                Err(TiffError::NeedRange { offset, end }) => {
+                                    let needed_len = end.saturating_sub(offset);
+                                    if needed_len > MAX_HEADER_FETCH_BYTES {
                                         return Err(IoError::Tiff(TiffError::Corrupt(
                                             "TIFF header/IFD exceeds 32 MiB limit",
                                         )));
@@ -626,25 +631,50 @@ impl CogStore {
                                             "TIFF header required too many incremental range fetches",
                                         )));
                                     }
-                                    let target = required
-                                        .checked_add(65535)
-                                        .map(|v| (v / 65536) * 65536)
-                                        .unwrap_or(MAX_HEADER_FETCH_BYTES)
-                                        .min(MAX_HEADER_FETCH_BYTES);
-                                    if target <= cur_len {
+                                    // If `offset` falls inside or right at the end of an existing
+                                    // chunk, extend that chunk from its end so we don't re-fetch
+                                    // the overlapping prefix.
+                                    let extend_idx = chunks.iter().position(|(base, data)| {
+                                        let cend = base.saturating_add(data.len() as u64);
+                                        *base <= offset && offset <= cend && end > cend
+                                    });
+                                    let (fetch_start, fetch_end) = if let Some(idx) = extend_idx {
+                                        let cend = chunks[idx]
+                                            .0
+                                            .saturating_add(chunks[idx].1.len() as u64);
+                                        let want_end = end
+                                            .max(cend.saturating_add(MIN_SEEK_WINDOW));
+                                        (cend, want_end)
+                                    } else {
+                                        let want_end = end
+                                            .max(offset.saturating_add(MIN_SEEK_WINDOW));
+                                        (offset, want_end)
+                                    };
+                                    let fetch_len = fetch_end.saturating_sub(fetch_start);
+                                    if total_fetched.saturating_add(fetch_len)
+                                        > MAX_HEADER_FETCH_BYTES
+                                    {
+                                        return Err(IoError::Tiff(TiffError::Corrupt(
+                                            "TIFF header/IFD exceeds 32 MiB limit",
+                                        )));
+                                    }
+                                    let more = source.fetch_range(fetch_start, fetch_end).await?;
+                                    if more.is_empty()
+                                        || fetch_start.saturating_add(more.len() as u64) < end
+                                    {
                                         return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                            required,
-                                            available: cur_len,
+                                            required: end,
+                                            available: fetch_start
+                                                .saturating_add(more.len() as u64),
                                         }));
                                     }
-                                    let more = source.fetch_range(cur_len, target).await?;
-                                    if more.is_empty() {
-                                        return Err(IoError::Tiff(TiffError::NeedMoreBytes {
-                                            required,
-                                            available: cur_len,
-                                        }));
+                                    total_fetched =
+                                        total_fetched.saturating_add(more.len() as u64);
+                                    if let Some(idx) = extend_idx {
+                                        chunks[idx].1.extend_from_slice(&more);
+                                    } else {
+                                        chunks.push((fetch_start, more.to_vec()));
                                     }
-                                    hdr.extend_from_slice(&more);
                                 }
                                 Err(e) => return Err(IoError::Tiff(e)),
                             }
@@ -2167,7 +2197,7 @@ impl CogStore {
             });
         }
 
-        let local = uri.strip_prefix("file://").unwrap_or(uri);
+        let local = crate::backend::resolve_local_or_reject_scheme(uri)?;
         let meta = std::fs::metadata(local)?;
         if !meta.is_file() {
             return Err(IoError::Fs(std::io::Error::other(format!(

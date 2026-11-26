@@ -216,12 +216,17 @@ fn geo_keys_match(a: &cogzilla_tiff::GeoKeys, b: &cogzilla_tiff::GeoKeys) -> boo
     true
 }
 
-/// Resampling kernel support margin `(lo, hi)` in source pixels needed around `[floor(min), ceil(max)]`.
+/// Resampling kernel support margin `(lo, hi)` in source pixels relative to
+/// `[floor(min), floor(max)]`.
 pub(crate) fn resample_fetch_margin(resample: ResampleMode, is_dem: bool) -> (i32, i32) {
     let (lo, hi) = match resample {
-        ResampleMode::Cubic | ResampleMode::CubicSpline => (1, 2),
+        ResampleMode::Nearest => (0, 0),
+        ResampleMode::Bilinear => (0, 1),
+        ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Gauss => (1, 2),
         ResampleMode::Lanczos => (2, 3),
-        _ => (1, 1),
+        // Footprint modes (Average/Mode/Rms/Min/Max/Med/Q1/Q3/Sum) use exact footprint bounds in
+        // `render_bbox_impl` and 1-px neighborhood padding on tile routes.
+        _ => (1, 2),
     };
     if is_dem {
         (lo + 2, hi + 2)
@@ -482,10 +487,10 @@ impl TileEngine {
 
         let (pad_lo, pad_hi) =
             resample_fetch_margin(req.resample, matches!(req.bands, BandRequest::Dem { .. }));
-        let (tx0, tx1, ty0, ty1) = if pad_lo > 1 || pad_hi > 1 {
-            // CoordPlan::src_pixel_bounds() already includes ±1 px padding.
-            let extra_lo = pad_lo - 1;
-            let extra_hi = pad_hi - 1;
+        let (tx0, tx1, ty0, ty1) = if pad_lo > 0 || pad_hi > 1 {
+            // CoordPlan::src_pixel_bounds() is the exact bilinear footprint [floor(min), floor(max)+1].
+            let extra_lo = pad_lo;
+            let extra_hi = (pad_hi - 1).max(0);
             let (c0, c1, r0, r1) = plan.src_pixel_bounds();
             let d_tx0 = (c0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_width;
             let d_tx1 = ((c1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_width)
@@ -1448,10 +1453,10 @@ impl TileEngine {
 
         let (pad_lo, pad_hi) =
             resample_fetch_margin(req.resample, matches!(req.bands, BandRequest::Dem { .. }));
-        let (tx0, tx1, ty0, ty1) = if pad_lo > 1 || pad_hi > 1 {
-            // CoordPlan::src_pixel_bounds() already includes ±1 px padding.
-            let extra_lo = pad_lo - 1;
-            let extra_hi = pad_hi - 1;
+        let (tx0, tx1, ty0, ty1) = if pad_lo > 0 || pad_hi > 1 {
+            // CoordPlan::src_pixel_bounds() is the exact bilinear footprint [floor(min), floor(max)+1].
+            let extra_lo = pad_lo;
+            let extra_hi = (pad_hi - 1).max(0);
             let (c0, c1, r0, r1) = plan.src_pixel_bounds();
             let d_tx0 = (c0.saturating_sub(extra_lo).max(0) as u32) / ifd.tile_width;
             let d_tx1 = ((c1.saturating_add(extra_hi).max(0) as u32) / ifd.tile_width)
