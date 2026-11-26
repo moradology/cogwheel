@@ -433,8 +433,9 @@ impl TileEngine {
         req: &TileRequest,
     ) -> Result<Bytes, EngineError> {
         self.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
-        if matches!(req.format, OutputFormat::RawF64 | OutputFormat::Npy)
+        if matches!(req.format, OutputFormat::RawF64 | OutputFormat::NpyF64)
             && !req.unscale
+            && matches!(req.resample, ResampleMode::Nearest | ResampleMode::Bilinear)
             && cog.index.full_res().sample_type.needs_f64()
         {
             let bands_1based: Option<Vec<u16>> = match &req.bands {
@@ -462,6 +463,7 @@ impl TileEngine {
                     kind,
                     true,
                     matches!(req.format, OutputFormat::RawF64),
+                    true,
                 )
                 .await;
             }
