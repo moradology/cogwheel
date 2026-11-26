@@ -523,6 +523,10 @@ def main() -> int:
         o.check("array of band math, bilinear, rescaled", "image", f"{base12}.npy?{math}(b2-b1)/(b2%2Bb1)&rescale=-1,1")
         o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
         o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
+        o.check("bbox, bilinear, a nodata of the request's own", "image",
+                f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.npy?assets=red&resampling=bilinear&reproject=bilinear&nodata=400")
+        o.check("bbox, average, a nodata of the request's own", "image",
+                f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.npy?assets=red&resampling=nearest&reproject=average&nodata=0")
         o.check("bbox, tif of one band", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.tif?assets=red")
         o.check("bbox in metres, tif of one band", "image", f"/searches/{sid}/bbox/912000,5700000,990000,5780000/64x64.tif?assets=red&coord_crs=epsg:3857")
         o.check("webp", "image", f"{base12}.webp?assets=visual")

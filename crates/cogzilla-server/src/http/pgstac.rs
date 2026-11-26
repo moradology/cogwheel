@@ -2282,9 +2282,7 @@ impl Window {
             }
             return Ok((planes, sample_type));
         }
-        if nodata.is_some() {
-            return Err(nearest_only());
-        }
+        // The renderer takes the request's own `nodata` in place of the raster's.
         let cogs = [cog];
         let mut planes = Vec::with_capacity(wanted.len());
         for band in wanted {
@@ -2299,7 +2297,7 @@ impl Window {
                 &bands,
                 resample,
                 OutputFormat::RawF32,
-                None,
+                nodata,
                 None,
                 None,
                 true,
@@ -2311,7 +2309,7 @@ impl Window {
             }
             planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
         }
-        Ok((planes, sample_type))
+        Ok((in_raster_type(planes, sample_type, unscale), sample_type))
     }
 }
 
@@ -4111,6 +4109,7 @@ async fn resampled_planes(
     (width, height): (usize, usize),
     resample: ResampleMode,
     unscale: bool,
+    nodata: Option<f32>,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     let mut planes = Vec::new();
     for band in 1..=cog.index.full_res().samples_per_pixel {
@@ -4129,7 +4128,7 @@ async fn resampled_planes(
             &one,
             resample,
             OutputFormat::RawF32,
-            None,
+            nodata,
             None,
             None,
             false,
@@ -4354,10 +4353,8 @@ async fn feature_statistics(
                 };
                 let read = if resample == ResampleMode::Nearest {
                     warp_nearest(engine, cog, &crs, own_bounds, false, size, native, path, req.unscale, true, &[], false, req.nodata).await
-                } else if req.nodata.is_some() {
-                    Err(EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into()))
                 } else {
-                    resampled_planes(engine, cog, own_bounds, size, resample, req.unscale)
+                    resampled_planes(engine, cog, own_bounds, size, resample, req.unscale, req.nodata)
                         .await
                         .map(|planes| in_raster_type(planes, cog.index.full_res().sample_type, req.unscale))
                 };
