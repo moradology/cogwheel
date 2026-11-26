@@ -1189,6 +1189,11 @@ struct WmtsSource<'a> {
 /// is the request's own query string when it can make a tile.
 fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, String)]) -> Resp {
     const TMS: &str = "WebMercatorQuad";
+    // The tiles' padding and buffer are checked here; their size is the document's own.
+    let of_tiles: Vec<(String, String)> = pairs.iter().filter(|(k, _)| k != "tilesize").cloned().collect();
+    if tile_bounds_error(&of_tiles).is_some() {
+        return detail(StatusCode::BAD_REQUEST, "a parameter of the tiles this document describes is not valid");
+    }
     let tile_format = query_value(pairs, "tile_format").unwrap_or("png");
     let media_type = match tile_format {
         "png" => "image/png",
@@ -6011,7 +6016,7 @@ pub(super) async fn item_route(
         _ => {}
     }
 
-    if let (["tiles", _, _, _, _], Some(resp)) = (rest, tile_bounds_error(&pairs)) {
+    if let (["tiles", _, _, _, _] | [_, "tilejson.json" | "map.html"], Some(resp)) = (rest, tile_bounds_error(&pairs)) {
         return Done(resp);
     }
     if item_route_needs_assets(rest) {

@@ -1065,6 +1065,9 @@ def main() -> int:
         ibox = f"{ilon - 0.1:.4f},{ilat - 0.1:.4f},{ilon + 0.1:.4f},{ilat + 0.1:.4f}"
         o.check("item assets", "json", f"{it}/assets")
         o.check("item for an unknown id", "json", f"/collections/{collection}/items/nope/info?assets=visual")
+        for route in ("WebMercatorQuad/tilejson.json", "WebMercatorQuad/map.html", "WMTSCapabilities.xml"):
+            for bad in ("tilesize=0", "buffer=0", "padding=-1"):
+                o.check(f"item {route} with {bad}", "status", f"{it}/{route}?assets=red&{bad}")
         o.check("item in an unknown collection", "json", f"/collections/nope/items/{item_id}/assets")
         o.check("item info", "json", f"{it}/info?assets=visual")
         o.check("item info, two assets", "json", f"{it}/info?assets=red&assets=nir")
