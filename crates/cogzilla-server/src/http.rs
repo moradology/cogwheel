@@ -1426,7 +1426,7 @@ pub(crate) fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::Crs
 fn dataset_native_crs_and_bounds(
     engine: &TileEngine,
     cog: &cogzilla_io::OpenedCog,
-) -> Result<(cogzilla_proj::CrsModel, u16, [f64; 4]), EngineError> {
+) -> Result<(cogzilla_proj::CrsModel, Option<u16>, [f64; 4]), EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
     let gk = &cog.index.geo_keys;
@@ -1436,13 +1436,13 @@ fn dataset_native_crs_and_bounds(
             || gk.projected_cs_type == Some(32767)
             || gk.proj_coord_trans.is_some());
     let native_epsg = if let Some(epsg) = std_proj_epsg {
-        epsg
-    } else if !is_user_defined_projected
-        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
-    {
-        epsg
+        Some(epsg)
+    } else if is_user_defined_projected {
+        None
+    } else if let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767) {
+        Some(epsg)
     } else {
-        4326
+        Some(4326)
     };
     let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
     let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
@@ -3011,12 +3011,24 @@ fn build_ogc_tileset_json(
     } else {
         format!("?{raw_query}")
     };
+    let tile_q: String = filter_tile_template_query(raw_query)
+        .split('&')
+        .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("crs"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let tile_q_suffix = if tile_q.is_empty() {
+        String::new()
+    } else {
+        format!("?{tile_q}")
+    };
     let [w, s, e, n] = bounds.unwrap_or([-180.0, -90.0, 180.0, 90.0]);
     let limits: Vec<serde_json::Value> = tms_def
         .matrices
         .iter()
         .filter(|m| {
-            let z = m.id.parse::<u8>().unwrap_or(0);
+            let Ok(z) = m.id.parse::<u8>() else {
+                return false;
+            };
             minzoom.is_none_or(|mn| z >= mn) && maxzoom.is_none_or(|mx| z <= mx)
         })
         .map(|m| {
@@ -3059,7 +3071,7 @@ fn build_ogc_tileset_json(
                 "title": format!("Definition of '{}' tile matrix set", tms_def.id),
             },
             {
-                "href": format!("{origin}/{route_prefix}/tiles/{}/{{tileMatrix}}/{{tileCol}}/{{tileRow}}{q_suffix}", tms_def.id),
+                "href": format!("{origin}/{route_prefix}/tiles/{}/{{tileMatrix}}/{{tileCol}}/{{tileRow}}{tile_q_suffix}", tms_def.id),
                 "rel": "item",
                 "type": "image/png",
                 "title": "Tiles",
@@ -3137,6 +3149,21 @@ fn utc_now_rfc3339() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+fn percent_encode_component(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
 fn build_stac_render_entry(
     host: &str,
     forwarded_prefix: &str,
@@ -3154,16 +3181,19 @@ fn build_stac_render_entry(
     } else {
         format!("http://{host}{suffix}")
     };
-    let mut qs_parts = vec![format!("url={stac_url}")];
+    let enc_url = percent_encode_component(stac_url);
+    let enc_rid = percent_encode_component(render_id);
+    let mut qs_parts = vec![format!("url={enc_url}")];
     if let Some(obj) = render.as_object() {
         for (k, v) in obj {
+            let ek = percent_encode_component(k);
             match k.as_str() {
                 "title" | "minmax_zoom" | "tilematrixsets" => continue,
                 "assets" => {
                     if let Some(arr) = v.as_array() {
                         for a in arr {
                             if let Some(s) = a.as_str() {
-                                qs_parts.push(format!("assets={s}"));
+                                qs_parts.push(format!("assets={}", percent_encode_component(s)));
                             }
                         }
                     }
@@ -3186,10 +3216,24 @@ fn build_stac_render_entry(
                         }
                     }
                 }
+                "colormap" => match v {
+                    serde_json::Value::String(s) => {
+                        qs_parts.push(format!("colormap={}", percent_encode_component(s)));
+                    }
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        qs_parts.push(format!(
+                            "colormap={}",
+                            percent_encode_component(&v.to_string())
+                        ));
+                    }
+                    _ => {}
+                },
                 _ => match v {
-                    serde_json::Value::String(s) => qs_parts.push(format!("{k}={s}")),
-                    serde_json::Value::Number(n) => qs_parts.push(format!("{k}={n}")),
-                    serde_json::Value::Bool(b) => qs_parts.push(format!("{k}={b}")),
+                    serde_json::Value::String(s) => {
+                        qs_parts.push(format!("{ek}={}", percent_encode_component(s)));
+                    }
+                    serde_json::Value::Number(n) => qs_parts.push(format!("{ek}={n}")),
+                    serde_json::Value::Bool(b) => qs_parts.push(format!("{ek}={b}")),
                     _ => {}
                 },
             }
@@ -3203,7 +3247,7 @@ fn build_stac_render_entry(
             {
                 "rel": "self",
                 "type": "application/json",
-                "href": format!("{origin}/stac/renders/{render_id}?url={stac_url}"),
+                "href": format!("{origin}/stac/renders/{enc_rid}?url={enc_url}"),
             },
             {
                 "rel": "tilesets-map",
@@ -8237,7 +8281,7 @@ where
                         {
                             "rel": "self",
                             "type": "application/json",
-                            "href": format!("{origin}/stac/renders?url={u}"),
+                            "href": format!("{origin}/stac/renders?url={}", percent_encode_component(&u)),
                         }
                     ],
                 });
@@ -8247,11 +8291,13 @@ where
             (Method::GET, ["renders", render_id]) => async {
                 let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
                 let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let dec_id = percent_decode_opts(render_id, false);
                 let render = item
                     .renders
-                    .get(*render_id)
-                    .ok_or_else(|| EngineError::NotFound(format!("render '{render_id}' not found")))?;
-                let out = build_stac_render_entry(&host, &forwarded_prefix, &u, render_id, render);
+                    .get(&dec_id)
+                    .or_else(|| item.renders.get(*render_id))
+                    .ok_or_else(|| EngineError::NotFound(format!("render '{dec_id}' not found")))?;
+                let out = build_stac_render_entry(&host, &forwarded_prefix, &u, &dec_id, render);
                 Ok((Bytes::from(out.to_string()), "application/json"))
             }
             .await,
@@ -10113,10 +10159,18 @@ where
                 let (native_crs, native_epsg, native_bounds) =
                     dataset_native_crs_and_bounds(&engine, &cogs[0])?;
                 let full = cogs[0].index.full_res();
+                let ext = pq.format_param.as_deref().unwrap_or("png");
+                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let explicit_crs = pq.dst_crs.clone().or_else(|| pq.bounds_crs.clone());
-                let (dst_crs, dst_epsg) = explicit_crs
-                    .clone()
-                    .unwrap_or((native_crs.clone(), native_epsg));
+                let (dst_crs, dst_epsg, used_native_crs) = match explicit_crs {
+                    Some((c, e)) => (c, Some(e), native_epsg == Some(e)),
+                    None if ct == GEOTIFF_CONTENT_TYPE && native_epsg.is_none() => {
+                        // User-defined projected COGs have no standard EPSG code for GeoTIFF output;
+                        // reproject to WGS84 rather than tagging metre coordinates as EPSG:4326.
+                        (cogzilla_proj::CrsModel::Geographic, Some(4326), false)
+                    }
+                    None => (native_crs.clone(), native_epsg, true),
+                };
                 let (wgs_bbox, out_bbox) = if let Some(raw_bbox) = pq.bbox_param {
                     let raw_bbox =
                         resolve_input_bbox(raw_bbox, pq.bbox_crs.as_ref().map(|(c, _)| c))?;
@@ -10124,8 +10178,9 @@ where
                         raw_bbox,
                         pq.bbox_crs.as_ref().map(|(c, _)| c),
                     )?;
-                    let ob = if pq.bbox_crs.as_ref().map(|(_, e)| *e) == Some(dst_epsg)
-                        || (pq.bbox_crs.is_none() && dst_epsg == 4326)
+                    let ob = if (dst_epsg.is_some()
+                        && pq.bbox_crs.as_ref().map(|(_, e)| *e) == dst_epsg)
+                        || (pq.bbox_crs.is_none() && dst_epsg == Some(4326))
                     {
                         normalize_render_bbox(raw_bbox, &dst_crs)?
                     } else {
@@ -10133,15 +10188,20 @@ where
                     };
                     (wb, ob)
                 } else {
-                    let wb = native_crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-                    let ob = if explicit_crs.is_some() {
+                    let wb = native_crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
+                    let ob = if !used_native_crs {
                         normalize_render_bbox(reproject_wgs84_bounds(wb, &dst_crs)?, &dst_crs)?
                     } else {
                         native_bounds
                     };
                     (wb, ob)
                 };
-                let (def_w, def_h) = if dst_epsg == native_epsg {
+                let (def_w, def_h) = if used_native_crs {
                     let px_x = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d).max(1e-12);
                     let px_y = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e).max(1e-12);
                     let nat_w = ((out_bbox[2] - out_bbox[0]).abs() / px_x)
@@ -10179,8 +10239,6 @@ where
                 };
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
-                let ext = pq.format_param.as_deref().unwrap_or("png");
-                let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st);
@@ -10189,14 +10247,23 @@ where
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
-                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
+                let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg.unwrap_or(0));
                 let data = render_crs_bbox(
                     &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
                     pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
                 )
                 .await?;
-                let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, dst_epsg, pq.return_mask);
-                geo_meta = Some((out_bbox, Some(dst_epsg), false));
+                let data = wrap_geotiff_fmt(
+                    data,
+                    ct,
+                    fmt,
+                    out_w,
+                    out_h,
+                    out_bbox,
+                    dst_epsg.unwrap_or(4326),
+                    pq.return_mask,
+                );
+                geo_meta = Some((out_bbox, dst_epsg, false));
                 Ok((data, ct))
             }
             .await,
@@ -11965,5 +12032,54 @@ mod tests {
             .unwrap_err();
         let resp_to = error_to_http_response(&err_to);
         assert_eq!(resp_to.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn ogc_tileset_filters_template_query_and_skips_negative_cdb_matrices_and_stac_renders_encodes() {
+        // 1. OGC tileset strips minzoom/maxzoom/crs from item href and skips CDB1GlobalGrid negative matrices.
+        let cdb = crate::tms::lookup_tms("CDB1GlobalGrid").unwrap();
+        let ts = build_ogc_tileset_json(
+            "example.com",
+            "",
+            "cog",
+            cdb,
+            "url=a.tif&minzoom=0&maxzoom=2&crs=EPSG:4326&bidx=1",
+            Some([-10.0, -10.0, 10.0, 10.0]),
+            Some(0),
+            Some(2),
+        );
+        let limits = ts["tileMatrixSetLimits"].as_array().unwrap();
+        assert!(
+            limits.iter().all(|l| !l["tileMatrix"].as_str().unwrap().starts_with('-')),
+            "CDB1GlobalGrid must not advertise negative matrix IDs: {limits:?}"
+        );
+        let item_href = ts["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "item")
+            .unwrap()["href"]
+            .as_str()
+            .unwrap();
+        assert!(item_href.contains("url=a.tif") && item_href.contains("bidx=1"));
+        assert!(!item_href.contains("minzoom=") && !item_href.contains("maxzoom=") && !item_href.contains("crs="));
+
+        // 2. STAC render links percent-encode presigned URLs, render IDs, and inline object colormaps.
+        let render = serde_json::json!({
+            "assets": ["red"],
+            "colormap": {"1": [255, 0, 0, 255]}
+        });
+        let entry = build_stac_render_entry(
+            "example.com",
+            "",
+            "https://s3.example/item.json?a=1&b=2",
+            "true color",
+            &render,
+        );
+        let links = entry["links"].as_array().unwrap();
+        let self_href = links[0]["href"].as_str().unwrap();
+        let tj_href = links[1]["href"].as_str().unwrap();
+        assert!(self_href.contains("/stac/renders/true%20color?url=https%3A%2F%2Fs3.example%2Fitem.json%3Fa%3D1%26b%3D2"), "{self_href}");
+        assert!(tj_href.contains("colormap=%7B%221%22%3A%5B255%2C0%2C0%2C255%5D%7D"), "{tj_href}");
     }
 }
