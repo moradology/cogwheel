@@ -68,7 +68,7 @@ impl CustomColormap {
             }
         }
         Self::Discrete {
-            lut: Box::new(ColormapLut { rgb, rgba_u32 }),
+            lut: Box::new(ColormapLut::new(rgba_u32, rgb)),
             extra,
             direct_lookup: true,
         }
@@ -131,7 +131,7 @@ impl CustomColormap {
                 }
             }
             Ok(Self::Discrete {
-                lut: Box::new(ColormapLut { rgba_u32, rgb }),
+                lut: Box::new(ColormapLut::new(rgba_u32, rgb)),
                 extra,
                 direct_lookup: !rescale_explicit,
             })
@@ -264,16 +264,44 @@ impl CustomColormap {
 pub struct ColormapLut {
     pub rgba_u32: [u32; 256],
     pub rgb: [[u8; 3]; 256],
+    /// The palette of a palette PNG with empty pixels: index 0 is transparent and the 256
+    /// entries share the other 255. Entry `nodata_merged` shares the index of the entry before
+    /// it, the one nearest it in colour, so the picture is exact for the colour maps that
+    /// repeat a colour next to itself and, for the rest, one entry is drawn with its
+    /// neighbour's colour (one step of one channel for most maps). `nodata_index` places a
+    /// byte value.
+    pub(crate) nodata_plte: [u8; 768],
+    pub(crate) nodata_merged: u8,
+}
+
+/// Where a byte value (rio-tiler's `rescale_u8`) goes in `ColormapLut::nodata_plte`: as
+/// arithmetic, not a table, so the loops that call it stay vectorised.
+#[inline(always)]
+pub(crate) fn nodata_index(v: u8, merged: u8) -> u8 {
+    v + u8::from(v < merged)
 }
 
 impl ColormapLut {
+    pub fn new(rgba_u32: [u32; 256], rgb: [[u8; 3]; 256]) -> Self {
+        let step = |i: usize| -> u32 {
+            (0..3).map(|k| u32::from(rgb[i - 1][k].abs_diff(rgb[i][k])).pow(2)).sum()
+        };
+        let nodata_merged = (1..256).min_by_key(|i| step(*i)).unwrap_or(1) as u8;
+        let mut nodata_plte = [0u8; 768];
+        for v in (0..=255u8).filter(|v| *v != nodata_merged) {
+            let at = usize::from(nodata_index(v, nodata_merged)) * 3;
+            nodata_plte[at..at + 3].copy_from_slice(&rgb[usize::from(v)]);
+        }
+        Self { rgba_u32, rgb, nodata_plte, nodata_merged }
+    }
+
     pub fn from_rgb_table(rgb: [[u8; 3]; 256]) -> Self {
         let mut rgba_u32 = [0u32; 256];
         for i in 0..256 {
             let c = rgb[i];
             rgba_u32[i] = u32::from_le_bytes([c[0], c[1], c[2], 255]);
         }
-        Self { rgba_u32, rgb }
+        Self::new(rgba_u32, rgb)
     }
 
     /// Parse TiTiler custom JSON colormap `{"0":[r,g,b,a], "128":"#rrggbb", ...}`.
@@ -320,7 +348,7 @@ impl ColormapLut {
                 }
             }
         }
-        Ok(Self { rgba_u32, rgb })
+        Ok(Self::new(rgba_u32, rgb))
     }
 }
 

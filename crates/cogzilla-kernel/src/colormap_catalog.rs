@@ -239,7 +239,7 @@ pub fn catalog_lut(idx: u16) -> &'static ColormapLut {
                 rgb[i] = [r, g, b];
                 rgba_u32[i] = u32::from_le_bytes([r, g, b, a]);
             }
-            v.push(ColormapLut { rgba_u32, rgb });
+            v.push(ColormapLut::new(rgba_u32, rgb));
         }
         v.into_boxed_slice()
     });
