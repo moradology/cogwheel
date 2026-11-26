@@ -2320,8 +2320,9 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
 
         let mut mosaic_guard = self.mosaic.lock().ok()?;
-        let stack = mosaic_guard.upload_scenes(planes, width, height).ok()?;
-        mosaic_guard.composite_f32(&stack, method).ok()
+        mosaic_guard
+            .composite_f32_direct(planes, width, height, method)
+            .ok()
     }
 
     /// Attempt GPU-accelerated multi-band, multi-scene pixel selection (`First`, `Highest`,
@@ -2371,12 +2372,9 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
 
         let mut mosaic_guard = self.mosaic.lock().ok()?;
-        let mut stacks = Vec::with_capacity(nb);
-        for planes in band_planes {
-            stacks.push(mosaic_guard.upload_scenes(planes, width, height).ok()?);
-        }
-        let stack_refs: Vec<&cogzilla_gpu::GpuSceneStack> = stacks.iter().collect();
-        mosaic_guard.composite_f32_bands(&stack_refs, method).ok()
+        mosaic_guard
+            .composite_f32_bands_direct(band_planes, width, height, method)
+            .ok()
     }
 
     /// Attempt fused GPU multi-scene pixel selection + rescale + colormap directly to PNG / WebP /
@@ -2436,13 +2434,15 @@ impl GpuBackend {
         let lut = colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
         let mut mosaic_guard = self.mosaic.lock().ok()?;
-        let stack = mosaic_guard.upload_scenes(planes, width, height).ok()?;
 
-        // 1-pass fused Mosaic -> GPU JPEG FDCT: zero RGBA8 readback, zero CPU JPEG encode.
+        // 1-pass fused Mosaic -> GPU JPEG FDCT: zero per-call VRAM alloc, zero RGBA8 readback,
+        // zero CPU JPEG encode.
         if let OutputFormat::Jpeg { quality } = format {
             if let Ok(mut jpeg_guard) = self.jpeg.lock() {
-                if let Ok(jpg) = mosaic_guard.composite_styled_jpeg(
-                    &stack,
+                if let Ok(jpg) = mosaic_guard.composite_styled_jpeg_direct(
+                    planes,
+                    width,
+                    height,
                     method,
                     rescale.0,
                     rescale.1,
@@ -2456,7 +2456,16 @@ impl GpuBackend {
         }
 
         let raw = mosaic_guard
-            .composite_styled(&stack, method, rescale.0, rescale.1, &lut_u32, out_kind)
+            .composite_styled_direct(
+                planes,
+                width,
+                height,
+                method,
+                rescale.0,
+                rescale.1,
+                &lut_u32,
+                out_kind,
+            )
             .ok()?;
         drop(mosaic_guard);
 
