@@ -4680,7 +4680,12 @@ async fn tile(
 ) -> Resp {
     // A tile with a `buffer` is the tile's box grown by that many pixels on every side,
     // at a size grown as much: to rio-tiler, and here, a box in Web Mercator like any other.
-    if pq.buffer > 0.0 {
+    // The renderer draws tiles of 256 and 512 pixels, and planes no algorithm: a tile of
+    // another size under `algorithm`, or with band math only the renderer reads, is drawn
+    // as its box too, with no buffer.
+    let odd_for_renderer = !matches!(scale.map_or(pq.tile_size, |s| s * 256), 256 | 512)
+        && (pq.algorithm.is_some() || check_mosaic_query(&pq, pairs).is_ok_and(|q| !planes_read_all(&pq, &q)));
+    if pq.buffer > 0.0 || odd_for_renderer {
         let buffer_asked = pq.buffer;
         if scale.is_some_and(|s| !(1..=8).contains(&s)) {
             return detail(StatusCode::BAD_REQUEST, "a tile's scale is from @1x to @8x");
@@ -4692,7 +4697,10 @@ async fn tile(
             return r;
         }
         if raw {
-            return detail(StatusCode::BAD_REQUEST, "a tile with a `buffer` is drawn as a picture, `.npy` or `.tif`");
+            return detail(
+                StatusCode::BAD_REQUEST,
+                "a tile with a `buffer`, or of a size other than 256 and 512 drawn by the renderer, is drawn as a picture, `.npy` or `.tif`",
+            );
         }
         let buffer = buffer_asked;
         // As in rio-tiler, which grows the tile by whole pixels: halves, since both sides grow.

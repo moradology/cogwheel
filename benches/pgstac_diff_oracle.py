@@ -568,6 +568,10 @@ def main() -> int:
         o.check("normalizedIndex over two assets as a GeoTIFF", "image", f"{base12}.tif?{ndi}")
         o.check("bbox, normalizedIndex over two assets as an array", "image", f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.npy?{ndi}")
         o.check("bbox, normalizedIndex over two assets", "image", f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.png?{ndi}&rescale=-1,1")
+        # A tile of a size the renderer does not draw, under an algorithm: drawn as its box.
+        o.check("contours, 300 pixels", "image", f"{base12}.png?assets=red&algorithm=contours&tilesize=300")
+        o.check("terrarium, 128 pixels", "image", f"{base12}.png?assets=red&algorithm=terrarium&tilesize=128")
+        o.check("normalizedIndex over two assets, 384 pixels", "image", f"{base12}.png?{ndi}&rescale=-1,1&tilesize=384")
         o.check("algorithm parameters of the wrong type", "status",
                 f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%22x%22%7D")
         # Band math read with a smoothing resampling: whole numbers stay whole, rescaled is bytes.
