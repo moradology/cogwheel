@@ -1719,3 +1719,346 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         }
     }
 }
+
+/// Write a minimal uncompressed single-band float32 GeoTIFF with `ProjectedCSTypeGeoKey = epsg`
+/// so CI tests never depend on gitignored `benches/fixtures/`.
+#[allow(clippy::too_many_arguments)]
+fn write_synthetic_f32_projected_geotiff(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    epsg: u16,
+    origin_x: f64,
+    origin_y: f64,
+    pixel_size: f64,
+    pixels: &[f32],
+) {
+    assert_eq!(pixels.len(), (width * height) as usize);
+    let mut buf = Vec::<u8>::new();
+    // Little-endian classic TIFF header
+    buf.extend_from_slice(b"II");
+    buf.extend_from_slice(&42u16.to_le_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes()); // IFD at offset 8
+
+    let num_entries: u16 = 13;
+    let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+    let data_start = 8 + ifd_size;
+
+    let scale_off = data_start as u32;
+    let tiepoint_off = scale_off + 24;
+    let geokey_off = tiepoint_off + 48;
+    let pixel_off = geokey_off + 24;
+    let pixel_bytes = (pixels.len() * 4) as u32;
+
+    let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        b.extend_from_slice(&val.to_le_bytes());
+    };
+
+    buf.extend_from_slice(&num_entries.to_le_bytes());
+    push_entry(&mut buf, 256, 4, 1, width); // ImageWidth
+    push_entry(&mut buf, 257, 4, 1, height); // ImageLength
+    push_entry(&mut buf, 258, 3, 1, 32); // BitsPerSample = 32
+    push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+    push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+    push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+    push_entry(&mut buf, 277, 3, 1, 1); // SamplesPerPixel = 1
+    push_entry(&mut buf, 278, 4, 1, height); // RowsPerStrip
+    push_entry(&mut buf, 279, 4, 1, pixel_bytes); // StripByteCounts
+    push_entry(&mut buf, 339, 3, 1, 3); // SampleFormat = IEEEFP (3)
+    push_entry(&mut buf, 33550, 12, 3, scale_off); // ModelPixelScaleTag
+    push_entry(&mut buf, 33922, 12, 6, tiepoint_off); // ModelTiepointTag
+    push_entry(&mut buf, 34735, 3, 12, geokey_off); // GeoKeyDirectoryTag
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+
+    assert_eq!(buf.len(), scale_off as usize);
+    for v in [pixel_size, pixel_size, 0.0f64] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), tiepoint_off as usize);
+    for v in [0.0f64, 0.0, 0.0, origin_x, origin_y, 0.0] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), geokey_off as usize);
+    // GeoKeyDirectory: 1,1,0,2 keys: GTModelTypeGeoKey(1024)=1 (Projected), ProjectedCSTypeGeoKey(3072)=epsg
+    for v in [1u16, 1, 0, 2, 1024, 0, 1, 1, 3072, 0, 1, epsg] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), pixel_off as usize);
+    for &p in pixels {
+        buf.extend_from_slice(&p.to_le_bytes());
+    }
+    std::fs::write(path, &buf).unwrap();
+}
+
+fn decode_npy_f32(bytes: &[u8]) -> Vec<f32> {
+    assert!(bytes.starts_with(b"\x93NUMPY"), "not an npy payload");
+    let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let payload = &bytes[10 + hlen..];
+    payload
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+#[tokio::test]
+async fn sweep11_l1_l2_and_sweep12_m1_self_contained() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_l1_l2_m1_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. Synthetic 64x64 float32 UTM 10N GeoTIFF (no overviews) for L1 average + L2 CRS tests
+    let w = 64u32;
+    let h = 64u32;
+    let mut grad = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            grad.push(((y * 7 + x * 3) % 97) as f32 / 100.0 + (x as f32) * 0.01);
+        }
+    }
+    let grad_path = tmp.join("grad_64_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &grad_path,
+        w,
+        h,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &grad,
+    );
+
+    // 2. Synthetic 64x64 categorical float32 GeoTIFF for L1 mode test:
+    // Each 4x4 block has 11 pixels of class `c` and 5 pixels of other classes.
+    let mut cat = vec![0.0f32; (w * h) as usize];
+    for by in 0..16u32 {
+        for bx in 0..16u32 {
+            let dominant = ((by * 16 + bx) % 10 + 1) as f32;
+            for dy in 0..4u32 {
+                for dx in 0..4u32 {
+                    let v = if dy == 0 && dx < 2 {
+                        99.0
+                    } else if dy == 3 && dx >= 1 {
+                        88.0
+                    } else {
+                        dominant
+                    };
+                    cat[((by * 4 + dy) * w + (bx * 4 + dx)) as usize] = v;
+                }
+            }
+        }
+    }
+    let cat_path = tmp.join("cat_64_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &cat_path,
+        w,
+        h,
+        32610,
+        500_000.0,
+        4_200_000.0,
+        30.0,
+        &cat,
+    );
+
+    // 3. Synthetic 16x16 GeoTIFF in unsupported CRS EPSG:6933 for M1 test
+    let ease_path = tmp.join("ease_6933.tif");
+    write_synthetic_f32_projected_geotiff(
+        &ease_path,
+        16,
+        16,
+        6933,
+        0.0,
+        100_000.0,
+        1000.0,
+        &vec![42.0f32; 256],
+    );
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let grad_url = grad_path.to_string_lossy().to_string();
+    let cat_url = cat_path.to_string_lossy().to_string();
+    let ease_url = ease_path.to_string_lossy().to_string();
+
+    // --- L1: resampling=average at 1x, 2x, 4x, 8x equals exact full-res block mean ---
+    for factor in [1u32, 2, 4, 8] {
+        let out_dim = w / factor;
+        let resp = client
+            .get(format!(
+                "{base}/cog/preview.npy?url={grad_url}&max_size={out_dim}&resampling=average&return_mask=false"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "average preview factor={factor}");
+        let vals = decode_npy_f32(&resp.bytes().await.unwrap());
+        assert_eq!(vals.len(), (out_dim * out_dim) as usize);
+        let mut max_err = 0.0f64;
+        for by in 0..out_dim {
+            for bx in 0..out_dim {
+                let mut block_sum = 0.0f64;
+                for dy in 0..factor {
+                    for dx in 0..factor {
+                        block_sum += grad[((by * factor + dy) * w + (bx * factor + dx)) as usize] as f64;
+                    }
+                }
+                let expected = block_sum / ((factor * factor) as f64);
+                let got = vals[(by * out_dim + bx) as usize] as f64;
+                max_err = max_err.max((got - expected).abs());
+            }
+        }
+        assert!(
+            max_err < 1e-6,
+            "L1 average at {factor}x reduction max_err={max_err} (expected < 1e-6)"
+        );
+    }
+
+    // --- L1: resampling=mode at 4x matches exact 4x4 block mode ---
+    let mode_resp = client
+        .get(format!(
+            "{base}/cog/preview.npy?url={cat_url}&max_size=16&resampling=mode&return_mask=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mode_resp.status(), 200);
+    let mode_vals = decode_npy_f32(&mode_resp.bytes().await.unwrap());
+    assert_eq!(mode_vals.len(), 256);
+    for by in 0..16u32 {
+        for bx in 0..16u32 {
+            let expected = ((by * 16 + bx) % 10 + 1) as f32;
+            let got = mode_vals[(by * 16 + bx) as usize];
+            assert_eq!(got, expected, "L1 mode mismatch at ({bx},{by})");
+        }
+    }
+
+    // --- L2: legacy GeoJSON `crs` member honoured on /cog/statistics and /cog/feature ---
+    let utm_feature_with_crs = serde_json::json!({
+        "type": "Feature",
+        "crs": { "type": "name", "properties": { "name": "EPSG:32610" } },
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_000.0, 4_200_000.0],
+                [500_300.0, 4_200_000.0],
+                [500_300.0, 4_199_700.0],
+                [500_000.0, 4_199_700.0],
+                [500_000.0, 4_200_000.0]
+            ]]
+        }
+    });
+    let st_crs = client
+        .post(format!("{base}/cog/statistics?url={grad_url}&max_size=0"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&utm_feature_with_crs).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st_crs.status(), 200, "legacy GeoJSON crs should be honoured");
+    let st_crs_json: serde_json::Value =
+        serde_json::from_slice(&st_crs.bytes().await.unwrap()).unwrap();
+    let count = st_crs_json["properties"]["statistics"]["b1"]["count"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (count - 100.0).abs() < 1e-4,
+        "10x10 UTM pixel box with legacy GeoJSON crs should have count=100, got {count}"
+    );
+
+    // FeatureCollection with top-level `crs`
+    let utm_fc_with_crs = serde_json::json!({
+        "type": "FeatureCollection",
+        "crs": { "type": "name", "properties": { "name": "EPSG:32610" } },
+        "features": [{
+            "type": "Feature",
+            "properties": {},
+            "geometry": utm_feature_with_crs["geometry"].clone()
+        }]
+    });
+    let fc_crs = client
+        .post(format!("{base}/cog/statistics?url={grad_url}&max_size=0"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&utm_fc_with_crs).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fc_crs.status(), 200);
+    let fc_crs_json: serde_json::Value =
+        serde_json::from_slice(&fc_crs.bytes().await.unwrap()).unwrap();
+    let fc_count = fc_crs_json["features"][0]["properties"]["statistics"]["b1"]["count"]
+        .as_f64()
+        .unwrap();
+    assert!((fc_count - 100.0).abs() < 1e-4, "FC legacy crs count={fc_count}");
+
+    // /cog/feature with legacy `crs`
+    let feat_crs = client
+        .post(format!("{base}/cog/feature.npy?url={grad_url}&max_size=64"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&utm_feature_with_crs).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(feat_crs.status(), 200, "/cog/feature should honour legacy GeoJSON crs");
+
+    // --- L2: projected coordinates without coord_crs or `crs` return 400 with hint ---
+    let utm_feature_no_crs = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": utm_feature_with_crs["geometry"].clone()
+    });
+    for ep in [
+        format!("{base}/cog/statistics?url={grad_url}&max_size=0"),
+        format!("{base}/cog/feature.npy?url={grad_url}&max_size=64"),
+    ] {
+        let bad = client
+            .post(&ep)
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(&utm_feature_no_crs).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400, "projected coords without coord_crs must 400 on {ep}");
+        let body = bad.text().await.unwrap();
+        assert!(
+            body.contains("coord_crs"),
+            "400 message should hint at coord_crs, got: {body}"
+        );
+    }
+
+    // --- M1: unsupported CRS (EPSG:6933) returns 400 on /cog/tiles (matching /cog/info) ---
+    let info_6933 = client
+        .get(format!("{base}/cog/info?url={ease_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info_6933.status(), 400);
+    let info_body = info_6933.text().await.unwrap();
+    assert!(info_body.to_ascii_lowercase().contains("unsupported crs"), "got: {info_body}");
+
+    let tile_6933 = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/0/0/0.png?url={ease_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        tile_6933.status(),
+        400,
+        "unsupported CRS tile must return 400 (not 404 outside image bounds)"
+    );
+    let tile_body = tile_6933.text().await.unwrap();
+    assert!(
+        tile_body.to_ascii_lowercase().contains("unsupported crs"),
+        "expected unsupported CRS message on tile route, got: {tile_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

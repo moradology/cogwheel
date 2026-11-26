@@ -1,0 +1,1483 @@
+//! Exact analytical (`exactextract`-style) coverage-weighted & ellipsoidal area-weighted
+//! zonal statistics on native raster pixel grids.
+//!
+//! For every pixel `(c, r)` in the native raster window `[c0..c1] × [r0..r1]`:
+//! - **Exact coverage fraction** `cov ∈ [0, 1]` is computed analytically via Green's theorem
+//!   edge-walking across grid cells (`O(V + perimeter_cells)` geometry work) followed by a
+//!   single linear row scanline prefix sum (`O(win_w * win_h)`). Holes subtract, MultiPolygon
+//!   parts add, and each cell is clamped to `[0, 1]`.
+//! - **Ellipsoidal ground area** `area_px` (WGS84, m²) uses a closed-form authalic band area
+//!   per row (`O(win_h)`) for Geographic (`EPSG:4326`) and Web Mercator (`EPSG:3857`) rasters,
+//!   and a coarse `5×5` Jacobian lattice for other projected CRSs with a `< 1e-6` variation
+//!   short-circuit so small UTM/Albers/LAEA polygons run at zero extra cost.
+
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use cogzilla_io::OpenedCog;
+use cogzilla_proj::CrsModel;
+use cogzilla_tiff::{Affine2D, PlanarConfig};
+
+use crate::engine::{EngineError, TileEngine};
+use crate::titiler::{PolygonMask, StatsOptions, compute_f32_band_stats};
+
+/// WGS84 ellipsoid constants.
+const WGS84_A: f64 = 6_378_137.0;
+const WGS84_F: f64 = 1.0 / 298.257_223_563;
+const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
+const WGS84_B2: f64 = WGS84_A * WGS84_A * (1.0 - WGS84_E2);
+
+/// Reusable thread-local scratch buffers so repeated zonal statistics calls avoid re-allocating.
+struct ZonalScratch {
+    area: Vec<f64>,
+    run_delta: Vec<f64>,
+    t_breaks: Vec<f64>,
+}
+
+impl ZonalScratch {
+    fn new() -> Self {
+        Self {
+            area: Vec::new(),
+            run_delta: Vec::new(),
+            t_breaks: Vec::with_capacity(64),
+        }
+    }
+}
+
+thread_local! {
+    static ZONAL_SCRATCH: RefCell<ZonalScratch> = RefCell::new(ZonalScratch::new());
+}
+
+/// WGS84 authalic zone integral `q(phi)` where `phi` is geodetic latitude in radians.
+/// The ellipsoidal surface area between longitudes `[lam0, lam1]` and latitudes `[phi0, phi1]` is:
+/// `A = (b^2 / 2) * |lam1 - lam0| * |q(phi1) - q(phi0)|`.
+#[inline]
+pub fn wgs84_authalic_q(phi_rad: f64) -> f64 {
+    let e = WGS84_E2.sqrt();
+    let s = phi_rad.sin();
+    let es = e * s;
+    s / (1.0 - es * es) + ((1.0 + es) / (1.0 - es)).ln() / (2.0 * e)
+}
+
+/// Exact WGS84 ellipsoidal area (m²) of a geographic cell `[lon0, lon1] × [lat0, lat1]` in degrees.
+#[inline]
+pub fn wgs84_geographic_cell_area_m2(lon0_deg: f64, lon1_deg: f64, lat0_deg: f64, lat1_deg: f64) -> f64 {
+    let dlam = (lon1_deg - lon0_deg).abs().to_radians();
+    let phi0 = lat0_deg.clamp(-90.0, 90.0).to_radians();
+    let phi1 = lat1_deg.clamp(-90.0, 90.0).to_radians();
+    0.5 * WGS84_B2 * dlam * (wgs84_authalic_q(phi1) - wgs84_authalic_q(phi0)).abs()
+}
+
+/// Local WGS84 ellipsoidal ground area (m²) of 1 pixel at `(col, row)` via finite-difference
+/// Jacobian of `(col, row) -> (lon, lat)` and WGS84 principal radii of curvature `R_M * R_N * cos(phi)`.
+fn wgs84_projected_pixel_area_m2(crs: &CrsModel, p2c: &Affine2D, col: f64, row: f64) -> f64 {
+    let (sx0, sy0) = p2c.forward(col, row);
+    let (sx1, sy1) = p2c.forward(col + 1.0, row);
+    let (sx2, sy2) = p2c.forward(col, row + 1.0);
+    let (lo0, la0) = crs.to_lonlat_deg(sx0, sy0);
+    let (lo1, la1) = crs.to_lonlat_deg(sx1, sy1);
+    let (lo2, la2) = crs.to_lonlat_deg(sx2, sy2);
+    if !(lo0.is_finite()
+        && la0.is_finite()
+        && lo1.is_finite()
+        && la1.is_finite()
+        && lo2.is_finite()
+        && la2.is_finite())
+    {
+        return 0.0;
+    }
+    let wrap_dlon = |d: f64| -> f64 {
+        if d > 180.0 {
+            d - 360.0
+        } else if d < -180.0 {
+            d + 360.0
+        } else {
+            d
+        }
+    };
+    let dlo_dc = wrap_dlon(lo1 - lo0).to_radians();
+    let dla_dc = (la1 - la0).to_radians();
+    let dlo_dr = wrap_dlon(lo2 - lo0).to_radians();
+    let dla_dr = (la2 - la0).to_radians();
+    let det = (dlo_dc * dla_dr - dlo_dr * dla_dc).abs();
+    let phi = la0.clamp(-89.9999, 89.9999).to_radians();
+    let s = phi.sin();
+    let denom = 1.0 - WGS84_E2 * s * s;
+    let rm = WGS84_A * (1.0 - WGS84_E2) / (denom * denom.sqrt());
+    let rn = WGS84_A / denom.sqrt();
+    det * rm * rn * phi.cos().abs()
+}
+
+/// Ellipsoidal pixel ground-area model over a native pixel window `[c0..c0+win_w) × [r0..r0+win_h)`.
+pub enum PixelAreaModel {
+    /// Constant area per pixel (variation `< 1e-6` across the window, e.g. small UTM polygon).
+    /// Allows skipping per-pixel area weighting in mean/std/quantiles (zero overhead).
+    Constant(f64),
+    /// Per-row exact area (m²) for Geographic and Web Mercator rasters (`O(win_h)`).
+    PerRow(Vec<f64>),
+    /// Coarse `N × N` bilinearly interpolated lattice for large projected polygons.
+    Lattice {
+        nx: usize,
+        ny: usize,
+        vals: Vec<f64>,
+        win_w: usize,
+        win_h: usize,
+    },
+}
+
+impl PixelAreaModel {
+    pub fn build(
+        crs: &CrsModel,
+        p2c: &Affine2D,
+        c0: usize,
+        r0: usize,
+        win_w: usize,
+        win_h: usize,
+    ) -> Self {
+        if win_w == 0 || win_h == 0 {
+            return Self::Constant(0.0);
+        }
+        // Fast exact O(win_h) closed-form authalic band area for axis-aligned Geographic & EPSG:3857.
+        if p2c.is_axis_aligned() {
+            match crs {
+                CrsModel::Geographic => {
+                    let dlon = p2c.a.abs();
+                    let mut rows = Vec::with_capacity(win_h);
+                    let mut min_a = f64::INFINITY;
+                    let mut max_a = 0.0_f64;
+                    for dy in 0..win_h {
+                        let r = (r0 + dy) as f64;
+                        let (_, lat0) = p2c.forward(c0 as f64, r);
+                        let (_, lat1) = p2c.forward(c0 as f64, r + 1.0);
+                        let a = wgs84_geographic_cell_area_m2(0.0, dlon, lat0, lat1);
+                        min_a = min_a.min(a);
+                        max_a = max_a.max(a);
+                        rows.push(a);
+                    }
+                    if max_a > 0.0 && (max_a - min_a) / max_a < 1e-6 {
+                        return Self::Constant(0.5 * (min_a + max_a));
+                    }
+                    return Self::PerRow(rows);
+                }
+                CrsModel::Epsg3857 => {
+                    let (mx0, _) = p2c.forward(c0 as f64, r0 as f64);
+                    let (mx1, _) = p2c.forward((c0 + 1) as f64, r0 as f64);
+                    let (lon0, _) = cogzilla_proj::mercator_to_lonlat_deg(mx0, 0.0);
+                    let (lon1, _) = cogzilla_proj::mercator_to_lonlat_deg(mx1, 0.0);
+                    let dlon = (lon1 - lon0).abs();
+                    let mut rows = Vec::with_capacity(win_h);
+                    let mut min_a = f64::INFINITY;
+                    let mut max_a = 0.0_f64;
+                    for dy in 0..win_h {
+                        let r = (r0 + dy) as f64;
+                        let (_, my0) = p2c.forward(c0 as f64, r);
+                        let (_, my1) = p2c.forward(c0 as f64, r + 1.0);
+                        let (_, lat0) = cogzilla_proj::mercator_to_lonlat_deg(0.0, my0);
+                        let (_, lat1) = cogzilla_proj::mercator_to_lonlat_deg(0.0, my1);
+                        let a = wgs84_geographic_cell_area_m2(0.0, dlon, lat0, lat1);
+                        min_a = min_a.min(a);
+                        max_a = max_a.max(a);
+                        rows.push(a);
+                    }
+                    if max_a > 0.0 && (max_a - min_a) / max_a < 1e-6 {
+                        return Self::Constant(0.5 * (min_a + max_a));
+                    }
+                    return Self::PerRow(rows);
+                }
+                _ => {}
+            }
+        }
+
+        // General projected / rotated CRS: evaluate exact WGS84 Jacobian on a 5×5 lattice.
+        let nx = if win_w <= 1 { 1 } else { 5 };
+        let ny = if win_h <= 1 { 1 } else { 5 };
+        let mut vals = Vec::with_capacity(nx * ny);
+        let mut min_a = f64::INFINITY;
+        let mut max_a = 0.0_f64;
+        let mut sum_a = 0.0_f64;
+        for iy in 0..ny {
+            let fy = if ny == 1 { 0.5 } else { iy as f64 / (ny - 1) as f64 };
+            let row = r0 as f64 + fy * win_h as f64;
+            for ix in 0..nx {
+                let fx = if nx == 1 { 0.5 } else { ix as f64 / (nx - 1) as f64 };
+                let col = c0 as f64 + fx * win_w as f64;
+                let a = wgs84_projected_pixel_area_m2(crs, p2c, col, row);
+                min_a = min_a.min(a);
+                max_a = max_a.max(a);
+                sum_a += a;
+                vals.push(a);
+            }
+        }
+        if max_a > 0.0 && (max_a - min_a) / max_a < 1e-6 {
+            return Self::Constant(sum_a / vals.len().max(1) as f64);
+        }
+        Self::Lattice {
+            nx,
+            ny,
+            vals,
+            win_w,
+            win_h,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Self::Constant(_))
+    }
+
+    #[inline(always)]
+    pub fn area_at(&self, dx: usize, dy: usize) -> f64 {
+        match self {
+            Self::Constant(a) => *a,
+            Self::PerRow(rows) => rows[dy],
+            Self::Lattice {
+                nx,
+                ny,
+                vals,
+                win_w,
+                win_h,
+            } => {
+                let fx = if *nx <= 1 {
+                    0.0
+                } else {
+                    ((dx as f64 + 0.5) / (*win_w as f64)).clamp(0.0, 1.0) * ((*nx - 1) as f64)
+                };
+                let fy = if *ny <= 1 {
+                    0.0
+                } else {
+                    ((dy as f64 + 0.5) / (*win_h as f64)).clamp(0.0, 1.0) * ((*ny - 1) as f64)
+                };
+                let x0 = (fx.floor() as usize).min(nx.saturating_sub(1));
+                let x1 = (x0 + 1).min(nx.saturating_sub(1));
+                let y0 = (fy.floor() as usize).min(ny.saturating_sub(1));
+                let y1 = (y0 + 1).min(ny.saturating_sub(1));
+                let tx = fx - x0 as f64;
+                let ty = fy - y0 as f64;
+                let v00 = vals[y0 * nx + x0];
+                let v10 = vals[y0 * nx + x1];
+                let v01 = vals[y1 * nx + x0];
+                let v11 = vals[y1 * nx + x1];
+                let top = v00 + (v10 - v00) * tx;
+                let bot = v01 + (v11 - v01) * tx;
+                top + (bot - top) * ty
+            }
+        }
+    }
+}
+
+/// Densify a ring in WGS84 `(lon, lat)` degrees before transforming into a non-geographic dataset CRS,
+/// so straight GeoJSON edges do not introduce boundary projection error.
+/// Tolerance: `0.01°` (~1.1 km) for normal polygons (`<= 2048` vertices), relaxed to `0.1°` for
+/// high-vertex polygons (`> 2048` vertices), capped at 64 subdivisions per edge.
+pub fn densify_ring_lonlat_to_pixel(
+    ring: &[(f64, f64)],
+    crs: &CrsModel,
+    crs_to_pixel: &Affine2D,
+    is_geo_dataset: bool,
+    densify_lonlat: bool,
+    wrap_lo: Option<f64>,
+    total_vertices_hint: usize,
+) -> Vec<(f64, f64)> {
+    if ring.len() < 2 {
+        return Vec::new();
+    }
+    let map_pt = |lon: f64, lat: f64| -> (f64, f64) {
+        let mut adj_lon = lon;
+        if let Some(lo) = wrap_lo
+            && adj_lon < lo
+        {
+            adj_lon += 360.0;
+        }
+        let (sx, sy) = if is_geo_dataset {
+            (adj_lon, lat)
+        } else {
+            crs.from_lonlat_deg(adj_lon, lat)
+        };
+        crs_to_pixel.forward(sx, sy)
+    };
+    if !densify_lonlat {
+        return ring.iter().map(|&(lo, la)| map_pt(lo, la)).collect();
+    }
+    let max_step_deg = if total_vertices_hint > 2048 { 0.1 } else { 0.01 };
+    let mut out = Vec::with_capacity(ring.len());
+    for i in 0..ring.len() {
+        let (x0, y0) = ring[i];
+        out.push(map_pt(x0, y0));
+        if i + 1 < ring.len() {
+            let (x1, y1) = ring[i + 1];
+            let dist = (x1 - x0).hypot(y1 - y0);
+            if dist > max_step_deg {
+                let segs = ((dist / max_step_deg).ceil() as usize).clamp(1, 64);
+                for k in 1..segs {
+                    let t = k as f64 / segs as f64;
+                    out.push(map_pt(x0 + t * (x1 - x0), y0 + t * (y1 - y0)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compute signed area of a closed ring in pixel coordinates (`> 0` for CCW in standard Cartesian).
+#[inline]
+fn ring_signed_area(ring: &[(f64, f64)]) -> f64 {
+    if ring.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    for i in 0..ring.len() {
+        let (x0, y0) = ring[i];
+        let (x1, y1) = ring[(i + 1) % ring.len()];
+        sum += x0 * y1 - x1 * y0;
+    }
+    0.5 * sum
+}
+
+/// Traverse one directed edge `(x0, y0) -> (x1, y1)` across the pixel grid `[c0..c1) × [r0..r1)`
+/// and accumulate exact Green's-theorem per-cell area and scanline run deltas.
+fn accumulate_edge_exact(
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    c0: i64,
+    r0: i64,
+    win_w: usize,
+    win_h: usize,
+    area: &mut [f64],
+    run_delta: &mut [f64],
+    t_breaks: &mut Vec<f64>,
+) {
+    let dy_total = y1 - y0;
+    if dy_total == 0.0 || !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+        return;
+    }
+    let r1 = r0 + win_h as i64;
+    let c1 = c0 + win_w as i64;
+
+    // Quick vertical reject if edge is completely outside [r0, r1].
+    let y_min = y0.min(y1);
+    let y_max = y0.max(y1);
+    if y_max <= r0 as f64 || y_min >= r1 as f64 {
+        return;
+    }
+
+    // Clip segment to y ∈ [r0, r1].
+    let mut t_start = 0.0_f64;
+    let mut t_end = 1.0_f64;
+    if dy_total > 0.0 {
+        if y0 < r0 as f64 {
+            t_start = t_start.max((r0 as f64 - y0) / dy_total);
+        }
+        if y1 > r1 as f64 {
+            t_end = t_end.min((r1 as f64 - y0) / dy_total);
+        }
+    } else {
+        if y0 > r1 as f64 {
+            t_start = t_start.max((r1 as f64 - y0) / dy_total);
+        }
+        if y1 < r0 as f64 {
+            t_end = t_end.min((r0 as f64 - y0) / dy_total);
+        }
+    }
+    if t_end <= t_start {
+        return;
+    }
+
+    let dx_total = x1 - x0;
+    let sx0 = x0 + t_start * dx_total;
+    let sy0 = y0 + t_start * dy_total;
+    let sx1 = x0 + t_end * dx_total;
+    let sy1 = y0 + t_end * dy_total;
+
+    t_breaks.clear();
+    t_breaks.push(t_start);
+    t_breaks.push(t_end);
+
+    // Collect all horizontal grid-line crossings y = k strictly inside (t_start, t_end).
+    let ry_lo = sy0.min(sy1).ceil() as i64;
+    let ry_hi = sy0.max(sy1).floor() as i64;
+    for ry in ry_lo.max(r0)..=ry_hi.min(r1) {
+        let t = (ry as f64 - y0) / dy_total;
+        if t > t_start && t < t_end {
+            t_breaks.push(t);
+        }
+    }
+
+    // Collect all vertical grid-line crossings x = k strictly inside (t_start, t_end) and within [c0, c1].
+    if dx_total != 0.0 {
+        let cx_lo = sx0.min(sx1).ceil() as i64;
+        let cx_hi = sx0.max(sx1).floor() as i64;
+        for cx in cx_lo.max(c0)..=cx_hi.min(c1) {
+            let t = (cx as f64 - x0) / dx_total;
+            if t > t_start && t < t_end {
+                t_breaks.push(t);
+            }
+        }
+    }
+
+    t_breaks.sort_unstable_by(|a, b| a.total_cmp(b));
+
+    let stride_delta = win_w + 1;
+    for k in 0..t_breaks.len() - 1 {
+        let ta = t_breaks[k];
+        let tb = t_breaks[k + 1];
+        if tb - ta <= 1e-15 {
+            continue;
+        }
+        let ax = x0 + ta * dx_total;
+        let ay = y0 + ta * dy_total;
+        let bx = x0 + tb * dx_total;
+        let by = y0 + tb * dy_total;
+        let seg_dy = by - ay;
+        if seg_dy == 0.0 {
+            continue;
+        }
+        let mid_y = 0.5 * (ay + by);
+        let r = mid_y.floor() as i64;
+        if r < r0 || r >= r1 {
+            continue;
+        }
+        let row_idx = (r - r0) as usize;
+        let mid_x = 0.5 * (ax + bx);
+        let c = mid_x.floor() as i64;
+        if c < c0 {
+            // Segment lies strictly to the left of the window: contributes -seg_dy to every cell in this row.
+            run_delta[row_idx * stride_delta] += -seg_dy;
+        } else if c < c1 {
+            let col_idx = (c - c0) as usize;
+            area[row_idx * win_w + col_idx] += (mid_x - (c as f64 + 1.0)) * seg_dy;
+            run_delta[row_idx * stride_delta + col_idx + 1] += -seg_dy;
+        }
+        // If c >= c1, segment lies strictly to the right of the window: zero contribution to [c0, c1).
+    }
+}
+
+/// Rasterize exact analytical coverage fractions `∈ [0.0, 1.0]` for a collection of polygons
+/// (each polygon = `[outer_ring, hole1, ...]`, coordinates in native pixel space), optional
+/// polylines (weighted by clipped segment length per cell, clamped to `1.0`), and optional
+/// points (weight `1.0` at the containing pixel) over window `[c0..c0+win_w) × [r0..r0+win_h)`.
+pub fn rasterize_exact_coverage(
+    polygons_px: &[Vec<Vec<(f64, f64)>>],
+    lines_px: &[Vec<(f64, f64)>],
+    points_px: &[(f64, f64)],
+    c0: usize,
+    r0: usize,
+    win_w: usize,
+    win_h: usize,
+) -> Vec<f64> {
+    let n_px = win_w * win_h;
+    let mut cov = vec![0.0_f64; n_px];
+    if n_px == 0 {
+        return cov;
+    }
+    let c0_i = c0 as i64;
+    let r0_i = r0 as i64;
+    let stride_delta = win_w + 1;
+
+    ZONAL_SCRATCH.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.area.resize(n_px, 0.0);
+        st.run_delta.resize(win_h * stride_delta, 0.0);
+
+        for poly in polygons_px {
+            st.area[..n_px].fill(0.0);
+            st.run_delta[..win_h * stride_delta].fill(0.0);
+
+            for (ring_idx, ring) in poly.iter().enumerate() {
+                if ring.len() < 3 {
+                    continue;
+                }
+                let sa = ring_signed_area(ring);
+                if sa.abs() < 1e-18 {
+                    continue;
+                }
+                // Outer ring (ring_idx == 0) must be positively oriented (CCW: sa > 0);
+                // Holes (ring_idx > 0) must be negatively oriented (CW: sa < 0) so they subtract.
+                let need_reverse = if ring_idx == 0 { sa < 0.0 } else { sa > 0.0 };
+                let n = ring.len();
+                let ZonalScratch {
+                    area,
+                    run_delta,
+                    t_breaks,
+                } = &mut *st;
+                if need_reverse {
+                    for i in 0..n {
+                        let (x0, y0) = ring[(i + 1) % n];
+                        let (x1, y1) = ring[i];
+                        accumulate_edge_exact(
+                            x0, y0, x1, y1, c0_i, r0_i, win_w, win_h, area, run_delta, t_breaks,
+                        );
+                    }
+                } else {
+                    for i in 0..n {
+                        let (x0, y0) = ring[i];
+                        let (x1, y1) = ring[(i + 1) % n];
+                        accumulate_edge_exact(
+                            x0, y0, x1, y1, c0_i, r0_i, win_w, win_h, area, run_delta, t_breaks,
+                        );
+                    }
+                }
+            }
+
+            // Single linear scanline pass per row: combine prefix run with boundary cell area.
+            for row in 0..win_h {
+                let d_off = row * stride_delta;
+                let a_off = row * win_w;
+                let mut prefix = 0.0_f64;
+                for col in 0..win_w {
+                    prefix += st.run_delta[d_off + col];
+                    let v = (prefix + st.area[a_off + col]).clamp(0.0, 1.0);
+                    if v > 1e-12 {
+                        cov[a_off + col] = (cov[a_off + col] + v).min(1.0);
+                    }
+                }
+            }
+        }
+
+        // LineString / MultiLineString: weight each touched cell by its segment length inside the cell (clamped to 1.0).
+        for line in lines_px {
+            for seg in line.windows(2) {
+                let (x0, y0) = seg[0];
+                let (x1, y1) = seg[1];
+                if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                    continue;
+                }
+                let dx = x1 - x0;
+                let dy = y1 - y0;
+                let len = dx.hypot(dy);
+                if len <= 1e-15 {
+                    let c = x0.floor() as i64;
+                    let r = y0.floor() as i64;
+                    if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
+                        let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
+                        cov[idx] = 1.0;
+                    }
+                    continue;
+                }
+                st.t_breaks.clear();
+                st.t_breaks.push(0.0);
+                st.t_breaks.push(1.0);
+                if dx != 0.0 {
+                    let lo = x0.min(x1).ceil() as i64;
+                    let hi = x0.max(x1).floor() as i64;
+                    for cx in lo.max(c0_i)..=hi.min(c0_i + win_w as i64) {
+                        let t = (cx as f64 - x0) / dx;
+                        if t > 0.0 && t < 1.0 {
+                            st.t_breaks.push(t);
+                        }
+                    }
+                }
+                if dy != 0.0 {
+                    let lo = y0.min(y1).ceil() as i64;
+                    let hi = y0.max(y1).floor() as i64;
+                    for ry in lo.max(r0_i)..=hi.min(r0_i + win_h as i64) {
+                        let t = (ry as f64 - y0) / dy;
+                        if t > 0.0 && t < 1.0 {
+                            st.t_breaks.push(t);
+                        }
+                    }
+                }
+                st.t_breaks.sort_unstable_by(|a, b| a.total_cmp(b));
+                for k in 0..st.t_breaks.len() - 1 {
+                    let ta = st.t_breaks[k];
+                    let tb = st.t_breaks[k + 1];
+                    if tb - ta <= 1e-15 {
+                        continue;
+                    }
+                    let mid_t = 0.5 * (ta + tb);
+                    let mx = x0 + mid_t * dx;
+                    let my = y0 + mid_t * dy;
+                    let c = mx.floor() as i64;
+                    let r = my.floor() as i64;
+                    if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
+                        let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
+                        let seg_len = (tb - ta) * len;
+                        cov[idx] = (cov[idx] + seg_len).min(1.0);
+                    }
+                }
+            }
+        }
+    });
+
+    // Point / MultiPoint: weight 1.0 at the containing pixel.
+    for &(px, py) in points_px {
+        if px.is_finite() && py.is_finite() {
+            let c = px.floor() as i64;
+            let r = py.floor() as i64;
+            if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
+                let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
+                cov[idx] = 1.0;
+            }
+        }
+    }
+
+    cov
+}
+
+/// Compute exact coverage-weighted & ellipsoidal area-weighted band statistics over a native window.
+///
+/// Semantics:
+/// - `count`: sum of pixel coverage fractions (equals true area in pixels).
+/// - `sum`: coverage-weighted sum of valid pixel values (`sum(cov_i * v_i)`).
+/// - `area`: ellipsoidal ground area (m²) covered by valid data (`sum(cov_i * area_px_i)`).
+/// - `mean`, `std`, `median`, `percentiles`, `histogram`: weighted by `w_i = cov_i * area_px_i`
+///   when `area_weighted == true` (short-circuited to `cov_i` when `area_model.is_constant()`),
+///   or `w_i = cov_i` when `area_weighted == false`.
+/// - `min`, `max`, `unique`, `majority`, `minority`: over valid pixels with `cov > 0`.
+/// - `valid_pixels`, `masked_pixels`, `valid_percent`: counts of pixels with `cov > 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_weighted_band_stats(
+    pixels: &[f32],
+    cov: &[f64],
+    win_w: usize,
+    win_h: usize,
+    area_model: &PixelAreaModel,
+    area_weighted: bool,
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let use_area_w = area_weighted && !area_model.is_constant();
+
+    let mut valid_pixels = 0usize;
+    let mut masked_pixels = 0usize;
+    let mut count_cov = 0.0_f64;
+    let mut sum_cov = 0.0_f64;
+    let mut area_valid_m2 = 0.0_f64;
+    let mut w_total = 0.0_f64;
+    let mut w_sum = 0.0_f64;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+
+    let mut weighted_vals: Vec<(f64, f64)> = Vec::new();
+    let mut cat_weights: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+
+    for dy in 0..win_h {
+        let row_off = dy * win_w;
+        for dx in 0..win_w {
+            let i = row_off + dx;
+            let c = cov[i];
+            if c <= 0.0 {
+                continue;
+            }
+            let v = pixels[i];
+            if !v.is_finite() {
+                masked_pixels += 1;
+                continue;
+            }
+            let vf = v as f64;
+            let a_px = area_model.area_at(dx, dy);
+            let w = if use_area_w { c * a_px } else { c };
+            valid_pixels += 1;
+            count_cov += c;
+            sum_cov += c * vf;
+            area_valid_m2 += c * a_px;
+            w_total += w;
+            w_sum += w * vf;
+            if vf < min_v {
+                min_v = vf;
+            }
+            if vf > max_v {
+                max_v = vf;
+            }
+            weighted_vals.push((vf, w));
+            if opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty()) {
+                *cat_weights.entry(vf.round() as i64).or_insert(0.0) += w;
+            }
+        }
+    }
+
+    if valid_pixels == 0 || w_total <= 0.0 {
+        let mut empty = compute_f32_band_stats(&[], description, opts);
+        if let Some(obj) = empty.as_object_mut() {
+            obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels as f64));
+            obj.insert("area".into(), serde_json::json!(0.0));
+        }
+        return empty;
+    }
+
+    let mean = w_sum / w_total;
+    let mut var_acc = 0.0_f64;
+    for &(vf, w) in &weighted_vals {
+        let d = vf - mean;
+        var_acc += w * d * d;
+    }
+    let std = (var_acc / w_total).max(0.0).sqrt();
+
+    let total_touched = valid_pixels + masked_pixels;
+    let valid_percent = if total_touched > 0 {
+        ((valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    // Sort once for weighted quantiles, unique count, majority/minority, and histogram.
+    weighted_vals.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+    // Weighted quantile helper (linear interpolation on weighted midpoint CDF).
+    let weighted_quantile = |pct: f64| -> f64 {
+        let q = (pct / 100.0).clamp(0.0, 1.0);
+        if weighted_vals.len() == 1 {
+            return weighted_vals[0].0;
+        }
+        let target = q * w_total;
+        let mut cum = 0.0_f64;
+        let mut prev_mid = 0.0_f64;
+        let mut prev_v = weighted_vals[0].0;
+        for (idx, &(v, w)) in weighted_vals.iter().enumerate() {
+            let mid = cum + 0.5 * w;
+            if idx == 0 {
+                if target <= mid {
+                    return v;
+                }
+            } else if target <= mid {
+                let span = (mid - prev_mid).max(1e-30);
+                let frac = ((target - prev_mid) / span).clamp(0.0, 1.0);
+                return prev_v + frac * (v - prev_v);
+            }
+            cum += w;
+            prev_mid = mid;
+            prev_v = v;
+        }
+        weighted_vals.last().unwrap().0
+    };
+
+    let median = weighted_quantile(50.0);
+
+    // Unique count, majority, minority (weighted by w).
+    let mut unique_count = 0usize;
+    let mut maj_val = weighted_vals[0].0;
+    let mut maj_w = -1.0_f64;
+    let mut min_val_freq = weighted_vals[0].0;
+    let mut min_w = f64::INFINITY;
+    let mut idx = 0;
+    while idx < weighted_vals.len() {
+        let v = weighted_vals[idx].0;
+        let mut gw = weighted_vals[idx].1;
+        idx += 1;
+        while idx < weighted_vals.len() && weighted_vals[idx].0 == v {
+            gw += weighted_vals[idx].1;
+            idx += 1;
+        }
+        unique_count += 1;
+        if gw > maj_w {
+            maj_w = gw;
+            maj_val = v;
+        }
+        if gw < min_w {
+            min_w = gw;
+            min_val_freq = v;
+        }
+    }
+
+    // Weighted histogram (counts scaled to `count_cov` so histogram sums to `count`).
+    let (h_lo, h_hi) = opts.histogram_range.unwrap_or((min_v, max_v));
+    let edges: Vec<f64> = if let Some(ref custom_edges) = opts.histogram_edges {
+        custom_edges.clone()
+    } else {
+        let nbins = opts.histogram_bins.clamp(1, 1000);
+        let span = if (h_hi - h_lo).abs() < 1e-12 {
+            1.0
+        } else {
+            h_hi - h_lo
+        };
+        (0..=nbins)
+            .map(|k| h_lo + span * (k as f64) / (nbins as f64))
+            .collect()
+    };
+    let nbins = edges.len().saturating_sub(1).max(1);
+    let mut hist_w = vec![0.0_f64; nbins];
+    let scale_to_count = count_cov / w_total;
+    for &(vf, w) in &weighted_vals {
+        if vf < edges[0] || vf > edges[nbins] {
+            continue;
+        }
+        let bin = if vf == edges[nbins] {
+            nbins - 1
+        } else {
+            let pos = edges.partition_point(|&e| e <= vf);
+            pos.saturating_sub(1).min(nbins - 1)
+        };
+        hist_w[bin] += w * scale_to_count;
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("min".into(), serde_json::json!(min_v));
+    obj.insert("max".into(), serde_json::json!(max_v));
+    obj.insert("mean".into(), serde_json::json!(mean));
+    obj.insert("count".into(), serde_json::json!(count_cov));
+    obj.insert("sum".into(), serde_json::json!(sum_cov));
+    obj.insert("std".into(), serde_json::json!(std));
+    obj.insert("median".into(), serde_json::json!(median));
+    obj.insert("majority".into(), serde_json::json!(maj_val));
+    obj.insert("minority".into(), serde_json::json!(min_val_freq));
+    obj.insert("unique".into(), serde_json::json!(unique_count as f64));
+    obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
+    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels as f64));
+    obj.insert("valid_pixels".into(), serde_json::json!(valid_pixels as f64));
+    obj.insert("area".into(), serde_json::json!(area_valid_m2));
+
+    let pcts: Vec<f64> = if opts.percentiles.is_empty() {
+        vec![2.0, 98.0]
+    } else {
+        opts.percentiles.clone()
+    };
+    for p in pcts {
+        let key = if p.fract() == 0.0 {
+            format!("percentile_{}", p as i64)
+        } else {
+            format!("percentile_{p}")
+        };
+        obj.insert(key, serde_json::json!(weighted_quantile(p)));
+    }
+    if opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty()) {
+        let mut cats_obj = serde_json::Map::new();
+        if let Some(ref cats) = opts.categories
+            && !cats.is_empty()
+        {
+            for &c in cats {
+                let k = c.round() as i64;
+                let w = cat_weights.get(&k).copied().unwrap_or(0.0) * scale_to_count;
+                cats_obj.insert(k.to_string(), serde_json::json!(w));
+            }
+        } else {
+            for (k, w) in cat_weights {
+                cats_obj.insert(k.to_string(), serde_json::json!(w * scale_to_count));
+            }
+        }
+        obj.insert("categories".into(), serde_json::Value::Object(cats_obj));
+    }
+    if !description.is_empty() {
+        obj.insert("description".into(), serde_json::json!(description));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Compute exact analytical coverage-weighted & ellipsoidal area-weighted zonal statistics
+/// directly on the COG's native pixel grid (zero resampling).
+#[allow(clippy::too_many_arguments)]
+pub async fn compute_native_exact_polygon_stats(
+    engine: &TileEngine,
+    cog: &Arc<OpenedCog>,
+    crs: &CrsModel,
+    pm: &PolygonMask,
+    max_size: u32,
+    unscale: bool,
+    nodata_override: Option<f32>,
+    opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let full = cog.index.full_res();
+    let count = full.samples_per_pixel;
+    let alpha_idx = cogzilla_codec::alpha_channel_index(count as usize, &full.extra_samples);
+    let sel_bands: Vec<u16> = if let Some(ref exprs) = opts.expressions {
+        let mut needed: Vec<u16> = Vec::new();
+        for (_, prog) in exprs {
+            for &b in &prog.used_bands {
+                if !needed.contains(&b) {
+                    needed.push(b);
+                }
+            }
+        }
+        needed.sort_unstable();
+        needed
+    } else {
+        match &opts.bidx {
+            Some(b) if !b.is_empty() => b.clone(),
+            _ => (1..=count)
+                .filter(|&b| Some((b - 1) as usize) != alpha_idx)
+                .collect(),
+        }
+    };
+
+    let empty_result = || -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        if let Some(ref exprs) = opts.expressions {
+            for (i, (desc, _)) in exprs.iter().enumerate() {
+                let mut e = compute_f32_band_stats(&[], desc, opts);
+                if let Some(o) = e.as_object_mut() {
+                    o.insert("area".into(), serde_json::json!(0.0));
+                }
+                out.insert(format!("b{}", i + 1), e);
+            }
+        } else {
+            for &b1 in &sel_bands {
+                let desc = cog
+                    .index
+                    .band_descriptions
+                    .get((b1 - 1) as usize)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("b{b1}"));
+                let mut e = compute_f32_band_stats(&[], &desc, opts);
+                if let Some(o) = e.as_object_mut() {
+                    o.insert("area".into(), serde_json::json!(0.0));
+                }
+                out.insert(format!("b{b1}"), e);
+            }
+        }
+        serde_json::Value::Object(out)
+    };
+
+    let total_verts: usize = pm
+        .polygons
+        .iter()
+        .flat_map(|p| p.iter())
+        .map(|r| r.len())
+        .sum::<usize>()
+        + pm.lines.iter().map(|l| l.len()).sum::<usize>()
+        + pm.points.len();
+    let is_geo_dataset = matches!(crs, CrsModel::Geographic);
+
+    let densify_lonlat = !is_geo_dataset && !pm.coord_crs_projected;
+
+    let project_to_ifd = |ifd: &cogzilla_tiff::IfdMeta| -> Result<
+        (
+            Vec<Vec<Vec<(f64, f64)>>>,
+            Vec<Vec<(f64, f64)>>,
+            Vec<(f64, f64)>,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+        EngineError,
+    > {
+        let c2p = ifd.pixel_to_crs.invert().ok_or_else(|| {
+            EngineError::BadRequest("dataset has singular affine transform".into())
+        })?;
+        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let mut min_c = f64::INFINITY;
+        let mut max_c = f64::NEG_INFINITY;
+        let mut min_r = f64::INFINITY;
+        let mut max_r = f64::NEG_INFINITY;
+
+        let mut polys_px = Vec::with_capacity(pm.polygons.len());
+        for poly in &pm.polygons {
+            let mut rings_px = Vec::with_capacity(poly.len());
+            for ring in poly {
+                let rp = densify_ring_lonlat_to_pixel(
+                    ring,
+                    crs,
+                    &c2p,
+                    is_geo_dataset,
+                    densify_lonlat,
+                    wrap_lo,
+                    total_verts,
+                );
+                for &(c, r) in &rp {
+                    if c.is_finite() && r.is_finite() {
+                        min_c = min_c.min(c);
+                        max_c = max_c.max(c);
+                        min_r = min_r.min(r);
+                        max_r = max_r.max(r);
+                    }
+                }
+                rings_px.push(rp);
+            }
+            polys_px.push(rings_px);
+        }
+
+        let mut lines_px = Vec::with_capacity(pm.lines.len());
+        for line in &pm.lines {
+            let lp = densify_ring_lonlat_to_pixel(
+                line,
+                crs,
+                &c2p,
+                is_geo_dataset,
+                densify_lonlat,
+                wrap_lo,
+                total_verts,
+            );
+            for &(c, r) in &lp {
+                if c.is_finite() && r.is_finite() {
+                    min_c = min_c.min(c);
+                    max_c = max_c.max(c);
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r);
+                }
+            }
+            lines_px.push(lp);
+        }
+
+        let mut pts_px = Vec::with_capacity(pm.points.len());
+        for &(lon, lat) in &pm.points {
+            let mut adj_lon = lon;
+            if let Some(lo) = wrap_lo
+                && adj_lon < lo
+            {
+                adj_lon += 360.0;
+            }
+            let (sx, sy) = if is_geo_dataset {
+                (adj_lon, lat)
+            } else {
+                crs.from_lonlat_deg(adj_lon, lat)
+            };
+            let (c, r) = c2p.forward(sx, sy);
+            if c.is_finite() && r.is_finite() {
+                min_c = min_c.min(c);
+                max_c = max_c.max(c + 1.0);
+                min_r = min_r.min(r);
+                max_r = max_r.max(r + 1.0);
+                pts_px.push((c, r));
+            }
+        }
+
+        if !min_c.is_finite() || !min_r.is_finite() {
+            return Ok((polys_px, lines_px, pts_px, 0, 0, 0, 0));
+        }
+        let c0 = min_c.floor().clamp(0.0, ifd.width as f64) as usize;
+        let c1 = max_c.ceil().clamp(c0 as f64, ifd.width as f64) as usize;
+        let r0 = min_r.floor().clamp(0.0, ifd.height as f64) as usize;
+        let r1 = max_r.ceil().clamp(r0 as f64, ifd.height as f64) as usize;
+        Ok((polys_px, lines_px, pts_px, c0, c1, r0, r1))
+    };
+
+    // Start on full-resolution IFD 0; only step down to an overview if explicit max_size > 0 requests it.
+    let mut ifd_idx = 0usize;
+    let (mut polys_px, mut lines_px, mut pts_px, mut c0, mut c1, mut r0, mut r1) =
+        project_to_ifd(full)?;
+    if c1 <= c0 || r1 <= r0 {
+        return Ok(empty_result());
+    }
+    if opts.max_size_explicit && max_size > 0 && (c1 - c0).max(r1 - r0) > max_size as usize {
+        for (i, ov) in cog.index.ifds.iter().enumerate().skip(1) {
+            let (pp, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov)?;
+            ifd_idx = i;
+            polys_px = pp;
+            lines_px = lp;
+            pts_px = ptp;
+            c0 = oc0;
+            c1 = oc1;
+            r0 = or0;
+            r1 = or1;
+            if (c1 - c0).max(r1 - r0) <= max_size as usize {
+                break;
+            }
+        }
+    }
+    if c1 <= c0 || r1 <= r0 {
+        return Ok(empty_result());
+    }
+
+    let ifd = &cog.index.ifds[ifd_idx];
+    let win_w = c1 - c0;
+    let win_h = r1 - r0;
+    let n_px = win_w.saturating_mul(win_h);
+    const MAX_EXACT_WINDOW_PIXELS: usize = 16_777_216; // 4096 x 4096
+    if n_px > MAX_EXACT_WINDOW_PIXELS {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window ({win_w}x{win_h} = {n_px} px) exceeds maximum exact statistics window ({MAX_EXACT_WINDOW_PIXELS} px); pass max_size to downsample"
+        )));
+    }
+
+    let tw = ifd.tile_width as usize;
+    let th = ifd.tile_height as usize;
+    let tx0 = c0 / tw;
+    let tx1 = (c1 - 1) / tw;
+    let ty0 = r0 / th;
+    let ty1 = (r1 - 1) / th;
+    let blocks_x = tx1 - tx0 + 1;
+    let blocks_y = ty1 - ty0 + 1;
+    const MAX_EXACT_BLOCKS: usize = 1024;
+    if blocks_x * blocks_y > MAX_EXACT_BLOCKS {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window requires {} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
+            blocks_x * blocks_y
+        )));
+    }
+
+    // Fetch intersecting data blocks in parallel (get_blocks already applies internal mask IFDs).
+    let eff_nodata = nodata_override.or(cog.index.nodata);
+
+    let mut band_bufs: Vec<(u16, Vec<f32>)> = Vec::with_capacity(sel_bands.len());
+    match ifd.planar_config {
+        PlanarConfig::Chunky => {
+            let mut indices = Vec::with_capacity(blocks_x * blocks_y);
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    indices.push(Some(ifd.tile_index(tx as u32, ty as u32, 0) as u32));
+                }
+            }
+            let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+            for &b1 in &sel_bands {
+                let b0 = (b1 - 1) as usize;
+                let sc = if unscale {
+                    cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                let off = if unscale {
+                    cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let mut pixels = vec![f32::NAN; n_px];
+                for (bi, tile_opt) in tiles.iter().enumerate() {
+                    let Some(tile) = tile_opt else { continue };
+                    let Some(band) = tile.bands.get(b0) else { continue };
+                    let ty = ty0 + bi / blocks_x;
+                    let tx = tx0 + bi % blocks_x;
+                    let tile_x0 = tx * tw;
+                    let tile_y0 = ty * th;
+                    let rx0 = c0.max(tile_x0);
+                    let rx1 = c1.min(tile_x0 + tw);
+                    let ry0 = r0.max(tile_y0);
+                    let ry1 = r1.min(tile_y0 + th);
+                    for row in ry0..ry1 {
+                        let ly = row - tile_y0;
+                        let dst_row = (row - r0) * win_w;
+                        for col in rx0..rx1 {
+                            let lx = col - tile_x0;
+                            let src_i = ly * tw + lx;
+                            let mut v = band.data.get_f32(src_i);
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = eff_nodata
+                                && (nd.is_nan() && v.is_nan() || v == nd)
+                            {
+                                continue;
+                            }
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            pixels[dst_row + (col - c0)] = v;
+                        }
+                    }
+                }
+                band_bufs.push((b1, pixels));
+            }
+        }
+        PlanarConfig::Planar => {
+            for &b1 in &sel_bands {
+                let b0 = (b1 - 1) as usize;
+                let mut indices = Vec::with_capacity(blocks_x * blocks_y);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        indices.push(Some(ifd.tile_index(tx as u32, ty as u32, b0 as u16) as u32));
+                    }
+                }
+                let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+                let sc = if unscale {
+                    cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                let off = if unscale {
+                    cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let mut pixels = vec![f32::NAN; n_px];
+                for (bi, tile_opt) in tiles.iter().enumerate() {
+                    let Some(tile) = tile_opt else { continue };
+                    let Some(band) = tile.bands.first() else { continue };
+                    let ty = ty0 + bi / blocks_x;
+                    let tx = tx0 + bi % blocks_x;
+                    let tile_x0 = tx * tw;
+                    let tile_y0 = ty * th;
+                    let rx0 = c0.max(tile_x0);
+                    let rx1 = c1.min(tile_x0 + tw);
+                    let ry0 = r0.max(tile_y0);
+                    let ry1 = r1.min(tile_y0 + th);
+                    for row in ry0..ry1 {
+                        let ly = row - tile_y0;
+                        let dst_row = (row - r0) * win_w;
+                        for col in rx0..rx1 {
+                            let lx = col - tile_x0;
+                            let src_i = ly * tw + lx;
+                            let mut v = band.data.get_f32(src_i);
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = eff_nodata
+                                && (nd.is_nan() && v.is_nan() || v == nd)
+                            {
+                                continue;
+                            }
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            pixels[dst_row + (col - c0)] = v;
+                        }
+                    }
+                }
+                band_bufs.push((b1, pixels));
+            }
+        }
+    }
+
+    // Compute exact coverage, ellipsoidal area model, and weighted statistics.
+    let crs_owned = crs.clone();
+    let p2c = ifd.pixel_to_crs;
+    let opts_owned = opts.clone();
+    let descs_owned = cog.index.band_descriptions.clone();
+    let compute_cpu = move || -> serde_json::Value {
+        let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
+        let area_model = PixelAreaModel::build(&crs_owned, &p2c, c0, r0, win_w, win_h);
+        let mut out = serde_json::Map::new();
+        if let Some(ref exprs) = opts_owned.expressions {
+            for (ei, (desc, prog)) in exprs.iter().enumerate() {
+                let mut expr_px = vec![f32::NAN; n_px];
+                let mut b_vals = [0.0_f32; 16];
+                for i in 0..n_px {
+                    if cov[i] <= 0.0 {
+                        continue;
+                    }
+                    let mut all_valid = true;
+                    for &b1 in &prog.used_bands {
+                        let v = band_bufs
+                            .iter()
+                            .find(|(k, _)| *k == b1)
+                            .map(|(_, buf)| buf[i])
+                            .unwrap_or(f32::NAN);
+                        if !v.is_finite() {
+                            all_valid = false;
+                            break;
+                        }
+                        if (b1 as usize) <= b_vals.len() {
+                            b_vals[(b1 - 1) as usize] = v;
+                        }
+                    }
+                    if all_valid {
+                        expr_px[i] = prog.eval(&b_vals);
+                    }
+                }
+                out.insert(
+                    format!("b{}", ei + 1),
+                    compute_weighted_band_stats(
+                        &expr_px,
+                        &cov,
+                        win_w,
+                        win_h,
+                        &area_model,
+                        opts_owned.area_weighted,
+                        desc,
+                        &opts_owned,
+                    ),
+                );
+            }
+        } else {
+            for (b1, pixels) in &band_bufs {
+                let desc = descs_owned
+                    .get((*b1 - 1) as usize)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("b{b1}"));
+                out.insert(
+                    format!("b{b1}"),
+                    compute_weighted_band_stats(
+                        pixels,
+                        &cov,
+                        win_w,
+                        win_h,
+                        &area_model,
+                        opts_owned.area_weighted,
+                        &desc,
+                        &opts_owned,
+                    ),
+                );
+            }
+        }
+        serde_json::Value::Object(out)
+    };
+
+    if n_px >= 65_536 {
+        Ok(engine.store.run_heavy_cpu(compute_cpu).await?)
+    } else {
+        Ok(compute_cpu())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sum_cov(cov: &[f64]) -> f64 {
+        cov.iter().sum()
+    }
+
+    #[test]
+    fn exact_coverage_matches_analytic_area_to_1e_6_on_all_shapes() {
+        // 1. 3x3 grid-aligned (true = 9.0)
+        let poly = vec![vec![vec![(2.0, 2.0), (5.0, 2.0), (5.0, 5.0), (2.0, 5.0), (2.0, 2.0)]]];
+        let cov = rasterize_exact_coverage(&poly, &[], &[], 0, 0, 10, 10);
+        assert!((sum_cov(&cov) - 9.0).abs() < 1e-12);
+
+        // 2. 3x3 shifted half a pixel (true = 9.0)
+        let poly = vec![vec![vec![(2.5, 2.5), (5.5, 2.5), (5.5, 5.5), (2.5, 5.5), (2.5, 2.5)]]];
+        let cov = rasterize_exact_coverage(&poly, &[], &[], 0, 0, 10, 10);
+        assert!((sum_cov(&cov) - 9.0).abs() < 1e-12);
+
+        // 3. 3x3 grown 0.1 px per side -> 3.2 x 3.2 (true = 10.24)
+        let poly = vec![vec![vec![(1.9, 1.9), (5.1, 1.9), (5.1, 5.1), (1.9, 5.1), (1.9, 1.9)]]];
+        let cov = rasterize_exact_coverage(&poly, &[], &[], 0, 0, 10, 10);
+        assert!((sum_cov(&cov) - 10.24).abs() < 1e-12);
+
+        // 4. Sliver 0.2 px wide by 100 long (true = 20.0)
+        let poly = vec![vec![vec![(5.3, 1.0), (5.5, 1.0), (5.5, 101.0), (5.3, 101.0), (5.3, 1.0)]]];
+        let cov = rasterize_exact_coverage(&poly, &[], &[], 0, 0, 10, 105);
+        assert!((sum_cov(&cov) - 20.0).abs() < 1e-12);
+
+        // 5. Right triangle 100x100 (true = 5000.0)
+        let poly = vec![vec![vec![(1.3, 2.7), (101.3, 2.7), (101.3, 102.7), (1.3, 2.7)]]];
+        let cov = rasterize_exact_coverage(&poly, &[], &[], 0, 0, 110, 110);
+        assert!((sum_cov(&cov) - 5000.0).abs() < 1e-9);
+
+        // 6. 50x50 square (true = 2500.0)
+        let poly = vec![vec![vec![(3.7, 4.2), (53.7, 4.2), (53.7, 54.2), (3.7, 54.2), (3.7, 4.2)]]];
+        let cov = rasterize_exact_coverage(&poly, &[], &[], 0, 0, 60, 60);
+        assert!((sum_cov(&cov) - 2500.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adjacent_polygons_holes_multipolygon_and_subpixel() {
+        // Adjacent polygons split along a diagonal line inside cells -> sum equals union with no double count
+        let left = vec![vec![vec![(1.2, 1.3), (4.7, 1.3), (4.7, 6.8), (1.2, 1.3)]]];
+        let right = vec![vec![vec![(1.2, 1.3), (4.7, 6.8), (1.2, 6.8), (1.2, 1.3)]]];
+        let union = vec![vec![vec![(1.2, 1.3), (4.7, 1.3), (4.7, 6.8), (1.2, 6.8), (1.2, 1.3)]]];
+        let cl = rasterize_exact_coverage(&left, &[], &[], 0, 0, 10, 10);
+        let cr = rasterize_exact_coverage(&right, &[], &[], 0, 0, 10, 10);
+        let cu = rasterize_exact_coverage(&union, &[], &[], 0, 0, 10, 10);
+        for i in 0..cu.len() {
+            assert!((cl[i] + cr[i] - cu[i]).abs() < 1e-12, "cell {i} double-count mismatch");
+        }
+
+        // Polygon with hole: 6x6 outer (36) minus 2x2 hole (4) = 32.0
+        let with_hole = vec![vec![
+            vec![(1.0, 1.0), (7.0, 1.0), (7.0, 7.0), (1.0, 7.0), (1.0, 1.0)],
+            vec![(3.0, 3.0), (5.0, 3.0), (5.0, 5.0), (3.0, 5.0), (3.0, 3.0)],
+        ]];
+        let ch = rasterize_exact_coverage(&with_hole, &[], &[], 0, 0, 10, 10);
+        assert!((sum_cov(&ch) - 32.0).abs() < 1e-12);
+
+        // MultiPolygon: two disjoint 2x2 squares = 8.0
+        let mp = vec![
+            vec![vec![(0.5, 0.5), (2.5, 0.5), (2.5, 2.5), (0.5, 2.5), (0.5, 0.5)]],
+            vec![vec![(5.2, 5.2), (7.2, 5.2), (7.2, 7.2), (5.2, 7.2), (5.2, 5.2)]],
+        ];
+        let cm = rasterize_exact_coverage(&mp, &[], &[], 0, 0, 10, 10);
+        assert!((sum_cov(&cm) - 8.0).abs() < 1e-12);
+
+        // Sub-pixel polygon (0.2 x 0.3 = 0.06) inside pixel (4, 4) returns fractional weight & pixel value
+        let tiny = vec![vec![vec![(4.2, 4.3), (4.4, 4.3), (4.4, 4.6), (4.2, 4.6), (4.2, 4.3)]]];
+        let ct = rasterize_exact_coverage(&tiny, &[], &[], 4, 4, 1, 1);
+        assert!((ct[0] - 0.06).abs() < 1e-12);
+        let st = compute_weighted_band_stats(
+            &[42.5_f32],
+            &ct,
+            1,
+            1,
+            &PixelAreaModel::Constant(900.0),
+            true,
+            "b1",
+            &StatsOptions::default(),
+        );
+        assert!((st["count"].as_f64().unwrap() - 0.06).abs() < 1e-12);
+        assert!((st["mean"].as_f64().unwrap() - 42.5).abs() < 1e-6);
+        assert!((st["area"].as_f64().unwrap() - 54.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ellipsoidal_area_and_40n_60n_cos_weighted_mean() {
+        // 1. 1° x 1° box at equator (0..1N) and at 60N (59.5..60.5N) on WGS84
+        // Exact reference values verified against pyproj.Geod(ellps="WGS84"):
+        // 0..1N = 12308.463926 km^2, 59.5..60.5N = 6216.722658 km^2
+        let eq_km2 = wgs84_geographic_cell_area_m2(0.0, 1.0, 0.0, 1.0) / 1e6;
+        let hi_km2 = wgs84_geographic_cell_area_m2(0.0, 1.0, 59.5, 60.5) / 1e6;
+        assert!(
+            (eq_km2 - 12_308.4639).abs() < 1e-3,
+            "equator 1x1 deg area expected 12308.4639 km2, got {eq_km2}"
+        );
+        assert!(
+            (hi_km2 - 6_216.7227).abs() < 1e-3,
+            "60N 1x1 deg area expected 6216.7227 km2, got {hi_km2}"
+        );
+
+        // 2. Synthetic EPSG:4326 raster over 40N..60N (0.05° resolution -> 400 rows x 20 cols)
+        // whose pixel value equals its center latitude.
+        let win_w = 20usize;
+        let win_h = 400usize;
+        let step = 20.0 / win_h as f64;
+        let p2c = Affine2D {
+            a: step,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+            e: -step,
+            f: 60.0,
+        };
+        let mut pixels = vec![0.0_f32; win_w * win_h];
+        for r in 0..win_h {
+            let lat_center = 60.0 - (r as f64 + 0.5) * step;
+            for c in 0..win_w {
+                pixels[r * win_w + c] = lat_center as f32;
+            }
+        }
+        let cov = vec![1.0_f64; win_w * win_h];
+        let area_model = PixelAreaModel::build(&CrsModel::Geographic, &p2c, 0, 0, win_w, win_h);
+        let st_weighted = compute_weighted_band_stats(
+            &pixels,
+            &cov,
+            win_w,
+            win_h,
+            &area_model,
+            true,
+            "lat",
+            &StatsOptions::default(),
+        );
+        let st_unweighted = compute_weighted_band_stats(
+            &pixels,
+            &cov,
+            win_w,
+            win_h,
+            &area_model,
+            false,
+            "lat",
+            &StatsOptions::default(),
+        );
+
+        // Exact analytic WGS84 ellipsoidal mean latitude over 40..60N:
+        // Compare against exact sum(lat_center * band_area) / sum(band_area) (~49.306° vs 50.0° unweighted)
+        let mut num = 0.0_f64;
+        let mut den = 0.0_f64;
+        for r in 0..win_h {
+            let lat_top = 60.0 - r as f64 * step;
+            let lat_bot = lat_top - step;
+            let a = wgs84_geographic_cell_area_m2(0.0, step, lat_bot, lat_top);
+            num += (0.5 * (lat_top + lat_bot)) * a;
+            den += a;
+        }
+        let expected_weighted = num / den;
+        let got_weighted = st_weighted["mean"].as_f64().unwrap();
+        let got_unweighted = st_unweighted["mean"].as_f64().unwrap();
+        assert!(
+            ((got_weighted - expected_weighted) / expected_weighted).abs() < 1e-6,
+            "weighted mean {got_weighted} vs analytic {expected_weighted}"
+        );
+        assert!(
+            (got_unweighted - 50.0).abs() < 1e-5,
+            "unweighted mean expected 50.0, got {got_unweighted}"
+        );
+        assert!(
+            (got_weighted - 49.306).abs() < 0.02,
+            "40N..60N ellipsoidal mean should be ~49.306°, got {got_weighted}"
+        );
+
+        // 3. Small UTM polygon: PixelAreaModel short-circuits to Constant so area_weighted true == false
+        let utm = CrsModel::from_epsg(32610).unwrap();
+        let p2c_utm = Affine2D {
+            a: 30.0,
+            b: 0.0,
+            c: 500_000.0,
+            d: 0.0,
+            e: -30.0,
+            f: 4_200_000.0,
+        };
+        let utm_model = PixelAreaModel::build(&utm, &p2c_utm, 0, 0, 10, 10);
+        assert!(utm_model.is_constant(), "small UTM window must short-circuit to Constant");
+    }
+}
