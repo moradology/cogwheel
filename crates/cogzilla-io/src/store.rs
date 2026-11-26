@@ -772,7 +772,7 @@ impl CogStore {
 
                 let (index, freshness) = match &source {
                     CogSource::LocalMmap { mmap } => {
-                        let local_path = uri.strip_prefix("file://").unwrap_or(uri);
+                        let local_path = crate::backend::resolve_local_or_reject_scheme(uri)?;
                         let meta = std::fs::metadata(local_path)?;
                         let idx = parse_cog(mmap)?;
                         let fresh = SourceFreshness::Local {
