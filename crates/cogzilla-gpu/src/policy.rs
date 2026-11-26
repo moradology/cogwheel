@@ -35,6 +35,9 @@ pub enum GpuOp {
     FusedColormapBilinear,
     FusedColormapCubic,
     FusedColormapLanczos3,
+    DemHornCubic,
+    DemHornLanczos3,
+    DemTerrainRgbCubic,
 }
 
 /// Startup-calibrated hardware profile for a `GpuContext`.
@@ -212,6 +215,9 @@ impl DispatchPolicy {
             GpuOp::FusedColormapBilinear => 0.0022,
             GpuOp::FusedColormapCubic => 0.0045,
             GpuOp::FusedColormapLanczos3 => 0.1270,
+            GpuOp::DemHornCubic => 0.0085,
+            GpuOp::DemHornLanczos3 => 0.1320,
+            GpuOp::DemTerrainRgbCubic => 0.0055,
         }
     }
 
@@ -219,8 +225,11 @@ impl DispatchPolicy {
     fn gpu_compute_us_per_pixel(op: GpuOp) -> f64 {
         match op {
             GpuOp::ResampleBilinear | GpuOp::FusedColormapBilinear => 0.00008,
-            GpuOp::ResampleCubic | GpuOp::FusedColormapCubic => 0.00020,
-            GpuOp::ResampleLanczos3 | GpuOp::FusedColormapLanczos3 => 0.00045,
+            GpuOp::ResampleCubic | GpuOp::FusedColormapCubic | GpuOp::DemTerrainRgbCubic => 0.00020,
+            GpuOp::DemHornCubic => 0.00030,
+            GpuOp::ResampleLanczos3 | GpuOp::FusedColormapLanczos3 | GpuOp::DemHornLanczos3 => {
+                0.00050
+            }
         }
     }
 
