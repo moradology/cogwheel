@@ -276,6 +276,9 @@ pub struct IfdMeta {
     pub is_stripped: bool,
     pub pixel_to_crs: Affine2D,
     pub crs_to_pixel: Affine2D,
+    /// Optional order 2–3 polynomial warp for nonlinear GCP-georeferenced files.
+    /// Always `None` on normal geotransform COGs and affine-exact GCP files (zero hot-path overhead).
+    pub gcp_poly: Option<Box<crate::gcp::GcpPoly>>,
     /// Flat array of tile byte offsets.
     /// For Chunky: length = `tiles_across * tiles_down`.
     /// For Planar: length = `samples_per_pixel * tiles_across * tiles_down`.
@@ -335,6 +338,26 @@ impl IfdMeta {
         let ry = (self.pixel_to_crs.b.powi(2) + self.pixel_to_crs.e.powi(2)).sqrt();
         (rx, ry)
     }
+
+    /// Map pixel `(col, row)` to source CRS `(x, y)`, using the polynomial GCP warp when present.
+    #[inline(always)]
+    pub fn pixel_to_crs_pt(&self, col: f64, row: f64) -> (f64, f64) {
+        if let Some(poly) = self.gcp_poly.as_deref() {
+            poly.pixel_to_crs(col, row)
+        } else {
+            self.pixel_to_crs.forward(col, row)
+        }
+    }
+
+    /// Map source CRS `(x, y)` to pixel `(col, row)`, using the polynomial GCP warp when present.
+    #[inline(always)]
+    pub fn crs_to_pixel_pt(&self, x: f64, y: f64) -> (f64, f64) {
+        if let Some(poly) = self.gcp_poly.as_deref() {
+            poly.crs_to_pixel(x, y)
+        } else {
+            self.crs_to_pixel.forward(x, y)
+        }
+    }
 }
 
 /// Complete parsed metadata index for a single float32 COG.
@@ -342,6 +365,11 @@ impl IfdMeta {
 pub struct CogIndex {
     pub byte_order: ByteOrder,
     pub is_bigtiff: bool,
+    /// False for ungeoreferenced TIFFs (no GeoTransform and no GCPs); pixel-space routes
+    /// (`/cog/info`, `/cog/preview`, `GET /cog/statistics`) work while geographic routes return 400.
+    pub is_georeferenced: bool,
+    /// Max pixel residual when georeferenced via Ground Control Points (`ModelTiepointTag`).
+    pub gcp_residual_px: Option<f64>,
     /// `None` means no explicit GDAL_NODATA tag (NaN is still always treated as nodata).
     /// `Some(v)` where `v.is_nan()` means explicit NaN nodata; finite `v` means sentinel nodata.
     pub nodata: Option<f32>,

@@ -52,15 +52,7 @@ fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta, has_color_map: bool) -> Vec<
 
 /// TiTiler-compatible `/cog/info` JSON payload built directly from our `CogIndex`.
 pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json::Value, EngineError> {
-    let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
-    let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-    let coarsest = cog.index.ifds.last().unwrap();
-    let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
-        .max(full.height as f64 / coarsest.height.max(1) as f64);
-    let (minzoom, maxzoom) =
-        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
-
     let count = full.samples_per_pixel as usize;
     let band_metadata: Vec<_> = (0..count)
         .map(|i| {
@@ -104,22 +96,6 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         None => ("None", None),
     };
 
-    let gk = &cog.index.geo_keys;
-    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
-    let is_user_defined_projected = std_proj_epsg.is_none()
-        && (gk.model_type == Some(1)
-            || gk.projected_cs_type == Some(32767)
-            || gk.proj_coord_trans.is_some());
-    let crs_uri = if let Some(epsg) = std_proj_epsg {
-        format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
-    } else if !is_user_defined_projected
-        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
-    {
-        format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
-    } else {
-        "http://www.opengis.net/def/crs/EPSG/0/4326".to_string()
-    };
-
     let scales: Vec<f64> = (0..count)
         .map(|i| cog.index.scales_f64.get(i).copied().unwrap_or(1.0))
         .collect();
@@ -127,43 +103,95 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .map(|i| cog.index.offsets_f64.get(i).copied().unwrap_or(0.0))
         .collect();
 
-    let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
-    let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
-    let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
-    let (x11, y11) = full
-        .pixel_to_crs
-        .forward(full.width as f64, full.height as f64);
-    let native_bounds = [
-        x00.min(x10).min(x01).min(x11),
-        y00.min(y10).min(y01).min(y11),
-        x00.max(x10).max(x01).max(x11),
-        y00.max(y10).max(y01).max(y11),
-    ];
-    let reported_bounds = if is_user_defined_projected {
-        bounds
+    let mut info = if !cog.index.is_georeferenced {
+        serde_json::json!({
+            "bounds": serde_json::Value::Null,
+            "crs": serde_json::Value::Null,
+            "wgs84_bounds": serde_json::Value::Null,
+            "minzoom": serde_json::Value::Null,
+            "maxzoom": serde_json::Value::Null,
+            "band_metadata": band_metadata,
+            "band_descriptions": band_descriptions,
+            "dtype": full.sample_type.gdal_name(),
+            "nodata_type": nodata_type,
+            "colorinterp": colorinterp,
+            "scales": scales,
+            "offsets": offsets,
+            "driver": "GTiff",
+            "count": count,
+            "width": full.width,
+            "height": full.height,
+            "overviews": overviews,
+        })
     } else {
-        native_bounds
-    };
+        let crs = engine.get_or_build_crs(cog)?;
+        let bounds = crs.wgs84_bounds_with_gcp(
+            &full.pixel_to_crs,
+            full.gcp_poly.as_deref(),
+            full.width,
+            full.height,
+        );
+        let coarsest = cog.index.ifds.last().unwrap();
+        let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
+            .max(full.height as f64 / coarsest.height.max(1) as f64);
+        let (minzoom, maxzoom) =
+            crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
 
-    let mut info = serde_json::json!({
-        "bounds": reported_bounds,
-        "crs": crs_uri,
-        "wgs84_bounds": bounds,
-        "minzoom": minzoom,
-        "maxzoom": maxzoom,
-        "band_metadata": band_metadata,
-        "band_descriptions": band_descriptions,
-        "dtype": full.sample_type.gdal_name(),
-        "nodata_type": nodata_type,
-        "colorinterp": colorinterp,
-        "scales": scales,
-        "offsets": offsets,
-        "driver": "GTiff",
-        "count": count,
-        "width": full.width,
-        "height": full.height,
-        "overviews": overviews,
-    });
+        let gk = &cog.index.geo_keys;
+        let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+        let is_user_defined_projected = std_proj_epsg.is_none()
+            && (gk.model_type == Some(1)
+                || gk.projected_cs_type == Some(32767)
+                || gk.proj_coord_trans.is_some());
+        let crs_uri = if let Some(epsg) = std_proj_epsg {
+            format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
+        } else if !is_user_defined_projected
+            && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
+        {
+            format!("http://www.opengis.net/def/crs/EPSG/0/{epsg}")
+        } else {
+            "http://www.opengis.net/def/crs/EPSG/0/4326".to_string()
+        };
+
+        let (x00, y00) = full.pixel_to_crs_pt(0.0, 0.0);
+        let (x10, y10) = full.pixel_to_crs_pt(full.width as f64, 0.0);
+        let (x01, y01) = full.pixel_to_crs_pt(0.0, full.height as f64);
+        let (x11, y11) = full.pixel_to_crs_pt(full.width as f64, full.height as f64);
+        let native_bounds = [
+            x00.min(x10).min(x01).min(x11),
+            y00.min(y10).min(y01).min(y11),
+            x00.max(x10).max(x01).max(x11),
+            y00.max(y10).max(y01).max(y11),
+        ];
+        let reported_bounds = if is_user_defined_projected {
+            bounds
+        } else {
+            native_bounds
+        };
+
+        serde_json::json!({
+            "bounds": reported_bounds,
+            "crs": crs_uri,
+            "wgs84_bounds": bounds,
+            "minzoom": minzoom,
+            "maxzoom": maxzoom,
+            "band_metadata": band_metadata,
+            "band_descriptions": band_descriptions,
+            "dtype": full.sample_type.gdal_name(),
+            "nodata_type": nodata_type,
+            "colorinterp": colorinterp,
+            "scales": scales,
+            "offsets": offsets,
+            "driver": "GTiff",
+            "count": count,
+            "width": full.width,
+            "height": full.height,
+            "overviews": overviews,
+        })
+    };
+    if let Some(res) = cog.index.gcp_residual_px {
+        info["gcp_residual_px"] = serde_json::json!(res);
+    }
     if let Some(nv) = nodata_value {
         info["nodata_value"] = nv;
     }
@@ -188,6 +216,7 @@ pub fn build_cog_info_geojson(
     engine: &TileEngine,
     cog: &OpenedCog,
 ) -> Result<serde_json::Value, EngineError> {
+    let _ = engine.get_or_build_crs(cog)?;
     let info = build_cog_info(engine, cog)?;
     let b = info["wgs84_bounds"]
         .as_array()
@@ -984,7 +1013,7 @@ pub async fn query_point(
         lon
     };
     let (sx, sy) = crs.from_lonlat_deg(q_lon, lat);
-    let (col_f, row_f) = ifd.crs_to_pixel.forward(sx, sy);
+    let (col_f, row_f) = ifd.crs_to_pixel_pt(sx, sy);
     let col = col_f.floor() as i64;
     let row = row_f.floor() as i64;
 
@@ -3317,7 +3346,11 @@ pub async fn compute_statistics_with_options(
     }
     const MAX_STATS_BLOCKS: usize = 512;
     const MAX_STATS_MASK_TILES: usize = 65_536;
-    let crs = engine.get_or_build_crs(cog)?;
+    let crs = if poly_mask.is_none() && !cog.index.is_georeferenced {
+        cogzilla_proj::CrsModel::Geographic
+    } else {
+        engine.get_or_build_crs(cog)?
+    };
     if let Some(pm) = poly_mask {
         if opts.width.is_none() && opts.height.is_none() {
             return crate::zonal::compute_native_exact_polygon_stats(
@@ -4924,7 +4957,11 @@ async fn render_bbox_impl(
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
     let primary = &cogs[0];
-    let crs = engine.get_or_build_crs(primary)?;
+    let crs = if native_preview && !primary.index.is_georeferenced {
+        cogzilla_proj::CrsModel::Geographic
+    } else {
+        engine.get_or_build_crs(primary)?
+    };
 
     let cx = 0.5 * (bbox[0] + bbox[2]);
     let cy = 0.5 * (bbox[1] + bbox[3]);
@@ -5054,10 +5091,18 @@ async fn render_bbox_impl(
         let dst_crs = dst_crs.clone();
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
+        let gcp_poly = ifd.gcp_poly.clone();
         let ifd_width = ifd.width;
         let ifd_height = ifd.height;
         let poly_mask = poly_mask.cloned();
         move || {
+            let map_crs_to_px = |sx: f64, sy: f64| -> (f64, f64) {
+                if let Some(ref poly) = gcp_poly {
+                    poly.crs_to_pixel(sx, sy)
+                } else {
+                    crs_to_pixel.forward(sx, sy)
+                }
+            };
             let touched_mask: Option<Vec<bool>> = poly_mask
                 .as_ref()
                 .map(|pm| pm.rasterize_all_touched(w, h, bbox, &dst_crs));
@@ -5097,7 +5142,8 @@ async fn render_bbox_impl(
             // Separable 1D fast path: when both dst_crs and src_crs are separable cylindrical/geographic
             // projections and the raster is axis-aligned, u depends only on px and v depends only on py.
             // Uses w + h exact evaluations (faster than a 16-px bilinear grid and 100% exact at every row).
-            let is_separable = crs_to_pixel.is_axis_aligned()
+            let is_separable = gcp_poly.is_none()
+                && crs_to_pixel.is_axis_aligned()
                 && matches!(
                     dst_crs,
                     cogzilla_proj::CrsModel::Geographic
@@ -5192,7 +5238,7 @@ async fn render_bbox_impl(
                     let x_coord = bbox[0] + px_f * dlx;
                     let (sx, sy) = to_src_crs(x_coord, y_coord);
                     if sx.is_finite() && sy.is_finite() {
-                        let (col, row) = crs_to_pixel.forward(sx, sy);
+                        let (col, row) = map_crs_to_px(sx, sy);
                         grid_u[gy * gw + gx] = col - 0.5;
                         grid_v[gy * gw + gx] = row - 0.5;
                     }
@@ -5240,7 +5286,7 @@ async fn render_bbox_impl(
                         let y_mid = bbox[3] - (0.5 * (y0 + y1) as f64) * dly;
                         let (msx, msy) = to_src_crs(x_mid, y_mid);
                         let mid_ok = if msx.is_finite() && msy.is_finite() {
-                            let (mcol, mrow) = crs_to_pixel.forward(msx, msy);
+                            let (mcol, mrow) = map_crs_to_px(msx, msy);
                             let mu = mcol - 0.5;
                             let mv = mrow - 0.5;
                             let u_avg = 0.25 * (u00 + u10 + u01 + u11);
@@ -5339,7 +5385,7 @@ async fn render_bbox_impl(
                                 if !sx.is_finite() || !sy.is_finite() {
                                     continue;
                                 }
-                                let (col, row) = crs_to_pixel.forward(sx, sy);
+                                let (col, row) = map_crs_to_px(sx, sy);
                                 let uu = (col - 0.5) as f32;
                                 let vv = (row - 0.5) as f32;
                                 if uu >= -1.0 && uu <= ifd_w_f && vv >= -1.0 && vv <= ifd_h_f {

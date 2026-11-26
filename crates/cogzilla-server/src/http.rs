@@ -8968,9 +8968,23 @@ where
                     .or(pq.format_param.as_deref())
                     .unwrap_or("png");
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let is_georef = cogs[0].index.is_georeferenced;
+                if !is_georef && pq.dst_crs.is_some() {
+                    let _ = engine.get_or_build_crs(&cogs[0])?;
+                }
+                let (crs_opt, bbox) = if is_georef {
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let b = crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
+                    (Some(crs), b)
+                } else {
+                    (None, [0.0, 0.0, full.width as f64, full.height as f64])
+                };
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -9006,7 +9020,14 @@ where
                     let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
                         && full.pixel_to_crs.a > 0.0
                         && full.pixel_to_crs.e < 0.0;
-                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
+                    if !is_georef {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                            pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, bbox, out_w, out_h, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -9018,7 +9039,7 @@ where
                     } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
                         let epsg = nat_epsg.unwrap_or(4326);
                         let d = render_crs_bbox(
-                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            &engine, &cogs, nat_bbox, crs_opt.as_ref().unwrap(), out_w, out_h, None, &bands,
                             pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
                             pq.return_mask, pq.unscale,
                         )
@@ -9034,16 +9055,32 @@ where
                     }
                 };
                 let (data, ct) = finalize_image_output(data, ct, fmt, auto_fmt, out_w, out_h, out_bbox, out_epsg, pq.jpeg_quality, pq.return_mask);
-                geo_meta = Some((out_bbox, Some(out_epsg), false));
+                if is_georef {
+                    geo_meta = Some((out_bbox, Some(out_epsg), false));
+                }
                 Ok((data, ct))
             }
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let is_georef = cogs[0].index.is_georeferenced;
+                if !is_georef && pq.dst_crs.is_some() {
+                    let _ = engine.get_or_build_crs(&cogs[0])?;
+                }
+                let (crs_opt, bbox) = if is_georef {
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let b = crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
+                    (Some(crs), b)
+                } else {
+                    (None, [0.0, 0.0, full.width as f64, full.height as f64])
+                };
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
@@ -9070,7 +9107,14 @@ where
                     let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
                         && full.pixel_to_crs.a > 0.0
                         && full.pixel_to_crs.e < 0.0;
-                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
+                    if !is_georef {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                            pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, bbox, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -9082,7 +9126,7 @@ where
                     } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
                         let epsg = nat_epsg.unwrap_or(4326);
                         let d = render_crs_bbox(
-                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            &engine, &cogs, nat_bbox, crs_opt.as_ref().unwrap(), out_w, out_h, None, &bands,
                             pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
                             pq.return_mask, pq.unscale,
                         )
@@ -9098,7 +9142,9 @@ where
                     }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
-                geo_meta = Some((out_bbox, Some(out_epsg), false));
+                if is_georef {
+                    geo_meta = Some((out_bbox, Some(out_epsg), false));
+                }
                 Ok((data, ct))
             }
             .await,

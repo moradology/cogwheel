@@ -77,6 +77,12 @@ This document is the living record of every intentional divergence, **why** it e
 - **`POST /*/feature` body types:** Accepts `FeatureCollection` and bare `Geometry` in addition to `Feature` (TiTiler returns `422`).
 - **`reproject=gauss`:** Supported as a resampling extension (TiTiler returns `422`).
 
+### 1.9 Pure-Rust GCP Georeferencing & Ungeoreferenced Pixel-Space Support (`U2(b)`, `U3`)
+
+- **TiTiler / GDAL:** On GCP-only GeoTIFFs (e.g. `odd/gcp_affine.tif`), GDAL's default GCP warper can disagree with the exact affine twin (`2088` vs `2600` at `-122.4, 37.8`).
+- **`cogzilla`:** Fits GCPs in pure Rust (zero C dependencies): when the order-1 least-squares affine residual is `< 0.05 px`, stores an exact `Affine2D` (zero runtime overhead on hot paths and bit-identical pixels/point values to the affine twin); otherwise fits a normalized order-2 (`>= 6` GCPs) or order-3 (`>= 10` GCPs) forward & inverse polynomial warp. Exposes `gcp_residual_px` in `/cog/info`.
+- **Ungeoreferenced TIFFs (`U3`):** Serves `/cog/info` (`crs: null`, `bounds: null`), `/cog/preview`, and `GET /cog/statistics` directly in pixel space while returning `400 Bad Request` on geographic routes (`/tiles`, `/point`, `/bbox`, `/feature`, `/bounds`).
+
 ---
 
 ## 2. Deliberate API & Error-Handling Divergences

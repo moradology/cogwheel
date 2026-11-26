@@ -94,6 +94,7 @@ fn clone_for_decode(ifd: &IfdMeta) -> IfdMeta {
         is_stripped: ifd.is_stripped,
         pixel_to_crs: ifd.pixel_to_crs,
         crs_to_pixel: ifd.crs_to_pixel,
+        gcp_poly: None,
         tile_offsets: Box::default(),
         tile_byte_counts: Box::default(),
     }

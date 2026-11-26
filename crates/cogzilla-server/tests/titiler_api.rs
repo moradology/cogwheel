@@ -2655,10 +2655,11 @@ async fn sweep16_u1_stac_post_expr_and_u2a_gcp_message() {
         buf.extend_from_slice(b"II");
         buf.extend_from_slice(&42u16.to_le_bytes());
         buf.extend_from_slice(&8u32.to_le_bytes());
-        let num_entries: u16 = 11;
+        let num_entries: u16 = 12;
         let data_start = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
         let tp_off = data_start;
-        let pix_off = tp_off + 24 * 8;
+        let gkd_off = tp_off + 24 * 8;
+        let pix_off = gkd_off + 12 * 2;
         let push = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
             b.extend_from_slice(&tag.to_le_bytes());
             b.extend_from_slice(&ty.to_le_bytes());
@@ -2677,6 +2678,7 @@ async fn sweep16_u1_stac_post_expr_and_u2a_gcp_message() {
         push(&mut buf, 279, 4, 1, 8 * 8 * 4);
         push(&mut buf, 339, 3, 1, 3);
         push(&mut buf, 33922, 12, 24, tp_off); // 4 GCPs
+        push(&mut buf, 34735, 3, 12, gkd_off); // GeoKeyDirectory: EPSG:4326
         buf.extend_from_slice(&0u32.to_le_bytes());
         for gcp in [
             [0.0f64, 0.0, 0.0, -122.5, 37.9, 0.0],
@@ -2687,6 +2689,9 @@ async fn sweep16_u1_stac_post_expr_and_u2a_gcp_message() {
             for v in gcp {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
+        }
+        for k in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&k.to_le_bytes());
         }
         for _ in 0..64 {
             buf.extend_from_slice(&1.0f32.to_le_bytes());
@@ -2751,18 +2756,24 @@ async fn sweep16_u1_stac_post_expr_and_u2a_gcp_message() {
         );
     }
 
-    // U2(a): GCP-only TIFF returns clear 400 mentioning ground control points (not missing georef tags)
+    // U2(b): 4-GCP affine TIFF now succeeds with 200, gcp_residual_px ~ 0, and exact /cog/point!
     let r_gcp = client
         .get(format!("{base}/cog/info?url={gcp_url}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r_gcp.status(), 400);
-    let gcp_body = r_gcp.text().await.unwrap();
-    assert!(
-        gcp_body.to_ascii_lowercase().contains("ground control points"),
-        "U2(a) expected GCP message, got: {gcp_body}"
-    );
+    assert_eq!(r_gcp.status(), 200);
+    let gcp_info: serde_json::Value = serde_json::from_slice(&r_gcp.bytes().await.unwrap()).unwrap();
+    let res_px = gcp_info["gcp_residual_px"].as_f64().expect("gcp_residual_px present");
+    assert!(res_px < 1e-9, "expected exact affine residual < 1e-9, got {res_px}");
+    let r_pt = client
+        .get(format!("{base}/cog/point/-122.45,37.85?url={gcp_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pt.status(), 200);
+    let pt_json: serde_json::Value = serde_json::from_slice(&r_pt.bytes().await.unwrap()).unwrap();
+    assert_eq!(pt_json["values"][0].as_f64().unwrap(), 1.0);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -3135,4 +3146,149 @@ async fn sweep17_v4_non_cog_ifd_seeking_and_v5_tight_block_fetch() {
 
     mock_task.abort();
     srv_task.abort();
+}
+
+
+#[tokio::test]
+async fn sweep16_u3_ungeoreferenced_and_u2b_nonlinear_gcp_self_contained() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_u3_u2b_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a tiny stripped float32 TIFF with optional ModelTiepointTag GCPs (no scale).
+    let write_tiff = |path: &std::path::Path, w: u32, h: u32, gcps: Option<&[[f64; 6]]>, pixels: &[f32]| {
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let has_gcp = gcps.is_some();
+        let num_entries: u16 = if has_gcp { 12 } else { 10 };
+        let data_start = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
+        let tp_off = data_start;
+        let tp_bytes = gcps.map_or(0, |g| (g.len() * 6 * 8) as u32);
+        let gkd_off = tp_off + tp_bytes;
+        let gkd_bytes = if has_gcp { 12 * 2 } else { 0 };
+        let pix_off = gkd_off + gkd_bytes;
+        let push = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push(&mut buf, 256, 4, 1, w);
+        push(&mut buf, 257, 4, 1, h);
+        push(&mut buf, 258, 3, 1, 32);
+        push(&mut buf, 259, 3, 1, 1);
+        push(&mut buf, 262, 3, 1, 1);
+        push(&mut buf, 273, 4, 1, pix_off);
+        push(&mut buf, 277, 3, 1, 1);
+        push(&mut buf, 278, 4, 1, h);
+        push(&mut buf, 279, 4, 1, w * h * 4);
+        push(&mut buf, 339, 3, 1, 3);
+        if let Some(g) = gcps {
+            push(&mut buf, 33922, 12, (g.len() * 6) as u32, tp_off);
+            push(&mut buf, 34735, 3, 12, gkd_off);
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        if let Some(g) = gcps {
+            for row in g {
+                for v in row {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            for k in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+                buf.extend_from_slice(&k.to_le_bytes());
+            }
+        }
+        for &p in pixels {
+            buf.extend_from_slice(&p.to_le_bytes());
+        }
+        std::fs::write(path, &buf).unwrap();
+    };
+
+    // 1. Ungeoreferenced 32x32 TIFF (U3)
+    let nogeo_path = tmp.join("nogeo.tif");
+    let nogeo_px: Vec<f32> = (0..(32 * 32)).map(|i| (i % 32) as f32 * 10.0).collect();
+    write_tiff(&nogeo_path, 32, 32, None, &nogeo_px);
+
+    // 2. Nonlinear quadratic 9-GCP 64x64 TIFF (U2b order-2 polynomial)
+    let gcp_nl_path = tmp.join("gcp_nonlinear.tif");
+    let mut nl_gcps = Vec::new();
+    for &row in &[0.0f64, 32.0, 64.0] {
+        for &col in &[0.0f64, 32.0, 64.0] {
+            let u = col / 64.0;
+            let v = row / 64.0;
+            let x = -122.5 + 0.25 * u + 0.01 * u * v;
+            let y = 37.9 - 0.25 * v - 0.01 * u * u;
+            nl_gcps.push([col, row, 0.0, x, y, 0.0]);
+        }
+    }
+    let mut nl_px = vec![0.0f32; 64 * 64];
+    for r in 0..64 {
+        for c in 0..64 {
+            nl_px[r * 64 + c] = (r * 100 + c) as f32;
+        }
+    }
+    write_tiff(&gcp_nl_path, 64, 64, Some(&nl_gcps), &nl_px);
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let nogeo_url = nogeo_path.to_string_lossy().to_string();
+    let nl_url = gcp_nl_path.to_string_lossy().to_string();
+
+    // U3: /cog/info returns 200 with crs=null, bounds=null, width=32, height=32
+    let r = client.get(format!("{base}/cog/info?url={nogeo_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let info: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert!(info["crs"].is_null(), "expected crs: null, got {info}");
+    assert!(info["bounds"].is_null(), "expected bounds: null, got {info}");
+    assert_eq!(info["width"], 32);
+    assert_eq!(info["height"], 32);
+
+    // U3: /cog/preview and GET /cog/statistics succeed in pixel space
+    let r = client.get(format!("{base}/cog/preview.png?url={nogeo_url}&rescale=0,310")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client.get(format!("{base}/cog/preview/16x16.png?url={nogeo_url}&rescale=0,310")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client.get(format!("{base}/cog/statistics?url={nogeo_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let stats: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert!((stats["b1"]["mean"].as_f64().unwrap() - 155.0).abs() < 1e-4);
+
+    // U3: Geographic routes return 400 Bad Request
+    for path in [
+        format!("/cog/bounds?url={nogeo_url}"),
+        format!("/cog/point/0,0?url={nogeo_url}"),
+        format!("/cog/tiles/WebMercatorQuad/0/0/0.png?url={nogeo_url}"),
+        format!("/cog/bbox/0,0,1,1/16x16.png?url={nogeo_url}"),
+        format!("/cog/WebMercatorQuad/tilejson.json?url={nogeo_url}"),
+    ] {
+        let r = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 400, "U3 expected 400 for {path}");
+    }
+
+    // U2(b): Nonlinear 9-GCP TIFF succeeds on /cog/info (with gcp_residual_px) and /cog/point
+    let r = client.get(format!("{base}/cog/info?url={nl_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let nl_info: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    let res = nl_info["gcp_residual_px"].as_f64().expect("gcp_residual_px present");
+    assert!(res < 0.05, "expected order-2 poly residual < 0.05 px, got {res}");
+
+    // Query center pixel (col=32.5, row=32.5) mapped through the exact quadratic formula:
+    let (u, v) = (32.5 / 64.0, 32.5 / 64.0);
+    let qx = -122.5 + 0.25 * u + 0.01 * u * v;
+    let qy = 37.9 - 0.25 * v - 0.01 * u * u;
+    let r = client.get(format!("{base}/cog/point/{qx},{qy}?url={nl_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let pt: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(pt["values"][0].as_f64().unwrap(), (32 * 100 + 32) as f64);
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
 }
