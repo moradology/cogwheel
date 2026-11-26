@@ -12,10 +12,11 @@ This document is the living record of every intentional divergence, **why** it e
 
 - **TiTiler / `rio-tiler`:** Uses a binary pixel mask by default (overcounting thin slivers up to 5× and small/diagonal shapes), or an approximate `cover_scale=10` 10× supersampled rasterization (100× larger temporary boolean grid in RAM, still approximate). Pixel means are unweighted in the raster's CRS plane, which over-weights northern pixels by up to **53%** on a `40°N–60°N` polygon in `EPSG:4326`.
 - **`cogzilla`:** Computes **exact analytical pixel coverage fractions** in `[0, 1]` directly on the COG's native pixel grid (zero resampling, Green's-theorem edge traversal in `O(V + perimeter_cells)` + linear scanline fill), multiplied by each pixel's **WGS84 ellipsoidal ground area** (`w = cov × area_px`):
-  - `count`: exact sum of pixel coverage fractions (pixel units).
+  - `count`: exact sum of pixel coverage fractions for polygons (pixel units, snapped to integer within `1e-6`), exact clipped length in pixels for `LineString`/`MultiLineString` (e.g. `141.42` for a 100-px diagonal), or point count (`1.0` per point) for `Point`/`MultiPoint`.
   - `sum`: coverage-weighted sum of valid pixel values.
-  - `area`: new field giving exact ellipsoidal ground area in `m²` covered by valid data.
-  - `mean`, `std`, `median`, `percentiles`, `histogram`: weighted by `w = cov × area_px` when `?area_weighted=true` (default), or `w = cov` when `?area_weighted=false`.
+  - `area`: exact ellipsoidal ground area in `m²` covered by valid data for polygons; `null` for `Point`/`MultiPoint`/`LineString`/`MultiLineString` (points and lines have no area).
+  - `length`: exact WGS84 geodesic length in metres for `LineString`/`MultiLineString` features (omitted for polygons/points).
+  - `mean`, `std`, `median`, `percentiles`, `histogram`: weighted by `w = cov × area_px` for polygons (or geodesic segment length for lines) when `?area_weighted=true` (default), or `w = cov` when `?area_weighted=false`. Zero-coverage boundary neighbors (`cov ≤ 1e-12`) are excluded from `valid_pixels`, `masked_pixels`, `min`, `max`, `unique`, `majority`, and `minority`.
   - `?cover_scale=` and `?all_touched=` are accepted and ignored (since exact coverage is already strictly more accurate and faster).
 - **Client significance:** Strictly more accurate (max error `≤ 8.55e-9` px on analytic shapes vs up to 5× error on binary masks), zero supersampling RAM blowup, and **2.3×–7.9× faster** than in-process `rio-tiler`/GDAL even over HTTP:
 
