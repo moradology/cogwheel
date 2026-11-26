@@ -192,7 +192,9 @@ pub(super) fn plain_numbers(raw_query: &str) -> String {
         let (key, value) = part.split_once('=')?;
         let value = percent_decode(value);
         let written = match key {
-            "tilesize" | "padding" | "items_limit" | "scan_limit" | "time_limit" if py_whole(&value) => {
+            "tilesize" | "padding" | "items_limit" | "scan_limit" | "time_limit" | "width" | "height" | "max_size"
+                if py_whole(&value) =>
+            {
                 let n = py_number(&value)?;
                 // More padding than the widest kernel reads changes no pixel.
                 let n = if key == "padding" { n.min(64.0) } else { n };
@@ -308,6 +310,16 @@ fn tile_bounds_error(pairs: &[(String, String)]) -> Option<Resp> {
         }
     }
     None
+}
+
+/// What a point reads of a picture's parameters, checked as a picture's are.
+fn point_query_error(pairs: &[(String, String)]) -> Option<Resp> {
+    let read: Vec<(String, String)> = pairs
+        .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "resampling" | "nodata" | "unscale"))
+        .cloned()
+        .collect();
+    render_query_error(&read)
 }
 
 /// What FastAPI refuses of a picture's parameters before anything is drawn. The routes
@@ -1163,7 +1175,8 @@ fn tileset(
 /// `GET {base}/tiles`: the tilesets on offer. TiTiler lists thirteen tile matrix sets;
 /// these routes serve Web Mercator only, so that is the one listed.
 fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, String)]) -> Resp {
-    let (_, _, bounds) = match mosaic_extent(metadata, pairs) {
+    // The list has no zooms in it, and titiler-pgstac does not read the request's.
+    let (_, _, bounds) = match mosaic_extent(metadata, &[]) {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -1283,7 +1296,8 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         "tile_format", "use_epsg", "tilesize", "zooms", "service", "request", "acceptversions",
         "sections", "updatesequence", "acceptformats",
     ];
-    if query_value(pairs, "assets").is_some_and(|a| !a.is_empty()) {
+    // `assets=` with nothing after it is a layer all the same, as in titiler-pgstac.
+    if query_value(pairs, "assets").is_some() {
         let qs: Vec<String> = pairs
             .iter()
             .filter(|(k, _)| !NOT_TILE_PARAMS.contains(&k.to_ascii_lowercase().as_str()))
@@ -4622,7 +4636,13 @@ async fn point_values(
     if pq.assets.is_empty() {
         return missing_query_param("assets");
     }
+    if let Some(resp) = point_query_error(pairs) {
+        return resp;
+    }
     if let Some(e) = pq.errors.iter().find(|e| !own_error(e)) {
+        if error_parameter(e) == Some("coord_crs") {
+            return invalid_param("query", "coord_crs", "Value error, invalid CRS format");
+        }
         return detail(StatusCode::BAD_REQUEST, e.clone());
     }
     // A point is one pixel whatever the method; one that is not a method is still refused.
@@ -6041,6 +6061,9 @@ pub(super) async fn item_route(
     }
 
     if let (["tiles", _, _, _, _] | [_, "tilejson.json" | "map.html"], Some(resp)) = (rest, tile_bounds_error(&pairs)) {
+        return Done(resp);
+    }
+    if let (["point", _], Some(resp)) = (rest, point_query_error(&pairs)) {
         return Done(resp);
     }
     if item_route_needs_assets(rest) {
