@@ -424,6 +424,261 @@ impl TileEngine {
         }
     }
 
+    /// Render a batch of XYZ tiles for a single COG (e.g. a map viewport burst or pyramid
+    /// cache-warming pass).
+    ///
+    /// When built with `--features gpu` and a hardware GPU is active, eligible single-band
+    /// separable tiles that share the same `(ifd_idx, band, tile-block neighborhood, style)` are
+    /// fused into a single 3D GPU micro-batch (`GpuTileBatcher`), amortizing the Metal/Vulkan
+    /// dispatch floor across all `K` tiles. Any remaining tiles fall back transparently to
+    /// `render_tile`.
+    pub async fn render_tiles_batch(
+        &self,
+        cog: &OpenedCog,
+        reqs: &[TileRequest],
+    ) -> Vec<Result<Bytes, EngineError>> {
+        if reqs.is_empty() {
+            return Vec::new();
+        }
+        #[allow(unused_mut)]
+        let mut results: Vec<Option<Result<Bytes, EngineError>>> =
+            (0..reqs.len()).map(|_| None).collect();
+
+        #[cfg(feature = "gpu")]
+        if reqs.len() >= 2
+            && let Some(ref gpu) = self.gpu
+            && let Ok(crs) = self.get_or_build_crs(cog)
+        {
+            #[derive(Hash, PartialEq, Eq)]
+            struct BatchKey {
+                ifd_idx: usize,
+                band0: u16,
+                tx0: u32,
+                ty0: u32,
+                grid_w: u32,
+                grid_h: u32,
+                tile_size: u32,
+                resample: u8,
+                rmin_bits: u32,
+                rmax_bits: u32,
+                colormap: String,
+                format_tag: u8,
+                format_q: u32,
+            }
+            struct BatchItem {
+                req_idx: usize,
+                u: Vec<f32>,
+                v: Vec<f32>,
+            }
+            let mut groups: std::collections::HashMap<BatchKey, (SingleBandStyle, Vec<BatchItem>)> =
+                std::collections::HashMap::new();
+
+            for (idx, req) in reqs.iter().enumerate() {
+                if req.unscale {
+                    continue;
+                }
+                let BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    colormap,
+                } = req.bands
+                else {
+                    continue;
+                };
+                if req.tile_size != 256 && req.tile_size != 512 {
+                    continue;
+                }
+                let (format_tag, format_q) = match req.format {
+                    OutputFormat::Png => (0u8, 0u32),
+                    OutputFormat::RawRgba => (1u8, 0u32),
+                    OutputFormat::Webp { quality } => {
+                        (2u8, quality.map(f32::to_bits).unwrap_or(0))
+                    }
+                    OutputFormat::Jpeg { quality } => (3u8, quality as u32),
+                    _ => continue,
+                };
+                let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, req.tile_size);
+                let ifd_idx = cog.index.select_ifd(target_rx, target_ry);
+                let ifd = &cog.index.ifds[ifd_idx];
+                let band0 = band_1based.saturating_sub(1);
+                if band0 >= ifd.samples_per_pixel {
+                    continue;
+                }
+                let pad = match req.resample {
+                    ResampleMode::Nearest => 0i64,
+                    ResampleMode::Bilinear => 1i64,
+                    ResampleMode::Cubic => 2i64,
+                    _ => 3i64,
+                };
+                let uv_bounds: Option<(Vec<f32>, Vec<f32>, f32, f32, f32, f32)> =
+                    if req.tile_size == 256 {
+                        CoordPlan::<256>::build_with_gcp(
+                            &crs,
+                            &ifd.crs_to_pixel,
+                            ifd.gcp_poly.as_deref(),
+                            ifd.width,
+                            ifd.height,
+                            req.tile,
+                        )
+                        .and_then(|p| match p {
+                            CoordPlan::Separable1D { u, v, .. } => {
+                                let (mut u0, mut u1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                let (mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                for &x in u.iter() {
+                                    u0 = u0.min(x);
+                                    u1 = u1.max(x);
+                                }
+                                for &y in v.iter() {
+                                    v0 = v0.min(y);
+                                    v1 = v1.max(y);
+                                }
+                                Some((u.to_vec(), v.to_vec(), u0, u1, v0, v1))
+                            }
+                            _ => None,
+                        })
+                    } else {
+                        CoordPlan::<512>::build_with_gcp(
+                            &crs,
+                            &ifd.crs_to_pixel,
+                            ifd.gcp_poly.as_deref(),
+                            ifd.width,
+                            ifd.height,
+                            req.tile,
+                        )
+                        .and_then(|p| match p {
+                            CoordPlan::Separable1D { u, v, .. } => {
+                                let (mut u0, mut u1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                let (mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                for &x in u.iter() {
+                                    u0 = u0.min(x);
+                                    u1 = u1.max(x);
+                                }
+                                for &y in v.iter() {
+                                    v0 = v0.min(y);
+                                    v1 = v1.max(y);
+                                }
+                                Some((u.to_vec(), v.to_vec(), u0, u1, v0, v1))
+                            }
+                            _ => None,
+                        })
+                    };
+                let Some((u_vec, v_vec, min_u, max_u, min_v, max_v)) = uv_bounds else {
+                    continue;
+                };
+                if !min_u.is_finite() || !min_v.is_finite() {
+                    continue;
+                }
+                let px0 = (min_u.floor() as i64 - pad).clamp(0, ifd.width.saturating_sub(1) as i64) as u32;
+                let py0 = (min_v.floor() as i64 - pad).clamp(0, ifd.height.saturating_sub(1) as i64) as u32;
+                let px1 = (max_u.ceil() as i64 + pad).clamp(0, ifd.width.saturating_sub(1) as i64) as u32;
+                let py1 = (max_v.ceil() as i64 + pad).clamp(0, ifd.height.saturating_sub(1) as i64) as u32;
+                let tx0 = px0 / ifd.tile_width;
+                let ty0 = py0 / ifd.tile_height;
+                let tx1 = (px1 / ifd.tile_width).min(ifd.tiles_across.saturating_sub(1));
+                let ty1 = (py1 / ifd.tile_height).min(ifd.tiles_down.saturating_sub(1));
+                let grid_w = tx1 - tx0 + 1;
+                let grid_h = ty1 - ty0 + 1;
+
+                let key = BatchKey {
+                    ifd_idx,
+                    band0,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
+                    tile_size: req.tile_size,
+                    resample: req.resample as u8,
+                    rmin_bits: rescale.0.to_bits(),
+                    rmax_bits: rescale.1.to_bits(),
+                    colormap: format!("{colormap:?}"),
+                    format_tag,
+                    format_q,
+                };
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (style, Vec::new()))
+                    .1
+                    .push(BatchItem {
+                        req_idx: idx,
+                        u: u_vec,
+                        v: v_vec,
+                    });
+            }
+
+            for (key, (style, items)) in groups {
+                if items.len() < 2 {
+                    continue;
+                }
+                let ifd = &cog.index.ifds[key.ifd_idx];
+                let mut indices = Vec::with_capacity((key.grid_w * key.grid_h) as usize);
+                for ty in key.ty0..key.ty0 + key.grid_h {
+                    for tx in key.tx0..key.tx0 + key.grid_w {
+                        indices.push(Some(ifd.tile_index(tx, ty, key.band0) as u32));
+                    }
+                }
+                let Ok(tiles) = self.store.get_blocks(cog, key.ifd_idx, &indices).await else {
+                    continue;
+                };
+                let band_in_decoded = match ifd.planar_config {
+                    PlanarConfig::Chunky => key.band0 as usize,
+                    PlanarConfig::Planar => 0,
+                };
+                let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                    .iter()
+                    .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+                    .collect();
+                let src = BandSource::new(
+                    ifd.width,
+                    ifd.height,
+                    ifd.tile_width,
+                    ifd.tile_height,
+                    key.tx0,
+                    key.ty0,
+                    key.grid_w,
+                    key.grid_h,
+                    &block_refs,
+                );
+                let uvs: Vec<(&[f32], &[f32])> = items
+                    .iter()
+                    .map(|it| (it.u.as_slice(), it.v.as_slice()))
+                    .collect();
+                if let Some(batch_out) = gpu.try_render_single_band_batch(
+                    cog.id,
+                    key.ifd_idx,
+                    key.band0,
+                    key.tile_size as usize,
+                    &uvs,
+                    &src,
+                    &style,
+                ) {
+                    self.stats
+                        .tiles_served
+                        .fetch_add(items.len() as u64, Ordering::Relaxed);
+                    self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                    for (item, bytes) in items.into_iter().zip(batch_out.into_iter()) {
+                        results[item.req_idx] = Some(Ok(bytes));
+                    }
+                }
+            }
+        }
+
+        let mut final_out = Vec::with_capacity(reqs.len());
+        for (slot, req) in results.into_iter().zip(reqs.iter()) {
+            match slot {
+                Some(res) => final_out.push(res),
+                None => final_out.push(self.render_tile(cog, req).await),
+            }
+        }
+        final_out
+    }
+
     async fn render_tile_sized<const N: usize>(
         &self,
         cog: &OpenedCog,
