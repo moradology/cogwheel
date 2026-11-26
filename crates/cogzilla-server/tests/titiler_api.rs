@@ -5323,3 +5323,161 @@ async fn audit75_power_expr_npy_and_unscale_heterogeneous_geotiff_dtypes() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn audit77_shown_npy_multiband_palette_and_invalid_formula() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_audit77_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. 2-band uint16 EPSG:4326 GeoTIFF (band1=50, band2=100)
+    let two_band_path = tmp.join("two_band.tif");
+    write_synthetic_u16_2band_4326_geotiff(
+        &two_band_path,
+        16,
+        16,
+        [-122.5, 37.7, -122.3, 37.9],
+        50,
+        100,
+        None,
+    );
+
+    // 2. 3-band RGB uint8 EPSG:4326 GeoTIFF for WebMercator tile invalid color_formula test
+    let rgb_path = tmp.join("rgb3.tif");
+    {
+        let w = 16u32;
+        let h = 16u32;
+        let bounds = [-122.5f64, 37.7, -122.3, 37.9];
+        let rgba = vec![100u8; (w * h * 4) as usize];
+        let tif = cogzilla_server::titiler::encode_geotiff_rgba(w, h, &rgba, bounds, 4326, false);
+        std::fs::write(&rgb_path, tif).unwrap();
+    }
+
+    // 3. 1-band uint8 paletted GeoTIFF with TIFF ColorMap tag (index 1 -> RGB(10, 20, 30))
+    let pal_path = tmp.join("paletted.tif");
+    {
+        let w = 8u32;
+        let h = 8u32;
+        let bounds = [-122.5f64, 37.7, -122.3, 37.9];
+        let pixels = vec![1u8; (w * h) as usize];
+        let mut cmap = vec![0u16; 256 * 3];
+        cmap[1] = 10u16 << 8;
+        cmap[256 + 1] = 20u16 << 8;
+        cmap[512 + 1] = 30u16 << 8;
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let num_entries: u16 = 14;
+        let data_start = 8 + 2 + (num_entries as usize) * 12 + 4;
+        let scale_off = data_start as u32;
+        let tiepoint_off = scale_off + 24;
+        let geokey_off = tiepoint_off + 48;
+        let cmap_off = geokey_off + 24;
+        let pixel_off = cmap_off + (cmap.len() * 2) as u32;
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w);
+        push_entry(&mut buf, 257, 4, 1, h);
+        push_entry(&mut buf, 258, 3, 1, 8);
+        push_entry(&mut buf, 259, 3, 1, 1);
+        push_entry(&mut buf, 262, 3, 1, 3); // Photometric = Palette
+        push_entry(&mut buf, 273, 4, 1, pixel_off);
+        push_entry(&mut buf, 277, 3, 1, 1);
+        push_entry(&mut buf, 278, 4, 1, h);
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32);
+        push_entry(&mut buf, 284, 3, 1, 1);
+        push_entry(&mut buf, 320, 3, (cmap.len()) as u32, cmap_off); // ColorMap
+        push_entry(&mut buf, 33550, 12, 3, scale_off);
+        push_entry(&mut buf, 33922, 12, 6, tiepoint_off);
+        push_entry(&mut buf, 34735, 3, 12, geokey_off);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let sx = (bounds[2] - bounds[0]) / w as f64;
+        let sy = (bounds[3] - bounds[1]) / h as f64;
+        for v in [sx, sy, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in cmap {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&pixels);
+        std::fs::write(&pal_path, buf).unwrap();
+    }
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // A. 2-band rescaled `.npy` preserves both bands + mask -> shape (3, 16, 16) |u1
+    let r2 = client
+        .get(format!(
+            "{base}/cog/preview.npy?url={}&bidx=1&bidx=2&rescale=0,100&rescale=0,200",
+            two_band_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let b2 = r2.bytes().await.unwrap();
+    let hdr_len = u16::from_le_bytes([b2[8], b2[9]]) as usize;
+    let hdr = std::str::from_utf8(&b2[10..10 + hdr_len]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected |u1, got {hdr}");
+    assert!(hdr.contains("(3, 16, 16)"), "expected 2 bands + mask (3, 16, 16), got {hdr}");
+    let body = &b2[10 + hdr_len..];
+    assert_eq!(body[0], 127);
+    assert_eq!(body[256], 127);
+    assert_eq!(body[512], 255);
+
+    // B. Paletted COG with color_formula on `.npy` resolves embedded TIFF ColorMap -> 3-band RGB + mask
+    let r_pal = client
+        .get(format!(
+            "{base}/cog/preview.npy?url={}&color_formula=gamma%20rgb%201.0",
+            pal_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pal.status(), 200);
+    let b_pal = r_pal.bytes().await.unwrap();
+    let hdr_len = u16::from_le_bytes([b_pal[8], b_pal[9]]) as usize;
+    let hdr = std::str::from_utf8(&b_pal[10..10 + hdr_len]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected |u1, got {hdr}");
+    assert!(hdr.contains("(4, 8, 8)"), "expected RGB + mask (4, 8, 8) from embedded palette, got {hdr}");
+    let body = &b_pal[10 + hdr_len..];
+    assert_eq!((body[0], body[64], body[128], body[192]), (10, 20, 30, 255));
+
+    // C. Invalid color_formula on 3-band RGB WebMercator `.npy` tile returns 400 (not 200 raw <f4)
+    let r_bad = client
+        .get(format!(
+            "{base}/cog/tiles/WebMercatorQuad/12/655/1583.npy?url={}&color_formula=bogus_op",
+            rgb_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bad.status(), 400, "invalid color_formula on RGB .npy tile must return 400");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
