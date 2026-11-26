@@ -804,9 +804,12 @@ impl TileEngine {
                 };
                 #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu.try_render_single_band::<N>(
-                        cog.id, ifd_idx, band0, tx0, ty0, &plan, &src, &style,
-                    ) {
+                    if let Some(bytes) = gpu
+                        .try_render_single_band::<N>(
+                            cog.id, ifd_idx, band0, tx0, ty0, &plan, &src, &style,
+                        )
+                        .await
+                    {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
@@ -865,18 +868,21 @@ impl TileEngine {
                 }
                 #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu.try_render_terrain::<N>(
-                        cog.id,
-                        ifd_idx,
-                        band0,
-                        tx0,
-                        ty0,
-                        &plan,
-                        &src,
-                        *encoding,
-                        req.resample,
-                        req.format,
-                    ) {
+                    if let Some(bytes) = gpu
+                        .try_render_terrain::<N>(
+                            cog.id,
+                            ifd_idx,
+                            band0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *encoding,
+                            req.resample,
+                            req.format,
+                        )
+                        .await
+                    {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
@@ -955,18 +961,21 @@ impl TileEngine {
                 };
                 #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu.try_render_dem::<N>(
-                        cog.id,
-                        ifd_idx,
-                        band0,
-                        tx0,
-                        ty0,
-                        &plan,
-                        &src,
-                        *algorithm,
-                        pixel_size_m,
-                        &style,
-                    ) {
+                    if let Some(bytes) = gpu
+                        .try_render_dem::<N>(
+                            cog.id,
+                            ifd_idx,
+                            band0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *algorithm,
+                            pixel_size_m,
+                            &style,
+                        )
+                        .await
+                    {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }

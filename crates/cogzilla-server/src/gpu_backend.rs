@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use cogzilla_gpu::{
-    DispatchPolicy, DispatchRequest, GpuColorFormula, GpuColormapMode, GpuColormapRenderer,
-    GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuMosaicCompositor,
-    GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab,
-    GpuSlabCache, GpuTerrainRenderer, GpuTileBatcher, MultiBandSlabKey, PolicyOverride, SlabKey,
-    TileCoordSlice, opcodes,
+    CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer, GpuColorFormula,
+    GpuColormapMode, GpuColormapRenderer, GpuContext, GpuCoordPlan, GpuDemAlgorithm,
+    GpuExprRenderer, GpuInstr, GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput,
+    GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer, GpuTileBatcher,
+    MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -44,8 +44,11 @@ pub struct GpuBackend {
     pub policy: DispatchPolicy,
     pub slab_cache: GpuSlabCache,
     pub multi_slab_cache: GpuMultiBandCache,
+    pub coalescer: GpuCoalescer,
     resampler: GpuResampler,
+    #[allow(dead_code)]
     colormap: Mutex<GpuColormapRenderer>,
+    #[allow(dead_code)]
     terrain: Mutex<GpuTerrainRenderer>,
     expr: Mutex<GpuExprRenderer>,
     mosaic: Mutex<GpuMosaicCompositor>,
@@ -118,6 +121,48 @@ pub fn stitch_band_source(src: &BandSource<'_>) -> Option<(Vec<f32>, u32, u32, u
     Some((out, base_col, base_row, w, h))
 }
 
+fn to_owned_plan(coords: BboxCoordSource<'_>, bc: f32, br: f32) -> OwnedCoordPlan {
+    match coords {
+        BboxCoordSource::Separable { u, v } => OwnedCoordPlan::Separable1D {
+            u: u.iter().map(|&x| x - bc).collect(),
+            v: v.iter().map(|&y| y - br).collect(),
+        },
+        BboxCoordSource::Grid2D {
+            dst_w,
+            dst_h,
+            grid_u,
+            grid_v,
+        } => {
+            let mut gu = [0.0f32; 289];
+            let mut gv = [0.0f32; 289];
+            for i in 0..289 {
+                gu[i] = grid_u[i] - bc;
+                gv[i] = grid_v[i] - br;
+            }
+            OwnedCoordPlan::Grid2D {
+                dst_w,
+                dst_h,
+                grid_u: gu,
+                grid_v: gv,
+            }
+        }
+        BboxCoordSource::Exact2D {
+            dst_w,
+            dst_h,
+            u_map,
+            v_map,
+        } => {
+            let n = dst_w * dst_h;
+            OwnedCoordPlan::Exact2D {
+                dst_w,
+                dst_h,
+                u: u_map[..n].iter().map(|&x| x - bc).collect(),
+                v: v_map[..n].iter().map(|&y| y - br).collect(),
+            }
+        }
+    }
+}
+
 fn source_slab_key(cog_id: u64, ifd_idx: usize, band0: u16, src: &BandSource<'_>) -> SlabKey {
     SlabKey {
         dataset_id: cog_id,
@@ -155,6 +200,8 @@ impl GpuBackend {
             "cogzilla GPU backend initialized"
         );
         let resampler = GpuResampler::new(&ctx);
+        let coalesce_us = if ctx.info.unified_memory { 400 } else { 250 };
+        let coalescer = GpuCoalescer::new(&ctx, 32, coalesce_us);
         let colormap = Mutex::new(GpuColormapRenderer::new(&ctx));
         let terrain = Mutex::new(GpuTerrainRenderer::new(&ctx));
         let expr = Mutex::new(GpuExprRenderer::new(&ctx));
@@ -165,6 +212,7 @@ impl GpuBackend {
             policy,
             slab_cache: GpuSlabCache::new(slab_cache_bytes),
             multi_slab_cache: GpuMultiBandCache::new(slab_cache_bytes),
+            coalescer,
             resampler,
             colormap,
             terrain,
@@ -222,6 +270,16 @@ impl GpuBackend {
         w.saturating_mul(h).saturating_mul(std::mem::size_of::<f32>())
     }
 
+    async fn submit_coalesced_async(&self, job: CoalescedJob) -> Option<Vec<u8>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.coalescer
+            .submit_with_callback(job, move |res| {
+                let _ = tx.send(res);
+            })
+            .ok()?;
+        rx.await.ok()?.ok()
+    }
+
     /// Attempt GPU-accelerated single-band rendering for arbitrary `(u_coords, v_coords)` crops
     /// (`/cog/preview`, `/cog/bbox`, `/cog/feature`, or multi-block tiles).
     #[allow(clippy::too_many_arguments)]
@@ -249,10 +307,8 @@ impl GpuBackend {
         )
     }
 
-    /// Attempt GPU-accelerated single-band rendering for `/cog/preview`, `/cog/bbox`,
-    /// `/cog/crop`, and `/cog/feature` (both separable 1D and exact 2D curved/masked maps).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_single_band(
+    fn prepare_bbox_single_band(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -261,7 +317,8 @@ impl GpuBackend {
         src: &BandSource<'_>,
         style: &SingleBandStyle,
         return_mask: bool,
-    ) -> Option<Bytes> {
+        active: usize,
+    ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
@@ -302,105 +359,44 @@ impl GpuBackend {
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let bc = base_col as f32;
-        let br = base_row as f32;
         let lut = style.colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        Some((
+            CoalescedJob::Colormap {
+                slab,
+                plan,
+                mode: gpu_mode,
+                rescale_min: style.rescale_min,
+                rescale_max: style.rescale_max,
+                lut_u32,
+                output: out_kind.into(),
+            },
+            out_kind,
+            dst_w,
+            dst_h,
+        ))
+    }
 
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                self.colormap
-                    .lock()
-                    .ok()?
-                    .render_slab(
-                        &slab,
-                        &u_local,
-                        &v_local,
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                self.colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                self.colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-        };
-
-        Some(match out_kind {
+    fn finish_styled_output(
+        raw: Vec<u8>,
+        out_kind: GpuPixelOutput,
+        dst_w: usize,
+        dst_h: usize,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Bytes {
+        match out_kind {
             GpuPixelOutput::IndexedU8 => {
-                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, lut)
+                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, style.colormap.lut())
             }
             GpuPixelOutput::Rgba8 => {
                 if style.format == OutputFormat::RawRgba {
@@ -409,7 +405,31 @@ impl GpuBackend {
                     crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
                 }
             }
-        })
+        }
+    }
+
+    /// Attempt GPU-accelerated single-band rendering for `/cog/preview`, `/cog/bbox`,
+    /// `/cog/crop`, and `/cog/feature` (sync, for `spawn_blocking` callers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_single_band(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
+            cog_id, ifd_idx, band0, coords, src, style, return_mask, active,
+        )?;
+        let raw = self.coalescer.submit(job).ok()?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, return_mask,
+        ))
     }
 
     /// Attempt GPU-accelerated DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`) rendering for
@@ -445,10 +465,8 @@ impl GpuBackend {
         )
     }
 
-    /// Attempt GPU-accelerated DEM Horn 3×3 rendering for `/cog/preview`, `/cog/bbox`,
-    /// `/cog/crop`, and `/cog/feature` (both separable 1D and exact 2D curved/masked maps).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_dem(
+    fn prepare_bbox_dem(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -460,7 +478,8 @@ impl GpuBackend {
         pixel_size_y_m: f32,
         style: &SingleBandStyle,
         return_mask: bool,
-    ) -> Option<Bytes> {
+        active: usize,
+    ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
@@ -519,128 +538,75 @@ impl GpuBackend {
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let bc = base_col as f32;
-        let br = base_row as f32;
         let lut = style.colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab(
-                        &slab,
-                        &u_local,
-                        &v_local,
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_x_m,
-                        pixel_size_y_m,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_x_m,
-                        pixel_size_y_m,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_x_m,
-                        pixel_size_y_m,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-        };
-
-        Some(match out_kind {
-            GpuPixelOutput::IndexedU8 => {
-                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, lut)
-            }
-            GpuPixelOutput::Rgba8 => {
-                if style.format == OutputFormat::RawRgba {
-                    Bytes::from(raw)
-                } else {
-                    crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
-                }
-            }
-        })
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        Some((
+            CoalescedJob::Terrain {
+                slab,
+                plan,
+                mode: gpu_mode,
+                alg: gpu_alg,
+                pixel_size_x_m,
+                pixel_size_y_m,
+                rescale_min: style.rescale_min,
+                rescale_max: style.rescale_max,
+                lut_u32,
+                output: out_kind.into(),
+            },
+            out_kind,
+            dst_w,
+            dst_h,
+        ))
     }
 
-    /// Attempt GPU-accelerated Terrarium / TerrainRGB rendering for `/cog/preview` & `/cog/bbox`.
+    /// Attempt GPU-accelerated DEM Horn 3×3 rendering for `/cog/preview`, `/cog/bbox`,
+    /// `/cog/crop`, and `/cog/feature` (sync, for `spawn_blocking` callers).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_terrain(
+    pub fn try_render_bbox_dem(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        alg: DemAlgorithm,
+        pixel_size_x_m: f32,
+        pixel_size_y_m: f32,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
+            cog_id,
+            ifd_idx,
+            band0,
+            coords,
+            src,
+            alg,
+            pixel_size_x_m,
+            pixel_size_y_m,
+            style,
+            return_mask,
+            active,
+        )?;
+        let raw = self.coalescer.submit(job).ok()?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, return_mask,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_bbox_terrain(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -650,8 +616,8 @@ impl GpuBackend {
         encoding: TerrainEncoding,
         resample: ResampleMode,
         format: OutputFormat,
-        return_mask: bool,
-    ) -> Option<Bytes> {
+        active: usize,
+    ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample(resample)?;
         let gpu_alg = match encoding {
             TerrainEncoding::Terrarium => GpuDemAlgorithm::Terrarium,
@@ -688,114 +654,63 @@ impl GpuBackend {
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
         let warm_slab = self.slab_cache.get(&key);
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::ResampleLanczos3,
+            _ => GpuOp::DemTerrainRgbCubic,
+        };
         let decision = self.policy.decide(&DispatchRequest {
-            op: GpuOp::DemTerrainRgbCubic,
+            op,
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let dummy_lut = [0u32; 256];
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab(
-                        &slab,
-                        &u_local,
-                        &v_local,
-                        gpu_mode,
-                        gpu_alg,
-                        30.0,
-                        30.0,
-                        0.0,
-                        255.0,
-                        &dummy_lut,
-                        GpuPixelOutput::Rgba8,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        30.0,
-                        30.0,
-                        0.0,
-                        255.0,
-                        &dummy_lut,
-                        GpuPixelOutput::Rgba8,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        30.0,
-                        30.0,
-                        0.0,
-                        255.0,
-                        &dummy_lut,
-                        GpuPixelOutput::Rgba8,
-                    )
-                    .ok()?
-            }
-        };
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        Some((
+            CoalescedJob::Terrain {
+                slab,
+                plan,
+                mode: gpu_mode,
+                alg: gpu_alg,
+                pixel_size_x_m: 30.0,
+                pixel_size_y_m: 30.0,
+                rescale_min: 0.0,
+                rescale_max: 255.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::Rgba8,
+            },
+            dst_w,
+            dst_h,
+        ))
+    }
 
+    /// Attempt GPU-accelerated Terrarium / TerrainRGB rendering for `/cog/preview` & `/cog/bbox`
+    /// (sync, for `spawn_blocking` callers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_terrain(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        encoding: TerrainEncoding,
+        resample: ResampleMode,
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
+            cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
+        )?;
+        let raw = self.coalescer.submit(job).ok()?;
         Some(if format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
@@ -803,10 +718,9 @@ impl GpuBackend {
         })
     }
 
-    /// Attempt GPU-accelerated single-band tile rendering (single- or multi-block, any dtype,
-    /// and all `CoordPlan` variants: `Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
+    /// Attempt GPU-accelerated single-band tile rendering (non-blocking async coalesced).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_single_band<const N: usize>(
+    pub async fn try_render_single_band<const N: usize>(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -817,163 +731,38 @@ impl GpuBackend {
         src: &BandSource<'_>,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
-        match plan {
-            CoordPlan::Separable1D { u, v, .. } => self.try_render_crop_single_band(
-                cog_id,
-                ifd_idx,
-                band0,
-                u.as_slice(),
-                v.as_slice(),
-                src,
-                style,
-            ),
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => {
-                let gpu_mode = map_resample(style.resample)?;
-                let out_kind = match style.format {
-                    OutputFormat::Png => GpuPixelOutput::IndexedU8,
-                    OutputFormat::Webp { .. }
-                    | OutputFormat::Jpeg { .. }
-                    | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-                    _ => return None,
-                };
-                let key = source_slab_key(cog_id, ifd_idx, band0, src);
-                let warm_slab = self.slab_cache.get(&key);
-                let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
-                let readback_bytes = match out_kind {
-                    GpuPixelOutput::IndexedU8 => N * N,
-                    GpuPixelOutput::Rgba8 => N * N * 4,
-                };
-                let decision = self.policy.decide(&DispatchRequest {
-                    op: gpu_mode.to_policy_op(),
-                    dst_pixels: N * N,
-                    upload_bytes,
-                    readback_bytes,
-                    batch_size: 1,
-                    in_flight: self.in_flight.load(Ordering::Relaxed),
-                });
-                if !decision.use_gpu {
-                    return None;
-                }
-                self.in_flight.fetch_add(1, Ordering::Relaxed);
-                let _guard = InFlightGuard(&self.in_flight);
-                let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-                let bc = base_col as f32;
-                let br = base_row as f32;
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                let lut = style.colormap.lut();
-                let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-                let raw = self
-                    .colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w: N,
-                            dst_h: N,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?;
-                Some(match out_kind {
-                    GpuPixelOutput::IndexedU8 => {
-                        encode_indexed_u8_png(&raw, N as u32, N as u32, lut)
-                    }
-                    GpuPixelOutput::Rgba8 => {
-                        if style.format == OutputFormat::RawRgba {
-                            Bytes::from(raw)
-                        } else {
-                            encode_rgba_tile(&raw, N as u32, false, style.format)
-                        }
-                    }
-                })
-            }
-            CoordPlan::Exact2D { u, v, .. } => {
-                let gpu_mode = map_resample(style.resample)?;
-                let out_kind = match style.format {
-                    OutputFormat::Png => GpuPixelOutput::IndexedU8,
-                    OutputFormat::Webp { .. }
-                    | OutputFormat::Jpeg { .. }
-                    | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-                    _ => return None,
-                };
-                let key = source_slab_key(cog_id, ifd_idx, band0, src);
-                let warm_slab = self.slab_cache.get(&key);
-                let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + N * N * 8;
-                let readback_bytes = match out_kind {
-                    GpuPixelOutput::IndexedU8 => N * N,
-                    GpuPixelOutput::Rgba8 => N * N * 4,
-                };
-                let decision = self.policy.decide(&DispatchRequest {
-                    op: gpu_mode.to_policy_op(),
-                    dst_pixels: N * N,
-                    upload_bytes,
-                    readback_bytes,
-                    batch_size: 1,
-                    in_flight: self.in_flight.load(Ordering::Relaxed),
-                });
-                if !decision.use_gpu {
-                    return None;
-                }
-                self.in_flight.fetch_add(1, Ordering::Relaxed);
-                let _guard = InFlightGuard(&self.in_flight);
-                let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-                let bc = base_col as f32;
-                let br = base_row as f32;
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                let lut = style.colormap.lut();
-                let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-                let raw = self
-                    .colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w: N,
-                            dst_h: N,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?;
-                Some(match out_kind {
-                    GpuPixelOutput::IndexedU8 => {
-                        encode_indexed_u8_png(&raw, N as u32, N as u32, lut)
-                    }
-                    GpuPixelOutput::Rgba8 => {
-                        if style.format == OutputFormat::RawRgba {
-                            Bytes::from(raw)
-                        } else {
-                            encode_rgba_tile(&raw, N as u32, false, style.format)
-                        }
-                    }
-                })
-            }
-        }
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        };
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
+            cog_id, ifd_idx, band0, coords, src, style, true, active,
+        )?;
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, true,
+        ))
     }
 
-    /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (single- or multi-block, any dtype,
-    /// and all `CoordPlan` variants: `Separable1D`, `Grid2D`, `Exact2D`).
+    /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (non-blocking async coalesced).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_dem<const N: usize>(
+    pub async fn try_render_dem<const N: usize>(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -986,119 +775,48 @@ impl GpuBackend {
         pixel_size_m: f32,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
-        match plan {
-            CoordPlan::Separable1D { u, v, .. } => self.try_render_crop_dem(
-                cog_id,
-                ifd_idx,
-                band0,
-                u.as_slice(),
-                v.as_slice(),
-                src,
-                alg,
-                pixel_size_m,
-                pixel_size_m,
-                style,
-            ),
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => {
-                let gpu_mode = map_resample(style.resample)?;
-                let gpu_alg = match alg {
-                    DemAlgorithm::Hillshade {
-                        azimuth_deg,
-                        altitude_deg,
-                        z_factor,
-                    } => GpuDemAlgorithm::Hillshade {
-                        azimuth_deg,
-                        altitude_deg,
-                        z_factor,
-                    },
-                    DemAlgorithm::Slope { z_factor } => GpuDemAlgorithm::Slope { z_factor },
-                    DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
-                    DemAlgorithm::Contours { .. } => return None,
-                };
-                let out_kind = match style.format {
-                    OutputFormat::Png => GpuPixelOutput::IndexedU8,
-                    OutputFormat::Webp { .. }
-                    | OutputFormat::Jpeg { .. }
-                    | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-                    _ => return None,
-                };
-                let key = source_slab_key(cog_id, ifd_idx, band0, src);
-                let warm_slab = self.slab_cache.get(&key);
-                let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
-                let readback_bytes = match out_kind {
-                    GpuPixelOutput::IndexedU8 => N * N,
-                    GpuPixelOutput::Rgba8 => N * N * 4,
-                };
-                let op = match gpu_mode {
-                    GpuColormapMode::Lanczos3 => GpuOp::DemHornLanczos3,
-                    _ => GpuOp::DemHornCubic,
-                };
-                let decision = self.policy.decide(&DispatchRequest {
-                    op,
-                    dst_pixels: N * N,
-                    upload_bytes,
-                    readback_bytes,
-                    batch_size: 1,
-                    in_flight: self.in_flight.load(Ordering::Relaxed),
-                });
-                if !decision.use_gpu {
-                    return None;
-                }
-                self.in_flight.fetch_add(1, Ordering::Relaxed);
-                let _guard = InFlightGuard(&self.in_flight);
-                let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-                let bc = base_col as f32;
-                let br = base_row as f32;
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                let lut = style.colormap.lut();
-                let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-                let raw = self
-                    .terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w: N,
-                            dst_h: N,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_m,
-                        pixel_size_m,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?;
-                Some(match out_kind {
-                    GpuPixelOutput::IndexedU8 => {
-                        encode_indexed_u8_png(&raw, N as u32, N as u32, lut)
-                    }
-                    GpuPixelOutput::Rgba8 => {
-                        if style.format == OutputFormat::RawRgba {
-                            Bytes::from(raw)
-                        } else {
-                            encode_rgba_tile(&raw, N as u32, false, style.format)
-                        }
-                    }
-                })
-            }
-            CoordPlan::Exact2D { .. } => None,
-        }
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        };
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
+            cog_id,
+            ifd_idx,
+            band0,
+            coords,
+            src,
+            alg,
+            pixel_size_m,
+            pixel_size_m,
+            style,
+            true,
+            active,
+        )?;
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, true,
+        ))
     }
 
-    /// Attempt GPU-accelerated `Terrarium` / `TerrainRgb` tile rendering (single- or multi-block).
+    /// Attempt GPU-accelerated `Terrarium` / `TerrainRgb` tile rendering (non-blocking async coalesced).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_terrain<const N: usize>(
+    pub async fn try_render_terrain<const N: usize>(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -1111,68 +829,34 @@ impl GpuBackend {
         resample: ResampleMode,
         format: OutputFormat,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(resample)?;
-        let gpu_alg = match encoding {
-            TerrainEncoding::Terrarium => GpuDemAlgorithm::Terrarium,
-            TerrainEncoding::TerrainRgb => GpuDemAlgorithm::TerrainRgb,
-            TerrainEncoding::Contours { .. } => return None,
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
         };
-        if !matches!(
-            format,
-            OutputFormat::Png | OutputFormat::Webp { .. } | OutputFormat::RawRgba
-        ) {
-            return None;
-        }
-        let CoordPlan::Separable1D { u, v, .. } = plan else {
-            return None;
-        };
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
-        let decision = self.policy.decide(&DispatchRequest {
-            op: GpuOp::DemTerrainRgbCubic,
-            dst_pixels: N * N,
-            upload_bytes,
-            readback_bytes: N * N * 4,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
-
-        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-        let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-        let dummy_lut = [0u32; 256];
-        let raw = self
-            .terrain
-            .lock()
-            .ok()?
-            .render_slab(
-                &slab,
-                &u_local,
-                &v_local,
-                gpu_mode,
-                gpu_alg,
-                30.0,
-                30.0,
-                0.0,
-                255.0,
-                &dummy_lut,
-                GpuPixelOutput::Rgba8,
-            )
-            .ok()?;
-
+        let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
+            cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
+        )?;
+        let raw = self.submit_coalesced_async(job).await?;
         Some(if format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
-            encode_rgba_tile(&raw, N as u32, false, format)
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, format, true)
         })
     }
 
@@ -2014,93 +1698,34 @@ impl GpuBackend {
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
         let warm_slab = self.slab_cache.get(&key);
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
         let decision = self.policy.decide(&DispatchRequest {
             op: gpu_mode.to_policy_op(),
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                self.colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_f32_with_plan(
-                        &slab,
-                        GpuCoordPlan::Separable1D {
-                            u_coords: &u_local,
-                            v_coords: &v_local,
-                        },
-                        gpu_mode,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                self.colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_f32_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                self.colormap
-                    .lock()
-                    .ok()?
-                    .render_slab_f32_with_plan(
-                        &slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                    )
-                    .ok()?
-            }
-        };
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::Colormap {
+                slab,
+                plan,
+                mode: gpu_mode,
+                rescale_min: 0.0,
+                rescale_max: 1.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            })
+            .ok()?;
         Some(Bytes::from(raw))
     }
 
@@ -2159,102 +1784,37 @@ impl GpuBackend {
             GpuColormapMode::Lanczos3 => GpuOp::DemHornLanczos3,
             _ => GpuOp::DemHornCubic,
         };
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
         let decision = self.policy.decide(&DispatchRequest {
             op,
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_f32_with_plan(
-                        &slab,
-                        GpuCoordPlan::Separable1D {
-                            u_coords: &u_local,
-                            v_coords: &v_local,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_x_m,
-                        pixel_size_y_m,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_f32_with_plan(
-                        &slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_x_m,
-                        pixel_size_y_m,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                self.terrain
-                    .lock()
-                    .ok()?
-                    .render_slab_f32_with_plan(
-                        &slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        gpu_alg,
-                        pixel_size_x_m,
-                        pixel_size_y_m,
-                    )
-                    .ok()?
-            }
-        };
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::Terrain {
+                slab,
+                plan,
+                mode: gpu_mode,
+                alg: gpu_alg,
+                pixel_size_x_m,
+                pixel_size_y_m,
+                rescale_min: 0.0,
+                rescale_max: 255.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            })
+            .ok()?;
         Some(Bytes::from(raw))
     }
 
@@ -2824,7 +2384,9 @@ mod tests {
         }
 
         // Verify GPU RawRgba crop output against CPU sample_cubic on a 1024x1024 crop
-        if let Some(rgba) = gpu.try_render_crop_single_band(99, 0, 0, &u_coords, &v_coords, &src, &style) {
+        if let Some(rgba) =
+            gpu.try_render_crop_single_band(99, 0, 0, &u_coords, &v_coords, &src, &style)
+        {
             assert_eq!(rgba.len(), n * n * 4);
             let lut = ColormapName::Viridis.lut();
             let inv255 = 255.0 / 2000.0;
