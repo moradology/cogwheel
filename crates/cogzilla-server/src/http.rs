@@ -5115,9 +5115,9 @@ where
                                                 .is_some_and(|obj| {
                                                     obj.values().any(|b| {
                                                         b.get("valid_pixels")
-                                                            .and_then(|v| v.as_u64())
-                                                            .unwrap_or(0)
-                                                            > 0
+                                                            .and_then(|v| v.as_f64())
+                                                            .unwrap_or(0.0)
+                                                            > 0.0
                                                     })
                                                 });
                                             if has_valid {
@@ -6884,6 +6884,22 @@ where
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
                             let compiled = expr_progs_c.unwrap();
+                            // Fast exact analytical coverage + ellipsoidal area-weighted native-grid path
+                            // (shared with POST /cog/statistics) whenever assets share the same pixel grid.
+                            if let Some(exact) = crate::zonal::compute_native_exact_multi_cog_expr_stats(
+                                &eng,
+                                &cogs_c,
+                                &mask,
+                                max_size,
+                                unscale,
+                                nodata,
+                                &compiled,
+                                &stats_opts,
+                            )
+                            .await?
+                            {
+                                return Ok::<_, EngineError>(exact);
+                            }
                             let mut map = serde_json::Map::new();
                             for (idx, (desc, prog)) in compiled.into_iter().enumerate() {
                                 let mut bands = BandRequest::CustomExpr {
@@ -9423,7 +9439,13 @@ where
                 let mask_opt = pq.shape_mask.then_some(&mask);
                 let feat_max = effective_bbox_max_size(&pq);
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = eff_dst {
-                    let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                        mask.raw_bbox
+                    } else if let Some(b) = mask.bbox_in_crs(dst_crs) {
+                        b
+                    } else {
+                        reproject_wgs84_bounds(bbox, dst_crs)?
+                    };
                     let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, feat_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_crs_bbox(
@@ -9471,7 +9493,13 @@ where
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
                 let mask_opt = pq.shape_mask.then_some(&mask);
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = eff_dst {
-                    let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
+                    let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
+                        mask.raw_bbox
+                    } else if let Some(b) = mask.bbox_in_crs(dst_crs) {
+                        b
+                    } else {
+                        reproject_wgs84_bounds(bbox, dst_crs)?
+                    };
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, mask_opt, &bands, resample, fmt,
                         pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
