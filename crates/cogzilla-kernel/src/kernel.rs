@@ -1289,7 +1289,7 @@ fn sample_footprint_exact(
 
 /// Estimate source-pixel footprint `(scale_x, scale_y)` per output pixel from a `CoordPlan`.
 #[inline]
-fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
+pub fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
     match plan {
         CoordPlan::Separable1D { u, v, .. } => {
             let denom = (N.saturating_sub(1)).max(1) as f32;

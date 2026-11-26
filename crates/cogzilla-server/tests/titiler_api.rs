@@ -3801,3 +3801,154 @@ async fn sweep23_cc1_null_geometry_and_indexed_fc_errors() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn audit53_color_formula_with_custom_colormap_and_where_nan_zonal() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_audit53_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // Two 64x64 f32 GeoTIFFs in EPSG:32610 (10 m pixels, origin (500000, 4200640)):
+    // a.tif = 10 + col, b.tif = NaN everywhere.
+    let w = 64usize;
+    let h = 64usize;
+    let mut b1 = vec![0.0f32; w * h];
+    for (i, px) in b1.iter_mut().enumerate() {
+        *px = 10.0 + (i % 64) as f32;
+    }
+    let b2 = vec![f32::NAN; w * h];
+    let a_path = tmp.join("a.tif");
+    let b_path = tmp.join("b.tif");
+    write_synthetic_f32_projected_geotiff(
+        &a_path,
+        w as u32,
+        h as u32,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &b1,
+    );
+    write_synthetic_f32_projected_geotiff(
+        &b_path,
+        w as u32,
+        h as u32,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &b2,
+    );
+    let stac_path = tmp.join("item.json");
+    let stac_json = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "audit53",
+        "geometry": null,
+        "bbox": [-123.0, 37.9, -122.9, 38.0],
+        "properties": {},
+        "assets": {
+            "a": { "href": a_path.to_string_lossy() },
+            "b": { "href": b_path.to_string_lossy() }
+        }
+    });
+    std::fs::write(&stac_path, stac_json.to_string()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let a_url = a_path.to_string_lossy().to_string();
+    let b_url = b_path.to_string_lossy().to_string();
+    let stac_url = stac_path.to_string_lossy().to_string();
+
+    let poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_100.0, 4_200_100.0],
+                [500_200.0, 4_200_100.0],
+                [500_200.0, 4_200_200.0],
+                [500_100.0, 4_200_200.0],
+                [500_100.0, 4_200_100.0]
+            ]]
+        }
+    });
+
+    // 1a. Single-COG POST /cog/statistics with where(1, 42, b1) when untaken b1 is NaN must
+    // evaluate the taken branch (42) instead of aborting on NaN.
+    let r_cog = client
+        .post(format!(
+            "{base}/cog/statistics?url={b_url}&coord_crs=EPSG:32610&max_size=0&expression=where(1,42,b1)"
+        ))
+        .header("content-type", "application/json")
+        .body(poly.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_cog.status(), 200);
+    let cog_stats: serde_json::Value = serde_json::from_str(&r_cog.text().await.unwrap()).unwrap();
+    let cog_b1 = &cog_stats["properties"]["statistics"]["b1"];
+    assert_eq!(
+        cog_b1["valid_pixels"].as_f64().unwrap(),
+        100.0,
+        "where(1,42,b1) on NaN band must keep all 100 valid pixels: {cog_b1}"
+    );
+    assert!((cog_b1["mean"].as_f64().unwrap() - 42.0).abs() < 1e-4);
+
+    // 1b. Multi-COG POST /stac/statistics with where(a>0, a, b) when untaken b is NaN must keep
+    // all 100 valid pixels from a.
+    let r_stac = client
+        .post(format!(
+            "{base}/stac/statistics?url={stac_url}&assets=a&assets=b&coord_crs=EPSG:32610&max_size=0&expression=where(a%3E0,a,b)"
+        ))
+        .header("content-type", "application/json")
+        .body(poly.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stac.status(), 200);
+    let stac_stats: serde_json::Value = serde_json::from_str(&r_stac.text().await.unwrap()).unwrap();
+    let stac_b1 = &stac_stats["properties"]["statistics"]["b1"];
+    assert_eq!(
+        stac_b1["valid_pixels"].as_f64().unwrap(),
+        100.0,
+        "STAC where(a>0,a,b) must keep all 100 valid pixels even when untaken b is NaN: {stac_b1}"
+    );
+    // cols 10..20 have values 20..29 -> mean = 24.5
+    assert!((stac_b1["mean"].as_f64().unwrap() - 24.5).abs() < 1e-4);
+
+    // 2. ?color_formula= with custom JSON ?colormap= must actually transform the output pixels.
+    let cmap = "%5B%5B%5B0%2C100%5D%2C%5B120%2C120%2C120%2C255%5D%5D%5D";
+    let r_plain = client
+        .get(format!(
+            "{base}/cog/bbox/500000,4200000,500640,4200640/32x32.png?url={a_url}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610&colormap={cmap}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_plain.status(), 200);
+    let png_plain = r_plain.bytes().await.unwrap();
+
+    let r_cf = client
+        .get(format!(
+            "{base}/cog/bbox/500000,4200000,500640,4200640/32x32.png?url={a_url}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610&colormap={cmap}&color_formula=Gamma+RGB+2.0"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_cf.status(), 200);
+    let png_cf = r_cf.bytes().await.unwrap();
+    assert_ne!(
+        png_plain, png_cf,
+        "color_formula must not be silently dropped when custom JSON colormap is active"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

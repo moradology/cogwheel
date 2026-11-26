@@ -1822,10 +1822,15 @@ pub async fn compute_native_exact_polygon_stats(
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
     const MAX_EXACT_BLOCKS: usize = 1024;
-    if blocks_x * blocks_y > MAX_EXACT_BLOCKS {
+    let total_blocks = match ifd.planar_config {
+        PlanarConfig::Chunky => blocks_x.saturating_mul(blocks_y),
+        PlanarConfig::Planar => sel_bands
+            .len()
+            .saturating_mul(blocks_x.saturating_mul(blocks_y)),
+    };
+    if total_blocks > MAX_EXACT_BLOCKS {
         return Err(EngineError::BadRequest(format!(
-            "polygon window requires {} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
-            blocks_x * blocks_y
+            "polygon window requires {total_blocks} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
         )));
     }
 
@@ -1840,10 +1845,28 @@ pub async fn compute_native_exact_polygon_stats(
         }
     }
 
+    let stream_chunky =
+        matches!(ifd.planar_config, PlanarConfig::Chunky) && opts.expressions.is_none();
+    const MAX_EXACT_TOTAL_SAMPLES: usize = 67_108_864; // 256 MiB across retained bands
+    if !stream_chunky {
+        let total_samples = n_px.saturating_mul(sel_bands.len());
+        if total_samples > MAX_EXACT_TOTAL_SAMPLES {
+            return Err(EngineError::BadRequest(format!(
+                "polygon window requires {total_samples} band-samples across {} bands (max {MAX_EXACT_TOTAL_SAMPLES}); pass bidx or max_size to narrow",
+                sel_bands.len()
+            )));
+        }
+    }
+
     // Fetch intersecting data blocks in parallel (get_blocks already applies internal mask IFDs).
     let eff_nodata = nodata_override.or(cog.index.nodata);
 
-    let mut band_bufs: Vec<(u16, Vec<f32>)> = Vec::with_capacity(sel_bands.len());
+    let mut band_bufs: Vec<(u16, Vec<f32>)> = if stream_chunky {
+        Vec::new()
+    } else {
+        Vec::with_capacity(sel_bands.len())
+    };
+    let mut streamed_chunky_tiles = None;
     match ifd.planar_config {
         PlanarConfig::Chunky => {
             let mut indices = Vec::with_capacity(blocks_x * blocks_y);
@@ -1853,53 +1876,57 @@ pub async fn compute_native_exact_polygon_stats(
                 }
             }
             let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
-            for &b1 in &sel_bands {
-                let b0 = (b1 - 1) as usize;
-                let sc = if unscale {
-                    cog.index.scales.get(b0).copied().unwrap_or(1.0)
-                } else {
-                    1.0
-                };
-                let off = if unscale {
-                    cog.index.offsets.get(b0).copied().unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                let mut pixels = vec![f32::NAN; n_px];
-                for (bi, tile_opt) in tiles.iter().enumerate() {
-                    let Some(tile) = tile_opt else { continue };
-                    let Some(band) = tile.bands.get(b0) else { continue };
-                    let ty = ty0 + bi / blocks_x;
-                    let tx = tx0 + bi % blocks_x;
-                    let tile_x0 = tx * tw;
-                    let tile_y0 = ty * th;
-                    let rx0 = c0.max(tile_x0);
-                    let rx1 = c1.min(tile_x0 + tw);
-                    let ry0 = r0.max(tile_y0);
-                    let ry1 = r1.min(tile_y0 + th);
-                    for row in ry0..ry1 {
-                        let ly = row - tile_y0;
-                        let dst_row = (row - r0) * win_w;
-                        for col in rx0..rx1 {
-                            let lx = col - tile_x0;
-                            let src_i = ly * tw + lx;
-                            let mut v = band.data.get_f32(src_i);
-                            if !v.is_finite() {
-                                continue;
+            if stream_chunky {
+                streamed_chunky_tiles = Some(tiles);
+            } else {
+                for &b1 in &sel_bands {
+                    let b0 = (b1 - 1) as usize;
+                    let sc = if unscale {
+                        cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    let off = if unscale {
+                        cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let mut pixels = vec![f32::NAN; n_px];
+                    for (bi, tile_opt) in tiles.iter().enumerate() {
+                        let Some(tile) = tile_opt else { continue };
+                        let Some(band) = tile.bands.get(b0) else { continue };
+                        let ty = ty0 + bi / blocks_x;
+                        let tx = tx0 + bi % blocks_x;
+                        let tile_x0 = tx * tw;
+                        let tile_y0 = ty * th;
+                        let rx0 = c0.max(tile_x0);
+                        let rx1 = c1.min(tile_x0 + tw);
+                        let ry0 = r0.max(tile_y0);
+                        let ry1 = r1.min(tile_y0 + th);
+                        for row in ry0..ry1 {
+                            let ly = row - tile_y0;
+                            let dst_row = (row - r0) * win_w;
+                            for col in rx0..rx1 {
+                                let lx = col - tile_x0;
+                                let src_i = ly * tw + lx;
+                                let mut v = band.data.get_f32(src_i);
+                                if !v.is_finite() {
+                                    continue;
+                                }
+                                if let Some(nd) = eff_nodata
+                                    && (nd.is_nan() && v.is_nan() || v == nd)
+                                {
+                                    continue;
+                                }
+                                if unscale {
+                                    v = v * sc + off;
+                                }
+                                pixels[dst_row + (col - c0)] = v;
                             }
-                            if let Some(nd) = eff_nodata
-                                && (nd.is_nan() && v.is_nan() || v == nd)
-                            {
-                                continue;
-                            }
-                            if unscale {
-                                v = v * sc + off;
-                            }
-                            pixels[dst_row + (col - c0)] = v;
                         }
                     }
+                    band_bufs.push((b1, pixels));
                 }
-                band_bufs.push((b1, pixels));
             }
         }
         PlanarConfig::Planar => {
@@ -1966,6 +1993,16 @@ pub async fn compute_native_exact_polygon_stats(
     let p2c = ifd.pixel_to_crs;
     let opts_owned = opts.clone();
     let descs_owned = cog.index.band_descriptions.clone();
+    let scales_owned = if stream_chunky && unscale {
+        cog.index.scales.clone()
+    } else {
+        Vec::new()
+    };
+    let offsets_owned = if stream_chunky && unscale {
+        cog.index.offsets.clone()
+    } else {
+        Vec::new()
+    };
     let geom_kind = if !polys_px.is_empty() {
         ZonalGeomKind::Polygon
     } else if !lines_px.is_empty() {
@@ -2001,6 +2038,7 @@ pub async fn compute_native_exact_polygon_stats(
                             .map(|(_, buf)| buf.as_slice())
                     })
                     .collect();
+                let allow_nan = prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where);
                 let mut b_vals = vec![0.0_f32; slot_bufs.len()];
                 for i in 0..n_px {
                     if cov[i] <= COV_EPS {
@@ -2010,13 +2048,20 @@ pub async fn compute_native_exact_polygon_stats(
                     for (slot, buf_opt) in slot_bufs.iter().enumerate() {
                         let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
                         if !v.is_finite() {
+                            if allow_nan {
+                                b_vals[slot] = f32::NAN;
+                                continue;
+                            }
                             all_valid = false;
                             break;
                         }
                         b_vals[slot] = v;
                     }
                     if all_valid {
-                        expr_px[i] = prog.eval(&b_vals);
+                        let r = prog.eval(&b_vals);
+                        if r.is_finite() {
+                            expr_px[i] = r;
+                        }
                     }
                 }
                 out.insert(
@@ -2031,6 +2076,78 @@ pub async fn compute_native_exact_polygon_stats(
                         geom_kind,
                         line_len_m.as_deref(),
                         desc,
+                        &opts_owned,
+                    ),
+                );
+            }
+        } else if let Some(ref tiles) = streamed_chunky_tiles {
+            let mut pixels = vec![f32::NAN; n_px];
+            for (bi_sel, &b1) in sel_bands.iter().enumerate() {
+                if bi_sel > 0 {
+                    pixels.fill(f32::NAN);
+                }
+                let b0 = (b1 - 1) as usize;
+                let sc = if unscale {
+                    scales_owned.get(b0).copied().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                let off = if unscale {
+                    offsets_owned.get(b0).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                for (bi, tile_opt) in tiles.iter().enumerate() {
+                    let Some(tile) = tile_opt else { continue };
+                    let Some(band) = tile.bands.get(b0) else { continue };
+                    let ty = ty0 + bi / blocks_x;
+                    let tx = tx0 + bi % blocks_x;
+                    let tile_x0 = tx * tw;
+                    let tile_y0 = ty * th;
+                    let rx0 = c0.max(tile_x0);
+                    let rx1 = c1.min(tile_x0 + tw);
+                    let ry0 = r0.max(tile_y0);
+                    let ry1 = r1.min(tile_y0 + th);
+                    for row in ry0..ry1 {
+                        let ly = row - tile_y0;
+                        let dst_row = (row - r0) * win_w;
+                        for col in rx0..rx1 {
+                            let lx = col - tile_x0;
+                            let src_i = ly * tw + lx;
+                            let mut v = band.data.get_f32(src_i);
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = eff_nodata
+                                && (nd.is_nan() && v.is_nan() || v == nd)
+                            {
+                                continue;
+                            }
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            pixels[dst_row + (col - c0)] = v;
+                        }
+                    }
+                }
+                let desc = descs_owned
+                    .get(b0)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("b{b1}"));
+                out.insert(
+                    format!("b{b1}"),
+                    compute_weighted_band_stats_with_geom(
+                        &pixels,
+                        &cov,
+                        win_w,
+                        win_h,
+                        &area_model,
+                        opts_owned.area_weighted,
+                        geom_kind,
+                        line_len_m.as_deref(),
+                        &desc,
                         &opts_owned,
                     ),
                 );
@@ -2294,10 +2411,21 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
     const MAX_EXACT_BLOCKS: usize = 1024;
-    if blocks_x * blocks_y > MAX_EXACT_BLOCKS {
+    let total_blocks = ref_slots
+        .len()
+        .max(1)
+        .saturating_mul(blocks_x.saturating_mul(blocks_y));
+    if total_blocks > MAX_EXACT_BLOCKS {
         return Err(EngineError::BadRequest(format!(
-            "polygon window requires {} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
-            blocks_x * blocks_y
+            "polygon window requires {total_blocks} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
+        )));
+    }
+    const MAX_EXACT_TOTAL_SAMPLES: usize = 67_108_864; // 256 MiB across retained bands
+    let total_samples = n_px.saturating_mul(ref_slots.len());
+    if total_samples > MAX_EXACT_TOTAL_SAMPLES {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window requires {total_samples} band-samples across {} bands (max {MAX_EXACT_TOTAL_SAMPLES}); pass max_size to narrow",
+            ref_slots.len()
         )));
     }
 
@@ -2394,6 +2522,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                         .map(|(_, buf)| buf.as_slice())
                 })
                 .collect();
+            let allow_nan = prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where);
             let mut b_vals = vec![0.0_f32; slot_bufs.len()];
             for i in 0..n_px {
                 if cov[i] <= COV_EPS {
@@ -2403,13 +2532,20 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 for (slot, buf_opt) in slot_bufs.iter().enumerate() {
                     let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
                     if !v.is_finite() {
+                        if allow_nan {
+                            b_vals[slot] = f32::NAN;
+                            continue;
+                        }
                         all_valid = false;
                         break;
                     }
                     b_vals[slot] = v;
                 }
                 if all_valid {
-                    expr_px[i] = prog.eval(&b_vals);
+                    let r = prog.eval(&b_vals);
+                    if r.is_finite() {
+                        expr_px[i] = r;
+                    }
                 }
             }
             out.insert(

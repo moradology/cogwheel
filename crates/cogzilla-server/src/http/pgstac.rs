@@ -1705,6 +1705,27 @@ const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_WORKING_BYTES: usize = 512 * 1024 * 1024;
 
 /// Refuse a pixel selection over more bands and pixels than it may work in.
+/// A fold for a pixel selection, refused before anything is read when holding every scene
+/// (the median does) or working through them would take too much.
+fn fold_within_limits<T: super::pixel_selection::Sample>(
+    method: Selection,
+    scenes: usize,
+    bands: usize,
+    pixels: usize,
+    integer: bool,
+    of_a_tile: bool,
+) -> Result<Fold<T>, EngineError> {
+    if Fold::<T>::held_bytes(method, scenes, bands, pixels) > MAX_HELD_BYTES {
+        return Err(EngineError::BadRequest(if of_a_tile {
+            format!("{scenes} items are too many for a median at this tile size; narrow the search or lower items_limit")
+        } else {
+            format!("{scenes} items are too many for a median at this size; narrow the search, lower items_limit or pass max_size")
+        }));
+    }
+    check_working_bytes(Fold::<T>::working_bytes(method, bands, pixels))?;
+    Ok(Fold::new(method, bands, pixels, integer))
+}
+
 fn check_working_bytes(bytes: usize) -> Result<(), EngineError> {
     if bytes > MAX_WORKING_BYTES {
         return Err(EngineError::BadRequest(
@@ -2426,14 +2447,8 @@ impl PlanesTile {
                             "pixel_selection by the last band needs at least two bands".into(),
                         ));
                     }
-                    if Fold::<f32>::held_bytes(self.selection, scenes.len(), bands, pixels) > MAX_HELD_BYTES {
-                        return Err(EngineError::BadRequest(format!(
-                            "{} items are too many for a median at this tile size; narrow the search or lower items_limit",
-                            scenes.len()
-                        )));
-                    }
-                    check_working_bytes(Fold::<f32>::working_bytes(self.selection, bands, pixels))?;
-                    fold.insert((Fold::new(self.selection, bands, pixels, item.integer).absent_as(self.nodata.unwrap_or(0.0)), item.sample_type, item.widest))
+                    let new = fold_within_limits::<f32>(self.selection, scenes.len(), bands, pixels, item.integer, true)?;
+                    fold.insert((new.absent_as(self.nodata.unwrap_or(0.0)), item.sample_type, item.widest))
                 }
             };
             if item.bands.len() != fold.bands() {
@@ -3450,15 +3465,8 @@ async fn part_image_of(
                     let paint = Paint::of(&bands).ok_or_else(|| {
                         EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
                     })?;
-                    if Fold::<f32>::held_bytes(method, scenes.len(), count, width * height) > MAX_HELD_BYTES {
-                        return Err(EngineError::BadRequest(format!(
-                            "{} items are too many for a median at this size; narrow the search, lower items_limit or pass max_size",
-                            scenes.len()
-                        )));
-                    }
-                    check_working_bytes(Fold::<f32>::working_bytes(method, count, width * height))?;
                     let integer = whole_numbers(pq.unscale, &bands, full.sample_type);
-                    selecting = Some((Fold::new(method, count, width * height, integer), paint));
+                    selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint));
                 }
                 let values = render_wgs84_bbox(
                     engine,
@@ -4425,18 +4433,13 @@ async fn feature_statistics(
                             "pixel_selection by the last band needs at least two bands".into(),
                         ));
                     }
-                    if Fold::<f64>::held_bytes(method, scene_count, canvas.len(), width * height) > MAX_HELD_BYTES {
-                        return Err(EngineError::BadRequest(format!(
-                            "{scene_count} items are too many for a median at this size; narrow the search, lower items_limit or pass max_size"
-                        )));
-                    }
                     // Whole numbers only when the values are the first raster's own.
                     let integer = program.is_none()
                         && !req.unscale
                         && assets.iter().all(|a| a.expression.is_none())
                         && !matches!(cogs[0].index.full_res().sample_type, SampleType::Float32 | SampleType::Float64);
-                    check_working_bytes(Fold::<f64>::working_bytes(method, canvas.len(), width * height))?;
-                    fold = Some(Fold::new(method, canvas.len(), width * height, integer).absent_as(req.nodata.map_or(0.0, f64::from)));
+                    let new = fold_within_limits::<f64>(method, scene_count, canvas.len(), width * height, integer, false)?;
+                    fold = Some(new.absent_as(req.nodata.map_or(0.0, f64::from)));
                 }
             }
             // The expression was read for the first item's bands; an item with another number
@@ -4446,48 +4449,20 @@ async fn feature_statistics(
                     "the items under the feature do not have the same number of bands".into(),
                 ));
             }
-            if let Some(fold) = &mut fold {
-                let bands: Vec<Vec<f64>> = match &program {
-                    Some(program) => {
-                        let mut bands = vec![vec![f64::NAN; width * height]; canvas.len()];
-                        let mut pixel = vec![0f64; planes.len()];
-                        for i in 0..width * height {
-                            for (value, plane) in pixel.iter_mut().zip(&planes) {
-                                *value = plane[i];
-                            }
-                            for (part, band) in bands.iter_mut().enumerate() {
-                                let v = program.eval(part, &pixel);
-                                if v.is_finite() {
-                                    band[i] = v;
-                                }
-                            }
-                        }
-                        bands
-                    }
-                    None => {
-                        if planes.len() != canvas.len() {
-                            return Err(EngineError::BadRequest(
-                                "the items under the feature do not have the same number of bands".into(),
-                            ));
-                        }
-                        planes
-                    }
-                };
-                fold.add(bands.iter().flatten().map(|v| if v.is_finite() { *v } else { f64::NAN }));
-                used.push(name);
-                continue;
-            }
-            match &program {
+            // The request's band math over this item's bands, or the bands as they are.
+            let bands: Vec<Vec<f64>> = match &program {
                 Some(program) => {
+                    // With `first`, only what the mosaic still lacks is worked out.
+                    let mut bands = if fold.is_some() { vec![vec![f64::NAN; width * height]; canvas.len()] } else { canvas.clone() };
                     let mut pixel = vec![0f64; planes.len()];
                     for i in 0..width * height {
-                        if canvas.iter().all(|band| !band[i].is_nan()) {
+                        if bands.iter().all(|band| !band[i].is_nan()) {
                             continue;
                         }
                         for (value, plane) in pixel.iter_mut().zip(&planes) {
                             *value = plane[i];
                         }
-                        for (part, band) in canvas.iter_mut().enumerate() {
+                        for (part, band) in bands.iter_mut().enumerate() {
                             if band[i].is_nan() {
                                 let v = program.eval(part, &pixel);
                                 if v.is_finite() {
@@ -4496,6 +4471,7 @@ async fn feature_statistics(
                             }
                         }
                     }
+                    bands
                 }
                 None => {
                     if planes.len() != canvas.len() {
@@ -4503,12 +4479,18 @@ async fn feature_statistics(
                             "the items under the feature do not have the same number of bands".into(),
                         ));
                     }
-                    for (band, plane) in canvas.iter_mut().zip(&planes) {
-                        for (dst, src) in band.iter_mut().zip(plane) {
-                            if dst.is_nan() && src.is_finite() {
-                                *dst = *src;
-                            }
-                        }
+                    planes
+                }
+            };
+            if let Some(fold) = &mut fold {
+                fold.add(bands.iter().flatten().map(|v| if v.is_finite() { *v } else { f64::NAN }));
+                used.push(name);
+                continue;
+            }
+            for (band, plane) in canvas.iter_mut().zip(&bands) {
+                for (dst, src) in band.iter_mut().zip(plane) {
+                    if dst.is_nan() && src.is_finite() {
+                        *dst = *src;
                     }
                 }
             }
@@ -5233,13 +5215,7 @@ async fn tile(
                 let bands = TileEngine::value_bands(&treq.bands);
                 // The median has to hold every scene, so it is refused before anything is
                 // read when that would be too much.
-                if Fold::<f32>::held_bytes(method, scenes.len(), bands, dim * dim) > MAX_HELD_BYTES {
-                    return Err(EngineError::BadRequest(format!(
-                        "{} items are too many for a median at this tile size; narrow the search or lower items_limit",
-                        scenes.len()
-                    )));
-                }
-                let mut fold = Fold::new(method, bands, dim * dim, integer);
+                let mut fold = fold_within_limits::<f32>(method, scenes.len(), bands, dim * dim, integer, true)?;
                 // For an array each scene's values are brought to whole numbers first, where
                 // the raster's are: rio-tiler's scenes are in the raster's type before the
                 // method sees them, and a mean cut off after is otherwise half a level low.
