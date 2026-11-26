@@ -798,7 +798,14 @@ def main() -> int:
         o.check("feature posted in metres", "image", f"/searches/{sid}/feature/32x32.npy?assets=red&coord_crs=epsg:3857", "POST", in_metres)
         o.check("feature posted in metres, drawn in degrees", "image",
                 f"/searches/{sid}/feature/32x32.npy?assets=red&coord_crs=epsg:3857&dst_crs=epsg:4326", "POST", in_metres)
-        o.check("statistics of a feature posted in metres", "status", f"/searches/{sid}/statistics?assets=red&max_size=64&coord_crs=epsg:3857", "POST", in_metres)
+        # Statistics count the pixels of a grid in `dst_crs`, which is `coord_crs` unless given.
+        in_degrees = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [kite]}}
+        o.check("statistics of a feature posted in metres", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&coord_crs=epsg:3857", "POST", in_metres)
+        o.check("statistics on a grid in metres", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&dst_crs=epsg:3857", "POST", in_degrees)
+        o.check("statistics of band math on a grid in metres", "zonal",
+                f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&expression=(b2-b1)/(b2%2Bb1)&max_size=48&dst_crs=epsg:3857", "POST", in_degrees)
+        o.check("statistics of a feature posted in metres, on a grid in degrees", "zonal",
+                f"/searches/{sid}/statistics?assets=red&max_size=64&coord_crs=epsg:3857&dst_crs=epsg:4326", "POST", in_metres)
         o.check("statistics pass a colour map over", "status", f"/searches/{sid}/statistics?assets=red&colormap_name=nope&max_size=64", "POST", triangle)
         # Arrays keep the data's type and carry the mask as a band of their own.
         o.check("feature as an array", "image", f"/searches/{sid}/feature/200x100.npy?assets=visual", "POST", triangle)
