@@ -22,6 +22,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
 mod pgstac;
+mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
 mod paint;
@@ -716,7 +717,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "resample" | "resampling" => {
-                match parse_resample_mode(v) {
+                let dec = percent_decode(v).to_ascii_lowercase();
+                match parse_resample_mode(&dec) {
                     Some(m) => pq.resample = m,
                     None => {
                         bad("unsupported resampling method");
@@ -725,7 +727,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 }
             }
             "reproject" => {
-                match parse_resample_mode(v) {
+                let dec = percent_decode(v).to_ascii_lowercase();
+                match parse_resample_mode(&dec) {
                     Some(m) => pq.reproject = m,
                     None => {
                         bad("unsupported reproject method");
@@ -970,16 +973,23 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     if pq.colormap_name_set {
         pq.custom_colormap_json = None;
     }
-    // TiTiler HillShade/Slope crop `algorithm_params.buffer` (default 3) back out of the buffered
-    // input tile; since cogzilla's Horn 3×3 already fetches its own neighbor halo seamlessly,
-    // subtract that crop from `pq.buffer` so `?algorithm=hillshade&buffer=3` outputs 256×256.
+    // TiTiler HillShade (default buffer 3) and Slope/Aspect (default buffer 0) crop
+    // `algorithm_params.buffer` back out of the buffered input tile; since cogzilla's Horn 3×3
+    // already fetches its own neighbor halo seamlessly, subtract that crop from `pq.buffer`
+    // so `?algorithm=hillshade&buffer=3` outputs 256×256 while `?algorithm=slope&buffer=3`
+    // keeps the requested 262×262 unless `algorithm_params.buffer` is explicitly set.
     if pq.buffer > 0.0
-        && pq
-            .algorithm
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case("hillshade") || a.eq_ignore_ascii_case("slope"))
+        && let Some(alg) = pq.algorithm.as_deref()
+        && (alg.eq_ignore_ascii_case("hillshade")
+            || alg.eq_ignore_ascii_case("slope")
+            || alg.eq_ignore_ascii_case("aspect"))
     {
-        let crop = pq.alg_buffer.unwrap_or(3.0).min(pq.buffer);
+        let default_crop = if alg.eq_ignore_ascii_case("hillshade") {
+            3.0
+        } else {
+            0.0
+        };
+        let crop = pq.alg_buffer.unwrap_or(default_crop).min(pq.buffer);
         pq.buffer = (pq.buffer - crop).max(0.0);
     }
     pq.errors = pq_errors;
@@ -1082,6 +1092,15 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             Some(segs[segs.len() - 2])
         } else {
             match segs.iter().position(|s| *s == "tiles") {
+                Some(i) if last == "assets" => {
+                    // `/mosaicjson/tiles/{tms}/{z}/{x}/{y}/assets` has len - i == 6;
+                    // `/mosaicjson/tiles/{z}/{x}/{y}/assets` (len - i == 5) has no TMS segment.
+                    if segs.len() - i == 6 {
+                        Some(segs[i + 1])
+                    } else {
+                        None
+                    }
+                }
                 Some(i) if matches!(segs.len() - i, 2 | 5) => Some(segs[i + 1]),
                 _ => None,
             }
@@ -2018,6 +2037,77 @@ fn wrap_geotiff_fmt(
     }
 }
 
+/// Whether `data` is a float32 `.npy`, the renderers' array.
+fn is_f32_npy(data: &[u8]) -> bool {
+    data.starts_with(b"\x93NUMPY") && data.get(10..80).is_some_and(|dict| dict.windows(4).any(|w| w == b"<f4'"))
+}
+
+/// An array the renderers wrote in float32, rewritten in `kind`, the type TiTiler writes it
+/// in ([`array_type`]); with `mask`, its last plane is the mask. Left as it is without a
+/// type, or when it is not an array of the planes it says.
+fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
+    kind.and_then(|kind| cogzilla_kernel::retype_f32_npy(&data, kind, mask)).unwrap_or(data)
+}
+
+/// What a `/cog` or `/stac` array's type is decided by: the rule, the assets asked for (none
+/// on `/cog`), the band math, and whether a mask was asked for.
+type ArrayAsked = (array_type::ArrayRule, Vec<String>, Option<String>, bool);
+
+fn array_asked(pq: &ParsedQuery) -> Option<ArrayAsked> {
+    array_type::ArrayRule::of(pq).map(|rule| (rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask))
+}
+
+/// A `/cog` answer in the type TiTiler writes its array in: the rasters at `urls` are
+/// opened again (they are cached) for their types. Anything but a float32 array, and an
+/// array whose rasters cannot be opened, is left as it is.
+async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
+    let Some((rule, _, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
+    let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
+    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+}
+
+/// A `/stac` answer in the type TiTiler writes its array in, from the types of the item's
+/// assets that were read and the band math as it was rewritten over them. As
+/// [`cog_array_in_its_type`].
+async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
+    let Some((rule, assets, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
+        return data;
+    };
+    let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
+    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+}
+
+/// A rendered `/cog` tile, its array in its type: what the tile cache keeps.
+async fn cog_tile_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    urls: &[String],
+    rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let (data, ct) = rendered.await?;
+    Ok((cog_array_in_its_type(engine, asked, urls, data).await, ct))
+}
+
+/// A rendered `/stac` tile, its array in its type: what the tile cache keeps. The item is
+/// the one the tile was drawn from, named by `url` or read from pgSTAC.
+async fn stac_tile_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    source: StacSource,
+    rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let (data, ct) = rendered.await?;
+    if asked.is_none() || !is_f32_npy(&data) {
+        return Ok((data, ct));
+    }
+    match source.load(engine).await {
+        Ok(item) => Ok((stac_array_in_its_type(engine, asked, &item, data).await, ct)),
+        Err(_) => Ok((data, ct)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_image_output(
     data: Bytes,
@@ -2262,7 +2352,7 @@ fn build_band_request(
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::Contours {
-                        increment: pq.contour_increment.round() as i32,
+                        increment: (pq.contour_increment.round() as i32).max(1),
                         thickness: pq.contour_thickness.min(255) as u8,
                         minz: pq.contour_minz.round() as i32,
                         maxz: pq.contour_maxz.round() as i32,
@@ -3585,12 +3675,22 @@ async fn render_mosaic_tile_styled(
         if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
             let mut acc_f32: Option<(usize, Vec<f32>)> = None;
             let mut filled = 0usize;
+            let mut any_ok = false;
+            let mut last_err: Option<EngineError> = None;
             for (scene_i, url) in urls.iter().enumerate() {
                 if scene_i > 0 {
                     tokio::task::consume_budget().await;
                 }
-                let Ok(cog) = engine.store.open_uri(url).await else {
-                    continue;
+                let cog = match engine.store.open_uri(url).await {
+                    Ok(c) => c,
+                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        return Err(EngineError::Io(e));
+                    }
+                    Err(e) => {
+                        failed_out.push(url.clone());
+                        last_err = Some(crate::engine::asset_fetch_error(url, e));
+                        continue;
+                    }
                 };
                 let cogs = vec![cog];
                 let mut scene_bands = treq.bands.clone();
@@ -3616,9 +3716,22 @@ async fn render_mosaic_tile_styled(
                 .await
                 {
                     Ok(b) => b,
-                    Err(EngineError::NotFound(_)) => continue,
-                    Err(e) => return Err(e),
+                    Err(EngineError::NotFound(_)) => {
+                        any_ok = true;
+                        continue;
+                    }
+                    Err(EngineError::Io(e))
+                        if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                    {
+                        return Err(EngineError::Io(e));
+                    }
+                    Err(e) => {
+                        failed_out.push(url.clone());
+                        last_err = Some(e);
+                        continue;
+                    }
                 };
+                any_ok = true;
                 if n_px == 0 || raw.len() % (n_px * 4) != 0 {
                     continue;
                 }
@@ -3664,6 +3777,11 @@ async fn render_mosaic_tile_styled(
                     break;
                 }
             }
+            if !any_ok
+                && let Some(err) = last_err
+            {
+                return Err(err);
+            }
             let default_nb = default_raw_band_count(&treq.bands, pq.pixel_selection);
             let (nb, acc) = acc_f32.unwrap_or_else(|| (default_nb, vec![f32::NAN; default_nb * n_px]));
             let mut out = bytes::BytesMut::with_capacity(acc.len() * 4);
@@ -3690,13 +3808,23 @@ async fn render_mosaic_tile_styled(
             .map_err(EngineError::BadRequest)?;
         let mut comp = vec![0u8; n_px * 4];
         let mut filled = 0usize;
+        let mut any_ok = false;
+        let mut last_err: Option<EngineError> = None;
 
         for (scene_i, url) in urls.iter().enumerate() {
             if scene_i > 0 {
                 tokio::task::consume_budget().await;
             }
-            let Ok(cog) = engine.store.open_uri(url).await else {
-                continue;
+            let cog = match engine.store.open_uri(url).await {
+                Ok(c) => c,
+                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    return Err(EngineError::Io(e));
+                }
+                Err(e) => {
+                    failed_out.push(url.clone());
+                    last_err = Some(crate::engine::asset_fetch_error(url, e));
+                    continue;
+                }
             };
             let cogs = vec![cog];
             let mut scene_bands = treq.bands.clone();
@@ -3723,9 +3851,22 @@ async fn render_mosaic_tile_styled(
             .await
             {
                 Ok(b) => b,
-                Err(EngineError::NotFound(_)) => continue,
-                Err(e) => return Err(e),
+                Err(EngineError::NotFound(_)) => {
+                    any_ok = true;
+                    continue;
+                }
+                Err(EngineError::Io(e))
+                    if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                {
+                    return Err(EngineError::Io(e));
+                }
+                Err(e) => {
+                    failed_out.push(url.clone());
+                    last_err = Some(e);
+                    continue;
+                }
             };
+            any_ok = true;
             if scene_rgba.len() != n_px * 4 {
                 continue;
             }
@@ -3739,6 +3880,11 @@ async fn render_mosaic_tile_styled(
             if filled >= n_px {
                 break;
             }
+        }
+        if !any_ok
+            && let Some(err) = last_err
+        {
+            return Err(err);
         }
         return Ok(encode_rgba_output(
             out_dim as usize,
@@ -7009,6 +7155,7 @@ where
         let stac_item_hdr = pgstac_item.clone();
         let stac_req_assets = pq.assets.clone();
         let stac_req_expr = pq.expr_raw.clone();
+        let stac_array = array_asked(&pq);
         let attach_resolved_stac_assets = |resp: &mut Response<Full<Bytes>>| {
             if !resp.status().is_success() {
                 return;
@@ -8057,9 +8204,10 @@ where
                     engine.sync_tile_cache_epoch();
                 }
                 let stac_tile_geo = TileGeoOpts::from_pq(&pq);
+                let stac_tile_source = stac_source.clone();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || async {
+                    .get_or_render(cache_key, || stac_tile_in_its_type(&engine, stac_array.clone(), stac_tile_source, async {
                         let item = stac_source.load(&engine).await?;
                         let (names, cogs, rewritten_expr) = resolve_stac_assets(
                             &engine,
@@ -8275,7 +8423,7 @@ where
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.jpeg_quality, pq_stac.return_mask))
                         }
-                    })
+                    }))
                     .await;
                 if stac_prefix != "stac"
                     && let Err(e) = &cached
@@ -8885,6 +9033,19 @@ where
 
             _ => Err(EngineError::NotFound(path.clone())),
         };
+        let res = match res {
+            Ok((data, ct)) if stac_array.is_some() && is_f32_npy(&data) => {
+                let source = match &stac_item_hdr {
+                    Some(item) => StacSource::Item(item.clone()),
+                    None => StacSource::Url(stac_url_hdr.clone()),
+                };
+                match source.load(&engine).await {
+                    Ok(item) => Ok((stac_array_in_its_type(&engine, stac_array, &item, data).await, ct)),
+                    Err(_) => Ok((data, ct)),
+                }
+            }
+            res => res,
+        };
         // titiler-pgstac answers errors as JSON `{"detail": ...}`.
         if stac_prefix != "stac" {
             return Ok(match res {
@@ -8938,6 +9099,8 @@ where
     if segs.first() == Some(&"cog") {
         let sub = &segs[1..];
         let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
+        let cog_array = array_asked(&pq);
+        let cog_urls = pq.urls.clone();
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // 1. GET /cog/info
             (Method::GET, ["info"]) => async {
@@ -9335,7 +9498,7 @@ where
                 engine.sync_tile_cache_epoch();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || async {
+                    .get_or_render(cache_key, || cog_tile_in_its_type(&engine, cog_array.clone(), &cog_urls, async {
                         let cogs = open_query_urls(&engine, &pq.urls).await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
                             parse_u8_like(zs),
@@ -9519,7 +9682,7 @@ where
                             let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq.jpeg_quality, pq.return_mask))
                         }
-                    })
+                    }))
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 if let (Some(z), Some(x), Some((y, sc, _))) =
@@ -10447,6 +10610,10 @@ where
             }
 
             _ => Err(EngineError::NotFound(path)),
+        };
+        let res = match res {
+            Ok((data, ct)) => Ok((cog_array_in_its_type(&engine, cog_array, &cog_urls, data).await, ct)),
+            Err(e) => Err(e),
         };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if let Some((bbox, epsg, is_crs84)) = geo_meta {

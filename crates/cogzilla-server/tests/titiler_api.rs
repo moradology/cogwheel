@@ -4749,6 +4749,26 @@ async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
         .await
         .unwrap();
     assert_eq!(r_tile_assets.status(), 400, "/mosaicjson/tiles/.../assets must refuse pixel_selection with 400");
+    // Audit #72 #1 & #11: TMS-less /mosaicjson/tiles/{z}/{x}/{y}/assets -> 200; bogus TMS -> 422;
+    // mixed-case / percent-encoded resampling accepted
+    let r_assets_notms = client
+        .get(format!("{base}/mosaicjson/tiles/10/163/395/assets?url={mp}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_assets_notms.status(), 200, "/mosaicjson/tiles/z/x/y/assets must return 200");
+    let r_assets_badtms = client
+        .get(format!("{base}/mosaicjson/tiles/BogusTMS/10/163/395/assets?url={mp}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_assets_badtms.status(), 422, "/mosaicjson/tiles/BogusTMS/z/x/y/assets must return 422");
+    let r_resamp_case = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.npy?url={mp}&resampling=Bilinear"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_resamp_case.status(), 200, "mixed-case resampling=Bilinear must return 200");
 
     // (c) POST /mosaicjson/statistics on Point and horizontal LineString with pixel_selection=count
     let pt = serde_json::json!({

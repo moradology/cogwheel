@@ -30,6 +30,7 @@ use super::{
     parse_ext_format, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
+use super::array_type::{band_math_type, wider_type};
 use super::paint::{Paint, formula_levels, rescale_byte};
 use super::pixel_selection::{Fold, Selected, Selection};
 use super::point_expr::Program;
@@ -2540,75 +2541,6 @@ impl PlanesTile {
             return Ok((npy_array(&values, shown, width, height, SampleType::Uint8, look.return_mask, None), content_type));
         }
         encode_picture(rgba, width, height, formula, Some(asked), look.jpeg_quality, look.return_mask, grey)
-    }
-}
-
-/// The type that holds the numbers of both, as numpy promotes them when it stacks bands.
-fn wider_type(a: SampleType, b: SampleType) -> SampleType {
-    use SampleType as T;
-    if a == b {
-        return a;
-    }
-    let float = |t| matches!(t, T::Float32 | T::Float64);
-    let signed = |t| matches!(t, T::Int8 | T::Int16 | T::Int32);
-    let bits = |t| match t {
-        T::Uint8 | T::Int8 => 8u32,
-        T::Uint16 | T::Int16 => 16,
-        T::Uint32 | T::Int32 | T::Float32 => 32,
-        T::Float64 => 64,
-    };
-    if float(a) || float(b) {
-        // float32 holds whole numbers of 16 bits and no more.
-        let narrow = |t| if float(t) { bits(t) == 32 } else { bits(t) <= 16 };
-        return if narrow(a) && narrow(b) { T::Float32 } else { T::Float64 };
-    }
-    let sized = |kinds: [SampleType; 3], width: u32| kinds[match width { 8 => 0, 16 => 1, _ => 2 }];
-    match (signed(a), signed(b)) {
-        (false, false) => sized([T::Uint8, T::Uint16, T::Uint32], bits(a).max(bits(b))),
-        (true, true) => sized([T::Int8, T::Int16, T::Int32], bits(a).max(bits(b))),
-        // A signed type one size up from the unsigned one, or the signed one's own if larger.
-        _ => {
-            let (own, unsigned) = if signed(a) { (bits(a), bits(b)) } else { (bits(b), bits(a)) };
-            match (unsigned * 2).max(own) {
-                16 => T::Int16,
-                32 => T::Int32,
-                _ => T::Float64,
-            }
-        }
-    }
-}
-
-/// The type band math comes out in, as numexpr has it in TiTiler, from the type `read`
-/// of the bands it is worked on: whole numbers of up to 16 bits stay whole, as 32-bit
-/// ones, through sums, differences and products, and 32-bit floats stay so; a division, a
-/// function or a fraction makes doubles.
-fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> + Clone, read: SampleType) -> SampleType {
-    let whole = |e: &String| {
-        let mut rest = e.as_str();
-        while let Some(at) = rest.find('b') {
-            let digits = rest[at + 1..].bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 {
-                return false;
-            }
-            rest = &rest[at + 1 + digits..];
-        }
-        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
-    };
-    // float32 stays float32 through operations and functions alike; a literal with a
-    // fraction or an exponent is a double and makes the result one.
-    let plain = |e: &String| {
-        let e = e.as_bytes();
-        !e.contains(&b'.') && !e.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
-    };
-    if read == SampleType::Float32 && expressions.clone().all(plain) {
-        SampleType::Float32
-    } else if !expressions.clone().all(whole) {
-        SampleType::Float64
-    } else {
-        match read {
-            SampleType::Uint8 | SampleType::Int8 | SampleType::Uint16 | SampleType::Int16 => SampleType::Int32,
-            _ => SampleType::Float64,
-        }
     }
 }
 
@@ -7866,20 +7798,6 @@ mod tests {
         let doubles = npy_array(&[f32::NAN, 0.5], 1, 2, 1, SampleType::Float64, true, None);
         assert_eq!(&doubles[doubles.len() - 16..doubles.len() - 8], f64::MIN.to_le_bytes());
         assert_eq!(&doubles[doubles.len() - 8..], f64::MAX.to_le_bytes());
-    }
-
-    #[test]
-    fn stacked_bands_take_the_type_that_holds_them_all() {
-        use SampleType as T;
-        for (a, b, both) in [
-            (T::Uint8, T::Uint16, T::Uint16), (T::Uint16, T::Int16, T::Int32), (T::Uint8, T::Int8, T::Int16),
-            (T::Uint8, T::Int16, T::Int16), (T::Uint8, T::Int32, T::Int32), (T::Int8, T::Int16, T::Int16),
-            (T::Uint16, T::Float32, T::Float32), (T::Uint32, T::Float32, T::Float64), (T::Float32, T::Float64, T::Float64),
-            (T::Uint32, T::Int32, T::Float64), (T::Uint8, T::Uint8, T::Uint8), (T::Uint16, T::Uint32, T::Uint32),
-        ] {
-            assert_eq!(wider_type(a, b), both, "{a:?} with {b:?}");
-            assert_eq!(wider_type(b, a), both, "{b:?} with {a:?}");
-        }
     }
 
     #[test]
