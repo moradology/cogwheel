@@ -1978,6 +1978,16 @@ fn attach_x_assets(resp: &mut Response<Full<Bytes>>, assets: &[String]) {
     }
 }
 
+fn attach_x_failed_assets(resp: &mut Response<Full<Bytes>>, failed: &[String]) {
+    if failed.is_empty() || !resp.status().is_success() {
+        return;
+    }
+    let joined = failed.join(",");
+    if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
+        resp.headers_mut().insert("x-failed-assets", hv);
+    }
+}
+
 fn parse_ext_format(
     ext: &str,
     webp_quality: Option<f32>,
@@ -3622,6 +3632,7 @@ async fn render_mosaic_tile_styled(
     mut treq: TileRequest,
     pq: &ParsedQuery,
     first_has_colormap: bool,
+    failed_out: &mut Vec<String>,
 ) -> Result<Bytes, EngineError> {
     if pq.pixel_selection != PixelSelection::First {
         return render_mosaic_tile_pixel_selection(engine, urls, treq, pq).await;
@@ -3837,7 +3848,8 @@ async fn render_mosaic_tile_styled(
             .map_err(EngineError::BadRequest)?;
         let orig_format = treq.format;
         treq.format = OutputFormat::RawRgba;
-        let raw = engine.render_mosaic_tile(urls, &treq).await?;
+        let (raw, failed) = engine.render_mosaic_tile_with_report(urls, &treq).await?;
+        failed_out.extend(failed);
         let dim = treq.tile_size as usize;
         let data = if let Some(cf) = cf {
             let mut buf = raw.to_vec();
@@ -3848,7 +3860,9 @@ async fn render_mosaic_tile_styled(
         };
         Ok(data)
     } else {
-        engine.render_mosaic_tile(urls, &treq).await
+        let (raw, failed) = engine.render_mosaic_tile_with_report(urls, &treq).await?;
+        failed_out.extend(failed);
+        Ok(raw)
     }
 }
 
@@ -4396,11 +4410,11 @@ async fn open_first_mosaic_cog(
     for u in urls.iter().take(16) {
         match engine.store.open_uri(u).await {
             Ok(c) => return Ok(c),
-            Err(e) => last_err = Some(e.into()),
+            Err(e) => last_err = Some(crate::engine::asset_fetch_error(u, e)),
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        EngineError::NotFound("mosaic contains no readable scenes".into())
+        EngineError::BadGateway("mosaic contains no readable scenes".into())
     }))
 }
 
@@ -4514,7 +4528,24 @@ where
         .get(hyper::header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .is_some_and(header_accepts_gzip);
-    let mut resp = handle_request_inner(engine, req, is_head).await?;
+    engine.sync_tile_cache_epoch();
+    let retry_head = if is_get_or_head {
+        Some((req.method().clone(), req.uri().clone(), req.headers().clone()))
+    } else {
+        None
+    };
+    let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
+    if resp.headers_mut().remove("x-cogzilla-retry").is_some()
+        && let Some((m, u, h)) = retry_head
+    {
+        engine.sync_tile_cache_epoch();
+        let mut retry_req = Request::new(Full::new(Bytes::new()));
+        *retry_req.method_mut() = m;
+        *retry_req.uri_mut() = u;
+        *retry_req.headers_mut() = h;
+        resp = handle_request_inner(engine, retry_req, is_head).await?;
+        resp.headers_mut().remove("x-cogzilla-retry");
+    }
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
         resp.headers_mut().insert(
@@ -5704,6 +5735,8 @@ where
             | ["mosaicjson", "tiles", zs, xs, ys] => {
                 let tms = if segs.len() == 6 { segs[2] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
+                let failed_assets = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let failed_assets_inner = failed_assets.clone();
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
@@ -5867,14 +5900,19 @@ where
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
+                            let mut failed = Vec::new();
                             let b = render_mosaic_tile_styled(
                                 &engine,
                                 &urls,
                                 treq,
                                 &pq,
                                 first_cog.index.color_map.is_some(),
+                                &mut failed,
                             )
                             .await?;
+                            if !failed.is_empty() {
+                                *failed_assets_inner.lock().unwrap_or_else(|e| e.into_inner()) = failed;
+                            }
                             Ok(finalize_image_output(
                                 b,
                                 ct,
@@ -5891,6 +5929,8 @@ where
                     })
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                let failed = failed_assets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                attach_x_failed_assets(&mut resp, &failed);
                 if let (Some(z), Some(x), Some((y, sc, _))) =
                     (parse_u8_like(zs), parse_u32_like(xs), parse_y_scale_ext(ys))
                 {
@@ -5942,6 +5982,8 @@ where
                         pq.urls.len()
                     )))
                 } else {
+                    let failed_assets = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                    let failed_assets_inner = failed_assets.clone();
                     let cached = engine
                         .tile_cache
                         .get_or_render(cache_key, || async {
@@ -5964,14 +6006,19 @@ where
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
+                            let mut failed = Vec::new();
                             let b = render_mosaic_tile_styled(
                                 &engine,
                                 &pq.urls,
                                 treq,
                                 &pq,
                                 first_cog.index.color_map.is_some(),
+                                &mut failed,
                             )
                             .await?;
+                            if !failed.is_empty() {
+                                *failed_assets_inner.lock().unwrap_or_else(|e| e.into_inner()) = failed;
+                            }
                             let b = wrap_geotiff_fmt(
                                 b,
                                 ct,
@@ -5986,6 +6033,8 @@ where
                         })
                         .await;
                     let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
+                    let failed = failed_assets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    attach_x_failed_assets(&mut resp, &failed);
                     attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
                     return Ok(resp);
                 }
@@ -6102,12 +6151,14 @@ where
                             let fmt = treq.format;
                             let out_dim = (ts as f32 + 2.0 * pq.buffer).round() as u32;
                             let buf_bbox = web_mercator_buffered_3857_bbox(z, x, y, pq.buffer, ts);
+                            let mut failed = Vec::new();
                             let b = render_mosaic_tile_styled(
                                 &engine,
                                 &urls,
                                 treq,
                                 &pq,
                                 first_cog.index.color_map.is_some(),
+                                &mut failed,
                             )
                             .await?;
                             let b = wrap_geotiff_fmt(
@@ -9117,9 +9168,23 @@ where
                     .or(pq.format_param.as_deref())
                     .unwrap_or("png");
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let is_georef = cogs[0].index.is_georeferenced;
+                if !is_georef && pq.dst_crs.is_some() {
+                    let _ = engine.get_or_build_crs(&cogs[0])?;
+                }
+                let (crs_opt, bbox) = if is_georef {
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let b = crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
+                    (Some(crs), b)
+                } else {
+                    (None, [0.0, 0.0, full.width as f64, full.height as f64])
+                };
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = cogs[0].index.full_res().sample_type;
@@ -9155,7 +9220,14 @@ where
                     let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
                         && full.pixel_to_crs.a > 0.0
                         && full.pixel_to_crs.e < 0.0;
-                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
+                    if !is_georef {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                            pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, bbox, out_w, out_h, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -9167,7 +9239,7 @@ where
                     } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
                         let epsg = nat_epsg.unwrap_or(4326);
                         let d = render_crs_bbox(
-                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            &engine, &cogs, nat_bbox, crs_opt.as_ref().unwrap(), out_w, out_h, None, &bands,
                             pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
                             pq.return_mask, pq.unscale,
                         )
@@ -9183,16 +9255,32 @@ where
                     }
                 };
                 let (data, ct) = finalize_image_output(data, ct, fmt, auto_fmt, out_w, out_h, out_bbox, out_epsg, pq.jpeg_quality, pq.return_mask);
-                geo_meta = Some((out_bbox, Some(out_epsg), false));
+                if is_georef {
+                    geo_meta = Some((out_bbox, Some(out_epsg), false));
+                }
                 Ok((data, ct))
             }
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let is_georef = cogs[0].index.is_georeferenced;
+                if !is_georef && pq.dst_crs.is_some() {
+                    let _ = engine.get_or_build_crs(&cogs[0])?;
+                }
+                let (crs_opt, bbox) = if is_georef {
+                    let crs = engine.get_or_build_crs(&cogs[0])?;
+                    let b = crs.wgs84_bounds_with_gcp(
+                        &full.pixel_to_crs,
+                        full.gcp_poly.as_deref(),
+                        full.width,
+                        full.height,
+                    );
+                    (Some(crs), b)
+                } else {
+                    (None, [0.0, 0.0, full.width as f64, full.height as f64])
+                };
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
@@ -9219,7 +9307,14 @@ where
                     let north_up_aligned = full.pixel_to_crs.is_axis_aligned()
                         && full.pixel_to_crs.a > 0.0
                         && full.pixel_to_crs.e < 0.0;
-                    if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
+                    if !is_georef {
+                        let d = render_native_preview(
+                            &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
+                            pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
+                        )
+                        .await?;
+                        (d, bbox, 4326)
+                    } else if ct == GEOTIFF_CONTENT_TYPE && nat_epsg.is_none() {
                         let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                         let d = render_wgs84_bbox(
                             &engine, &cogs, bbox, out_w, out_h, None, &bands,
@@ -9231,7 +9326,7 @@ where
                     } else if ct == GEOTIFF_CONTENT_TYPE && !north_up_aligned {
                         let epsg = nat_epsg.unwrap_or(4326);
                         let d = render_crs_bbox(
-                            &engine, &cogs, nat_bbox, &crs, out_w, out_h, None, &bands,
+                            &engine, &cogs, nat_bbox, crs_opt.as_ref().unwrap(), out_w, out_h, None, &bands,
                             pq.resample, fmt, pq.nodata, custom_lut.as_ref(), cf.as_ref(),
                             pq.return_mask, pq.unscale,
                         )
@@ -9247,7 +9342,9 @@ where
                     }
                 };
                 let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, out_bbox, out_epsg, pq.return_mask);
-                geo_meta = Some((out_bbox, Some(out_epsg), false));
+                if is_georef {
+                    geo_meta = Some((out_bbox, Some(out_epsg), false));
+                }
                 Ok((data, ct))
             }
             .await,
@@ -9853,6 +9950,7 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
             .unwrap(),
         EngineError::MethodNotAllowed(allow) => method_not_allowed_resp(allow),
         EngineError::NotFound(msg) => json_error_resp(StatusCode::NOT_FOUND, msg),
+        EngineError::BadGateway(msg) => json_error_resp(StatusCode::BAD_GATEWAY, msg),
         EngineError::BadRequest(msg) => json_error_resp(StatusCode::BAD_REQUEST, msg),
         // The file is in a coordinate system this server cannot place. That is a
         // property of the requested source, not a server fault.
@@ -9885,6 +9983,12 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
             }
             e @ cogzilla_io::IoError::RangeNotSupported { .. } => {
                 json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+            }
+            e @ cogzilla_io::IoError::SourceChanged { .. } => {
+                let mut r = json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string());
+                r.headers_mut()
+                    .insert("x-cogzilla-retry", HeaderValue::from_static("1"));
+                r
             }
             e @ cogzilla_io::IoError::ResponseTooLarge { .. } => {
                 json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())

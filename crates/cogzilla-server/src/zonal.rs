@@ -413,6 +413,7 @@ pub fn densify_ring_lonlat_to_pixel(
     ring: &[(f64, f64)],
     crs: &CrsModel,
     crs_to_pixel: &Affine2D,
+    gcp_poly: Option<&cogzilla_tiff::GcpPoly>,
     is_geo_dataset: bool,
     densify_lonlat: bool,
     wrap_lo: Option<f64>,
@@ -433,7 +434,11 @@ pub fn densify_ring_lonlat_to_pixel(
         } else {
             crs.from_lonlat_deg(adj_lon, lat)
         };
-        let (col, row) = crs_to_pixel.forward(sx, sy);
+        let (col, row) = if let Some(poly) = gcp_poly {
+            poly.crs_to_pixel(sx, sy)
+        } else {
+            crs_to_pixel.forward(sx, sy)
+        };
         // Snap vertices within 1e-6 px of an integer grid line onto it before clipping so
         // CRS round-trip noise (e.g. UTM -> WGS84 -> UTM ~1e-9 px) never bleeds into neighbors.
         let snap_grid = |v: f64| -> f64 {
@@ -1345,6 +1350,7 @@ pub async fn compute_native_exact_polygon_stats(
                     ring,
                     crs,
                     &c2p,
+                    ifd.gcp_poly.as_deref(),
                     is_geo_dataset,
                     densify_lonlat,
                     wrap_lo,
@@ -1369,6 +1375,7 @@ pub async fn compute_native_exact_polygon_stats(
                 line,
                 crs,
                 &c2p,
+                ifd.gcp_poly.as_deref(),
                 is_geo_dataset,
                 densify_lonlat,
                 wrap_lo,
@@ -1770,6 +1777,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 ring,
                 &crs,
                 &ifd.crs_to_pixel,
+                ifd.gcp_poly.as_deref(),
                 is_geo,
                 densify_lonlat,
                 wrap_lo,
@@ -1784,6 +1792,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             line,
             &crs,
             &ifd.crs_to_pixel,
+            ifd.gcp_poly.as_deref(),
             is_geo,
             densify_lonlat,
             wrap_lo,
@@ -1799,7 +1808,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             adj_lo += 360.0;
         }
         let (sx, sy) = if is_geo { (adj_lo, la) } else { crs.from_lonlat_deg(adj_lo, la) };
-        let (c, r) = ifd.crs_to_pixel.forward(sx, sy);
+        let (c, r) = ifd.crs_to_pixel_pt(sx, sy);
         pts_px.push((c, r));
     }
 

@@ -493,6 +493,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
     let mut color_map: Option<Vec<[u8; 4]>> = None;
     let mut base_affine: Option<Affine2D> = None;
     let mut base_dims: Option<(u32, u32)> = None;
+    let mut base_gcp_poly: Option<crate::gcp::GcpPoly> = None;
+    let mut is_georeferenced = true;
+    let mut gcp_residual_px: Option<f64> = None;
 
     // Guard against cyclic IFD chains, runaway IFD counts, and cumulative heap amplification DoS.
     const MAX_COG_METADATA_BYTES: usize = 64 * 1024 * 1024;
@@ -943,11 +946,11 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             return Err(TiffError::Corrupt("cumulative TIFF IFD metadata exceeds 64 MiB limit"));
         }
 
-        let pixel_to_crs = if ifds.is_empty() {
+        let (pixel_to_crs, gcp_poly) = if ifds.is_empty() {
             if let Some(rk) = raw_geo_keys {
                 geo_keys = parse_geo_keys(&rk, &double_params);
             }
-            let aff = if let Some(m) = model_transform {
+            let (aff, poly) = if let Some(m) = model_transform {
                 if m.len() < 16 {
                     return Err(TiffError::MissingGeoTransform);
                 }
@@ -958,14 +961,17 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     c -= 0.5 * (m[0] + m[1]);
                     f -= 0.5 * (m[4] + m[5]);
                 }
-                Affine2D {
-                    a: m[0],
-                    b: m[1],
-                    c,
-                    d: m[4],
-                    e: m[5],
-                    f,
-                }
+                (
+                    Affine2D {
+                        a: m[0],
+                        b: m[1],
+                        c,
+                        d: m[4],
+                        e: m[5],
+                        f,
+                    },
+                    None,
+                )
             } else if let (Some(ps), Some(tp)) = (pixel_scale.as_ref(), tiepoint.as_ref()) {
                 if ps.len() < 2 || tp.len() < 6 {
                     return Err(TiffError::MissingGeoTransform);
@@ -979,37 +985,64 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     c -= 0.5 * sx;
                     f -= 0.5 * sy;
                 }
-                Affine2D {
-                    a: sx,
-                    b: 0.0,
-                    c,
-                    d: 0.0,
-                    e: sy,
-                    f,
-                }
-            } else if let Some(tp) = tiepoint
+                (
+                    Affine2D {
+                        a: sx,
+                        b: 0.0,
+                        c,
+                        d: 0.0,
+                        e: sy,
+                        f,
+                    },
+                    None,
+                )
+            } else if let Some(tp) = tiepoint.as_ref()
+                && tp.len() >= 18
+            {
+                let fit = crate::gcp::fit_gcps(tp, geo_keys.raster_type == Some(2))
+                    .ok_or(TiffError::Corrupt("degenerate or collinear GCPs"))?;
+                gcp_residual_px = Some(fit.residual_px);
+                (fit.affine, fit.poly)
+            } else if let Some(tp) = tiepoint.as_ref()
                 && tp.len() >= 12
             {
                 return Err(TiffError::UnsupportedGcpGeoreferencing(tp.len() / 6));
             } else {
-                return Err(TiffError::MissingGeoTransform);
+                // Ungeoreferenced TIFF (U3): allow pixel-space metadata, preview, and statistics.
+                is_georeferenced = false;
+                (
+                    Affine2D {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 0.0,
+                        e: 1.0,
+                        f: 0.0,
+                    },
+                    None,
+                )
             };
             base_affine = Some(aff);
             base_dims = Some((width, height));
-            aff
+            base_gcp_poly = poly.clone();
+            (aff, poly.map(Box::new))
         } else {
             let base = base_affine.ok_or(TiffError::MissingGeoTransform)?;
             let (bw, bh) = base_dims.unwrap();
             let scale_x = (bw as f64) / (width as f64);
             let scale_y = (bh as f64) / (height as f64);
-            Affine2D {
+            let aff = Affine2D {
                 a: base.a * scale_x,
                 b: base.b * scale_y,
                 c: base.c,
                 d: base.d * scale_x,
                 e: base.e * scale_y,
                 f: base.f,
-            }
+            };
+            let poly = base_gcp_poly
+                .as_ref()
+                .map(|p| Box::new(p.scaled_for_overview(scale_x, scale_y)));
+            (aff, poly)
         };
 
         let crs_to_pixel = pixel_to_crs
@@ -1035,6 +1068,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             is_stripped,
             pixel_to_crs,
             crs_to_pixel,
+            gcp_poly,
             tile_offsets,
             tile_byte_counts,
         });
@@ -1081,6 +1115,8 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
     Ok(CogIndex {
         byte_order: bo,
         is_bigtiff,
+        is_georeferenced,
+        gcp_residual_px,
         nodata,
         scales,
         offsets,

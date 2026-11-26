@@ -2544,29 +2544,7 @@ impl PlanesTile {
                 // them into a picture's bytes.
                 let shown = !look.rescale.is_empty() || look.mapped || look.custom.is_some() || look.formula.is_some();
                 if let (Some((OutputFormat::Npy, content_type)), false) = (look.asked, shown) {
-                    // Band math comes out in numexpr's types: whole numbers of up to 16
-                    // bits stay whole, as 32-bit ones, through sums, differences and
-                    // products, and 32-bit floats stay so; a division, a function or a fraction
-                    // makes doubles.
-                    let whole = |e: &String| {
-                        let mut rest = e.as_str();
-                        while let Some(at) = rest.find('b') {
-                            let digits = rest[at + 1..].bytes().take_while(u8::is_ascii_digit).count();
-                            if digits == 0 {
-                                return false;
-                            }
-                            rest = &rest[at + 1 + digits..];
-                        }
-                        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
-                    };
                     let math_of = || self.expression.iter().chain(self.assets.iter().filter_map(|a| a.expression.as_ref()));
-                    let whole_math = math_of().all(whole);
-                    // float32 stays float32 through operations and functions alike; a literal
-                    // with a fraction or an exponent is a double and makes the result one.
-                    let plain_math = math_of().all(|e| {
-                        let e = e.as_bytes();
-                        !e.contains(&b'.') && !e.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
-                    });
                     // What the bands are before any math: floats once unscaled.
                     let read = if self.window.unscale() { SampleType::Float32 } else { widest };
                     let kind = if matches!(self.selection, Selection::Stdev) {
@@ -2575,15 +2553,8 @@ impl PlanesTile {
                         SampleType::Uint8
                     } else if !math {
                         read
-                    } else if read == SampleType::Float32 && plain_math {
-                        SampleType::Float32
-                    } else if !whole_math {
-                        SampleType::Float64
                     } else {
-                        match read {
-                            SampleType::Uint8 | SampleType::Int8 | SampleType::Uint16 | SampleType::Int16 => SampleType::Int32,
-                            _ => SampleType::Float64,
-                        }
+                        band_math_type(math_of(), read)
                     };
                     return Ok((npy_array(&selected.values, selected.bands, width, height, kind, look.return_mask, self.nodata), content_type));
                 }
@@ -2688,6 +2659,40 @@ fn wider_type(a: SampleType, b: SampleType) -> SampleType {
                 32 => T::Int32,
                 _ => T::Float64,
             }
+        }
+    }
+}
+
+/// The type band math comes out in, as numexpr has it in TiTiler, from the type `read`
+/// of the bands it is worked on: whole numbers of up to 16 bits stay whole, as 32-bit
+/// ones, through sums, differences and products, and 32-bit floats stay so; a division, a
+/// function or a fraction makes doubles.
+fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> + Clone, read: SampleType) -> SampleType {
+    let whole = |e: &String| {
+        let mut rest = e.as_str();
+        while let Some(at) = rest.find('b') {
+            let digits = rest[at + 1..].bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return false;
+            }
+            rest = &rest[at + 1 + digits..];
+        }
+        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
+    };
+    // float32 stays float32 through operations and functions alike; a literal with a
+    // fraction or an exponent is a double and makes the result one.
+    let plain = |e: &String| {
+        let e = e.as_bytes();
+        !e.contains(&b'.') && !e.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
+    };
+    if read == SampleType::Float32 && expressions.clone().all(plain) {
+        SampleType::Float32
+    } else if !expressions.clone().all(whole) {
+        SampleType::Float64
+    } else {
+        match read {
+            SampleType::Uint8 | SampleType::Int8 | SampleType::Uint16 | SampleType::Int16 => SampleType::Int32,
+            _ => SampleType::Float64,
         }
     }
 }
@@ -5134,12 +5139,18 @@ async fn tile(
             // an array from planes is. What makes a picture's bytes of them, band math and
             // `algorithm` are still the renderer's own float32.
             let own_bands = matches!(treq.bands, BandRequest::Single { .. } | BandRequest::Rgb { .. });
+            // One band of band math is the renderer's too, in the type the math gives.
+            let band_math = pq.expr_raw.as_ref().filter(|_| {
+                matches!(
+                    treq.bands,
+                    BandRequest::Spectral1 { .. } | BandRequest::Spectral2 { .. } | BandRequest::Spectral3 { .. } | BandRequest::CustomExpr { .. }
+                )
+            });
             if matches!(treq.format, OutputFormat::Npy)
-                && own_bands
+                && (own_bands && pq.expr_raw.is_none() || band_math.is_some())
                 && selection.is_none()
                 && !pq.colormap_explicit
                 && formula.is_none()
-                && pq.expr_raw.is_none()
                 && pq.algorithm.is_none()
                 && full.extra_samples.is_empty()
                 && !super::has_embedded_palette(&pq, &first, &treq.bands)
@@ -5154,7 +5165,13 @@ async fn tile(
                         kind = wider_type(kind, engine.store.open_uri(uri).await?.index.full_res().sample_type);
                     }
                     let kind = if pq.unscale { SampleType::Float32 } else { kind };
-                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    // Where the math makes doubles the values are still the renderer's 32-bit
+                    // ones: written as float32, half the bytes of TiTiler's float64 and no less told.
+                    let kind = band_math.map_or(kind, |math| match band_math_type(std::iter::once(math), kind) {
+                        SampleType::Float64 => SampleType::Float32,
+                        other => other,
+                    });
+                    let whole = band_math.is_none() && !matches!(kind, SampleType::Float32 | SampleType::Float64);
                     // A whole-number raster's values between pixels are rounded to its type.
                     let read = raw
                         .chunks_exact(4)
