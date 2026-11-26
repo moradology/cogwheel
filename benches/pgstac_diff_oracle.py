@@ -1253,6 +1253,11 @@ def main() -> int:
         ):
             o.check(name, "status", path, method, triangle if method == "POST" else None)
         # A side of zero in the path follows the other; both, and `max_size` bounds the picture.
+        o.check("item preview, a width of zero in the path", "image", f"{it}/preview/0x64.png?assets=visual")
+        o.check("item preview, a height of zero in the path", "image", f"{it}/preview/100x0.png?assets=red&rescale=0,3000")
+        o.check("item preview, no size in the path and a max_size", "image", f"{it}/preview/0x0.png?assets=visual&max_size=128")
+        o.check("item preview, a side in the path outranks max_size", "image", f"{it}/preview/0x64.png?assets=visual&max_size=32")
+        o.check("item preview, a width of zero as an array", "npy", f"{it}/preview/0x64.npy?assets=red")
         o.check("item bbox, a width of zero in the path", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/0x64.png?assets=visual")
         o.check("item bbox, a height of zero in the path", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/64x0.tif?assets=visual")
         o.check("item bbox, no size in the path and a max_size", "image", f"{it}/bbox/6.3,43.6,6.5,43.8/0x0.png?assets=visual&max_size=200")
