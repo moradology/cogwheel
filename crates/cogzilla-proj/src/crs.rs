@@ -466,23 +466,7 @@ impl CrsModel {
             (rx, ry)
         };
 
-        let (mut rx, mut ry) = probe(0.5, 0.5);
-        // For polar stereographic rasters, Web Mercator ground resolution shrinks by cos(lat)
-        // toward the pole-ward edge of low-zoom tiles where the polar raster actually lies.
-        // Taking the minimum across center and pole-ward edge avoids picking an overly coarse overview.
-        if let Self::PolarStereographic(ps) = self {
-            let pole_fy = if ps.south { 0.01 } else { 0.99 };
-            let (prx, pry) = probe(0.5, pole_fy);
-            if prx.is_finite() && pry.is_finite() && prx > 0.0 && pry > 0.0 {
-                if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
-                    rx = rx.min(prx);
-                    ry = ry.min(pry);
-                } else {
-                    rx = prx;
-                    ry = pry;
-                }
-            }
-        }
+        let (rx, ry) = probe(0.5, 0.5);
         if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
             return (rx, ry);
         }
@@ -2170,9 +2154,11 @@ mod tests {
         };
         assert_eq!(ps3031.web_mercator_zoom_range(&p2c_3031, 1024, 1024, 4.0), (2, 2));
         let (rx_3031, ry_3031) = ps3031.target_resolution_for_tile(TileCoord { z: 1, x: 1, y: 1 }, 256);
+        // Tile 1/1/1 is much coarser than the 4x overview (7812.5m), so select_ifd must pick the 4x overview
+        // rather than oversampling finer levels.
         assert!(
-            rx_3031.min(ry_3031) < 7_812.5,
-            "EPSG:3031 tile 1/1/1 must resolve finer than 4x overview (7812.5m), got ({rx_3031}, {ry_3031})"
+            rx_3031.min(ry_3031) >= 7_812.5,
+            "EPSG:3031 tile 1/1/1 should select 4x overview (>= 7812.5m), got ({rx_3031}, {ry_3031})"
         );
 
         // Arctic UPS North EPSG:32661 (1.5e6..2.5e6, 1024×1024) enclosing the North Pole
@@ -2187,9 +2173,11 @@ mod tests {
         };
         assert_eq!(ups.web_mercator_zoom_range(&p2c_ups, 1024, 1024, 4.0), (2, 2));
         let (rx_ups, ry_ups) = ups.target_resolution_for_tile(TileCoord { z: 3, x: 6, y: 0 }, 256);
+        // UPS tile 3/6/0 (~2500 m/px at center) is coarser than 2x overview (1953.1m) and finer than 4x (3906.2m),
+        // so select_ifd picks the 2x overview instead of oversampling full-res (976.6m).
         assert!(
-            rx_ups.min(ry_ups) < 1_953.125,
-            "UPS tile 3/6/0 must resolve finer than 2x overview (1953.1m), got ({rx_ups}, {ry_ups})"
+            rx_ups.min(ry_ups) >= 1_953.125 && rx_ups.min(ry_ups) < 3_906.25,
+            "UPS tile 3/6/0 should select 2x overview (in [1953.1, 3906.25)), got ({rx_ups}, {ry_ups})"
         );
     }
 }
