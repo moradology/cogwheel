@@ -430,6 +430,70 @@ impl TmsDef {
         Some([min_x, min_y, max_x, max_y])
     }
 
+    /// Compute `(min_col, max_col, min_row, max_row)` tile index limits for `wgs84_bounds`
+    /// `[min_lon, min_lat, max_lon, max_lat]` at a given tile matrix, clamped to the matrix grid.
+    pub fn tile_limits_for_wgs84_bounds(
+        &self,
+        m: &TileMatrixDef,
+        wgs84_bounds: [f64; 4],
+    ) -> (u64, u64, u64, u64) {
+        let max_c = m.matrix_width.saturating_sub(1);
+        let max_r = m.matrix_height.saturating_sub(1);
+        let Ok(dst_crs) = self.crs_model() else {
+            return (0, max_c, 0, max_r);
+        };
+        let [w, s, e, n] = wgs84_bounds;
+        let clamp_lat = |lat: f64| -> f64 {
+            if matches!(dst_crs, CrsModel::Epsg3857) {
+                lat.clamp(-85.05112878, 85.05112878)
+            } else {
+                lat.clamp(-90.0, 90.0)
+            }
+        };
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        let steps = 8;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let lon_t = w + t * (e - w);
+            let lat_t = clamp_lat(s + t * (n - s));
+            for &(lon, lat) in &[
+                (lon_t, clamp_lat(s)),
+                (lon_t, clamp_lat(n)),
+                (w, lat_t),
+                (e, lat_t),
+            ] {
+                let (x, y) = dst_crs.from_lonlat_deg(lon, lat);
+                if x.is_finite() && y.is_finite() {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+            return (0, max_c, 0, max_r);
+        }
+        let span_x = (m.cell_size * (m.tile_width as f64)).max(1e-12);
+        let span_y = (m.cell_size * (m.tile_height as f64)).max(1e-12);
+        let c0 = ((min_x - m.origin_x) / span_x)
+            .floor()
+            .clamp(0.0, max_c as f64) as u64;
+        let c1 = (((max_x - m.origin_x) / span_x) - 1e-9)
+            .floor()
+            .clamp(c0 as f64, max_c as f64) as u64;
+        let r0 = ((m.origin_y - max_y) / span_y)
+            .floor()
+            .clamp(0.0, max_r as f64) as u64;
+        let r1 = (((m.origin_y - min_y) / span_y) - 1e-9)
+            .floor()
+            .clamp(r0 as f64, max_r as f64) as u64;
+        (c0, c1, r0, r1)
+    }
+
     /// Compute `(minzoom, maxzoom)` for a COG in this TileMatrixSet.
     pub fn zoom_range_for_cog(
         &self,

@@ -1149,7 +1149,7 @@ fn filter_tile_template_query(raw_query: &str) -> String {
             !pair.is_empty()
                 && !matches!(
                     k,
-                    "minzoom" | "maxzoom" | "tile_format" | "tile_scale" | "use_epsg"
+                    "minzoom" | "maxzoom" | "tile_format" | "tile_scale" | "use_epsg" | "zooms"
                 )
         })
         .collect::<Vec<_>>()
@@ -2432,12 +2432,14 @@ fn build_ogc_tileset_json(
             minzoom.is_none_or(|mn| z >= mn) && maxzoom.is_none_or(|mx| z <= mx)
         })
         .map(|m| {
+            let (min_col, max_col, min_row, max_row) =
+                tms_def.tile_limits_for_wgs84_bounds(m, [w, s, e, n]);
             serde_json::json!({
                 "tileMatrix": m.id,
-                "minTileRow": 0,
-                "maxTileRow": m.matrix_height.saturating_sub(1),
-                "minTileCol": 0,
-                "maxTileCol": m.matrix_width.saturating_sub(1),
+                "minTileRow": min_row,
+                "maxTileRow": max_row,
+                "minTileCol": min_col,
+                "maxTileCol": max_col,
             })
         })
         .collect();
@@ -4248,7 +4250,7 @@ fn header_accepts_gzip(val: &str) -> bool {
     for part in val.split(',') {
         let mut iter = part.split(';');
         let enc = iter.next().unwrap_or("").trim();
-        if !enc.eq_ignore_ascii_case("gzip") && !enc.eq_ignore_ascii_case("x-gzip") {
+        if !enc.eq_ignore_ascii_case("gzip") && !enc.eq_ignore_ascii_case("x-gzip") && enc != "*" {
             continue;
         }
         let mut q_ok = true;
@@ -4275,6 +4277,9 @@ fn is_compressible_content_type(ct: &str) -> bool {
         || media.eq_ignore_ascii_case("application/geo+json")
         || media.eq_ignore_ascii_case("application/xml")
         || media.eq_ignore_ascii_case("application/vnd.oai.openapi+json")
+        || media.eq_ignore_ascii_case("application/x-binary")
+        || media.eq_ignore_ascii_case("application/octet-stream")
+        || media.eq_ignore_ascii_case("image/tiff")
         || media.eq_ignore_ascii_case("image/svg+xml")
         || media.starts_with("text/")
 }
