@@ -548,6 +548,12 @@ def main() -> int:
         for name, shape in (("of a hundred polygons", many), ("nested twelve deep", deep), ("of a polygon and a line", mixed)):
             o.check(f"statistics, a collection {name}", "status", f"/searches/{sid}/statistics?assets=red&max_size=128", "POST", shape)
             o.check(f"feature, a collection {name}", "status", f"/searches/{sid}/feature/96x96.npy?assets=red", "POST", shape)
+        # 16-bit data asked for as a PNG and as it is: a PNG of 16 bits, which the reader of
+        # pictures here takes as it takes any other.
+        o.check("png of 16 bits, one band", "image", f"{base12}.png?assets=red")
+        o.check("png of 16 bits, one band and no mask", "image", f"{base12}.png?assets=red&return_mask=false")
+        o.check("png of 16 bits, three bands", "image", f"{base12}.png?assets=red&assets=green&assets=blue&asset_as_band=true")
+        o.check("png of 16 bits, a bbox", "image", f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75/64x64.png?assets=red")
         # Smoothed pixels on a grid in metres: one reader for all four.
         smoothed_shape = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
             [8.40, 45.70], [8.52, 45.71], [8.50, 45.78], [8.41, 45.76], [8.40, 45.70]]]}}

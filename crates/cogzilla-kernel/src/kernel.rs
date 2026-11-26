@@ -2218,6 +2218,8 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     let r_ptr = r_slice.as_ptr();
     let g_ptr = g_slice.as_ptr();
     let b_ptr = b_slice.as_ptr();
+    #[allow(unused_assignments, unused_mut)]
+    let mut start_px = 0usize;
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -2315,7 +2317,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
             }
             px += 4;
         }
-        return;
+        start_px = px;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2329,15 +2331,14 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
                     &to_f32,
                 );
             }
-            return;
+            start_px = (N / 8) * 8;
         }
     }
 
-    #[allow(unreachable_code)]
-    {
+    if start_px < N {
         let max_x = (stride as i32 - 2).max(0);
         let max_y = ((r_slice.len().min(g_slice.len()).min(b_slice.len()) / stride) as i32 - 2).max(0);
-        for px in 0..N {
+        for px in start_px..N {
         let (x0_raw, fx) = fast_floor_i32(u_row[px] - bc);
         let (y0_raw, fy) = fast_floor_i32(v_row[px] - br);
         let x0 = x0_raw.clamp(0, max_x) as usize;
@@ -4965,6 +4966,8 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
     let sun_u = zenith.cos();
     let neg_z_scale = -z_factor * inv_8dx;
     let pos_z_scale = z_factor * inv_8dx;
+    #[allow(unused_assignments, unused_mut)]
+    let mut start_px = 0usize;
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -5017,7 +5020,7 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
             *out_idx.get_unchecked_mut(px + 3) = tmp[3] as u8;
             px += 4;
         }
-        return;
+        start_px = px;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5038,12 +5041,11 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
                     out_idx,
                 );
             }
-            return;
+            start_px = (N / 8) * 8;
         }
     }
 
-    #[allow(unreachable_code)]
-    for px in 0..N {
+    for px in start_px..N {
         let c = px + 1;
         let val = eval_horn_3x3(
             row0[c - 1], row0[c], row0[c + 1],
@@ -6693,5 +6695,42 @@ mod npy_typed_tests {
         assert_eq!(typed[..144], wrapped[..144]);
         assert_eq!(&typed[144..148], f32::MAX.to_le_bytes());
         assert_eq!(&wrapped[144..148], 255.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn simd_tail_loops_write_all_pixels_for_non_multiple_widths() {
+        // N = 5 is neither a multiple of 4 (NEON) nor 8 (AVX2).
+        let u = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let v = [1.0f32, 1.0, 1.0, 1.0, 1.0];
+        let band = vec![100u8; 64];
+        let mut rgb = [0xAAu8; 5 * 3];
+        bilinear_rgb_single_block_row::<5, u8, _>(
+            &u,
+            &v,
+            &band,
+            &band,
+            &band,
+            0,
+            0,
+            8,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            &mut rgb,
+            |x| x as f32,
+        );
+        assert!(
+            rgb.iter().all(|&b| b == 100),
+            "tail pixel in bilinear_rgb_single_block_row::<5> was not written: {rgb:?}"
+        );
+
+        let r0 = [10.0f32; 7];
+        let r1 = [10.0f32; 7];
+        let r2 = [10.0f32; 7];
+        let mut hs = [0xEEu8; 5];
+        eval_horn_hillshade_row_clean::<5>(&r0, &r1, &r2, 1.0 / 80.0, 315.0, 45.0, 1.0, 1.0, 0.0, &mut hs);
+        assert!(
+            hs.iter().all(|&b| b == hs[0] && b != 0xEE),
+            "tail pixel in eval_horn_hillshade_row_clean::<5> was not written: {hs:?}"
+        );
     }
 }

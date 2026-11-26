@@ -3285,13 +3285,18 @@ fn default_raw_band_count(bands: &BandRequest, pixel_selection: Selection) -> us
     if pixel_selection == Selection::Count {
         return 1;
     }
-    match bands {
+    let raw_nb = match bands {
         BandRequest::Rgb { .. }
         | BandRequest::SarRgb { .. }
         | BandRequest::Terrain { .. }
         | BandRequest::CustomExprRgb { .. } => 3,
         BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
         _ => 1,
+    };
+    if pixel_selection.by_last_band() {
+        raw_nb.saturating_sub(1).max(1)
+    } else {
+        raw_nb
     }
 }
 
@@ -3327,8 +3332,12 @@ async fn render_mosaic_tile_pixel_selection(
         if scene_i > 0 {
             tokio::task::consume_budget().await;
         }
-        let Ok(cog) = engine.store.open_uri(url).await else {
-            continue;
+        let cog = match engine.store.open_uri(url).await {
+            Ok(c) => c,
+            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                return Err(EngineError::Io(e));
+            }
+            Err(_) => continue,
         };
         let cogs = vec![cog];
         let mut scene_bands = treq.bands.clone();
@@ -3375,9 +3384,16 @@ async fn render_mosaic_tile_pixel_selection(
                         "pixel_selection by the last band needs at least two bands".into(),
                     ));
                 }
+                if Fold::<f32>::working_bytes(method, nb, n_px) > MAX_MEDIAN_BUFFER_BYTES {
+                    return Err(EngineError::BadRequest(format!(
+                        "pixel_selection working buffer exceeds memory budget ({} MiB limit); reduce tile_size, buffer, or band count",
+                        MAX_MEDIAN_BUFFER_BYTES / (1024 * 1024)
+                    )));
+                }
                 let integer =
                     reads_whole_numbers(pq.unscale, &scene_bands, cogs[0].index.full_res().sample_type);
-                fold.insert(Fold::new(method, nb, n_px, integer).absent_as(pq.nodata.unwrap_or(0.0)))
+                let absent = pq.nodata.or(cogs[0].index.nodata).unwrap_or(0.0);
+                fold.insert(Fold::new(method, nb, n_px, integer).absent_as(absent))
             }
         };
         if fold.bands() != nb {
@@ -3487,15 +3503,19 @@ async fn render_mosaic_tile_pixel_selection(
             _ => ((0.0, 255.0), pq.colormap),
         };
         let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-        let cf_lut = cf.as_ref().map(|c| {
-            let mut t = [0u8; 256];
-            for i in 0..256 {
-                let mut px = [i as u8, i as u8, i as u8, 255];
-                c.apply_buffer_in_place(&mut px, 4);
-                t[i] = px[0];
-            }
-            t
-        });
+        let cf_lut = if first_lut.is_none() {
+            cf.as_ref().map(|c| {
+                let mut t = [0u8; 256];
+                for i in 0..256 {
+                    let mut px = [i as u8, i as u8, i as u8, 255];
+                    c.apply_buffer_in_place(&mut px, 4);
+                    t[i] = px[0];
+                }
+                t
+            })
+        } else {
+            None
+        };
         let lut = cmap.lut();
         for i in 0..n_px {
             let v = combined[i];
@@ -3511,6 +3531,11 @@ async fn render_mosaic_tile_pixel_selection(
                 };
                 rgba[i * 4..i * 4 + 4].copy_from_slice(&px);
             }
+        }
+        if cf_lut.is_none()
+            && let Some(ref cf) = cf
+        {
+            cf.apply_buffer_in_place(&mut rgba, 4);
         }
     }
     Ok(encode_rgba_output(
