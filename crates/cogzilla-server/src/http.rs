@@ -1639,21 +1639,38 @@ fn wgs84_bboxes_intersect(a: [f64; 4], b: [f64; 4]) -> bool {
     if an < bs || as_ > bn {
         return false;
     }
-    let lon_overlaps = |w1: f64, e1: f64, w2: f64, e2: f64| -> bool {
-        if w2 <= e2 {
-            e1 >= w2 && w1 <= e2
+    // Split any longitude interval [w, e] into 1 or 2 normalized segments in [-180, 180].
+    let split_lon = |w: f64, e: f64| -> [(f64, f64); 2] {
+        if e - w >= 360.0 {
+            return [(-180.0, 180.0), (f64::NAN, f64::NAN)];
+        }
+        if w > e {
+            // RFC 7946 antimeridian-crossing [w..180] U [-180..e]
+            [(w.clamp(-180.0, 180.0), 180.0), (-180.0, e.clamp(-180.0, 180.0))]
+        } else if w < -180.0 {
+            [(-180.0, e.min(180.0)), ((w + 360.0).max(-180.0), 180.0)]
+        } else if e > 180.0 {
+            [(w.max(-180.0), 180.0), (-180.0, (e - 360.0).min(180.0))]
         } else {
-            e1 >= w2 || w1 <= e2
+            [(w, e), (f64::NAN, f64::NAN)]
         }
     };
-    if aw <= ae {
-        let primary = lon_overlaps(aw.max(-180.0), ae.min(180.0), bw, be);
-        let wrap_w = aw < -180.0 && lon_overlaps((aw + 360.0).max(-180.0), 180.0, bw, be);
-        let wrap_e = ae > 180.0 && lon_overlaps(-180.0, (ae - 360.0).min(180.0), bw, be);
-        primary || wrap_w || wrap_e
-    } else {
-        lon_overlaps(aw, 180.0, bw, be) || lon_overlaps(-180.0, ae, bw, be)
+    let segs_a = split_lon(aw, ae);
+    let segs_b = split_lon(bw, be);
+    for (w1, e1) in segs_a {
+        if !w1.is_finite() {
+            continue;
+        }
+        for (w2, e2) in segs_b {
+            if !w2.is_finite() {
+                continue;
+            }
+            if e1 >= w2 && w1 <= e2 {
+                return true;
+            }
+        }
     }
+    false
 }
 
 /// Exact geometric test: returns `true` iff at least one point of the tile box `tb` in `dst_crs`
