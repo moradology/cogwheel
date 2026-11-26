@@ -3,11 +3,19 @@
 //!
 //! `b1+b2;b2-b1` gives two values. Each result is described by the expression with every
 //! `bN` replaced by that band's description (`red_b1+nir_b1`).
+//!
+//! Beyond arithmetic, numexpr's grammar is read as numexpr reads it: comparisons (true is 1),
+//! `&`, `|` and `~` (on comparisons, logic; on whole numbers, bits), `//`, `where(c, a, b)`,
+//! and its functions of one and two arguments. A program that uses any of that says so
+//! ([`Program::plain`]): band math over planes, whose arrays are typed from the expression's
+//! text, reads plain arithmetic only.
 
 /// A parsed expression: one tree per `;`-separated part.
 pub(super) struct Program {
     /// Each part's tree, its text, and the bands it reads, by index.
     parts: Vec<(Node, String, Box<[usize]>)>,
+    /// Whether any part goes beyond arithmetic and the first functions.
+    extended: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +25,47 @@ enum Node {
     Neg(Box<Node>),
     Bin(u8, Box<Node>, Box<Node>),
     Call(fn(f64) -> f64, Box<Node>),
+    /// Anything beyond arithmetic, boxed so that a node stays as small as plain band math,
+    /// whose loop over a plane's pixels walks these trees, needs it.
+    More(Box<More>),
+}
+
+#[derive(Debug, Clone)]
+enum More {
+    Call2(fn(f64, f64) -> f64, Node, Node),
+    /// A comparison, 1 where it holds and 0 where not.
+    Cmp(Cmp, Node, Node),
+    /// `&` (`true`) or `|` (`false`): logic over comparisons, bits over whole numbers.
+    Bits(bool, Node, Node),
+    /// `~`: not, over a comparison; the bits turned over, over a whole number.
+    Not(Node),
+    /// Python's floor division, which numexpr follows.
+    FloorDiv(Node, Node),
+    Where(Node, Node, Node),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// `x` as a whole number for numexpr's bit operations, which take no fractions.
+fn whole(x: f64) -> Option<i64> {
+    (x.is_finite() && x.fract() == 0.0 && x.abs() < 9.0e15).then_some(x as i64)
+}
+
+/// numpy's `minimum` and `maximum`: a NaN on either side is the answer.
+fn minimum(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+}
+
+fn maximum(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
 }
 
 impl Node {
@@ -39,6 +88,7 @@ impl Node {
                 }
             }
             Node::Call(f, a) => f(a.eval(bands)),
+            Node::More(more) => more.eval(bands),
         }
     }
 
@@ -56,7 +106,85 @@ impl Node {
                 a.reads(into);
                 b.reads(into);
             }
+            Node::More(more) => more.reads(into),
         }
+    }
+}
+
+impl More {
+    /// [`Node::eval`] for what goes beyond arithmetic and the first functions: worked out
+    /// apart, and never folded into that loop.
+    #[inline(never)]
+    fn eval(&self, bands: &[f64]) -> f64 {
+        match self {
+            More::FloorDiv(a, b) => (a.eval(bands) / b.eval(bands)).floor(),
+            More::Call2(f, a, b) => f(a.eval(bands), b.eval(bands)),
+            More::Cmp(op, a, b) => {
+                let (a, b) = (a.eval(bands), b.eval(bands));
+                if a.is_nan() || b.is_nan() {
+                    return f64::NAN;
+                }
+                let holds = match op {
+                    Cmp::Lt => a < b,
+                    Cmp::Le => a <= b,
+                    Cmp::Gt => a > b,
+                    Cmp::Ge => a >= b,
+                    Cmp::Eq => a == b,
+                    Cmp::Ne => a != b,
+                };
+                f64::from(u8::from(holds))
+            }
+            More::Bits(and, a, b) => match (whole(a.eval(bands)), whole(b.eval(bands))) {
+                (Some(a), Some(b)) => (if *and { a & b } else { a | b }) as f64,
+                _ => f64::NAN,
+            },
+            More::Not(a) => {
+                let v = a.eval(bands);
+                if is_logical(a) {
+                    if v.is_nan() { v } else { 1.0 - v }
+                } else {
+                    whole(v).map_or(f64::NAN, |v| !v as f64)
+                }
+            }
+            More::Where(c, a, b) => {
+                let c = c.eval(bands);
+                if c.is_nan() {
+                    f64::NAN
+                } else if c != 0.0 {
+                    a.eval(bands)
+                } else {
+                    b.eval(bands)
+                }
+            }
+        }
+    }
+
+    fn reads(&self, into: &mut Vec<usize>) {
+        match self {
+            More::Not(a) => a.reads(into),
+            More::Call2(_, a, b) | More::Cmp(_, a, b) | More::Bits(_, a, b) | More::FloorDiv(a, b) => {
+                a.reads(into);
+                b.reads(into);
+            }
+            More::Where(c, a, b) => {
+                c.reads(into);
+                a.reads(into);
+                b.reads(into);
+            }
+        }
+    }
+}
+
+/// Whether a tree is true or false rather than a number: what `~` turns over as logic.
+fn is_logical(node: &Node) -> bool {
+    match node {
+        Node::More(more) => match more.as_ref() {
+            More::Cmp(..) => true,
+            More::Bits(_, a, b) => is_logical(a) && is_logical(b),
+            More::Not(a) => is_logical(a),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -69,12 +197,14 @@ impl Program {
             return Err(format!("expression is longer than {MAX_EXPRESSION_BYTES} bytes"));
         }
         let mut parts = Vec::new();
+        let mut extended = false;
         for part in expression.split(';').map(str::trim).filter(|p| !p.is_empty()) {
             if parts.len() == MAX_RESULTS {
                 return Err(format!("expression has more than {MAX_RESULTS} results"));
             }
-            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands, depth: 0 };
-            let node = parser.sum()?;
+            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands, depth: 0, extended: false };
+            let node = parser.comparison()?;
+            extended |= parser.extended;
             parser.skip_space();
             if parser.pos != parser.src.len() {
                 return Err(format!("Invalid expression '{part}'"));
@@ -86,7 +216,13 @@ impl Program {
         if parts.is_empty() {
             return Err("Invalid expression ''".into());
         }
-        Ok(Self { parts })
+        Ok(Self { parts, extended })
+    }
+
+    /// Whether the expression is arithmetic and the first functions only (`sqrt`, `log`,
+    /// `floor`...), whose type the shared typing of band math reads from the text.
+    pub(super) fn plain(&self) -> bool {
+        !self.extended
     }
 
     /// How many values the expression gives.
@@ -147,9 +283,9 @@ pub(super) fn apply(
     Ok((out, program.describe(descriptions)))
 }
 
-/// `b3` -> `Some(2)`.
+/// `b3` (or `B3`, as rio-tiler takes it) -> `Some(2)`.
 fn band_index(ident: &str) -> Option<usize> {
-    let n: usize = ident.strip_prefix('b')?.parse().ok()?;
+    let n: usize = ident.strip_prefix(['b', 'B'])?.parse().ok()?;
     n.checked_sub(1)
 }
 
@@ -189,6 +325,8 @@ struct Parser<'a> {
     bands: usize,
     /// How many operands are open around the one being read.
     depth: usize,
+    /// Whether anything beyond arithmetic and the first functions was read.
+    extended: bool,
 }
 
 impl Parser<'_> {
@@ -206,6 +344,51 @@ impl Parser<'_> {
         } else {
             false
         }
+    }
+
+    /// One comparison at most, as numexpr has them: `a < b < c` is not read.
+    fn comparison(&mut self) -> Result<Node, String> {
+        let left = self.bit_or()?;
+        self.skip_space();
+        let rest = &self.src[self.pos..];
+        let op = if rest.starts_with(b"<=") {
+            Some((Cmp::Le, 2))
+        } else if rest.starts_with(b">=") {
+            Some((Cmp::Ge, 2))
+        } else if rest.starts_with(b"==") {
+            Some((Cmp::Eq, 2))
+        } else if rest.starts_with(b"!=") {
+            Some((Cmp::Ne, 2))
+        } else if rest.starts_with(b"<") && !rest.starts_with(b"<<") {
+            Some((Cmp::Lt, 1))
+        } else if rest.starts_with(b">") && !rest.starts_with(b">>") {
+            Some((Cmp::Gt, 1))
+        } else {
+            None
+        };
+        let Some((op, len)) = op else { return Ok(left) };
+        self.pos += len;
+        self.extended = true;
+        let right = self.bit_or()?;
+        Ok(Node::More(Box::new(More::Cmp(op, left, right))))
+    }
+
+    fn bit_or(&mut self) -> Result<Node, String> {
+        let mut v = self.bit_and()?;
+        while self.eat("|") {
+            self.extended = true;
+            v = Node::More(Box::new(More::Bits(false, v, self.bit_and()?)));
+        }
+        Ok(v)
+    }
+
+    fn bit_and(&mut self) -> Result<Node, String> {
+        let mut v = self.sum()?;
+        while self.eat("&") {
+            self.extended = true;
+            v = Node::More(Box::new(More::Bits(true, v, self.sum()?)));
+        }
+        Ok(v)
     }
 
     fn sum(&mut self) -> Result<Node, String> {
@@ -231,6 +414,9 @@ impl Parser<'_> {
             }
             if self.eat("*") {
                 v = Node::Bin(b'*', Box::new(v), Box::new(self.unary()?));
+            } else if self.eat("//") {
+                self.extended = true;
+                v = Node::More(Box::new(More::FloorDiv(v, self.unary()?)));
             } else if self.eat("/") {
                 v = Node::Bin(b'/', Box::new(v), Box::new(self.unary()?));
             } else if self.eat("%") {
@@ -259,6 +445,10 @@ impl Parser<'_> {
         if self.eat("+") {
             return self.unary();
         }
+        if self.eat("~") {
+            self.extended = true;
+            return Ok(Node::More(Box::new(More::Not(self.unary()?))));
+        }
         let base = self.primary()?;
         if self.eat("**") {
             // Right-associative, and binds tighter than a leading minus on its right.
@@ -275,7 +465,7 @@ impl Parser<'_> {
         };
         if c == b'(' {
             self.pos += 1;
-            let v = self.sum()?;
+            let v = self.comparison()?;
             if !self.eat(")") {
                 return Err("Invalid expression: missing ')'".into());
             }
@@ -309,27 +499,17 @@ impl Parser<'_> {
             }
             let ident = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
             if self.eat("(") {
-                let arg = self.sum()?;
+                let mut args = vec![self.comparison()?];
+                while self.eat(",") {
+                    if args.len() == 3 {
+                        return Err(format!("function '{ident}' takes at most three arguments"));
+                    }
+                    args.push(self.comparison()?);
+                }
                 if !self.eat(")") {
                     return Err("Invalid expression: missing ')'".into());
                 }
-                let function: fn(f64) -> f64 = match ident {
-                    "sqrt" => f64::sqrt,
-                    "abs" => f64::abs,
-                    "exp" => f64::exp,
-                    "log" => f64::ln,
-                    "log10" => f64::log10,
-                    "sin" => f64::sin,
-                    "cos" => f64::cos,
-                    "tan" => f64::tan,
-                    "arcsin" => f64::asin,
-                    "arccos" => f64::acos,
-                    "arctan" => f64::atan,
-                    "floor" => f64::floor,
-                    "ceil" => f64::ceil,
-                    other => return Err(format!("function '{other}' is not supported in expressions")),
-                };
-                return Ok(Node::Call(function, Box::new(arg)));
+                return self.call(ident, args);
             }
             return match band_index(ident).filter(|n| *n < self.bands) {
                 Some(n) => Ok(Node::Band(n)),
@@ -337,6 +517,79 @@ impl Parser<'_> {
             };
         }
         Err(format!("Invalid expression: unexpected '{}'", c as char))
+    }
+
+    /// A call of `ident` on `args`, by numexpr's functions.
+    fn call(&mut self, ident: &str, mut args: Vec<Node>) -> Result<Node, String> {
+        let arity = |n: usize| {
+            if args.len() == n {
+                Ok(())
+            } else {
+                Err(format!("function '{ident}' takes {n} argument{}", if n == 1 { "" } else { "s" }))
+            }
+        };
+        let two: Option<fn(f64, f64) -> f64> = match ident {
+            "arctan2" => Some(f64::atan2),
+            "fmod" => Some(|a, b| a % b),
+            "minimum" => Some(minimum),
+            "maximum" => Some(maximum),
+            _ => None,
+        };
+        if let Some(function) = two {
+            arity(2)?;
+            self.extended = true;
+            let b = args.pop().unwrap_or(Node::Num(f64::NAN));
+            let a = args.pop().unwrap_or(Node::Num(f64::NAN));
+            return Ok(Node::More(Box::new(More::Call2(function, a, b))));
+        }
+        if ident == "where" {
+            arity(3)?;
+            self.extended = true;
+            let b = args.pop().unwrap_or(Node::Num(f64::NAN));
+            let a = args.pop().unwrap_or(Node::Num(f64::NAN));
+            let c = args.pop().unwrap_or(Node::Num(f64::NAN));
+            return Ok(Node::More(Box::new(More::Where(c, a, b))));
+        }
+        arity(1)?;
+        let arg = args.pop().unwrap_or(Node::Num(f64::NAN));
+        let later: Option<fn(f64) -> f64> = match ident {
+            "log1p" => Some(f64::ln_1p),
+            "expm1" => Some(f64::exp_m1),
+            "sinh" => Some(f64::sinh),
+            "cosh" => Some(f64::cosh),
+            "tanh" => Some(f64::tanh),
+            "arcsinh" => Some(f64::asinh),
+            "arccosh" => Some(f64::acosh),
+            "arctanh" => Some(f64::atanh),
+            // numpy rounds a half to the even neighbour.
+            "round" => Some(f64::round_ties_even),
+            "real" => Some(|x| x),
+            // One where the argument has a value; nowhere, as everything, where it has none.
+            "ones_like" => Some(|x| if x.is_nan() { x } else { 1.0 }),
+            _ => None,
+        };
+        if let Some(function) = later {
+            self.extended = true;
+            return Ok(Node::Call(function, Box::new(arg)));
+        }
+        // The functions every expression reader here has always taken.
+        let function: fn(f64) -> f64 = match ident {
+            "sqrt" => f64::sqrt,
+            "abs" => f64::abs,
+            "exp" => f64::exp,
+            "log" => f64::ln,
+            "log10" => f64::log10,
+            "sin" => f64::sin,
+            "cos" => f64::cos,
+            "tan" => f64::tan,
+            "arcsin" => f64::asin,
+            "arccos" => f64::acos,
+            "arctan" => f64::atan,
+            "floor" => f64::floor,
+            "ceil" => f64::ceil,
+            other => return Err(format!("function '{other}' is not supported in expressions")),
+        };
+        Ok(Node::Call(function, Box::new(arg)))
     }
 }
 
@@ -377,6 +630,49 @@ mod tests {
         assert_eq!(one("b2 % (-b3)"), -1.0);
         // b10 is not b1 followed by a zero.
         assert_eq!(run("b10", &v).unwrap_err(), "Invalid band/asset name 'b10'");
+    }
+
+    #[test]
+    fn numexpr_beyond_arithmetic() {
+        // Values titiler-pgstac returned for a pixel of 77, 81 (visual_b1, visual_b2).
+        let v = [Some(77.0), Some(81.0)];
+        let one = |e: &str| run(e, &v).unwrap().0[0].unwrap();
+        assert_eq!(one("b1>=b2"), 0.0);
+        assert_eq!(one("b1!=b2"), 1.0);
+        assert_eq!(one("~(b1>100)"), 1.0);
+        assert_eq!(one("(b1>1)&(b2<9000)"), 1.0);
+        assert_eq!(one("b1//7"), 11.0);
+        assert_eq!(one("round(b1/7)"), 11.0);
+        assert_eq!(one("log1p(b1)"), 4.356708826689592);
+        assert_eq!(one("where(b1>b2,b1,b2)"), 81.0);
+        assert_eq!(one("arctan2(b1,b2)"), 0.7600871142546);
+        assert_eq!(one("minimum(b1,b2)"), 77.0);
+        assert_eq!(one("fmod(b1,7)"), 0.0);
+        assert_eq!(one("B1+B2"), 158.0);
+        assert_eq!(one("ones_like(b1)"), 1.0);
+        // Bits over whole numbers, as numexpr's integers.
+        assert_eq!(one("b1&b2"), f64::from(77 & 81));
+        assert_eq!(one("b1|b2"), f64::from(77 | 81));
+        assert_eq!(one("~b1"), -78.0);
+        // numpy rounds a half to the even neighbour.
+        assert_eq!(one("round(2.5)+b1*0"), 2.0);
+        // A comparison binds looser than `|`, so this is `b1 > (100|b2) > 5`: a chain, which
+        // numexpr fails on too.
+        assert!(run("b1>100|b2>5", &v).is_err());
+        assert!(run("b1<b2<3", &v).is_err());
+        assert_eq!(one("(b1>100)|(b2>5)"), 1.0);
+        assert!(run("where(b1,b2)", &v).unwrap_err().contains("takes 3 arguments"));
+        assert!(run("minimum(b1)", &v).unwrap_err().contains("takes 2 arguments"));
+        assert!(run("f(b1,b2,b1,b2)", &v).unwrap_err().contains("at most three"));
+        assert!(run("b1<<b2", &v).is_err());
+        // A band with no value is no value through all of it.
+        assert_eq!(run("where(b1>0,1,0);~(b1>0)", &[None, Some(1.0)]).unwrap().0, [None, None]);
+        // Who reads what: plain arithmetic, or more.
+        assert!(Program::parse("(b2-b1)/(b2+b1)*sqrt(b1)", 2).unwrap().plain());
+        for e in ["b1>1", "b1//2", "~b1", "where(b1>1,b1,0)", "log1p(b1)", "b1&b2", "minimum(b1,b2)"] {
+            assert!(!Program::parse(e, 2).unwrap().plain(), "{e}");
+        }
+        assert_eq!(run("B1+b2", &v).unwrap().1, ["red_b1+nir_b1"]);
     }
 
     #[test]
