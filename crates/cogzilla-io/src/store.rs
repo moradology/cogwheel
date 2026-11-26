@@ -574,17 +574,30 @@ impl CogStore {
 
     /// Evict a cached URI (optionally only if its `OpenedCog::id` matches `expected_id`) and
     /// advance `invalidation_epoch` so downstream caches flush stale rendered tiles.
+    /// Never evicts `OpenSlot::InFlight` entries so concurrent waiters are always woken by the owner.
     pub fn invalidate_uri(&self, uri: &str, expected_id: Option<u64>) {
         let removed = match expected_id {
             Some(id) => self
                 .datasets_by_uri
                 .remove_if(uri, |_, slot| matches!(slot, OpenSlot::Ready { cog, .. } if cog.id == id))
                 .is_some(),
-            None => self.datasets_by_uri.remove(uri).is_some(),
+            None => self
+                .datasets_by_uri
+                .remove_if(uri, |_, slot| matches!(slot, OpenSlot::Ready { .. }))
+                .is_some(),
         };
         if removed {
             self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    /// Evict all cached `Ready` `OpenedCog` entries (leaving any `InFlight` opens intact) and
+    /// advance `invalidation_epoch`. Called by `POST /admin/clear-cache` so overwritten Cloud COGs
+    /// (`s3://`, `gs://`, `az://`) re-read fresh IFD headers on the next request.
+    pub fn clear_open_uris(&self) {
+        self.datasets_by_uri
+            .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
+        self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Validate a cached `OpenedCog` against its backing source.
@@ -769,7 +782,7 @@ impl CogStore {
             let mut open_guard = OpenAbortGuard {
                 map: &self.datasets_by_uri,
                 uri: uri.to_string(),
-                flight: my_flight,
+                flight: my_flight.clone(),
                 done: false,
             };
 
@@ -926,13 +939,18 @@ impl CogStore {
             open_guard.done = true;
             match open_res {
                 Ok(cog) => {
-                    if let Some(OpenSlot::InFlight(f)) = self.datasets_by_uri.insert(
+                    my_flight.set_outcome(Ok(cog.clone()));
+                    let prev = self.datasets_by_uri.insert(
                         uri.to_string(),
                         OpenSlot::Ready {
                             cog: cog.clone(),
                             last_used: AtomicU64::new(self.uri_tick()),
                         },
-                    ) {
+                    );
+                    my_flight.notify.notify_waiters();
+                    if let Some(OpenSlot::InFlight(f)) = prev
+                        && !Arc::ptr_eq(&f, &my_flight)
+                    {
                         f.set_outcome(Ok(cog.clone()));
                         f.notify.notify_waiters();
                     }
@@ -943,18 +961,17 @@ impl CogStore {
                 }
                 Err(err) => {
                     let shared = Arc::new(err);
-                    // Set outcome while holding the shard lock before removing the InFlight entry
-                    // so no waiter can observe `None` in both the map and `take_outcome()`.
-                    if let Some((_, OpenSlot::InFlight(f))) =
-                        self.datasets_by_uri.remove_if(uri, |_, v| {
-                            if let OpenSlot::InFlight(f) = v {
-                                f.set_outcome(Err(shared.clone()));
-                                true
-                            } else {
-                                false
-                            }
-                        })
+                    // Set outcome before removing the InFlight entry so no waiter can observe
+                    // `None` in both the map and `take_outcome()`.
+                    my_flight.set_outcome(Err(shared.clone()));
+                    let removed = self.datasets_by_uri.remove_if(uri, |_, v| {
+                        matches!(v, OpenSlot::InFlight(cur) if Arc::ptr_eq(cur, &my_flight))
+                    });
+                    my_flight.notify.notify_waiters();
+                    if let Some((_, OpenSlot::InFlight(f))) = removed
+                        && !Arc::ptr_eq(&f, &my_flight)
                     {
+                        f.set_outcome(Err(shared.clone()));
                         f.notify.notify_waiters();
                     }
                     return Err(IoError::Shared(shared));
@@ -1873,10 +1890,16 @@ impl CogStore {
                                                 let mut mset = tokio::task::JoinSet::new();
                                                 for ms in mspans {
                                                     let src = cog.source.clone();
+                                                    let rv = remote_val.clone();
                                                     mset.spawn(async move {
                                                         let b = src
-                                                            .fetch_range(ms.start, ms.end)
-                                                            .await?;
+                                                            .fetch_range_with_meta(
+                                                                ms.start,
+                                                                ms.end,
+                                                                rv.as_ref(),
+                                                            )
+                                                            .await?
+                                                            .bytes;
                                                         Ok::<_, IoError>((ms, b))
                                                     });
                                                 }
@@ -1956,10 +1979,16 @@ impl CogStore {
                                             let mut aset = tokio::task::JoinSet::new();
                                             for aspan in aspans {
                                                 let src = cog.source.clone();
+                                                let rv = remote_val.clone();
                                                 aset.spawn(async move {
                                                     let b = src
-                                                        .fetch_range(aspan.start, aspan.end)
-                                                        .await?;
+                                                        .fetch_range_with_meta(
+                                                            aspan.start,
+                                                            aspan.end,
+                                                            rv.as_ref(),
+                                                        )
+                                                        .await?
+                                                        .bytes;
                                                     Ok::<_, IoError>((aspan, b))
                                                 });
                                             }
@@ -2273,7 +2302,18 @@ impl CogStore {
                 available: 0,
             })
         })?;
-        let raw = cog.source.fetch_range(offset, end).await?;
+        let raw = match cog
+            .source
+            .fetch_range_with_meta(offset, end, cog.remote_validator())
+            .await
+        {
+            Ok(resp) => resp.bytes,
+            Err(e @ IoError::SourceChanged { .. }) => {
+                self.invalidate_uri(&cog.uri, Some(cog.id));
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         if raw.len() < want {
             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
                 required: end,
@@ -2401,7 +2441,7 @@ impl CogStore {
                                 continue;
                             }
                         }
-                        return Err(IoError::Http(e.without_url()));
+                        return Err(crate::backend::io_error_from_reqwest(e));
                     }
                 };
                 let status = resp.status().as_u16();
@@ -2447,7 +2487,7 @@ impl CogStore {
                                 continue;
                             }
                         }
-                        return Err(IoError::Http(e.without_url()));
+                        return Err(crate::backend::io_error_from_reqwest(e));
                     }
                     Err(e) => return Err(e),
                 }
