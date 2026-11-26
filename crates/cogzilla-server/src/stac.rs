@@ -146,7 +146,10 @@ fn resolve_href(item_uri: &str, href: &str) -> String {
     } else if href.starts_with('/') {
         href.to_string()
     } else {
-        let local = item_uri.strip_prefix("file://").unwrap_or(item_uri);
+        let local = match cogzilla_io::strip_file_uri_prefix(item_uri) {
+            Ok(Some(path)) => path,
+            _ => item_uri,
+        };
         let parent = Path::new(local).parent().unwrap_or_else(|| Path::new("."));
         parent
             .join(href)
@@ -683,6 +686,14 @@ mod tests {
         assert_eq!(
             resolve_href("/vsis3/mybucket/stac/items/item.json", "../cogs/B04.tif"),
             "/vsis3/mybucket/stac/cogs/B04.tif"
+        );
+        assert_eq!(
+            resolve_href("file://localhost/allowed/items/item.json", "B04.tif"),
+            "/allowed/items/B04.tif"
+        );
+        assert_eq!(
+            resolve_href("file:///allowed/items/item.json", "B04.tif"),
+            "/allowed/items/B04.tif"
         );
     }
 }
