@@ -5392,6 +5392,7 @@ enum BboxRenderOutput {
 /// fallback path is actually taken.
 enum BboxCoordMap {
     Separable { u_cols: Vec<f32>, v_rows: Vec<f32> },
+    Grid2D { grid_u: [f32; 289], grid_v: [f32; 289] },
     Exact2D { u_map: Vec<f32>, v_map: Vec<f32> },
 }
 
@@ -5413,6 +5414,32 @@ impl BboxCoordMap {
                         if u_cols[px].is_finite() {
                             v_map[row_off + px] = vv;
                         }
+                    }
+                }
+                (u_map, v_map)
+            }
+            Self::Grid2D { grid_u, grid_v } => {
+                let mut u_map = vec![f32::NAN; w * h];
+                let mut v_map = vec![f32::NAN; w * h];
+                let inv_w = 16.0f32 / (w as f32);
+                let inv_h = 16.0f32 / (h as f32);
+                for py in 0..h {
+                    let gy_f = (py as f32) * inv_h;
+                    let gy = (gy_f as usize).min(15);
+                    let ty = gy_f - (gy as f32);
+                    let r0 = gy * 17;
+                    let r1 = (gy + 1) * 17;
+                    let row_off = py * w;
+                    for px in 0..w {
+                        let gx_f = (px as f32) * inv_w;
+                        let gx = (gx_f as usize).min(15);
+                        let tx = gx_f - (gx as f32);
+                        let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+                        let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+                        let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+                        let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+                        u_map[row_off + px] = u_l + (u_r - u_l) * tx;
+                        v_map[row_off + px] = v_l + (v_r - v_l) * tx;
                     }
                 }
                 (u_map, v_map)
@@ -5849,7 +5876,161 @@ async fn render_bbox_core(
             }
             (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
         } else {
-        let build_uv_maps = {
+            // Try 17x17 coarse Grid2D fast path (2.3 KB vs 128 MB Exact2D!) for unmasked curved
+            // projections (UTM, Albers, LCC, Polar Stereo) when all 289 control knots are finite
+            // and 4 interior midpoint probes verify bilinear error < 0.05 source pixels.
+            let grid2d_fast = if poly_mask.is_none() && ifd.gcp_poly.is_none() {
+                let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+                let crs_to_pixel = ifd.crs_to_pixel;
+                let ifd_w_f = ifd.width as f32;
+                let ifd_h_f = ifd.height as f32;
+                let project_px = |px_f: f64, py_f: f64| -> (f32, f32) {
+                    let x = bbox[0] + (px_f + 0.5) * dlx;
+                    let y = bbox[3] - (py_f + 0.5) * dly;
+                    let (mut sx, sy) = match dst_crs {
+                        cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                        cogzilla_proj::CrsModel::Geographic => {
+                            let lon = if x > 180.0 { x - 360.0 } else { x };
+                            crs.from_lonlat_deg(lon, y)
+                        }
+                        other => {
+                            let (lon, lat) = other.to_lonlat_deg(x, y);
+                            if lon.is_finite() && lat.is_finite() {
+                                crs.from_lonlat_deg(lon, lat)
+                            } else {
+                                (f64::NAN, f64::NAN)
+                            }
+                        }
+                    };
+                    if let Some(lo) = wrap_lo
+                        && sx.is_finite()
+                        && sx < lo
+                    {
+                        sx += 360.0;
+                    }
+                    if sx.is_finite() && sy.is_finite() {
+                        let (col, row) = crs_to_pixel.forward(sx, sy);
+                        ((col - 0.5) as f32, (row - 0.5) as f32)
+                    } else {
+                        (f32::NAN, f32::NAN)
+                    }
+                };
+                let mut grid_u = [0.0f32; 289];
+                let mut grid_v = [0.0f32; 289];
+                let mut all_finite = true;
+                let cell_x = (w as f64) / 16.0;
+                let cell_y = (h as f64) / 16.0;
+                'grid: for gy in 0..17usize {
+                    let py_f = (gy as f64) * cell_y;
+                    for gx in 0..17usize {
+                        let px_f = (gx as f64) * cell_x;
+                        let (uu, vv) = project_px(px_f, py_f);
+                        if !uu.is_finite() || !vv.is_finite() {
+                            all_finite = false;
+                            break 'grid;
+                        }
+                        grid_u[gy * 17 + gx] = uu;
+                        grid_v[gy * 17 + gx] = vv;
+                    }
+                }
+                if all_finite {
+                    // Verify curvature accuracy at 4 interior cell midpoints (< 0.05 px).
+                    let mut accurate = true;
+                    for (gx_i, gy_i) in [(3usize, 3usize), (11, 3), (3, 11), (11, 11)] {
+                        let (ex_u, ex_v) =
+                            project_px((gx_i as f64 + 0.5) * cell_x, (gy_i as f64 + 0.5) * cell_y);
+                        let i00 = gy_i * 17 + gx_i;
+                        let bi_u = 0.25
+                            * (grid_u[i00]
+                                + grid_u[i00 + 1]
+                                + grid_u[i00 + 17]
+                                + grid_u[i00 + 18]);
+                        let bi_v = 0.25
+                            * (grid_v[i00]
+                                + grid_v[i00 + 1]
+                                + grid_v[i00 + 17]
+                                + grid_v[i00 + 18]);
+                        if !ex_u.is_finite()
+                            || !ex_v.is_finite()
+                            || (ex_u - bi_u).abs() > 0.05
+                            || (ex_v - bi_v).abs() > 0.05
+                        {
+                            accurate = false;
+                            break;
+                        }
+                    }
+                    if accurate {
+                        let mut min_u = f32::INFINITY;
+                        let mut max_u = f32::NEG_INFINITY;
+                        let mut min_v = f32::INFINITY;
+                        let mut max_v = f32::NEG_INFINITY;
+                        let mut track = |uu: f32, vv: f32| {
+                            min_u = min_u.min(uu);
+                            max_u = max_u.max(uu);
+                            min_v = min_v.min(vv);
+                            max_v = max_v.max(vv);
+                        };
+                        for gy in 0..16usize {
+                            for gx in 0..16usize {
+                                track(grid_u[gy * 17 + gx], grid_v[gy * 17 + gx]);
+                            }
+                        }
+                        let tx_end = ((w.saturating_sub(1) as f32) * 16.0 / (w as f32) - 15.0)
+                            .clamp(0.0, 1.0);
+                        let ty_end = ((h.saturating_sub(1) as f32) * 16.0 / (h as f32) - 15.0)
+                            .clamp(0.0, 1.0);
+                        for gy in 0..16usize {
+                            let i0 = gy * 17 + 15;
+                            let i1 = gy * 17 + 16;
+                            track(
+                                grid_u[i0] + tx_end * (grid_u[i1] - grid_u[i0]),
+                                grid_v[i0] + tx_end * (grid_v[i1] - grid_v[i0]),
+                            );
+                        }
+                        for gx in 0..16usize {
+                            let i0 = 15 * 17 + gx;
+                            let i1 = 16 * 17 + gx;
+                            track(
+                                grid_u[i0] + ty_end * (grid_u[i1] - grid_u[i0]),
+                                grid_v[i0] + ty_end * (grid_v[i1] - grid_v[i0]),
+                            );
+                        }
+                        let c00 = 15 * 17 + 15;
+                        let c10 = 15 * 17 + 16;
+                        let c01 = 16 * 17 + 15;
+                        let c11 = 16 * 17 + 16;
+                        let u_t = grid_u[c00] + tx_end * (grid_u[c10] - grid_u[c00]);
+                        let u_b = grid_u[c01] + tx_end * (grid_u[c11] - grid_u[c01]);
+                        let v_t = grid_v[c00] + tx_end * (grid_v[c10] - grid_v[c00]);
+                        let v_b = grid_v[c01] + tx_end * (grid_v[c11] - grid_v[c01]);
+                        track(u_t + ty_end * (u_b - u_t), v_t + ty_end * (v_b - v_t));
+
+                        if max_u < -1.0 || min_u > ifd_w_f || max_v < -1.0 || min_v > ifd_h_f {
+                            min_u = f32::INFINITY;
+                            max_u = f32::NEG_INFINITY;
+                            min_v = f32::INFINITY;
+                            max_v = f32::NEG_INFINITY;
+                        }
+                        Some((
+                            BboxCoordMap::Grid2D { grid_u, grid_v },
+                            min_u,
+                            max_u,
+                            min_v,
+                            max_v,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(res) = grid2d_fast {
+                res
+            } else {
+            let build_uv_maps = {
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
@@ -6176,6 +6357,7 @@ async fn render_bbox_core(
         build_uv_maps()
     };
     (BboxCoordMap::Exact2D { u_map, v_map }, min_u, max_u, min_v, max_v)
+    }
     }
     };
 
@@ -6730,6 +6912,14 @@ async fn render_bbox_core(
                         crate::gpu_backend::BboxCoordSource::Separable {
                             u: u_cols,
                             v: v_rows,
+                        }
+                    }
+                    BboxCoordMap::Grid2D { grid_u, grid_v } => {
+                        crate::gpu_backend::BboxCoordSource::Grid2D {
+                            dst_w: w,
+                            dst_h: h,
+                            grid_u,
+                            grid_v,
                         }
                     }
                     BboxCoordMap::Exact2D { u_map, v_map } => {
@@ -7379,6 +7569,14 @@ async fn render_bbox_core(
                     crate::gpu_backend::BboxCoordSource::Separable {
                         u: u_cols,
                         v: v_rows,
+                    }
+                }
+                BboxCoordMap::Grid2D { grid_u, grid_v } => {
+                    crate::gpu_backend::BboxCoordSource::Grid2D {
+                        dst_w: w,
+                        dst_h: h,
+                        grid_u,
+                        grid_v,
                     }
                 }
                 BboxCoordMap::Exact2D { u_map, v_map } => {
