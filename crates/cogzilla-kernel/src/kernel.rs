@@ -5110,11 +5110,7 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
 
             let len_sq = vfmaq_f32(vfmaq_f32(v_one, nx, nx), ny, ny);
             let num = vfmaq_f32(vfmaq_f32(v_su, nx, v_se), ny, v_sn);
-            // Hardware reciprocal-sqrt + 1 Newton-Raphson step (~23-bit mantissa accuracy,
-            // ~4x lower latency than `vsqrtq_f32` + `vdivq_f32`; `len_sq >= 1.0` always).
-            let r = vrsqrteq_f32(len_sq);
-            let inv_len = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(len_sq, r), r));
-            let dot = vmulq_f32(num, inv_len);
+            let dot = vdivq_f32(num, vsqrtq_f32(len_sq));
             let hs = vminq_f32(vmulq_f32(vmaxq_f32(dot, v_zero), v_255), v_255);
             let scaled = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(hs, v_min), v_inv_r), v_zero), v_255);
             // Narrow 4x u32 -> 4x u8 in registers and emit a single unaligned u32 store.
