@@ -5,6 +5,7 @@ members = [
     "crates/cogzilla-codec",
     "crates/cogzilla-proj",
     "crates/cogzilla-kernel",
+    "crates/cogzilla-gpu",
     "crates/cogzilla-io",
     "crates/cogzilla-server",
     "crates/cogzilla-lambda",

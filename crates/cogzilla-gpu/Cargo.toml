@@ -1,0 +1,16 @@
+[package]
+name = "cogzilla-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional wgpu (Metal/Vulkan) GPU compute backend for cogzilla"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+thiserror.workspace = true
+wgpu = "24"
+
+[dev-dependencies]
+cogzilla-codec = { path = "../cogzilla-codec" }
+cogzilla-kernel = { path = "../cogzilla-kernel" }
