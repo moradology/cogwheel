@@ -18,6 +18,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::colormap::{GpuColormapMode, GpuPixelOutput};
 use crate::context::{GpuContext, GpuError};
+use crate::expr::{GpuColorFormula, GpuInstr, GpuMultiBandSlab};
 use crate::resample::GpuSlab;
 use crate::terrain::GpuDemAlgorithm;
 
@@ -61,6 +62,29 @@ struct TerrainParams {
     _pad1: f32,
     _pad2: f32,
     _pad3: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ExprParams {
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+    band_stride: u32,
+    dst_w: u32,
+    dst_h: u32,
+    num_bands: u32,
+    num_instrs: u32,
+    resample_mode: u32,
+    formula_flags: u32,
+    coord_mode: u32,
+    _pad1: u32,
+    rescale_min: f32,
+    inv_range_255: f32,
+    inv_range_254: f32,
+    saturation: f32,
+    rgb_min: [f32; 4],
+    rgb_inv_255: [f32; 4],
 }
 
 /// Owned coordinate plan for submission to `GpuCoalescer`.
@@ -133,6 +157,32 @@ pub enum CoalescedJob {
         lut_u32: [u32; 256],
         output: CoalescedOutput,
     },
+    Expr {
+        slab: Arc<GpuMultiBandSlab>,
+        plan: OwnedCoordPlan,
+        mode: GpuColormapMode,
+        instrs: Vec<GpuInstr>,
+        rescale_min: f32,
+        rescale_max: f32,
+        lut_u32: [u32; 256],
+        output: CoalescedOutput,
+    },
+    Rgb {
+        slab: Arc<GpuMultiBandSlab>,
+        plan: OwnedCoordPlan,
+        mode: GpuColormapMode,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        formula: GpuColorFormula,
+    },
+    SarRgb {
+        slab: Arc<GpuMultiBandSlab>,
+        plan: OwnedCoordPlan,
+        mode: GpuColormapMode,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        formula: GpuColorFormula,
+    },
 }
 
 /// Telemetry counters for `GpuCoalescer`.
@@ -153,6 +203,8 @@ struct PendingRequest {
 struct JobSlot {
     cm_params_buf: wgpu::Buffer,
     tr_params_buf: wgpu::Buffer,
+    expr_params_buf: wgpu::Buffer,
+    instr_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
     u_buf: wgpu::Buffer,
     u_cap: usize,
@@ -177,6 +229,18 @@ impl JobSlot {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let expr_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-expr-params"),
+            size: std::mem::size_of::<ExprParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instr_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-coal-instrs"),
+            size: (256 * std::mem::size_of::<GpuInstr>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lut_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-coal-lut"),
             size: (256 * std::mem::size_of::<u32>()) as u64,
@@ -191,6 +255,8 @@ impl JobSlot {
         Self {
             cm_params_buf,
             tr_params_buf,
+            expr_params_buf,
+            instr_buf,
             lut_buf,
             u_buf,
             u_cap: init_coord,
@@ -239,6 +305,7 @@ struct WorkerState {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     bgl: wgpu::BindGroupLayout,
+    expr_bgl: wgpu::BindGroupLayout,
     cm_rgba8: wgpu::ComputePipeline,
     cm_indexed: wgpu::ComputePipeline,
     cm_f32: wgpu::ComputePipeline,
@@ -246,6 +313,11 @@ struct WorkerState {
     tr_indexed: wgpu::ComputePipeline,
     tr_f32: wgpu::ComputePipeline,
     tr_rgb: wgpu::ComputePipeline,
+    expr_rgba8: wgpu::ComputePipeline,
+    expr_indexed: wgpu::ComputePipeline,
+    expr_f32: wgpu::ComputePipeline,
+    rgb_formula: wgpu::ComputePipeline,
+    sar_rgb_formula: wgpu::ComputePipeline,
     slots: Vec<JobSlot>,
     staging_buf: wgpu::Buffer,
     staging_words_cap: usize,
@@ -263,6 +335,10 @@ impl WorkerState {
         let tr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-coal-tr-wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
+        });
+        let expr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cogzilla-coal-expr-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/expr.wgsl").into()),
         });
 
         // Both colormap.wgsl and terrain.wgsl share the exact same 6-binding layout:
@@ -358,6 +434,104 @@ impl WorkerState {
         let tr_f32 = mk_pipe("coal-tr-f32", &tr_shader, "dem_horn_f32");
         let tr_rgb = mk_pipe("coal-tr-rgb", &tr_shader, "dem_terrain_rgb");
 
+        // 7-binding layout for expr.wgsl:
+        // 0: uniform ExprParams, 1: multi-band slab, 2: u, 3: v, 4: instrs, 5: lut, 6: dst_words
+        let expr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cogzilla-coal-expr-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let expr_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cogzilla-coal-expr-pl"),
+            bind_group_layouts: &[&expr_bgl],
+            push_constant_ranges: &[],
+        });
+        let mk_expr_pipe = |label: &str, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&expr_pl),
+                module: &expr_shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let expr_rgba8 = mk_expr_pipe("coal-expr-rgba8", "expr_eval_rgba8");
+        let expr_indexed = mk_expr_pipe("coal-expr-idx", "expr_eval_indexed_u8");
+        let expr_f32 = mk_expr_pipe("coal-expr-f32", "expr_eval_f32");
+        let rgb_formula = mk_expr_pipe("coal-rgb-formula", "rgb_color_formula_rgba8");
+        let sar_rgb_formula = mk_expr_pipe("coal-sar-rgb-formula", "sar_rgb_color_formula_rgba8");
+
         let staging_words_cap = 512 * 512 * 4;
         let staging_buf = Self::alloc_staging(&device, staging_words_cap);
 
@@ -365,6 +539,7 @@ impl WorkerState {
             device,
             queue,
             bgl,
+            expr_bgl,
             cm_rgba8,
             cm_indexed,
             cm_f32,
@@ -372,6 +547,11 @@ impl WorkerState {
             tr_indexed,
             tr_f32,
             tr_rgb,
+            expr_rgba8,
+            expr_indexed,
+            expr_f32,
+            rgb_formula,
+            sar_rgb_formula,
             slots: Vec::new(),
             staging_buf,
             staging_words_cap,
@@ -696,6 +876,273 @@ impl WorkerState {
                         reply,
                     });
                 }
+                CoalescedJob::Expr {
+                    slab,
+                    plan,
+                    mode,
+                    instrs,
+                    rescale_min,
+                    rescale_max,
+                    lut_u32,
+                    output,
+                } => {
+                    let (dst_w, dst_h, coord_mode, u_slice, v_slice) = match plan.dims_mode_slices()
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            reply(Err(e));
+                            continue;
+                        }
+                    };
+                    if dst_w == 0 || dst_h == 0 || instrs.is_empty() || instrs.len() > 256 {
+                        reply(Err(GpuError::InvalidDimensions(
+                            "expr job requires non-zero dims and 1..=256 instrs".into(),
+                        )));
+                        continue;
+                    }
+                    let words_per_row = match output {
+                        CoalescedOutput::Rgba8 | CoalescedOutput::RawF32 => dst_w,
+                        CoalescedOutput::IndexedU8 => dst_w.div_ceil(4),
+                    };
+                    let out_words = words_per_row * dst_h;
+                    let slot = &mut self.slots[slot_idx];
+                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+
+                    let range = rescale_max - rescale_min;
+                    let safe_range = if range.is_finite() && range.abs() > 1e-20 {
+                        range
+                    } else {
+                        1.0
+                    };
+                    let params = ExprParams {
+                        src_w: slab.width,
+                        src_h: slab.height,
+                        src_stride: slab.stride,
+                        band_stride: slab.band_stride,
+                        dst_w: dst_w as u32,
+                        dst_h: dst_h as u32,
+                        num_bands: slab.num_bands,
+                        num_instrs: instrs.len() as u32,
+                        resample_mode: mode.as_u32(),
+                        formula_flags: 0,
+                        coord_mode,
+                        _pad1: 0,
+                        rescale_min,
+                        inv_range_255: 255.0 / safe_range,
+                        inv_range_254: 254.0 / safe_range,
+                        saturation: 1.0,
+                        rgb_min: [0.0; 4],
+                        rgb_inv_255: [1.0; 4],
+                    };
+                    self.queue
+                        .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
+                    self.queue
+                        .write_buffer(&slot.instr_buf, 0, bytemuck::cast_slice(&instrs));
+                    if !matches!(output, CoalescedOutput::RawF32) {
+                        self.queue
+                            .write_buffer(&slot.lut_buf, 0, bytemuck::cast_slice(&lut_u32));
+                    }
+                    self.queue
+                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
+                    self.queue
+                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("coal-expr-bg"),
+                        layout: &self.expr_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: slot.expr_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: slab.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: slot.u_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: slot.v_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: slot.instr_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: slot.lut_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: slot.out_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    let staging_byte_off = (total_staging_words * 4) as u64;
+                    total_staging_words += out_words;
+                    let (wg_x, pipe_kind) = match output {
+                        CoalescedOutput::Rgba8 => ((dst_w as u32).div_ceil(16), 7u8),
+                        CoalescedOutput::IndexedU8 => ((words_per_row as u32).div_ceil(16), 8u8),
+                        CoalescedOutput::RawF32 => ((dst_w as u32).div_ceil(16), 9u8),
+                    };
+                    prepared.push(PreparedJob {
+                        slot_idx,
+                        dst_w,
+                        dst_h,
+                        words_per_row,
+                        out_words,
+                        staging_byte_off,
+                        output,
+                        wg_x,
+                        wg_y: (dst_h as u32).div_ceil(16),
+                        pipe_kind,
+                        bind_group,
+                        reply,
+                    });
+                }
+                job @ (CoalescedJob::Rgb { .. } | CoalescedJob::SarRgb { .. }) => {
+                    let (is_sar, slab, plan, mode, rescale_min, rescale_max, formula) = match job {
+                        CoalescedJob::Rgb {
+                            slab,
+                            plan,
+                            mode,
+                            rescale_min,
+                            rescale_max,
+                            formula,
+                        } => (false, slab, plan, mode, rescale_min, rescale_max, formula),
+                        CoalescedJob::SarRgb {
+                            slab,
+                            plan,
+                            mode,
+                            rescale_min,
+                            rescale_max,
+                            formula,
+                        } => (true, slab, plan, mode, rescale_min, rescale_max, formula),
+                        _ => unreachable!(),
+                    };
+                    let (dst_w, dst_h, coord_mode, u_slice, v_slice) = match plan.dims_mode_slices()
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            reply(Err(e));
+                            continue;
+                        }
+                    };
+                    let min_bands = if is_sar { 2 } else { 3 };
+                    if slab.num_bands < min_bands || dst_w == 0 || dst_h == 0 {
+                        reply(Err(GpuError::InvalidDimensions(
+                            "rgb/sar job requires sufficient bands and non-zero dims".into(),
+                        )));
+                        continue;
+                    }
+                    let out_words = dst_w * dst_h;
+                    let slot = &mut self.slots[slot_idx];
+                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+
+                    let inv = |min: f32, max: f32| {
+                        let d = max - min;
+                        255.0 / if d.is_finite() && d.abs() > 1e-20 { d } else { 1.0 }
+                    };
+                    let mut flags = 0u32;
+                    if let Some(lut) = &formula.rgb_lut {
+                        flags |= 1;
+                        self.queue
+                            .write_buffer(&slot.lut_buf, 0, bytemuck::cast_slice(lut));
+                    }
+                    let sat = if let Some(s) = formula.saturation {
+                        flags |= 2;
+                        s
+                    } else {
+                        1.0
+                    };
+                    let params = ExprParams {
+                        src_w: slab.width,
+                        src_h: slab.height,
+                        src_stride: slab.stride,
+                        band_stride: slab.band_stride,
+                        dst_w: dst_w as u32,
+                        dst_h: dst_h as u32,
+                        num_bands: min_bands,
+                        num_instrs: 0,
+                        resample_mode: mode.as_u32(),
+                        formula_flags: flags,
+                        coord_mode,
+                        _pad1: 0,
+                        rescale_min: 0.0,
+                        inv_range_255: 1.0,
+                        inv_range_254: 1.0,
+                        saturation: sat,
+                        rgb_min: [rescale_min[0], rescale_min[1], rescale_min[2], 0.0],
+                        rgb_inv_255: [
+                            inv(rescale_min[0], rescale_max[0]),
+                            inv(rescale_min[1], rescale_max[1]),
+                            inv(rescale_min[2], rescale_max[2]),
+                            0.0,
+                        ],
+                    };
+                    self.queue
+                        .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
+                    self.queue
+                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
+                    self.queue
+                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(if is_sar { "coal-sar-rgb-bg" } else { "coal-rgb-bg" }),
+                        layout: &self.expr_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: slot.expr_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: slab.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: slot.u_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: slot.v_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: slot.instr_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: slot.lut_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: slot.out_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    let staging_byte_off = (total_staging_words * 4) as u64;
+                    total_staging_words += out_words;
+                    prepared.push(PreparedJob {
+                        slot_idx,
+                        dst_w,
+                        dst_h,
+                        words_per_row: dst_w,
+                        out_words,
+                        staging_byte_off,
+                        output: CoalescedOutput::Rgba8,
+                        wg_x: (dst_w as u32).div_ceil(16),
+                        wg_y: (dst_h as u32).div_ceil(16),
+                        pipe_kind: if is_sar { 11u8 } else { 10u8 },
+                        bind_group,
+                        reply,
+                    });
+                }
             }
         }
 
@@ -727,7 +1174,12 @@ impl WorkerState {
                     3 => &self.tr_rgba8,
                     4 => &self.tr_indexed,
                     5 => &self.tr_f32,
-                    _ => &self.tr_rgb,
+                    6 => &self.tr_rgb,
+                    7 => &self.expr_rgba8,
+                    8 => &self.expr_indexed,
+                    9 => &self.expr_f32,
+                    10 => &self.rgb_formula,
+                    _ => &self.sar_rgb_formula,
                 };
                 pass.set_pipeline(pipe);
                 pass.set_bind_group(0, &job.bind_group, &[]);
@@ -1100,6 +1552,222 @@ mod tests {
         assert!(
             st.batches_submitted < 12 && st.max_batch_seen >= 2,
             "expected coalescing across 12 concurrent threads, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn five_family_multiband_burst_matches_serial() {
+        let Ok(ctx) = GpuContext::new(crate::context::GpuOptions::default()) else {
+            eprintln!("skipping five_family_multiband_burst_matches_serial (no GPU adapter)");
+            return;
+        };
+        let resampler = crate::resample::GpuResampler::new(&ctx);
+        let mut cm_ref = crate::colormap::GpuColormapRenderer::new(&ctx);
+        let mut tr_ref = crate::terrain::GpuTerrainRenderer::new(&ctx);
+        let mut ex_ref = crate::expr::GpuExprRenderer::new(&ctx);
+
+        let w = 128u32;
+        let h = 128u32;
+        let b0: Vec<f32> = (0..(w * h))
+            .map(|i| 0.05 + ((i % w) as f32 * 0.008) + ((i / w) as f32 * 0.004))
+            .collect();
+        let b1: Vec<f32> = (0..(w * h))
+            .map(|i| 0.02 + ((i % w) as f32 * 0.003) + ((i / w) as f32 * 0.006))
+            .collect();
+        let b2: Vec<f32> = (0..(w * h))
+            .map(|i| 0.01 + (((i % w) ^ (i / w)) as f32 * 0.005))
+            .collect();
+
+        let single_slab = Arc::new(resampler.upload_slab(&b0, w, h, w).unwrap());
+        let mb3_slab = Arc::new(
+            ex_ref
+                .upload_bands(&[b0.as_slice(), b1.as_slice(), b2.as_slice()], w, h, w)
+                .unwrap(),
+        );
+        let sar2_slab = Arc::new(
+            ex_ref
+                .upload_bands(&[b0.as_slice(), b1.as_slice()], w, h, w)
+                .unwrap(),
+        );
+
+        let n = 64usize;
+        let u: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * 1.8).collect();
+        let v: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * 1.8).collect();
+        let mut lut_rgb = [[0u8; 3]; 256];
+        for i in 0..256 {
+            lut_rgb[i] = [i as u8, (255 - i) as u8, ((i * 3) & 255) as u8];
+        }
+        let lut_u32 = crate::colormap::GpuColormapRenderer::pack_rgb_lut(&lut_rgb);
+
+        // NDVI = (b0 - b1) / (b0 + b1)
+        let ndvi_instrs = vec![
+            GpuInstr::load_band(0),
+            GpuInstr::load_band(1),
+            GpuInstr::op(crate::expr::opcodes::SUB),
+            GpuInstr::load_band(0),
+            GpuInstr::load_band(1),
+            GpuInstr::op(crate::expr::opcodes::ADD),
+            GpuInstr::op(crate::expr::opcodes::DIV),
+        ];
+        let formula = GpuColorFormula::from_gamma_sigmoidal_sat(Some(1.2), Some((6.0, 0.5)), Some(1.3));
+
+        let ref_cm = cm_ref
+            .render_slab(
+                &single_slab,
+                &u,
+                &v,
+                GpuColormapMode::Lanczos3,
+                0.0,
+                2.0,
+                &lut_u32,
+                GpuPixelOutput::IndexedU8,
+            )
+            .unwrap();
+        let ref_dem = tr_ref
+            .render_slab(
+                &single_slab,
+                &u,
+                &v,
+                GpuColormapMode::Cubic,
+                GpuDemAlgorithm::Hillshade {
+                    azimuth_deg: 315.0,
+                    altitude_deg: 45.0,
+                    z_factor: 1.0,
+                },
+                30.0,
+                30.0,
+                0.0,
+                255.0,
+                &lut_u32,
+                GpuPixelOutput::Rgba8,
+            )
+            .unwrap();
+        let ref_expr = ex_ref
+            .render_expr(
+                &mb3_slab,
+                &u,
+                &v,
+                GpuColormapMode::Lanczos3,
+                &ndvi_instrs,
+                -1.0,
+                1.0,
+                &lut_u32,
+                GpuPixelOutput::IndexedU8,
+            )
+            .unwrap();
+        let ref_rgb = ex_ref
+            .render_rgb_formula(
+                &mb3_slab,
+                &u,
+                &v,
+                GpuColormapMode::Lanczos3,
+                [0.0, 0.0, 0.0],
+                [2.0, 2.0, 2.0],
+                &formula,
+            )
+            .unwrap();
+        let ref_sar = ex_ref
+            .render_sar_rgb_formula_with_plan(
+                &sar2_slab,
+                crate::colormap::GpuCoordPlan::Separable1D {
+                    u_coords: &u,
+                    v_coords: &v,
+                },
+                GpuColormapMode::Lanczos3,
+                [-25.0, -30.0, 0.0],
+                [0.0, -5.0, 15.0],
+                &formula,
+            )
+            .unwrap();
+
+        let coalescer = Arc::new(GpuCoalescer::new(&ctx, 32, 2000));
+        let barrier = Arc::new(std::sync::Barrier::new(15));
+        let mut handles = Vec::new();
+        for i in 0..15usize {
+            let c = Arc::clone(&coalescer);
+            let b = Arc::clone(&barrier);
+            let s1 = Arc::clone(&single_slab);
+            let s3 = Arc::clone(&mb3_slab);
+            let s2 = Arc::clone(&sar2_slab);
+            let u_c = u.clone();
+            let v_c = v.clone();
+            let instrs = ndvi_instrs.clone();
+            let form = formula.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let plan = OwnedCoordPlan::Separable1D { u: u_c, v: v_c };
+                let job = match i % 5 {
+                    0 => CoalescedJob::Colormap {
+                        slab: s1,
+                        plan,
+                        mode: GpuColormapMode::Lanczos3,
+                        rescale_min: 0.0,
+                        rescale_max: 2.0,
+                        lut_u32,
+                        output: CoalescedOutput::IndexedU8,
+                    },
+                    1 => CoalescedJob::Terrain {
+                        slab: s1,
+                        plan,
+                        mode: GpuColormapMode::Cubic,
+                        alg: GpuDemAlgorithm::Hillshade {
+                            azimuth_deg: 315.0,
+                            altitude_deg: 45.0,
+                            z_factor: 1.0,
+                        },
+                        pixel_size_x_m: 30.0,
+                        pixel_size_y_m: 30.0,
+                        rescale_min: 0.0,
+                        rescale_max: 255.0,
+                        lut_u32,
+                        output: CoalescedOutput::Rgba8,
+                    },
+                    2 => CoalescedJob::Expr {
+                        slab: s3,
+                        plan,
+                        mode: GpuColormapMode::Lanczos3,
+                        instrs,
+                        rescale_min: -1.0,
+                        rescale_max: 1.0,
+                        lut_u32,
+                        output: CoalescedOutput::IndexedU8,
+                    },
+                    3 => CoalescedJob::Rgb {
+                        slab: s3,
+                        plan,
+                        mode: GpuColormapMode::Lanczos3,
+                        rescale_min: [0.0, 0.0, 0.0],
+                        rescale_max: [2.0, 2.0, 2.0],
+                        formula: form,
+                    },
+                    _ => CoalescedJob::SarRgb {
+                        slab: s2,
+                        plan,
+                        mode: GpuColormapMode::Lanczos3,
+                        rescale_min: [-25.0, -30.0, 0.0],
+                        rescale_max: [0.0, -5.0, 15.0],
+                        formula: form,
+                    },
+                };
+                (i % 5, c.submit(job).unwrap())
+            }));
+        }
+
+        for h in handles {
+            let (kind, out) = h.join().unwrap();
+            match kind {
+                0 => assert_eq!(out, ref_cm, "Colormap mismatch"),
+                1 => assert_eq!(out, ref_dem, "Terrain mismatch"),
+                2 => assert_eq!(out, ref_expr, "Expr NDVI mismatch"),
+                3 => assert_eq!(out, ref_rgb, "Rgb+ColorFormula mismatch"),
+                _ => assert_eq!(out, ref_sar, "SarRgb+ColorFormula mismatch"),
+            }
+        }
+        let st = coalescer.stats();
+        assert_eq!(st.jobs_executed, 15);
+        assert!(
+            st.batches_submitted < 15 && st.max_batch_seen >= 3,
+            "expected multi-family coalescing across 15 threads, got {st:?}"
         );
     }
 }

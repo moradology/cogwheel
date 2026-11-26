@@ -1,30 +1,37 @@
 //! End-to-end concurrent heterogeneous HTTP-style micro-batching benchmark (`GpuCoalescer`).
 //!
 //! Spawns K=16 and K=32 concurrent Tokio tasks calling the normal per-request
-//! `TileEngine::render_tile(...)` API across **4 distinct COGs** and **4 distinct styles**
-//! (Viridis colormap, Magma colormap, DEM Horn Hillshade, and Terrarium) — verifying that
-//! `GpuCoalescer` automatically packs arbitrary in-flight GPU work into 1–3 command buffers
-//! without requiring any batch endpoint or homogeneous viewport grouping.
+//! `TileEngine::render_tile(...)` API across **4 distinct 3-band COGs** and **6 distinct styles**
+//! spanning **all 5 GPU shader families** (Viridis Single-band, DEM Horn Hillshade, Terrarium,
+//! NDVI `Spectral2`, 3-band `Rgb`, and Dual-Pol `SarRgb`) — verifying that `GpuCoalescer`
+//! automatically packs arbitrary concurrent work into ~1 command buffer with zero batch API.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use cogzilla_io::CogStore;
-use cogzilla_kernel::{ColormapName, DemAlgorithm, OutputFormat, ResampleMode, TerrainEncoding};
+use cogzilla_kernel::{
+    ColormapName, DemAlgorithm, OutputFormat, ResampleMode, SpectralExpr, TerrainEncoding,
+};
 use cogzilla_proj::TileCoord;
 use cogzilla_server::engine::{BandRequest, TileEngine, TileRequest};
 
-fn build_512_mercator_cog_bytes(seed: f32) -> Vec<u8> {
+/// Build a 512x512 3-band chunky Float32 EPSG:3857 COG with positive values suitable for
+/// single-band, DEM, NDVI (`(b1-b2)/(b1+b2)`), 3-band RGB, and Dual-Pol SAR dB RGB.
+fn build_512_3band_mercator_cog_bytes(seed: f32) -> Vec<u8> {
     let w: u32 = 512;
     let h: u32 = 512;
-    let tile_bytes = (w * h * 4) as usize;
+    let spp: u32 = 3;
+    let tile_bytes = (w * h * spp * 4) as usize;
     let mut tile_data = Vec::with_capacity(tile_bytes);
     for y in 0..h {
         for x in 0..w {
-            let v = 1000.0
-                + 600.0 * (x as f32 * 0.025 + seed).sin()
-                + 450.0 * (y as f32 * 0.03 + seed * 1.7).cos();
-            tile_data.extend_from_slice(&v.to_le_bytes());
+            let b0 = 0.20 + 0.15 * (x as f32 * 0.025 + seed).sin().abs() + 0.10 * (y as f32 * 0.02).cos().abs();
+            let b1 = 0.08 + 0.07 * (y as f32 * 0.03 + seed * 1.7).cos().abs();
+            let b2 = 0.12 + 0.09 * ((x + y) as f32 * 0.015 + seed).sin().abs();
+            tile_data.extend_from_slice(&b0.to_le_bytes());
+            tile_data.extend_from_slice(&b1.to_le_bytes());
+            tile_data.extend_from_slice(&b2.to_le_bytes());
         }
     }
 
@@ -49,6 +56,9 @@ fn build_512_mercator_cog_bytes(seed: f32) -> Vec<u8> {
         }
         off
     };
+
+    let bps_off = write_extra(&mut buf, &[32, 0, 32, 0, 32, 0]);
+    let sf_off = write_extra(&mut buf, &[3, 0, 3, 0, 3, 0]);
 
     let mut scale_bytes = Vec::with_capacity(24);
     scale_bytes.extend_from_slice(&(span / w as f64).to_le_bytes());
@@ -75,16 +85,16 @@ fn build_512_mercator_cog_bytes(seed: f32) -> Vec<u8> {
     let entries: [(u16, u16, u32, u32); 16] = [
         (256, 4, 1, w),
         (257, 4, 1, h),
-        (258, 3, 1, 32),
+        (258, 3, spp, bps_off),
         (259, 3, 1, 1),
-        (262, 3, 1, 1),
-        (277, 3, 1, 1),
+        (262, 3, 1, 2),
+        (277, 3, 1, spp),
         (284, 3, 1, 1),
         (322, 4, 1, w),
         (323, 4, 1, h),
         (324, 4, 1, tile_off),
         (325, 4, 1, tile_bytes as u32),
-        (339, 3, 1, 3),
+        (339, 3, spp, sf_off),
         (33550, 12, 3, scale_off),
         (33922, 12, 6, tie_off),
         (34735, 3, gkd.len() as u32, gkd_off),
@@ -100,36 +110,51 @@ fn build_512_mercator_cog_bytes(seed: f32) -> Vec<u8> {
     buf
 }
 
-fn build_mixed_workload(k: usize, resample: ResampleMode, format: OutputFormat) -> Vec<(usize, TileRequest)> {
+fn build_mixed_workload(
+    k: usize,
+    resample: ResampleMode,
+    format: OutputFormat,
+) -> Vec<(usize, TileRequest)> {
     (0..k)
         .map(|i| {
             let cog_idx = i % 4;
             let dx = (i % 8) as u32;
             let dy = ((i / 8) % 8) as u32;
-            let bands = match i % 4 {
+            let bands = match i % 6 {
                 0 => BandRequest::Single {
                     band_1based: 1,
-                    rescale: (0.0, 2000.0),
+                    rescale: (0.0, 0.5),
                     colormap: ColormapName::Viridis,
                 },
-                1 => BandRequest::Single {
-                    band_1based: 1,
-                    rescale: (0.0, 2000.0),
-                    colormap: ColormapName::Magma,
-                },
-                2 => BandRequest::Dem {
+                1 => BandRequest::Dem {
                     band_1based: 1,
                     algorithm: DemAlgorithm::Hillshade {
                         azimuth_deg: 315.0,
                         altitude_deg: 45.0,
-                        z_factor: 1.0,
+                        z_factor: 100.0,
                     },
                     colormap: ColormapName::Grayscale,
                     rescale: (0.0, 255.0),
                 },
-                _ => BandRequest::Terrain {
+                2 => BandRequest::Terrain {
                     band_1based: 1,
                     encoding: TerrainEncoding::Terrarium,
+                },
+                3 => BandRequest::Spectral2 {
+                    expr: SpectralExpr::NormalizedDiff,
+                    bands_1based: [1, 2],
+                    rescale: (-1.0, 1.0),
+                    colormap: ColormapName::Magma,
+                },
+                4 => BandRequest::Rgb {
+                    bands_1based: [1, 2, 3],
+                    rescale_min: [0.0, 0.0, 0.0],
+                    rescale_max: [0.5, 0.5, 0.5],
+                },
+                _ => BandRequest::SarRgb {
+                    bands_1based: [1, 2],
+                    rescale_min: [-20.0, -25.0, 0.0],
+                    rescale_max: [0.0, 0.0, 10.0],
                 },
             };
             (
@@ -155,8 +180,8 @@ fn build_mixed_workload(k: usize, resample: ResampleMode, format: OutputFormat) 
 async fn main() {
     let mut paths = Vec::with_capacity(4);
     for c in 0..4 {
-        let p = std::env::temp_dir().join(format!("cogzilla_coalesce_bench_{c}.tif"));
-        std::fs::write(&p, build_512_mercator_cog_bytes(c as f32 * 0.9)).expect("write COG");
+        let p = std::env::temp_dir().join(format!("cogzilla_coalesce_5fam_bench_{c}.tif"));
+        std::fs::write(&p, build_512_3band_mercator_cog_bytes(c as f32 * 0.9)).expect("write COG");
         paths.push(p);
     }
 
@@ -183,25 +208,24 @@ async fn main() {
     };
 
     println!(
-        "Heterogeneous GpuCoalescer backend: {} ({:?}, floor={:.1} us)\n",
+        "5-Family Heterogeneous GpuCoalescer backend: {} ({:?}, floor={:.1} us)\n",
         gpu.ctx.info.name, gpu.ctx.info.backend, gpu.policy.profile.dispatch_floor_us
     );
-    println!("| Heterogeneous Burst (4 COGs x 4 styles, 256x256) | K | Conc CPU (ms) | Serial GPU (ms) | Coalesced GPU (ms) | vs Conc CPU | vs Serial GPU | Tiles/s | Batches (avg K) |");
+    println!("| 5-Family Mixed Burst (4 COGs x 6 styles, 256x256) | K | Conc CPU (ms) | Serial GPU (ms) | Coalesced GPU (ms) | vs Conc CPU | vs Serial GPU | Tiles/s | Batches (avg K) |");
     println!("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
 
     let cases = [
-        ("Mixed Cubic PNG", 16usize, ResampleMode::Cubic, OutputFormat::Png),
-        ("Mixed Cubic PNG", 32usize, ResampleMode::Cubic, OutputFormat::Png),
-        ("Mixed Lanczos3 PNG", 16usize, ResampleMode::Lanczos, OutputFormat::Png),
-        ("Mixed Lanczos3 PNG", 32usize, ResampleMode::Lanczos, OutputFormat::Png),
-        ("Mixed Lanczos3 RawRgba", 32usize, ResampleMode::Lanczos, OutputFormat::RawRgba),
+        ("6-Style Mixed Cubic PNG", 32usize, ResampleMode::Cubic, OutputFormat::Png),
+        ("6-Style Mixed Lanczos3 PNG", 16usize, ResampleMode::Lanczos, OutputFormat::Png),
+        ("6-Style Mixed Lanczos3 PNG", 32usize, ResampleMode::Lanczos, OutputFormat::Png),
+        ("6-Style Mixed Lanczos3 RawRgba", 32usize, ResampleMode::Lanczos, OutputFormat::RawRgba),
     ];
 
     let iters = 5usize;
     for (name, k, resample, format) in cases {
         let workload = build_mixed_workload(k, resample, format);
 
-        // Warmup slabs + decode cache on both engines
+        // Warmup slabs + multi-band slabs + decode cache on both engines
         for (ci, req) in &workload {
             let _ = cpu_engine.render_tile(&cpu_cogs[*ci], req).await.unwrap();
             let _ = gpu_engine.render_tile(&gpu_cogs[*ci], req).await.unwrap();
@@ -234,7 +258,7 @@ async fn main() {
         }
         let serial_gpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-        // 3. Concurrent GPU via GpuCoalescer (normal render_tile called concurrently!)
+        // 3. Concurrent GPU via GpuCoalescer (all 5 shader families packed into ~1 submit!)
         let stats_before = gpu.coalescer.stats();
         let t0 = Instant::now();
         for _ in 0..iters {
