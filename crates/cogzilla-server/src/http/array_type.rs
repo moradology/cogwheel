@@ -33,10 +33,14 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
         // A signed type one size up from the unsigned one, or the signed one's own if larger.
         _ => {
             let (own, unsigned) = if signed(a) { (bits(a), bits(b)) } else { (bits(b), bits(a)) };
-            match (unsigned * 2).max(own) {
-                16 => T::Int16,
-                32 => T::Int32,
-                _ => T::Float64,
+            if own == 64 && unsigned < 64 {
+                T::Int64
+            } else {
+                match (unsigned * 2).max(own) {
+                    16 => T::Int16,
+                    32 => T::Int32,
+                    _ => T::Float64,
+                }
             }
         }
     }
