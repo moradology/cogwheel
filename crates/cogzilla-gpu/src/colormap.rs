@@ -39,6 +39,29 @@ pub enum GpuPixelOutput {
     IndexedU8,
 }
 
+/// Coordinate mapping passed to `GpuColormapRenderer::render_slab_with_plan`.
+pub enum GpuCoordPlan<'a> {
+    /// Separable 1D `(u_coords[dst_w], v_coords[dst_h])` (EPSG:3857 / EPSG:4326 / axis-aligned crops).
+    Separable1D {
+        u_coords: &'a [f32],
+        v_coords: &'a [f32],
+    },
+    /// 17×17 bilinear control grid (`grid_u[289], grid_v[289]`) for reprojected UTM / Albers / LCC / Polar tiles.
+    Grid2D {
+        dst_w: usize,
+        dst_h: usize,
+        grid_u: &'a [f32; 289],
+        grid_v: &'a [f32; 289],
+    },
+    /// Exact per-pixel 2D coordinates (`u[dst_w * dst_h], v[dst_w * dst_h]`) for low-zoom reprojected tiles.
+    Exact2D {
+        dst_w: usize,
+        dst_h: usize,
+        u: &'a [f32],
+        v: &'a [f32],
+    },
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct ColormapParams {
@@ -51,7 +74,7 @@ struct ColormapParams {
     rescale_min: f32,
     inv_range_255: f32,
     inv_range_254: f32,
-    _pad0: u32,
+    coord_mode: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -266,10 +289,8 @@ impl GpuColormapRenderer {
         packed
     }
 
-    /// Execute fused resample -> rescale -> colormap from a GPU-resident `GpuSlab`.
-    ///
-    /// - For `GpuPixelOutput::Rgba8`: returns `dst_w * dst_h * 4` bytes (`RGBA8`).
-    /// - For `GpuPixelOutput::IndexedU8`: returns `dst_w * dst_h` bytes (`0` = nodata, `1..=255` = palette index).
+    /// Execute fused resample -> rescale -> colormap from a GPU-resident `GpuSlab` using
+    /// separable 1D `(u_coords, v_coords)`.
     #[allow(clippy::too_many_arguments)]
     pub fn render_slab(
         &mut self,
@@ -282,8 +303,50 @@ impl GpuColormapRenderer {
         lut_rgba_u32: &[u32; 256],
         output: GpuPixelOutput,
     ) -> Result<Vec<u8>, GpuError> {
-        let dst_w = u_coords.len();
-        let dst_h = v_coords.len();
+        self.render_slab_with_plan(
+            slab,
+            GpuCoordPlan::Separable1D { u_coords, v_coords },
+            mode,
+            rescale_min,
+            rescale_max,
+            lut_rgba_u32,
+            output,
+        )
+    }
+
+    /// Execute fused resample -> rescale -> colormap from a GPU-resident `GpuSlab` for any
+    /// `GpuCoordPlan` (`Separable1D`, 17×17 `Grid2D`, or per-pixel `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_slab_with_plan(
+        &mut self,
+        slab: &GpuSlab,
+        plan: GpuCoordPlan<'_>,
+        mode: GpuColormapMode,
+        rescale_min: f32,
+        rescale_max: f32,
+        lut_rgba_u32: &[u32; 256],
+        output: GpuPixelOutput,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D { u_coords, v_coords } => {
+                    (u_coords.len(), v_coords.len(), 0, u_coords, v_coords)
+                }
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() < dst_w * dst_h || v.len() < dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v buffers shorter than dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
         if dst_w == 0 || dst_h == 0 {
             return Err(GpuError::InvalidDimensions(
                 "destination width/height must be > 0".into(),
@@ -295,7 +358,7 @@ impl GpuColormapRenderer {
             GpuPixelOutput::IndexedU8 => dst_w.div_ceil(4),
         };
         let out_words = words_per_row * dst_h;
-        self.ensure_capacities(dst_w, dst_h, out_words);
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
 
         let range = rescale_max - rescale_min;
         let safe_range = if range.is_finite() && range.abs() > 1e-20 {
@@ -314,7 +377,7 @@ impl GpuColormapRenderer {
             rescale_min,
             inv_range_255: 255.0 / safe_range,
             inv_range_254: 254.0 / safe_range,
-            _pad0: 0,
+            coord_mode,
             _pad1: 0,
             _pad2: 0,
         };
@@ -322,9 +385,9 @@ impl GpuColormapRenderer {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
-            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_coords));
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
         self.queue
-            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_coords));
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
         if output == GpuPixelOutput::Rgba8 {
             self.queue
                 .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
@@ -566,5 +629,122 @@ mod tests {
                 "{gpu_mode:?}: RGBA8 channel diff {max_channel_diff} > 4 (1 LUT step)"
             );
         }
+    }
+
+    #[test]
+    fn grid2d_curved_reprojection_matches_cpu() {
+        let ctx = match GpuContext::new_default() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping GPU Grid2D test (no adapter): {e}");
+                return;
+            }
+        };
+        let resampler = GpuResampler::new(&ctx);
+        let mut renderer = GpuColormapRenderer::new(&ctx);
+
+        let src_w = 512u32;
+        let src_h = 512u32;
+        let mut src = vec![0.0f32; (src_w * src_h) as usize];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let i = (y * src_w + x) as usize;
+                if x >= 200 && x < 230 && y >= 180 && y < 210 {
+                    src[i] = f32::NAN;
+                } else {
+                    src[i] = 500.0 + 900.0 * (x as f32 * 0.021).sin() * (y as f32 * 0.019).cos();
+                }
+            }
+        }
+        let mut slab_cpu = AlignedF32Slab::new_uninit(src.len());
+        slab_cpu.as_mut_slice().copy_from_slice(&src);
+        let band = DecodedBand {
+            data: BandData::F32(slab_cpu),
+            width: src_w,
+            height: src_h,
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: false,
+                min: -400.0,
+                max: 1400.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        let bs = BandSource::new(src_w, src_h, src_w, src_h, 0, 0, 1, 1, &blocks);
+        let gpu_slab = resampler.upload_slab(&src, src_w, src_h, src_w).unwrap();
+
+        // Construct a curved, rotated 17x17 UTM-like control grid
+        let mut grid_u = [0.0f32; 289];
+        let mut grid_v = [0.0f32; 289];
+        let cos_a = 0.9659f32; // ~15 deg rotation
+        let sin_a = 0.2588f32;
+        for gy in 0..17 {
+            for gx in 0..17 {
+                let nx = (gx as f32 / 16.0) - 0.5;
+                let ny = (gy as f32 / 16.0) - 0.5;
+                let bend = 8.0 * nx * nx;
+                grid_u[gy * 17 + gx] = 256.0 + 320.0 * (nx * cos_a - ny * sin_a);
+                grid_v[gy * 17 + gx] = 256.0 + 320.0 * (nx * sin_a + ny * cos_a) + bend;
+            }
+        }
+
+        let dst_n = 256usize;
+        let lut = ColormapName::Viridis.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let rmin = -400.0f32;
+        let rmax = 1400.0f32;
+        let inv254 = 254.0 / (rmax - rmin);
+
+        let gpu_idx = renderer
+            .render_slab_with_plan(
+                &gpu_slab,
+                GpuCoordPlan::Grid2D {
+                    dst_w: dst_n,
+                    dst_h: dst_n,
+                    grid_u: &grid_u,
+                    grid_v: &grid_v,
+                },
+                GpuColormapMode::Cubic,
+                rmin,
+                rmax,
+                &lut_u32,
+                GpuPixelOutput::IndexedU8,
+            )
+            .unwrap();
+
+        let cell_px = dst_n / 16;
+        let inv_cell = 1.0 / cell_px as f32;
+        let mut mask_err = 0usize;
+        let mut max_diff = 0i32;
+        for py in 0..dst_n {
+            let gy = (py / cell_px).min(15);
+            let ty = (py - gy * cell_px) as f32 * inv_cell;
+            let r0 = gy * 17;
+            let r1 = (gy + 1) * 17;
+            for px in 0..dst_n {
+                let gx = (px / cell_px).min(15);
+                let tx = (px - gx * cell_px) as f32 * inv_cell;
+                let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+                let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+                let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+                let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+                let u = u_l + (u_r - u_l) * tx;
+                let v = v_l + (v_r - v_l) * tx;
+                let val = sample_cubic(&bs, u, v);
+                let g = gpu_idx[py * dst_n + px];
+                if !val.is_finite() {
+                    if g != 0 {
+                        mask_err += 1;
+                    }
+                } else if g == 0 {
+                    mask_err += 1;
+                } else {
+                    let c = 1 + ((val - rmin) * inv254).clamp(0.0, 254.0) as i32;
+                    max_diff = max_diff.max((c - g as i32).abs());
+                }
+            }
+        }
+        assert_eq!(mask_err, 0, "Grid2D nodata mask mismatch");
+        assert!(max_diff <= 1, "Grid2D max diff {max_diff} > 1 LSB");
     }
 }

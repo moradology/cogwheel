@@ -28,5 +28,6 @@ This document tracks GPU acceleration experiments and PRs targeting the `gpu-imp
 | 6 | Multi-COG / STAC / Mosaic compositing | `GpuSceneStack` + `GpuMosaicCompositor` (`First`/`Highest`/`Lowest`/`Mean`/`Median`/`Stdev`/`Count`) with fused `f32`/`RGBA8`/`IndexedU8` | Merged | #219 |
 | 7 | `cogzilla-server` `--features gpu` integration | Opt-in `GpuBackend` in `TileEngine` (adaptive `DispatchPolicy`, `GpuSlabCache`, fused colormap + DEM/terrain PNG/WebP/JPEG) | Merged | #221 |
 | 8 | GPU TIFF Predictor 2/3 unshuffle | Bit-exact zero-scratch single-pass WGSL Predictor 2 & 3 unshuffle + nodata normalization (66.8 GB/s VRAM-only on RTX 3090 Ti) | Merged | #223 |
-| 9 | Multi-block stitching & large-crop GPU API | Multi-block `BandSource` stitching (all dtypes: `F32`/`U16`/`U8`/sparse/scale) + arbitrary-size `/preview`/`/bbox` crop PNG acceleration (up to 87.6× at 4096²) | Merged | (this PR) |
-| 10 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
+| 9 | Multi-block stitching & large-crop GPU API | Multi-block `BandSource` stitching (all dtypes: `F32`/`U16`/`U8`/sparse/scale) + arbitrary-size `/preview`/`/bbox` crop PNG acceleration (up to 87.6× at 4096²) | Merged | #225 |
+| 10 | Curved 17×17 `Grid2D` & `Exact2D` reprojection | In-shader 17×17 bilinear warp grid + `Exact2D` unlocking GPU acceleration for all 3,260+ projected CRS (UTM/Albers/LCC/Polar; up to 436× on RTX 3090 Ti) | Merged | (this PR) |
+| 11 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
