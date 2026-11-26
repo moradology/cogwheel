@@ -2028,43 +2028,60 @@ fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask:
     kind.and_then(|kind| cogzilla_kernel::retype_f32_npy(&data, kind, mask)).unwrap_or(data)
 }
 
+/// What a `/cog` or `/stac` array's type is decided by: the rule, the assets asked for (none
+/// on `/cog`), the band math, and whether a mask was asked for.
+type ArrayAsked = (array_type::ArrayRule, Vec<String>, Option<String>, bool);
+
+fn array_asked(pq: &ParsedQuery) -> Option<ArrayAsked> {
+    array_type::ArrayRule::of(pq).map(|rule| (rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask))
+}
+
 /// A `/cog` answer in the type TiTiler writes its array in: the rasters at `urls` are
 /// opened again (they are cached) for their types. Anything but a float32 array, and an
 /// array whose rasters cannot be opened, is left as it is.
-async fn cog_array_in_its_type(
-    engine: &TileEngine,
-    rule: &array_type::ArrayRule,
-    urls: &[String],
-    expression: Option<&str>,
-    mask: bool,
-    data: Bytes,
-) -> Bytes {
-    if !is_f32_npy(&data) {
-        return data;
-    }
+async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
+    let Some((rule, _, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
     let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
     let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
-    array_in_its_type(data, rule.kind(&reads, expression), mask)
+    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
 }
 
-/// A `/stac` answer in the type TiTiler writes its array in, from the types of the assets
-/// read and the band math as it was rewritten over them. As [`cog_array_in_its_type`].
-async fn stac_array_in_its_type(
-    engine: &TileEngine,
-    rule: &array_type::ArrayRule,
-    url: &str,
-    assets: &[String],
-    expression: Option<&str>,
-    mask: bool,
-    data: Bytes,
-) -> Bytes {
-    if !is_f32_npy(&data) {
+/// A `/stac` answer in the type TiTiler writes its array in, from the types of the item's
+/// assets that were read and the band math as it was rewritten over them. As
+/// [`cog_array_in_its_type`].
+async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
+    let Some((rule, assets, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
         return data;
-    }
-    let Ok(item) = load_stac_item(&engine.stac_cache, &engine.store, url).await else { return data };
-    let Ok((_, cogs, expression)) = resolve_stac_assets(engine, &item, assets, expression).await else { return data };
+    };
     let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
     array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+}
+
+/// A rendered `/cog` tile, its array in its type: what the tile cache keeps.
+async fn cog_tile_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    urls: &[String],
+    rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let (data, ct) = rendered.await?;
+    Ok((cog_array_in_its_type(engine, asked, urls, data).await, ct))
+}
+
+/// A rendered `/stac` tile, its array in its type: what the tile cache keeps.
+async fn stac_tile_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    url: Option<String>,
+    rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let (data, ct) = rendered.await?;
+    let Some(url) = url.filter(|_| asked.is_some() && is_f32_npy(&data)) else { return Ok((data, ct)) };
+    match load_stac_item(&engine.stac_cache, &engine.store, &url).await {
+        Ok(item) => Ok((stac_array_in_its_type(engine, asked, &item, data).await, ct)),
+        Err(_) => Ok((data, ct)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6968,7 +6985,7 @@ where
         let stac_url_hdr = stac_url.clone();
         let stac_req_assets = pq.assets.clone();
         let stac_req_expr = pq.expr_raw.clone();
-        let array_rule = array_type::ArrayRule::of(&pq).map(|rule| (rule, pq.return_mask, stac_url.clone()));
+        let stac_array = array_asked(&pq);
         let attach_resolved_stac_assets = |resp: &mut Response<Full<Bytes>>| {
             if !resp.status().is_success() {
                 return;
@@ -7997,223 +8014,211 @@ where
                     engine.sync_tile_cache_epoch();
                 }
                 let stac_tile_geo = TileGeoOpts::from_pq(&pq);
-                let array_url = stac_url.clone();
+                let stac_tile_url = stac_url.clone();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || async {
-                        let array_rule = array_type::ArrayRule::of(&pq).map(|rule| (rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask));
-                        let rendered = async {
-                            let u = stac_url
-                                .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                            let item =
-                                load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
-                            let (names, cogs, rewritten_expr) = resolve_stac_assets(
+                    .get_or_render(cache_key, || stac_tile_in_its_type(&engine, stac_array.clone(), stac_tile_url, async {
+                        let u = stac_url
+                            .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                        let item =
+                            load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                        let (names, cogs, rewritten_expr) = resolve_stac_assets(
+                            &engine,
+                            &item,
+                            &pq.assets,
+                            pq.expr_raw.as_deref(),
+                        )
+                        .await?;
+                        let (Some(z), Some(x), Some((y, sc, ext))) = (
+                            parse_u8_like(zs),
+                            parse_u32_like(xs),
+                            parse_y_scale_ext(ys),
+                        ) else {
+                            return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                        };
+                        let mut pq_stac = pq;
+                        pq_stac.expr_raw = rewritten_expr;
+                        let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
+                        let db = if cogs.len() > 1 {
+                            cogs.len() as u16
+                        } else {
+                            cogs[0].index.full_res().samples_per_pixel
+                        };
+                        let st = cogs[0].index.full_res().sample_type;
+                        let (mut treq, ct) = build_tile_request_for_tms(
+                            Some(&engine),
+                            TileCoord { z, x, y },
+                            sc,
+                            ext,
+                            &pq_stac,
+                            db,
+                            st,
+                            tms,
+                            Some(&cogs[0]),
+                        )?;
+                        if pq_stac.unscale {
+                            apply_unscale_cogs(&mut treq.bands, &cogs);
+                        }
+                        let mut any_intersects = false;
+                        for c in &cogs {
+                            if tile_intersects_cog(
                                 &engine,
-                                &item,
-                                &pq.assets,
-                                pq.expr_raw.as_deref(),
-                            )
-                            .await?;
-                            let (Some(z), Some(x), Some((y, sc, ext))) = (
-                                parse_u8_like(zs),
-                                parse_u32_like(xs),
-                                parse_y_scale_ext(ys),
-                            ) else {
-                                return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
-                            };
-                            let mut pq_stac = pq;
-                            pq_stac.expr_raw = rewritten_expr;
-                            let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                            let db = if cogs.len() > 1 {
-                                cogs.len() as u16
-                            } else {
-                                cogs[0].index.full_res().samples_per_pixel
-                            };
-                            let st = cogs[0].index.full_res().sample_type;
-                            let (mut treq, ct) = build_tile_request_for_tms(
-                                Some(&engine),
-                                TileCoord { z, x, y },
-                                sc,
-                                ext,
-                                &pq_stac,
-                                db,
-                                st,
+                                c,
                                 tms,
-                                Some(&cogs[0]),
-                            )?;
-                            if pq_stac.unscale {
-                                apply_unscale_cogs(&mut treq.bands, &cogs);
+                                TileCoord { z, x, y },
+                                pq_stac.buffer,
+                                treq.tile_size,
+                            )? {
+                                any_intersects = true;
+                                break;
                             }
-                            let mut any_intersects = false;
-                            for c in &cogs {
-                                if tile_intersects_cog(
+                        }
+                        if !any_intersects {
+                            let full = cogs[0].index.full_res();
+                            let b = engine
+                                .get_or_build_crs(&cogs[0])
+                                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                                .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+                            return Err(EngineError::NotFound(format!(
+                                "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                                b[0], b[1], b[2], b[3]
+                            )));
+                        }
+                        let needs_general = tms != "WebMercatorQuad"
+                            || slot_bands.is_some()
+                            || pq_stac.buffer > 0.0
+                            || pq_stac.nodata.is_some()
+                            || pq_stac.custom_colormap_json.is_some()
+                            || (!pq_stac.return_mask && matches!(treq.format, OutputFormat::Npy))
+                            || (pq_stac.color_formula.is_some()
+                                && !matches!(
+                                    treq.bands,
+                                    BandRequest::Rgb { .. }
+                                        | BandRequest::SarRgb { .. }
+                                        | BandRequest::CustomExprRgb { .. }
+                                        | BandRequest::Terrain { .. }
+                                ))
+                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                            || (treq.tile_size != 256 && treq.tile_size != 512)
+                            || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
+                            || !crate::engine::cogs_share_base_grid(&cogs);
+                        let auto_fmt = ext.is_none() && pq_stac.format_param.is_none();
+                        if auto_fmt {
+                            treq.format = OutputFormat::RawRgba;
+                        }
+                        if needs_general {
+                            let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
+                            let cf = pq_stac
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq_stac.buffer).round() as u32;
+                            let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
+                                let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
+                                    EngineError::BadRequest(format!("unsupported TMS '{tms}'"))
+                                })?;
+                                let bbox = tms_def
+                                    .tile_bounds(z, x, y, pq_stac.buffer, treq.tile_size)
+                                    .ok_or_else(|| {
+                                        EngineError::NotFound(format!(
+                                            "Tile {z}/{x}/{y} is outside {tms} matrix"
+                                        ))
+                                    })?;
+                                let dst_crs = tms_def.crs_model()?;
+                                let d = render_stac_bbox_opt(
                                     &engine,
-                                    c,
-                                    tms,
-                                    TileCoord { z, x, y },
+                                    &cogs,
+                                    slot_bands.as_deref(),
+                                    bbox,
+                                    &dst_crs,
+                                    false,
+                                    out_dim,
+                                    out_dim,
+                                    None,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq_stac.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq_stac.return_mask,
+                                    pq_stac.unscale,
+                                )
+                                .await?;
+                                (d, bbox, tms_def.epsg)
+                            } else {
+                                let bbox_3857 = web_mercator_buffered_3857_bbox(
+                                    z,
+                                    x,
+                                    y,
                                     pq_stac.buffer,
                                     treq.tile_size,
-                                )? {
-                                    any_intersects = true;
-                                    break;
-                                }
-                            }
-                            if !any_intersects {
-                                let full = cogs[0].index.full_res();
-                                let b = engine
-                                    .get_or_build_crs(&cogs[0])
-                                    .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
-                                    .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
-                                return Err(EngineError::NotFound(format!(
-                                    "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
-                                    b[0], b[1], b[2], b[3]
-                                )));
-                            }
-                            let needs_general = tms != "WebMercatorQuad"
-                                || slot_bands.is_some()
-                                || pq_stac.buffer > 0.0
-                                || pq_stac.nodata.is_some()
-                                || pq_stac.custom_colormap_json.is_some()
-                                || (!pq_stac.return_mask && matches!(treq.format, OutputFormat::Npy))
-                                || (pq_stac.color_formula.is_some()
-                                    && !matches!(
-                                        treq.bands,
-                                        BandRequest::Rgb { .. }
-                                            | BandRequest::SarRgb { .. }
-                                            | BandRequest::CustomExprRgb { .. }
-                                            | BandRequest::Terrain { .. }
-                                    ))
-                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
-                                || (treq.tile_size != 256 && treq.tile_size != 512)
-                                || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
-                                || !crate::engine::cogs_share_base_grid(&cogs);
-                            let auto_fmt = ext.is_none() && pq_stac.format_param.is_none();
+                                );
+                                let d = render_stac_bbox_opt(
+                                    &engine,
+                                    &cogs,
+                                    slot_bands.as_deref(),
+                                    bbox_3857,
+                                    &cogzilla_proj::CrsModel::Epsg3857,
+                                    false,
+                                    out_dim,
+                                    out_dim,
+                                    None,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq_stac.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq_stac.return_mask,
+                                    pq_stac.unscale,
+                                )
+                                .await?;
+                                (d, bbox_3857, 3857u16)
+                            };
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq_stac.jpeg_quality, pq_stac.return_mask))
+                        } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                        {
+                            let cf = pq_stac
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let orig_format = treq.format;
+                            treq.format = OutputFormat::RawRgba;
+                            let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let dim = treq.tile_size as usize;
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             if auto_fmt {
-                                treq.format = OutputFormat::RawRgba;
-                            }
-                            if needs_general {
-                                let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
-                                let cf = pq_stac
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
-                                let out_dim = (treq.tile_size as f32 + 2.0 * pq_stac.buffer).round() as u32;
-                                let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
-                                    let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
-                                        EngineError::BadRequest(format!("unsupported TMS '{tms}'"))
-                                    })?;
-                                    let bbox = tms_def
-                                        .tile_bounds(z, x, y, pq_stac.buffer, treq.tile_size)
-                                        .ok_or_else(|| {
-                                            EngineError::NotFound(format!(
-                                                "Tile {z}/{x}/{y} is outside {tms} matrix"
-                                            ))
-                                        })?;
-                                    let dst_crs = tms_def.crs_model()?;
-                                    let d = render_stac_bbox_opt(
-                                        &engine,
-                                        &cogs,
-                                        slot_bands.as_deref(),
-                                        bbox,
-                                        &dst_crs,
-                                        false,
-                                        out_dim,
-                                        out_dim,
-                                        None,
-                                        &treq.bands,
-                                        treq.resample,
-                                        treq.format,
-                                        pq_stac.nodata,
-                                        custom_lut.as_ref(),
-                                        cf.as_ref(),
-                                        pq_stac.return_mask,
-                                        pq_stac.unscale,
-                                    )
-                                    .await?;
-                                    (d, bbox, tms_def.epsg)
+                                let buf = if let Some(cf) = cf {
+                                    let mut b = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut b, 4);
+                                    Bytes::from(b)
                                 } else {
-                                    let bbox_3857 = web_mercator_buffered_3857_bbox(
-                                        z,
-                                        x,
-                                        y,
-                                        pq_stac.buffer,
-                                        treq.tile_size,
-                                    );
-                                    let d = render_stac_bbox_opt(
-                                        &engine,
-                                        &cogs,
-                                        slot_bands.as_deref(),
-                                        bbox_3857,
-                                        &cogzilla_proj::CrsModel::Epsg3857,
-                                        false,
-                                        out_dim,
-                                        out_dim,
-                                        None,
-                                        &treq.bands,
-                                        treq.resample,
-                                        treq.format,
-                                        pq_stac.nodata,
-                                        custom_lut.as_ref(),
-                                        cf.as_ref(),
-                                        pq_stac.return_mask,
-                                        pq_stac.unscale,
-                                    )
-                                    .await?;
-                                    (d, bbox_3857, 3857u16)
+                                    raw
                                 };
-                                Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq_stac.jpeg_quality, pq_stac.return_mask))
-                            } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
-                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
-                            {
-                                let cf = pq_stac
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
-                                let orig_format = treq.format;
-                                treq.format = OutputFormat::RawRgba;
-                                let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                                let dim = treq.tile_size as usize;
-                                let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                                if auto_fmt {
-                                    let buf = if let Some(cf) = cf {
-                                        let mut b = raw.to_vec();
-                                        cf.apply_buffer_in_place(&mut b, 4);
-                                        Bytes::from(b)
-                                    } else {
-                                        raw
-                                    };
-                                    Ok(encode_auto_image(dim, dim, &buf, pq_stac.jpeg_quality, pq_stac.return_mask))
-                                } else {
-                                    let data = if let Some(cf) = cf {
-                                        let mut buf = raw.to_vec();
-                                        cf.apply_buffer_in_place(&mut buf, 4);
-                                        encode_rgba_output(dim, dim, &buf, orig_format, pq_stac.return_mask)
-                                    } else {
-                                        encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
-                                    };
-                                    let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
-                                    Ok((data, ct))
-                                }
+                                Ok(encode_auto_image(dim, dim, &buf, pq_stac.jpeg_quality, pq_stac.return_mask))
                             } else {
-                                let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                                let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                                Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.jpeg_quality, pq_stac.return_mask))
-                            }
-                        }
-                        .await;
-                        // An array is cached in the type TiTiler writes it in.
-                        match (rendered, array_rule, array_url) {
-                            (Ok((data, ct)), Some((rule, assets, expression, mask)), Some(url)) => {
-                                let data = stac_array_in_its_type(&engine, &rule, &url, &assets, expression.as_deref(), mask, data).await;
+                                let data = if let Some(cf) = cf {
+                                    let mut buf = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut buf, 4);
+                                    encode_rgba_output(dim, dim, &buf, orig_format, pq_stac.return_mask)
+                                } else {
+                                    encode_rgba_output(dim, dim, &raw, orig_format, pq_stac.return_mask)
+                                };
+                                let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.return_mask);
                                 Ok((data, ct))
                             }
-                            (rendered, _, _) => rendered,
+                        } else {
+                            let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq_stac.jpeg_quality, pq_stac.return_mask))
                         }
-                    })
+                    }))
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_resolved_stac_assets(&mut resp);
@@ -8821,12 +8826,18 @@ where
 
             _ => Err(EngineError::NotFound(path.clone())),
         };
-        let res = match (res, array_rule) {
-            (Ok((data, ct)), Some((rule, mask, Some(url)))) => {
-                let typed = stac_array_in_its_type(&engine, &rule, &url, &stac_req_assets, stac_req_expr.as_deref(), mask, data).await;
-                Ok((typed, ct))
+        let res = match res {
+            Ok((data, ct)) if stac_array.is_some() && is_f32_npy(&data) => {
+                let item = match &stac_url_hdr {
+                    Some(u) => load_stac_item(&engine.stac_cache, &engine.store, u).await.ok(),
+                    None => None,
+                };
+                match item {
+                    Some(item) => Ok((stac_array_in_its_type(&engine, stac_array, &item, data).await, ct)),
+                    None => Ok((data, ct)),
+                }
             }
-            (res, _) => res,
+            res => res,
         };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if !matches!(
@@ -8854,7 +8865,8 @@ where
     if segs.first() == Some(&"cog") {
         let sub = &segs[1..];
         let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
-        let array_rule = array_type::ArrayRule::of(&pq).map(|rule| (rule, pq.urls.clone(), pq.expr_raw.clone(), pq.return_mask));
+        let cog_array = array_asked(&pq);
+        let cog_urls = pq.urls.clone();
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // 1. GET /cog/info
             (Method::GET, ["info"]) => async {
@@ -9252,202 +9264,191 @@ where
                 engine.sync_tile_cache_epoch();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || async {
-                        let rendered = async {
-                            let cogs = open_query_urls(&engine, &pq.urls).await?;
-                            let (Some(z), Some(x), Some((y, sc, ext))) = (
-                                parse_u8_like(zs),
-                                parse_u32_like(xs),
-                                parse_y_scale_ext(ys),
-                            ) else {
-                                return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
-                            };
-                            let db = if cogs.len() > 1 {
-                                cogs.len() as u16
-                            } else {
-                                cogs[0].index.full_res().samples_per_pixel
-                            };
-                            let st = cogs[0].index.full_res().sample_type;
-                            let (mut treq, ct) = build_tile_request_for_tms(
-                                Some(&engine),
-                                TileCoord { z, x, y },
-                                sc,
-                                ext,
-                                &pq,
-                                db,
-                                st,
-                                tms,
-                                Some(&cogs[0]),
-                            )?;
-                            if pq.unscale {
-                                apply_unscale_cogs(&mut treq.bands, &cogs);
-                            }
+                    .get_or_render(cache_key, || cog_tile_in_its_type(&engine, cog_array.clone(), &cog_urls, async {
+                        let cogs = open_query_urls(&engine, &pq.urls).await?;
+                        let (Some(z), Some(x), Some((y, sc, ext))) = (
+                            parse_u8_like(zs),
+                            parse_u32_like(xs),
+                            parse_y_scale_ext(ys),
+                        ) else {
+                            return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
+                        };
+                        let db = if cogs.len() > 1 {
+                            cogs.len() as u16
+                        } else {
+                            cogs[0].index.full_res().samples_per_pixel
+                        };
+                        let st = cogs[0].index.full_res().sample_type;
+                        let (mut treq, ct) = build_tile_request_for_tms(
+                            Some(&engine),
+                            TileCoord { z, x, y },
+                            sc,
+                            ext,
+                            &pq,
+                            db,
+                            st,
+                            tms,
+                            Some(&cogs[0]),
+                        )?;
+                        if pq.unscale {
+                            apply_unscale_cogs(&mut treq.bands, &cogs);
+                        }
 
-                            let mut any_intersects = false;
-                            for c in &cogs {
-                                if tile_intersects_cog(
+                        let mut any_intersects = false;
+                        for c in &cogs {
+                            if tile_intersects_cog(
+                                &engine,
+                                c,
+                                tms,
+                                TileCoord { z, x, y },
+                                pq.buffer,
+                                treq.tile_size,
+                            )? {
+                                any_intersects = true;
+                                break;
+                            }
+                        }
+                        if !any_intersects {
+                            let full = cogs[0].index.full_res();
+                            let b = engine
+                                .get_or_build_crs(&cogs[0])
+                                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                                .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+                            return Err(EngineError::NotFound(format!(
+                                "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                                b[0], b[1], b[2], b[3]
+                            )));
+                        }
+                        let needs_general_path = tms != "WebMercatorQuad"
+                            || pq.buffer > 0.0
+                            || pq.nodata.is_some()
+                            || pq.custom_colormap_json.is_some()
+                            || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
+                            || (pq.color_formula.is_some()
+                                && !matches!(
+                                    treq.bands,
+                                    BandRequest::Rgb { .. }
+                                        | BandRequest::SarRgb { .. }
+                                        | BandRequest::CustomExprRgb { .. }
+                                        | BandRequest::Terrain { .. }
+                                ))
+                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                            || (treq.tile_size != 256 && treq.tile_size != 512)
+                            || has_embedded_palette(&pq, &cogs[0], &treq.bands)
+                            || !crate::engine::cogs_share_base_grid(&cogs);
+
+                        let auto_fmt = ext.is_none() && pq.format_param.is_none();
+                        if auto_fmt {
+                            treq.format = OutputFormat::RawRgba;
+                        }
+
+                        if needs_general_path {
+                            let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
+                            let cf = pq
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
+                            let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
+                                let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
+                                    EngineError::BadRequest(format!("unsupported TMS '{tms}'"))
+                                })?;
+                                let bbox = tms_def
+                                    .tile_bounds(z, x, y, pq.buffer, treq.tile_size)
+                                    .ok_or_else(|| {
+                                        EngineError::NotFound(format!(
+                                            "Tile {z}/{x}/{y} is outside {tms} matrix"
+                                        ))
+                                    })?;
+                                let dst_crs = tms_def.crs_model()?;
+                                let d = render_crs_bbox(
                                     &engine,
-                                    c,
-                                    tms,
-                                    TileCoord { z, x, y },
+                                    &cogs,
+                                    bbox,
+                                    &dst_crs,
+                                    out_dim,
+                                    out_dim,
+                                    None,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq.return_mask,
+                                    pq.unscale,
+                                )
+                                .await?;
+                                (d, bbox, tms_def.epsg)
+                            } else {
+                                let bbox_3857 = web_mercator_buffered_3857_bbox(
+                                    z,
+                                    x,
+                                    y,
                                     pq.buffer,
                                     treq.tile_size,
-                                )? {
-                                    any_intersects = true;
-                                    break;
-                                }
-                            }
-                            if !any_intersects {
-                                let full = cogs[0].index.full_res();
-                                let b = engine
-                                    .get_or_build_crs(&cogs[0])
-                                    .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
-                                    .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
-                                return Err(EngineError::NotFound(format!(
-                                    "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
-                                    b[0], b[1], b[2], b[3]
-                                )));
-                            }
-                            let needs_general_path = tms != "WebMercatorQuad"
-                                || pq.buffer > 0.0
-                                || pq.nodata.is_some()
-                                || pq.custom_colormap_json.is_some()
-                                || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
-                                || (pq.color_formula.is_some()
-                                    && !matches!(
-                                        treq.bands,
-                                        BandRequest::Rgb { .. }
-                                            | BandRequest::SarRgb { .. }
-                                            | BandRequest::CustomExprRgb { .. }
-                                            | BandRequest::Terrain { .. }
-                                    ))
-                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
-                                || (treq.tile_size != 256 && treq.tile_size != 512)
-                                || has_embedded_palette(&pq, &cogs[0], &treq.bands)
-                                || !crate::engine::cogs_share_base_grid(&cogs);
-
-                            let auto_fmt = ext.is_none() && pq.format_param.is_none();
+                                );
+                                let d = render_mercator_bbox(
+                                    &engine,
+                                    &cogs,
+                                    bbox_3857,
+                                    out_dim,
+                                    out_dim,
+                                    &treq.bands,
+                                    treq.resample,
+                                    treq.format,
+                                    pq.nodata,
+                                    custom_lut.as_ref(),
+                                    cf.as_ref(),
+                                    pq.return_mask,
+                                    pq.unscale,
+                                )
+                                .await?;
+                                (d, bbox_3857, 3857u16)
+                            };
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq.jpeg_quality, pq.return_mask))
+                        } else if (pq.color_formula.is_some() || !pq.return_mask)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                        {
+                            let cf = pq
+                                .color_formula
+                                .as_deref()
+                                .map(ColorFormula::parse)
+                                .transpose()
+                                .map_err(EngineError::BadRequest)?;
+                            let orig_format = treq.format;
+                            treq.format = OutputFormat::RawRgba;
+                            let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let dim = treq.tile_size as usize;
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
                             if auto_fmt {
-                                treq.format = OutputFormat::RawRgba;
-                            }
-
-                            if needs_general_path {
-                                let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
-                                let cf = pq
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
-                                let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
-                                let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
-                                    let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
-                                        EngineError::BadRequest(format!("unsupported TMS '{tms}'"))
-                                    })?;
-                                    let bbox = tms_def
-                                        .tile_bounds(z, x, y, pq.buffer, treq.tile_size)
-                                        .ok_or_else(|| {
-                                            EngineError::NotFound(format!(
-                                                "Tile {z}/{x}/{y} is outside {tms} matrix"
-                                            ))
-                                        })?;
-                                    let dst_crs = tms_def.crs_model()?;
-                                    let d = render_crs_bbox(
-                                        &engine,
-                                        &cogs,
-                                        bbox,
-                                        &dst_crs,
-                                        out_dim,
-                                        out_dim,
-                                        None,
-                                        &treq.bands,
-                                        treq.resample,
-                                        treq.format,
-                                        pq.nodata,
-                                        custom_lut.as_ref(),
-                                        cf.as_ref(),
-                                        pq.return_mask,
-                                        pq.unscale,
-                                    )
-                                    .await?;
-                                    (d, bbox, tms_def.epsg)
+                                let buf = if let Some(cf) = cf {
+                                    let mut b = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut b, 4);
+                                    Bytes::from(b)
                                 } else {
-                                    let bbox_3857 = web_mercator_buffered_3857_bbox(
-                                        z,
-                                        x,
-                                        y,
-                                        pq.buffer,
-                                        treq.tile_size,
-                                    );
-                                    let d = render_mercator_bbox(
-                                        &engine,
-                                        &cogs,
-                                        bbox_3857,
-                                        out_dim,
-                                        out_dim,
-                                        &treq.bands,
-                                        treq.resample,
-                                        treq.format,
-                                        pq.nodata,
-                                        custom_lut.as_ref(),
-                                        cf.as_ref(),
-                                        pq.return_mask,
-                                        pq.unscale,
-                                    )
-                                    .await?;
-                                    (d, bbox_3857, 3857u16)
+                                    raw
                                 };
-                                Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq.jpeg_quality, pq.return_mask))
-                            } else if (pq.color_formula.is_some() || !pq.return_mask)
-                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
-                            {
-                                let cf = pq
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
-                                let orig_format = treq.format;
-                                treq.format = OutputFormat::RawRgba;
-                                let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                                let dim = treq.tile_size as usize;
-                                let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                                if auto_fmt {
-                                    let buf = if let Some(cf) = cf {
-                                        let mut b = raw.to_vec();
-                                        cf.apply_buffer_in_place(&mut b, 4);
-                                        Bytes::from(b)
-                                    } else {
-                                        raw
-                                    };
-                                    Ok(encode_auto_image(dim, dim, &buf, pq.jpeg_quality, pq.return_mask))
-                                } else {
-                                    let data = if let Some(cf) = cf {
-                                        let mut buf = raw.to_vec();
-                                        cf.apply_buffer_in_place(&mut buf, 4);
-                                        encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
-                                    } else {
-                                        encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
-                                    };
-                                    let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
-                                    Ok((data, ct))
-                                }
+                                Ok(encode_auto_image(dim, dim, &buf, pq.jpeg_quality, pq.return_mask))
                             } else {
-                                let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
-                                let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
-                                Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq.jpeg_quality, pq.return_mask))
-                            }
-                        }
-                        .await;
-                        // An array is cached in the type TiTiler writes it in.
-                        match (rendered, array_type::ArrayRule::of(&pq)) {
-                            (Ok((data, ct)), Some(rule)) => {
-                                let data = cog_array_in_its_type(&engine, &rule, &pq.urls, pq.expr_raw.as_deref(), pq.return_mask, data).await;
+                                let data = if let Some(cf) = cf {
+                                    let mut buf = raw.to_vec();
+                                    cf.apply_buffer_in_place(&mut buf, 4);
+                                    encode_rgba_output(dim, dim, &buf, orig_format, pq.return_mask)
+                                } else {
+                                    encode_rgba_output(dim, dim, &raw, orig_format, pq.return_mask)
+                                };
+                                let data = wrap_geotiff_fmt(data, ct, orig_format, treq.tile_size, treq.tile_size, bbox, 3857, pq.return_mask);
                                 Ok((data, ct))
                             }
-                            (rendered, _) => rendered,
+                        } else {
+                            let data = engine.render_multi_cog_tile(&cogs, &treq).await?;
+                            let bbox = web_mercator_buffered_3857_bbox(z, x, y, 0.0, treq.tile_size);
+                            Ok(finalize_image_output(data, ct, treq.format, auto_fmt, treq.tile_size, treq.tile_size, bbox, 3857, pq.jpeg_quality, pq.return_mask))
                         }
-                    })
+                    }))
                     .await;
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 if let (Some(z), Some(x), Some((y, sc, _))) =
@@ -10376,11 +10377,9 @@ where
 
             _ => Err(EngineError::NotFound(path)),
         };
-        let res = match (res, array_rule) {
-            (Ok((data, ct)), Some((rule, urls, expression, mask))) => {
-                Ok((cog_array_in_its_type(&engine, &rule, &urls, expression.as_deref(), mask, data).await, ct))
-            }
-            (res, _) => res,
+        let res = match res {
+            Ok((data, ct)) => Ok((cog_array_in_its_type(&engine, cog_array, &cog_urls, data).await, ct)),
+            Err(e) => Err(e),
         };
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if let Some((bbox, epsg, is_crs84)) = geo_meta {
