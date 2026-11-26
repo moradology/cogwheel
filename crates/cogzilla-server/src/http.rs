@@ -2034,16 +2034,24 @@ fn wrap_geotiff_fmt(
     }
 }
 
-/// Whether `data` is a float32 `.npy`, the renderers' array.
-fn is_f32_npy(data: &[u8]) -> bool {
-    data.starts_with(b"\x93NUMPY") && data.get(10..80).is_some_and(|dict| dict.windows(4).any(|w| w == b"<f4'"))
+/// Whether `data` may be an array the renderers wrote in float32: a float32 `.npy`, or a
+/// GeoTIFF (whose samples [`array_in_its_type`] reads before it changes anything).
+fn may_be_f32_array(data: &[u8]) -> bool {
+    let npy = data.starts_with(b"\x93NUMPY") && data.get(10..80).is_some_and(|dict| dict.windows(4).any(|w| w == b"<f4'"));
+    npy || data.starts_with(b"II*\0")
 }
 
-/// An array the renderers wrote in float32, rewritten in `kind`, the type TiTiler writes it
-/// in ([`array_type`]); with `mask`, its last plane is the mask. Left as it is without a
-/// type, or when it is not an array of the planes it says.
+/// An array the renderers wrote in float32, as `.npy` or as a GeoTIFF, rewritten in `kind`,
+/// the type TiTiler writes it in ([`array_type`]); with `mask`, its last band is the mask.
+/// Left as it is without a type, or when it is not a float32 array of the bands it says.
 fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
-    kind.and_then(|kind| cogzilla_kernel::retype_f32_npy(&data, kind, mask)).unwrap_or(data)
+    let Some(kind) = kind else { return data };
+    let typed = if data.starts_with(b"II*\0") {
+        crate::geotiff::retype_f32_geotiff(&data, kind, mask)
+    } else {
+        cogzilla_kernel::retype_f32_npy(&data, kind, mask)
+    };
+    typed.unwrap_or(data)
 }
 
 /// What a `/cog` or `/stac` array's type is decided by: the rule, the assets asked for (none
@@ -2058,7 +2066,7 @@ fn array_asked(pq: &ParsedQuery) -> Option<ArrayAsked> {
 /// opened again (they are cached) for their types. Anything but a float32 array, and an
 /// array whose rasters cannot be opened, is left as it is.
 async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
-    let Some((rule, _, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Some((rule, _, expression, mask)) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
     let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
     let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
     array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
@@ -2068,7 +2076,7 @@ async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, u
 /// assets that were read and the band math as it was rewritten over them. As
 /// [`cog_array_in_its_type`].
 async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
-    let Some((rule, assets, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Some((rule, assets, expression, mask)) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
     let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
         return data;
     };
@@ -2095,7 +2103,7 @@ async fn stac_tile_in_its_type(
     rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
 ) -> Result<(Bytes, &'static str), EngineError> {
     let (data, ct) = rendered.await?;
-    let Some(url) = url.filter(|_| asked.is_some() && is_f32_npy(&data)) else { return Ok((data, ct)) };
+    let Some(url) = url.filter(|_| asked.is_some() && may_be_f32_array(&data)) else { return Ok((data, ct)) };
     match load_stac_item(&engine.stac_cache, &engine.store, &url).await {
         Ok(item) => Ok((stac_array_in_its_type(engine, asked, &item, data).await, ct)),
         Err(_) => Ok((data, ct)),
@@ -8901,7 +8909,7 @@ where
             _ => Err(EngineError::NotFound(path.clone())),
         };
         let res = match res {
-            Ok((data, ct)) if stac_array.is_some() && is_f32_npy(&data) => {
+            Ok((data, ct)) if stac_array.is_some() && may_be_f32_array(&data) => {
                 let item = match &stac_url_hdr {
                     Some(u) => load_stac_item(&engine.stac_cache, &engine.store, u).await.ok(),
                     None => None,
