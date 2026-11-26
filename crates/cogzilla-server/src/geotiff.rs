@@ -371,7 +371,18 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
         (0..count).map(|i| u16_at(from + 2 * i)).collect()
     };
     let (width, height, bands) = (long(256)?, long(257)?, short(277)?);
-    if shorts(258)?.iter().any(|b| *b != 32) || shorts(339)?.iter().any(|f| *f != 3) || short(259)? != 1 {
+    let bands_us = usize::from(bands);
+    if width == 0 || height == 0 || bands == 0 || (mask && bands < 2) {
+        return None;
+    }
+    let bps = shorts(258)?;
+    let sf = shorts(339)?;
+    if bps.len() != bands_us
+        || sf.len() != bands_us
+        || bps.iter().any(|b| *b != 32)
+        || sf.iter().any(|f| *f != 3)
+        || short(259)? != 1
+    {
         return None;
     }
     let photometric = match short(262)? {
@@ -386,9 +397,15 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
     let keys_at = long(34735)? as usize;
     let epsg = u16_at(keys_at + 2 * 15)?;
     let (pixel_size, corner) = ([f64_at(scale_at)?, f64_at(scale_at + 8)?], [f64_at(tie_at + 24)?, f64_at(tie_at + 32)?]);
-    let (bands_us, pixels) = (usize::from(bands), (width as usize).checked_mul(height as usize)?);
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    let in_bytes = bands_us.checked_mul(pixels)?.checked_mul(4)?;
+    let out_bytes = bands_us.checked_mul(pixels)?.checked_mul(kind.bytes_per_sample())?;
+    // Classic TIFF uses 32-bit strip offsets and byte counts.
+    if out_bytes > (u32::MAX as usize) - 4096 {
+        return None;
+    }
     let start = long(273).filter(|_| !planar).or_else(|| u32_at(long(273)? as usize))? as usize;
-    let samples = tif.get(start..start.checked_add(bands_us * pixels * 4)?)?;
+    let samples = tif.get(start..start.checked_add(in_bytes)?)?;
     let layout = if planar { GeoTiffLayout::Planar } else { GeoTiffLayout::Chunky };
     let spec = GeoTiffSpec {
         width,
@@ -414,7 +431,7 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
                 for (i, v) in values.enumerate() {
                     let x: $t = if !is_mask(i) {
                         cast(f64::from(v))
-                    } else if v != 0.0 {
+                    } else if v.is_finite() && v != 0.0 {
                         <$t>::MAX
                     } else {
                         <$t>::MIN
@@ -1194,6 +1211,11 @@ mod retype_tests {
         let f32_tif = encode_geotiff_f32(2, 1, &f32s(&[0.5, 7.0]), bbox, 3857, true);
         let again = retype_f32_geotiff(&f32_tif, T::Float32, true).unwrap();
         assert_eq!(again, made(GeoTiffSample::F32, 2, &[2], bbox, 3857, &f32s(&[0.5, f32::MAX, 7.0, f32::MAX])));
+        // NaN in the mask band maps to `<T>::MIN` (invalid), not `<T>::MAX`.
+        let nan_mask_tif = made(GeoTiffSample::F32, 2, &[2], bbox, 3857, &f32s(&[5.0, f32::NAN, 6.0, 255.0]));
+        let u16_nan = retype_f32_geotiff(&nan_mask_tif, T::Uint16, true).unwrap();
+        let px_u16: Vec<u8> = [5u16, u16::MIN, 6, u16::MAX].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(u16_nan, made(GeoTiffSample::U16, 2, &[2], bbox, 3857, &px_u16));
     }
 
     #[test]
@@ -1201,6 +1223,7 @@ mod retype_tests {
         let rgba = crate::titiler::encode_geotiff_rgba(2, 1, &[1, 2, 3, 255, 4, 5, 6, 255], [0.0, 0.0, 2.0, 1.0], 3857, true);
         assert!(retype_f32_geotiff(&rgba, T::Uint16, true).is_none());
         let f32_tif = encode_geotiff_f32(2, 1, &f32s(&[1.0, 2.0]), [0.0, 0.0, 2.0, 1.0], 3857, false);
+        assert!(retype_f32_geotiff(&f32_tif, T::Uint16, true).is_none());
         assert!(retype_f32_geotiff(&f32_tif[..f32_tif.len() - 1], T::Uint16, false).is_none());
         assert!(retype_f32_geotiff(b"II*\0 not a tiff at all", T::Uint16, false).is_none());
         assert!(retype_f32_geotiff(b"\x93NUMPY", T::Uint16, false).is_none());
