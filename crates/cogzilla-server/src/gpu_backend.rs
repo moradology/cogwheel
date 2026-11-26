@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use cogzilla_gpu::{
     DispatchPolicy, DispatchRequest, GpuColormapMode, GpuColormapRenderer, GpuContext,
-    GpuDemAlgorithm, GpuOp, GpuPixelOutput, GpuResampler, GpuSlab, GpuSlabCache,
+    GpuCoordPlan, GpuDemAlgorithm, GpuOp, GpuPixelOutput, GpuResampler, GpuSlab, GpuSlabCache,
     GpuTerrainRenderer, PolicyOverride, SlabKey,
 };
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -385,7 +385,8 @@ impl GpuBackend {
         })
     }
 
-    /// Attempt GPU-accelerated single-band tile rendering (single- or multi-block, any dtype).
+    /// Attempt GPU-accelerated single-band tile rendering (single- or multi-block, any dtype,
+    /// and all `CoordPlan` variants: `Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
     #[allow(clippy::too_many_arguments)]
     pub fn try_render_single_band<const N: usize>(
         &self,
@@ -398,10 +399,157 @@ impl GpuBackend {
         src: &BandSource<'_>,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
-        let CoordPlan::Separable1D { u, v, .. } = plan else {
-            return None;
-        };
-        self.try_render_crop_single_band(cog_id, ifd_idx, band0, u.as_slice(), v.as_slice(), src, style)
+        match plan {
+            CoordPlan::Separable1D { u, v, .. } => self.try_render_crop_single_band(
+                cog_id,
+                ifd_idx,
+                band0,
+                u.as_slice(),
+                v.as_slice(),
+                src,
+                style,
+            ),
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => {
+                let gpu_mode = map_resample(style.resample)?;
+                let out_kind = match style.format {
+                    OutputFormat::Png => GpuPixelOutput::IndexedU8,
+                    OutputFormat::Webp { .. }
+                    | OutputFormat::Jpeg { .. }
+                    | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
+                    _ => return None,
+                };
+                let key = source_slab_key(cog_id, ifd_idx, band0, src);
+                let warm_slab = self.slab_cache.get(&key);
+                let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
+                let readback_bytes = match out_kind {
+                    GpuPixelOutput::IndexedU8 => N * N,
+                    GpuPixelOutput::Rgba8 => N * N * 4,
+                };
+                let decision = self.policy.decide(&DispatchRequest {
+                    op: gpu_mode.to_policy_op(),
+                    dst_pixels: N * N,
+                    upload_bytes,
+                    readback_bytes,
+                    batch_size: 1,
+                    in_flight: self.in_flight.load(Ordering::Relaxed),
+                });
+                if !decision.use_gpu {
+                    return None;
+                }
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
+                let _guard = InFlightGuard(&self.in_flight);
+                let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+                let bc = base_col as f32;
+                let br = base_row as f32;
+                let mut gu = [0.0f32; 289];
+                let mut gv = [0.0f32; 289];
+                for i in 0..289 {
+                    gu[i] = grid_u[i] - bc;
+                    gv[i] = grid_v[i] - br;
+                }
+                let lut = style.colormap.lut();
+                let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+                let raw = self
+                    .colormap
+                    .lock()
+                    .ok()?
+                    .render_slab_with_plan(
+                        &slab,
+                        GpuCoordPlan::Grid2D {
+                            dst_w: N,
+                            dst_h: N,
+                            grid_u: &gu,
+                            grid_v: &gv,
+                        },
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?;
+                Some(match out_kind {
+                    GpuPixelOutput::IndexedU8 => {
+                        encode_indexed_u8_png(&raw, N as u32, N as u32, lut)
+                    }
+                    GpuPixelOutput::Rgba8 => {
+                        if style.format == OutputFormat::RawRgba {
+                            Bytes::from(raw)
+                        } else {
+                            encode_rgba_tile(&raw, N as u32, false, style.format)
+                        }
+                    }
+                })
+            }
+            CoordPlan::Exact2D { u, v, .. } => {
+                let gpu_mode = map_resample(style.resample)?;
+                let out_kind = match style.format {
+                    OutputFormat::Png => GpuPixelOutput::IndexedU8,
+                    OutputFormat::Webp { .. }
+                    | OutputFormat::Jpeg { .. }
+                    | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
+                    _ => return None,
+                };
+                let key = source_slab_key(cog_id, ifd_idx, band0, src);
+                let warm_slab = self.slab_cache.get(&key);
+                let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + N * N * 8;
+                let readback_bytes = match out_kind {
+                    GpuPixelOutput::IndexedU8 => N * N,
+                    GpuPixelOutput::Rgba8 => N * N * 4,
+                };
+                let decision = self.policy.decide(&DispatchRequest {
+                    op: gpu_mode.to_policy_op(),
+                    dst_pixels: N * N,
+                    upload_bytes,
+                    readback_bytes,
+                    batch_size: 1,
+                    in_flight: self.in_flight.load(Ordering::Relaxed),
+                });
+                if !decision.use_gpu {
+                    return None;
+                }
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
+                let _guard = InFlightGuard(&self.in_flight);
+                let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+                let bc = base_col as f32;
+                let br = base_row as f32;
+                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
+                let lut = style.colormap.lut();
+                let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+                let raw = self
+                    .colormap
+                    .lock()
+                    .ok()?
+                    .render_slab_with_plan(
+                        &slab,
+                        GpuCoordPlan::Exact2D {
+                            dst_w: N,
+                            dst_h: N,
+                            u: &u_local,
+                            v: &v_local,
+                        },
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?;
+                Some(match out_kind {
+                    GpuPixelOutput::IndexedU8 => {
+                        encode_indexed_u8_png(&raw, N as u32, N as u32, lut)
+                    }
+                    GpuPixelOutput::Rgba8 => {
+                        if style.format == OutputFormat::RawRgba {
+                            Bytes::from(raw)
+                        } else {
+                            encode_rgba_tile(&raw, N as u32, false, style.format)
+                        }
+                    }
+                })
+            }
+        }
     }
 
     /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (single- or multi-block, any dtype).

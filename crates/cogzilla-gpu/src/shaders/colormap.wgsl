@@ -9,7 +9,8 @@ struct ColormapParams {
     rescale_min: f32,
     inv_range_255: f32,
     inv_range_254: f32,
-    _pad0: u32,
+    /// 0 = Separable1D, 1 = Grid2D (17x17 control grid), 2 = Exact2D (dst_w * dst_h)
+    coord_mode: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -213,6 +214,29 @@ fn value_to_indexed_u8(val: f32) -> u32 {
     return 1u + u32(scaled);
 }
 
+fn eval_uv(px: u32, py: u32) -> vec2<f32> {
+    if (params.coord_mode == 0u) {
+        return vec2<f32>(u_coords[px], v_coords[py]);
+    } else if (params.coord_mode == 1u) {
+        let cell_px = max(params.dst_w / 16u, 1u);
+        let inv_cell = 1.0 / f32(cell_px);
+        let gx = min(px / cell_px, 15u);
+        let gy = min(py / cell_px, 15u);
+        let tx = f32(px - gx * cell_px) * inv_cell;
+        let ty = f32(py - gy * cell_px) * inv_cell;
+        let r0 = gy * 17u + gx;
+        let r1 = (gy + 1u) * 17u + gx;
+        let u_l = u_coords[r0] + (u_coords[r1] - u_coords[r0]) * ty;
+        let u_r = u_coords[r0 + 1u] + (u_coords[r1 + 1u] - u_coords[r0 + 1u]) * ty;
+        let v_l = v_coords[r0] + (v_coords[r1] - v_coords[r0]) * ty;
+        let v_r = v_coords[r0 + 1u] + (v_coords[r1 + 1u] - v_coords[r0 + 1u]) * ty;
+        return vec2<f32>(u_l + (u_r - u_l) * tx, v_l + (v_r - v_l) * tx);
+    } else {
+        let idx = py * params.dst_w + px;
+        return vec2<f32>(u_coords[idx], v_coords[idx]);
+    }
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn fused_colormap_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x;
@@ -220,7 +244,8 @@ fn fused_colormap_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (px >= params.dst_w || py >= params.dst_h) {
         return;
     }
-    let val = sample_mode(u_coords[px], v_coords[py]);
+    let uv = eval_uv(px, py);
+    let val = sample_mode(uv.x, uv.y);
     dst_words[py * params.dst_w + px] = value_to_rgba8(val);
 }
 
@@ -236,12 +261,12 @@ fn fused_colormap_indexed_u8(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let base_x = word_x * 4u;
-    let v = v_coords[py];
     var packed: u32 = 0u;
     for (var k: u32 = 0u; k < 4u; k = k + 1u) {
         let px = base_x + k;
         if (px < params.dst_w) {
-            let val = sample_mode(u_coords[px], v);
+            let uv = eval_uv(px, py);
+            let val = sample_mode(uv.x, uv.y);
             let idx = value_to_indexed_u8(val);
             packed = packed | ((idx & 0xffu) << (k * 8u));
         }
