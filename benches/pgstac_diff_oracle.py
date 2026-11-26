@@ -894,6 +894,12 @@ def main() -> int:
                       "items_limit=5%20", "scan_limit=1_000", "time_limit=%2010", "tilesize=1e2", "padding=1.5", "buffer=abc"):
             o.check(f"tile with {spelt}", "status", f"{base12}.png?assets=red&{spelt}")
         o.check("tile, a size written with space around it", "image", f"{base12}.png?assets=visual&tilesize=%20512")
+        # A point checks what it reads; the list of tilesets reads no zooms; `assets=` is a layer.
+        for bad in ("unscale=maybe", "resampling=nope", "nodata=abc", "coord_crs=nope"):
+            o.check(f"point with {bad}", "status", f"/searches/{sid}/point/{lon},{lat}?assets=red&{bad}")
+        o.check("tilesets with a zoom that is not one", "status", f"/searches/{sid}/tiles?minzoom=abc")
+        o.check("WMTS with assets and nothing after it", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=")
+        o.check("bbox, a height written 1.0", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0.png?assets=red&height=1.0&width=8")
         for fmt in ("tif", "tiff", "pngraw"):
             o.check(f"WMTS with tile_format={fmt}", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=red&tile_format={fmt}")
         for date in ("20241201", "2024-12-01_00:00:00Z", "", "../.."):
