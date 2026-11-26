@@ -6251,7 +6251,7 @@ async fn render_bbox_impl(
 
         #[cfg(feature = "gpu")]
         if custom_lut.is_none()
-            && color_formula.is_none()
+            && (color_formula.is_none() || matches!(bands, BandRequest::Rgb { .. }))
             && matches!(
                 format,
                 OutputFormat::Png
@@ -6371,7 +6371,17 @@ async fn render_bbox_impl(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_expr(coords, &srcs, prog, &style, return_mask)
+                    let cache_key = if num_cogs == 1 {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id,
+                            ifd_idx,
+                            &prog.used_bands,
+                            &srcs,
+                        )
+                    } else {
+                        None
+                    };
+                    gpu.try_render_bbox_expr(cache_key, coords, &srcs, prog, &style, return_mask)
                 }
                 BandRequest::Rgb {
                     bands_1based,
@@ -6388,7 +6398,24 @@ async fn render_bbox_impl(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_rgb(coords, &srcs, &style, return_mask)
+                    let cache_key = if num_cogs == 1 {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id,
+                            ifd_idx,
+                            bands_1based,
+                            &srcs,
+                        )
+                    } else {
+                        None
+                    };
+                    gpu.try_render_bbox_rgb(
+                        cache_key,
+                        coords,
+                        &srcs,
+                        &style,
+                        color_formula,
+                        return_mask,
+                    )
                 }
                 _ => None,
             };

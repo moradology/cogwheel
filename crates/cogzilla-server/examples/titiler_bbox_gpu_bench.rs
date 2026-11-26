@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cogzilla_kernel::{ColormapName, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode};
+use cogzilla_kernel::{ColorFormula, ColormapName, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode};
 use cogzilla_server::engine::{BandRequest, TileEngine};
 use cogzilla_io::CogStore;
 use cogzilla_server::titiler::{render_native_preview, render_wgs84_bbox};
@@ -187,7 +187,10 @@ async fn main() {
         h: u32,
         bands: BandRequest,
         resample: ResampleMode,
+        color_formula: Option<ColorFormula>,
     }
+
+    let cf = ColorFormula::parse("Gamma RGB 1.5 Sigmoidal RGB 15 0.35 Saturation 1.2").unwrap();
 
     let cases = [
         Case {
@@ -202,6 +205,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Cubic,
+            color_formula: None,
         },
         Case {
             name: "/cog/preview Single Lanczos3 PNG",
@@ -215,6 +219,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/preview Single Lanczos3 PNG",
@@ -228,6 +233,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/preview DEM Hillshade Lanczos3 PNG",
@@ -246,6 +252,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/bbox (Exact2D) Single Lanczos3 PNG",
@@ -259,6 +266,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/bbox (Exact2D) DEM Hillshade Lanczos3",
@@ -277,6 +285,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/preview Expr NDVI Lanczos3 PNG",
@@ -290,6 +299,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/bbox (Exact2D) Expr NDVI Lanczos3",
@@ -303,6 +313,7 @@ async fn main() {
                 colormap: ColormapName::Viridis,
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/preview RGB 3-band Lanczos3 PNG",
@@ -316,6 +327,7 @@ async fn main() {
                 rescale_max: [2500.0, 1500.0, 1000.0],
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
         },
         Case {
             name: "/cog/bbox (Exact2D) RGB 3-band Lanczos3",
@@ -329,6 +341,21 @@ async fn main() {
                 rescale_max: [2500.0, 1500.0, 1000.0],
             },
             resample: ResampleMode::Lanczos,
+            color_formula: None,
+        },
+        Case {
+            name: "/cog/preview RGB+ColorFormula Lanczos3",
+            native_preview: true,
+            bbox: full_bbox,
+            w: 1024,
+            h: 1024,
+            bands: BandRequest::Rgb {
+                bands_1based: [1, 2, 3],
+                rescale_min: [0.0; 3],
+                rescale_max: [2500.0, 1500.0, 1000.0],
+            },
+            resample: ResampleMode::Lanczos,
+            color_formula: Some(cf),
         },
     ];
 
@@ -338,20 +365,20 @@ async fn main() {
         if c.native_preview {
             let _ = render_native_preview(
                 &cpu_engine, &cpu_cogs, c.bbox, c.w, c.h, &c.bands, c.resample, OutputFormat::Png,
-                None, None, None, true, false,
+                None, None, c.color_formula.as_ref(), true, false,
             ).await.expect("cpu warmup");
             let _ = render_native_preview(
                 &gpu_engine, &gpu_cogs, c.bbox, c.w, c.h, &c.bands, c.resample, OutputFormat::Png,
-                None, None, None, true, false,
+                None, None, c.color_formula.as_ref(), true, false,
             ).await.expect("gpu warmup");
         } else {
             let _ = render_wgs84_bbox(
                 &cpu_engine, &cpu_cogs, c.bbox, c.w, c.h, None, &c.bands, c.resample,
-                OutputFormat::Png, None, None, None, true, false,
+                OutputFormat::Png, None, None, c.color_formula.as_ref(), true, false,
             ).await.expect("cpu warmup");
             let _ = render_wgs84_bbox(
                 &gpu_engine, &gpu_cogs, c.bbox, c.w, c.h, None, &c.bands, c.resample,
-                OutputFormat::Png, None, None, None, true, false,
+                OutputFormat::Png, None, None, c.color_formula.as_ref(), true, false,
             ).await.expect("gpu warmup");
         }
 
@@ -360,12 +387,12 @@ async fn main() {
             let out = if c.native_preview {
                 render_native_preview(
                     &cpu_engine, &cpu_cogs, c.bbox, c.w, c.h, &c.bands, c.resample,
-                    OutputFormat::Png, None, None, None, true, false,
+                    OutputFormat::Png, None, None, c.color_formula.as_ref(), true, false,
                 ).await.expect("cpu render")
             } else {
                 render_wgs84_bbox(
                     &cpu_engine, &cpu_cogs, c.bbox, c.w, c.h, None, &c.bands, c.resample,
-                    OutputFormat::Png, None, None, None, true, false,
+                    OutputFormat::Png, None, None, c.color_formula.as_ref(), true, false,
                 ).await.expect("cpu render")
             };
             assert!(out.starts_with(b"\x89PNG"));
@@ -378,12 +405,12 @@ async fn main() {
             let out = if c.native_preview {
                 render_native_preview(
                     &gpu_engine, &gpu_cogs, c.bbox, c.w, c.h, &c.bands, c.resample,
-                    OutputFormat::Png, None, None, None, true, false,
+                    OutputFormat::Png, None, None, c.color_formula.as_ref(), true, false,
                 ).await.expect("gpu render")
             } else {
                 render_wgs84_bbox(
                     &gpu_engine, &gpu_cogs, c.bbox, c.w, c.h, None, &c.bands, c.resample,
-                    OutputFormat::Png, None, None, None, true, false,
+                    OutputFormat::Png, None, None, c.color_formula.as_ref(), true, false,
                 ).await.expect("gpu render")
             };
             assert!(out.starts_with(b"\x89PNG"));

@@ -4,14 +4,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use cogzilla_gpu::{
     DispatchPolicy, DispatchRequest, GpuColorFormula, GpuColormapMode, GpuColormapRenderer,
-    GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuOp, GpuPixelOutput,
-    GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer, PolicyOverride, SlabKey, opcodes,
+    GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuMultiBandCache,
+    GpuOp, GpuPixelOutput, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer,
+    MultiBandSlabKey, PolicyOverride, SlabKey, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
 use cogzilla_kernel::{
-    BandSource, ColormapLut, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode, RgbStyle,
-    SingleBandStyle, TerrainEncoding, encode_rgba_tile,
+    BandSource, ColorFormula, ColormapLut, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode,
+    RgbStyle, SingleBandStyle, TerrainEncoding, encode_rgba_tile,
 };
 use cogzilla_proj::CoordPlan;
 
@@ -41,6 +42,7 @@ pub struct GpuBackend {
     pub ctx: GpuContext,
     pub policy: DispatchPolicy,
     pub slab_cache: GpuSlabCache,
+    pub multi_slab_cache: GpuMultiBandCache,
     resampler: GpuResampler,
     colormap: Mutex<GpuColormapRenderer>,
     terrain: Mutex<GpuTerrainRenderer>,
@@ -157,6 +159,7 @@ impl GpuBackend {
             ctx,
             policy,
             slab_cache: GpuSlabCache::new(slab_cache_bytes),
+            multi_slab_cache: GpuMultiBandCache::new(slab_cache_bytes),
             resampler,
             colormap,
             terrain,
@@ -1214,10 +1217,69 @@ impl GpuBackend {
         Some(out)
     }
 
+    /// Build a cache key for a single-COG multi-band `GpuMultiBandSlab` when all band sources
+    /// share identical tile-grid geometry and have no per-request nodata/scale overrides.
+    pub fn multiband_key(
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: &[u16],
+        srcs: &[BandSource<'_>],
+    ) -> Option<MultiBandSlabKey> {
+        if srcs.is_empty() || srcs.len() > 8 || bands_1based.len() != srcs.len() {
+            return None;
+        }
+        let s0 = &srcs[0];
+        for s in srcs {
+            if s.tx0 != s0.tx0
+                || s.ty0 != s0.ty0
+                || s.grid_w != s0.grid_w
+                || s.grid_h != s0.grid_h
+                || s.tile_w != s0.tile_w
+                || s.tile_h != s0.tile_h
+                || s.nodata_override.is_some()
+                || s.scale_offset.is_some()
+            {
+                return None;
+            }
+        }
+        let mut bands = [0u16; 8];
+        for (i, &b) in bands_1based.iter().enumerate() {
+            bands[i] = b;
+        }
+        Some(MultiBandSlabKey {
+            dataset_id: cog_id,
+            ifd_idx: ifd_idx as u16,
+            num_bands: srcs.len() as u8,
+            bands,
+            tx: (s0.tx0 << 8) | (s0.grid_w & 0xff),
+            ty: (s0.ty0 << 8) | (s0.grid_h & 0xff),
+        })
+    }
+
+    fn translate_color_formula(cf: Option<&ColorFormula>) -> Option<GpuColorFormula> {
+        match cf {
+            None => Some(GpuColorFormula {
+                rgb_lut: None,
+                saturation: None,
+            }),
+            Some(formula) => {
+                let (lut_opt, saturation) = formula.as_lut_then_saturation()?;
+                let rgb_lut = lut_opt.map(|(r, g, b)| GpuColorFormula::pack_rgb_luts(r, g, b));
+                Some(GpuColorFormula {
+                    rgb_lut,
+                    saturation,
+                })
+            }
+        }
+    }
+
     /// Attempt GPU-accelerated multi-band `ExprProgram` tile rendering across all `CoordPlan`
     /// variants (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
     pub fn try_render_expr<const N: usize>(
         &self,
+        cog_id: u64,
+        ifd_idx: usize,
         plan: &CoordPlan<N>,
         srcs: &[BandSource<'_>],
         prog: &ExprProgram,
@@ -1241,13 +1303,18 @@ impl GpuBackend {
                 v_map: &v[..],
             },
         };
-        self.try_render_bbox_expr(coords, srcs, prog, style, true)
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, &prog.used_bands, srcs);
+        self.try_render_bbox_expr(cache_key, coords, srcs, prog, style, true)
     }
 
     /// Attempt GPU-accelerated 3-band RGB tile rendering across all `CoordPlan` variants
     /// (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
     pub fn try_render_rgb<const N: usize>(
         &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: [u16; 3],
         plan: &CoordPlan<N>,
         srcs: &[BandSource<'_>; 3],
         style: &RgbStyle,
@@ -1270,7 +1337,8 @@ impl GpuBackend {
                 v_map: &v[..],
             },
         };
-        self.try_render_bbox_rgb(coords, srcs, style, true)
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
+        self.try_render_bbox_rgb(cache_key, coords, srcs, style, None, true)
     }
 
     /// Attempt GPU-accelerated multi-band `ExprProgram` rendering for arbitrary `BboxCoordSource`
@@ -1278,6 +1346,7 @@ impl GpuBackend {
     #[allow(clippy::too_many_arguments)]
     pub fn try_render_bbox_expr(
         &self,
+        cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
         srcs: &[BandSource<'_>],
         prog: &ExprProgram,
@@ -1312,11 +1381,15 @@ impl GpuBackend {
             | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
             _ => return None,
         };
-        let upload_bytes: usize = srcs
-            .iter()
-            .map(|s| Self::estimate_upload_bytes(&None, s))
-            .sum::<usize>()
-            + coord_upload_bytes;
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let upload_bytes = band_upload_bytes + coord_upload_bytes;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
@@ -1341,28 +1414,37 @@ impl GpuBackend {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard(&self.in_flight);
 
-        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
-        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-        for src in srcs {
-            let (buf, bc, br, w, h) = stitch_band_source(src)?;
-            if let Some(g) = common_geom {
-                if g != (bc, br, w, h) {
-                    return None;
-                }
-            } else {
-                common_geom = Some((bc, br, w, h));
-            }
-            stitched_vecs.push(buf);
-        }
-        let (base_col, base_row, w, h) = common_geom?;
-        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
-        let bc = base_col as f32;
-        let br = base_row as f32;
-
         let lut = style.colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
         let mut expr_guard = self.expr.lock().ok()?;
-        let multi_slab = expr_guard.upload_bands(&refs, w, h, w).ok()?;
+        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
+            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
+            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
+            (slab, bc, br)
+        } else {
+            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
+            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+            for src in srcs {
+                let (buf, bc, br, w, h) = stitch_band_source(src)?;
+                if let Some(g) = common_geom {
+                    if g != (bc, br, w, h) {
+                        return None;
+                    }
+                } else {
+                    common_geom = Some((bc, br, w, h));
+                }
+                stitched_vecs.push(buf);
+            }
+            let (base_col, base_row, w, h) = common_geom?;
+            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
+            if let Some(k) = cache_key {
+                self.multi_slab_cache.insert(k, Arc::clone(&slab));
+            }
+            (slab, base_col, base_row)
+        };
+        let bc = base_col as f32;
+        let br = base_row as f32;
         let raw = match coords {
             BboxCoordSource::Separable { u, v } => {
                 let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
@@ -1455,17 +1537,21 @@ impl GpuBackend {
         })
     }
 
-    /// Attempt GPU-accelerated 3-band RGB rendering for arbitrary `BboxCoordSource`
+    /// Attempt GPU-accelerated 3-band RGB rendering (with optional fused `ColorFormula`:
+    /// Gamma/Sigmoidal LUT + CIE LCH Saturation) for arbitrary `BboxCoordSource`
     /// (`Separable`, `Grid2D`, or `Exact2D` for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles).
     #[allow(clippy::too_many_arguments)]
     pub fn try_render_bbox_rgb(
         &self,
+        cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
         srcs: &[BandSource<'_>; 3],
         style: &RgbStyle,
+        color_formula: Option<&ColorFormula>,
         return_mask: bool,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample(style.resample)?;
+        let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
             BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
@@ -1493,11 +1579,15 @@ impl GpuBackend {
         ) {
             return None;
         }
-        let upload_bytes: usize = srcs
-            .iter()
-            .map(|s| Self::estimate_upload_bytes(&None, s))
-            .sum::<usize>()
-            + coord_upload_bytes;
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let upload_bytes = band_upload_bytes + coord_upload_bytes;
         let readback_bytes = dst_w * dst_h * 4;
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
@@ -1519,30 +1609,35 @@ impl GpuBackend {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard(&self.in_flight);
 
-        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(3);
-        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-        for src in srcs {
-            let (buf, bc, br, w, h) = stitch_band_source(src)?;
-            if let Some(g) = common_geom {
-                if g != (bc, br, w, h) {
-                    return None;
+        let mut expr_guard = self.expr.lock().ok()?;
+        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
+            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
+            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
+            (slab, bc, br)
+        } else {
+            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(3);
+            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+            for src in srcs {
+                let (buf, bc, br, w, h) = stitch_band_source(src)?;
+                if let Some(g) = common_geom {
+                    if g != (bc, br, w, h) {
+                        return None;
+                    }
+                } else {
+                    common_geom = Some((bc, br, w, h));
                 }
-            } else {
-                common_geom = Some((bc, br, w, h));
+                stitched_vecs.push(buf);
             }
-            stitched_vecs.push(buf);
-        }
-        let (base_col, base_row, w, h) = common_geom?;
-        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+            let (base_col, base_row, w, h) = common_geom?;
+            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
+            if let Some(k) = cache_key {
+                self.multi_slab_cache.insert(k, Arc::clone(&slab));
+            }
+            (slab, base_col, base_row)
+        };
         let bc = base_col as f32;
         let br = base_row as f32;
-
-        let identity = GpuColorFormula {
-            rgb_lut: None,
-            saturation: None,
-        };
-        let mut expr_guard = self.expr.lock().ok()?;
-        let multi_slab = expr_guard.upload_bands(&refs, w, h, w).ok()?;
         let raw = match coords {
             BboxCoordSource::Separable { u, v } => {
                 let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
@@ -1555,7 +1650,7 @@ impl GpuBackend {
                         gpu_mode,
                         style.rescale_min,
                         style.rescale_max,
-                        &identity,
+                        &gpu_formula,
                     )
                     .ok()?
             }
@@ -1583,7 +1678,7 @@ impl GpuBackend {
                         gpu_mode,
                         style.rescale_min,
                         style.rescale_max,
-                        &identity,
+                        &gpu_formula,
                     )
                     .ok()?
             }
@@ -1608,7 +1703,7 @@ impl GpuBackend {
                         gpu_mode,
                         style.rescale_min,
                         style.rescale_max,
-                        &identity,
+                        &gpu_formula,
                     )
                     .ok()?
             }
@@ -1825,6 +1920,130 @@ mod tests {
             }
             assert!(checked_inside > 100 && checked_outside > 50);
             assert!(max_diff <= 4, "Exact2D masked bbox max channel diff {max_diff} > 4");
+        }
+    }
+
+    #[test]
+    fn rgb_color_formula_and_multiband_cache_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU RGB color_formula test (no adapter)");
+            return;
+        };
+        let cf = ColorFormula::parse("Gamma RGB 1.5 Sigmoidal RGB 15 0.35 Saturation 1.2").unwrap();
+        assert!(cf.as_lut_then_saturation().is_some());
+        // Multi-stage post-saturation LUT must fall back cleanly to CPU
+        let cf_complex = ColorFormula::parse("Saturation 1.2 Gamma RGB 1.5").unwrap();
+        assert!(cf_complex.as_lut_then_saturation().is_none());
+
+        let w = 256u32;
+        let h = 256u32;
+        let mk_band = |offset: f32| -> DecodedBand {
+            let mut vals = vec![0u16; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    vals[(y * w + x) as usize] = (offset
+                        + 400.0 * (x as f32 * 0.03).sin()
+                        + 300.0 * (y as f32 * 0.04).cos())
+                        .max(0.0) as u16;
+                }
+            }
+            DecodedBand {
+                width: w,
+                height: h,
+                data: BandData::U16 {
+                    data: vals.into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 0.0,
+                    max: 2000.0,
+                },
+            }
+        };
+        let b0 = mk_band(900.0);
+        let b1 = mk_band(700.0);
+        let b2 = mk_band(500.0);
+        let bl0 = [Some(&b0)];
+        let bl1 = [Some(&b1)];
+        let bl2 = [Some(&b2)];
+        let srcs = [
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl0),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl1),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl2),
+        ];
+
+        let n = 512usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| 4.0 + (i as f32 / n as f32) * 246.0).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| 4.0 + (i as f32 / n as f32) * 246.0).collect();
+        let style = RgbStyle {
+            rescale_min: [0.0; 3],
+            rescale_max: [2000.0; 3],
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        let key = GpuBackend::multiband_key(999, 0, &[1, 2, 3], &srcs);
+        assert!(key.is_some());
+
+        // First call populates multi_slab_cache; second call hits VRAM cache with 0 upload
+        let first = gpu.try_render_bbox_rgb(
+            key,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &srcs,
+            &style,
+            Some(&cf),
+            true,
+        );
+        if let Some(rgba1) = first {
+            let st1 = gpu.multi_slab_cache.stats();
+            assert_eq!(st1.entries, 1);
+            let rgba2 = gpu
+                .try_render_bbox_rgb(
+                    key,
+                    BboxCoordSource::Separable {
+                        u: &u_coords,
+                        v: &v_coords,
+                    },
+                    &srcs,
+                    &style,
+                    Some(&cf),
+                    true,
+                )
+                .expect("warm cached RGB render should use GPU");
+            assert_eq!(rgba1, rgba2, "cached multi-band slab output must be bit-identical");
+            assert!(gpu.multi_slab_cache.stats().hits >= 1);
+
+            let inv = 255.0 / 2000.0;
+            let mut max_diff = 0i32;
+            for py in (0..n).step_by(19) {
+                for px in (0..n).step_by(19) {
+                    let sr = cogzilla_kernel::sample_general_scaled(
+                        &srcs[0], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let sg = cogzilla_kernel::sample_general_scaled(
+                        &srcs[1], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let sb = cogzilla_kernel::sample_general_scaled(
+                        &srcs[2], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let (cr, cg, cb) = cf.apply_rgb(
+                        (sr * inv).clamp(0.0, 255.0) as u8,
+                        (sg * inv).clamp(0.0, 255.0) as u8,
+                        (sb * inv).clamp(0.0, 255.0) as u8,
+                    );
+                    let off = (py * n + px) * 4;
+                    assert_eq!(rgba1[off + 3], 255);
+                    max_diff = max_diff
+                        .max((cr as i32 - rgba1[off] as i32).abs())
+                        .max((cg as i32 - rgba1[off + 1] as i32).abs())
+                        .max((cb as i32 - rgba1[off + 2] as i32).abs());
+                }
+            }
+            assert!(max_diff <= 4, "RGB ColorFormula max channel diff {max_diff} > 4");
         }
     }
 }
