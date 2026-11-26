@@ -2310,7 +2310,7 @@ async fn mosaic_array_in_its_type(
                 return array_in_its_type(data, Some(cogzilla_tiff::SampleType::Float32), *mask);
             }
             pixel_selection::Selection::Count => {
-                let kind = if urls.len() <= 255 {
+                let kind = if urls.len().min(64) <= 255 {
                     cogzilla_tiff::SampleType::Uint8
                 } else {
                     cogzilla_tiff::SampleType::Uint16
@@ -2320,8 +2320,9 @@ async fn mosaic_array_in_its_type(
             _ => {}
         }
     }
-    let mut cogs = Vec::with_capacity(urls.len());
-    for u in urls {
+    let cap = urls.len().min(64);
+    let mut cogs = Vec::with_capacity(cap);
+    for u in urls.iter().take(cap) {
         if let Ok(cog) = engine.store.open_uri(u).await {
             cogs.push(cog);
         }
@@ -2392,7 +2393,11 @@ fn attach_x_failed_assets(resp: &mut Response<Full<Bytes>>, failed: &[String]) {
     if failed.is_empty() || !resp.status().is_success() {
         return;
     }
-    let joined = failed.join(",");
+    let joined = failed
+        .iter()
+        .map(|u| cogzilla_io::redact_http_url(u))
+        .collect::<Vec<_>>()
+        .join(",");
     if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
         resp.headers_mut().insert("x-failed-assets", hv);
     }
@@ -2496,6 +2501,7 @@ fn aspect_preserving_dims(bbox: [f64; 4], max_dim: u32) -> (u32, u32) {
 fn capped_native_bbox_dims(
     engine: &TileEngine,
     cog: &cogzilla_io::OpenedCog,
+    dst_crs: &cogzilla_proj::CrsModel,
     wgs_bbox: [f64; 4],
     dst_bbox: [f64; 4],
     max_dim: u32,
@@ -2504,7 +2510,7 @@ fn capped_native_bbox_dims(
     let Ok(crs) = engine.get_or_build_crs(cog) else {
         return aspect_preserving_dims(dst_bbox, cap);
     };
-    let (nat_w, nat_h) = native_bbox_dims_in_crs(cog.index.full_res(), &crs, wgs_bbox, dst_bbox);
+    let (nat_w, nat_h) = native_bbox_dims_in_crs(cog.index.full_res(), &crs, dst_crs, wgs_bbox, dst_bbox);
     if nat_w.max(nat_h) <= cap {
         (nat_w.max(1), nat_h.max(1))
     } else if nat_w >= nat_h {
@@ -2524,12 +2530,14 @@ fn capped_native_bbox_dims(
 fn default_rescale_for_dtype(st: cogzilla_tiff::SampleType, single: bool) -> (f32, f32) {
     use cogzilla_tiff::SampleType;
     match st {
-        SampleType::Uint8 => (0.0, 255.0),
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => (0.0, 255.0),
         SampleType::Int8 => (-128.0, 127.0),
         SampleType::Uint16 => (0.0, 65535.0),
         SampleType::Int16 => (-32768.0, 32767.0),
         SampleType::Uint32 => (0.0, 4_294_967_295.0),
         SampleType::Int32 => (-2_147_483_648.0, 2_147_483_647.0),
+        SampleType::Uint64 => (0.0, u64::MAX as f32),
+        SampleType::Int64 => (i64::MIN as f32, i64::MAX as f32),
         SampleType::Float32 | SampleType::Float64 => {
             if single {
                 (0.0, 1000.0)
@@ -3761,8 +3769,10 @@ async fn render_mosaic_tile_pixel_selection(
         let data_bands = data_band_count(cogs[0].index.full_res());
         if method.by_last_band()
             && pq.bidx.is_empty()
+            && pq.expr_raw.is_none()
+            && pq.algorithm.is_none()
             && data_bands >= 2
-            && !matches!(scene_bands, BandRequest::MultiBand { .. })
+            && matches!(scene_bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
         {
             scene_bands = BandRequest::MultiBand {
                 bands_1based: (1..=data_bands).collect(),
@@ -4499,8 +4509,10 @@ async fn render_mosaic_bbox_composite(
         }
         if method.by_last_band()
             && pq.bidx.is_empty()
+            && pq.expr_raw.is_none()
+            && pq.algorithm.is_none()
             && data_bands >= 2
-            && !matches!(bands, BandRequest::MultiBand { .. })
+            && matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
         {
             bands = BandRequest::MultiBand {
                 bands_1based: (1..=data_bands).collect(),
@@ -4928,7 +4940,7 @@ async fn compute_mosaic_statistics_with_fold(
                         (w, cap)
                     }
                 } else {
-                    capped_native_bbox_dims(engine, &cogs[0], eff_bbox, eff_bbox, cap)
+                    capped_native_bbox_dims(engine, &cogs[0], &cogzilla_proj::CrsModel::Geographic, eff_bbox, eff_bbox, cap)
                 };
                 let (w, h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let dims = (w.clamp(1, 4096), h.clamp(1, 4096));
@@ -5341,6 +5353,9 @@ async fn open_first_mosaic_cog(
     for u in urls.iter().take(16) {
         match engine.store.open_uri(u).await {
             Ok(c) => return Ok(c),
+            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                return Err(EngineError::Io(e));
+            }
             Err(e) => last_err = Some(crate::engine::asset_fetch_error(u, e)),
         }
     }
@@ -5404,28 +5419,40 @@ pub async fn handle_bytes_request(
 }
 
 fn header_accepts_gzip(val: &str) -> bool {
+    let mut gzip_q: Option<f32> = None;
+    let mut star_q: Option<f32> = None;
     for part in val.split(',') {
         let mut iter = part.split(';');
         let enc = iter.next().unwrap_or("").trim();
-        if !enc.eq_ignore_ascii_case("gzip") && !enc.eq_ignore_ascii_case("x-gzip") && enc != "*" {
+        let is_gzip = enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip");
+        let is_star = enc == "*";
+        if !is_gzip && !is_star {
             continue;
         }
-        let mut q_ok = true;
+        let mut q_val = 1.0f32;
+        let mut valid = true;
         for param in iter {
             let p = param.trim();
             if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                if let Ok(q) = qv.trim().parse::<f32>() {
-                    if q <= 0.0 {
-                        q_ok = false;
+                match qv.trim().parse::<f32>() {
+                    Ok(q) if q.is_finite() && (0.0..=1.0).contains(&q) => q_val = q,
+                    _ => {
+                        valid = false;
+                        break;
                     }
                 }
             }
         }
-        if q_ok {
-            return true;
+        if !valid {
+            continue;
+        }
+        if is_gzip {
+            gzip_q = Some(gzip_q.map_or(q_val, |prev| prev.max(q_val)));
+        } else {
+            star_q = Some(star_q.map_or(q_val, |prev| prev.max(q_val)));
         }
     }
-    false
+    gzip_q.or(star_q).is_some_and(|q| q > 0.0)
 }
 
 fn is_compressible_content_type(ct: &str) -> bool {
@@ -6561,6 +6588,9 @@ where
                             opened_any = true;
                             c
                         }
+                        Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                            return Err(EngineError::Io(e));
+                        }
                         Err(e) => {
                             last_open_err = Some(crate::engine::asset_fetch_error(&asset_url, e));
                             continue;
@@ -6675,6 +6705,7 @@ where
                     "maxzoom": mj.maxzoom,
                     "bounds": mj.bounds,
                     "center": center,
+                    "raster_layers": {},
                 });
                 apply_tilejson_overrides(&mut tj, &pq, &host, "mosaicjson", tms, &raw_query);
                 Ok((Bytes::from(tj.to_string()), "application/json"))
@@ -8364,6 +8395,9 @@ where
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
                 apply_tilejson_overrides(&mut tj, &pq, &host, &stac_prefix, tms, &raw_query);
                 tj["name"] = serde_json::json!(item.id);
+                if !item.renders.is_empty() {
+                    tj["raster_layers"] = serde_json::json!(&item.renders);
+                }
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
@@ -8987,7 +9021,7 @@ where
                     .map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, pq_stac.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, pq_stac.max_size);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_stac_bbox_opt(
@@ -9157,7 +9191,7 @@ where
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, &dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &dst_crs, wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_stac_bbox_opt(
@@ -9172,7 +9206,7 @@ where
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                     let d = render_stac_bbox_opt(
@@ -9182,7 +9216,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else if pq_stac.coord_crs_3857 {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, bbox, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &cogzilla_proj::CrsModel::Epsg3857, wgs_bbox_src, bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 3857);
                     let d = render_stac_bbox_opt(
@@ -9192,7 +9226,7 @@ where
                     .await?;
                     (d, bbox, out_w, out_h, 3857u16)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, wgs_bbox_src, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &cogzilla_proj::CrsModel::Geographic, wgs_bbox_src, wgs_bbox_src, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), 4326);
                     let d = render_stac_bbox_opt(
@@ -9383,7 +9417,7 @@ where
                 let mask_opt = pq_stac.shape_mask.then_some(&mask);
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = eff_dst {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, s);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, s);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let d = render_stac_bbox_opt(
                         &engine, &cogs, slot_bands.as_deref(), dst_bbox, dst_crs, false, out_w, out_h, mask_opt, &bands, resample, fmt,
@@ -9392,7 +9426,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, bbox, s);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &cogzilla_proj::CrsModel::Geographic, bbox, bbox, s);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq_stac.width, pq_stac.height);
                     let d = render_stac_bbox_opt(
                         &engine, &cogs, slot_bands.as_deref(), bbox, &cogzilla_proj::CrsModel::Geographic, false, out_w, out_h, mask_opt, &bands, resample, fmt,
@@ -10411,6 +10445,7 @@ where
                     capped_native_bbox_dims(
                         &engine,
                         &cogs[0],
+                        &dst_crs,
                         wgs_bbox,
                         out_bbox,
                         pq.max_size,
@@ -10583,7 +10618,7 @@ where
                 let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, pq.max_size);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, pq.max_size);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
@@ -10776,7 +10811,7 @@ where
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, &dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &dst_crs, wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
@@ -10791,7 +10826,7 @@ where
                     } else {
                         reproject_wgs84_bounds(wgs_bbox_src, dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, dst_bbox, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, wgs_bbox_src, dst_bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
                     let d = render_crs_bbox(
@@ -10801,7 +10836,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else if pq.coord_crs_3857 {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, bbox, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &cogzilla_proj::CrsModel::Epsg3857, wgs_bbox_src, bbox, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 3857);
                     let d = render_mercator_bbox(
@@ -10811,7 +10846,7 @@ where
                     .await?;
                     (d, bbox, out_w, out_h, 3857u16)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], wgs_bbox_src, wgs_bbox_src, bbox_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &cogzilla_proj::CrsModel::Geographic, wgs_bbox_src, wgs_bbox_src, bbox_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), 4326);
                     let d = render_wgs84_bbox(
@@ -10937,7 +10972,7 @@ where
                     } else {
                         reproject_wgs84_bounds(bbox, dst_crs)?
                     };
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, dst_bbox, feat_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, feat_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_crs_bbox(
                         &engine, &cogs, dst_bbox, dst_crs, out_w, out_h, mask_opt, &bands, resample, fmt,
@@ -10946,7 +10981,7 @@ where
                     .await?;
                     (d, dst_bbox, out_w, out_h, dst_epsg)
                 } else {
-                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], bbox, bbox, feat_max);
+                    let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], &cogzilla_proj::CrsModel::Geographic, bbox, bbox, feat_max);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let d = render_wgs84_bbox(
                         &engine, &cogs, bbox, out_w, out_h, mask_opt, &bands, resample, fmt,
@@ -12270,5 +12305,37 @@ mod tests {
         let tj_href = links[1]["href"].as_str().unwrap();
         assert!(self_href.contains("/stac/renders/true%20color?url=https%3A%2F%2Fs3.example%2Fitem.json%3Fa%3D1%26b%3D2"), "{self_href}");
         assert!(tj_href.contains("colormap=%7B%221%22%3A%5B255%2C0%2C0%2C255%5D%7D"), "{tj_href}");
+    }
+
+    #[test]
+    fn audit87_header_accepts_gzip_rfc9110_precedence_and_nan() {
+        assert!(!header_accepts_gzip("gzip;q=0, *"));
+        assert!(!header_accepts_gzip("*, gzip;q=0"));
+        assert!(!header_accepts_gzip("x-gzip;q=0, *;q=1"));
+        assert!(!header_accepts_gzip("gzip;q=NaN"));
+        assert!(!header_accepts_gzip("gzip;q=inf"));
+        assert!(!header_accepts_gzip("gzip;q=-0.5"));
+        assert!(!header_accepts_gzip("br, deflate"));
+        assert!(header_accepts_gzip("br, *;q=0.5"));
+        assert!(header_accepts_gzip("x-gzip;q=0.1"));
+        assert!(header_accepts_gzip("gzip, deflate"));
+    }
+
+    #[test]
+    fn audit88_attach_x_failed_assets_redacts_credentials_and_presigned_queries() {
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        attach_x_failed_assets(
+            &mut resp,
+            &[
+                "https://user:secret@s3.example.com/bucket/a.tif?X-Amz-Signature=deadbeef".into(),
+                "/local/ok.tif".into(),
+            ],
+        );
+        let hv = resp.headers().get("x-failed-assets").unwrap().to_str().unwrap();
+        assert!(!hv.contains("secret") && !hv.contains("deadbeef"), "leaked creds in x-failed-assets: {hv}");
+        assert!(hv.contains("https://s3.example.com/bucket/a.tif") && hv.contains("/local/ok.tif"), "{hv}");
     }
 }

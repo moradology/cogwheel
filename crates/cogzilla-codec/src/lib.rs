@@ -185,10 +185,10 @@ pub fn decode_tile_rows(
         PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
         PlanarConfig::Planar => 1,
     };
-    let expected_bytes = (ifd.tile_width as usize)
-        .checked_mul(tile_h as usize)
-        .and_then(|n| n.checked_mul(bands_in_tile))
-        .and_then(|n| n.checked_mul(ifd.sample_type.bytes_per_sample()))
+    let expected_bytes = ifd
+        .sample_type
+        .row_bytes(ifd.tile_width as usize, bands_in_tile)
+        .and_then(|rb| rb.checked_mul(tile_h as usize))
         .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
         .ok_or(CodecError::SizeMismatch {
             expected: MAX_DECODED_TILE_BYTES,
@@ -269,6 +269,42 @@ pub fn decode_tile_rows(
                 recon_nodata,
             ),
             SampleType::Int32 => predictor::reconstruct_int32(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                byte_order,
+                true,
+                false,
+                recon_nodata,
+            ),
+            SampleType::Uint1 => predictor::reconstruct_subbyte(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                1,
+                recon_nodata,
+            ),
+            SampleType::Uint4 => predictor::reconstruct_subbyte(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                4,
+                recon_nodata,
+            ),
+            SampleType::Uint64 => predictor::reconstruct_int64(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                byte_order,
+                false,
+                false,
+                recon_nodata,
+            ),
+            SampleType::Int64 => predictor::reconstruct_int64(
                 &compressed[..expected_bytes],
                 ifd.tile_width,
                 tile_h,
@@ -875,6 +911,42 @@ pub fn decode_tile_rows(
                 recon_nodata,
             ),
             (SampleType::Int32, p) => predictor::reconstruct_int32(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                eff_byte_order,
+                true,
+                p == Predictor::HorizontalInt,
+                recon_nodata,
+            ),
+            (SampleType::Uint1, _) => predictor::reconstruct_subbyte(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                1,
+                recon_nodata,
+            ),
+            (SampleType::Uint4, _) => predictor::reconstruct_subbyte(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                4,
+                recon_nodata,
+            ),
+            (SampleType::Uint64, p) => predictor::reconstruct_int64(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                eff_byte_order,
+                false,
+                p == Predictor::HorizontalInt,
+                recon_nodata,
+            ),
+            (SampleType::Int64, p) => predictor::reconstruct_int64(
                 raw_slice,
                 ifd.tile_width,
                 tile_h,

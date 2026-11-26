@@ -651,6 +651,12 @@ impl CogSource {
                         _ => false,
                     },
                 };
+                // Drain the tiny 1-byte body on `206 Partial Content` (for `Range: bytes=0-0`) so
+                // reqwest can return the HTTP/1.1 keep-alive connection to the pool instead of
+                // tearing it down. Never drain a `200` (origin may have ignored Range on a huge file).
+                if status == 206 && resp.content_length().is_some_and(|n| n <= 64) {
+                    let _ = resp.bytes().await;
+                }
                 return Ok(unchanged);
             }
             if is_retryable_status(status) && attempt < *max_retries {

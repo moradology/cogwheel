@@ -47,6 +47,11 @@ enum SceneFailure {
     Unread(EngineError),
 }
 
+/// Whether opening a scene failed because the allowlist refuses its asset.
+fn refused(e: &EngineError) -> bool {
+    matches!(e, EngineError::Io(io) if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)))
+}
+
 impl SceneFailure {
     fn into_error(self) -> EngineError {
         match self {
@@ -481,9 +486,12 @@ impl TileEngine {
 
     pub fn get_or_build_crs(&self, cog: &OpenedCog) -> Result<CrsModel, EngineError> {
         if !cog.index.is_georeferenced {
-            return Err(EngineError::BadRequest(
-                "dataset has no georeferencing (missing GeoTransform/GCPs); geographic operations require a georeferenced raster".into(),
-            ));
+            let msg = if cog.index.has_rpc {
+                "dataset has no supported georeferencing (missing GeoTransform/GCPs; RPC georeferencing is not supported); geographic operations require a georeferenced raster"
+            } else {
+                "dataset has no georeferencing (missing GeoTransform/GCPs; RPCs are not supported); geographic operations require a georeferenced raster"
+            };
+            return Err(EngineError::BadRequest(msg.into()));
         }
         if let Some(c) = self.crs_cache.get(&cog.id) {
             return Ok(c.clone());
@@ -2189,7 +2197,9 @@ impl TileEngine {
                         opened_any = true;
                         src
                     }
-                    Err(SceneFailure::Unopened(e)) if skip_unopened => {
+                    // An asset the allowlist refuses fails the tile, as on `main`, rather than being
+                    // passed over as one that could not be read.
+                    Err(SceneFailure::Unopened(e)) if skip_unopened && !refused(&e) => {
                         failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
                         last_open_err = Some(e);
                         continue;
@@ -2206,7 +2216,6 @@ impl TileEngine {
                         continue;
                     }
                     let mut all_valid = true;
-                    let mut vals = [f32::NAN; 3];
                     for b in 0..f32_bands {
                         let byte_off = (b * total_pixels + i) * 4;
                         let v = f32::from_le_bytes([
@@ -2219,11 +2228,16 @@ impl TileEngine {
                             all_valid = false;
                             break;
                         }
-                        vals[b] = v;
                     }
                     if all_valid {
                         for b in 0..f32_bands {
-                            canvas[b * total_pixels + i] = vals[b];
+                            let byte_off = (b * total_pixels + i) * 4;
+                            canvas[b * total_pixels + i] = f32::from_le_bytes([
+                                src[byte_off],
+                                src[byte_off + 1],
+                                src[byte_off + 2],
+                                src[byte_off + 3],
+                            ]);
                         }
                         filled += 1;
                     }
@@ -2297,7 +2311,9 @@ impl TileEngine {
                     opened_any = true;
                     src
                 }
-                Err(SceneFailure::Unopened(e)) if skip_unopened => {
+                // An asset the allowlist refuses fails the tile, as on `main`, rather than being
+                // passed over as one that could not be read.
+                Err(SceneFailure::Unopened(e)) if skip_unopened && !refused(&e) => {
                     failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
                     last_open_err = Some(e);
                     continue;
@@ -2690,6 +2706,9 @@ mod tests {
             byte_order: cogzilla_tiff::ByteOrder::Little,
             is_bigtiff: false,
             is_georeferenced: true,
+            has_rpc: false,
+            main_ifd_offset: 8,
+            ifd_offsets: vec![8],
             gcp_residual_px: None,
             geo_keys,
             nodata: None,
