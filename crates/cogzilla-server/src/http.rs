@@ -4388,34 +4388,111 @@ async fn load_mosaicjson(
 }
 
 const MAX_POST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_STATISTICS_FEATURES: usize = 10_000;
+const MAX_STATISTICS_FEATURES_ENV: &str = "COGZILLA_MAX_STATISTICS_FEATURES";
+const DEFAULT_BODY_TIMEOUT_SECS: u64 = 30;
+const BODY_TIMEOUT_SECS_ENV: &str = "COGZILLA_BODY_TIMEOUT_SECS";
+
+/// Maximum features accepted in a `POST /*/statistics` `FeatureCollection` (`0` = unlimited,
+/// still bounded by `MAX_POST_BODY_BYTES` and per-feature window/block caps).
+fn max_statistics_features() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var(MAX_STATISTICS_FEATURES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_STATISTICS_FEATURES)
+    })
+}
+
+/// Timeout in seconds for reading a POST request body (`0` disables the timeout).
+fn body_timeout_secs() -> u64 {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SECS.get_or_init(|| {
+        std::env::var(BODY_TIMEOUT_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BODY_TIMEOUT_SECS)
+    })
+}
+
+fn check_feature_collection_len(len: usize) -> Result<(), EngineError> {
+    let cap = max_statistics_features();
+    if cap > 0 && len > cap {
+        return Err(EngineError::BadRequest(format!(
+            "FeatureCollection exceeds max {cap} features (got {len})"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_feature_stats(feat: &mut serde_json::Value, stats: serde_json::Value) {
+    if let Some(props) = feat.get_mut("properties").and_then(|v| v.as_object_mut()) {
+        props.insert("statistics".into(), stats);
+    } else if let Some(obj) = feat.as_object_mut() {
+        obj.insert(
+            "properties".into(),
+            serde_json::json!({"statistics": stats}),
+        );
+    }
+}
+
+fn fc_worker_count(n: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .clamp(2, 16)
+        .min(n)
+}
+
+async fn read_limited_body_with_timeout<B>(body: B, timeout_secs: u64) -> Result<Bytes, EngineError>
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
+    use bytes::Buf;
+    let read_fut = async move {
+        let mut out = bytes::BytesMut::new();
+        tokio::pin!(body);
+        while let Some(frame_res) = body.frame().await {
+            let frame =
+                frame_res.map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?;
+            if let Ok(mut data) = frame.into_data() {
+                if out.len().saturating_add(data.remaining()) > MAX_POST_BODY_BYTES {
+                    return Err(EngineError::PayloadTooLarge(format!(
+                        "request body exceeds {} MiB limit",
+                        MAX_POST_BODY_BYTES / (1024 * 1024)
+                    )));
+                }
+                while data.has_remaining() {
+                    let chunk = data.chunk();
+                    out.extend_from_slice(chunk);
+                    let n = chunk.len();
+                    data.advance(n);
+                }
+            }
+        }
+        Ok(out.freeze())
+    };
+    if timeout_secs == 0 {
+        read_fut.await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), read_fut)
+            .await
+            .map_err(|_| {
+                EngineError::RequestTimeout(format!(
+                    "request body read timed out after {timeout_secs}s"
+                ))
+            })?
+    }
+}
 
 async fn read_limited_body<B>(body: B) -> Result<Bytes, EngineError>
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
-    use bytes::Buf;
-    let mut out = bytes::BytesMut::new();
-    tokio::pin!(body);
-    while let Some(frame_res) = body.frame().await {
-        let frame =
-            frame_res.map_err(|e| EngineError::BadRequest(format!("body read error: {e}")))?;
-        if let Ok(mut data) = frame.into_data() {
-            if out.len().saturating_add(data.remaining()) > MAX_POST_BODY_BYTES {
-                return Err(EngineError::BadRequest(format!(
-                    "request body exceeds {} MiB limit",
-                    MAX_POST_BODY_BYTES / (1024 * 1024)
-                )));
-            }
-            while data.has_remaining() {
-                let chunk = data.chunk();
-                out.extend_from_slice(chunk);
-                let n = chunk.len();
-                data.advance(n);
-            }
-        }
-    }
-    Ok(out.freeze())
+    read_limited_body_with_timeout(body, body_timeout_secs()).await
 }
 
 /// Open the first readable scene in a mosaic candidate list so a single missing/corrupt scene at
@@ -5122,23 +5199,31 @@ where
                                 "FeatureCollection missing 'features' array".into(),
                             )
                         })?;
-                    if features.len() > 64 {
-                        return Err(EngineError::BadRequest(format!(
-                            "FeatureCollection exceeds max 64 features (got {})",
-                            features.len()
-                        )));
-                    }
-                    for feat in features.iter_mut() {
-                        let stats = compute_for_geom(feat).await?;
-                        if let Some(props) =
-                            feat.get_mut("properties").and_then(|v| v.as_object_mut())
-                        {
-                            props.insert("statistics".into(), stats);
-                        } else if let Some(obj) = feat.as_object_mut() {
-                            obj.insert(
-                                "properties".into(),
-                                serde_json::json!({"statistics": stats}),
-                            );
+                    check_feature_collection_len(features.len())?;
+                    let n_feats = features.len();
+                    if n_feats <= 1 {
+                        for feat in features.iter_mut() {
+                            let stats = compute_for_geom(feat).await?;
+                            insert_feature_stats(feat, stats);
+                        }
+                    } else {
+                        let sem = Arc::new(tokio::sync::Semaphore::new(fc_worker_count(n_feats)));
+                        let mut set = tokio::task::JoinSet::new();
+                        for (idx, feat) in features.iter().enumerate() {
+                            let fut = compute_for_geom(feat);
+                            let sem_c = sem.clone();
+                            set.spawn(async move {
+                                let _permit = sem_c.acquire_owned().await.map_err(|_| {
+                                    EngineError::BadRequest("statistics worker cancelled".into())
+                                })?;
+                                Ok::<_, EngineError>((idx, fut.await?))
+                            });
+                        }
+                        while let Some(joined) = set.join_next().await {
+                            let (idx, stats) = joined.map_err(|e| {
+                                EngineError::BadRequest(format!("statistics worker failed: {e}"))
+                            })??;
+                            insert_feature_stats(&mut features[idx], stats);
                         }
                     }
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
@@ -7009,25 +7094,39 @@ where
                         .ok_or_else(|| {
                             EngineError::BadRequest("FeatureCollection missing 'features' array".into())
                         })?;
-                    if features.len() > 64 {
-                        return Err(EngineError::BadRequest(format!(
-                            "FeatureCollection exceeds max 64 features (got {})",
-                            features.len()
-                        )));
-                    }
-                    for feat in features.iter_mut() {
-                        let (mask, poly_bbox) =
-                            PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
-                        let stats = compute_stac_merged_stats(Arc::new(mask), poly_bbox).await?;
-                        if let Some(props) =
-                            feat.get_mut("properties").and_then(|v| v.as_object_mut())
-                        {
-                            props.insert("statistics".into(), stats);
-                        } else if let Some(obj) = feat.as_object_mut() {
-                            obj.insert(
-                                "properties".into(),
-                                serde_json::json!({"statistics": stats}),
-                            );
+                    check_feature_collection_len(features.len())?;
+                    let n_feats = features.len();
+                    if n_feats <= 1 {
+                        for feat in features.iter_mut() {
+                            let (mask, poly_bbox) =
+                                PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
+                            let stats = compute_stac_merged_stats(Arc::new(mask), poly_bbox).await?;
+                            insert_feature_stats(feat, stats);
+                        }
+                    } else {
+                        let mut parsed = Vec::with_capacity(n_feats);
+                        for feat in features.iter() {
+                            let (mask, poly_bbox) =
+                                PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
+                            parsed.push((Arc::new(mask), poly_bbox));
+                        }
+                        let sem = Arc::new(tokio::sync::Semaphore::new(fc_worker_count(n_feats)));
+                        let mut set = tokio::task::JoinSet::new();
+                        for (idx, (mask, poly_bbox)) in parsed.into_iter().enumerate() {
+                            let fut = compute_stac_merged_stats(mask, poly_bbox);
+                            let sem_c = sem.clone();
+                            set.spawn(async move {
+                                let _permit = sem_c.acquire_owned().await.map_err(|_| {
+                                    EngineError::BadRequest("statistics worker cancelled".into())
+                                })?;
+                                Ok::<_, EngineError>((idx, fut.await?))
+                            });
+                        }
+                        while let Some(joined) = set.join_next().await {
+                            let (idx, stats) = joined.map_err(|e| {
+                                EngineError::BadRequest(format!("statistics worker failed: {e}"))
+                            })??;
+                            insert_feature_stats(&mut features[idx], stats);
                         }
                     }
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
@@ -8328,34 +8427,76 @@ where
                                     "FeatureCollection missing 'features' array".into(),
                                 )
                             })?;
-                        if features.len() > 64 {
-                            return Err(EngineError::BadRequest(format!(
-                                "FeatureCollection exceeds max 64 features (got {})",
-                                features.len()
-                            )));
-                        }
-                        for feat in features.iter_mut() {
-                            let (mask, _) =
-                                PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
-                            let stats = compute_statistics_with_options(
-                                &engine,
-                                &cogs[0],
-                                pq.max_size,
-                                Some(&mask),
-                                pq.unscale,
-                                pq.nodata,
-                                &stats_opts,
-                            )
-                            .await?;
-                            if let Some(props) =
-                                feat.get_mut("properties").and_then(|v| v.as_object_mut())
-                            {
-                                props.insert("statistics".into(), stats);
-                            } else if let Some(obj) = feat.as_object_mut() {
-                                obj.insert(
-                                    "properties".into(),
-                                    serde_json::json!({"statistics": stats}),
-                                );
+                        check_feature_collection_len(features.len())?;
+                        let n_feats = features.len();
+                        if n_feats <= 1 {
+                            for feat in features.iter_mut() {
+                                let (mask, _) =
+                                    PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
+                                let stats = compute_statistics_with_options(
+                                    &engine,
+                                    &cogs[0],
+                                    pq.max_size,
+                                    Some(&mask),
+                                    pq.unscale,
+                                    pq.nodata,
+                                    &stats_opts,
+                                )
+                                .await?;
+                                insert_feature_stats(feat, stats);
+                            }
+                        } else {
+                            let mut masks = Vec::with_capacity(n_feats);
+                            for feat in features.iter() {
+                                let (mask, _) =
+                                    PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
+                                masks.push(mask);
+                            }
+                            let masks = Arc::new(masks);
+                            let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                            let workers = fc_worker_count(n_feats);
+                            let mut set = tokio::task::JoinSet::new();
+                            for _ in 0..workers {
+                                let eng_c = engine.clone();
+                                let cog_c = cogs[0].clone();
+                                let masks_c = masks.clone();
+                                let next_c = next_idx.clone();
+                                let opts_c = stats_opts.clone();
+                                let max_size = pq.max_size;
+                                let unscale = pq.unscale;
+                                let nodata = pq.nodata;
+                                set.spawn(async move {
+                                    let mut local = Vec::new();
+                                    loop {
+                                        let idx = next_c
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if idx >= masks_c.len() {
+                                            break;
+                                        }
+                                        let stats = compute_statistics_with_options(
+                                            &eng_c,
+                                            &cog_c,
+                                            max_size,
+                                            Some(&masks_c[idx]),
+                                            unscale,
+                                            nodata,
+                                            &opts_c,
+                                        )
+                                        .await?;
+                                        local.push((idx, stats));
+                                    }
+                                    Ok::<_, EngineError>(local)
+                                });
+                            }
+                            while let Some(joined) = set.join_next().await {
+                                let batch = joined.map_err(|e| {
+                                    EngineError::BadRequest(format!(
+                                        "statistics worker failed: {e}"
+                                    ))
+                                })??;
+                                for (idx, stats) in batch {
+                                    insert_feature_stats(&mut features[idx], stats);
+                                }
                             }
                         }
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
@@ -9891,6 +10032,8 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
         EngineError::NotFound(msg) => json_error_resp(StatusCode::NOT_FOUND, msg),
         EngineError::BadGateway(msg) => json_error_resp(StatusCode::BAD_GATEWAY, msg),
         EngineError::BadRequest(msg) => json_error_resp(StatusCode::BAD_REQUEST, msg),
+        EngineError::PayloadTooLarge(msg) => json_error_resp(StatusCode::PAYLOAD_TOO_LARGE, msg),
+        EngineError::RequestTimeout(msg) => json_error_resp(StatusCode::REQUEST_TIMEOUT, msg),
         // The file is in a coordinate system this server cannot place. That is a
         // property of the requested source, not a server fault.
         EngineError::Proj(e) => json_error_resp(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -10459,5 +10602,46 @@ mod tests {
             "OGC tileset links doubled X-Forwarded-Prefix: {ts_str}"
         );
         assert!(ts_str.contains("https://api.example.com/prod/cog/"));
+    }
+
+    #[tokio::test]
+    async fn sweep22_body_limits_timeout_and_feature_collection_cap() {
+        // BB1: default FeatureCollection limit allows thousands of features (not capped at 64)
+        assert!(check_feature_collection_len(200).is_ok());
+        assert!(check_feature_collection_len(1_000).is_ok());
+        assert!(check_feature_collection_len(DEFAULT_MAX_STATISTICS_FEATURES).is_ok());
+        assert!(check_feature_collection_len(DEFAULT_MAX_STATISTICS_FEATURES + 1).is_err());
+
+        // BB2: oversized POST body returns 413 Content Too Large with exact message
+        let big = Bytes::from(vec![b'a'; MAX_POST_BODY_BYTES + 1]);
+        let err = read_limited_body_with_timeout(http_body_util::Full::new(big), 5)
+            .await
+            .unwrap_err();
+        let resp = error_to_http_response(&err);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("request body exceeds 16 MiB limit"),
+            "unexpected 413 message: {msg}"
+        );
+
+        // BB3: stalled POST body returns 408 Request Timeout
+        struct NeverBody;
+        impl hyper::body::Body for NeverBody {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+            {
+                std::task::Poll::Pending
+            }
+        }
+        let err_to = read_limited_body_with_timeout(NeverBody, 1)
+            .await
+            .unwrap_err();
+        let resp_to = error_to_http_response(&err_to);
+        assert_eq!(resp_to.status(), StatusCode::REQUEST_TIMEOUT);
     }
 }
