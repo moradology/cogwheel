@@ -596,6 +596,21 @@ impl CrsModel {
         (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo)
     }
 
+    /// Returns `Some(max_lon)` when this is a Geographic CRS whose raster extent uses negative
+    /// west-antimeridian longitudes (e.g. `[-190, -170]`), so longitudes `> max_lon` (e.g. `+175°E`)
+    /// should be wrapped by `-360.0` into the raster's domain.
+    pub fn geographic_neg_180_max_lon(&self, pixel_to_crs: &Affine2D, width: u32) -> Option<f64> {
+        if !matches!(self, CrsModel::Geographic) {
+            return None;
+        }
+        let (x0, _) = pixel_to_crs.forward(0.0, 0.0);
+        let (x1, _) = pixel_to_crs.forward(width as f64, 0.0);
+        let lo = x0.min(x1);
+        let hi = x0.max(x1);
+        let px_w = ((hi - lo) / (width.max(1) as f64)).max(1e-6);
+        (lo < -180.0 - 1e-6 && hi <= px_w).then_some(hi)
+    }
+
     /// Returns `true` when this is a Geographic CRS whose raster extent uses `0..360` longitudes
     /// (including pixel-centered NOAA GFS / ECMWF ERA5 grids with `-dx/2` western overhang).
     pub fn is_geographic_0_360(&self, pixel_to_crs: &Affine2D, width: u32) -> bool {
@@ -1277,15 +1292,18 @@ impl<const N: usize> CoordPlan<N> {
                     }
                 }
                 CrsModel::Geographic => {
-                    let wrap_lo = if crs_to_pixel.a.abs() > 1e-18 {
+                    let (wrap_lo, wrap_hi) = if crs_to_pixel.a.abs() > 1e-18 {
                         let x0 = -crs_to_pixel.c / crs_to_pixel.a;
                         let x1 = (ifd_w as f64 - crs_to_pixel.c) / crs_to_pixel.a;
                         let lo = x0.min(x1);
                         let hi = x0.max(x1);
                         let px_w = ((hi - lo) / (ifd_w.max(1) as f64)).max(1e-6);
-                        (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo)
+                        (
+                            (lo >= -px_w && hi > 180.0 + 1e-6).then_some(lo),
+                            (lo < -180.0 - 1e-6 && hi <= px_w).then_some(hi),
+                        )
                     } else {
-                        None
+                        (None, None)
                     };
                     for px in 0..N {
                         let mx = min_x + (px as f64 + 0.5) * step_x;
@@ -1294,6 +1312,10 @@ impl<const N: usize> CoordPlan<N> {
                             && lon < lo
                         {
                             lon += 360.0;
+                        } else if let Some(hi) = wrap_hi
+                            && lon > hi
+                        {
+                            lon -= 360.0;
                         }
                         let uu = (crs_to_pixel.a * lon + crs_to_pixel.c - 0.5) as f32;
                         u[px] = uu;
@@ -2507,6 +2529,31 @@ mod tests {
         let c2p = p2c.invert().unwrap();
         let plan = CoordPlan::<256>::build(&crs6933, &c2p, 1024, 512, TileCoord { z: 2, x: 3, y: 1 })
             .expect("dateline tile should intersect global EASE-2");
+        assert!(matches!(plan, CoordPlan::Separable1D { .. }));
+    }
+
+    #[test]
+    fn west_antimeridian_neg190_geographic_raster_wraps_eastern_hemisphere_tiles() {
+        // Geographic raster spanning [-190, -170] x [-20, 0] (100x100 px)
+        let p2c = Affine2D {
+            a: 0.2,
+            b: 0.0,
+            c: -190.0,
+            d: 0.0,
+            e: -0.2,
+            f: 0.0,
+        };
+        let c2p = p2c.invert().unwrap();
+        assert_eq!(CrsModel::Geographic.geographic_neg_180_max_lon(&p2c, 100), Some(-170.0));
+        // WebMercator z=4, x=15, y=8 covers lon [+157.5, +180], lat [-21.94, 0] -> overlaps +170..+180 (-190..-180)
+        let plan = CoordPlan::<256>::build(
+            &CrsModel::Geographic,
+            &c2p,
+            100,
+            100,
+            TileCoord { z: 4, x: 15, y: 8 },
+        )
+        .expect("z=4/15/8 (+157.5..+180) must intersect [-190, -170] geographic COG");
         assert!(matches!(plan, CoordPlan::Separable1D { .. }));
     }
 }
