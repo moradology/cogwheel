@@ -2938,7 +2938,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let full = primary.index.full_res();
     let alpha_idx =
         cogzilla_codec::alpha_channel_index(full.samples_per_pixel as usize, &full.extra_samples);
-    let sel_bands: Vec<u16> = match &opts.bidx {
+    let mut sel_bands: Vec<u16> = match &opts.bidx {
         Some(b) if !b.is_empty() => {
             for &b1 in b {
                 if b1 == 0 || b1 > full.samples_per_pixel {
@@ -2954,6 +2954,9 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             .filter(|&b| Some((b - 1) as usize) != alpha_idx)
             .collect(),
     };
+    if method == Selection::Count && sel_bands.len() > 1 {
+        sel_bands.truncate(1);
+    }
     let nb = sel_bands.len();
     if nb == 0 {
         return Ok(None);
@@ -3117,13 +3120,37 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             }
         }
         if !min_c.is_finite() || !min_r.is_finite() {
-            return (polys_px, poly_area_px, lines_px, pts_px, 0usize, 0usize, 0usize, 0usize);
+            return (
+                polys_px,
+                poly_area_px,
+                lines_px,
+                pts_px,
+                0usize,
+                0usize,
+                0usize,
+                0usize,
+                false,
+            );
         }
+        let clipped_outside = min_c < 0.0
+            || max_c > ifd.width as f64
+            || min_r < 0.0
+            || max_r > ifd.height as f64;
         let c0 = min_c.floor().clamp(0.0, ifd.width as f64) as usize;
         let c1 = max_c.ceil().clamp(c0 as f64, ifd.width as f64) as usize;
         let r0 = min_r.floor().clamp(0.0, ifd.height as f64) as usize;
         let r1 = max_r.ceil().clamp(r0 as f64, ifd.height as f64) as usize;
-        (polys_px, poly_area_px, lines_px, pts_px, c0, c1, r0, r1)
+        (
+            polys_px,
+            poly_area_px,
+            lines_px,
+            pts_px,
+            c0,
+            c1,
+            r0,
+            r1,
+            clipped_outside,
+        )
     };
 
     let mut ifd_idx = 0usize;
@@ -3136,6 +3163,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
         mut c1,
         mut r0,
         mut r1,
+        mut clipped_outside,
     ) = project_to_ifd(&primary.index.ifds[0]);
     if c1 <= c0 || r1 <= r0 {
         return Ok(Some((empty_result(), Vec::new())));
@@ -3145,7 +3173,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             if crate::engine::validate_multi_cog_grid(&cogs, i).is_err() {
                 break;
             }
-            let (pp, pa, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov);
+            let (pp, pa, lp, ptp, oc0, oc1, or0, or1, oclip) = project_to_ifd(ov);
             ifd_idx = i;
             polys_px = pp;
             total_poly_area_px_val = pa;
@@ -3155,13 +3183,24 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             c1 = oc1;
             r0 = or0;
             r1 = or1;
+            clipped_outside = oclip;
             if (c1 - c0).max(r1 - r0) <= max_size as usize {
                 break;
             }
         }
+        // If explicit max_size could not be satisfied by matching native overviews, fall back
+        // to the resampled exact-grid path (which caps to max_size cleanly).
+        if (c1 - c0).max(r1 - r0) > max_size as usize {
+            return Ok(None);
+        }
     }
     if c1 <= c0 || r1 <= r0 {
         return Ok(Some((empty_result(), Vec::new())));
+    }
+    // For Selection::Count, pixels outside the raster extent have valid count 0.0 rather than
+    // being masked; fall back to the full-polygon resampled exact-grid path when straddling.
+    if method == Selection::Count && clipped_outside {
+        return Ok(None);
     }
 
     let ifd = &primary.index.ifds[ifd_idx];
@@ -3174,7 +3213,16 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             "polygon window ({win_w}x{win_h} = {n_px} px) exceeds maximum exact statistics window ({MAX_EXACT_WINDOW_PX} px); pass max_size to downsample"
         )));
     }
-    if Fold::<f32>::working_bytes(method, nb, n_px) > max_fold_bytes {
+    let scene_samples = nb.checked_mul(n_px).ok_or_else(|| {
+        EngineError::BadRequest("pixel_selection buffer size overflow".into())
+    })?;
+    let scene_bytes = scene_samples.checked_mul(4).ok_or_else(|| {
+        EngineError::BadRequest("pixel_selection buffer size overflow".into())
+    })?;
+    if scene_bytes > max_fold_bytes
+        || Fold::<f32>::working_bytes(method, nb, n_px) > max_fold_bytes
+        || Fold::<f32>::held_bytes(method, 1, nb, n_px) > max_fold_bytes
+    {
         return Err(EngineError::BadRequest(format!(
             "pixel_selection working buffer exceeds memory budget ({} MiB limit); reduce max_size or band count",
             max_fold_bytes / (1024 * 1024)
@@ -3189,15 +3237,20 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let ty1 = (r1 - 1) / th;
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
-    const MAX_EXACT_BLOCKS: usize = 1024;
-    let per_asset_blocks = match ifd.planar_config {
-        PlanarConfig::Chunky => blocks_x.saturating_mul(blocks_y),
-        PlanarConfig::Planar => nb.saturating_mul(blocks_x.saturating_mul(blocks_y)),
+    // Match CogStore::get_blocks MAX_BLOCKS_PER_REQUEST (512); fall back to the resampled
+    // exact-grid path if the native window would exceed it on any asset.
+    const MAX_NATIVE_BLOCKS: usize = 512;
+    let grid_blocks = blocks_x.saturating_mul(blocks_y);
+    let any_planar = cogs
+        .iter()
+        .any(|c| matches!(c.index.ifds[ifd_idx].planar_config, PlanarConfig::Planar));
+    let max_per_asset_blocks = if any_planar {
+        nb.saturating_mul(grid_blocks)
+    } else {
+        grid_blocks
     };
-    if per_asset_blocks > MAX_EXACT_BLOCKS {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window requires {per_asset_blocks} blocks per asset (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
-        )));
+    if grid_blocks > MAX_NATIVE_BLOCKS || max_per_asset_blocks > MAX_NATIVE_BLOCKS {
+        return Ok(None);
     }
 
     let integer = !unscale
@@ -3214,7 +3267,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let mut fold = Fold::<f32>::new(method, nb, n_px, integer).absent_as(absent);
     let mut taken = 0usize;
     let mut used_assets: Vec<String> = Vec::new();
-    let mut scene_buf = vec![f32::NAN; nb * n_px];
+    let mut scene_buf = vec![f32::NAN; scene_samples];
 
     for (scene_i, (url, asset_cog)) in assets.iter().enumerate() {
         if scene_i > 0 {

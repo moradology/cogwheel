@@ -240,6 +240,15 @@ impl DiskBlockCache {
         Some(Bytes::from(raw).slice(HEADER_LEN..))
     }
 
+    /// Remove all cached block files on disk and clear the in-memory index.
+    pub fn clear(&self) {
+        let keys: Vec<[u8; 16]> = self.entries.iter().map(|e| *e.key()).collect();
+        for key in keys {
+            self.remove_entry(key);
+        }
+        self.current_bytes.store(0, Ordering::Release);
+    }
+
     /// Synchronous read + CRC32 verification (call from `spawn_blocking` on async paths).
     /// Returns `Some(compressed_bytes)` on a valid hit, or `None` on miss/corruption.
     pub fn get_sync(&self, uri: &str, ifd_idx: u16, tile_idx: u32) -> Option<Bytes> {
@@ -497,6 +506,10 @@ mod tests {
         assert!(st.evictions >= 6, "expected >= 6 evictions, got {}", st.evictions);
         // Most recent entries must survive
         assert!(c.get_sync("s3://bucket/b.tif", 0, 9).is_some());
+        // Audit #66 #8: clear() removes all disk files and resets bytes_used
+        c.clear();
+        assert_eq!(c.stats().bytes_used, 0);
+        assert!(c.get_sync("s3://bucket/b.tif", 0, 9).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }

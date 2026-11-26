@@ -179,6 +179,9 @@ pub fn matches_any_prefix_with_opts(
     }
 
     let matches_boundary = |candidate: &str, local_only: bool| -> bool {
+        let cand_vsi = is_vsi_uri(candidate);
+        let cand_http =
+            !cand_vsi && (candidate.starts_with("http://") || candidate.starts_with("https://"));
         prefixes.iter().any(|raw_p| {
             let p = match strip_file_uri_prefix(raw_p.as_str()) {
                 Ok(Some(local_p)) => local_p,
@@ -187,6 +190,16 @@ pub fn matches_any_prefix_with_opts(
             if local_only && !is_local_candidate(p) {
                 return false;
             }
+            // A local filesystem prefix (e.g. `/` or `file:///`) must never match GDAL VSI
+            // remote URIs (`/vsicurl/...`, `/vsis3/...`, `/vsigs/...`, `/vsiaz/...`).
+            if cand_vsi && is_local_candidate(p) {
+                return false;
+            }
+            let p = if cand_http {
+                p.strip_prefix("/vsicurl/").unwrap_or(p)
+            } else {
+                p
+            };
             match candidate.strip_prefix(p) {
                 Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
                 None => false,
@@ -287,7 +300,7 @@ pub fn matches_any_prefix_with_opts(
 pub fn check_uri_allowed(uri: &str) -> Result<(), IoError> {
     match configured() {
         Some(prefixes) if !matches_any_prefix_with_opts(prefixes, uri, resolve_symlinks_enabled()) => {
-            Err(IoError::Forbidden(uri.to_string()))
+            Err(IoError::Forbidden(crate::backend::redact_http_url(uri)))
         }
         _ => Ok(()),
     }
@@ -501,5 +514,36 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn local_root_prefix_rejects_vsi_remote_ssrf_and_vsicurl_prefix_allows_redirect() {
+        // Audit #66 #6: local `/` or `file:///` must never allow GDAL VSI remote URIs.
+        for local_root in [vec!["/".to_string()], vec!["file:///".to_string()]] {
+            assert!(matches_any_prefix(&local_root, "/data/ok.tif"));
+            assert!(matches_any_prefix(&local_root, "file:///data/ok.tif"));
+            assert!(!matches_any_prefix(
+                &local_root,
+                "/vsicurl/http://169.254.169.254/latest/meta-data/"
+            ));
+            assert!(!matches_any_prefix(&local_root, "/vsis3/private-bucket/secret.tif"));
+            assert!(!matches_any_prefix(&local_root, "/vsigs/private-bucket/secret.tif"));
+            assert!(!matches_any_prefix(&local_root, "/vsiaz/private-container/secret.tif"));
+        }
+
+        // Audit #66 #9: `/vsicurl/https://...` prefix must allow same-prefix HTTP redirects.
+        let vsicurl_prefixes = vec!["/vsicurl/https://allowed.example/public/".to_string()];
+        assert!(matches_any_prefix(
+            &vsicurl_prefixes,
+            "/vsicurl/https://allowed.example/public/a.tif"
+        ));
+        assert!(matches_any_prefix(
+            &vsicurl_prefixes,
+            "https://allowed.example/public/v2/a.tif"
+        ));
+        assert!(!matches_any_prefix(
+            &vsicurl_prefixes,
+            "https://evil.example/public/a.tif"
+        ));
     }
 }
