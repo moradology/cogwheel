@@ -1014,8 +1014,12 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(resp.status(), 200, "algorithm={alg} failed");
             let bytes = resp.bytes().await.unwrap();
             assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            // Indexed-palette PNG (color_type=3)
-            assert_eq!(bytes[25], 3, "expected indexed PNG for algorithm={alg}");
+            // Grayscale (0) for clean grayscale DEMs or indexed-palette PNG (3)
+            assert!(
+                matches!(bytes[25], 0 | 3),
+                "expected grayscale or indexed PNG for algorithm={alg}, got color_type={}",
+                bytes[25]
+            );
         }
 
         // Verify TiTiler-compatible JSON ?algorithm_params={"azimuth":180,"angle_altitude":30}
