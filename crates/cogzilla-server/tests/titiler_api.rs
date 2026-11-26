@@ -1861,17 +1861,52 @@ async fn sweep11_l1_l2_and_sweep12_m1_self_contained() {
         &cat,
     );
 
-    // 3. Synthetic 16x16 GeoTIFF in unsupported CRS EPSG:6933 for M1 test
-    let ease_path = tmp.join("ease_6933.tif");
+    // 3. Synthetic 16x16 GeoTIFF in unsupported CRS EPSG:54030 (Robinson) for M1 test
+    let unsup_path = tmp.join("robinson_54030.tif");
     write_synthetic_f32_projected_geotiff(
-        &ease_path,
+        &unsup_path,
         16,
         16,
-        6933,
+        54030,
         0.0,
         100_000.0,
         1000.0,
         &vec![42.0f32; 256],
+    );
+
+    // 4. Synthetic 32x32 GeoTIFFs in EPSG:6933 (EASE-2 Global), EPSG:3410, and EPSG:8857 (Equal Earth)
+    let ease6933_path = tmp.join("ease_6933.tif");
+    write_synthetic_f32_projected_geotiff(
+        &ease6933_path,
+        32,
+        32,
+        6933,
+        -1_000_000.0,
+        4_000_000.0,
+        25_000.0,
+        &(0..1024).map(|i| (i % 50) as f32 + 10.0).collect::<Vec<_>>(),
+    );
+    let ease3410_path = tmp.join("ease_3410.tif");
+    write_synthetic_f32_projected_geotiff(
+        &ease3410_path,
+        32,
+        32,
+        3410,
+        -1_000_000.0,
+        4_000_000.0,
+        25_000.0,
+        &vec![7.0f32; 1024],
+    );
+    let ee8857_path = tmp.join("equal_earth_8857.tif");
+    write_synthetic_f32_projected_geotiff(
+        &ee8857_path,
+        32,
+        32,
+        8857,
+        -1_000_000.0,
+        4_000_000.0,
+        25_000.0,
+        &vec![13.0f32; 1024],
     );
 
     let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
@@ -1886,7 +1921,10 @@ async fn sweep11_l1_l2_and_sweep12_m1_self_contained() {
 
     let grad_url = grad_path.to_string_lossy().to_string();
     let cat_url = cat_path.to_string_lossy().to_string();
-    let ease_url = ease_path.to_string_lossy().to_string();
+    let unsup_url = unsup_path.to_string_lossy().to_string();
+    let ease6933_url = ease6933_path.to_string_lossy().to_string();
+    let ease3410_url = ease3410_path.to_string_lossy().to_string();
+    let ee8857_url = ee8857_path.to_string_lossy().to_string();
 
     // --- L1: resampling=average at 1x, 2x, 4x, 8x equals exact full-res block mean ---
     for factor in [1u32, 2, 4, 8] {
@@ -2034,30 +2072,98 @@ async fn sweep11_l1_l2_and_sweep12_m1_self_contained() {
         );
     }
 
-    // --- M1: unsupported CRS (EPSG:6933) returns 400 on /cog/tiles (matching /cog/info) ---
-    let info_6933 = client
-        .get(format!("{base}/cog/info?url={ease_url}"))
+    // --- M1: unsupported CRS (EPSG:54030) returns 400 on /cog/tiles (matching /cog/info) ---
+    let info_unsup = client
+        .get(format!("{base}/cog/info?url={unsup_url}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(info_6933.status(), 400);
-    let info_body = info_6933.text().await.unwrap();
+    assert_eq!(info_unsup.status(), 400);
+    let info_body = info_unsup.text().await.unwrap();
     assert!(info_body.to_ascii_lowercase().contains("unsupported crs"), "got: {info_body}");
 
-    let tile_6933 = client
-        .get(format!("{base}/cog/tiles/WebMercatorQuad/0/0/0.png?url={ease_url}"))
+    let tile_unsup = client
+        .get(format!("{base}/cog/tiles/WebMercatorQuad/0/0/0.png?url={unsup_url}"))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        tile_6933.status(),
+        tile_unsup.status(),
         400,
         "unsupported CRS tile must return 400 (not 404 outside image bounds)"
     );
-    let tile_body = tile_6933.text().await.unwrap();
+    let tile_body = tile_unsup.text().await.unwrap();
     assert!(
         tile_body.to_ascii_lowercase().contains("unsupported crs"),
         "expected unsupported CRS message on tile route, got: {tile_body}"
+    );
+
+    // --- EPSG:6933, EPSG:3410 (EASE-Grid Global) and EPSG:8857 (Equal Earth) ---
+    for (label, u) in [
+        ("EPSG:6933", &ease6933_url),
+        ("EPSG:3410", &ease3410_url),
+        ("EPSG:8857", &ee8857_url),
+    ] {
+        let info = client.get(format!("{base}/cog/info?url={u}")).send().await.unwrap();
+        assert_eq!(info.status(), 200, "{label} /cog/info should return 200");
+        let tile = client
+            .get(format!("{base}/cog/tiles/WebMercatorQuad/2/1/1.png?url={u}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tile.status(), 200, "{label} /cog/tiles should return 200");
+    }
+
+    // Equal-area zonal statistics on EPSG:6933: every 25km x 25km pixel covers exactly 625,000,000 m^2,
+    // so area == count * pixel_area and area_weighted=true/false produce identical mean.
+    let ease_poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [-1_000_000.0, 4_000_000.0],
+                [-750_000.0,   4_000_000.0],
+                [-750_000.0,   3_750_000.0],
+                [-1_000_000.0, 3_750_000.0],
+                [-1_000_000.0, 4_000_000.0]
+            ]]
+        }
+    });
+    let st_aw = client
+        .post(format!("{base}/cog/statistics?url={ease6933_url}&max_size=0&coord_crs=EPSG:6933&area_weighted=true"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&ease_poly).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st_aw.status(), 200);
+    let st_aw_j: serde_json::Value = serde_json::from_slice(&st_aw.bytes().await.unwrap()).unwrap();
+    let st_un = client
+        .post(format!("{base}/cog/statistics?url={ease6933_url}&max_size=0&coord_crs=EPSG:6933&area_weighted=false"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&ease_poly).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st_un.status(), 200);
+    let st_un_j: serde_json::Value = serde_json::from_slice(&st_un.bytes().await.unwrap()).unwrap();
+    let b1_aw = &st_aw_j["properties"]["statistics"]["b1"];
+    let b1_un = &st_un_j["properties"]["statistics"]["b1"];
+    let count_aw = b1_aw["count"].as_f64().unwrap();
+    let area_aw = b1_aw["area"].as_f64().unwrap();
+    let mean_aw = b1_aw["mean"].as_f64().unwrap();
+    let mean_un = b1_un["mean"].as_f64().unwrap();
+    assert!((count_aw - 100.0).abs() < 1e-4, "expected 100 px, got {count_aw}");
+    let expected_area = 100.0 * 25_000.0 * 25_000.0;
+    let rel_area_err = (area_aw - expected_area).abs() / expected_area;
+    assert!(
+        rel_area_err < 1e-5,
+        "EPSG:6933 equal-area should match 100 * 25km^2 = {expected_area}, got {area_aw} (rel_err={rel_area_err})"
+    );
+    assert!(
+        (mean_aw - mean_un).abs() < 1e-12,
+        "equal-area EPSG:6933 area_weighted=true ({mean_aw}) and false ({mean_un}) must match"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

@@ -2,8 +2,8 @@
 
 use crate::crs::CrsModel;
 use crate::ellipsoid::{
-    AlbersEqualArea, Ellipsoid, LambertAzimuthalEqualArea, LambertConformalConic,
-    PolarStereographic, Sinusoidal, TransverseMercator,
+    AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, LambertAzimuthalEqualArea,
+    LambertConformalConic, PolarStereographic, Sinusoidal, TransverseMercator,
 };
 use crate::epsg_table::EPSG_TABLE;
 
@@ -26,6 +26,10 @@ pub enum Method {
     Laea,
     /// `[lon0, x0, y0]`
     Sinusoidal,
+    /// `[lat_ts, lon0, x0, y0]`
+    Cea,
+    /// `[lon0, x0, y0]`
+    EqualEarth,
 }
 
 /// One projected CRS. Angles are degrees; `x0`/`y0` are in the CRS's own units.
@@ -96,6 +100,16 @@ impl EpsgDef {
                 let mut m = Sinusoidal::new(ellip, p[0], p[1], p[2]);
                 m.unit = unit;
                 CrsModel::Sinusoidal(m)
+            }
+            Method::Cea => {
+                let mut m = CylindricalEqualArea::new(ellip, p[0], p[1], p[2], p[3]);
+                m.unit = unit;
+                CrsModel::CylindricalEqualArea(m)
+            }
+            Method::EqualEarth => {
+                let mut m = EqualEarth::new(ellip, p[0], p[1], p[2]);
+                m.unit = unit;
+                CrsModel::EqualEarth(m)
             }
         }
     }

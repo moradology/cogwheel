@@ -68,21 +68,32 @@ pub fn wgs84_geographic_cell_area_m2(lon0_deg: f64, lon1_deg: f64, lat0_deg: f64
     0.5 * WGS84_B2 * dlam * (wgs84_authalic_q(phi1) - wgs84_authalic_q(phi0)).abs()
 }
 
-/// Local WGS84 ellipsoidal ground area (m²) of 1 pixel at `(col, row)` via finite-difference
-/// Jacobian of `(col, row) -> (lon, lat)` and WGS84 principal radii of curvature `R_M * R_N * cos(phi)`.
+/// Local WGS84 ellipsoidal ground area (m²) of 1 pixel centered at `(col + 0.5, row + 0.5)` via
+/// central finite-difference Jacobian of `(col, row) -> (lon, lat)` and WGS84 principal radii of
+/// curvature `R_M * R_N * cos(phi)`.
 fn wgs84_projected_pixel_area_m2(crs: &CrsModel, p2c: &Affine2D, col: f64, row: f64) -> f64 {
-    let (sx0, sy0) = p2c.forward(col, row);
-    let (sx1, sy1) = p2c.forward(col + 1.0, row);
-    let (sx2, sy2) = p2c.forward(col, row + 1.0);
-    let (lo0, la0) = crs.to_lonlat_deg(sx0, sy0);
-    let (lo1, la1) = crs.to_lonlat_deg(sx1, sy1);
-    let (lo2, la2) = crs.to_lonlat_deg(sx2, sy2);
-    if !(lo0.is_finite()
-        && la0.is_finite()
-        && lo1.is_finite()
-        && la1.is_finite()
-        && lo2.is_finite()
-        && la2.is_finite())
+    const EPS: f64 = 1e-3;
+    let cx = col + 0.5;
+    let cy = row + 0.5;
+    let (sxc, syc) = p2c.forward(cx, cy);
+    let (_, lac) = crs.to_lonlat_deg(sxc, syc);
+    let (sxm, sym) = p2c.forward(cx - EPS, cy);
+    let (sxp, syp) = p2c.forward(cx + EPS, cy);
+    let (sxn, syn) = p2c.forward(cx, cy - EPS);
+    let (sxs, sys) = p2c.forward(cx, cy + EPS);
+    let (lom, lam) = crs.to_lonlat_deg(sxm, sym);
+    let (lop, lap) = crs.to_lonlat_deg(sxp, syp);
+    let (lon, lan) = crs.to_lonlat_deg(sxn, syn);
+    let (los, las) = crs.to_lonlat_deg(sxs, sys);
+    if !(lac.is_finite()
+        && lom.is_finite()
+        && lam.is_finite()
+        && lop.is_finite()
+        && lap.is_finite()
+        && lon.is_finite()
+        && lan.is_finite()
+        && los.is_finite()
+        && las.is_finite())
     {
         return 0.0;
     }
@@ -95,12 +106,13 @@ fn wgs84_projected_pixel_area_m2(crs: &CrsModel, p2c: &Affine2D, col: f64, row: 
             d
         }
     };
-    let dlo_dc = wrap_dlon(lo1 - lo0).to_radians();
-    let dla_dc = (la1 - la0).to_radians();
-    let dlo_dr = wrap_dlon(lo2 - lo0).to_radians();
-    let dla_dr = (la2 - la0).to_radians();
+    let inv_2eps = 0.5 / EPS;
+    let dlo_dc = wrap_dlon(lop - lom).to_radians() * inv_2eps;
+    let dla_dc = (lap - lam).to_radians() * inv_2eps;
+    let dlo_dr = wrap_dlon(los - lon).to_radians() * inv_2eps;
+    let dla_dr = (las - lan).to_radians() * inv_2eps;
     let det = (dlo_dc * dla_dr - dlo_dr * dla_dc).abs();
-    let phi = la0.clamp(-89.9999, 89.9999).to_radians();
+    let phi = lac.clamp(-89.9999, 89.9999).to_radians();
     let s = phi.sin();
     let denom = 1.0 - WGS84_E2 * s * s;
     let rm = WGS84_A * (1.0 - WGS84_E2) / (denom * denom.sqrt());
