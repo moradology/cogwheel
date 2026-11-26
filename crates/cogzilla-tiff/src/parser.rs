@@ -700,10 +700,17 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_LERC_PARAMETERS => {
                     if entry.count >= 2 && entry.count <= 16 {
-                        if let Ok(vals) = entry.read_u64_vec(&r)
-                            && vals.len() >= 2
-                        {
-                            lerc_additional = vals[1] as u32;
+                        match entry.read_u64_vec(&r) {
+                            Ok(vals) => {
+                                if vals.len() >= 2 {
+                                    lerc_additional = vals[1] as u32;
+                                }
+                            }
+                            Err(
+                                e @ (TiffError::NeedRange { .. }
+                                | TiffError::NeedMoreBytes { .. }),
+                            ) => return Err(e),
+                            Err(_) => {}
                         }
                     }
                 }
