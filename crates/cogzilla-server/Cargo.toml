@@ -52,3 +52,7 @@ required-features = ["gpu"]
 [[example]]
 name = "scientific_f32_gpu_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "spectral_server_bench"
+required-features = ["gpu"]

@@ -6076,6 +6076,60 @@ async fn render_bbox_impl(
                         };
                         gpu.try_render_bbox_expr_f32(cache_key, coords, &srcs, prog, resample)
                     }
+                    BandRequest::Spectral1 {
+                        expr, band_1based, ..
+                    } => {
+                        let refs = get_band_refs(*band_1based, 0);
+                        let srcs = [make_src!(&refs)];
+                        let cache_key = if num_cogs == 1 {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id,
+                                ifd_idx,
+                                &[*band_1based],
+                                &srcs,
+                            )
+                        } else {
+                            None
+                        };
+                        gpu.try_render_bbox_spectral_f32(cache_key, coords, &srcs, *expr, resample)
+                    }
+                    BandRequest::Spectral2 {
+                        expr, bands_1based, ..
+                    } => {
+                        let r0 = get_band_refs(bands_1based[0], 0);
+                        let r1 = get_band_refs(bands_1based[1], 1);
+                        let srcs = [make_src!(&r0), make_src!(&r1)];
+                        let cache_key = if num_cogs == 1 {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id,
+                                ifd_idx,
+                                bands_1based,
+                                &srcs,
+                            )
+                        } else {
+                            None
+                        };
+                        gpu.try_render_bbox_spectral_f32(cache_key, coords, &srcs, *expr, resample)
+                    }
+                    BandRequest::Spectral3 {
+                        expr, bands_1based, ..
+                    } => {
+                        let r0 = get_band_refs(bands_1based[0], 0);
+                        let r1 = get_band_refs(bands_1based[1], 1);
+                        let r2 = get_band_refs(bands_1based[2], 2);
+                        let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                        let cache_key = if num_cogs == 1 {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id,
+                                ifd_idx,
+                                bands_1based,
+                                &srcs,
+                            )
+                        } else {
+                            None
+                        };
+                        gpu.try_render_bbox_spectral_f32(cache_key, coords, &srcs, *expr, resample)
+                    }
                     _ => None,
                 };
                 if let Some(raw) = gpu_raw {
@@ -6509,6 +6563,90 @@ async fn render_bbox_impl(
                         color_formula,
                         return_mask,
                     )
+                }
+                BandRequest::Spectral1 {
+                    expr,
+                    band_1based,
+                    rescale,
+                    colormap,
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let srcs = [make_src!(&refs)];
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    let cache_key = if num_cogs == 1 {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id,
+                            ifd_idx,
+                            &[*band_1based],
+                            &srcs,
+                        )
+                    } else {
+                        None
+                    };
+                    gpu.try_render_bbox_spectral(cache_key, coords, &srcs, *expr, &style, return_mask)
+                }
+                BandRequest::Spectral2 {
+                    expr,
+                    bands_1based,
+                    rescale,
+                    colormap,
+                } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let srcs = [make_src!(&r0), make_src!(&r1)];
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    let cache_key = if num_cogs == 1 {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id,
+                            ifd_idx,
+                            bands_1based,
+                            &srcs,
+                        )
+                    } else {
+                        None
+                    };
+                    gpu.try_render_bbox_spectral(cache_key, coords, &srcs, *expr, &style, return_mask)
+                }
+                BandRequest::Spectral3 {
+                    expr,
+                    bands_1based,
+                    rescale,
+                    colormap,
+                } => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let r2 = get_band_refs(bands_1based[2], 2);
+                    let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    let cache_key = if num_cogs == 1 {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id,
+                            ifd_idx,
+                            bands_1based,
+                            &srcs,
+                        )
+                    } else {
+                        None
+                    };
+                    gpu.try_render_bbox_spectral(cache_key, coords, &srcs, *expr, &style, return_mask)
                 }
                 _ => None,
             };
