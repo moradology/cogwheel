@@ -2894,8 +2894,17 @@ pub fn encode_geotiff_rgba(
             buf.put_u16_le(8);
         }
     }
-    // ModelPixelScaleTag: [dx, dy, 0.0]
-    let dx = ((bbox[2] - bbox[0]).abs() / (width.max(1) as f64)).max(1e-12);
+    let is_geographic = matches!(
+        cogzilla_proj::CrsModel::from_epsg(epsg),
+        Ok(cogzilla_proj::CrsModel::Geographic)
+    );
+    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
+    let span_x = if is_geographic && bbox[2] < bbox[0] {
+        (bbox[2] + 360.0) - bbox[0]
+    } else {
+        (bbox[2] - bbox[0]).abs()
+    };
+    let dx = (span_x / (width.max(1) as f64)).max(1e-12);
     let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
     buf.put_f64_le(dx);
     buf.put_f64_le(dy);
@@ -2908,10 +2917,6 @@ pub fn encode_geotiff_rgba(
     buf.put_f64_le(bbox[3]);
     buf.put_f64_le(0.0);
     // GeoKeyDirectoryTag (16 u16s = 32 bytes)
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
     let (model_type, crs_key): (u16, u16) = if is_geographic {
         (2, 2048) // ModelTypeGeographic, GeographicTypeGeoKey
     } else {
@@ -3088,8 +3093,17 @@ pub fn encode_geotiff_f32(
             buf.put_u16_le(3);
         }
     }
-    // ModelPixelScaleTag: [dx, dy, 0.0]
-    let dx = ((bbox[2] - bbox[0]).abs() / (width.max(1) as f64)).max(1e-12);
+    let is_geographic = matches!(
+        cogzilla_proj::CrsModel::from_epsg(epsg),
+        Ok(cogzilla_proj::CrsModel::Geographic)
+    );
+    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
+    let span_x = if is_geographic && bbox[2] < bbox[0] {
+        (bbox[2] + 360.0) - bbox[0]
+    } else {
+        (bbox[2] - bbox[0]).abs()
+    };
+    let dx = (span_x / (width.max(1) as f64)).max(1e-12);
     let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
     buf.put_f64_le(dx);
     buf.put_f64_le(dy);
@@ -3102,10 +3116,6 @@ pub fn encode_geotiff_f32(
     buf.put_f64_le(bbox[3]);
     buf.put_f64_le(0.0);
     // GeoKeyDirectoryTag
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
     let (model_type, crs_key): (u16, u16) = if is_geographic {
         (2, 2048)
     } else {
@@ -3172,7 +3182,10 @@ pub fn native_bbox_dims_in_crs(
     wgs_bbox: [f64; 4],
     dst_bbox: [f64; 4],
 ) -> (u32, u32) {
-    let [w, s, e, n] = wgs_bbox;
+    let [w, s, mut e, n] = wgs_bbox;
+    if e < w {
+        e += 360.0;
+    }
     let mx = 0.5 * (w + e);
     let my = 0.5 * (s + n);
     let pts = [
@@ -3215,7 +3228,11 @@ pub fn native_bbox_dims_in_crs(
     }
     let nat_w = (cmax - cmin).abs();
     let nat_h = (rmax - rmin).abs();
-    let dx = (dst_bbox[2] - dst_bbox[0]).abs();
+    let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
+        (dst_bbox[2] + 360.0) - dst_bbox[0]
+    } else {
+        (dst_bbox[2] - dst_bbox[0]).abs()
+    };
     let dy = (dst_bbox[3] - dst_bbox[1]).abs();
     if dx <= 1e-12 || dy <= 1e-12 || nat_w <= 1e-6 || nat_h <= 1e-6 {
         return (
@@ -3461,7 +3478,7 @@ pub async fn compute_statistics_with_options(
                     rescale: (0.0, 1.0),
                     colormap: ColormapName::Grayscale,
                 };
-                let raw = render_wgs84_bbox(
+                let raw = match render_wgs84_bbox(
                     engine,
                     &cogs,
                     eff_bbox,
@@ -3477,7 +3494,12 @@ pub async fn compute_statistics_with_options(
                     true,
                     unscale,
                 )
-                .await?;
+                .await
+                {
+                    Ok(b) => b,
+                    Err(EngineError::NotFound(_)) => Bytes::new(),
+                    Err(e) => return Err(e),
+                };
                 let pixels: Vec<f32> = raw
                     .chunks_exact(4)
                     .take(n_px)
@@ -3509,7 +3531,7 @@ pub async fn compute_statistics_with_options(
                     bands_1based: chunk.to_vec(),
                 }
             };
-            let raw = render_wgs84_bbox(
+            let raw = match render_wgs84_bbox(
                 engine,
                 &cogs,
                 eff_bbox,
@@ -3525,11 +3547,17 @@ pub async fn compute_statistics_with_options(
                 true,
                 unscale,
             )
-            .await?;
+            .await
+            {
+                Ok(b) => b,
+                Err(EngineError::NotFound(_)) => Bytes::new(),
+                Err(e) => return Err(e),
+            };
             for (ci, &b1) in chunk.iter().enumerate() {
                 let start = ci * n_px * 4;
                 let end = (start + n_px * 4).min(raw.len());
-                let pixels: Vec<f32> = raw[start..end]
+                let slice = if start < end { &raw[start..end] } else { &[] };
+                let pixels: Vec<f32> = slice
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
