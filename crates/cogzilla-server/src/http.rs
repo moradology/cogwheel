@@ -2085,32 +2085,46 @@ fn array_asked(pq: &ParsedQuery, last: Option<&&str>) -> Option<ArrayAsked> {
         return Some(ArrayAsked::Typed(rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask));
     }
     let npy = last.is_some_and(|last| last.ends_with(".npy")) || pq.format_param.as_deref() == Some("npy");
-    let shown = npy && array_type::shown(pq) && pq.algorithm.is_none() && pq.asset_exprs.is_empty();
+    let shown = npy && array_type::shown(pq) && pq.algorithm.is_none();
     shown.then(|| ArrayAsked::Shown(Box::new(pq.clone())))
 }
 
 /// A float32 `.npy` of raw values painted as the request paints them ([`paint_selected`]),
 /// as TiTiler writes an array asked with a rescale, a colour map or a colour formula: in
-/// bytes, one band when it is grey and red, green and blue otherwise, then the mask (`255`
-/// where a pixel is there) when it was asked for. `first` is the raster read first, for a
-/// colour map of its own. `None` when `data` is not such an array.
+/// bytes, preserving all bands for multi-band rescaled arrays (or 1 grey / 3 RGB bands when
+/// painted through a colour map or colour formula), then the mask (`255` where a pixel is
+/// there) when it was asked for. `first` is the raster read first, for a colour map of its
+/// own. `None` when `data` is not such an array.
 fn shown_array(pq: &ParsedQuery, first: Option<&cogzilla_io::OpenedCog>, data: &[u8]) -> Option<Bytes> {
     let (shape, start) = cogzilla_kernel::f32_npy_shape(data)?;
     let [planes, height, width] = shape[..] else { return None };
     let pixels = height.checked_mul(width)?;
     let mask = pq.return_mask;
     let bands = planes.checked_sub(usize::from(mask)).filter(|b| *b > 0)?;
-    let body = data.get(start..start + planes.checked_mul(pixels)?.checked_mul(4)?)?;
+    let byte_len = planes.checked_mul(pixels)?.checked_mul(4)?;
+    let end = start.checked_add(byte_len)?;
+    let body = data.get(start..end)?;
     let floats: Vec<f32> = body.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect();
     let (values, there) = floats.split_at(bands * pixels);
     // A pixel that is not there is no value, whatever the renderer filled it with.
-    let values = if mask {
-        values.iter().enumerate().map(|(i, v)| if there[i % pixels] == 0.0 { f32::NAN } else { *v }).collect()
+    let values: Vec<f32> = if mask {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let m = there[i % pixels];
+                if !m.is_finite() || m == 0.0 { f32::NAN } else { *v }
+            })
+            .collect()
     } else {
         values.to_vec()
     };
-    let selected = pixel_selection::Selected { bands, values };
-    let request = BandRequest::MultiBand { bands_1based: (1..=bands as u16).collect() };
+    let request = if bands == 1 && pq.expr_raw.is_none() && pq.asset_exprs.is_empty() {
+        let rescale = pq.rescale.first().copied().unwrap_or((0.0, 255.0));
+        BandRequest::Single { band_1based: 1, rescale, colormap: pq.colormap }
+    } else {
+        BandRequest::MultiBand { bands_1based: (1..=bands as u16).collect() }
+    };
     let custom = match first {
         Some(first) => resolve_custom_lut(pq, first, &request).ok()?,
         None => pq
@@ -2120,6 +2134,38 @@ fn shown_array(pq: &ParsedQuery, first: Option<&cogzilla_io::OpenedCog>, data: &
             .transpose()
             .ok()?,
     };
+    // Preserve all N bands for 2-band and 4+-band rescaled arrays when no colormap/formula is active.
+    if bands != 1
+        && bands != 3
+        && pq.colormap == ColormapName::Grayscale
+        && custom.is_none()
+        && pq.color_formula.is_none()
+    {
+        let out_planes = bands + usize::from(mask);
+        let hdr = cogzilla_kernel::encode_npy_header("|u1", &[out_planes, height, width]);
+        let mut out = Vec::with_capacity(hdr.len() + out_planes * pixels);
+        out.extend_from_slice(&hdr);
+        let mut valid = if mask { vec![0u8; pixels] } else { Vec::new() };
+        for b in 0..bands {
+            let (min, max) = pq.rescale.get(b).or(pq.rescale.first()).copied().unwrap_or((0.0, 255.0));
+            let plane = &values[b * pixels..(b + 1) * pixels];
+            for (p, &v) in plane.iter().enumerate() {
+                if v.is_finite() {
+                    out.push(paint::rescale_byte(v, min, max));
+                    if mask {
+                        valid[p] = 255;
+                    }
+                } else {
+                    out.push(0);
+                }
+            }
+        }
+        if mask {
+            out.extend_from_slice(&valid);
+        }
+        return Some(Bytes::from(out));
+    }
+    let selected = pixel_selection::Selected { bands, values };
     let grey = bands < 3 && pq.colormap == ColormapName::Grayscale && custom.is_none();
     let rgba = paint_selected(selected, pixels, &request, pq, custom.as_ref()).ok()?;
     let shown = if grey { 1 } else { 3 };
@@ -8428,6 +8474,9 @@ where
                         if auto_fmt {
                             treq.format = OutputFormat::RawRgba;
                         }
+                        if let Some(ref cf_str) = pq_stac.color_formula {
+                            ColorFormula::parse(cf_str).map_err(EngineError::BadRequest)?;
+                        }
                         if needs_general {
                             let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
                             let cf = pq_stac
@@ -9703,6 +9752,9 @@ where
                         let auto_fmt = ext.is_none() && pq.format_param.is_none();
                         if auto_fmt {
                             treq.format = OutputFormat::RawRgba;
+                        }
+                        if let Some(ref cf_str) = pq.color_formula {
+                            ColorFormula::parse(cf_str).map_err(EngineError::BadRequest)?;
                         }
 
                         if needs_general_path {
@@ -11300,6 +11352,16 @@ mod tests {
         // Without the mask, the band alone.
         let bare = shown("rescale=0,100&return_mask=false", &f32_npy(&[50.0, 100.0], false));
         assert_eq!(body(&bare), [127, 255]);
+        // 2-band and 4-band rescaled arrays preserve every band and the any-band-valid mask.
+        let two = shown("rescale=0,100&rescale=0,200", &f32_npy(&[50.0, f32::NAN, 100.0, 200.0], true));
+        assert!(std::str::from_utf8(&two[10..80]).unwrap().contains("'shape': (3, 1, 2)"));
+        assert_eq!(body(&two), [127, 0, 127, 255, 255, 255]);
+        let four = shown("rescale=0,100", &f32_npy(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], true));
+        assert!(std::str::from_utf8(&four[10..80]).unwrap().contains("'shape': (5, 1, 2)"));
+        assert_eq!(body(&four).len(), 10);
+        // STAC per-asset expression with rescale still asks for painted bytes.
+        let pq_ae = parse_query(Some("assets=red|expression=b1*2&rescale=0,100"));
+        assert!(matches!(array_asked(&pq_ae, Some(&"tile.npy")), Some(ArrayAsked::Shown(_))));
         // What is not a float32 array is not painted.
         assert!(shown_array(&parse_query(Some("rescale=0,100")), None, b"not an array").is_none());
     }
