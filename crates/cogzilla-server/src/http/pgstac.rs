@@ -1817,9 +1817,6 @@ fn check_mosaic_query(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<Mo
             }
         },
     };
-    if query_value(pairs, "algorithm_params").is_some() {
-        return Err(detail(StatusCode::BAD_REQUEST, "parameter 'algorithm_params' is not supported yet"));
-    }
     // A tile's `buffer` is taken before this is asked; anything else has none.
     if pq.buffer > 0.0 {
         return Err(detail(StatusCode::BAD_REQUEST, "parameter 'buffer' is for tiles"));
