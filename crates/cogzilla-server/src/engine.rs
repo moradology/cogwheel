@@ -961,6 +961,13 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_rgb::<N>(&plan, &srcs, &style) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
                     }
                     PlanarConfig::Planar => {
@@ -1021,6 +1028,13 @@ impl TileEngine {
                         ];
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_rgb::<N>(&plan, &srcs, &style) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
                         }
                         Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
                     }
@@ -1340,6 +1354,13 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_expr::<N>(&plan, &srcs, prog, &style) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
                     }
                     PlanarConfig::Planar => {
@@ -1383,6 +1404,13 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_expr::<N>(&plan, &srcs, prog, &style) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
                     }
                 }
