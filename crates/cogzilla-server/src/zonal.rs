@@ -1935,7 +1935,7 @@ pub async fn compute_native_exact_polygon_stats(
     let ty1 = (r1 - 1) / th;
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
-    const MAX_EXACT_BLOCKS: usize = 1024;
+    const MAX_EXACT_BLOCKS: usize = 512;
     let total_blocks = match ifd.planar_config {
         PlanarConfig::Chunky => blocks_x.saturating_mul(blocks_y),
         PlanarConfig::Planar => sel_bands
@@ -2544,7 +2544,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let ty1 = (r1 - 1) / th;
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
-    const MAX_EXACT_BLOCKS: usize = 1024;
+    const MAX_EXACT_BLOCKS: usize = 512;
     let total_blocks = ref_slots
         .len()
         .max(1)
@@ -2572,7 +2572,13 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
 
     let mut band_bufs: Vec<(u16, Vec<f32>)> = Vec::with_capacity(ref_slots.len());
     for &b1 in &ref_slots {
-        let slot = (b1.saturating_sub(1) as usize).min(cogs.len().saturating_sub(1));
+        if (b1 as usize) == 0 || (b1 as usize) > cogs.len() {
+            return Err(EngineError::BadRequest(format!(
+                "expression band b{b1} out of range for {} asset(s)",
+                cogs.len()
+            )));
+        }
+        let slot = (b1 - 1) as usize;
         let asset_cog = &cogs[slot];
         let asset_ifd = &asset_cog.index.ifds[ifd_idx];
         let asset_tw = asset_ifd.tile_width as usize;
