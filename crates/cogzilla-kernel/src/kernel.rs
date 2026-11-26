@@ -1528,7 +1528,7 @@ pub fn encode_npy_typed(
 }
 
 /// The shape of a float32 `.npy` this crate wrote (`<f4`, C order), and where its data starts.
-fn f32_npy_shape(npy: &[u8]) -> Option<(Vec<usize>, usize)> {
+pub fn f32_npy_shape(npy: &[u8]) -> Option<(Vec<usize>, usize)> {
     if npy.len() < 10 || &npy[..8] != b"\x93NUMPY\x01\x00" {
         return None;
     }
