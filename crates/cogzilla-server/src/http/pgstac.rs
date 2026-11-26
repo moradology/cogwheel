@@ -4994,16 +4994,10 @@ async fn tile(
         // tile's words, sooner than further on in a box's.
         let raw = matches!(ext, "bin" | "raw" | "f32") || matches!(query_value(pairs, "format"), Some("bin" | "raw" | "f32"));
         match check_mosaic_query(&pq, pairs) {
-            Ok(q)
-                if q.resampling != ResampleMode::Nearest
-                    || q.reproject != ResampleMode::Nearest
-                    || pq.algorithm.is_some()
-                    || raw
-                    || !planes_read_all(&pq, &q) =>
-            {
+            Ok(q) if pq.algorithm.is_some() || raw || !planes_read_all(&pq, &q) => {
                 return detail(
                     StatusCode::BAD_REQUEST,
-                    "a tile with a `buffer` is drawn with nearest-neighbour resampling, as a picture or `.npy`, and without `algorithm` or band math only the renderer reads",
+                    "a tile with a `buffer` is drawn as a picture or `.npy`, and without `algorithm` or band math only the renderer reads",
                 );
             }
             Ok(_) => {}

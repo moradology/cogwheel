@@ -120,7 +120,7 @@ fn common_band_render_params() -> Vec<Value> {
         q_str("color_formula", false, "rio-color formula (e.g. Gamma RGB 1.5)"),
         q_str("colormap_name", false, "Named rio-tiler colormap"),
         q_str("colormap", false, "JSON-encoded custom discrete or interval colormap"),
-        q_str("colormap_type", false, "Colormap type (explicit or interval)"),
+        q_str("colormap_type", false, "Colormap type (explicit or linear)"),
         q_bool("return_mask", false, "Include alpha/validity mask in output"),
         q_str("algorithm", false, "Raster algorithm (hillshade, slope, aspect, contours, terrarium, terrainrgb, normalizedIndex)"),
         q_str("algorithm_params", false, "JSON-encoded algorithm parameters"),

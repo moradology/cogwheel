@@ -522,6 +522,10 @@ def main() -> int:
         o.check("array of whole band math, bilinear", "image", f"{base12}.npy?{band_math}b1*2")
         o.check("array of band math, bilinear, rescaled", "image", f"{base12}.npy?{band_math}(b2-b1)/(b2%2Bb1)&rescale=-1,1")
         o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
+        o.check("array with a buffer, bilinear", "image", f"{base12}.npy?assets=red&buffer=2&resampling=bilinear&reproject=bilinear")
+        o.check("picture with half a pixel of buffer, average", "image", f"{base12}.png?assets=visual&buffer=0.5&resampling=average&reproject=average")
+        o.check("array of two assets with a buffer, cubic, 512", "image",
+                f"{base12}.npy?assets=red&assets=nir&asset_as_band=true&buffer=3&tilesize=512&resampling=cubic&reproject=cubic")
         o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
         # A method that gathers a pixel's footprint, far below the raster's coarsest overview:
         # read as a box is. (The reference takes seconds for each of these.)

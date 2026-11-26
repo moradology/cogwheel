@@ -275,7 +275,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cogmark"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "clap",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-codec"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "cogzilla-tiff",
  "lerc-core",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-io"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-kernel"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "cogzilla-codec",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-lambda"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "cogzilla-io",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-pgstac"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "deadpool-postgres",
  "parking_lot",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-proj"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "cogzilla-tiff",
  "thiserror",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-server"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "cogzilla-tiff"
-version = "0.7.23"
+version = "0.8.0"
 dependencies = [
  "thiserror",
 ]
