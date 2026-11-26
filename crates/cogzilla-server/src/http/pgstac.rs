@@ -5955,6 +5955,23 @@ fn item_route_needs_assets(rest: &[&str]) -> bool {
     }
 }
 
+/// An item's `preview/{width}x{height}.{format}` with a side of zero, as the
+/// `preview.{format}` it stands for: a zero is a side left to follow the other, or
+/// `max_size` when both are, as TiTiler has it. The side that is given goes into the query,
+/// where it outranks `max_size` as it does in rio-tiler. Any other path is left alone.
+pub(super) fn item_preview_by_query(rest: &[&str], pq: &mut ParsedQuery) -> Option<String> {
+    let ["preview", dims] = rest else { return None };
+    let (sides, ext) = dims.split_once('.')?;
+    let (w, h) = sides.split_once('x')?;
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    if (w != 0 && h != 0) || w > MAX_PART_SIDE || h > MAX_PART_SIDE {
+        return None;
+    }
+    pq.width = (w != 0).then_some(w);
+    pq.height = (h != 0).then_some(h);
+    Some(format!("preview.{ext}"))
+}
+
 /// Resolve the item behind `/collections/{collection}/items/{item_id}/...` and answer what
 /// is specific to titiler-pgstac. Everything else goes to the `/stac` handlers.
 pub(super) async fn item_route(
@@ -6986,6 +7003,25 @@ mod tests {
         assert_eq!(status("use_epsg=maybe"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status("zooms=WebMercatorQuad"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status(""), StatusCode::OK);
+    }
+
+    #[test]
+    fn an_item_preview_with_a_side_of_zero_is_sized_from_the_query() {
+        let sized = |dims: &str| {
+            let mut pq = crate::http::parse_query(Some("max_size=32"));
+            let path = item_preview_by_query(&["preview", dims], &mut pq);
+            (path, pq.width, pq.height, pq.max_size)
+        };
+        assert_eq!(sized("0x64.png"), (Some("preview.png".into()), None, Some(64), 32));
+        assert_eq!(sized("100x0.jpg"), (Some("preview.jpg".into()), Some(100), None, 32));
+        assert_eq!(sized("0x0.tif"), (Some("preview.tif".into()), None, None, 32));
+        // Both sides given, no format, a side too large or not a number: as it was.
+        for dims in ["64x64.png", "0x64", "0x5000.png", "0x-1.png", "ax0.png", "64.png"] {
+            assert_eq!(sized(dims), (None, None, None, 32), "{dims}");
+        }
+        let mut pq = crate::http::parse_query(None);
+        assert_eq!(item_preview_by_query(&["bbox", "0x64.png"], &mut pq), None);
+        assert_eq!(item_preview_by_query(&["preview", "0x64.png", "more"], &mut pq), None);
     }
 
     #[test]

@@ -5349,6 +5349,7 @@ where
     let mut pgstac_item: Option<Arc<StacItem>> = None;
     let mut pgstac_item_extent: Option<pgstac::ItemExtent> = None;
     let mut stac_prefix = String::from("stac");
+    let item_preview: Option<String>;
     let item_rest: Option<Vec<&str>> = match segs.as_slice() {
         ["collections", c, "items", i, rest @ ..] if !rest.is_empty() => {
             let ctx = pgstac::Ctx {
@@ -5382,7 +5383,13 @@ where
                     }
                     stac_prefix = format!("collections/{c}/items/{i}");
                     let mut as_stac = vec!["stac"];
-                    as_stac.extend_from_slice(rest);
+                    // A preview with a side of zero in its path is the preview sized from
+                    // the query, which is what works such a side out.
+                    item_preview = pgstac::item_preview_by_query(rest, &mut pq);
+                    match &item_preview {
+                        Some(preview) => as_stac.push(preview),
+                        None => as_stac.extend_from_slice(rest),
+                    }
                     Some(as_stac)
                 }
             }
