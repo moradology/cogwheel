@@ -299,6 +299,8 @@ name = "cogzilla-codec"
 version = "0.7.23"
 dependencies = [
  "cogzilla-tiff",
+ "lerc-core",
+ "lerc-reader",
  "libdeflater",
  "libwebp-sys",
  "thiserror",
@@ -1247,6 +1249,21 @@ name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
+name = "lerc-core"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a393a8871cff51fc7469d84a96c4b2ddba887d85d89609b1689364baac8cd881"
+
+[[package]]
+name = "lerc-reader"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e876b00fd61cabb5a274d1eaaec252efced767fecd8a2ae1709259c22d733ec"
+dependencies = [
+ "lerc-core",
+]
 
 [[package]]
 name = "libc"

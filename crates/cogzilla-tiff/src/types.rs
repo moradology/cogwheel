@@ -35,6 +35,9 @@ pub enum Compression {
     PackBits,
     Zstd,
     Webp,
+    Lerc,
+    LercDeflate,
+    LercZstd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

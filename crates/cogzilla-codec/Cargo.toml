@@ -10,3 +10,5 @@ libdeflater.workspace = true
 zstd-sys.workspace = true
 libwebp-sys.workspace = true
 zune-jpeg.workspace = true
+lerc-core.workspace = true
+lerc-reader.workspace = true

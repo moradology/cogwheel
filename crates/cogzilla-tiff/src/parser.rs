@@ -28,6 +28,7 @@ const TAG_TILE_BYTE_COUNTS: u16 = 325;
 const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_JPEG_TABLES: u16 = 347;
+const TAG_LERC_PARAMETERS: u16 = 50674;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
@@ -476,6 +477,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         let mut samples_per_pixel = 1u16;
         let mut planar_config = PlanarConfig::Chunky;
         let mut compression = Compression::None;
+        let mut lerc_additional: u32 = 0;
         let mut predictor = Predictor::None;
         let mut photometric = 1u16;
         let mut extra_samples: Vec<u16> = Vec::new();
@@ -572,6 +574,7 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                         7 => Compression::Jpeg,
                         8 | 32946 => Compression::Deflate,
                         32773 => Compression::PackBits,
+                        34887 => Compression::Lerc,
                         50000 => Compression::Zstd,
                         50001 => Compression::Webp,
                         other => return Err(TiffError::UnsupportedCompression(other)),
@@ -649,6 +652,15 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
                     }
                     charge_tag(entry.count, 1)?;
                     jpeg_tables = Some(entry.read_bytes(&r)?);
+                }
+                TAG_LERC_PARAMETERS => {
+                    if entry.count >= 2 && entry.count <= 16 {
+                        if let Ok(vals) = entry.read_u64_vec(&r)
+                            && vals.len() >= 2
+                        {
+                            lerc_additional = vals[1] as u32;
+                        }
+                    }
                 }
                 TAG_MODEL_PIXEL_SCALE if ifds.is_empty() => {
                     charge_tag(entry.count, 8)?;
@@ -863,6 +875,11 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
         if extra_samples.len() > samples_per_pixel as usize {
             return Err(TiffError::Corrupt("ExtraSamples exceeds SamplesPerPixel"));
         }
+        let compression = match (compression, lerc_additional) {
+            (Compression::Lerc, 1) => Compression::LercDeflate,
+            (Compression::Lerc, 2) => Compression::LercZstd,
+            (c, _) => c,
+        };
         let jpeg_tables = if compression == Compression::Jpeg {
             if let Some(ref jt) = jpeg_tables {
                 if jt.len() > MAX_JPEG_TABLES_BYTES {
