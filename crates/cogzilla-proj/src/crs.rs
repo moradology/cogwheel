@@ -2,8 +2,8 @@ use cogzilla_tiff::{Affine2D, GeoKeys};
 use thiserror::Error;
 
 use crate::ellipsoid::{
-    AlbersEqualArea, Ellipsoid, LambertAzimuthalEqualArea, LambertConformalConic,
-    PolarStereographic, Sinusoidal, TransverseMercator,
+    AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, LambertAzimuthalEqualArea,
+    LambertConformalConic, PolarStereographic, Sinusoidal, TransverseMercator,
 };
 use crate::mercator::{
     ORIGIN_SHIFT, TileCoord, lonlat_deg_to_mercator, mercator_to_lonlat_deg,
@@ -34,6 +34,8 @@ pub enum CrsModel {
     PolarStereographic(PolarStereographic),
     Laea(LambertAzimuthalEqualArea),
     Sinusoidal(Sinusoidal),
+    CylindricalEqualArea(CylindricalEqualArea),
+    EqualEarth(EqualEarth),
 }
 
 impl CrsModel {
@@ -73,6 +75,8 @@ impl CrsModel {
             Self::PolarStereographic(p) => p.unit,
             Self::Laea(p) => p.unit,
             Self::Sinusoidal(p) => p.unit,
+            Self::CylindricalEqualArea(p) => p.unit,
+            Self::EqualEarth(p) => p.unit,
             Self::Epsg3857 | Self::WorldMercator | Self::Geographic => 1.0,
         }
     }
@@ -140,7 +144,7 @@ impl CrsModel {
             }
         }
 
-        let sphere_ok = matches!(gk.proj_coord_trans, Some(10 | 24));
+        let sphere_ok = matches!(gk.proj_coord_trans, Some(10 | 24 | 28));
         let ellip = Self::wgs84_compatible_ellipsoid(gk, sphere_ok).map_err(unsupported)?;
 
         // 2. User-defined projection parameters via ProjCoordTransGeoKey.
@@ -349,6 +353,25 @@ impl CrsModel {
                     p.unit = unit;
                     Ok(Self::Sinusoidal(p))
                 }
+                // CT_CylindricalEqualArea
+                28 => {
+                    let lat_ts = require_lat(
+                        gk.std_parallel_1
+                            .or(gk.nat_origin_lat)
+                            .unwrap_or(0.0),
+                        true,
+                        "standard parallel",
+                    )?;
+                    let lon0 = require_finite(
+                        gk.nat_origin_long
+                            .or(gk.center_long)
+                            .unwrap_or(0.0),
+                        "central meridian",
+                    )?;
+                    let mut p = CylindricalEqualArea::new(ellip, lat_ts, lon0, fe, fn_m);
+                    p.unit = unit;
+                    Ok(Self::CylindricalEqualArea(p))
+                }
                 _ => Err(unsupported("projection method is not implemented")),
             };
         }
@@ -444,6 +467,14 @@ impl CrsModel {
                 let (lon, lat) = mercator_to_lonlat_rad(mx, my);
                 p.forward(lon, lat)
             }
+            Self::CylindricalEqualArea(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
+            Self::EqualEarth(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
         }
     }
 
@@ -494,6 +525,10 @@ impl CrsModel {
             Self::PolarStereographic(ps) => ps.forward(lon_deg.to_radians(), lat_deg.to_radians()),
             Self::Laea(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
             Self::Sinusoidal(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::CylindricalEqualArea(p) => {
+                p.forward(lon_deg.to_radians(), lat_deg.to_radians())
+            }
+            Self::EqualEarth(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
         }
     }
 
@@ -525,6 +560,14 @@ impl CrsModel {
                 (lon.to_degrees(), lat.to_degrees())
             }
             Self::Sinusoidal(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::CylindricalEqualArea(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::EqualEarth(p) => {
                 let (lon, lat) = p.inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
@@ -1085,7 +1128,10 @@ impl<const N: usize> CoordPlan<N> {
         let step_y = (max_y - min_y) / (N as f64);
 
         if crs_to_pixel.is_axis_aligned()
-            && matches!(crs, CrsModel::Epsg3857 | CrsModel::Geographic)
+            && matches!(
+                crs,
+                CrsModel::Epsg3857 | CrsModel::Geographic | CrsModel::CylindricalEqualArea(_)
+            )
         {
             let mut u = Box::new([0.0f32; N]);
             let mut v = Box::new([0.0f32; N]);
@@ -1145,6 +1191,26 @@ impl<const N: usize> CoordPlan<N> {
                         max_v = max_v.max(vv);
                     }
                 }
+                CrsModel::CylindricalEqualArea(cea) => {
+                    for px in 0..N {
+                        let mx = min_x + (px as f64 + 0.5) * step_x;
+                        let (lon, _) = mercator_to_lonlat_rad(mx, 0.0);
+                        let sx = cea.forward_x(lon);
+                        let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
+                        u[px] = uu;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                    }
+                    for py in 0..N {
+                        let my = max_y - (py as f64 + 0.5) * step_y;
+                        let (_, lat) = mercator_to_lonlat_rad(0.0, my);
+                        let sy = cea.forward_y(lat);
+                        let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
+                        v[py] = vv;
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
                 _ => unreachable!(),
             }
 
@@ -1185,6 +1251,7 @@ impl<const N: usize> CoordPlan<N> {
             // to adaptive `Exact2D` so boundary 16x16 blocks are never dropped or smeared.
             let branch_lon0: Option<f64> = match crs {
                 CrsModel::Sinusoidal(p) => Some(p.lon0),
+                CrsModel::EqualEarth(p) => Some(p.lon0),
                 CrsModel::Albers(p) => Some(p.lon0),
                 CrsModel::LambertConformalConic(p) => Some(p.lon0),
                 _ => None,
@@ -2179,5 +2246,103 @@ mod tests {
             rx_ups.min(ry_ups) >= 1_953.125 && rx_ups.min(ry_ups) < 3_906.25,
             "UPS tile 3/6/0 should select 2x overview (in [1953.1, 3906.25)), got ({rx_ups}, {ry_ups})"
         );
+    }
+
+    #[test]
+    fn ease_grid_6933_3410_and_equal_earth_8857_match_proj() {
+        // Reference coordinates computed via pyproj / PROJ 9.x
+        let cases: &[(u16, &[(f64, f64, f64, f64)])] = &[
+            (
+                6933,
+                &[
+                    (0.0, 0.0, 0.0, 0.0),
+                    (0.0, 30.0, 0.0, 3_658_789.324_855),
+                    (0.0, 60.0, 0.0, 6_351_419.997_326),
+                    (0.0, 84.0, 0.0, 7_301_649.868_311),
+                    (179.9, 30.0, 17_357_881.817_136, 3_658_789.324_855),
+                    (-179.9, -45.0, -17_357_881.817_136, -5_180_102.328_839),
+                ],
+            ),
+            (
+                3410,
+                &[
+                    (0.0, 0.0, 0.0, 0.0),
+                    (0.0, 30.0, 0.0, 3_678_430.200_868),
+                    (0.0, 60.0, 0.0, 6_371_228.000_000),
+                    (0.0, 84.0, 0.0, 7_316_558.750_695),
+                    (179.9, 30.0, 17_324_563.835_940, 3_678_430.200_868),
+                    (-179.9, -45.0, -17_324_563.835_940, -5_202_085.878_311),
+                ],
+            ),
+            (
+                8857,
+                &[
+                    (0.0, 0.0, 0.0, 0.0),
+                    (0.0, 30.0, 0.0, 3_764_325.426_892),
+                    (0.0, 60.0, 0.0, 6_924_035.137_553),
+                    (0.0, 84.0, 0.0, 8_324_478.230_694),
+                    (179.9, 30.0, 16_128_646.549_557, 3_764_325.426_892),
+                    (-179.9, -45.0, -14_784_256.707_468, -5_466_867.760_214),
+                ],
+            ),
+            (
+                8858,
+                &[
+                    (0.0, 0.0, 8_621_979.531_108, 0.0),
+                    (0.0, 30.0, 8_068_805.944_748, 3_764_325.426_892),
+                    (179.9, 30.0, -8_077_771.284_687, 3_764_325.426_892),
+                ],
+            ),
+            (
+                8859,
+                &[
+                    (0.0, 0.0, -14_369_965.885_181, 0.0),
+                    (0.0, 30.0, -13_448_009.907_913, 3_764_325.426_892),
+                    (179.9, 30.0, 2_680_636.641_644, 3_764_325.426_892),
+                ],
+            ),
+        ];
+
+        for &(code, pts) in cases {
+            let crs = CrsModel::from_epsg(code).unwrap_or_else(|e| panic!("EPSG:{code}: {e}"));
+            for &(lon, lat, ex, ey) in pts {
+                let (gx, gy) = crs.from_lonlat_deg(lon, lat);
+                assert!(
+                    (gx - ex).abs() < 1e-5 && (gy - ey).abs() < 1e-5,
+                    "EPSG:{code} forward ({lon},{lat}): got ({gx:.6},{gy:.6}), expected ({ex:.6},{ey:.6})"
+                );
+                let (rlon, rlat) = crs.to_lonlat_deg(gx, gy);
+                assert!(
+                    (rlon - lon).abs() < 1e-9 && (rlat - lat).abs() < 1e-9,
+                    "EPSG:{code} inverse ({gx:.6},{gy:.6}): got ({rlon:.9},{rlat:.9}), expected ({lon},{lat})"
+                );
+            }
+        }
+
+        // Edge case: |q| slightly above qp from rounding clamps cleanly to +-90 deg;
+        // far beyond poles returns NaN.
+        let CrsModel::CylindricalEqualArea(cea) = CrsModel::from_epsg(6933).unwrap() else {
+            unreachable!()
+        };
+        let y_pole = cea.a * cea.qp / (2.0 * cea.k0);
+        let (_, lat_clamp) = cea.inverse(0.0, y_pole * (1.0 + 1e-11));
+        assert!((lat_clamp.to_degrees() - 90.0).abs() < 1e-6);
+        let (nan_lon, nan_lat) = cea.inverse(0.0, y_pole * 1.01);
+        assert!(nan_lon.is_nan() && nan_lat.is_nan());
+
+        // Fast path: axis-aligned EPSG:6933 uses Separable1D in CoordPlan::build
+        let crs6933 = CrsModel::from_epsg(6933).unwrap();
+        let p2c = Affine2D {
+            a: 34_735_040.0 / 1024.0,
+            b: 0.0,
+            c: -17_367_520.0,
+            d: 0.0,
+            e: -14_629_080.0 / 512.0,
+            f: 7_314_540.0,
+        };
+        let c2p = p2c.invert().unwrap();
+        let plan = CoordPlan::<256>::build(&crs6933, &c2p, 1024, 512, TileCoord { z: 2, x: 3, y: 1 })
+            .expect("dateline tile should intersect global EASE-2");
+        assert!(matches!(plan, CoordPlan::Separable1D { .. }));
     }
 }
