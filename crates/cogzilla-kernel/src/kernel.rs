@@ -2,6 +2,7 @@ use std::cell::RefCell;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use cogzilla_proj::{CoordPlan, GRID_DIM};
+use cogzilla_tiff::SampleType;
 
 use crate::bandmath::{SpectralExpr, fast_db_from_power};
 use crate::colormap::{ColormapLut, ColormapName};
@@ -1391,12 +1392,21 @@ fn for_each_pixel_in_row<const N: usize, F: FnMut(usize, f32, f32)>(
     }
 }
 
-/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous `<f4` array
-/// of shape `(bands, height, width)`.
-pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
-    let mut dict = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({bands}, {height}, {width}), }}"
-    );
+/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous array of the
+/// dtype `descr` (`<f4`, `|u1`, ...) and of `shape`: the magic, the version, the length of
+/// what follows, then the dict padded with spaces and ended by a newline so that the data
+/// starts on a multiple of 64 bytes. Every `.npy` this crate writes begins with it.
+pub fn encode_npy_header(descr: &str, shape: &[usize]) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': (");
+    for (i, dim) in shape.iter().enumerate() {
+        if i > 0 {
+            dict.push_str(", ");
+        }
+        let _ = write!(dict, "{dim}");
+    }
+    // A tuple of one is written `(n,)`.
+    dict.push_str(if shape.len() == 1 { ",), }" } else { "), }" });
     let unpadded = 10 + dict.len() + 1;
     let pad = (64 - (unpadded % 64)) % 64;
     for _ in 0..pad {
@@ -1409,6 +1419,85 @@ pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
     hdr.extend_from_slice(&hlen.to_le_bytes());
     hdr.extend_from_slice(dict.as_bytes());
     hdr
+}
+
+/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous `<f4` array
+/// of shape `(bands, height, width)`.
+pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
+    encode_npy_header("<f4", &[bands, height as usize, width as usize])
+}
+
+/// The NumPy dtype string of a sample type: little-endian, and `|` for the single bytes.
+pub fn npy_descr(kind: SampleType) -> &'static str {
+    match kind {
+        SampleType::Uint8 => "|u1",
+        SampleType::Int8 => "|i1",
+        SampleType::Uint16 => "<u2",
+        SampleType::Int16 => "<i2",
+        SampleType::Uint32 => "<u4",
+        SampleType::Int32 => "<i4",
+        SampleType::Float32 => "<f4",
+        SampleType::Float64 => "<f8",
+    }
+}
+
+/// A `.npy` array of `bands` planes of `height` by `width`, written in the dtype of `kind`
+/// from CHW float32 `values` in which NaN marks a value that is not there.
+///
+/// A value that is not there is written as `absent`, or as zero without one. Integers take
+/// the value truncated toward zero and held to the type's range (a NaN `absent` is zero);
+/// the float types hold an infinity to their largest finite number. With `mask`, one more
+/// plane follows the bands: the type's largest number (`255` for `u1`, `65535` for `u2`,
+/// `f32::MAX` for `f4`, ...) where any band has a value, zero elsewhere. Only the first
+/// `bands * height * width` of `values` are written, and a shorter slice makes a shorter
+/// body under a header that still names every plane.
+///
+/// This is not the float32 path of [`wrap_raw_f32_as_npy_with_mask`], which copies its
+/// planes as they are, counts an infinity as absent and writes `255.0` in its mask.
+pub fn encode_npy_typed(
+    values: &[f32],
+    bands: usize,
+    height: usize,
+    width: usize,
+    kind: SampleType,
+    absent: Option<f32>,
+    mask: bool,
+) -> Bytes {
+    let pixels = width * height;
+    let planes = bands + usize::from(mask);
+    let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
+    out.extend_from_slice(&hdr);
+    let absent = f64::from(absent.unwrap_or(0.0));
+    let data = &values[..(bands * pixels).min(values.len())];
+    // One loop for each type, so the type is not asked about per value.
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for v in data {
+                let x: $t = cast(if v.is_nan() { absent } else { f64::from(*v) });
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if mask {
+                for i in 0..pixels {
+                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+                    let x: $t = if there { <$t>::MAX } else { cast(0.0) };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+    Bytes::from(out)
 }
 
 /// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes.
@@ -6385,5 +6474,224 @@ mod npy_golden_tests {
             assert_eq!(got.len(), len, "empty {size} tile of {bands} bands");
             assert_eq!(sha256_hex(&got), digest, "empty {size} tile of {bands} bands");
         }
+    }
+}
+
+/// The typed `.npy` writer and the header it shares with the float32 one.
+#[cfg(test)]
+mod npy_typed_tests {
+    use super::*;
+
+    const KINDS: [(SampleType, &str, usize); 8] = [
+        (SampleType::Uint8, "|u1", 1),
+        (SampleType::Int8, "|i1", 1),
+        (SampleType::Uint16, "<u2", 2),
+        (SampleType::Int16, "<i2", 2),
+        (SampleType::Uint32, "<u4", 4),
+        (SampleType::Int32, "<i4", 4),
+        (SampleType::Float32, "<f4", 4),
+        (SampleType::Float64, "<f8", 8),
+    ];
+
+    /// Read a header back: the dtype, the order, the shape, and where the data starts.
+    fn parse(npy: &[u8]) -> (String, String, Vec<usize>, usize) {
+        assert_eq!(&npy[..8], b"\x93NUMPY\x01\x00");
+        let start = 10 + usize::from(u16::from_le_bytes([npy[8], npy[9]]));
+        assert_eq!(start % 64, 0, "the data starts on a multiple of 64 bytes");
+        let dict = std::str::from_utf8(&npy[10..start]).unwrap();
+        assert!(dict.ends_with('\n'));
+        assert!(dict[..dict.len() - 1].trim_end_matches(' ').ends_with(", }"));
+        let field = |name: &str, end: &str| {
+            let from = dict.find(name).unwrap_or_else(|| panic!("{name} in {dict}")) + name.len();
+            dict[from..from + dict[from..].find(end).unwrap()].to_string()
+        };
+        let shape = field("'shape': (", ")")
+            .split(',')
+            .map(str::trim)
+            .filter(|dim| !dim.is_empty())
+            .map(|dim| dim.parse().unwrap())
+            .collect();
+        (field("'descr': '", "'"), field("'fortran_order': ", ","), shape, start)
+    }
+
+    #[test]
+    fn header_is_general_over_dtype_and_shape() {
+        for (_, descr, _) in KINDS {
+            for shape in [vec![], vec![7], vec![1, 2, 2], vec![4, 1024, 512], vec![2, 3, 4, 5]] {
+                let hdr = encode_npy_header(descr, &shape);
+                let (got_descr, order, got_shape, start) = parse(&hdr);
+                assert_eq!((got_descr.as_str(), order.as_str()), (descr, "False"));
+                assert_eq!(got_shape, shape);
+                assert_eq!(start, hdr.len());
+            }
+        }
+        // NumPy writes a tuple of one with its comma, and of none as `()`.
+        let dict = |hdr: Vec<u8>| String::from_utf8(hdr[10..].to_vec()).unwrap();
+        assert!(dict(encode_npy_header("<i2", &[7])).starts_with("{'descr': '<i2', 'fortran_order': False, 'shape': (7,), }"));
+        assert!(dict(encode_npy_header("<f8", &[])).starts_with("{'descr': '<f8', 'fortran_order': False, 'shape': (), }"));
+    }
+
+    #[test]
+    fn header_pads_to_the_next_64_bytes() {
+        // Shapes of 2 to 40 dimensions, led by a number of one or two digits, so the dict
+        // runs through every length from short to past 128 bytes.
+        let (mut unpadded, mut short, mut long) = (false, false, false);
+        for first in [1usize, 10] {
+            for dims in 2..=40usize {
+                let mut shape = vec![1usize; dims];
+                shape[0] = first;
+                let inner = shape.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+                let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({inner}), }}");
+                let total = (10 + dict.len() + 1).div_ceil(64) * 64;
+                let pad = total - 11 - dict.len();
+                let hdr = encode_npy_header("<f4", &shape);
+                assert_eq!(hdr.len(), total, "{dict}");
+                assert_eq!(usize::from(u16::from_le_bytes([hdr[8], hdr[9]])), total - 10);
+                assert_eq!(&hdr[10..10 + dict.len()], dict.as_bytes());
+                assert!(hdr[10 + dict.len()..total - 1].iter().all(|b| *b == b' '));
+                assert_eq!(hdr[total - 1], b'\n');
+                unpadded |= pad == 0;
+                short |= total == 128;
+                long |= total == 192;
+            }
+        }
+        assert!(unpadded && short && long, "a dict that fills its block, and both block counts");
+    }
+
+    #[test]
+    fn f32_header_is_the_general_header() {
+        for (bands, height, width) in [(1usize, 2u32, 2u32), (3, 256, 256), (10, 1024, 512), (usize::MAX, u32::MAX, u32::MAX)] {
+            assert_eq!(
+                encode_npy_f32_header(bands, height, width),
+                encode_npy_header("<f4", &[bands, height as usize, width as usize])
+            );
+        }
+    }
+
+    #[test]
+    fn every_dtype_parses_back_with_a_body_of_the_right_length() {
+        let values: Vec<f32> = (0..3 * 5 * 7).map(|i| if i % 4 == 0 { f32::NAN } else { i as f32 }).collect();
+        for (kind, descr, size) in KINDS {
+            assert_eq!(npy_descr(kind), descr);
+            assert_eq!(kind.bytes_per_sample(), size);
+            for bands in [1usize, 3] {
+                for mask in [false, true] {
+                    let npy = encode_npy_typed(&values, bands, 5, 7, kind, None, mask);
+                    let (got_descr, order, shape, start) = parse(&npy);
+                    assert_eq!((got_descr.as_str(), order.as_str()), (descr, "False"));
+                    assert_eq!(shape, [bands + usize::from(mask), 5, 7]);
+                    assert_eq!(npy.len() - start, (bands + usize::from(mask)) * 5 * 7 * size);
+                }
+            }
+        }
+    }
+
+    /// The body of a 1x4 single-band array of `values`, with its mask plane.
+    fn body(values: &[f32], kind: SampleType, absent: Option<f32>, mask: bool) -> Vec<u8> {
+        let npy = encode_npy_typed(values, 1, 1, values.len(), kind, absent, mask);
+        npy[parse(&npy).3..].to_vec()
+    }
+
+    #[test]
+    fn values_fill_and_mask_in_each_dtype() {
+        let nan = f32::NAN;
+        let values = [1.9, nan, -2.9, 70000.0];
+        macro_rules! le {
+            ($t:ty, $($v:expr),*) => {{
+                let mut out = Vec::new();
+                $(out.extend_from_slice(&<$t>::to_le_bytes($v));)*
+                out
+            }};
+        }
+        // Truncated toward zero, held to the range, absent as zero; then the mask.
+        assert_eq!(body(&values, SampleType::Uint8, None, true), le!(u8, 1, 0, 0, 255, 255, 0, 255, 255));
+        assert_eq!(body(&values, SampleType::Int8, None, true), le!(i8, 1, 0, -2, 127, 127, 0, 127, 127));
+        assert_eq!(body(&values, SampleType::Uint16, None, true), le!(u16, 1, 0, 0, 65535, 65535, 0, 65535, 65535));
+        assert_eq!(body(&values, SampleType::Int16, None, true), le!(i16, 1, 0, -2, 32767, 32767, 0, 32767, 32767));
+        assert_eq!(body(&values, SampleType::Uint32, None, true), le!(u32, 1, 0, 0, 70000, u32::MAX, 0, u32::MAX, u32::MAX));
+        assert_eq!(body(&values, SampleType::Int32, None, true), le!(i32, 1, 0, -2, 70000, i32::MAX, 0, i32::MAX, i32::MAX));
+        assert_eq!(
+            body(&values, SampleType::Float32, None, true),
+            le!(f32, 1.9, 0.0, -2.9, 70000.0, f32::MAX, 0.0, f32::MAX, f32::MAX)
+        );
+        assert_eq!(
+            body(&values, SampleType::Float64, None, true),
+            le!(f64, f64::from(1.9f32), 0.0, f64::from(-2.9f32), 70000.0, f64::MAX, 0.0, f64::MAX, f64::MAX)
+        );
+        // Without the mask the body is the bands alone.
+        assert_eq!(body(&values, SampleType::Uint16, None, false), le!(u16, 1, 0, 0, 65535));
+        assert_eq!(body(&values, SampleType::Float32, None, false), le!(f32, 1.9, 0.0, -2.9, 70000.0));
+    }
+
+    #[test]
+    fn absent_values_take_the_named_fill() {
+        let nan = f32::NAN;
+        let values = [nan, 5.0, nan];
+        assert_eq!(body(&values, SampleType::Uint8, Some(9.0), false), [9, 5, 9]);
+        assert_eq!(body(&values, SampleType::Uint8, None, false), [0, 5, 0]);
+        // The fill is cast as a value is: out of range it is held to the range.
+        assert_eq!(body(&values, SampleType::Uint8, Some(-9999.0), false), [0, 5, 0]);
+        assert_eq!(body(&values, SampleType::Int16, Some(-9999.0), false), [(-9999i16).to_le_bytes(), 5i16.to_le_bytes(), (-9999i16).to_le_bytes()].concat());
+        assert_eq!(body(&values, SampleType::Float32, Some(-9999.0), false), [(-9999f32).to_le_bytes(), 5f32.to_le_bytes(), (-9999f32).to_le_bytes()].concat());
+        // A fill of NaN is zero in an integer and stays NaN in a float.
+        assert_eq!(body(&values, SampleType::Int32, Some(nan), false), [0i32.to_le_bytes(), 5i32.to_le_bytes(), 0i32.to_le_bytes()].concat());
+        assert!(f32::from_le_bytes(body(&values, SampleType::Float32, Some(nan), false)[..4].try_into().unwrap()).is_nan());
+        // The fill does not reach the mask, which reads the values given.
+        assert_eq!(body(&values, SampleType::Uint8, Some(9.0), true), [9, 5, 9, 0, 255, 0]);
+    }
+
+    #[test]
+    fn floats_hold_infinities_to_the_largest_finite_number() {
+        let values = [f32::INFINITY, f32::NEG_INFINITY];
+        assert_eq!(body(&values, SampleType::Float32, None, false), [f32::MAX.to_le_bytes(), f32::MIN.to_le_bytes()].concat());
+        assert_eq!(
+            body(&values, SampleType::Float64, None, false),
+            [f64::MAX.to_le_bytes(), f64::MIN.to_le_bytes()].concat()
+        );
+        assert_eq!(body(&values, SampleType::Int16, None, true), [i16::MAX.to_le_bytes(), i16::MIN.to_le_bytes(), i16::MAX.to_le_bytes(), i16::MAX.to_le_bytes()].concat());
+    }
+
+    #[test]
+    fn mask_is_set_where_any_band_has_a_value() {
+        let nan = f32::NAN;
+        // Three bands of 1x3: nothing at the first pixel, one band at the second, all at the third.
+        let values = [nan, nan, 1.0, nan, 2.0, 3.0, nan, nan, 0.0];
+        let npy = encode_npy_typed(&values, 3, 1, 3, SampleType::Uint16, None, true);
+        let (_, _, shape, start) = parse(&npy);
+        assert_eq!(shape, [4, 1, 3]);
+        assert_eq!(&npy[start + 18..], [0u16.to_le_bytes(), u16::MAX.to_le_bytes(), u16::MAX.to_le_bytes()].concat().as_slice());
+    }
+
+    #[test]
+    fn only_the_named_planes_are_read() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // More values than the planes hold: the rest is left out.
+        let npy = encode_npy_typed(&values, 1, 2, 2, SampleType::Uint8, None, false);
+        assert_eq!(&npy[parse(&npy).3..], [1, 2, 3, 4]);
+        // Fewer: the body is short, and the mask counts what is missing as absent.
+        let npy = encode_npy_typed(&values[..3], 1, 2, 2, SampleType::Uint8, None, true);
+        let (_, _, shape, start) = parse(&npy);
+        assert_eq!(shape, [2, 2, 2]);
+        assert_eq!(&npy[start..], [1, 2, 3, 255, 255, 255, 0]);
+        // No bands: a mask of zeros.
+        let npy = encode_npy_typed(&[], 0, 2, 2, SampleType::Int16, None, true);
+        assert_eq!(&npy[parse(&npy).3..], [0u8; 8]);
+    }
+
+    #[test]
+    fn typed_float32_is_not_the_raw_float32_wrapper() {
+        // The two float32 writers agree on the header and on finite values, and differ
+        // in what they write for an absent value, an infinity and the mask.
+        let values = [1.5f32, -2.0, 3.25, 4.0];
+        let raw = Bytes::from(values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        assert_eq!(
+            encode_npy_typed(&values, 1, 2, 2, SampleType::Float32, None, false),
+            wrap_raw_f32_as_npy(raw.clone(), 1, 2, 2)
+        );
+        let typed = encode_npy_typed(&values, 1, 2, 2, SampleType::Float32, None, true);
+        let wrapped = wrap_raw_f32_as_npy_with_mask(raw, 1, 2, 2, true);
+        assert_eq!(typed[..144], wrapped[..144]);
+        assert_eq!(&typed[144..148], f32::MAX.to_le_bytes());
+        assert_eq!(&wrapped[144..148], 255.0f32.to_le_bytes());
     }
 }
