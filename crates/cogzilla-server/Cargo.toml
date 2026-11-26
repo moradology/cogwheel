@@ -68,3 +68,7 @@ required-features = ["gpu"]
 [[example]]
 name = "concurrent_coalesce_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "continuous_ring_bench"
+required-features = ["gpu"]

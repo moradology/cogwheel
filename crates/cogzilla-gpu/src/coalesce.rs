@@ -9,7 +9,8 @@
 //! This eliminates `(K - 1)` Metal/Vulkan synchronization fences across concurrent HTTP tile
 //! requests without requiring callers to use a batch API or share the same source slab.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -301,6 +302,49 @@ impl JobSlot {
     }
 }
 
+struct PreparedJob {
+    slot_idx: usize,
+    dst_w: usize,
+    dst_h: usize,
+    words_per_row: usize,
+    out_words: usize,
+    staging_byte_off: u64,
+    output: CoalescedOutput,
+    wg_x: u32,
+    wg_y: u32,
+    pipe_kind: u8,
+    bind_group: wgpu::BindGroup,
+    reply: ReplyFn,
+}
+
+struct InFlightBatch {
+    prepared: Vec<PreparedJob>,
+    total_bytes: u64,
+    sub_idx: wgpu::SubmissionIndex,
+    map_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ready: Arc<AtomicBool>,
+}
+
+struct RingFrame {
+    slots: Vec<JobSlot>,
+    staging_buf: wgpu::Buffer,
+    staging_words_cap: usize,
+    in_flight: Option<InFlightBatch>,
+}
+
+impl RingFrame {
+    fn new(device: &wgpu::Device) -> Self {
+        let staging_words_cap = 512 * 512 * 4;
+        let staging_buf = WorkerState::alloc_staging(device, staging_words_cap);
+        Self {
+            slots: Vec::new(),
+            staging_buf,
+            staging_words_cap,
+            in_flight: None,
+        }
+    }
+}
+
 struct WorkerState {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -318,13 +362,13 @@ struct WorkerState {
     expr_f32: wgpu::ComputePipeline,
     rgb_formula: wgpu::ComputePipeline,
     sar_rgb_formula: wgpu::ComputePipeline,
-    slots: Vec<JobSlot>,
-    staging_buf: wgpu::Buffer,
-    staging_words_cap: usize,
+    frames: Vec<RingFrame>,
+    in_flight_order: VecDeque<usize>,
+    free_frames: VecDeque<usize>,
 }
 
 impl WorkerState {
-    fn new(ctx: &GpuContext) -> Self {
+    fn new(ctx: &GpuContext, ring_depth: usize) -> Self {
         let device = Arc::clone(&ctx.device);
         let queue = Arc::clone(&ctx.queue);
 
@@ -532,8 +576,9 @@ impl WorkerState {
         let rgb_formula = mk_expr_pipe("coal-rgb-formula", "rgb_color_formula_rgba8");
         let sar_rgb_formula = mk_expr_pipe("coal-sar-rgb-formula", "sar_rgb_color_formula_rgba8");
 
-        let staging_words_cap = 512 * 512 * 4;
-        let staging_buf = Self::alloc_staging(&device, staging_words_cap);
+        let depth = ring_depth.clamp(1, 4);
+        let frames: Vec<RingFrame> = (0..depth).map(|_| RingFrame::new(&device)).collect();
+        let free_frames: VecDeque<usize> = (0..depth).collect();
 
         Self {
             device,
@@ -552,9 +597,9 @@ impl WorkerState {
             expr_f32,
             rgb_formula,
             sar_rgb_formula,
-            slots: Vec::new(),
-            staging_buf,
-            staging_words_cap,
+            frames,
+            in_flight_order: VecDeque::with_capacity(depth),
+            free_frames,
         }
     }
 
@@ -567,27 +612,15 @@ impl WorkerState {
         })
     }
 
-    fn execute_batch(&mut self, batch: Vec<PendingRequest>) {
+    /// Non-blocking submission of a batch into `frame_idx`. Returns `true` if work was submitted
+    /// to the GPU (so the caller should keep `frame_idx` in `in_flight_order`).
+    fn submit_batch(&mut self, frame_idx: usize, batch: Vec<PendingRequest>) -> bool {
         if batch.is_empty() {
-            return;
+            return false;
         }
-        while self.slots.len() < batch.len() {
-            self.slots.push(JobSlot::new(&self.device));
-        }
-
-        struct PreparedJob {
-            slot_idx: usize,
-            dst_w: usize,
-            dst_h: usize,
-            words_per_row: usize,
-            out_words: usize,
-            staging_byte_off: u64,
-            output: CoalescedOutput,
-            wg_x: u32,
-            wg_y: u32,
-            pipe_kind: u8,
-            bind_group: wgpu::BindGroup,
-            reply: ReplyFn,
+        let frame = &mut self.frames[frame_idx];
+        while frame.slots.len() < batch.len() {
+            frame.slots.push(JobSlot::new(&self.device));
         }
 
         let mut prepared = Vec::with_capacity(batch.len());
@@ -624,7 +657,7 @@ impl WorkerState {
                         CoalescedOutput::IndexedU8 => dst_w.div_ceil(4),
                     };
                     let out_words = words_per_row * dst_h;
-                    let slot = &mut self.slots[slot_idx];
+                    let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
 
                     let range = rescale_max - rescale_min;
@@ -777,7 +810,7 @@ impl WorkerState {
                         CoalescedOutput::IndexedU8 => dst_w.div_ceil(4),
                     };
                     let out_words = words_per_row * dst_h;
-                    let slot = &mut self.slots[slot_idx];
+                    let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
 
                     let range = rescale_max - rescale_min;
@@ -905,7 +938,7 @@ impl WorkerState {
                         CoalescedOutput::IndexedU8 => dst_w.div_ceil(4),
                     };
                     let out_words = words_per_row * dst_h;
-                    let slot = &mut self.slots[slot_idx];
+                    let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
 
                     let range = rescale_max - rescale_min;
@@ -1040,7 +1073,7 @@ impl WorkerState {
                         continue;
                     }
                     let out_words = dst_w * dst_h;
-                    let slot = &mut self.slots[slot_idx];
+                    let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
 
                     let inv = |min: f32, max: f32| {
@@ -1147,15 +1180,15 @@ impl WorkerState {
         }
 
         if prepared.is_empty() {
-            return;
+            return false;
         }
 
-        if total_staging_words > self.staging_words_cap {
-            self.staging_words_cap = total_staging_words.next_power_of_two();
-            self.staging_buf = Self::alloc_staging(&self.device, self.staging_words_cap);
+        if total_staging_words > frame.staging_words_cap {
+            frame.staging_words_cap = total_staging_words.next_power_of_two();
+            frame.staging_buf = Self::alloc_staging(&self.device, frame.staging_words_cap);
         }
 
-        // Encode ALL heterogeneous jobs into ONE CommandEncoder -> ONE submit -> ONE poll!
+        // Encode ALL heterogeneous jobs into ONE CommandEncoder -> ONE non-blocking submit!
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1189,63 +1222,126 @@ impl WorkerState {
         for job in &prepared {
             let bytes = (job.out_words * 4) as u64;
             encoder.copy_buffer_to_buffer(
-                &self.slots[job.slot_idx].out_buf,
+                &frame.slots[job.slot_idx].out_buf,
                 0,
-                &self.staging_buf,
+                &frame.staging_buf,
                 job.staging_byte_off,
                 bytes,
             );
         }
 
-        self.queue.submit(Some(encoder.finish()));
+        let sub_idx = self.queue.submit(Some(encoder.finish()));
 
         let total_bytes = (total_staging_words * 4) as u64;
-        let slice = self.staging_buf.slice(..total_bytes);
-        let (tx, rx) = mpsc::channel();
+        let slice = frame.staging_buf.slice(..total_bytes);
+        let (tx, map_rx) = mpsc::channel();
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_cb = Arc::clone(&ready);
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
+            ready_cb.store(true, Ordering::Release);
         });
-        self.device.poll(wgpu::Maintain::Wait);
-        let map_res = rx
-            .recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))
-            .and_then(|r| r.map_err(|e| GpuError::BufferMap(e.to_string())));
+        frame.in_flight = Some(InFlightBatch {
+            prepared,
+            total_bytes,
+            sub_idx,
+            map_rx,
+            ready,
+        });
+        true
+    }
 
-        match map_res {
-            Err(e) => {
-                let msg = e.to_string();
-                for job in prepared {
-                    (job.reply)(Err(GpuError::BufferMap(msg.clone())));
-                }
-            }
-            Ok(()) => {
-                let mapped = slice.get_mapped_range();
-                for job in prepared {
-                    let start = job.staging_byte_off as usize;
-                    let len = job.out_words * 4;
-                    let bytes = &mapped[start..start + len];
-                    let out = match job.output {
-                        CoalescedOutput::Rgba8 | CoalescedOutput::RawF32 => bytes.to_vec(),
-                        CoalescedOutput::IndexedU8 => {
-                            if job.dst_w % 4 == 0 {
-                                bytes.to_vec()
-                            } else {
-                                let row_bytes = job.words_per_row * 4;
-                                let mut unpacked = Vec::with_capacity(job.dst_w * job.dst_h);
-                                for py in 0..job.dst_h {
-                                    let rs = py * row_bytes;
-                                    unpacked.extend_from_slice(&bytes[rs..rs + job.dst_w]);
-                                }
-                                unpacked
-                            }
-                        }
-                    };
-                    (job.reply)(Ok(out));
-                }
-                drop(mapped);
-                self.staging_buf.unmap();
-            }
+    /// Drain completed in-flight ring frames. When `wait_oldest` is true and no frame is ready yet,
+    /// blocks ONLY until the oldest in-flight submission completes (`WaitForSubmissionIndex`),
+    /// allowing newer ring frames to keep executing on the GPU without a pipeline bubble.
+    fn drain_completed(&mut self, wait_oldest: bool) -> usize {
+        if self.in_flight_order.is_empty() {
+            return 0;
         }
+        self.device.poll(wgpu::Maintain::Poll);
+        let mut drained = 0usize;
+        loop {
+            let Some(&oldest_idx) = self.in_flight_order.front() else {
+                break;
+            };
+            let is_ready = self.frames[oldest_idx]
+                .in_flight
+                .as_ref()
+                .map(|b| b.ready.load(Ordering::Acquire))
+                .unwrap_or(true);
+            if !is_ready {
+                if drained == 0 && wait_oldest {
+                    let sub_idx = self.frames[oldest_idx]
+                        .in_flight
+                        .as_ref()
+                        .map(|b| b.sub_idx.clone());
+                    if let Some(idx) = sub_idx {
+                        self.device.poll(wgpu::Maintain::WaitForSubmissionIndex(idx));
+                        // Ensure map_async callback has fired
+                        if !self.frames[oldest_idx]
+                            .in_flight
+                            .as_ref()
+                            .map(|b| b.ready.load(Ordering::Acquire))
+                            .unwrap_or(true)
+                        {
+                            self.device.poll(wgpu::Maintain::Wait);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.in_flight_order.pop_front();
+            let frame = &mut self.frames[oldest_idx];
+            if let Some(batch) = frame.in_flight.take() {
+                let map_res = batch
+                    .map_rx
+                    .recv()
+                    .map_err(|e| GpuError::BufferMap(e.to_string()))
+                    .and_then(|r| r.map_err(|e| GpuError::BufferMap(e.to_string())));
+                match map_res {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        for job in batch.prepared {
+                            (job.reply)(Err(GpuError::BufferMap(msg.clone())));
+                        }
+                    }
+                    Ok(()) => {
+                        let slice = frame.staging_buf.slice(..batch.total_bytes);
+                        let mapped = slice.get_mapped_range();
+                        for job in batch.prepared {
+                            let start = job.staging_byte_off as usize;
+                            let len = job.out_words * 4;
+                            let bytes = &mapped[start..start + len];
+                            let out = match job.output {
+                                CoalescedOutput::Rgba8 | CoalescedOutput::RawF32 => bytes.to_vec(),
+                                CoalescedOutput::IndexedU8 => {
+                                    if job.dst_w % 4 == 0 {
+                                        bytes.to_vec()
+                                    } else {
+                                        let row_bytes = job.words_per_row * 4;
+                                        let mut unpacked =
+                                            Vec::with_capacity(job.dst_w * job.dst_h);
+                                        for py in 0..job.dst_h {
+                                            let rs = py * row_bytes;
+                                            unpacked
+                                                .extend_from_slice(&bytes[rs..rs + job.dst_w]);
+                                        }
+                                        unpacked
+                                    }
+                                }
+                            };
+                            (job.reply)(Ok(out));
+                        }
+                        drop(mapped);
+                        frame.staging_buf.unmap();
+                    }
+                }
+            }
+            self.free_frames.push_back(oldest_idx);
+            drained += 1;
+        }
+        drained
     }
 }
 
@@ -1275,6 +1371,12 @@ impl GpuCoalescer {
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
         let window = Duration::from_micros(env_us.unwrap_or(coalesce_window_us));
+        let default_depth = if ctx.info.unified_memory { 2 } else { 3 };
+        let ring_depth = std::env::var("COGZILLA_GPU_RING_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default_depth)
+            .clamp(1, 4);
 
         let (tx, rx) = mpsc::channel::<PendingRequest>();
         let batches_submitted = Arc::new(AtomicU64::new(0));
@@ -1287,40 +1389,92 @@ impl GpuCoalescer {
         let m_stat = Arc::clone(&max_batch_seen);
         let p_stat = Arc::clone(&pending_count);
 
-        let mut state = WorkerState::new(ctx);
+        let mut state = WorkerState::new(ctx, ring_depth);
         let worker = std::thread::Builder::new()
             .name("cogzilla-gpu-coalescer".into())
             .spawn(move || {
                 let mut batch: Vec<PendingRequest> = Vec::with_capacity(max_batch);
                 let mut in_burst = false;
-                while let Ok(first) = rx.recv() {
+                let mut disconnected = false;
+                loop {
+                    // 1. Always harvest any GPU frames that have already finished (non-blocking).
+                    state.drain_completed(false);
+
+                    // 2. If all ring frames are currently in flight, wait ONLY for the oldest
+                    //    submission so the other (N-1) frames keep executing on the GPU.
+                    if state.free_frames.is_empty() {
+                        state.drain_completed(true);
+                        continue;
+                    }
+
+                    // 3. Acquire the next job (or drain remaining in-flight frames if queue empty).
                     batch.clear();
-                    batch.push(first);
-                    // Drain anything already sitting in the channel
+                    if state.in_flight_order.is_empty() {
+                        if disconnected {
+                            break;
+                        }
+                        match rx.recv() {
+                            Ok(first) => batch.push(first),
+                            Err(_) => break,
+                        }
+                    } else {
+                        match rx.try_recv() {
+                            Ok(first) => batch.push(first),
+                            Err(mpsc::TryRecvError::Empty) => {
+                                // No new job ready yet; wait for oldest in-flight frame to finish.
+                                state.drain_completed(true);
+                                continue;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                state.drain_completed(true);
+                                continue;
+                            }
+                        }
+                    }
+
+                    // 4. Immediately scoop any other jobs already sitting in the channel.
                     while batch.len() < max_batch {
                         match rx.try_recv() {
                             Ok(next) => batch.push(next),
-                            Err(_) => break,
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                break;
+                            }
                         }
                     }
-                    // Adaptive coalescing window: wait up to `window` when concurrent traffic
-                    // is present (either multiple jobs already queued, other callers in flight,
-                    // or continuing an active burst), while keeping isolated single requests
-                    // at 0 µs extra latency.
+
+                    // 5. Adaptive coalescing window: only wait briefly if the batch isn't full and
+                    //    concurrent traffic is active (and never wait past a completed frame).
                     let active_waiters = p_stat.load(Ordering::Acquire);
-                    if !window.is_zero()
+                    if !disconnected
+                        && !window.is_zero()
                         && batch.len() < max_batch
                         && (batch.len() > 1 || active_waiters > 1 || in_burst)
                     {
                         let deadline = Instant::now() + window;
                         while batch.len() < max_batch {
+                            if !state.in_flight_order.is_empty() && state.drain_completed(false) > 0
+                            {
+                                // Harvest completed replies right away so Tokio PNG encoders start!
+                            }
                             let now = Instant::now();
                             if now >= deadline {
                                 break;
                             }
-                            match rx.recv_timeout(deadline - now) {
+                            let slice_wait = (deadline - now).min(Duration::from_micros(100));
+                            match rx.recv_timeout(slice_wait) {
                                 Ok(next) => batch.push(next),
-                                Err(_) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    if Instant::now() >= deadline {
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1331,8 +1485,20 @@ impl GpuCoalescer {
                     j_stat.fetch_add(k as u64, Ordering::Relaxed);
                     m_stat.fetch_max(k, Ordering::Relaxed);
 
+                    let frame_idx = state.free_frames.pop_front().expect("free frame checked");
                     let to_run = std::mem::take(&mut batch);
-                    state.execute_batch(to_run);
+                    if state.submit_batch(frame_idx, to_run) {
+                        state.in_flight_order.push_back(frame_idx);
+                    } else {
+                        state.free_frames.push_back(frame_idx);
+                    }
+                    // For ring_depth == 1 (synchronous A/B baseline), complete immediately.
+                    if ring_depth == 1 {
+                        state.drain_completed(true);
+                    }
+                }
+                while !state.in_flight_order.is_empty() {
+                    state.drain_completed(true);
                 }
             })
             .expect("failed to spawn cogzilla-gpu-coalescer thread");
