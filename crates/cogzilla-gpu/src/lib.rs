@@ -5,6 +5,7 @@ pub mod context;
 pub mod expr;
 pub mod mosaic;
 pub mod policy;
+pub mod predictor;
 pub mod resample;
 pub mod terrain;
 
@@ -18,5 +19,6 @@ pub use policy::{
     DispatchDecision, DispatchPolicy, DispatchReason, DispatchRequest, GpuOp, GpuProfile,
     PolicyOverride,
 };
+pub use predictor::{GpuPredictorDecoder, GpuPredictorKind};
 pub use resample::{GpuResampleMode, GpuResampler, GpuSlab, ResampleTimings};
 pub use terrain::{GpuDemAlgorithm, GpuTerrainRenderer};
