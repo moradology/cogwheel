@@ -3292,3 +3292,297 @@ async fn sweep16_u3_ungeoreferenced_and_u2b_nonlinear_gcp_self_contained() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+
+#[tokio::test]
+async fn sweep18_w1_source_freshness_and_w2_referenced_asset_errors() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let tmp = std::env::temp_dir().join(format!("cogzilla_w1_w2_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: build a stripped EPSG:4326 float32 GeoTIFF covering [-122.5..-122.244, 37.644..37.9]
+    let build_geo_tiff = |w: u32, h: u32, fill_val: f32| -> Vec<u8> {
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let num_entries: u16 = 13;
+        let data_start = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
+        let scale_off = data_start;
+        let tp_off = scale_off + 24;
+        let gkd_off = tp_off + 48;
+        let pix_off = gkd_off + 24;
+        let push = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push(&mut buf, 256, 4, 1, w);
+        push(&mut buf, 257, 4, 1, h);
+        push(&mut buf, 258, 3, 1, 32);
+        push(&mut buf, 259, 3, 1, 1);
+        push(&mut buf, 262, 3, 1, 1);
+        push(&mut buf, 273, 4, 1, pix_off);
+        push(&mut buf, 277, 3, 1, 1);
+        push(&mut buf, 278, 4, 1, h);
+        push(&mut buf, 279, 4, 1, w * h * 4);
+        push(&mut buf, 339, 3, 1, 3);
+        push(&mut buf, 33550, 12, 3, scale_off);
+        push(&mut buf, 33922, 12, 6, tp_off);
+        push(&mut buf, 34735, 3, 12, gkd_off);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let px_deg = 0.256 / (w as f64);
+        for v in [px_deg, px_deg, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, -122.5, 37.9, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for k in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        let vb = fill_val.to_le_bytes();
+        for _ in 0..(w * h) {
+            buf.extend_from_slice(&vb);
+        }
+        buf
+    };
+
+    // Mutable remote HTTP origin supporting Range, ETag, If-Match (412), and If-None-Match (304)
+    let remote_state = Arc::new(std::sync::Mutex::new((
+        "\"v1\"".to_string(),
+        build_geo_tiff(64, 64, 111.0),
+    )));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let rs_srv = remote_state.clone();
+    let mock_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = mock_listener.accept().await else {
+                break;
+            };
+            let rs = rs_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let mut if_match = None;
+                let mut if_none_match = None;
+                let mut range_spec = None;
+                for line in req.lines().skip(1) {
+                    if let Some((k, v)) = line.split_once(':') {
+                        let kl = k.trim().to_ascii_lowercase();
+                        let vt = v.trim().to_string();
+                        if kl == "if-match" {
+                            if_match = Some(vt);
+                        } else if kl == "if-none-match" {
+                            if_none_match = Some(vt);
+                        } else if kl == "range" {
+                            range_spec = Some(vt);
+                        }
+                    }
+                }
+                let (etag, data) = rs.lock().unwrap().clone();
+                if let Some(im) = if_match
+                    && im != etag
+                {
+                    let hdr = format!(
+                        "HTTP/1.1 412 Precondition Failed\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(hdr.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+                if let Some(inm) = if_none_match
+                    && inm == etag
+                {
+                    let hdr = format!(
+                        "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(hdr.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+                let total = data.len();
+                let (s, e) = if let Some(rs) = range_spec
+                    && let Some(spec) = rs.strip_prefix("bytes=")
+                {
+                    let mut parts = spec.split('-');
+                    let s: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let e: usize = parts
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(total - 1)
+                        .min(total - 1);
+                    (s, e)
+                } else {
+                    (0, total - 1)
+                };
+                let slice = &data[s..=e];
+                let hdr = format!(
+                    "HTTP/1.1 206 Partial Content\r\nETag: {etag}\r\nContent-Range: bytes {s}-{e}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(slice).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    // Use a store with remote_cache_ttl = 0 so we also test immediate conditional revalidation
+    let mut store = cogzilla_io::CogStore::new(16 * 1024 * 1024);
+    store.remote_cache_ttl = std::time::Duration::ZERO;
+    let engine = Arc::new(TileEngine::with_store_and_tile_cache(Arc::new(store), 4 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // --- W1 Local: overwrite (same size), overwrite (larger size), delete ---
+    let local_path = tmp.join("mutable.tif");
+    let local_url = local_path.to_string_lossy().to_string();
+    std::fs::write(&local_path, build_geo_tiff(64, 64, 111.0)).unwrap();
+
+    let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={local_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(j["values"][0].as_f64().unwrap(), 111.0);
+
+    // Overwrite same size via atomic rename (changes inode + mtime even within same second)
+    let tmp_swap = tmp.join("mutable_v2.tif");
+    std::fs::write(&tmp_swap, build_geo_tiff(64, 64, 222.0)).unwrap();
+    std::fs::rename(&tmp_swap, &local_path).unwrap();
+    let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={local_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(j["values"][0].as_f64().unwrap(), 222.0, "W1 local overwrite failed");
+
+    // Overwrite with larger 128x128 file (changes size)
+    std::fs::write(&local_path, build_geo_tiff(128, 128, 333.0)).unwrap();
+    let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={local_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(j["values"][0].as_f64().unwrap(), 333.0, "W1 local resize failed");
+
+    // Delete file -> 404
+    std::fs::remove_file(&local_path).unwrap();
+    let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={local_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 404, "W1 deleted local file must return 404");
+
+    // --- W1 Remote: ETag replacement detected and re-read ---
+    let remote_url = format!("http://{mock_addr}/live.tif");
+    let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={remote_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(j["values"][0].as_f64().unwrap(), 111.0);
+
+    // Replace remote object with new ETag "v2" and value 222.0
+    *remote_state.lock().unwrap() = ("\"v2\"".to_string(), build_geo_tiff(64, 64, 222.0));
+    let r = client.get(format!("{base}/cog/point/-122.4,37.8?url={remote_url}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(j["values"][0].as_f64().unwrap(), 222.0, "W1 remote ETag replacement failed");
+
+    // --- W2: Referenced STAC & MosaicJSON asset failures -> 502; partial mosaic -> X-Failed-Assets ---
+    let gone_path = tmp.join("gone_asset.tif");
+    let valid_path = tmp.join("valid_asset.tif");
+    std::fs::write(&valid_path, build_geo_tiff(64, 64, 42.0)).unwrap();
+
+    // STAC item referencing missing asset -> 502 naming gone_asset.tif
+    let stac_path = tmp.join("w2_item.json");
+    std::fs::write(
+        &stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "w2-stac",
+            "bbox": [-122.5, 37.644, -122.244, 37.9],
+            "geometry": null,
+            "properties": {},
+            "assets": {
+                "red": { "href": gone_path.to_string_lossy(), "type": "image/tiff; application=geotiff" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = client
+        .get(format!("{base}/stac/info?url={}&assets=red", stac_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502, "W2 missing STAC asset must return 502");
+    let body = r.text().await.unwrap();
+    assert!(body.contains("gone_asset.tif"), "W2 502 body should name asset: {body}");
+
+    // MosaicJSON where every asset is missing -> 502 naming gone_asset.tif
+    let mj_all_gone = tmp.join("mj_all_gone.json");
+    // Quadkey for WebMercatorQuad z=12, x=655, y=1583 -> "023010203333"
+    let qk = "023010203333";
+    std::fs::write(
+        &mj_all_gone,
+        serde_json::json!({
+            "mosaicjson": "0.0.2",
+            "minzoom": 10,
+            "maxzoom": 14,
+            "quadkey_zoom": 12,
+            "bounds": [-122.5, 37.644, -122.244, 37.9],
+            "tiles": { qk: [gone_path.to_string_lossy()] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/12/655/1583.png?url={}", mj_all_gone.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502, "W2 all-missing mosaic assets must return 502");
+    let body = r.text().await.unwrap();
+    assert!(body.contains("gone_asset.tif"), "W2 mosaic 502 body should name asset: {body}");
+
+    // MosaicJSON with [gone_asset.tif, valid_asset.tif] -> 200 with X-Failed-Assets header!
+    let mj_partial = tmp.join("mj_partial.json");
+    std::fs::write(
+        &mj_partial,
+        serde_json::json!({
+            "mosaicjson": "0.0.2",
+            "minzoom": 10,
+            "maxzoom": 14,
+            "quadkey_zoom": 12,
+            "bounds": [-122.5, 37.644, -122.244, 37.9],
+            "tiles": { qk: [gone_path.to_string_lossy(), valid_path.to_string_lossy()] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/12/655/1583.png?url={}", mj_partial.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "W2 partial mosaic should render 200 from remaining asset");
+    let failed_hdr = r
+        .headers()
+        .get("x-failed-assets")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        failed_hdr.contains("gone_asset.tif"),
+        "W2 partial mosaic must report failed asset in X-Failed-Assets, got: '{failed_hdr}'"
+    );
+
+    mock_task.abort();
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -30,6 +30,8 @@ pub enum EngineError {
     BadRequest(String),
     #[error("dataset not found: {0}")]
     NotFound(String),
+    #[error("upstream error: {0}")]
+    BadGateway(String),
     #[error("no content")]
     NoContent,
     #[error("method not allowed")]
@@ -126,6 +128,21 @@ pub struct EngineStats {
     pub http_304_not_modified: AtomicU64,
 }
 
+/// Map a fetch/I/O error on an asset referenced by a STAC item or MosaicJSON document to
+/// `502 Bad Gateway` naming the asset (while preserving `403 Forbidden` for allowlist rejections
+/// and `400 Bad Request` for invalid URIs / corrupt TIFFs).
+pub fn asset_fetch_error(asset_uri: &str, err: IoError) -> EngineError {
+    match err.root() {
+        IoError::Forbidden(_) | IoError::InvalidUri(_) | IoError::Tiff(_) => EngineError::Io(err),
+        _ => {
+            let safe = cogzilla_io::redact_http_url(asset_uri);
+            EngineError::BadGateway(format!(
+                "referenced asset '{safe}' could not be fetched: {err}"
+            ))
+        }
+    }
+}
+
 pub struct TileEngine {
     pub store: Arc<CogStore>,
     crs_cache: DashMap<u64, CrsModel, ahash::RandomState>,
@@ -134,6 +151,7 @@ pub struct TileEngine {
     pub stac_cache: DashMap<String, Arc<crate::stac::StacItem>, ahash::RandomState>,
     pub mosaicjson_cache: DashMap<String, Arc<MosaicJsonCatalog>, ahash::RandomState>,
     pub tile_cache: Arc<TileCache>,
+    tile_cache_epoch: AtomicU64,
     pub stats: Arc<EngineStats>,
 }
 
@@ -277,7 +295,19 @@ impl TileEngine {
             stac_cache: DashMap::with_hasher(ahash::RandomState::new()),
             mosaicjson_cache: DashMap::with_hasher(ahash::RandomState::new()),
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
+            tile_cache_epoch: AtomicU64::new(0),
             stats: Arc::new(EngineStats::default()),
+        }
+    }
+
+    /// Flush the rendered tile cache if any underlying source was invalidated or replaced.
+    /// Costs a single relaxed/acquire atomic load on the warm path.
+    #[inline(always)]
+    pub fn sync_tile_cache_epoch(&self) {
+        let cur = self.store.invalidation_epoch.load(Ordering::Acquire);
+        let seen = self.tile_cache_epoch.load(Ordering::Relaxed);
+        if cur != seen && self.tile_cache_epoch.swap(cur, Ordering::AcqRel) != cur {
+            self.tile_cache.clear();
         }
     }
 
@@ -1647,6 +1677,17 @@ impl TileEngine {
         urls: &[String],
         req: &TileRequest,
     ) -> Result<Bytes, EngineError> {
+        Ok(self.render_mosaic_tile_with_report(urls, req).await?.0)
+    }
+
+    /// Render a dynamic front-to-back mosaic across `urls`, returning `(tile_bytes, failed_assets)`
+    /// where `failed_assets` lists any redacted asset URLs that could not be fetched and were
+    /// skipped before rendering completed.
+    pub async fn render_mosaic_tile_with_report(
+        &self,
+        urls: &[String],
+        req: &TileRequest,
+    ) -> Result<(Bytes, Vec<String>), EngineError> {
         if urls.is_empty() {
             return Err(EngineError::BadRequest(
                 "mosaic requires at least one ?url= parameter".into(),
@@ -1716,9 +1757,14 @@ impl TileEngine {
         // 1-scene fast path: skip canvas allocation, pixel compositing, and re-encoding so single-scene
         // mosaic tiles keep zero-decode JPEG/WebP passthrough and 8-bit indexed PLTE PNG encoding!
         if urls.len() == 1 {
-            let cog = self.store.open_uri(&urls[0]).await?;
+            let cog = self
+                .store
+                .open_uri(&urls[0])
+                .await
+                .map_err(|e| asset_fetch_error(&urls[0], e))?;
             let scene_req = fold_scene_unscale(&cog, req);
-            return self.render_tile(&cog, &scene_req).await;
+            let bytes = self.render_tile(&cog, &scene_req).await?;
+            return Ok((bytes, Vec::new()));
         }
 
         // RawF32 / Npy mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
@@ -1732,6 +1778,7 @@ impl TileEngine {
 
             let mut opened_any = false;
             let mut last_open_err: Option<EngineError> = None;
+            let mut failed_assets: Vec<String> = Vec::new();
             for (scene_i, url) in urls.iter().enumerate() {
                 if filled >= total_pixels {
                     break;
@@ -1745,7 +1792,8 @@ impl TileEngine {
                         c
                     }
                     Err(e) => {
-                        last_open_err = Some(e.into());
+                        failed_assets.push(cogzilla_io::redact_http_url(url));
+                        last_open_err = Some(asset_fetch_error(url, e));
                         continue;
                     }
                 };
@@ -1792,15 +1840,21 @@ impl TileEngine {
                 }
                 if req.format == OutputFormat::Npy {
                     let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
-                    return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                        raw,
-                        f32_bands,
-                        req.tile_size,
-                        req.tile_size,
-                        true,
+                    return Ok((
+                        cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                            raw,
+                            f32_bands,
+                            req.tile_size,
+                            req.tile_size,
+                            true,
+                        ),
+                        failed_assets,
                     ));
                 }
-                return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
+                return Ok((
+                    empty_tile_bytes(req.tile_size, req.format, f32_bands),
+                    failed_assets,
+                ));
             }
             let mut out = bytes::BytesMut::with_capacity(f32_bands * total_pixels * 4);
             for v in canvas {
@@ -1808,15 +1862,18 @@ impl TileEngine {
             }
             let raw = out.freeze();
             if req.format == OutputFormat::Npy {
-                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                    raw,
-                    f32_bands,
-                    req.tile_size,
-                    req.tile_size,
-                    true,
+                return Ok((
+                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                        raw,
+                        f32_bands,
+                        req.tile_size,
+                        req.tile_size,
+                        true,
+                    ),
+                    failed_assets,
                 ));
             }
-            return Ok(raw);
+            return Ok((raw, failed_assets));
         }
 
         let mut canvas = vec![0u8; total_pixels * 4];
@@ -1828,6 +1885,7 @@ impl TileEngine {
 
         let mut opened_any = false;
         let mut last_open_err: Option<EngineError> = None;
+        let mut failed_assets: Vec<String> = Vec::new();
         for (scene_i, url) in urls.iter().enumerate() {
             if filled >= total_pixels {
                 break;
@@ -1841,7 +1899,8 @@ impl TileEngine {
                     c
                 }
                 Err(e) => {
-                    last_open_err = Some(e.into());
+                    failed_assets.push(cogzilla_io::redact_http_url(url));
+                    last_open_err = Some(asset_fetch_error(url, e));
                     continue;
                 }
             };
@@ -1870,13 +1929,19 @@ impl TileEngine {
             {
                 return Err(err);
             }
-            return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
+            return Ok((
+                empty_tile_bytes(req.tile_size, req.format, f32_bands),
+                failed_assets,
+            ));
         }
-        Ok(encode_rgba_tile(
-            &canvas,
-            req.tile_size,
-            filled == total_pixels,
-            req.format,
+        Ok((
+            encode_rgba_tile(
+                &canvas,
+                req.tile_size,
+                filled == total_pixels,
+                req.format,
+            ),
+            failed_assets,
         ))
     }
 
@@ -2235,6 +2300,12 @@ mod tests {
             uri: tmp_path.to_string_lossy().into_owned(),
             index,
             source,
+            freshness: cogzilla_io::store::SourceFreshness::Local {
+                path: tmp_path.clone(),
+                len: 0,
+                mtime: None,
+                inode: 0,
+            },
         };
 
         let engine = TileEngine::new(16 * 1024 * 1024);

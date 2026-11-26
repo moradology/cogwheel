@@ -110,12 +110,51 @@ const INITIAL_HEADER_FETCH_BYTES: u64 = 128 * 1024;
 const RANGE_GAP_THRESHOLD: u64 = 32 * 1024;
 const MAX_COALESCED_SPAN: u64 = 4 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_URIS: usize = 4096;
+/// Default remote cache revalidation TTL in seconds (`COGZILLA_CACHE_TTL_SECS`).
+const DEFAULT_REMOTE_CACHE_TTL_SECS: u64 = 5;
+
+#[cfg(unix)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn file_inode(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// Source freshness metadata used to detect overwritten/deleted local files and replaced remote
+/// objects (`ETag` / `Last-Modified` / bounded TTL).
+pub enum SourceFreshness {
+    Local {
+        path: std::path::PathBuf,
+        len: u64,
+        mtime: Option<std::time::SystemTime>,
+        inode: u64,
+    },
+    Remote {
+        validator: crate::backend::RemoteValidator,
+        opened_at: std::time::Instant,
+        last_checked_ms: AtomicU64,
+    },
+}
 
 pub struct OpenedCog {
     pub id: u64,
     pub uri: String,
     pub index: CogIndex,
     pub source: CogSource,
+    pub freshness: SourceFreshness,
+}
+
+impl OpenedCog {
+    pub fn remote_validator(&self) -> Option<&crate::backend::RemoteValidator> {
+        match &self.freshness {
+            SourceFreshness::Remote { validator, .. } => Some(validator),
+            SourceFreshness::Local { .. } => None,
+        }
+    }
 }
 
 struct OpenFlight {
@@ -171,6 +210,11 @@ pub struct CogStore {
     pub cloud_client: reqwest::Client,
     pub s3_cfg: Option<S3Config>,
     pub metrics: Arc<IoMetrics>,
+    /// Bounded TTL for remote source cache revalidation (`COGZILLA_CACHE_TTL_SECS`, default 5s).
+    pub remote_cache_ttl: Duration,
+    /// Monotonic counter incremented whenever any cached source is invalidated or deleted,
+    /// allowing downstream caches (e.g. rendered tile cache) to flush stale entries in O(1).
+    pub invalidation_epoch: AtomicU64,
 }
 
 /// Build default outbound HTTP headers from standard GDAL environment variables:
@@ -314,6 +358,11 @@ impl CogStore {
             .map(|n| n.get())
             .unwrap_or(4)
             .max(1);
+        let remote_cache_ttl = std::env::var("COGZILLA_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_REMOTE_CACHE_TTL_SECS));
         Self {
             next_id: AtomicU64::new(1),
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
@@ -329,6 +378,8 @@ impl CogStore {
             cloud_client,
             s3_cfg: Some(S3Config::from_env_full()),
             metrics: Arc::new(IoMetrics::default()),
+            remote_cache_ttl,
+            invalidation_epoch: AtomicU64::new(0),
         }
     }
 
@@ -465,6 +516,7 @@ impl CogStore {
         path: impl AsRef<Path>,
     ) -> Result<Arc<OpenedCog>, IoError> {
         let uri = path.as_ref().to_string_lossy().to_string();
+        let meta = std::fs::metadata(&path)?;
         let source = CogSource::open_local(&path)?;
         let index = match &source {
             CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
@@ -475,6 +527,12 @@ impl CogStore {
             uri: uri.clone(),
             index,
             source,
+            freshness: SourceFreshness::Local {
+                path: path.as_ref().to_path_buf(),
+                len: meta.len(),
+                mtime: meta.modified().ok(),
+                inode: file_inode(&meta),
+            },
         });
         self.datasets_by_name.insert(name.into(), cog.clone());
         self.datasets_by_uri.insert(
@@ -491,34 +549,127 @@ impl CogStore {
         self.datasets_by_name.get(name).map(|v| v.clone())
     }
 
+    /// Evict a cached URI (optionally only if its `OpenedCog::id` matches `expected_id`) and
+    /// advance `invalidation_epoch` so downstream caches flush stale rendered tiles.
+    pub fn invalidate_uri(&self, uri: &str, expected_id: Option<u64>) {
+        let removed = match expected_id {
+            Some(id) => self
+                .datasets_by_uri
+                .remove_if(uri, |_, slot| matches!(slot, OpenSlot::Ready { cog, .. } if cog.id == id))
+                .is_some(),
+            None => self.datasets_by_uri.remove(uri).is_some(),
+        };
+        if removed {
+            self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Validate a cached `OpenedCog` against its backing source.
+    /// - Local files: one `stat()` checking `(len, mtime, inode)` (~1–2 µs); returns `Err(NotFound)`
+    ///   if deleted or `Ok(false)` if modified.
+    /// - Remote HTTP files: zero network calls within `remote_cache_ttl`; once TTL elapses, sends
+    ///   conditional `If-None-Match` / `If-Modified-Since` (or expires if the origin sent no validator).
+    async fn is_cached_cog_fresh(&self, uri: &str, cog: &Arc<OpenedCog>) -> Result<bool, IoError> {
+        match &cog.freshness {
+            SourceFreshness::Local {
+                path,
+                len,
+                mtime,
+                inode,
+            } => match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let same = meta.len() == *len
+                        && meta.modified().ok() == *mtime
+                        && file_inode(&meta) == *inode;
+                    if !same {
+                        self.invalidate_uri(uri, Some(cog.id));
+                    }
+                    Ok(same)
+                }
+                Err(e) => {
+                    self.invalidate_uri(uri, Some(cog.id));
+                    Err(IoError::Fs(e))
+                }
+            },
+            SourceFreshness::Remote {
+                validator,
+                opened_at,
+                last_checked_ms,
+            } => {
+                let ttl_ms = self.remote_cache_ttl.as_millis() as u64;
+                let now_ms = opened_at.elapsed().as_millis() as u64;
+                let prev_ms = last_checked_ms.load(Ordering::Relaxed);
+                if ttl_ms > 0 && now_ms.saturating_sub(prev_ms) < ttl_ms {
+                    return Ok(true);
+                }
+                if validator.etag.is_some() || validator.last_modified.is_some() {
+                    match cog.source.revalidate_remote(validator).await {
+                        Ok(true) => {
+                            last_checked_ms.store(
+                                opened_at.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
+                            Ok(true)
+                        }
+                        Ok(false) => {
+                            self.invalidate_uri(uri, Some(cog.id));
+                            Ok(false)
+                        }
+                        Err(e) => {
+                            self.invalidate_uri(uri, Some(cog.id));
+                            Err(e)
+                        }
+                    }
+                } else {
+                    self.invalidate_uri(uri, Some(cog.id));
+                    Ok(false)
+                }
+            }
+        }
+    }
+
     /// Open (or fetch from metadata cache) any local path, `file://`, `http(s)://`, or `s3://` COG.
     /// Singleflight-deduplicated so a 32-tile cold burst against a new S3 COG issues only 1 header GET.
     pub async fn open_uri(&self, uri: &str) -> Result<Arc<OpenedCog>, IoError> {
         crate::allowlist::check_uri_allowed(uri)?;
         loop {
-            if let Some(existing) = self.datasets_by_uri.get(uri) {
+            let cached_hit = self.datasets_by_uri.get(uri).and_then(|existing| {
                 if let OpenSlot::Ready { cog, last_used } = existing.value() {
                     last_used.store(self.uri_tick(), Ordering::Relaxed);
-                    return Ok(cog.clone());
+                    Some(cog.clone())
+                } else {
+                    None
                 }
+            });
+            if let Some(cog) = cached_hit {
+                if self.is_cached_cog_fresh(uri, &cog).await? {
+                    return Ok(cog);
+                }
+                continue;
             }
 
-            let wait_flight = {
+            let (wait_flight, ready_hit) = {
                 use dashmap::mapref::entry::Entry;
                 match self.datasets_by_uri.entry(uri.to_string()) {
                     Entry::Occupied(occ) => match occ.get() {
                         OpenSlot::Ready { cog, last_used } => {
                             last_used.store(self.uri_tick(), Ordering::Relaxed);
-                            return Ok(cog.clone());
+                            (None, Some(cog.clone()))
                         }
-                        OpenSlot::InFlight(f) => Some(f.clone()),
+                        OpenSlot::InFlight(f) => (Some(f.clone()), None),
                     },
                     Entry::Vacant(vac) => {
                         vac.insert(OpenSlot::InFlight(Arc::new(OpenFlight::new())));
-                        None
+                        (None, None)
                     }
                 }
             };
+            if let Some(cog) = ready_hit {
+                if self.is_cached_cog_fresh(uri, &cog).await? {
+                    return Ok(cog);
+                }
+                continue;
+            }
 
             if let Some(flight) = wait_flight {
                 let fut = flight.notify.notified();
@@ -596,8 +747,19 @@ impl CogStore {
                     self.upstream_limiter.clone(),
                 )?;
 
-                let index = match &source {
-                    CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
+                let (index, freshness) = match &source {
+                    CogSource::LocalMmap { mmap } => {
+                        let local_path = uri.strip_prefix("file://").unwrap_or(uri);
+                        let meta = std::fs::metadata(local_path)?;
+                        let idx = parse_cog(mmap)?;
+                        let fresh = SourceFreshness::Local {
+                            path: std::path::PathBuf::from(local_path),
+                            len: meta.len(),
+                            mtime: meta.modified().ok(),
+                            inode: file_inode(&meta),
+                        };
+                        (idx, fresh)
+                    }
                     CogSource::RemoteS3 { .. }
                     | CogSource::RemoteHttp { .. }
                     | CogSource::RemoteGcs { .. }
@@ -609,14 +771,18 @@ impl CogStore {
                         const MAX_HEADER_FETCH_BYTES: u64 = 32 * 1024 * 1024;
                         const MAX_HEADER_FETCH_ITERS: u32 = 64;
                         const MIN_SEEK_WINDOW: u64 = 32 * 1024;
-                        let first_chunk = source
-                            .fetch_range(0, INITIAL_HEADER_FETCH_BYTES)
-                            .await?
-                            .to_vec();
+                        let first_resp = source
+                            .fetch_range_with_meta(0, INITIAL_HEADER_FETCH_BYTES, None)
+                            .await?;
+                        let validator = crate::backend::RemoteValidator {
+                            etag: first_resp.etag,
+                            last_modified: first_resp.last_modified,
+                        };
+                        let first_chunk = first_resp.bytes.to_vec();
                         let mut total_fetched = first_chunk.len() as u64;
                         let mut chunks: Vec<(u64, Vec<u8>)> = vec![(0, first_chunk)];
                         let mut header_fetches = 0u32;
-                        loop {
+                        let idx = loop {
                             match parse_cog_sparse(&chunks) {
                                 Ok(idx) => break idx,
                                 Err(TiffError::NeedRange { offset, end }) => {
@@ -659,7 +825,14 @@ impl CogStore {
                                             "TIFF header/IFD exceeds 32 MiB limit",
                                         )));
                                     }
-                                    let more = source.fetch_range(fetch_start, fetch_end).await?;
+                                    let more = source
+                                        .fetch_range_with_meta(
+                                            fetch_start,
+                                            fetch_end,
+                                            Some(&validator),
+                                        )
+                                        .await?
+                                        .bytes;
                                     if more.is_empty()
                                         || fetch_start.saturating_add(more.len() as u64) < end
                                     {
@@ -679,7 +852,13 @@ impl CogStore {
                                 }
                                 Err(e) => return Err(IoError::Tiff(e)),
                             }
-                        }
+                        };
+                        let fresh = SourceFreshness::Remote {
+                            validator,
+                            opened_at: std::time::Instant::now(),
+                            last_checked_ms: AtomicU64::new(0),
+                        };
+                        (idx, fresh)
                     }
                 };
 
@@ -688,6 +867,7 @@ impl CogStore {
                     uri: uri.to_string(),
                     index,
                     source,
+                    freshness,
                 }))
             }
             .await;
@@ -1396,14 +1576,22 @@ impl CogStore {
                     let nodata = cog.index.nodata;
                     let mut fetch_err: Option<IoError> = None;
 
-                    // Fast path: 1 coalesced span -> await fetch_range directly (no JoinSet spawn).
+                    let remote_val = cog.remote_validator().cloned();
+                    // Fast path: 1 coalesced span -> await fetch_range_with_meta directly (no JoinSet spawn).
                     // Capture Err into `fetch_err` (instead of early `?`) so `guard.fail(...)`
                     // broadcasts the error to all parked singleflight waiters in 1 RTT.
                     let mut single_span = if spans.len() == 1 {
                         let span = spans.pop().unwrap();
-                        match cog.source.fetch_range(span.start, span.end).await {
-                            Ok(data) => Some((span, data)),
+                        match cog
+                            .source
+                            .fetch_range_with_meta(span.start, span.end, remote_val.as_ref())
+                            .await
+                        {
+                            Ok(resp) => Some((span, resp.bytes)),
                             Err(e) => {
+                                if matches!(e.root(), IoError::SourceChanged { .. }) {
+                                    self.invalidate_uri(&cog.uri, Some(cog.id));
+                                }
                                 fetch_err = Some(e);
                                 None
                             }
@@ -1416,9 +1604,12 @@ impl CogStore {
                     if single_span.is_none() && fetch_err.is_none() {
                         for span in spans {
                             let src = cog.source.clone();
+                            let rv = remote_val.clone();
                             join_set.spawn(async move {
-                                let data = src.fetch_range(span.start, span.end).await?;
-                                Ok::<_, IoError>((span, data))
+                                let resp = src
+                                    .fetch_range_with_meta(span.start, span.end, rv.as_ref())
+                                    .await?;
+                                Ok::<_, IoError>((span, resp.bytes))
                             });
                         }
                     }
@@ -1873,6 +2064,9 @@ impl CogStore {
                     }
 
                     if let Some(e) = fetch_err {
+                        if matches!(e.root(), IoError::SourceChanged { .. }) {
+                            self.invalidate_uri(&cog.uri, Some(cog.id));
+                        }
                         let shared = Arc::new(e);
                         // Broadcast the explicit upstream/decode error to all parked waiters for
                         // any still-owned guards so they fail in 1 RTT instead of retrying serially.
