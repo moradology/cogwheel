@@ -220,6 +220,10 @@ pub enum BandData {
         data: Box<[u8]>,
         nodata: Option<u8>,
     },
+    /// Exact 64-bit floating-point storage for wide TIFF sample types whose precision exceeds
+    /// IEEE-754 `f32`'s 24-bit mantissa (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`).
+    /// Holds every `u32`, `i32`, `f64`, and `i64`/`u64` up to ±2^53 bit-exact (`NaN` = nodata).
+    F64(Box<[f64]>),
     /// Zero-deinterleave view into a shared interleaved RGB8 (`[R, G, B, ...]`) block
     /// for chunky 3-band `uint8` COGs (Sentinel-2 TCI, NAIP, aerial JPEG/WebP RGB).
     RgbU8Channel {
@@ -241,6 +245,7 @@ impl BandData {
     pub fn len(&self) -> usize {
         match self {
             Self::F32(s) => s.len(),
+            Self::F64(s) => s.len(),
             Self::U16 { data, .. } => data.len(),
             Self::U8 { data, .. } => data.len(),
             Self::RgbU8Channel { rgb, .. } => rgb.len() / 3,
@@ -252,11 +257,12 @@ impl BandData {
         self.len() == 0
     }
 
-    /// Resident heap byte size of this band (1 B/px for `U8`/`RgbU8Channel`, 2 B/px for `U16`, 4 B/px for `F32`).
+    /// Resident heap byte size of this band (1 B/px for `U8`/`RgbU8Channel`, 2 B/px for `U16`, 4 B/px for `F32`, 8 B/px for `F64`).
     #[inline(always)]
     pub fn byte_len(&self) -> usize {
         match self {
             Self::F32(s) => s.len() * 4,
+            Self::F64(s) => s.len() * 8,
             Self::U16 { data, .. } => data.len() * 2,
             Self::U8 { data, .. } => data.len(),
             Self::RgbU8Channel { rgb, .. } => rgb.len() / 3,
@@ -272,6 +278,15 @@ impl BandData {
         }
     }
 
+    /// Borrow the underlying `f64` slice if this band is stored as `F64`.
+    #[inline(always)]
+    pub fn as_f64_slice(&self) -> Option<&[f64]> {
+        match self {
+            Self::F64(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Read pixel `idx` as `f32` without bounds checking (`nodata` normalized to `f32::NAN`).
     ///
     /// # Safety
@@ -280,6 +295,7 @@ impl BandData {
     pub unsafe fn get_f32_unchecked(&self, idx: usize) -> f32 {
         match self {
             Self::F32(s) => unsafe { *s.as_slice().get_unchecked(idx) },
+            Self::F64(s) => unsafe { *s.get_unchecked(idx) as f32 },
             Self::U16 { data, nodata } => {
                 let v = unsafe { *data.get_unchecked(idx) };
                 if *nodata == Some(v) {
@@ -316,6 +332,7 @@ impl BandData {
     pub fn get_f32(&self, idx: usize) -> f32 {
         match self {
             Self::F32(s) => s.as_slice()[idx],
+            Self::F64(s) => s[idx] as f32,
             Self::U16 { data, nodata } => {
                 let v = data[idx];
                 if *nodata == Some(v) {
@@ -342,6 +359,83 @@ impl BandData {
                     f32::NAN
                 } else {
                     v as f32
+                }
+            }
+        }
+    }
+
+    /// Bounds-checked read of pixel `idx` as exact `f64` (`nodata` normalized to `f64::NAN`).
+    #[inline(always)]
+    pub fn get_f64(&self, idx: usize) -> f64 {
+        match self {
+            Self::F64(s) => s[idx],
+            Self::F32(s) => s.as_slice()[idx] as f64,
+            Self::U16 { data, nodata } => {
+                let v = data[idx];
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::U8 { data, nodata } => {
+                let v = data[idx];
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::RgbU8Channel {
+                rgb,
+                channel,
+                nodata,
+            } => {
+                let v = rgb[idx * 3 + (*channel as usize)];
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+        }
+    }
+
+    /// Read pixel `idx` as exact `f64` without bounds checking (`nodata` normalized to `f64::NAN`).
+    ///
+    /// # Safety
+    /// `idx` must be `< self.len()`.
+    #[inline(always)]
+    pub unsafe fn get_f64_unchecked(&self, idx: usize) -> f64 {
+        match self {
+            Self::F64(s) => unsafe { *s.get_unchecked(idx) },
+            Self::F32(s) => unsafe { *s.as_slice().get_unchecked(idx) as f64 },
+            Self::U16 { data, nodata } => {
+                let v = unsafe { *data.get_unchecked(idx) };
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::U8 { data, nodata } => {
+                let v = unsafe { *data.get_unchecked(idx) };
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::RgbU8Channel {
+                rgb,
+                channel,
+                nodata,
+            } => {
+                let v = unsafe { *rgb.get_unchecked(idx * 3 + (*channel as usize)) };
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
                 }
             }
         }

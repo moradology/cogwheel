@@ -142,6 +142,49 @@ impl<'a> BandSource<'a> {
         v
     }
 
+    /// Exact `f64` bounds-checked pixel read (for wide dtypes `Uint32`/`Int32`/`Uint64`/`Int64`/`Float64`).
+    #[inline]
+    pub fn sample_f64_checked(&self, col: i32, row: i32) -> f64 {
+        if col < 0 || row < 0 || col >= self.ifd_w || row >= self.ifd_h {
+            return f64::NAN;
+        }
+        let col = col as u32;
+        let row = row as u32;
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (col >> s, col & self.mask_x),
+            None => (col / self.tile_w, col % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (row >> s, row & self.mask_y),
+            None => (row / self.tile_h, row % self.tile_h),
+        };
+        let gx = tx.wrapping_sub(self.tx0);
+        let gy = ty.wrapping_sub(self.ty0);
+        if gx >= self.grid_w || gy >= self.grid_h {
+            return f64::NAN;
+        }
+        let bidx = (gy * self.grid_w + gx) as usize;
+        let v = match unsafe { *self.blocks.get_unchecked(bidx) } {
+            Some(blk) if ly < blk.height && lx < blk.width => {
+                let pidx = (ly as usize) * (self.tile_w as usize) + (lx as usize);
+                unsafe { blk.data.get_f64_unchecked(pidx) }
+            }
+            _ => f64::NAN,
+        };
+        if let Some(nd) = self.nodata_override
+            && !nd.is_nan()
+            && v == nd as f64
+        {
+            return f64::NAN;
+        }
+        if let Some((sc, off)) = self.scale_offset
+            && !v.is_nan()
+        {
+            return v * (sc as f64) + (off as f64);
+        }
+        v
+    }
+
     /// Fast 2×2 bilinear quad fetch when all 4 taps `(ux0..=ux0+1, uy0..=uy0+1)` are in-bounds.
     /// For the 99.6% interior case where all 4 taps lie in the same internal COG block, performs
     /// only 1 block lookup and 1 `BandData` dispatch instead of 4!
@@ -185,6 +228,14 @@ impl<'a> BandSource<'a> {
                                     )
                                 }
                             }
+                            cogzilla_codec::BandData::F64(s) => unsafe {
+                                (
+                                    *s.get_unchecked(p00) as f32,
+                                    *s.get_unchecked(p00 + 1) as f32,
+                                    *s.get_unchecked(p01) as f32,
+                                    *s.get_unchecked(p01 + 1) as f32,
+                                )
+                            },
                             cogzilla_codec::BandData::U16 { data, nodata } => unsafe {
                                 let a = *data.get_unchecked(p00);
                                 let b = *data.get_unchecked(p00 + 1);

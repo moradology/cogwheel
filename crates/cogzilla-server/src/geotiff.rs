@@ -381,14 +381,18 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
     }
     let bps = shorts(258)?;
     let sf = shorts(339)?;
+    let src_bps = *bps.first()?;
+    let is_f32 = src_bps == 32 && bps.iter().all(|b| *b == 32);
+    let is_f64 = src_bps == 64 && bps.iter().all(|b| *b == 64);
     if bps.len() != bands_us
         || sf.len() != bands_us
-        || bps.iter().any(|b| *b != 32)
+        || (!is_f32 && !is_f64)
         || sf.iter().any(|f| *f != 3)
         || short(259)? != 1
     {
         return None;
     }
+    let src_bytes_per_sample = if is_f64 { 8usize } else { 4usize };
     let photometric = match short(262)? {
         1 => GeoTiffPhotometric::MinIsBlack,
         2 => GeoTiffPhotometric::Rgb,
@@ -402,7 +406,7 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
     let epsg = u16_at(keys_at + 2 * 15)?;
     let (pixel_size, corner) = ([f64_at(scale_at)?, f64_at(scale_at + 8)?], [f64_at(tie_at + 24)?, f64_at(tie_at + 32)?]);
     let pixels = (width as usize).checked_mul(height as usize)?;
-    let in_bytes = bands_us.checked_mul(pixels)?.checked_mul(4)?;
+    let in_bytes = bands_us.checked_mul(pixels)?.checked_mul(src_bytes_per_sample)?;
     let out_bytes = bands_us.checked_mul(pixels)?.checked_mul(kind.bytes_per_sample())?;
     // Classic TIFF uses 32-bit strip offsets and byte counts.
     if out_bytes > (u32::MAX as usize) - 4096 {
@@ -428,13 +432,28 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
     let band_of = |i: usize| if planar { i / pixels } else { i % bands_us };
     let is_mask = |i: usize| mask && band_of(i) + 1 == bands_us;
     Some(write_geotiff_placed(&spec, pixel_size, corner, |buf| {
-        let values = samples.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+        let total_samples = bands_us * pixels;
+        let read_sample = |i: usize| -> f64 {
+            if is_f64 {
+                let off = i * 8;
+                f64::from_le_bytes(samples[off..off + 8].try_into().unwrap())
+            } else {
+                let off = i * 4;
+                f64::from(f32::from_le_bytes([
+                    samples[off],
+                    samples[off + 1],
+                    samples[off + 2],
+                    samples[off + 3],
+                ]))
+            }
+        };
         macro_rules! put {
             ($t:ty, $cast:expr) => {{
                 let cast = $cast;
-                for (i, v) in values.enumerate() {
+                for i in 0..total_samples {
+                    let v = read_sample(i);
                     let x: $t = if !is_mask(i) {
-                        cast(f64::from(v))
+                        cast(v)
                     } else if v.is_finite() && v != 0.0 {
                         <$t>::MAX
                     } else {
@@ -458,6 +477,83 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
             T::Float64 => put!(f64, |v: f64| v),
         }
     }))
+}
+
+/// Write a band-major CHW `f64` array directly as an uncompressed GeoTIFF in `kind`
+/// (preserving exact `uint32`/`int32`/`int64` up to ±2^53 and 17-digit `float64` without `f32` quantization).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_geotiff_typed_f64(
+    values: &[f64],
+    bands: usize,
+    width: u32,
+    height: u32,
+    kind: cogzilla_tiff::SampleType,
+    bbox: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> Bytes {
+    let pixels = (width as usize) * (height as usize);
+    let total_bands = (bands + usize::from(return_mask)) as u16;
+    let photometric = if bands == 3 {
+        GeoTiffPhotometric::Rgb
+    } else {
+        GeoTiffPhotometric::MinIsBlack
+    };
+    let photo_bands = if bands == 3 { 3 } else { 1 };
+    let mut extra: Vec<u16> = Vec::new();
+    for b in photo_bands..bands {
+        let _ = b;
+        extra.push(0); // unspecified data band
+    }
+    if return_mask {
+        extra.push(2); // unassociated alpha / validity mask
+    }
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: total_bands,
+        sample: geotiff_sample(kind),
+        sample_format_tag: true,
+        layout: GeoTiffLayout::Planar,
+        photometric,
+        extra_samples: &extra,
+        nodata: None,
+        bbox,
+        epsg,
+    };
+    write_geotiff(&spec, |buf| {
+        let data = &values[..(bands * pixels).min(values.len())];
+        macro_rules! put_planes {
+            ($t:ty, $cast:expr) => {{
+                let cast = $cast;
+                for &v in data {
+                    let x: $t = cast(if v.is_nan() { 0.0 } else { v });
+                    buf.put_slice(&x.to_le_bytes());
+                }
+                if return_mask {
+                    for i in 0..pixels {
+                        let there = (0..bands)
+                            .any(|b| data.get(b * pixels + i).is_some_and(|v| !v.is_nan()));
+                        let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
+                        buf.put_slice(&x.to_le_bytes());
+                    }
+                }
+            }};
+        }
+        use cogzilla_tiff::SampleType as T;
+        match kind {
+            T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8),
+            T::Int8 => put_planes!(i8, |v: f64| v as i8),
+            T::Uint16 => put_planes!(u16, |v: f64| v as u16),
+            T::Int16 => put_planes!(i16, |v: f64| v as i16),
+            T::Uint32 => put_planes!(u32, |v: f64| v as u32),
+            T::Int32 => put_planes!(i32, |v: f64| v as i32),
+            T::Uint64 => put_planes!(u64, |v: f64| v as u64),
+            T::Int64 => put_planes!(i64, |v: f64| v as i64),
+            T::Float32 => put_planes!(f32, |v: f64| v as f32),
+            T::Float64 => put_planes!(f64, |v: f64| v),
+        }
+    })
 }
 
 #[cfg(test)]
