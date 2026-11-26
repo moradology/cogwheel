@@ -105,5 +105,9 @@ required-features = ["gpu"]
 name = "titiler_stats_gpu_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "fused_expr_stats_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 zune-jpeg.workspace = true
