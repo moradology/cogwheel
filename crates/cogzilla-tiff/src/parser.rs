@@ -68,24 +68,51 @@ fn type_size(ty: u16) -> Option<u64> {
     }
 }
 
+enum Backing<'a> {
+    Contiguous(&'a [u8]),
+    Sparse(&'a [(u64, Vec<u8>)]),
+}
+
+impl<'a> Backing<'a> {
+    #[inline(always)]
+    fn need(&self, offset: u64, len: u64) -> Result<&'a [u8], TiffError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(TiffError::Corrupt("offset overflow"))?;
+        match *self {
+            Self::Contiguous(buf) => {
+                if end > buf.len() as u64 {
+                    return Err(TiffError::NeedMoreBytes {
+                        required: end,
+                        available: buf.len() as u64,
+                    });
+                }
+                Ok(&buf[offset as usize..end as usize])
+            }
+            Self::Sparse(chunks) => {
+                for (base, data) in chunks {
+                    let chunk_end = base.saturating_add(data.len() as u64);
+                    if offset >= *base && end <= chunk_end {
+                        let s = (offset - *base) as usize;
+                        let e = (end - *base) as usize;
+                        return Ok(&data[s..e]);
+                    }
+                }
+                Err(TiffError::NeedRange { offset, end })
+            }
+        }
+    }
+}
+
 struct Reader<'a> {
-    buf: &'a [u8],
+    backing: Backing<'a>,
     bo: ByteOrder,
 }
 
 impl<'a> Reader<'a> {
     #[inline(always)]
     fn need(&self, offset: u64, len: u64) -> Result<&'a [u8], TiffError> {
-        let end = offset
-            .checked_add(len)
-            .ok_or(TiffError::Corrupt("offset overflow"))?;
-        if end > self.buf.len() as u64 {
-            return Err(TiffError::NeedMoreBytes {
-                required: end,
-                available: self.buf.len() as u64,
-            });
-        }
-        Ok(&self.buf[offset as usize..end as usize])
+        self.backing.need(offset, len)
     }
 
     #[inline(always)]
@@ -412,8 +439,8 @@ fn parse_ifd_entries(
     Ok((entries, next_ifd))
 }
 
-/// Parse a float32 COG's TIFF/BigTIFF header, all overview IFDs, GeoKeys, and tile offset tables
-/// from a prefix slice (e.g., `mmap` slice or initial speculative HTTP Range bytes).
+/// Parse a TIFF/BigTIFF header, all overview IFDs, GeoKeys, and tile offset tables
+/// from a prefix slice (e.g., `mmap` slice or in-memory buffer).
 ///
 /// If an IFD or tag array lies beyond `bytes.len()`, returns `Err(TiffError::NeedMoreBytes { required, .. })`.
 pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
@@ -423,12 +450,27 @@ pub fn parse_cog(bytes: &[u8]) -> Result<CogIndex, TiffError> {
             available: bytes.len() as u64,
         });
     }
-    let bo = match &bytes[0..2] {
+    parse_cog_with_backing(Backing::Contiguous(bytes))
+}
+
+/// Parse a TIFF/BigTIFF from a set of sparse `(file_offset, bytes)` chunks (e.g. non-COG remote
+/// GeoTIFFs whose IFDs live near the end of the file).
+///
+/// Returns `Err(TiffError::NeedRange { offset, end })` whenever a needed IFD or out-of-line tag
+/// array is not covered by any chunk in `chunks`, allowing the caller to jump directly to `offset`
+/// with a bounded HTTP Range request instead of reading the intervening pixel data.
+pub fn parse_cog_sparse(chunks: &[(u64, Vec<u8>)]) -> Result<CogIndex, TiffError> {
+    parse_cog_with_backing(Backing::Sparse(chunks))
+}
+
+fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
+    let hdr = backing.need(0, 8)?;
+    let bo = match &hdr[0..2] {
         b"II" => ByteOrder::Little,
         b"MM" => ByteOrder::Big,
         _ => return Err(TiffError::InvalidHeader),
     };
-    let r = Reader { buf: bytes, bo };
+    let r = Reader { backing, bo };
     let magic = r.u16_at(2)?;
     let (is_bigtiff, mut next_ifd) = match magic {
         42 => (false, r.u32_at(4)? as u64),

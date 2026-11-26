@@ -887,10 +887,12 @@ async fn fetch_s3_inner(
         // and sent bytes from offset 0, which would silently corrupt tile/IFD parsing.
         if status == 200
             && let Some(rng) = range_header
-            && !rng.starts_with("bytes=0-")
+            && (!rng.starts_with("bytes=0-")
+                || max_bytes.is_some_and(|cap| {
+                    resp.content_length().is_some_and(|cl| cl > cap as u64)
+                }))
         {
-            return Err(IoError::HttpStatus {
-                status: 200,
+            return Err(IoError::RangeNotSupported {
                 url: crate::backend::redact_http_url(&url),
             });
         }

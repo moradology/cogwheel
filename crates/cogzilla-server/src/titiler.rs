@@ -5439,25 +5439,60 @@ async fn render_bbox_impl(
             | ResampleMode::Q3
             | ResampleMode::Sum
     );
-    let (pad_lo, pad_hi) =
-        crate::engine::resample_fetch_margin(resample, matches!(bands, BandRequest::Dem { .. }));
-    let (pad_x_lo, pad_x_hi, pad_y_lo, pad_y_hi) = if is_footprint_mode {
-        let hx = (0.5 * footprint_sx).ceil() as i32;
-        let hy = (0.5 * footprint_sy).ceil() as i32;
-        (pad_lo.max(hx), pad_hi.max(hx), pad_lo.max(hy), pad_hi.max(hy))
+    let is_dem = matches!(bands, BandRequest::Dem { .. });
+    let (c0, c1, r0, r1) = if is_dem {
+        let (lo, hi) = crate::engine::resample_fetch_margin(resample, true);
+        (
+            (min_u.floor() as i32).saturating_sub(lo).max(0) as u32,
+            (max_u.floor() as i32)
+                .saturating_add(hi)
+                .min(ifd.width as i32 - 1)
+                .max(0) as u32,
+            (min_v.floor() as i32).saturating_sub(lo).max(0) as u32,
+            (max_v.floor() as i32)
+                .saturating_add(hi)
+                .min(ifd.height as i32 - 1)
+                .max(0) as u32,
+        )
+    } else if resample == ResampleMode::Nearest {
+        (
+            ((min_u + 0.5).floor() as i32).max(0) as u32,
+            ((max_u + 0.5).floor() as i32)
+                .min(ifd.width as i32 - 1)
+                .max(0) as u32,
+            ((min_v + 0.5).floor() as i32).max(0) as u32,
+            ((max_v + 0.5).floor() as i32)
+                .min(ifd.height as i32 - 1)
+                .max(0) as u32,
+        )
+    } else if is_footprint_mode {
+        let hx = 0.5 * footprint_sx;
+        let hy = 0.5 * footprint_sy;
+        (
+            ((min_u + 0.5 - hx).floor() as i32).max(0) as u32,
+            (((max_u + 0.5 + hx).ceil() as i32) - 1)
+                .min(ifd.width as i32 - 1)
+                .max(0) as u32,
+            ((min_v + 0.5 - hy).floor() as i32).max(0) as u32,
+            (((max_v + 0.5 + hy).ceil() as i32) - 1)
+                .min(ifd.height as i32 - 1)
+                .max(0) as u32,
+        )
     } else {
-        (pad_lo, pad_hi, pad_lo, pad_hi)
+        let (lo, hi) = crate::engine::resample_fetch_margin(resample, false);
+        (
+            (min_u.floor() as i32).saturating_sub(lo).max(0) as u32,
+            (max_u.floor() as i32)
+                .saturating_add(hi)
+                .min(ifd.width as i32 - 1)
+                .max(0) as u32,
+            (min_v.floor() as i32).saturating_sub(lo).max(0) as u32,
+            (max_v.floor() as i32)
+                .saturating_add(hi)
+                .min(ifd.height as i32 - 1)
+                .max(0) as u32,
+        )
     };
-    let c0 = (min_u.floor() as i32).saturating_sub(pad_x_lo).max(0) as u32;
-    let c1 = (max_u.ceil() as i32)
-        .saturating_add(pad_x_hi)
-        .min(ifd.width as i32 - 1)
-        .max(0) as u32;
-    let r0 = (min_v.floor() as i32).saturating_sub(pad_y_lo).max(0) as u32;
-    let r1 = (max_v.ceil() as i32)
-        .saturating_add(pad_y_hi)
-        .min(ifd.height as i32 - 1)
-        .max(0) as u32;
     let tx0 = c0 / ifd.tile_width;
     let tx1 = (c1 / ifd.tile_width).min(ifd.tiles_across.saturating_sub(1));
     let ty0 = r0 / ifd.tile_height;

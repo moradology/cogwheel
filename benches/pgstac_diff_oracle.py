@@ -118,6 +118,33 @@ def first_diff(a, b, path="$"):
     return None if a == b else f"{path}: {str(a)[:60]!r} vs {str(b)[:60]!r}"
 
 
+def geotiff_array(body: bytes) -> tuple[bytes, str]:
+    """A GeoTIFF as the NumPy array it holds, and what it says of itself."""
+    import warnings
+
+    from rasterio.io import MemoryFile
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with MemoryFile(body) as memory, memory.open() as ds:
+            said = (f"{ds.dtypes[0]} x{ds.count} {[c.name for c in ds.colorinterp]} "
+                    f"epsg {ds.crs.to_epsg() if ds.crs else None} {[round(v, 6) for v in ds.bounds]}")
+            out = io.BytesIO()
+            np.save(out, ds.read())
+            return out.getvalue(), said
+
+
+def compare_geotiffs(cz: bytes, tt: bytes, smooth: bool) -> tuple[bool, str]:
+    try:
+        (a, said_a), (b, said_b) = geotiff_array(cz), geotiff_array(tt)
+    except Exception as e:  # noqa: BLE001 - an unreadable GeoTIFF is a failed check
+        return False, f"unreadable GeoTIFF: {e}"
+    if said_a != said_b:
+        return False, f"{said_a} vs {said_b}"
+    ok, note = compare_arrays(a, b, smooth)
+    return ok, f"GeoTIFF, {note}"
+
+
 def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     try:
         a = np.array(Image.open(io.BytesIO(cz)).convert("RGBA"), dtype=np.float32)
@@ -328,6 +355,8 @@ class Oracle:
                 ok, note = False, f"content type {ct_cz} vs {ct_tt}"
             elif cz.content[:6] == b"\x93NUMPY":
                 ok, note = compare_arrays(cz.content, tt.content, smooth="resampling=" in path)
+            elif cz.content[:4] == b"II*\x00":
+                ok, note = compare_geotiffs(cz.content, tt.content, "resampling=" in path)
             else:
                 ok, note = compare_images(cz.content, tt.content)
                 note = f"{ct_cz}, {note}"
@@ -479,7 +508,19 @@ def main() -> int:
         o.check("format chosen from the pixels", "image", f"{base12}?assets=visual")
         o.check("jpg", "image", f"{base12}.jpg?assets=visual")
         o.check("tif", "image", f"{base12}.tif?assets=visual")
-        o.check("tif, bilinear", "image", f"{base12}.tif?assets=visual&resampling=bilinear")
+        o.check("tif, bilinear", "image", f"{base12}.tif?assets=visual&resampling=bilinear&reproject=bilinear")
+        # A GeoTIFF is the array: the raster's own type, every band, the mask as alpha.
+        o.check("tif of one band", "image", f"{base12}.tif?assets=red")
+        o.check("tiff of one band", "image", f"{base12}.tiff?assets=red")
+        o.check("tif of two assets", "image", f"{base12}.tif?assets=red&assets=nir&asset_as_band=true")
+        o.check("tif of band math", "image", f"{base12}.tif?assets=red&assets=nir&asset_as_band=true&expression=(b2-b1)/(b2%2Bb1)")
+        o.check("tif, rescaled under a colour map", "image", f"{base12}.tif?assets=red&rescale=0,3000&colormap_name=viridis")
+        o.check("tif of three assets that are not bytes", "image", f"{base12}.tif?assets=red&assets=green&assets=blue&asset_as_band=true")
+        o.check("bbox, tif under an algorithm", "status", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x64.tif?assets=red&algorithm=hillshade")
+        o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
+        o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
+        o.check("bbox, tif of one band", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.tif?assets=red")
+        o.check("bbox in metres, tif of one band", "image", f"/searches/{sid}/bbox/912000,5700000,990000,5780000/64x64.tif?assets=red&coord_crs=epsg:3857")
         o.check("webp", "image", f"{base12}.webp?assets=visual")
         o.check("tilesize=512", "image", f"{base12}.png?assets=visual&tilesize=512")
         o.check("tilesize=128", "image", f"{base12}.png?assets=visual&tilesize=128")

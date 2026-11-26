@@ -25,6 +25,10 @@ pub enum IoError {
     Http(#[from] reqwest::Error),
     #[error("HTTP status {status} fetching {url}")]
     HttpStatus { status: u16, url: String },
+    #[error("origin does not support HTTP range requests: {url}")]
+    RangeNotSupported { url: String },
+    #[error("remote response exceeded limit of {limit} bytes")]
+    ResponseTooLarge { limit: usize, actual: Option<u64> },
     #[error("TIFF parse error: {0}")]
     Tiff(#[from] cogzilla_tiff::TiffError),
     #[error("codec error: {0}")]
@@ -91,6 +95,28 @@ pub enum CogSource {
         metrics: Arc<IoMetrics>,
         limiter: Arc<AimdLimiter>,
     },
+}
+
+/// Strip `file://` for local paths, or reject any unrecognized `<scheme>://` URI with
+/// [`IoError::InvalidUri`] naming the unsupported scheme and the supported ones.
+pub(crate) fn resolve_local_or_reject_scheme(uri: &str) -> Result<&str, IoError> {
+    if let Some(local) = uri.strip_prefix("file://") {
+        return Ok(local);
+    }
+    if let Some(idx) = uri.find("://") {
+        let scheme = &uri[..idx];
+        let is_valid_scheme = !scheme.is_empty()
+            && scheme.as_bytes()[0].is_ascii_alphabetic()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+        if is_valid_scheme {
+            return Err(IoError::InvalidUri(format!(
+                "unsupported URI scheme '{scheme}://' (supported: http, https, s3, gs, az, abfs, abfss, file, or local path)"
+            )));
+        }
+    }
+    Ok(uri)
 }
 
 /// Strip `?query`, `#fragment`, and `user:pass@` userinfo from an HTTP(S) URL before surfacing it
@@ -264,7 +290,7 @@ impl CogSource {
         } else if uri.starts_with("/vsicurl/") {
             Err(IoError::InvalidUri(uri.to_string()))
         } else {
-            let local_path = uri.strip_prefix("file://").unwrap_or(uri);
+            let local_path = resolve_local_or_reject_scheme(uri)?;
             Self::open_local(local_path)
         }
     }
@@ -336,19 +362,28 @@ impl CogSource {
                         }
                     };
                     let status = resp.status().as_u16();
-                    if status == 200 && start > 0 {
-                        // Server ignored Range header and sent full object from offset 0:
-                        // returning those bytes would silently corrupt tile/IFD data!
-                        return Err(IoError::HttpStatus {
-                            status: 200,
+                    let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
+                    if status == 200
+                        && (start > 0
+                            || resp
+                                .content_length()
+                                .is_some_and(|cl| cl > expected_len as u64))
+                    {
+                        // Server ignored Range header and sent full object:
+                        // returning those bytes would silently corrupt tile/IFD data or OOM.
+                        return Err(IoError::RangeNotSupported {
                             url: redact_http_url(url),
                         });
                     }
                     if status == 200 || status == 206 {
-                        let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
                         let data = match crate::cloud::read_response_capped(resp, expected_len).await
                         {
                             Ok(d) => d,
+                            Err(IoError::ResponseTooLarge { .. }) if status == 200 => {
+                                return Err(IoError::RangeNotSupported {
+                                    url: redact_http_url(url),
+                                });
+                            }
                             Err(IoError::Http(e))
                                 if attempt < *max_retries && is_retryable_transport_error(&e) =>
                             {

@@ -3154,6 +3154,10 @@ async fn part_image_of(
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
+    // A GeoTIFF is the array with a place on the ground: made as the array, wrapped at the end.
+    // (With `algorithm` no array is written on these routes yet: there it stays the picture.)
+    let tiff = matches!(ext.or(pq.format_param.as_deref()), Some("tif" | "tiff")) && pq.algorithm.is_none();
+    let ext = if tiff { Some("npy") } else { ext };
     // `width` and `height` are read here; the shared parser does not know them.
     pq.errors.retain(|e| !own_size_error(e));
     let query = match check_mosaic_query(&pq, pairs) {
@@ -3348,7 +3352,7 @@ async fn part_image_of(
                 return_mask: pq.return_mask,
             };
             let made = job.picture(engine, &scenes, w as usize, h as usize, &look).await?;
-            return Ok(as_geotiff(made, w as usize, h as usize, bbox, if mercator { 3857 } else { 4326 }, pq.return_mask));
+            return Ok(made);
         }
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
@@ -3521,11 +3525,18 @@ async fn part_image_of(
         } else {
             (encode_rgba_output_colour(width, height, &canvas, format, pq.return_mask), content_type)
         };
-        Ok(as_geotiff(made, width, height, bbox, 4326, pq.return_mask))
+        // The renderer's picture under `algorithm`, asked for as a GeoTIFF: its RGBA, placed.
+        if made.1 == super::GEOTIFF_CONTENT_TYPE && made.0.len() == width * height * 4 {
+            let body = crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &made.0, bbox, 4326, pq.return_mask);
+            return Ok((body, made.1));
+        }
+        Ok(made)
     }
     .await;
     match rendered {
-        Ok((body, content_type)) => {
+        Ok(made) => {
+            let epsg = if mercator { 3857 } else { 4326 };
+            let (body, content_type) = as_geotiff(made, tiff, bbox, epsg, pq.return_mask);
             let mut resp = Response::new(Full::new(body));
             resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
             resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
@@ -4924,6 +4935,10 @@ async fn tile(
     } else {
         ext.to_string()
     };
+    // A GeoTIFF is the array with a place on the ground: it is made as the array is, and
+    // wrapped at the end.
+    let tiff = matches!(explicit.as_str(), "tif" | "tiff");
+    let explicit = if tiff { "npy".to_string() } else { explicit };
     let auto_format = explicit.is_empty();
     let (resampling, reproject) = (query.resampling, query.reproject);
     let asset_as_band = query.asset_as_band;
@@ -4941,6 +4956,7 @@ async fn tile(
             // A tile asked for as a GeoTIFF is one, placed where the tile lies.
             let (west, south, east, north) = tile_bounds_3857(tile);
             let lies = [west, south, east, north];
+            let made: Result<(Bytes, &'static str), EngineError> = async {
             // The first scene is opened here, to learn what the tile's bands are. The scenes
             // after it are put on their way meanwhile, so the mosaic does not start their
             // headers only once this one has come back. The list holds only scenes whose
@@ -5038,7 +5054,7 @@ async fn tile(
                     return_mask,
                 };
                 let made = job.picture(engine, &scenes, dim as usize, dim as usize, &look).await?;
-                return Ok(as_geotiff(made, dim as usize, dim as usize, lies, 3857, return_mask));
+                return Ok(made);
             }
             // On planes the bands are counted after an asset's own options; here they are the raster's.
             if asset_as_band && full.samples_per_pixel > 1 {
@@ -5303,7 +5319,9 @@ async fn tile(
                 None => formula.as_ref(),
             };
             encode_picture(rgba, dim, dim, formula, asked, jpeg_quality, return_mask, grey)
-                .map(|made| as_geotiff(made, dim, dim, lies, 3857, return_mask))
+            }
+            .await;
+            made.map(|made| as_geotiff(made, tiff, lies, 3857, return_mask))
         })
         .await;
     match rendered {
@@ -5371,20 +5389,124 @@ fn placed_as(mut resp: Resp, bounds: [f64; 4], epsg: u16, spelled: Option<&str>)
     resp
 }
 
-/// A picture asked for as a GeoTIFF, which until here is its bare RGBA pixels, written as
-/// one: `bounds` and `epsg` say where it lies. Any other format is left as it is.
-fn as_geotiff(
-    (body, content_type): (Bytes, &'static str),
-    width: usize,
-    height: usize,
-    bounds: [f64; 4],
-    epsg: u16,
-    return_mask: bool,
-) -> (Bytes, &'static str) {
-    if content_type != super::GEOTIFF_CONTENT_TYPE || width == 0 || body.len() != width * height * 4 {
-        return (body, content_type);
+/// The NumPy array these routes write, as a GeoTIFF of the same values in the same type:
+/// what TiTiler's `.tif` is, the array with a place on the ground. One strip to a band,
+/// which is the order the array is already in; with `mask` the last band is the alpha.
+/// `None` when the bytes are not such an array.
+fn npy_as_geotiff(npy: &[u8], bounds: [f64; 4], epsg: u16, mask: bool) -> Option<Bytes> {
+    let head_len = usize::from(u16::from_le_bytes([*npy.get(8)?, *npy.get(9)?]));
+    let head = std::str::from_utf8(npy.get(10..10 + head_len)?).ok()?;
+    let data = npy.get(10 + head_len..)?;
+    let descr = head.split("'descr': '").nth(1)?.split('\'').next()?;
+    // SampleFormat: 1 unsigned, 2 signed, 3 IEEE.
+    let (bits, format): (u16, u16) = match descr {
+        "|u1" => (8, 1),
+        "|i1" => (8, 2),
+        "<u2" => (16, 1),
+        "<i2" => (16, 2),
+        "<u4" => (32, 1),
+        "<i4" => (32, 2),
+        "<f4" => (32, 3),
+        "<f8" => (64, 3),
+        _ => return None,
+    };
+    let mut shape = head.split("'shape': (").nth(1)?.split(')').next()?.split(',').filter_map(|n| n.trim().parse::<usize>().ok());
+    let (bands, height, width) = (shape.next()?, shape.next()?, shape.next()?);
+    let strip = width.checked_mul(height)?.checked_mul(usize::from(bits / 8))?;
+    if bands == 0 || bands > 64 || strip == 0 || data.len() != strip.checked_mul(bands)? || u32::try_from(data.len()).is_err() {
+        return None;
     }
-    (crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &body, bounds, epsg, return_mask), content_type)
+    let shown = bands - usize::from(mask && bands > 1);
+    // Three bands of bytes and no more are a colour picture, as GDAL writes them; otherwise
+    // the first is grey and the rest are extra, the mask an alpha that is not multiplied in.
+    let colour = shown == 3 && descr == "|u1";
+    let extra: Vec<u16> = (if colour { 3 } else { 1 }..bands).map(|band| if mask && band + 1 == bands { 2 } else { 0 }).collect();
+    let entries: u16 = 14 + u16::from(!extra.is_empty());
+    // After the directory: the arrays that do not fit in an entry, then the geo tags.
+    let mut next = 8 + 2 + 12 * u32::from(entries) + 4;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut shorts = |values: &[u16]| -> u32 {
+        match values {
+            [one] => u32::from(*one),
+            [a, b] => u32::from(*a) | (u32::from(*b) << 16),
+            many => {
+                let at = next + tail.len() as u32;
+                many.iter().for_each(|v| tail.extend_from_slice(&v.to_le_bytes()));
+                at
+            }
+        }
+    };
+    let bits_value = shorts(&vec![bits; bands]);
+    let extra_value = shorts(&extra);
+    let format_value = shorts(&vec![format; bands]);
+    next += tail.len() as u32;
+    let (offsets_at, counts_at) = (next, next + 4 * bands as u32);
+    let geo_at = if bands == 1 { next } else { next + 8 * bands as u32 };
+    let (scale_at, tie_at, keys_at) = (geo_at, geo_at + 24, geo_at + 72);
+    let pixels_at = keys_at + 32;
+    let mut out = Vec::with_capacity(pixels_at as usize + data.len());
+    out.extend_from_slice(b"II");
+    out.extend_from_slice(&42u16.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&entries.to_le_bytes());
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    const DOUBLE: u16 = 12;
+    let mut entry = |tag: u16, kind: u16, count: u32, value: u32| {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    };
+    let n = bands as u32;
+    entry(256, LONG, 1, width as u32);
+    entry(257, LONG, 1, height as u32);
+    entry(258, SHORT, n, bits_value);
+    entry(259, SHORT, 1, 1);
+    entry(262, SHORT, 1, if colour { 2 } else { 1 });
+    entry(273, LONG, n, if bands == 1 { pixels_at } else { offsets_at });
+    entry(277, SHORT, 1, n);
+    entry(278, LONG, 1, height as u32);
+    entry(279, LONG, n, if bands == 1 { strip as u32 } else { counts_at });
+    // One band is one strip either way, and said to be chunky, which every reader takes.
+    entry(284, SHORT, 1, if bands == 1 { 1 } else { 2 });
+    if !extra.is_empty() {
+        entry(338, SHORT, extra.len() as u32, extra_value);
+    }
+    entry(339, SHORT, n, format_value);
+    entry(33550, DOUBLE, 3, scale_at);
+    entry(33922, DOUBLE, 6, tie_at);
+    entry(34735, SHORT, 16, keys_at);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&tail);
+    if bands > 1 {
+        (0..bands).for_each(|band| out.extend_from_slice(&(pixels_at + (band * strip) as u32).to_le_bytes()));
+        (0..bands).for_each(|_| out.extend_from_slice(&(strip as u32).to_le_bytes()));
+    }
+    let across = ((bounds[2] - bounds[0]).abs() / width as f64).max(1e-12);
+    let down = ((bounds[3] - bounds[1]).abs() / height as f64).max(1e-12);
+    for v in [across, down, 0.0, 0.0, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let (model, key): (u16, u16) = if epsg == 4326 { (2, 2048) } else { (1, 3072) };
+    for k in [1u16, 1, 0, 3, 1024, 0, 1, model, 1025, 0, 1, 1, key, 0, 1, epsg] {
+        out.extend_from_slice(&k.to_le_bytes());
+    }
+    debug_assert_eq!(out.len(), pixels_at as usize);
+    out.extend_from_slice(data);
+    Some(Bytes::from(out))
+}
+
+/// [`npy_as_geotiff`] of a route's answer when a GeoTIFF was asked for: the one place a
+/// tile, a `bbox` and a `feature` become one.
+fn as_geotiff(made: (Bytes, &'static str), tiff: bool, bounds: [f64; 4], epsg: u16, mask: bool) -> (Bytes, &'static str) {
+    if tiff
+        && made.1 != super::GEOTIFF_CONTENT_TYPE
+        && let Some(body) = npy_as_geotiff(&made.0, bounds, epsg, mask)
+    {
+        return (body, super::GEOTIFF_CONTENT_TYPE);
+    }
+    made
 }
 
 /// An RGBA picture as the response's bytes and media type: the colour formula, then
@@ -7449,18 +7571,20 @@ mod tests {
     }
 
     #[test]
-    fn geotiff_pictures_are_geotiffs() {
-        // Bare RGBA pixels under the GeoTIFF content type become a TIFF; anything else,
-        // and a body that is not the pixels it should be, is left alone.
-        let pixels = Bytes::from(vec![7u8; 4 * 3 * 4]);
-        let (tiff, kind) = as_geotiff((pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE), 4, 3, [8.0, 45.0, 9.0, 46.0], 4326, true);
+    fn an_array_asked_for_as_a_geotiff_is_one() {
+        let npy = npy_array(&[1.0, f32::NAN, 3.0, 4.0], 2, 2, 1, SampleType::Uint16, true, None);
+        let (tiff, kind) = as_geotiff((npy.clone(), "application/x-binary"), true, [8.0, 45.0, 9.0, 46.0], 4326, true);
         assert_eq!(kind, super::super::GEOTIFF_CONTENT_TYPE);
         assert_eq!(&tiff[..4], b"II*\0");
-        assert!(tiff.len() > pixels.len());
-        let (png, _) = as_geotiff((pixels.clone(), "image/png"), 4, 3, [8.0, 45.0, 9.0, 46.0], 4326, true);
-        assert_eq!(png, pixels);
-        let (short, _) = as_geotiff((pixels.clone(), super::super::GEOTIFF_CONTENT_TYPE), 4, 4, [8.0, 45.0, 9.0, 46.0], 4326, true);
-        assert_eq!(short, pixels);
+        // Two bands and the mask, in strips of the array's own bytes.
+        assert_eq!(&tiff[tiff.len() - 12..], &npy[npy.len() - 12..]);
+        let entries = u16::from_le_bytes([tiff[8], tiff[9]]);
+        assert_eq!(entries, 15);
+        // Anything else is left as it was made.
+        let (same, kind) = as_geotiff((npy.clone(), "application/x-binary"), false, [8.0, 45.0, 9.0, 46.0], 4326, true);
+        assert_eq!((same, kind), (npy, "application/x-binary"));
+        let png = Bytes::from_static(b"\x89PNG....");
+        assert_eq!(as_geotiff((png.clone(), "image/png"), true, [0.0, 0.0, 1.0, 1.0], 3857, true).0, png);
     }
 
     #[test]
