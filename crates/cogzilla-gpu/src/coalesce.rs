@@ -184,6 +184,16 @@ pub enum CoalescedJob {
         rescale_max: [f32; 3],
         formula: GpuColorFormula,
     },
+    ExprRgb {
+        slab: Arc<GpuMultiBandSlab>,
+        plan: OwnedCoordPlan,
+        mode: GpuColormapMode,
+        instrs: Vec<GpuInstr>,
+        lens: [u8; 3],
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        formula: GpuColorFormula,
+    },
 }
 
 /// Telemetry counters for `GpuCoalescer`.
@@ -362,6 +372,7 @@ struct WorkerState {
     expr_f32: wgpu::ComputePipeline,
     rgb_formula: wgpu::ComputePipeline,
     sar_rgb_formula: wgpu::ComputePipeline,
+    expr_rgb_formula: wgpu::ComputePipeline,
     frames: Vec<RingFrame>,
     in_flight_order: VecDeque<usize>,
     free_frames: VecDeque<usize>,
@@ -575,6 +586,7 @@ impl WorkerState {
         let expr_f32 = mk_expr_pipe("coal-expr-f32", "expr_eval_f32");
         let rgb_formula = mk_expr_pipe("coal-rgb-formula", "rgb_color_formula_rgba8");
         let sar_rgb_formula = mk_expr_pipe("coal-sar-rgb-formula", "sar_rgb_color_formula_rgba8");
+        let expr_rgb_formula = mk_expr_pipe("coal-expr-rgb-formula", "expr_rgb_color_formula_rgba8");
 
         let depth = ring_depth.clamp(1, 4);
         let frames: Vec<RingFrame> = (0..depth).map(|_| RingFrame::new(&device)).collect();
@@ -597,6 +609,7 @@ impl WorkerState {
             expr_f32,
             rgb_formula,
             sar_rgb_formula,
+            expr_rgb_formula,
             frames,
             in_flight_order: VecDeque::with_capacity(depth),
             free_frames,
@@ -1176,6 +1189,146 @@ impl WorkerState {
                         reply,
                     });
                 }
+                CoalescedJob::ExprRgb {
+                    slab,
+                    plan,
+                    mode,
+                    instrs,
+                    lens,
+                    rescale_min,
+                    rescale_max,
+                    formula,
+                } => {
+                    let (dst_w, dst_h, coord_mode, u_slice, v_slice) = match plan.dims_mode_slices()
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            reply(Err(e));
+                            continue;
+                        }
+                    };
+                    let total_len = lens[0] as usize + lens[1] as usize + lens[2] as usize;
+                    if dst_w == 0
+                        || dst_h == 0
+                        || total_len == 0
+                        || total_len > 256
+                        || total_len != instrs.len()
+                    {
+                        reply(Err(GpuError::InvalidDimensions(
+                            "expr_rgb job requires non-zero dims and valid 1..=256 packed instrs"
+                                .into(),
+                        )));
+                        continue;
+                    }
+                    let out_words = dst_w * dst_h;
+                    let slot = &mut frame.slots[slot_idx];
+                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+
+                    let inv = |min: f32, max: f32| {
+                        let d = max - min;
+                        255.0 / if d.is_finite() && d.abs() > 1e-20 { d } else { 1.0 }
+                    };
+                    let mut flags = 0u32;
+                    if let Some(lut) = &formula.rgb_lut {
+                        flags |= 1;
+                        self.queue
+                            .write_buffer(&slot.lut_buf, 0, bytemuck::cast_slice(lut));
+                    }
+                    let sat = if let Some(s) = formula.saturation {
+                        flags |= 2;
+                        s
+                    } else {
+                        1.0
+                    };
+                    let packed_lens = (lens[0] as u32)
+                        | ((lens[1] as u32) << 8)
+                        | ((lens[2] as u32) << 16);
+                    let params = ExprParams {
+                        src_w: slab.width,
+                        src_h: slab.height,
+                        src_stride: slab.stride,
+                        band_stride: slab.band_stride,
+                        dst_w: dst_w as u32,
+                        dst_h: dst_h as u32,
+                        num_bands: slab.num_bands,
+                        num_instrs: packed_lens,
+                        resample_mode: mode.as_u32(),
+                        formula_flags: flags,
+                        coord_mode,
+                        _pad1: 0,
+                        rescale_min: 0.0,
+                        inv_range_255: 1.0,
+                        inv_range_254: 1.0,
+                        saturation: sat,
+                        rgb_min: [rescale_min[0], rescale_min[1], rescale_min[2], 0.0],
+                        rgb_inv_255: [
+                            inv(rescale_min[0], rescale_max[0]),
+                            inv(rescale_min[1], rescale_max[1]),
+                            inv(rescale_min[2], rescale_max[2]),
+                            0.0,
+                        ],
+                    };
+                    self.queue
+                        .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
+                    self.queue
+                        .write_buffer(&slot.instr_buf, 0, bytemuck::cast_slice(&instrs));
+                    self.queue
+                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
+                    self.queue
+                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("coal-expr-rgb-bg"),
+                        layout: &self.expr_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: slot.expr_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: slab.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: slot.u_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: slot.v_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: slot.instr_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: slot.lut_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: slot.out_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    let staging_byte_off = (total_staging_words * 4) as u64;
+                    total_staging_words += out_words;
+                    prepared.push(PreparedJob {
+                        slot_idx,
+                        dst_w,
+                        dst_h,
+                        words_per_row: dst_w,
+                        out_words,
+                        staging_byte_off,
+                        output: CoalescedOutput::Rgba8,
+                        wg_x: (dst_w as u32).div_ceil(16),
+                        wg_y: (dst_h as u32).div_ceil(16),
+                        pipe_kind: 12u8,
+                        bind_group,
+                        reply,
+                    });
+                }
             }
         }
 
@@ -1212,7 +1365,8 @@ impl WorkerState {
                     8 => &self.expr_indexed,
                     9 => &self.expr_f32,
                     10 => &self.rgb_formula,
-                    _ => &self.sar_rgb_formula,
+                    11 => &self.sar_rgb_formula,
+                    _ => &self.expr_rgb_formula,
                 };
                 pass.set_pipeline(pipe);
                 pass.set_bind_group(0, &job.bind_group, &[]);

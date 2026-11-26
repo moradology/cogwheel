@@ -80,3 +80,7 @@ required-features = ["gpu"]
 [[example]]
 name = "lut_formula_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "expr_rgb_bench"
+required-features = ["gpu"]

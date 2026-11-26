@@ -6552,6 +6552,55 @@ async fn render_bbox_impl(
                         return_mask,
                     )
                 }),
+                BandRequest::CustomExprRgb {
+                    progs,
+                    rescale_min,
+                    rescale_max,
+                } if custom_lut.is_none() => {
+                    let mut unique_bands: Vec<u16> = Vec::new();
+                    for prog in progs {
+                        for &b in &prog.used_bands {
+                            if !unique_bands.contains(&b) {
+                                unique_bands.push(b);
+                            }
+                        }
+                    }
+                    if unique_bands.is_empty() || unique_bands.len() > 8 {
+                        None
+                    } else {
+                        let ref_vecs: Vec<_> = unique_bands
+                            .iter()
+                            .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                            .collect();
+                        let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                        let style = cogzilla_kernel::RgbStyle {
+                            rescale_min: *rescale_min,
+                            rescale_max: *rescale_max,
+                            resample,
+                            format,
+                        };
+                        let cache_key = if num_cogs == 1 {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id,
+                                ifd_idx,
+                                &unique_bands,
+                                &srcs,
+                            )
+                        } else {
+                            None
+                        };
+                        gpu.try_render_bbox_expr_rgb(
+                            cache_key,
+                            coords,
+                            &unique_bands,
+                            &srcs,
+                            progs,
+                            &style,
+                            color_formula,
+                            return_mask,
+                        )
+                    }
+                }
                 BandRequest::Rgb {
                     bands_1based,
                     rescale_min,
