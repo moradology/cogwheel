@@ -39,17 +39,19 @@ const HUGE_SLAB_BYTES: usize = 2 * 1024 * 1024;
 
 #[inline]
 fn slab_layout(len: usize) -> Layout {
-    let bytes = len * std::mem::size_of::<f32>();
+    let bytes = len
+        .checked_mul(std::mem::size_of::<f32>())
+        .expect("AlignedF32Slab size overflow");
     // Page-align large slabs (>= 2 MiB) so `madvise(MADV_HUGEPAGE)` on Linux is guaranteed
     // page-aligned, reducing TLB pressure in multi-GiB block caches.
     let align = if bytes >= HUGE_SLAB_BYTES { 4096 } else { 64 };
     Layout::from_size_align(bytes, align).expect("valid aligned f32 layout")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline]
 unsafe fn advise_hugepage(ptr: *mut f32, bytes: usize) {
-    // MADV_HUGEPAGE = 14 on Linux (x86_64 and aarch64).
+    // MADV_HUGEPAGE = 14 on Linux x86_64 and aarch64.
     const MADV_HUGEPAGE: std::ffi::c_int = 14;
     unsafe extern "C" {
         fn madvise(
@@ -95,12 +97,27 @@ impl AlignedF32Slab {
         let layout = slab_layout(len);
         // SAFETY: layout size > 0 and align is power of two; zero-initializing ensures
         // subsequent `&[f32]`/`&mut [f32]` slice views are always valid initialized memory.
-        let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
-        let ptr = NonNull::new(raw).expect("OOM allocating AlignedF32Slab");
-        #[cfg(target_os = "linux")]
-        unsafe {
-            advise_hugepage(raw, layout.size());
-        }
+        // On Linux (x86_64/aarch64) for >= 2 MiB slabs, allocate uninitialized first and call
+        // `madvise(MADV_HUGEPAGE)` *before* zeroing so the first-touch page faults allocate
+        // 2 MiB transparent huge pages under `madvise` mode instead of 4 KiB pages.
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let ptr = if layout.size() >= HUGE_SLAB_BYTES {
+            let raw = unsafe { std::alloc::alloc(layout) as *mut f32 };
+            let ptr = NonNull::new(raw).expect("OOM allocating AlignedF32Slab");
+            unsafe {
+                advise_hugepage(raw, layout.size());
+                std::ptr::write_bytes(raw, 0, len);
+            }
+            ptr
+        } else {
+            let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
+            NonNull::new(raw).expect("OOM allocating AlignedF32Slab")
+        };
+        #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let ptr = {
+            let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
+            NonNull::new(raw).expect("OOM allocating AlignedF32Slab")
+        };
         Self { ptr, len }
     }
 
@@ -448,5 +465,26 @@ mod tests {
         assert_eq!(b_p2[1].data.get_f32(3), 26.0);
         assert_eq!(b_p2[2].data.get_f32(3), 39.0);
         assert_eq!(b_p2[0].data.get_f32(5), 10.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "AlignedF32Slab size overflow")]
+    fn slab_new_uninit_panics_on_size_overflow_wrap_to_zero() {
+        let _ = AlignedF32Slab::new_uninit(usize::MAX / std::mem::size_of::<f32>() + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "AlignedF32Slab size overflow")]
+    fn slab_new_uninit_panics_on_size_overflow_small_wrap() {
+        let _ = AlignedF32Slab::new_uninit(usize::MAX / std::mem::size_of::<f32>() + 2);
+    }
+
+    #[test]
+    fn slab_hugepage_size_is_zero_initialized_and_page_aligned() {
+        let len = HUGE_SLAB_BYTES / std::mem::size_of::<f32>();
+        let slab = AlignedF32Slab::new_uninit(len);
+        assert_eq!(slab.len(), len);
+        assert_eq!((slab.as_slice().as_ptr() as usize) % 4096, 0);
+        assert!(slab.as_slice().iter().all(|&v| v == 0.0));
     }
 }

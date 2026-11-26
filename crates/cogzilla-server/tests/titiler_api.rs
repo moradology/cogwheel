@@ -5125,3 +5125,201 @@ async fn sweep31_gg1_mosaic_and_stac_exact_zonal_statistics() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn audit75_power_expr_npy_and_unscale_heterogeneous_geotiff_dtypes() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_audit75_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a minimal 1-band EPSG:4326 uncompressed GeoTIFF with optional GDAL_METADATA.
+    let write_1band_4326 = |path: &std::path::Path,
+                            bits: u16,
+                            sample_format: u16,
+                            pixels: &[u8],
+                            gdal_meta: Option<&str>| {
+        let w = 16u32;
+        let h = 16u32;
+        let bounds = [-122.5f64, 37.7, -122.3, 37.9];
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        let meta_bytes = gdal_meta.map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        });
+        let num_entries: u16 = 14 + u16::from(meta_bytes.is_some());
+        let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+        let data_start = 8 + ifd_size;
+
+        let scale_off = data_start as u32;
+        let tiepoint_off = scale_off + 24;
+        let geokey_off = tiepoint_off + 48;
+        let meta_off = geokey_off + 24;
+        let meta_len = meta_bytes.as_ref().map_or(0, Vec::len) as u32;
+        let pixel_off = meta_off + meta_len;
+
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w); // ImageWidth
+        push_entry(&mut buf, 257, 4, 1, h); // ImageLength
+        push_entry(&mut buf, 258, 3, 1, bits as u32); // BitsPerSample
+        push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+        push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+        push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+        push_entry(&mut buf, 277, 3, 1, 1); // SamplesPerPixel = 1
+        push_entry(&mut buf, 278, 4, 1, h); // RowsPerStrip
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32); // StripByteCounts
+        push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+        push_entry(&mut buf, 339, 3, 1, sample_format as u32); // SampleFormat
+        push_entry(&mut buf, 33550, 12, 3, scale_off); // ModelPixelScaleTag
+        push_entry(&mut buf, 33922, 12, 6, tiepoint_off); // ModelTiepointTag
+        push_entry(&mut buf, 34735, 3, 12, geokey_off); // GeoKeyDirectoryTag
+        if meta_len > 0 {
+            push_entry(&mut buf, 42112, 2, meta_len, meta_off); // GDAL_METADATA
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+
+        let sx = (bounds[2] - bounds[0]) / w as f64;
+        let sy = (bounds[3] - bounds[1]) / h as f64;
+        for v in [sx, sy, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(m) = meta_bytes {
+            buf.extend_from_slice(&m);
+        }
+        buf.extend_from_slice(pixels);
+        std::fs::write(path, buf).unwrap();
+    };
+
+    let u8_path = tmp.join("a_u8.tif");
+    let u8_scaled_path = tmp.join("scaled_u8.tif");
+    let u16_path = tmp.join("b_u16.tif");
+    let u16_two_path = tmp.join("two_u16.tif");
+    let f32_path = tmp.join("c_f32.tif");
+
+    let u8_px = vec![50u8; 16 * 16];
+    let u16_px: Vec<u8> = [500u16; 16 * 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let u16_two_px: Vec<u8> = [2u16; 16 * 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let f32_px: Vec<u8> = [1234.5f32; 16 * 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    write_1band_4326(&u8_path, 8, 1, &u8_px, None);
+    write_1band_4326(
+        &u8_scaled_path,
+        8,
+        1,
+        &u8_px,
+        Some(r#"<GDALMetadata><Item name="scale" sample="0" role="scale">0.01</Item><Item name="offset" sample="0" role="offset">10.0</Item></GDALMetadata>"#),
+    );
+    write_1band_4326(&u16_path, 16, 1, &u16_px, None);
+    write_1band_4326(&u16_two_path, 16, 1, &u16_two_px, None);
+    write_1band_4326(&f32_path, 32, 3, &f32_px, None);
+
+    let stac_path = tmp.join("item.json");
+    let stac_json = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "audit75-het",
+        "bbox": [-122.5, 37.7, -122.3, 37.9],
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[-122.5, 37.7], [-122.3, 37.7], [-122.3, 37.9], [-122.5, 37.9], [-122.5, 37.7]]]
+        },
+        "properties": {},
+        "assets": {
+            "a_u8": { "href": u8_path.to_string_lossy() },
+            "b_u16": { "href": u16_path.to_string_lossy() },
+            "c_f32": { "href": f32_path.to_string_lossy() }
+        }
+    });
+    std::fs::write(&stac_path, serde_json::to_string(&stac_json).unwrap()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // A. Power expressions (`**` and `^`) on integer COGs must promote to Float64 (<f8), not Int32.
+    for expr in ["b1**-1", "b1%5E-1"] {
+        let r = client
+            .get(format!(
+                "{base}/cog/preview.npy?url={}&expression={expr}&return_mask=false",
+                u16_two_path.to_string_lossy()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "expr {expr} failed");
+        let bytes = r.bytes().await.unwrap();
+        let hdr_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let hdr = std::str::from_utf8(&bytes[10..10 + hdr_len]).unwrap();
+        assert!(hdr.contains("'<f8'"), "expected Float64 <f8 for {expr}, got header: {hdr}");
+        let body = &bytes[10 + hdr_len..];
+        let v0 = f64::from_le_bytes(body[..8].try_into().unwrap());
+        assert!((v0 - 0.5).abs() < 1e-6, "expected 0.5 for 2^-1 ({expr}), got {v0}");
+    }
+
+    // B. `unscale=true` on a Uint8 COG requesting `.tif` must emit Float32 GeoTIFF, not 8-bit RGBA.
+    let r_unscale = client
+        .get(format!(
+            "{base}/cog/preview.tif?url={}&unscale=true",
+            u8_scaled_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_unscale.status(), 200);
+    let tif_unscale = r_unscale.bytes().await.unwrap();
+    let idx_unscale = cogzilla_tiff::parse_cog(&tif_unscale).unwrap();
+    assert_eq!(
+        idx_unscale.full_res().sample_type,
+        cogzilla_tiff::SampleType::Float32,
+        "unscale=true on Uint8 COG must emit Float32 GeoTIFF"
+    );
+
+    // C. Heterogeneous STAC assets starting with Uint8 requesting `.tif` must emit Float32 GeoTIFF.
+    let r_stac = client
+        .get(format!(
+            "{base}/stac/preview.tif?url={}&assets=a_u8&assets=b_u16&assets=c_f32&return_mask=false",
+            stac_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stac.status(), 200);
+    let tif_stac = r_stac.bytes().await.unwrap();
+    let idx_stac = cogzilla_tiff::parse_cog(&tif_stac).unwrap();
+    assert_eq!(
+        idx_stac.full_res().sample_type,
+        cogzilla_tiff::SampleType::Float32,
+        "heterogeneous STAC (u8, u16, f32) must emit Float32 GeoTIFF"
+    );
+    assert_eq!(idx_stac.full_res().samples_per_pixel, 3);
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
