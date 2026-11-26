@@ -5051,6 +5051,24 @@ async fn tile(
                 CrsModel::Epsg3857 => resampling,
                 _ => reproject,
             };
+            // A method that gathers a pixel's footprint is right only while the raster has
+            // an overview about as coarse as the tile: past that the tile engine gathers
+            // too little of it (`sum` comes out at half). Such a tile is refused, not drawn wrong.
+            if matches!(
+                treq.resample,
+                ResampleMode::Average | ResampleMode::Mode | ResampleMode::Gauss | ResampleMode::Rms | ResampleMode::Min
+                    | ResampleMode::Max | ResampleMode::Med | ResampleMode::Q1 | ResampleMode::Q3 | ResampleMode::Sum
+            ) {
+                let crs = engine.get_or_build_crs(&first)?;
+                let coarsest = first.index.ifds.iter().map(|ifd| ifd.width).min().unwrap_or(full.width).max(1);
+                let covered = mercator_resolution(&crs, &first).map(|res| res * f64::from(full.width) / f64::from(coarsest));
+                let of_tile = 40_075_016.685_578_49 / (256.0 * f64::from(1u32 << u32::from(treq.tile.z).min(30)));
+                if covered.is_none_or(|covered| of_tile > 2.0 * covered) {
+                    return Err(EngineError::BadRequest(
+                        "this resampling method is not drawn at a zoom this far below the raster's coarsest overview yet; use nearest, bilinear or cubic, or a `bbox`".into(),
+                    ));
+                }
+            }
             // The renderer draws tiles of 256 and 512 pixels; any other size is read as
             // planes, which is where a request with nearest-neighbour pixels has gone.
             if treq.tile_size != 256 && treq.tile_size != 512 {
