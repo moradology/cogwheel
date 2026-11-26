@@ -38,7 +38,7 @@ use super::zonal::{self, Bins, StatsOptions};
 use crate::engine::{BandRequest, EngineError, MOSAIC_SCENES_AHEAD, TileEngine};
 use crate::stac::{StacItem, stac_item_from_json};
 use crate::titiler::{
-    PolygonMask, build_map_html, encode_rgba_output_colour, query_point, render_wgs84_bbox,
+    PolygonMask, build_map_html, encode_rgba_output_colour, query_point, render_crs_bbox, render_wgs84_bbox,
 };
 
 /// Most scenes one tile may read. titiler-pgstac's default `items_limit` is 100.
@@ -3082,10 +3082,12 @@ async fn part_image_of(
     }
     let own_geometry = given_in_metres.then(|| bbox_polygon(in_degrees));
     let geometry = searched.or(own_geometry.as_ref()).unwrap_or(geometry);
-    if mercator && !(planes_can && pq.algorithm.is_none()) {
+    // The renderer draws a box in Web Mercator as well as in degrees, but cuts a posted
+    // shape out of degrees only.
+    if mercator && mask.is_some() && !(planes_can && pq.algorithm.is_none()) {
         return detail(
             StatusCode::BAD_REQUEST,
-            "dst_crs 'epsg:3857' is not drawn with `algorithm`, or with band math only the renderer reads",
+            "dst_crs 'epsg:3857' is not drawn for a posted shape with `algorithm`, or with band math only the renderer reads",
         );
     }
     // The extension in the path, then `format=`; with neither, the pixels decide.
@@ -3144,13 +3146,14 @@ async fn part_image_of(
         // or the first three, where planes would stack them all and TiTiler refuse most.
         let alpha = first.iter().any(|cog| !cog.index.full_res().extra_samples.is_empty())
             || (first.len() == 1 && !matches!(first[0].index.full_res().samples_per_pixel, 1 | 3));
-        // Those the renderer draws, and it draws in degrees only.
-        if mercator && alpha && !planes_needed {
+        // Those the renderer draws; in Web Mercator, only where no posted shape cuts the box.
+        if mercator && alpha && !planes_needed && mask.is_some() {
             return Err(EngineError::BadRequest(
-                "dst_crs 'epsg:3857' is not supported for a raster with an alpha band, or of two bands or more than three asked for whole".into(),
+                "dst_crs 'epsg:3857' is not supported for a posted shape over a raster with an alpha band, or of two bands or more than three asked for whole".into(),
             ));
         }
-        if mercator || planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
+        let renderer_in_mercator = mercator && mask.is_none() && !planes_needed && (pq.algorithm.is_some() || !planes_can || alpha);
+        if (mercator && !renderer_in_mercator) || planes_needed || !TileEngine::on_one_grid(&first) || (planes_preferred && !alpha) {
             if pq.algorithm.is_some() {
                 return Err(EngineError::BadRequest(
                     "`algorithm` is not supported with these assets and options yet".into(),
@@ -3199,6 +3202,8 @@ async fn part_image_of(
         let (mut width, mut height) = (0usize, 0usize);
         // With a pixel selection other than `first`: every scene's values, and how to colour them.
         let mut selecting: Option<(Fold, Paint)> = None;
+        // Degrees, or Web Mercator metres for a box drawn there.
+        let drawn_in = if mercator { CrsModel::Epsg3857 } else { CrsModel::Geographic };
         // One band under a colour map, with a colour formula: drawn grey, coloured at the end.
         let mut map_after: Option<MapAfterFormula> = None;
         let mut one_grey = false;
@@ -3214,7 +3219,7 @@ async fn part_image_of(
             }
             if n == 0 {
                 // The first item sets the size; the others are drawn onto its grid.
-                let res = warped_resolution(&crs, &cogs[0], false).ok_or_else(|| {
+                let res = warped_resolution(&crs, &cogs[0], mercator).ok_or_else(|| {
                     EngineError::BadRequest("cannot place the first item in WGS84".into())
                 })?;
                 let (w, h) = part_dims(size, bbox, res);
@@ -3250,8 +3255,8 @@ async fn part_image_of(
             let exact = formula.is_some() && one_grey_band(&bands) && (map_after.is_some() || one_grey);
             // As on tiles: `resampling` for a source already in the output's projection,
             // `reproject` for one that has to be warped into it.
-            let resample = match crs {
-                CrsModel::Geographic => query.resampling,
+            let resample = match (crs, mercator) {
+                (CrsModel::Geographic, false) | (CrsModel::Epsg3857, true) => query.resampling,
                 _ => query.reproject,
             };
             if let Some(method) = query.selection.or(exact.then_some(Selection::First)) {
@@ -3264,10 +3269,11 @@ async fn part_image_of(
                     let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
                     selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint));
                 }
-                let values = render_wgs84_bbox(
+                let values = render_crs_bbox(
                     engine,
                     &cogs,
                     bbox,
+                    &drawn_in,
                     width as u32,
                     height as u32,
                     mask,
@@ -3294,10 +3300,11 @@ async fn part_image_of(
             if pq.unscale {
                 apply_unscale_cogs(&mut bands, &cogs);
             }
-            let rgba = render_wgs84_bbox(
+            let rgba = render_crs_bbox(
                 engine,
                 &cogs,
                 bbox,
+                &drawn_in,
                 width as u32,
                 height as u32,
                 mask,
@@ -4649,18 +4656,13 @@ async fn tile(
             return detail(StatusCode::BAD_REQUEST, "a tile's scale is from @1x to @8x");
         }
         pq.buffer = 0.0;
-        // What the renderer draws of a tile, it draws without a `buffer`: said here, in a
-        // tile's words, sooner than further on in a box's.
+        // A box has no bare array: said here, in a tile's words, sooner than further on in a box's.
         let raw = matches!(ext, "bin" | "raw" | "f32") || matches!(query_value(pairs, "format"), Some("bin" | "raw" | "f32"));
-        match check_mosaic_query(&pq, pairs) {
-            Ok(q) if pq.algorithm.is_some() || raw || !planes_read_all(&pq, &q) => {
-                return detail(
-                    StatusCode::BAD_REQUEST,
-                    "a tile with a `buffer` is drawn as a picture or `.npy`, and without `algorithm` or band math only the renderer reads",
-                );
-            }
-            Ok(_) => {}
-            Err(r) => return r,
+        if let Err(r) = check_mosaic_query(&pq, pairs) {
+            return r;
+        }
+        if raw {
+            return detail(StatusCode::BAD_REQUEST, "a tile with a `buffer` is drawn as a picture, `.npy` or `.tif`");
         }
         let buffer = buffer_asked;
         // As in rio-tiler, which grows the tile by whole pixels: halves, since both sides grow.
