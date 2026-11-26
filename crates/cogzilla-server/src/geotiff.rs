@@ -454,7 +454,7 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
                     let v = read_sample(i);
                     let x: $t = if !is_mask(i) {
                         cast(v)
-                    } else if v.is_finite() && v != 0.0 {
+                    } else if v.is_finite() && v > 0.0 {
                         <$t>::MAX
                     } else {
                         <$t>::MIN
