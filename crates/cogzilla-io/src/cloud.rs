@@ -501,6 +501,14 @@ async fn fetch_gcs_inner(
                 url: crate::backend::redact_http_url(&url),
             });
         }
+        if status == 206
+            && let Some((start, _)) = range
+            && !crate::backend::validate_content_range_start(&resp, start)
+        {
+            return Err(IoError::RangeNotSupported {
+                url: crate::backend::redact_http_url(&url),
+            });
+        }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus {
                 status,
@@ -522,6 +530,11 @@ async fn fetch_gcs_inner(
                     .remote_bytes_fetched
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 return Ok(data);
+            }
+            Err(IoError::ResponseTooLarge { .. }) if status == 200 && range.is_some() => {
+                return Err(IoError::RangeNotSupported {
+                    url: crate::backend::redact_http_url(&url),
+                });
             }
             Err(IoError::Http(e)) => {
                 if is_retryable_transport_error(&e) {
@@ -685,6 +698,12 @@ async fn fetch_azure_inner(
         {
             return Err(IoError::RangeNotSupported { url: clean_url });
         }
+        if status == 206
+            && let Some((start, _)) = range
+            && !crate::backend::validate_content_range_start(&resp, start)
+        {
+            return Err(IoError::RangeNotSupported { url: clean_url });
+        }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus {
                 status,
@@ -706,6 +725,9 @@ async fn fetch_azure_inner(
                     .remote_bytes_fetched
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 return Ok(data);
+            }
+            Err(IoError::ResponseTooLarge { .. }) if status == 200 && range.is_some() => {
+                return Err(IoError::RangeNotSupported { url: clean_url });
             }
             Err(IoError::Http(e)) => {
                 if is_retryable_transport_error(&e) {

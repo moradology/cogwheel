@@ -200,10 +200,22 @@ pub fn matches_any_prefix_with_opts(
             } else {
                 p
             };
-            match candidate.strip_prefix(p) {
-                Some(rest) => rest.is_empty() || p.ends_with('/') || rest.starts_with('/'),
+            let matches_prefix = |pfx: &str| match candidate.strip_prefix(pfx) {
+                Some(rest) => rest.is_empty() || pfx.ends_with('/') || rest.starts_with('/'),
                 None => false,
+            };
+            if matches_prefix(p) {
+                return true;
             }
+            // Canonicalize HTTP(S) prefixes (lowercasing host and stripping default ports
+            // `:80`/`:443`) so prefixes like `https://Bucket.Example.com:443/` still match
+            // WHATWG-normalized URLs without relaxing path-boundary or scheme checks.
+            if cand_http && (p.starts_with("http://") || p.starts_with("https://")) {
+                if let Ok(parsed_p) = reqwest::Url::parse(p) {
+                    return matches_prefix(parsed_p.as_str());
+                }
+            }
+            false
         })
     };
 
@@ -338,6 +350,22 @@ mod tests {
         assert!(!matches_any_prefix(&p, "s3://imagery/private/a.tif"));
         assert!(!matches_any_prefix(&p, "/etc/passwd"));
         assert!(!matches_any_prefix(&p, "http://169.254.169.254/latest/meta-data/"));
+
+        // Uppercase host or explicit default port (:443 / :80) in prefix matches canonicalized URLs
+        // without relaxing path-boundary or lowercase-scheme checks.
+        let p_norm = list(&[
+            "https://Bucket.Example.com/",
+            "https://port.example.com:443/public/",
+            "http://plain.example.com:80/data",
+        ]);
+        assert!(matches_any_prefix(&p_norm, "https://Bucket.Example.com/a.tif"));
+        assert!(matches_any_prefix(&p_norm, "https://bucket.example.com/a.tif"));
+        assert!(matches_any_prefix(&p_norm, "https://port.example.com:443/public/a.tif"));
+        assert!(matches_any_prefix(&p_norm, "https://port.example.com/public/a.tif"));
+        assert!(matches_any_prefix(&p_norm, "http://plain.example.com:80/data/a.tif"));
+        assert!(!matches_any_prefix(&p_norm, "https://bucket.example.com.evil.test/a.tif"));
+        assert!(!matches_any_prefix(&p_norm, "http://plain.example.com/data2/a.tif"));
+        assert!(!matches_any_prefix(&p_norm, "HTTPS://bucket.example.com/a.tif"));
     }
 
     #[test]

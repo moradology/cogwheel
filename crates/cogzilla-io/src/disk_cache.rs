@@ -22,6 +22,7 @@ struct DiskEntry {
 struct WriteJob {
     key: [u8; 16],
     data: Bytes,
+    epoch: u64,
 }
 
 /// Snapshot of tier-2 disk cache counters for `/stats` observability.
@@ -51,6 +52,7 @@ pub struct DiskBlockCache {
     clock: AtomicU64,
     evicting: AtomicBool,
     tmp_seq: AtomicU64,
+    clear_epoch: AtomicU64,
     tx: std::sync::mpsc::SyncSender<WriteJob>,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
@@ -75,6 +77,7 @@ impl DiskBlockCache {
             clock: AtomicU64::new(1),
             evicting: AtomicBool::new(false),
             tmp_seq: AtomicU64::new(0),
+            clear_epoch: AtomicU64::new(0),
             tx,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -95,7 +98,10 @@ impl DiskBlockCache {
                     let Some(c) = writer_cache.upgrade() else {
                         break;
                     };
-                    c.write_sync(job.key, &job.data);
+                    if job.epoch != c.clear_epoch.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    c.write_sync(job.key, &job.data, Some(job.epoch));
                 }
             });
 
@@ -242,11 +248,11 @@ impl DiskBlockCache {
 
     /// Remove all cached block files on disk and clear the in-memory index.
     pub fn clear(&self) {
+        self.clear_epoch.fetch_add(1, Ordering::AcqRel);
         let keys: Vec<[u8; 16]> = self.entries.iter().map(|e| *e.key()).collect();
         for key in keys {
             self.remove_entry(key);
         }
-        self.current_bytes.store(0, Ordering::Release);
     }
 
     /// Synchronous read + CRC32 verification (call from `spawn_blocking` on async paths).
@@ -283,7 +289,8 @@ impl DiskBlockCache {
         if self.entries.contains_key(&key) {
             return;
         }
-        if self.tx.try_send(WriteJob { key, data }).is_err() {
+        let epoch = self.clear_epoch.load(Ordering::Acquire);
+        if self.tx.try_send(WriteJob { key, data, epoch }).is_err() {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -294,10 +301,14 @@ impl DiskBlockCache {
             return;
         }
         let key = Self::key_bytes(uri, ifd_idx, tile_idx);
-        self.write_sync(key, data);
+        self.write_sync(key, data, None);
     }
 
-    fn write_sync(&self, key: [u8; 16], data: &[u8]) {
+    fn write_sync(&self, key: [u8; 16], data: &[u8], expected_epoch: Option<u64>) {
+        let stale = || expected_epoch.is_some_and(|e| e != self.clear_epoch.load(Ordering::Acquire));
+        if stale() {
+            return;
+        }
         let path = self.entry_path(key);
         if let Some(parent) = path.parent() {
             if fs::create_dir_all(parent).is_err() {
@@ -309,20 +320,28 @@ impl DiskBlockCache {
         let tmp_path = path.with_extension(format!("cgz.tmp.{}.{seq}", std::process::id()));
 
         let crc = crc32fast::hash(data);
-        let write_res = (|| -> std::io::Result<()> {
+        let write_res = (|| -> std::io::Result<bool> {
             let mut f = fs::File::create(&tmp_path)?;
             f.write_all(&MAGIC)?;
             f.write_all(&crc.to_le_bytes())?;
             f.write_all(data)?;
             f.flush()?;
+            if stale() {
+                let _ = fs::remove_file(&tmp_path);
+                return Ok(false);
+            }
             fs::rename(&tmp_path, &path)?;
-            Ok(())
+            Ok(true)
         })();
 
-        if write_res.is_err() {
-            let _ = fs::remove_file(&tmp_path);
-            self.write_errors.fetch_add(1, Ordering::Relaxed);
-            return;
+        match write_res {
+            Ok(false) => return,
+            Err(_) => {
+                let _ = fs::remove_file(&tmp_path);
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Ok(true) => {}
         }
 
         let new_sz = (HEADER_LEN + data.len()) as u64;
@@ -350,6 +369,12 @@ impl DiskBlockCache {
                 })
                 .unwrap_or(0)
                 .saturating_sub(old_sz);
+        }
+
+        // If `clear()` ran concurrently between rename and insert, immediately remove the stale entry.
+        if stale() {
+            self.remove_entry(key);
+            return;
         }
 
         if now > self.max_bytes {
@@ -510,6 +535,27 @@ mod tests {
         c.clear();
         assert_eq!(c.stats().bytes_used, 0);
         assert!(c.get_sync("s3://bucket/b.tif", 0, 9).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_epoch_drops_stale_queued_writes_and_keeps_accounting_consistent() {
+        let dir = temp_dir("clear_epoch");
+        let c = DiskBlockCache::open(&dir, 64 * 1024).unwrap();
+        let payload = Bytes::from(vec![42u8; 256]);
+        for i in 0..32u32 {
+            c.put_async("s3://bucket/stale.tif", 0, i, payload.clone());
+        }
+        c.clear();
+        // Give the background writer thread time to drain any queued pre-clear jobs.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // A post-clear write must still be accounted for accurately.
+        c.put_sync("s3://bucket/fresh.tif", 0, 0, b"fresh-v2");
+        assert_eq!(
+            c.get_sync("s3://bucket/fresh.tif", 0, 0).unwrap().as_ref(),
+            b"fresh-v2"
+        );
+        assert_eq!(c.stats().bytes_used, (HEADER_LEN + 8) as u64);
         let _ = fs::remove_dir_all(&dir);
     }
 }
