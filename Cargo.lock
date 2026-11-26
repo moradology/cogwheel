@@ -345,6 +345,7 @@ dependencies = [
  "libdeflater",
  "libwebp-sys",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
