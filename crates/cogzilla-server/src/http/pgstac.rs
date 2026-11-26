@@ -214,7 +214,14 @@ pub(super) fn plain_numbers(raw_query: &str) -> String {
         };
         (written != value).then(|| format!("{key}={written}"))
     };
-    let parts: Vec<String> = raw_query.split('&').map(|part| plain(part).unwrap_or_else(|| part.to_string())).collect();
+    // A size of zero is a size not given, as rio-tiler reads it: the pair is dropped.
+    let unset = |part: &str| {
+        part.split_once('=').is_some_and(|(key, value)| {
+            matches!(key, "width" | "height" | "max_size") && py_whole(&percent_decode(value)) && py_number(&percent_decode(value)) == Some(0.0)
+        })
+    };
+    let parts: Vec<String> =
+        raw_query.split('&').filter(|part| !unset(part)).map(|part| plain(part).unwrap_or_else(|| part.to_string())).collect();
     parts.join("&")
 }
 
@@ -1979,7 +1986,8 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
 /// parameter FastAPI checks in titiler-pgstac, is a 422 as there; anything else (what is
 /// not supported here, above all) stays the 400 it was.
 fn parse_error(e: &str) -> Resp {
-    const CHECKED: [&str; 9] = ["coord_crs", "dst_crs", "crs", "max_size", "nodata", "unscale", "return_mask", "buffer", "padding"];
+    const CHECKED: [&str; 11] =
+        ["coord_crs", "dst_crs", "crs", "max_size", "width", "height", "nodata", "unscale", "return_mask", "buffer", "padding"];
     match error_parameter(e) {
         Some(name) if e.starts_with("invalid ") && CHECKED.contains(&name) => {
             let msg = if name.ends_with("crs") { "Value error, invalid CRS format" } else { "Input should be a valid value" };
@@ -6246,6 +6254,11 @@ pub(super) async fn item_route(
             "pgSTAC is not configured: set DATABASE_URL, or PGHOST and the other PG* variables",
         ));
     };
+    // What FastAPI answers before the item is looked for: the method, then the path.
+    let pairs = query_pairs(ctx.raw_query);
+    if let Some(resp) = item_path_error(method, rest, pq, &pairs) {
+        return Done(resp);
+    }
     let base = format!("/collections/{collection}/items/{item_id}");
     let (collection, item_id) = (percent_decode(collection), percent_decode(item_id));
     let doc = match pg.get_item_cached(&collection, &item_id).await {
@@ -6284,7 +6297,6 @@ pub(super) async fn item_route(
     }
     let item = Arc::new(item);
     let get = *method == Method::GET;
-    let pairs = query_pairs(ctx.raw_query);
 
     match rest {
         ["assets"] if get => return Done(json_resp(StatusCode::OK, &json!(readable))),
@@ -6559,6 +6571,58 @@ where
         }
         _ => not_found(),
     }
+}
+
+/// The methods an item's routes take, by the shape of the path: `(get, post)`; `None` for
+/// a path that is no route of an item.
+fn item_route_methods(rest: &[&str]) -> Option<(bool, bool)> {
+    match rest {
+        ["statistics"] => Some((true, true)),
+        [first, ..] if *first == "feature" || first.starts_with("feature.") => Some((false, true)),
+        ["info" | "info.geojson" | "assets" | "asset_statistics" | "renders" | "WMTSCapabilities.xml" | "preview" | "tiles"] => Some((true, false)),
+        [one] if one.starts_with("preview.") => Some((true, false)),
+        [_, "tilejson.json" | "map.html"] | ["preview" | "renders" | "tiles" | "point" | "bbox", _] => Some((true, false)),
+        ["tiles", _, _, _, _] | ["bbox", _, _] => Some((true, false)),
+        _ => None,
+    }
+}
+
+/// What is wrong with an item's request that FastAPI says before anything is read: a
+/// method the route does not take (405), then a piece of the path, or a size, that
+/// cannot be read (422). The parsers are the ones a search's routes read their paths with.
+fn item_path_error(method: &Method, rest: &[&str], pq: &ParsedQuery, pairs: &[(String, String)]) -> Option<Resp> {
+    let (get, post) = item_route_methods(rest)?;
+    if !(*method == Method::GET && get || *method == Method::POST && post) {
+        return Some(method_not_allowed(Some(if get { Method::GET } else { Method::POST })));
+    }
+    let unknown_tms = |tms: &str| {
+        (!TITILER_TMS.contains(&tms) && crate::tms::lookup_tms(tms).is_none())
+            .then(|| invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet"))
+    };
+    let of_path = match rest {
+        ["tiles", tms, zs, xs, ys] => unknown_tms(tms).or_else(|| match parse_y_scale_ext(ys) {
+            None => Some(invalid_param("path", "y", "Input should be a valid integer")),
+            Some((y, _, ext)) => parse_zxy(zs, xs, y).err().or_else(|| format_error(ext.filter(|_| ys.contains('.')))),
+        }),
+        ["tiles", tms] | [tms, "tilejson.json" | "map.html"] => unknown_tms(tms),
+        ["point", at] => point_coords(at).err(),
+        ["bbox", _, dims] => match path_size(dims) {
+            Err(resp) if resp.status() == StatusCode::UNPROCESSABLE_ENTITY => Some(resp),
+            _ => format_error(dims.split_once('.').map(|(_, ext)| ext)),
+        },
+        ["preview", dims] => format_error(dims.split_once('.').map(|(_, ext)| ext)),
+        [one] if one.starts_with("preview.") => format_error(one.strip_prefix("preview.")),
+        _ => None,
+    };
+    // A size that is not a number. One that is, and is out of the range drawn here, stays
+    // the 400 of a limit; `padding` and `buffer` are answered for where tiles are checked.
+    of_path.or_else(|| {
+        pq.errors.iter().find_map(|e| {
+            let name = error_parameter(e).filter(|name| matches!(*name, "max_size" | "width" | "height"))?;
+            let unread = pairs.iter().rev().find(|(k, _)| k == name).is_some_and(|(_, v)| !py_whole(v));
+            unread.then(|| invalid_param("query", name, "Input should be a valid value"))
+        })
+    })
 }
 
 /// The method each route of a mosaic takes, by the shape of its path; `None` for a path
