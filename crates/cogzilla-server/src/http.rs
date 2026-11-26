@@ -5156,20 +5156,25 @@ where
                     let nodata = pq.nodata;
                     async move {
                         if mask.is_empty() {
-                            if let Some(first_url) = mj_c.first_asset()
-                                && let Ok(cog) = eng.store.open_uri(first_url).await
-                                && let Ok(stats) = compute_statistics_with_options(
-                                    &eng,
-                                    &cog,
-                                    max_size,
-                                    Some(&mask),
-                                    unscale,
-                                    nodata,
-                                    &opts,
-                                )
-                                .await
-                            {
-                                return Ok(stats);
+                            if let Some(first_url) = mj_c.first_asset() {
+                                match eng.store.open_uri(first_url).await {
+                                    Ok(cog) => {
+                                        return compute_statistics_with_options(
+                                            &eng,
+                                            &cog,
+                                            max_size,
+                                            Some(&mask),
+                                            unscale,
+                                            nodata,
+                                            &opts,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                                        return Err(EngineError::Io(e));
+                                    }
+                                    Err(_) => {}
+                                }
                             }
                             let mut empty = compute_f32_band_stats(&[], "b1", &opts);
                             if let Some(o) = empty.as_object_mut() {
@@ -5275,20 +5280,30 @@ where
                             let opts = opts_m.clone();
                             async move {
                                 if mask.is_empty() {
-                                    if let Some(first_url) = mj_c.first_asset()
-                                        && let Ok(cog) = eng.store.open_uri(first_url).await
-                                        && let Ok(stats) = compute_statistics_with_options(
-                                            &eng,
-                                            &cog,
-                                            max_size,
-                                            Some(&mask),
-                                            unscale,
-                                            nodata,
-                                            &opts,
-                                        )
-                                        .await
-                                    {
-                                        return Ok(stats);
+                                    if let Some(first_url) = mj_c.first_asset() {
+                                        match eng.store.open_uri(first_url).await {
+                                            Ok(cog) => {
+                                                return compute_statistics_with_options(
+                                                    &eng,
+                                                    &cog,
+                                                    max_size,
+                                                    Some(&mask),
+                                                    unscale,
+                                                    nodata,
+                                                    &opts,
+                                                )
+                                                .await;
+                                            }
+                                            Err(e)
+                                                if matches!(
+                                                    e.root(),
+                                                    cogzilla_io::IoError::Forbidden(_)
+                                                ) =>
+                                            {
+                                                return Err(EngineError::Io(e));
+                                            }
+                                            Err(_) => {}
+                                        }
                                     }
                                     let mut empty = compute_f32_band_stats(&[], "b1", &opts);
                                     if let Some(o) = empty.as_object_mut() {
@@ -7101,13 +7116,34 @@ where
                     let n = names_c.len();
                     async move {
                         if is_dem_alg || expr_progs_c.is_some() {
-                            let (def_w, def_h) = aspect_preserving_dims(poly_bbox, max_size);
-                            let (out_w, out_h) = resolve_query_dims(def_w, def_h, width_opt, height_opt);
-                            let n_px = (out_w as usize) * (out_h as usize);
                             if is_dem_alg {
                                 let full = cogs_c[0].index.full_res();
                                 let db = if cogs_c.len() > 1 { cogs_c.len() as u16 } else { full.samples_per_pixel };
                                 let mut bands = build_band_request(&pq_clone, db, full.sample_type)?;
+                                if mask.is_empty() {
+                                    let alg_name = alg_c.as_deref().unwrap_or("algorithm");
+                                    let nb = match alg_name {
+                                        "terrarium" | "terrainrgb" | "terrain-rgb" | "mapbox" => 3,
+                                        _ => 1,
+                                    };
+                                    let mut map = serde_json::Map::new();
+                                    for b in 0..nb {
+                                        let desc = if nb == 1 {
+                                            alg_name.to_string()
+                                        } else {
+                                            format!("{alg_name}_b{}", b + 1)
+                                        };
+                                        let mut empty = compute_f32_band_stats(&[], &desc, &stats_opts);
+                                        if let Some(o) = empty.as_object_mut() {
+                                            o.insert("area".into(), serde_json::Value::Null);
+                                        }
+                                        map.insert(format!("b{}", b + 1), empty);
+                                    }
+                                    return Ok::<_, EngineError>(serde_json::Value::Object(map));
+                                }
+                                let (def_w, def_h) = aspect_preserving_dims(poly_bbox, max_size);
+                                let (out_w, out_h) = resolve_query_dims(def_w, def_h, width_opt, height_opt);
+                                let n_px = (out_w as usize) * (out_h as usize);
                                 if unscale {
                                     apply_unscale_cogs(&mut bands, &cogs_c);
                                 }
@@ -7136,6 +7172,19 @@ where
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
                             let compiled = expr_progs_c.unwrap();
+                            if mask.is_empty() {
+                                let mut map = serde_json::Map::new();
+                                for (idx, (desc, _)) in compiled.into_iter().enumerate() {
+                                    let mut empty = compute_f32_band_stats(&[], &desc, &stats_opts);
+                                    if let Some(o) = empty.as_object_mut() {
+                                        o.insert("area".into(), serde_json::Value::Null);
+                                    }
+                                    map.insert(format!("b{}", idx + 1), empty);
+                                }
+                                return Ok::<_, EngineError>(serde_json::Value::Object(map));
+                            }
+                            let (def_w, def_h) = aspect_preserving_dims(poly_bbox, max_size);
+                            let (out_w, out_h) = resolve_query_dims(def_w, def_h, width_opt, height_opt);
                             // Fast exact analytical coverage + ellipsoidal area-weighted native-grid path
                             // (shared with POST /cog/statistics) whenever assets share the same pixel grid
                             // and no explicit output width/height resampling was requested.
