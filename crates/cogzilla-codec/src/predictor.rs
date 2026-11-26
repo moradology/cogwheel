@@ -2353,6 +2353,28 @@ pub fn reconstruct_i8(
 }
 
 /// Reconstruct `uint32` or `int32` Predictor 1 or Predictor 2 -> `AlignedF32Slab`.
+#[inline(always)]
+fn check_val_f64(v: f64, finite_nodata: Option<f64>) -> (f64, bool) {
+    if !v.is_finite() {
+        return (f64::NAN, true);
+    }
+    if let Some(nd) = finite_nodata
+        && v == nd
+    {
+        return (f64::NAN, true);
+    }
+    (v, false)
+}
+
+#[inline(always)]
+fn clamp_f64_stat(v: f64) -> f32 {
+    if !v.is_finite() {
+        v as f32
+    } else {
+        (v as f32).clamp(f32::MIN, f32::MAX)
+    }
+}
+
 pub fn reconstruct_int32(
     raw: &[u8],
     tile_w: u32,
@@ -2361,19 +2383,19 @@ pub fn reconstruct_int32(
     byte_order: ByteOrder,
     signed: bool,
     horizontal_diff: bool,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
     let mut acc = vec![0u32; bands_in_tile];
 
     for y in 0..h {
@@ -2395,8 +2417,8 @@ pub fn reconstruct_int32(
                 } else {
                     raw_u32
                 };
-                let vf = if signed { (bits as i32) as f32 } else { bits as f32 };
-                let (v, is_nd) = check_val(vf, finite_nodata);
+                let vf = if signed { (bits as i32) as f64 } else { bits as f64 };
+                let (v, is_nd) = check_val_f64(vf, finite_nodata);
                 slabs[b][row_off + x] = v;
                 if is_nd {
                     any_nodata[b] = true;
@@ -2412,15 +2434,20 @@ pub fn reconstruct_int32(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
         })
         .collect()
 }
 
-/// Reconstruct 64-bit unsigned (`Uint64`) or signed (`Int64`) integer tiles into `BandData::F32`,
+/// Reconstruct 64-bit unsigned (`Uint64`) or signed (`Int64`) integer tiles into `BandData::F64`,
 /// supporting both `Predictor::None` and `Predictor::HorizontalInt`.
 pub fn reconstruct_int64(
     raw: &[u8],
@@ -2430,19 +2457,19 @@ pub fn reconstruct_int64(
     byte_order: ByteOrder,
     signed: bool,
     horizontal_diff: bool,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
     let mut acc = vec![0u64; bands_in_tile];
 
     for y in 0..h {
@@ -2464,8 +2491,8 @@ pub fn reconstruct_int64(
                 } else {
                     raw_u64
                 };
-                let vf = if signed { (bits as i64) as f32 } else { bits as f32 };
-                let (v, is_nd) = check_val(vf, finite_nodata);
+                let vf = if signed { (bits as i64) as f64 } else { bits as f64 };
+                let (v, is_nd) = check_val_f64(vf, finite_nodata);
                 slabs[b][row_off + x] = v;
                 if is_nd {
                     any_nodata[b] = true;
@@ -2485,10 +2512,15 @@ pub fn reconstruct_int64(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
         })
         .collect()
 }
@@ -2562,34 +2594,34 @@ pub fn reconstruct_subbyte(
         .collect()
 }
 
-/// Zero-copy `float64` (`Predictor::None`) decode directly from an immutable slice.
+/// Zero-copy `float64` (`Predictor::None`) decode directly into exact `BandData::F64`.
 pub fn reconstruct_f64_uncompressed(
     raw: &[u8],
     tile_w: u32,
     tile_h: u32,
     bands_in_tile: usize,
     byte_order: ByteOrder,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let pixels = (tile_w as usize) * (tile_h as usize);
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
 
     for i in 0..pixels {
         for b in 0..bands_in_tile {
             let off = (i * bands_in_tile + b) * 8;
             let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
             let vf = match byte_order {
-                ByteOrder::Little => f64::from_le_bytes(bytes) as f32,
-                ByteOrder::Big => f64::from_be_bytes(bytes) as f32,
+                ByteOrder::Little => f64::from_le_bytes(bytes),
+                ByteOrder::Big => f64::from_be_bytes(bytes),
             };
-            let (v, is_nd) = check_val(vf, finite_nodata);
+            let (v, is_nd) = check_val_f64(vf, finite_nodata);
             slabs[b][i] = v;
             if is_nd {
                 any_nodata[b] = true;
@@ -2609,15 +2641,20 @@ pub fn reconstruct_f64_uncompressed(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
         })
         .collect()
 }
 
-/// Reconstruct `float64` (Predictor 1, Predictor 2, or 8-plane Predictor 3) -> `AlignedF32Slab`.
+/// Reconstruct `float64` (Predictor 1, Predictor 2, or 8-plane Predictor 3) -> exact `BandData::F64`.
 pub fn reconstruct_f64(
     raw: &mut [u8],
     tile_w: u32,
@@ -2625,19 +2662,19 @@ pub fn reconstruct_f64(
     bands_in_tile: usize,
     byte_order: ByteOrder,
     predictor: cogzilla_tiff::Predictor,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
 
     match predictor {
         cogzilla_tiff::Predictor::FloatingPoint => {
@@ -2661,8 +2698,8 @@ pub fn reconstruct_f64(
                             row[samples_per_row + idx],
                             row[idx],
                         ];
-                        let vf = f64::from_le_bytes(bytes) as f32;
-                        let (v, is_nd) = check_val(vf, finite_nodata);
+                        let vf = f64::from_le_bytes(bytes);
+                        let (v, is_nd) = check_val_f64(vf, finite_nodata);
                         slabs[b][row_off + x] = v;
                         if is_nd {
                             any_nodata[b] = true;
@@ -2689,8 +2726,8 @@ pub fn reconstruct_f64(
                             ByteOrder::Big => u64::from_be_bytes(bytes),
                         };
                         acc[b] = acc[b].wrapping_add(delta);
-                        let vf = f64::from_bits(acc[b]) as f32;
-                        let (v, is_nd) = check_val(vf, finite_nodata);
+                        let vf = f64::from_bits(acc[b]);
+                        let (v, is_nd) = check_val_f64(vf, finite_nodata);
                         slabs[b][row_off + x] = v;
                         if is_nd {
                             any_nodata[b] = true;
@@ -2709,10 +2746,10 @@ pub fn reconstruct_f64(
                     let off = (i * bands_in_tile + b) * 8;
                     let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
                     let vf = match byte_order {
-                        ByteOrder::Little => f64::from_le_bytes(bytes) as f32,
-                        ByteOrder::Big => f64::from_be_bytes(bytes) as f32,
+                        ByteOrder::Little => f64::from_le_bytes(bytes),
+                        ByteOrder::Big => f64::from_be_bytes(bytes),
                     };
-                    let (v, is_nd) = check_val(vf, finite_nodata);
+                    let (v, is_nd) = check_val_f64(vf, finite_nodata);
                     slabs[b][i] = v;
                     if is_nd {
                         any_nodata[b] = true;
@@ -2730,10 +2767,15 @@ pub fn reconstruct_f64(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
         })
         .collect()
 }

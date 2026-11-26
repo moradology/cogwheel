@@ -116,6 +116,16 @@ impl SampleType {
             Self::Float64 => "float64",
         }
     }
+
+    /// True when the sample type has values that cannot be represented exactly in IEEE-754 `f32`
+    /// (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`), requiring `f64` storage on data paths.
+    #[inline(always)]
+    pub const fn needs_f64(self) -> bool {
+        matches!(
+            self,
+            Self::Uint32 | Self::Int32 | Self::Uint64 | Self::Int64 | Self::Float64
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -402,6 +412,8 @@ pub struct CogIndex {
     /// `None` means no explicit GDAL_NODATA tag (NaN is still always treated as nodata).
     /// `Some(v)` where `v.is_nan()` means explicit NaN nodata; finite `v` means sentinel nodata.
     pub nodata: Option<f32>,
+    /// Full-precision `f64` GDAL_NODATA value for wide sample types (`Uint32`/`Int32`/`Uint64`/`Int64`/`Float64`).
+    pub nodata_f64: Option<f64>,
     /// Per-band scale factors parsed from `GDAL_METADATA` (defaults to `1.0` per band).
     pub scales: Vec<f32>,
     /// Per-band additive offsets parsed from `GDAL_METADATA` (defaults to `0.0` per band).

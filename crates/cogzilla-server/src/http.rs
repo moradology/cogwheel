@@ -2061,7 +2061,20 @@ fn geotiff_render_format(
     sample_type: cogzilla_tiff::SampleType,
 ) -> OutputFormat {
     if wants_f32_geotiff(ct, pq, source_cog, bands, sample_type) {
-        OutputFormat::RawF32
+        if sample_type.needs_f64()
+            && !pq.unscale
+            && !array_type::shown(pq)
+            && pq.algorithm.is_none()
+            && pq.expr_raw.is_none()
+            && matches!(
+                bands,
+                BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
+            )
+        {
+            OutputFormat::RawF64
+        } else {
+            OutputFormat::RawF32
+        }
     } else {
         fmt
     }
@@ -2078,7 +2091,24 @@ fn wrap_geotiff_fmt(
     return_mask: bool,
 ) -> Bytes {
     if ct == GEOTIFF_CONTENT_TYPE {
-        if matches!(fmt, OutputFormat::RawF32) {
+        if matches!(fmt, OutputFormat::RawF64) {
+            let n_px = (w as usize).saturating_mul(h as usize).max(1);
+            let n_bands = (data.len() / (n_px * 8)).max(1);
+            let vals: Vec<f64> = data
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            crate::geotiff::write_geotiff_typed_f64(
+                &vals,
+                n_bands,
+                w,
+                h,
+                cogzilla_tiff::SampleType::Float64,
+                bbox,
+                epsg,
+                return_mask,
+            )
+        } else if matches!(fmt, OutputFormat::RawF32) {
             encode_geotiff_f32(w, h, &data, bbox, epsg, return_mask)
         } else {
             encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
@@ -3434,7 +3464,7 @@ fn build_tile_request_for_tms(
     let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
     if let BandRequest::MultiBand { ref bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
         && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4))
     {
         return Err(EngineError::BadRequest(
@@ -4238,7 +4268,7 @@ async fn render_mosaic_tile_styled(
     }
 
     if (pq.color_formula.is_some() || !pq.return_mask)
-        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
     {
         let cf = pq
             .color_formula
@@ -7413,7 +7443,7 @@ where
                                 );
                                 Ok((data, ct))
                             } else if (pq.color_formula.is_some() || !pq.return_mask)
-                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                                && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
                             {
                                 let cf = pq
                                     .color_formula
@@ -8804,7 +8834,7 @@ where
                         } else if item_auto_format {
                             pgstac::item_tile_auto_format(&engine, &cogs, treq, &pq_stac).await
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
-                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
                         {
                             let cf = pq_stac
                                 .color_formula
@@ -10067,7 +10097,7 @@ where
                             };
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq.jpeg_quality, pq.return_mask))
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
-                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
+                            && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy)
                         {
                             let cf = pq
                                 .color_formula
@@ -12337,5 +12367,66 @@ mod tests {
         let hv = resp.headers().get("x-failed-assets").unwrap().to_str().unwrap();
         assert!(!hv.contains("secret") && !hv.contains("deadbeef"), "leaked creds in x-failed-assets: {hv}");
         assert!(hv.contains("https://s3.example.com/bucket/a.tif") && hv.contains("/local/ok.tif"), "{hv}");
+    }
+
+    #[test]
+    fn audit91_native_bbox_dims_aspect_antimeridian_and_0_360() {
+        let make_ifd = |w: u32, h: u32, a: f64, e: f64, c: f64, f: f64| {
+            let p2c = cogzilla_tiff::Affine2D { a, b: 0.0, c, d: 0.0, e, f };
+            cogzilla_tiff::IfdMeta {
+                width: w,
+                height: h,
+                tile_width: 256,
+                tile_height: 256,
+                tiles_across: w.div_ceil(256),
+                tiles_down: h.div_ceil(256),
+                sample_type: cogzilla_tiff::SampleType::Uint8,
+                samples_per_pixel: 1,
+                planar_config: cogzilla_tiff::PlanarConfig::Chunky,
+                compression: cogzilla_tiff::Compression::None,
+                predictor: cogzilla_tiff::Predictor::None,
+                photometric: 1,
+                extra_samples: Vec::new(),
+                jpeg_tables: None,
+                mask_ifd: None,
+                is_stripped: false,
+                pixel_to_crs: p2c,
+                crs_to_pixel: p2c.invert().unwrap(),
+                gcp_poly: None,
+                tile_offsets: Box::default(),
+                tile_byte_counts: Box::default(),
+            }
+        };
+        let geo = cogzilla_proj::CrsModel::Geographic;
+        let merc = cogzilla_proj::CrsModel::Epsg3857;
+
+        // 1. Large 2:1 global COG preserves 2:1 aspect ratio at the 4096 cap (4096x2048, not 4096x4096).
+        let ifd_2to1 = make_ifd(21600, 10800, 360.0 / 21600.0, -180.0 / 10800.0, -180.0, 90.0);
+        let dims = native_bbox_dims_in_crs(&ifd_2to1, &geo, &geo, [-180.0, -90.0, 180.0, 90.0], [-180.0, -90.0, 180.0, 90.0]);
+        assert_eq!(dims, (4096, 2048));
+
+        // 2. Global 0..360° Geographic COG (1440x720) keeps 1440x720 in Geographic and does not collapse ddx in 3857.
+        let ifd_360 = make_ifd(1440, 720, 0.25, -0.25, 0.0, 90.0);
+        assert_eq!(
+            native_bbox_dims_in_crs(&ifd_360, &geo, &geo, [-180.0, -90.0, 180.0, 90.0], [-180.0, -90.0, 180.0, 90.0]),
+            (1440, 720)
+        );
+        let merc_bb = [-20_037_508.342_789_244, -20_037_508.342_789_244, 20_037_508.342_789_244, 20_037_508.342_789_244];
+        let (mw, mh) = native_bbox_dims_in_crs(&ifd_360, &geo, &merc, [-180.0, -85.05, 180.0, 85.05], merc_bb);
+        assert!((1100..=1500).contains(&mw) && (1100..=1500).contains(&mh), "got ({mw}, {mh})");
+
+        // 3. Global 1024x1024 EPSG:3857 -> EPSG:4326 does NOT falsely wrap ddx (stays ~1309x619, not 3065x1448).
+        let span = 2.0 * 20_037_508.342_789_244;
+        let ifd_merc = make_ifd(1024, 1024, span / 1024.0, -span / 1024.0, -20_037_508.342_789_244, 20_037_508.342_789_244);
+        let (gw, gh) = native_bbox_dims_in_crs(&ifd_merc, &merc, &geo, [-180.0, -85.05, 180.0, 85.05], [-180.0, -85.05, 180.0, 85.05]);
+        assert!((1200..=1400).contains(&gw) && (550..=700).contains(&gh), "got ({gw}, {gh})");
+
+        // 4. Antimeridian-crossing UTM 60N (179°E..179°W) -> EPSG:4326 wraps ddx properly (~512x512, not 4x4).
+        let utm60 = cogzilla_proj::CrsModel::from_epsg(32660).unwrap();
+        let (x0, y0) = utm60.from_lonlat_deg(179.0, 1.0);
+        let (x1, y1) = utm60.from_lonlat_deg(-179.0, -1.0);
+        let ifd_am = make_ifd(512, 512, (x1 - x0) / 512.0, (y1 - y0) / 512.0, x0, y0);
+        let (aw, ah) = native_bbox_dims_in_crs(&ifd_am, &utm60, &geo, [179.0, -1.0, 181.0, 1.0], [179.0, -1.0, 181.0, 1.0]);
+        assert!((450..=580).contains(&aw) && (450..=580).contains(&ah), "got ({aw}, {ah})");
     }
 }

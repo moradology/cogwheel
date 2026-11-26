@@ -511,6 +511,39 @@ impl TileEngine {
         req: &TileRequest,
     ) -> Result<Bytes, EngineError> {
         self.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
+        if matches!(req.format, OutputFormat::RawF64 | OutputFormat::Npy)
+            && !req.unscale
+            && cog.index.full_res().sample_type.needs_f64()
+        {
+            let bands_1based: Option<Vec<u16>> = match &req.bands {
+                BandRequest::Single { band_1based, .. } => Some(vec![*band_1based]),
+                BandRequest::Rgb { bands_1based, .. } => Some(bands_1based.to_vec()),
+                BandRequest::MultiBand { bands_1based } => Some(bands_1based.clone()),
+                _ => None,
+            };
+            if let Some(b1) = bands_1based {
+                let kind = cog.index.full_res().sample_type;
+                let (minx, miny, maxx, maxy) = cogzilla_proj::tile_bounds_3857(req.tile);
+                return crate::titiler::render_exact_f64_array(
+                    self,
+                    cog,
+                    [minx, miny, maxx, maxy],
+                    &CrsModel::Epsg3857,
+                    false,
+                    req.tile_size,
+                    req.tile_size,
+                    None,
+                    &b1,
+                    req.resample,
+                    None,
+                    req.unscale,
+                    kind,
+                    true,
+                    matches!(req.format, OutputFormat::RawF64),
+                )
+                .await;
+            }
+        }
         if req.format == OutputFormat::Npy {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
@@ -2712,6 +2745,7 @@ mod tests {
             gcp_residual_px: None,
             geo_keys,
             nodata: None,
+            nodata_f64: None,
             scales: vec![1.0; 3],
             offsets: vec![0.0; 3],
             scales_f64: vec![1.0; 3],
