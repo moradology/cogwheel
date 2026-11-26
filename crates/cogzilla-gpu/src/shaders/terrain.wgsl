@@ -8,7 +8,8 @@ struct TerrainParams {
     resample_mode: u32,
     /// Algorithm: 0 = Hillshade, 1 = Slope, 2 = Aspect, 3 = Terrarium, 4 = TerrainRgb
     alg_mode: u32,
-    _pad0: u32,
+    /// Coordinate mode: 0 = Separable1D, 1 = Grid2D (17x17), 2 = Exact2D (dst_w * dst_h)
+    coord_mode: u32,
     inv_8dx: f32,
     inv_8dy: f32,
     z_factor: f32,
@@ -203,38 +204,50 @@ fn sample_elev(u: f32, v: f32) -> f32 {
     }
 }
 
-fn u_extrap(ix: i32) -> f32 {
-    let w = i32(params.dst_w);
-    if (ix < 0) {
-        if (w >= 2) {
-            return 2.0 * u_coords[0] - u_coords[1];
-        }
-        return u_coords[0];
+fn eval_uv_inbounds(px: u32, py: u32) -> vec2<f32> {
+    if (params.coord_mode == 0u) {
+        return vec2<f32>(u_coords[px], v_coords[py]);
+    } else if (params.coord_mode == 1u) {
+        let cell_px = max(params.dst_w / 16u, 1u);
+        let inv_cell = 1.0 / f32(cell_px);
+        let gx = min(px / cell_px, 15u);
+        let gy = min(py / cell_px, 15u);
+        let tx = f32(px - gx * cell_px) * inv_cell;
+        let ty = f32(py - gy * cell_px) * inv_cell;
+        let r0 = gy * 17u + gx;
+        let r1 = (gy + 1u) * 17u + gx;
+        let u_l = u_coords[r0] + (u_coords[r1] - u_coords[r0]) * ty;
+        let u_r = u_coords[r0 + 1u] + (u_coords[r1 + 1u] - u_coords[r0 + 1u]) * ty;
+        let v_l = v_coords[r0] + (v_coords[r1] - v_coords[r0]) * ty;
+        let v_r = v_coords[r0 + 1u] + (v_coords[r1 + 1u] - v_coords[r0 + 1u]) * ty;
+        return vec2<f32>(u_l + (u_r - u_l) * tx, v_l + (v_r - v_l) * tx);
+    } else {
+        let idx = py * params.dst_w + px;
+        return vec2<f32>(u_coords[idx], v_coords[idx]);
     }
-    if (ix >= w) {
-        if (w >= 2) {
-            return 2.0 * u_coords[u32(w - 1)] - u_coords[u32(w - 2)];
-        }
-        return u_coords[u32(w - 1)];
-    }
-    return u_coords[u32(ix)];
 }
 
-fn v_extrap(iy: i32) -> f32 {
+fn eval_uv_extrap(ix: i32, iy: i32) -> vec2<f32> {
+    let w = i32(params.dst_w);
     let h = i32(params.dst_h);
-    if (iy < 0) {
-        if (h >= 2) {
-            return 2.0 * v_coords[0] - v_coords[1];
-        }
-        return v_coords[0];
+    let cx = u32(clamp(ix, 0, w - 1));
+    let cy = u32(clamp(iy, 0, h - 1));
+    var uv = eval_uv_inbounds(cx, cy);
+    if (ix < 0 && w >= 2) {
+        uv = 2.0 * eval_uv_inbounds(0u, cy) - eval_uv_inbounds(1u, cy);
+    } else if (ix >= w && w >= 2) {
+        uv = 2.0 * eval_uv_inbounds(u32(w - 1), cy) - eval_uv_inbounds(u32(w - 2), cy);
     }
-    if (iy >= h) {
-        if (h >= 2) {
-            return 2.0 * v_coords[u32(h - 1)] - v_coords[u32(h - 2)];
-        }
-        return v_coords[u32(h - 1)];
+    if (iy < 0 && h >= 2) {
+        let uv0 = eval_uv_inbounds(cx, 0u);
+        let uv1 = eval_uv_inbounds(cx, 1u);
+        uv = uv + (uv0 - uv1);
+    } else if (iy >= h && h >= 2) {
+        let uv0 = eval_uv_inbounds(cx, u32(h - 1));
+        let uv1 = eval_uv_inbounds(cx, u32(h - 2));
+        uv = uv + (uv0 - uv1);
     }
-    return v_coords[u32(iy)];
+    return uv;
 }
 
 fn eval_horn_from_shared(lx: u32, ly: u32) -> f32 {
@@ -307,9 +320,8 @@ fn load_shared_tile(wg_id: vec3<u32>, lid: vec3<u32>) {
         }
         let ty = idx / 18u;
         let tx = idx - ty * 18u;
-        let u = u_extrap(base_x + i32(tx));
-        let v = v_extrap(base_y + i32(ty));
-        shared_elev[idx] = sample_elev(u, v);
+        let uv = eval_uv_extrap(base_x + i32(tx), base_y + i32(ty));
+        shared_elev[idx] = sample_elev(uv.x, uv.y);
         idx += 256u;
     }
     workgroupBarrier();
@@ -386,7 +398,8 @@ fn dem_terrain_rgb(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let elev = sample_elev(u_coords[px], v_coords[py]);
+    let uv = eval_uv_inbounds(px, py);
+    let elev = sample_elev(uv.x, uv.y);
     let out_idx = py * params.dst_w + px;
     if (!is_finite_f32(elev)) {
         dst_words[out_idx] = 0u;
