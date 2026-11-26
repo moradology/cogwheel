@@ -634,6 +634,160 @@ unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
     }
 }
 
+/// 12-byte (4-triplet) AVX2/SSSE3 Kogge-Stone prefix sum for stride-3 interleaved byte streams
+/// (3-band chunky float32 Predictor 3 rows on x86_64 cloud servers).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn prefix_sum_stride3_avx2(row: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let len = row.len();
+    let ptr = row.as_mut_ptr();
+    let mut carry = _mm_setzero_si128();
+    // Broadcast lanes [9, 10, 11] across all four 3-byte triplets in lanes 0..12.
+    let bcast_last3 = _mm_setr_epi8(9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10, 11, -1, -1, -1, -1);
+    let mut i = 0usize;
+
+    while i + 16 <= len {
+        let mut v = unsafe { _mm_loadu_si128(ptr.add(i) as *const __m128i) };
+        v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+        v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+        v = _mm_add_epi8(v, carry);
+        // Write exact 12 bytes (8 + 4) so bytes i+12..i+16 are never clobbered before next load.
+        unsafe {
+            _mm_storel_epi64(ptr.add(i) as *mut __m128i, v);
+            (ptr.add(i + 8) as *mut i32).write_unaligned(_mm_extract_epi32::<2>(v));
+        }
+        carry = _mm_shuffle_epi8(v, bcast_last3);
+        i += 12;
+    }
+
+    if i < len {
+        let mut idx = i.max(3);
+        while idx < len {
+            row[idx] = row[idx].wrapping_add(row[idx - 3]);
+            idx += 1;
+        }
+    }
+}
+
+/// Single-pass AVX2 3-band chunky `uint8` horizontal differencing (optional) + min/max/nodata stats.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reconstruct_u8_rgb3_avx2(
+    slice: &mut [u8],
+    w: usize,
+    h: usize,
+    horizontal_diff: bool,
+    nd_u8: Option<u8>,
+    any_valid: &mut [bool; 3],
+    any_nodata: &mut [bool; 3],
+    min_u8: &mut [u8; 3],
+    max_u8: &mut [u8; 3],
+) {
+    use std::arch::x86_64::*;
+    let zero = _mm_setzero_si128();
+    let v255 = _mm_set1_epi8(-1i8);
+    let bcast_last3 = _mm_setr_epi8(9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10, 11, -1, -1, -1, -1);
+    let mut vmin = v255;
+    let mut vmax = zero;
+    let mut v_any_valid = zero;
+    let mut v_any_nodata = zero;
+    let has_nd = nd_u8.is_some();
+    let v_nd = _mm_set1_epi8(nd_u8.unwrap_or(0) as i8);
+    let mut simd_ran = false;
+
+    for y in 0..h {
+        let row = &mut slice[y * w * 3..(y + 1) * w * 3];
+        let row_bytes = w * 3;
+        let ptr = row.as_mut_ptr();
+        let mut carry = zero;
+        let mut byte_i = 0usize;
+
+        while byte_i + 16 <= row_bytes {
+            simd_ran = true;
+            let mut v = unsafe { _mm_loadu_si128(ptr.add(byte_i) as *const __m128i) };
+            if horizontal_diff {
+                v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+                v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+                v = _mm_add_epi8(v, carry);
+                unsafe {
+                    _mm_storel_epi64(ptr.add(byte_i) as *mut __m128i, v);
+                    (ptr.add(byte_i + 8) as *mut i32).write_unaligned(_mm_extract_epi32::<2>(v));
+                }
+                carry = _mm_shuffle_epi8(v, bcast_last3);
+            }
+            if has_nd {
+                let is_nd = _mm_cmpeq_epi8(v, v_nd);
+                let is_val = _mm_andnot_si128(is_nd, v255);
+                v_any_nodata = _mm_or_si128(v_any_nodata, is_nd);
+                v_any_valid = _mm_or_si128(v_any_valid, is_val);
+                vmin = _mm_min_epu8(vmin, _mm_blendv_epi8(v255, v, is_val));
+                vmax = _mm_max_epu8(vmax, _mm_blendv_epi8(zero, v, is_val));
+            } else {
+                vmin = _mm_min_epu8(vmin, v);
+                vmax = _mm_max_epu8(vmax, v);
+            }
+            byte_i += 12;
+        }
+
+        if byte_i < row_bytes {
+            let mut acc = if horizontal_diff && byte_i >= 3 {
+                [row[byte_i - 3], row[byte_i - 2], row[byte_i - 1]]
+            } else {
+                [0u8; 3]
+            };
+            for px in row[byte_i..].chunks_exact_mut(3) {
+                for b in 0..3 {
+                    let v = if horizontal_diff {
+                        acc[b] = acc[b].wrapping_add(px[b]);
+                        px[b] = acc[b];
+                        acc[b]
+                    } else {
+                        px[b]
+                    };
+                    if nd_u8 == Some(v) {
+                        any_nodata[b] = true;
+                    } else {
+                        any_valid[b] = true;
+                        if v < min_u8[b] { min_u8[b] = v; }
+                        if v > max_u8[b] { max_u8[b] = v; }
+                    }
+                }
+            }
+        }
+    }
+
+    if simd_ran {
+        let mut mn_arr = [0u8; 16];
+        let mut mx_arr = [0u8; 16];
+        let mut av_arr = [0u8; 16];
+        let mut an_arr = [0u8; 16];
+        unsafe {
+            _mm_storeu_si128(mn_arr.as_mut_ptr() as *mut __m128i, vmin);
+            _mm_storeu_si128(mx_arr.as_mut_ptr() as *mut __m128i, vmax);
+            _mm_storeu_si128(av_arr.as_mut_ptr() as *mut __m128i, v_any_valid);
+            _mm_storeu_si128(an_arr.as_mut_ptr() as *mut __m128i, v_any_nodata);
+        }
+        for k in 0..12 {
+            let b = k % 3;
+            if has_nd {
+                if an_arr[k] != 0 {
+                    any_nodata[b] = true;
+                }
+                if av_arr[k] != 0 {
+                    any_valid[b] = true;
+                    min_u8[b] = min_u8[b].min(mn_arr[k]);
+                    max_u8[b] = max_u8[b].max(mx_arr[k]);
+                }
+            } else {
+                any_valid[b] = true;
+                min_u8[b] = min_u8[b].min(mn_arr[k]);
+                max_u8[b] = max_u8[b].max(mx_arr[k]);
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn unshuffle_row_stride1_avx2(
@@ -1359,7 +1513,15 @@ pub fn reconstruct_predictor3(
             unsafe {
                 prefix_sum_stride3_neon(row);
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            {
+                if has_avx2 {
+                    unsafe { prefix_sum_stride3_avx2(row) };
+                } else {
+                    prefix_sum_scalar(row, 3);
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             prefix_sum_scalar(row, 3);
 
             let p0 = &row[0..samples_per_row];
@@ -2466,7 +2628,7 @@ pub fn reconstruct_u8(
         let mut max_u8 = [0u8; 3];
 
         #[cfg(target_arch = "aarch64")]
-        {
+        let handled = {
             let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
             unsafe {
                 reconstruct_u8_rgb3_neon(
@@ -2481,10 +2643,34 @@ pub fn reconstruct_u8(
                     &mut max_u8,
                 );
             }
-        }
+            true
+        };
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
+        #[cfg(target_arch = "x86_64")]
+        let handled = if std::is_x86_feature_detected!("avx2") {
+            let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
+            unsafe {
+                reconstruct_u8_rgb3_avx2(
+                    slice,
+                    w,
+                    h,
+                    horizontal_diff,
+                    nd_u8,
+                    &mut any_valid,
+                    &mut any_nodata,
+                    &mut min_u8,
+                    &mut max_u8,
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let handled = false;
+
+        if !handled {
             if horizontal_diff {
                 let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
                 for y in 0..h {
@@ -2749,6 +2935,24 @@ mod tests {
             let mut b = input;
             prefix_sum_scalar(&mut a, 3);
             unsafe { prefix_sum_stride3_neon(&mut b) };
+            assert_eq!(a, b, "mismatch for len={len}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefix_sum_stride3_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for len in [0usize, 3, 6, 12, 15, 18, 24, 48, 51, 96, 1536, 6144] {
+            let input: Vec<u8> = (0..len)
+                .map(|i| ((i.wrapping_mul(29) ^ (i >> 2)) & 0xFF) as u8)
+                .collect();
+            let mut a = input.clone();
+            let mut b = input;
+            prefix_sum_scalar(&mut a, 3);
+            unsafe { prefix_sum_stride3_avx2(&mut b) };
             assert_eq!(a, b, "mismatch for len={len}");
         }
     }
