@@ -3890,6 +3890,8 @@ pub struct PolygonMask {
     pub points: Vec<(f64, f64)>,
     /// Precomputed `[min_lon, min_lat, max_lon, max_lat]` for fast bounding-box rejection.
     pub bbox: [f64; 4],
+    /// Raw `[min_x, min_y, max_x, max_y]` in the incoming GeoJSON `coord_crs` (exact before WGS84 round-trip).
+    pub raw_bbox: [f64; 4],
     /// True when the incoming GeoJSON coordinates were provided in a projected `coord_crs`.
     pub coord_crs_projected: bool,
 }
@@ -4065,6 +4067,12 @@ impl PolygonMask {
 
         let mut total_vertices = 0usize;
         let mut total_rings = 0usize;
+        let raw_bounds = std::cell::Cell::new([
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ]);
 
         let parse_coord = |pt: &serde_json::Value| -> Result<(f64, f64), EngineError> {
             let p = pt
@@ -4083,6 +4091,12 @@ impl PolygonMask {
                     "GeoJSON coordinates must be finite".into(),
                 ));
             }
+            let mut rb = raw_bounds.get();
+            rb[0] = rb[0].min(x);
+            rb[1] = rb[1].min(y);
+            rb[2] = rb[2].max(x);
+            rb[3] = rb[3].max(y);
+            raw_bounds.set(rb);
             if let Some(crs) = effective_crs {
                 let (lo, la) = crs.to_lonlat_deg(x, y);
                 if !lo.is_finite() || !la.is_finite() {
@@ -4253,9 +4267,53 @@ impl PolygonMask {
             ));
         }
         let bbox = [min_x, min_y, max_x, max_y];
+        let rb = raw_bounds.get();
+        let raw_bbox = if rb.iter().all(|v| v.is_finite()) {
+            rb
+        } else {
+            bbox
+        };
         let coord_crs_projected =
             effective_crs.is_some_and(|c| !matches!(c, cogzilla_proj::CrsModel::Geographic));
-        Ok((Self { polygons, lines, points, bbox, coord_crs_projected }, bbox))
+        Ok((Self { polygons, lines, points, bbox, raw_bbox, coord_crs_projected }, bbox))
+    }
+
+    /// Compute the exact tight bounding box of this feature's vertices directly in `dst_crs`
+    /// (avoiding the area expansion caused by reprojecting an axis-aligned WGS84 envelope).
+    pub fn bbox_in_crs(&self, dst_crs: &cogzilla_proj::CrsModel) -> Option<[f64; 4]> {
+        let mut x0 = f64::INFINITY;
+        let mut y0 = f64::INFINITY;
+        let mut x1 = f64::NEG_INFINITY;
+        let mut y1 = f64::NEG_INFINITY;
+        let mut visit = |lon: f64, lat: f64| {
+            let (x, y) = dst_crs.from_lonlat_deg(lon, lat);
+            if x.is_finite() && y.is_finite() {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        };
+        for poly in &self.polygons {
+            if let Some(outer) = poly.first() {
+                for &(lo, la) in outer {
+                    visit(lo, la);
+                }
+            }
+        }
+        for line in &self.lines {
+            for &(lo, la) in line {
+                visit(lo, la);
+            }
+        }
+        for &(lo, la) in &self.points {
+            visit(lo, la);
+        }
+        if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x0 < x1 && y0 < y1 {
+            Some([x0, y0, x1, y1])
+        } else {
+            None
+        }
     }
 
     fn ring_contains(ring: &[(f64, f64)], x: f64, y: f64) -> bool {

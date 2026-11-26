@@ -2431,3 +2431,188 @@ async fn s1_cylindrical_equal_area_exact_in_worldcrs84_and_worldmercator() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn sweep15_t1_t2_t3_t4_self_contained() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_sweep15_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 64x64 float32 UTM 10N raster with extreme outliers outside [10..13, 10..13] and
+    // 9 distinct float values ~0.17..0.25 inside [10..13, 10..13].
+    let w = 64u32;
+    let h = 64u32;
+    let ox = 500_000.0_f64;
+    let oy = 4_200_000.0_f64;
+    let px = 30.0_f64;
+    let mut data = vec![999.0f32; (w * h) as usize];
+    for r in 0..h {
+        for c in 0..w {
+            if r == 9 || r == 13 || c == 9 || c == 13 {
+                data[(r * w + c) as usize] = -999.0;
+            }
+        }
+    }
+    for r in 10..13u32 {
+        for c in 10..13u32 {
+            let v = 0.17_f32 + ((r - 10) * 3 + (c - 10)) as f32 * 0.01;
+            data[(r * w + c) as usize] = v;
+        }
+    }
+    let utm_path = tmp.join("t1_t2_t3_utm.tif");
+    write_synthetic_f32_projected_geotiff(&utm_path, w, h, 32610, ox, oy, px, &data);
+
+    // 16x16 Web Mercator categorical raster spanning ~20N..50N (strong cos^2(lat) area variation)
+    let mut merc_cat = vec![1.0f32; 256];
+    for r in 8..16 {
+        for c in 0..16 {
+            merc_cat[r * 16 + c] = 2.0;
+        }
+    }
+    let merc_path = tmp.join("t4_merc_cat.tif");
+    write_synthetic_f32_projected_geotiff(
+        &merc_path,
+        16,
+        16,
+        3857,
+        0.0,
+        6_446_275.841_017_158,
+        180_000.0,
+        &merc_cat,
+    );
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let utm_url = utm_path.to_string_lossy().to_string();
+    let merc_url = merc_path.to_string_lossy().to_string();
+
+    // --- T1 & T2: aligned 3x3 UTM polygon through real coord_crs=EPSG:32610 round-trip ---
+    let sq_3x3 = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [ox + 10.0 * px, oy - 10.0 * px],
+                [ox + 13.0 * px, oy - 10.0 * px],
+                [ox + 13.0 * px, oy - 13.0 * px],
+                [ox + 10.0 * px, oy - 13.0 * px],
+                [ox + 10.0 * px, oy - 10.0 * px]
+            ]]
+        }
+    });
+    let r_t12 = client
+        .post(format!("{base}/cog/statistics?url={utm_url}&bidx=1&max_size=0&coord_crs=EPSG:32610&categorical=true"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&sq_3x3).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_t12.status(), 200);
+    let j_t12: serde_json::Value = serde_json::from_slice(&r_t12.bytes().await.unwrap()).unwrap();
+    let b1 = &j_t12["properties"]["statistics"]["b1"];
+    assert_eq!(b1["valid_pixels"].as_f64().unwrap(), 9.0, "T1 valid_pixels must be 9, got {b1}");
+    assert_eq!(b1["count"].as_f64().unwrap(), 9.0);
+    assert!(
+        (b1["min"].as_f64().unwrap() - 0.17).abs() < 1e-5,
+        "T1 min polluted by outlier neighbor: {}",
+        b1["min"]
+    );
+    assert!(
+        (b1["max"].as_f64().unwrap() - 0.25).abs() < 1e-5,
+        "T1 max polluted by outlier neighbor: {}",
+        b1["max"]
+    );
+    // T2: categorical=true on float data preserves all 9 distinct float values (not truncated to 0)
+    let hist_counts = b1["histogram"][0].as_array().unwrap();
+    let hist_vals = b1["histogram"][1].as_array().unwrap();
+    assert_eq!(hist_vals.len(), 9, "T2 float categorical must preserve 9 distinct values, got {hist_vals:?}");
+    assert_eq!(hist_counts.len(), 9);
+    assert!((hist_vals[0].as_f64().unwrap() - 0.17).abs() < 1e-5);
+
+    // --- T3: POST /cog/feature/32x32.npy matches GET /cog/bbox/.../32x32.npy identically ---
+    let full_rect = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [ox, oy],
+                [ox + 64.0 * px, oy],
+                [ox + 64.0 * px, oy - 64.0 * px],
+                [ox, oy - 64.0 * px],
+                [ox, oy]
+            ]]
+        }
+    });
+    let bbox_str = format!("{},{},{},{}", ox, oy - 64.0 * px, ox + 64.0 * px, oy);
+    let r_feat = client
+        .post(format!("{base}/cog/feature/32x32.npy?url={utm_url}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610&resampling=average&return_mask=false"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&full_rect).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_feat.status(), 200);
+    let r_bbox = client
+        .get(format!("{base}/cog/bbox/{bbox_str}/32x32.npy?url={utm_url}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610&resampling=average&return_mask=false"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bbox.status(), 200);
+    let v_feat = decode_npy_f32(&r_feat.bytes().await.unwrap());
+    let v_bbox = decode_npy_f32(&r_bbox.bytes().await.unwrap());
+    assert_eq!(v_feat.len(), v_bbox.len());
+    let max_diff = v_feat
+        .iter()
+        .zip(v_bbox.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff < 1e-6, "T3 /feature vs /bbox max_diff={max_diff}");
+
+    // --- T4: histogram & categories in coverage units even with area_weighted=true + category_areas ---
+    let merc_poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [0.0, 6_446_275.841_017_158],
+                [16.0 * 180_000.0, 6_446_275.841_017_158],
+                [16.0 * 180_000.0, 6_446_275.841_017_158 - 16.0 * 180_000.0],
+                [0.0, 6_446_275.841_017_158 - 16.0 * 180_000.0],
+                [0.0, 6_446_275.841_017_158]
+            ]]
+        }
+    });
+    let r_t4 = client
+        .post(format!("{base}/cog/statistics?url={merc_url}&bidx=1&max_size=0&coord_crs=EPSG:3857&categorical=true&area_weighted=true"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&merc_poly).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_t4.status(), 200);
+    let j_t4: serde_json::Value = serde_json::from_slice(&r_t4.bytes().await.unwrap()).unwrap();
+    let b1_t4 = &j_t4["properties"]["statistics"]["b1"];
+    assert_eq!(b1_t4["categories"]["1"].as_f64().unwrap(), 128.0);
+    assert_eq!(b1_t4["categories"]["2"].as_f64().unwrap(), 128.0);
+    assert_eq!(b1_t4["histogram"], serde_json::json!([[128.0, 128.0], [1.0, 2.0]]));
+    let a1 = b1_t4["category_areas"]["1"].as_f64().unwrap();
+    let a2 = b1_t4["category_areas"]["2"].as_f64().unwrap();
+    let total_area = b1_t4["area"].as_f64().unwrap();
+    assert!(a2 > a1, "southern class 2 covers more ground area than northern class 1 in EPSG:3857");
+    assert!(
+        ((a1 + a2) - total_area).abs() / total_area < 1e-9,
+        "category_areas must sum to total area"
+    );
+    assert!(b1_t4["mean"].as_f64().unwrap() > 1.55);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

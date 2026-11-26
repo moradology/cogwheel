@@ -68,9 +68,54 @@ pub fn wgs84_geographic_cell_area_m2(lon0_deg: f64, lon1_deg: f64, lat0_deg: f64
     0.5 * WGS84_B2 * dlam * (wgs84_authalic_q(phi1) - wgs84_authalic_q(phi0)).abs()
 }
 
-/// Minimum per-pixel weight to treat a cell as touched (excludes zero-area floating-point
-/// boundary-touch residue from `valid_pixels`, `masked_pixels`, `min`, `max`, `unique`, etc.).
+/// Minimum per-pixel weight to accumulate into weighted sums (`count`, `sum`, `area`, `mean`).
 const COV_EPS: f64 = 1e-12;
+
+/// Minimum per-pixel weight for pixel-set statistics (`valid_pixels`, `masked_pixels`,
+/// `valid_percent`, `min`, `max`, `unique`, `majority`, `minority`, categorical keys) so
+/// `1e-9..1e-8 px²` CRS round-trip residue on aligned boundaries never admits neighbor pixels.
+const PIXEL_SET_EPS: f64 = 1e-6;
+
+/// Ordered finite `f64` wrapper for exact categorical keying (normalizing `-0.0` to `+0.0`).
+#[derive(Debug, Clone, Copy)]
+struct OrderedF64(f64);
+
+impl OrderedF64 {
+    #[inline]
+    fn new(v: f64) -> Self {
+        Self(if v == 0.0 { 0.0 } else { v })
+    }
+}
+
+impl PartialEq for OrderedF64 {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+impl Eq for OrderedF64 {}
+impl PartialOrd for OrderedF64 {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedF64 {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[inline]
+fn format_category_key(v: f64) -> String {
+    let v = if v == 0.0 { 0.0 } else { v };
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        (v as i64).to_string()
+    } else {
+        v.to_string()
+    }
+}
 
 /// Semantic geometry dimensionality for zonal statistics (`area` vs `length` vs point weights).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +433,14 @@ pub fn densify_ring_lonlat_to_pixel(
         } else {
             crs.from_lonlat_deg(adj_lon, lat)
         };
-        crs_to_pixel.forward(sx, sy)
+        let (col, row) = crs_to_pixel.forward(sx, sy);
+        // Snap vertices within 1e-6 px of an integer grid line onto it before clipping so
+        // CRS round-trip noise (e.g. UTM -> WGS84 -> UTM ~1e-9 px) never bleeds into neighbors.
+        let snap_grid = |v: f64| -> f64 {
+            let r = v.round();
+            if (v - r).abs() < 1e-6 { r } else { v }
+        };
+        (snap_grid(col), snap_grid(row))
     };
     if !densify_lonlat {
         return ring.iter().map(|&(lo, la)| map_pt(lo, la)).collect();
@@ -860,6 +912,8 @@ pub fn compute_weighted_band_stats_with_geom(
 
     let mut valid_pixels = 0usize;
     let mut masked_pixels = 0usize;
+    let mut valid_pixels_all = 0usize;
+    let mut masked_pixels_all = 0usize;
     let mut count_cov = 0.0_f64;
     let mut sum_cov = 0.0_f64;
     let mut area_valid_m2 = 0.0_f64;
@@ -868,9 +922,16 @@ pub fn compute_weighted_band_stats_with_geom(
     let mut w_sum = 0.0_f64;
     let mut min_v = f64::INFINITY;
     let mut max_v = f64::NEG_INFINITY;
+    let mut min_v_all = f64::INFINITY;
+    let mut max_v_all = f64::NEG_INFINITY;
 
-    let mut weighted_vals: Vec<(f64, f64)> = Vec::new();
-    let mut cat_weights: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    // `(value, area_or_len_weight, coverage_weight)`
+    let mut weighted_vals: Vec<(f64, f64, f64)> = Vec::new();
+    // Exact f64 key -> `(coverage_sum, area_m2_sum)` for categorical stats (T2 + T4)
+    let mut cat_map: std::collections::BTreeMap<OrderedF64, (f64, f64)> =
+        std::collections::BTreeMap::new();
+    let mut cat_map_all: std::collections::BTreeMap<OrderedF64, (f64, f64)> =
+        std::collections::BTreeMap::new();
 
     for dy in 0..win_h {
         let row_off = dy * win_w;
@@ -880,17 +941,23 @@ pub fn compute_weighted_band_stats_with_geom(
             if c <= COV_EPS {
                 continue;
             }
+            let in_pixel_set = c > PIXEL_SET_EPS;
             let v = pixels[i];
             if !v.is_finite() {
-                masked_pixels += 1;
+                masked_pixels_all += 1;
+                if in_pixel_set {
+                    masked_pixels += 1;
+                }
                 continue;
             }
             let vf = v as f64;
+            let mut cell_area_m2 = 0.0_f64;
             let w = match geom_kind {
                 ZonalGeomKind::Polygon => {
                     let a_px = area_model.area_at(dx, dy);
-                    area_valid_m2 += c * a_px;
-                    if use_area_w { c * a_px } else { c }
+                    cell_area_m2 = c * a_px;
+                    area_valid_m2 += cell_area_m2;
+                    if use_area_w { cell_area_m2 } else { c }
                 }
                 ZonalGeomKind::Line => {
                     let lm = line_len_m.map_or(c, |buf| buf[i]);
@@ -899,21 +966,52 @@ pub fn compute_weighted_band_stats_with_geom(
                 }
                 ZonalGeomKind::Point => c,
             };
-            valid_pixels += 1;
+            valid_pixels_all += 1;
             count_cov += c;
             sum_cov += c * vf;
             w_total += w;
             w_sum += w * vf;
-            if vf < min_v {
-                min_v = vf;
+            if vf < min_v_all {
+                min_v_all = vf;
             }
-            if vf > max_v {
-                max_v = vf;
+            if vf > max_v_all {
+                max_v_all = vf;
             }
-            weighted_vals.push((vf, w));
+            if in_pixel_set {
+                valid_pixels += 1;
+                if vf < min_v {
+                    min_v = vf;
+                }
+                if vf > max_v {
+                    max_v = vf;
+                }
+            }
+            weighted_vals.push((vf, w, c));
             if is_categorical {
-                *cat_weights.entry(vf.round() as i64).or_insert(0.0) += w;
+                let key = OrderedF64::new(vf);
+                if in_pixel_set {
+                    let entry = cat_map.entry(key).or_insert((0.0, 0.0));
+                    entry.0 += c;
+                    entry.1 += cell_area_m2;
+                } else if valid_pixels == 0 {
+                    let entry = cat_map_all.entry(key).or_insert((0.0, 0.0));
+                    entry.0 += c;
+                    entry.1 += cell_area_m2;
+                }
             }
+        }
+    }
+
+    // If a microscopic sub-pixel polygon had all pixels with `COV_EPS < c <= PIXEL_SET_EPS`,
+    // fall back to the `COV_EPS` pixel set so valid_pixels/min/max are still populated.
+    let use_set_eps = valid_pixels > 0;
+    if !use_set_eps {
+        valid_pixels = valid_pixels_all;
+        masked_pixels = masked_pixels_all;
+        min_v = min_v_all;
+        max_v = max_v_all;
+        if cat_map.is_empty() {
+            cat_map = cat_map_all;
         }
     }
 
@@ -939,7 +1037,7 @@ pub fn compute_weighted_band_stats_with_geom(
 
     let mean = w_sum / w_total;
     let mut var_acc = 0.0_f64;
-    for &(vf, w) in &weighted_vals {
+    for &(vf, w, _) in &weighted_vals {
         let d = vf - mean;
         var_acc += w * d * d;
     }
@@ -965,7 +1063,7 @@ pub fn compute_weighted_band_stats_with_geom(
         let mut cum = 0.0_f64;
         let mut prev_mid = 0.0_f64;
         let mut prev_v = weighted_vals[0].0;
-        for (idx, &(v, w)) in weighted_vals.iter().enumerate() {
+        for (idx, &(v, w, _)) in weighted_vals.iter().enumerate() {
             let mid = cum + 0.5 * w;
             if idx == 0 {
                 if target <= mid {
@@ -985,33 +1083,40 @@ pub fn compute_weighted_band_stats_with_geom(
 
     let median = weighted_quantile(50.0);
 
-    // Unique count, majority, minority (weighted by w).
+    // Unique count, majority, minority over pixels in the pixel set (weighted by coverage `c`).
+    let set_thresh = if use_set_eps { PIXEL_SET_EPS } else { COV_EPS };
     let mut unique_count = 0usize;
-    let mut maj_val = weighted_vals[0].0;
+    let mut maj_val = min_v;
     let mut maj_w = -1.0_f64;
-    let mut min_val_freq = weighted_vals[0].0;
+    let mut min_val_freq = min_v;
     let mut min_w = f64::INFINITY;
     let mut idx = 0;
     while idx < weighted_vals.len() {
         let v = weighted_vals[idx].0;
-        let mut gw = weighted_vals[idx].1;
-        idx += 1;
+        let mut gc = 0.0_f64;
+        let mut any_in_set = false;
         while idx < weighted_vals.len() && weighted_vals[idx].0 == v {
-            gw += weighted_vals[idx].1;
+            let c = weighted_vals[idx].2;
+            if c > set_thresh {
+                gc += c;
+                any_in_set = true;
+            }
             idx += 1;
         }
+        if !any_in_set {
+            continue;
+        }
         unique_count += 1;
-        if gw > maj_w {
-            maj_w = gw;
+        if gc > maj_w {
+            maj_w = gc;
             maj_val = v;
         }
-        if gw < min_w {
-            min_w = gw;
+        if gc < min_w {
+            min_w = gc;
             min_val_freq = v;
         }
     }
 
-    let scale_to_count = count_cov / w_total;
     let count_out = snap_near_int(count_cov);
     let mut obj = serde_json::Map::new();
     obj.insert("min".into(), serde_json::json!(min_v));
@@ -1025,31 +1130,47 @@ pub fn compute_weighted_band_stats_with_geom(
     obj.insert("minority".into(), serde_json::json!(min_val_freq));
     obj.insert("unique".into(), serde_json::json!(unique_count as f64));
     if is_categorical {
+        // T2 + T4: categorical histogram and `categories` always report exact coverage counts
+        // summing to `count` (preserving float keys on float rasters), and `category_areas`
+        // reports per-class ground area in m² (summing to `area`) for polygons.
         let mut cat_counts: Vec<f64> = Vec::new();
         let mut cat_vals: Vec<f64> = Vec::new();
         let mut cats_obj = serde_json::Map::new();
+        let mut cat_areas_obj = serde_json::Map::new();
         if let Some(ref cats) = opts.categories
             && !cats.is_empty()
         {
-            for &c in cats {
-                let k = c.round() as i64;
-                let w = snap_near_int(cat_weights.get(&k).copied().unwrap_or(0.0) * scale_to_count);
-                cat_counts.push(w);
-                cat_vals.push(k as f64);
-                cats_obj.insert(k.to_string(), serde_json::json!(w));
+            for &c_val in cats {
+                let key = OrderedF64::new(c_val);
+                let (cov_c, area_c) = cat_map.get(&key).copied().unwrap_or((0.0, 0.0));
+                let cc = snap_near_int(cov_c);
+                let kstr = format_category_key(key.0);
+                cat_counts.push(cc);
+                cat_vals.push(key.0);
+                cats_obj.insert(kstr.clone(), serde_json::json!(cc));
+                if geom_kind == ZonalGeomKind::Polygon {
+                    cat_areas_obj.insert(kstr, serde_json::json!(area_c));
+                }
             }
         } else {
-            for (k, w) in cat_weights {
-                let cw = snap_near_int(w * scale_to_count);
-                cat_counts.push(cw);
-                cat_vals.push(k as f64);
-                cats_obj.insert(k.to_string(), serde_json::json!(cw));
+            for (key, (cov_c, area_c)) in cat_map {
+                let cc = snap_near_int(cov_c);
+                let kstr = format_category_key(key.0);
+                cat_counts.push(cc);
+                cat_vals.push(key.0);
+                cats_obj.insert(kstr.clone(), serde_json::json!(cc));
+                if geom_kind == ZonalGeomKind::Polygon {
+                    cat_areas_obj.insert(kstr, serde_json::json!(area_c));
+                }
             }
         }
         obj.insert("histogram".into(), serde_json::json!([cat_counts, cat_vals]));
         obj.insert("categories".into(), serde_json::Value::Object(cats_obj));
+        if geom_kind == ZonalGeomKind::Polygon {
+            obj.insert("category_areas".into(), serde_json::Value::Object(cat_areas_obj));
+        }
     } else {
-        // Weighted histogram (counts scaled to `count_cov` so histogram sums to `count`).
+        // T4: numeric histogram always reports coverage counts summing to `count`.
         let (h_lo, h_hi) = opts.histogram_range.unwrap_or((min_v, max_v));
         let edges: Vec<f64> = if let Some(ref custom_edges) = opts.histogram_edges
             && custom_edges.len() >= 2
@@ -1068,7 +1189,7 @@ pub fn compute_weighted_band_stats_with_geom(
         };
         let nbins = edges.len() - 1;
         let mut hist_w = vec![0.0_f64; nbins];
-        for &(vf, w) in &weighted_vals {
+        for &(vf, _, c) in &weighted_vals {
             if vf < edges[0] || vf > edges[nbins] {
                 continue;
             }
@@ -1078,7 +1199,7 @@ pub fn compute_weighted_band_stats_with_geom(
                 let pos = edges.partition_point(|&e| e <= vf);
                 pos.saturating_sub(1).min(nbins - 1)
             };
-            hist_w[bin] += w * scale_to_count;
+            hist_w[bin] += c;
         }
         obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
     }
