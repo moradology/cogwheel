@@ -523,6 +523,20 @@ def main() -> int:
         o.check("array of band math, bilinear, rescaled", "image", f"{base12}.npy?{band_math}(b2-b1)/(b2%2Bb1)&rescale=-1,1")
         o.check("tif with a buffer", "image", f"{base12}.tif?assets=red&buffer=2")
         o.check("tif by format=", "image", f"{base12}?assets=red&format=tif")
+        # Smoothed pixels on a grid in metres: one reader for all four.
+        smoothed_shape = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
+            [8.40, 45.70], [8.52, 45.71], [8.50, 45.78], [8.41, 45.76], [8.40, 45.70]]]}}
+        o.check("tile, bilinear, a nodata of the request's own", "image", f"{base12}.npy?assets=red&resampling=bilinear&reproject=bilinear&nodata=0")
+        o.check("tile, average, a nodata of the request's own, three bands", "image", f"{base12}.png?assets=visual&resampling=average&reproject=average&nodata=0")
+        o.check("tile of 300 pixels, bilinear", "image", f"{base12}.npy?assets=red&resampling=bilinear&reproject=bilinear&tilesize=300")
+        o.check("bbox in metres, bilinear", "image",
+                f"/searches/{sid}/bbox/930000,5700000,960000,5730000/256x256.npy?assets=red&coord_crs=epsg:3857&resampling=bilinear&reproject=bilinear")
+        o.check("bbox drawn in metres, average, a nodata of the request's own", "image",
+                f"/searches/{sid}/bbox/8.4,45.7,8.5,45.75/128x128.npy?assets=red&dst_crs=epsg:3857&resampling=average&reproject=average&nodata=0")
+        o.check("feature drawn in metres, bilinear", "image",
+                f"/searches/{sid}/feature/128x128.npy?assets=red&dst_crs=epsg:3857&resampling=bilinear&reproject=bilinear", "POST", smoothed_shape)
+        o.check("statistics on a grid in metres, average", "status",
+                f"/searches/{sid}/statistics?assets=red&dst_crs=epsg:3857&resampling=average&reproject=average&max_size=128", "POST", smoothed_shape)
         o.check("bbox, bilinear, a nodata of the request's own", "image",
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.npy?assets=red&resampling=bilinear&reproject=bilinear&nodata=400")
         o.check("bbox, average, a nodata of the request's own", "image",
