@@ -211,6 +211,22 @@ fn resolve_input_bbox(
         )));
     }
     let is_geo = matches!(coord_crs, None | Some(cogzilla_proj::CrsModel::Geographic));
+    if is_geo {
+        // Symmetric ±2-turn longitude normalisation (matching point routes) before RFC 7946 §5.2
+        // antimeridian unwrap: shift both bounds by the same whole multiple of 360° if needed.
+        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0) {
+            if let (Some(n0), Some(n2)) = (
+                cogzilla_proj::normalize_geographic_lon(bbox[0]),
+                cogzilla_proj::normalize_geographic_lon(bbox[2]),
+            ) {
+                let shift = n0 - bbox[0];
+                if (bbox[2] + shift - n2).abs() < 1e-9 || (bbox[2] - bbox[0]) <= 360.0 {
+                    bbox[0] += shift;
+                    bbox[2] += shift;
+                }
+            }
+        }
+    }
     if bbox[0] > bbox[2] {
         if is_geo && bbox[0] >= -180.0 && bbox[0] <= 180.0 && bbox[2] >= -180.0 && bbox[2] <= 180.0
         {
@@ -400,8 +416,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         pq.keys.push(k.to_string());
         let mut bad = |what: &str| pq_errors.push(format!("invalid {k}={}: {what}", percent_decode(v)));
         match k {
-            // Do not convert `+` to space in `url=` (S3 keys and Azure SAS tokens often contain literal `+`)
-            "url" => pq.urls.push(percent_decode_opts(v, false)),
+            // Decode `+` as space per `application/x-www-form-urlencoded` so standard HTTP clients
+            // (`httpx`, `requests`, `urllib.parse.urlencode`) work on paths with spaces; literal `+`
+            // is sent as `%2B`.
+            "url" => pq.urls.push(percent_decode(v)),
             "assets" => {
                 // Preserve literal `+` in per-asset expressions (`assets=red|expression=b1+1`).
                 let dec = percent_decode_opts(v, false);
@@ -1587,7 +1605,12 @@ fn coord_to_lonlat(
             "point coordinates could not be transformed to WGS84".into(),
         ));
     }
-    Ok((lon, lat))
+    let Some(norm_lon) = cogzilla_proj::normalize_geographic_lon(lon) else {
+        return Err(EngineError::NotFound(format!(
+            "point ({x}, {y}) is outside dataset bounds"
+        )));
+    };
+    Ok((norm_lon, lat))
 }
 
 fn bbox_to_wgs84(
@@ -1769,7 +1792,7 @@ fn wgs84_bboxes_intersect(a: [f64; 4], b: [f64; 4]) -> bool {
 /// Exact geometric test: returns `true` iff at least one point of the tile box `tb` in `dst_crs`
 /// maps onto `[0..full.width, 0..full.height]` in `src_crs`, OR a corner/center of the dataset
 /// maps inside `tb`. Failed / non-finite reprojections are treated as outside (never as inside).
-fn tile_box_intersects_cog(
+pub(crate) fn tile_box_intersects_cog(
     src_crs: &cogzilla_proj::CrsModel,
     full: &cogzilla_tiff::IfdMeta,
     dst_crs: &cogzilla_proj::CrsModel,
@@ -2179,40 +2202,111 @@ fn shown_array(pq: &ParsedQuery, first: Option<&cogzilla_io::OpenedCog>, data: &
     Some(Bytes::from(out))
 }
 
-/// A `/cog` answer in the type TiTiler writes its array in: the rasters at `urls` are
-/// opened again (they are cached) for their types. Anything but a float32 array, and an
-/// array whose rasters cannot be opened, is left as it is.
-async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
-    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
-    let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
+/// Apply `ArrayAsked` (typed `.npy`/`.tif` or painted `|u1` `.npy`) over already-opened `cogs`.
+/// Single shared entry point used by `/cog`, `/stac`, and `/mosaicjson` so all three route
+/// families produce identical dtypes, mask sentinels, and GeoTIFF nodata metadata.
+fn apply_array_asked(
+    asked: Option<ArrayAsked>,
+    cogs: &[Arc<cogzilla_io::OpenedCog>],
+    expression_override: Option<&str>,
+    data: Bytes,
+) -> Bytes {
+    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else {
+        return data;
+    };
+    if cogs.is_empty() {
+        return data;
+    }
     match asked {
         ArrayAsked::Typed(rule, _, expression, mask) => {
             let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
-            array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+            let expr = expression_override.or(expression.as_deref());
+            array_in_its_type(data, rule.kind(&reads, expr), mask)
         }
-        ArrayAsked::Shown(pq) => shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data),
+        ArrayAsked::Shown(pq) => {
+            shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data)
+        }
     }
+}
+
+/// A `/cog` answer in the type TiTiler writes its array in: the rasters at `urls` are
+/// opened again (they are cached) for their types. Anything but a float32 array, and an
+/// array whose rasters cannot be opened, is left as it is.
+async fn cog_array_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    urls: &[String],
+    data: Bytes,
+) -> Bytes {
+    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else {
+        return data;
+    };
+    let Ok(cogs) = open_query_urls(engine, urls).await else {
+        return data;
+    };
+    apply_array_asked(Some(asked), &cogs, None, data)
 }
 
 /// A `/stac` answer in the type TiTiler writes its array in, from the types of the item's
 /// assets that were read and the band math as it was rewritten over them. As
 /// [`cog_array_in_its_type`].
-async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
-    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
+async fn stac_array_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    item: &crate::stac::StacItem,
+    data: Bytes,
+) -> Bytes {
+    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else {
+        return data;
+    };
     let (assets, expression) = match &asked {
         ArrayAsked::Typed(_, assets, expression, _) => (assets.clone(), expression.clone()),
         ArrayAsked::Shown(pq) => (pq.assets.clone(), pq.expr_raw.clone()),
     };
-    let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
+    let Ok((_, cogs, expression)) =
+        resolve_stac_assets(engine, item, &assets, expression.as_deref()).await
+    else {
         return data;
     };
-    match asked {
-        ArrayAsked::Typed(rule, _, _, mask) => {
-            let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
-            array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+    apply_array_asked(Some(asked), &cogs, expression.as_deref(), data)
+}
+
+/// A `/mosaicjson` (or `/mosaic`) answer in the type TiTiler writes its array in, using the
+/// exact same [`apply_array_asked`] writer as `/cog` and `/stac`. Zero overhead for non-array
+/// image formats (short-circuits immediately on `!may_be_f32_array(&data)`).
+async fn mosaic_array_in_its_type(
+    engine: &TileEngine,
+    asked: Option<ArrayAsked>,
+    urls: &[String],
+    selection: pixel_selection::Selection,
+    data: Bytes,
+) -> Bytes {
+    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else {
+        return data;
+    };
+    if let ArrayAsked::Typed(_, _, _, mask) = &asked {
+        match selection {
+            pixel_selection::Selection::Stdev => {
+                return array_in_its_type(data, Some(cogzilla_tiff::SampleType::Float32), *mask);
+            }
+            pixel_selection::Selection::Count => {
+                let kind = if urls.len() <= 255 {
+                    cogzilla_tiff::SampleType::Uint8
+                } else {
+                    cogzilla_tiff::SampleType::Uint16
+                };
+                return array_in_its_type(data, Some(kind), *mask);
+            }
+            _ => {}
         }
-        ArrayAsked::Shown(pq) => shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data),
     }
+    let mut cogs = Vec::with_capacity(urls.len());
+    for u in urls {
+        if let Ok(cog) = engine.store.open_uri(u).await {
+            cogs.push(cog);
+        }
+    }
+    apply_array_asked(Some(asked), &cogs, None, data)
 }
 
 /// A rendered `/cog` tile, its array in its type: what the tile cache keeps.
@@ -5993,6 +6087,14 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, mask_opt, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                let data = mosaic_array_in_its_type(
+                    &engine,
+                    array_asked(&pq, segs.last()),
+                    &used,
+                    pq.pixel_selection,
+                    data,
+                )
+                .await;
                 x_assets = used;
                 geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
@@ -6017,6 +6119,14 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, mask_opt, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                let data = mosaic_array_in_its_type(
+                    &engine,
+                    array_asked(&pq, segs.last()),
+                    &used,
+                    pq.pixel_selection,
+                    data,
+                )
+                .await;
                 x_assets = used;
                 geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
@@ -6143,6 +6253,14 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                let data = mosaic_array_in_its_type(
+                    &engine,
+                    array_asked(&pq, segs.last()),
+                    &used,
+                    pq.pixel_selection,
+                    data,
+                )
+                .await;
                 x_assets = used;
                 geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
@@ -6188,6 +6306,14 @@ where
                     &engine, &urls, out_bbox, &dst_crs, out_w, out_h, None, &pq, fmt, ct, dst_epsg,
                 )
                 .await?;
+                let data = mosaic_array_in_its_type(
+                    &engine,
+                    array_asked(&pq, segs.last()),
+                    &used,
+                    pq.pixel_selection,
+                    data,
+                )
+                .await;
                 x_assets = used;
                 geo_meta = Some((out_bbox, Some(dst_epsg), false));
                 Ok((data, ct))
@@ -6568,7 +6694,7 @@ where
                                 }
                                 return Err(EngineError::NoContent);
                             }
-                            let (data, _used) = render_mosaic_bbox_composite(
+                            let (data, used) = render_mosaic_bbox_composite(
                                 &engine,
                                 &urls,
                                 tb,
@@ -6591,6 +6717,14 @@ where
                                     pq.return_mask,
                                 ));
                             }
+                            let data = mosaic_array_in_its_type(
+                                &engine,
+                                array_asked(&pq, segs.last()),
+                                &used,
+                                pq.pixel_selection,
+                                data,
+                            )
+                            .await;
                             return Ok((data, ct));
                         }
                         let query_ts = match sc {
@@ -6672,7 +6806,7 @@ where
                             if !failed.is_empty() {
                                 *failed_assets_inner.lock().unwrap_or_else(|e| e.into_inner()) = failed;
                             }
-                            Ok(finalize_image_output(
+                            let (data, ct) = finalize_image_output(
                                 b,
                                 ct,
                                 fmt,
@@ -6683,7 +6817,16 @@ where
                                 3857,
                                 pq.jpeg_quality,
                                 pq.return_mask,
-                            ))
+                            );
+                            let data = mosaic_array_in_its_type(
+                                &engine,
+                                array_asked(&pq, segs.last()),
+                                &urls,
+                                pq.pixel_selection,
+                                data,
+                            )
+                            .await;
+                            Ok((data, ct))
                         }
                     })
                     .await;
@@ -9766,7 +9909,7 @@ where
                 let mut with_eo = true;
                 for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
                     if let Some((k, v)) = pair.split_once('=') {
-                        let dec = percent_decode_opts(v, false);
+                        let dec = percent_decode(v);
                         match k {
                             "id" if !dec.is_empty() => q_id = Some(dec),
                             "collection" if !dec.is_empty() => q_collection = Some(dec),
