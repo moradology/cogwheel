@@ -213,12 +213,12 @@ fn eval_uv_inbounds(px: u32, py: u32) -> vec2<f32> {
     if (params.coord_mode == 0u) {
         return vec2<f32>(u_coords[px], v_coords[py]);
     } else if (params.coord_mode == 1u) {
-        let cell_px = max(params.dst_w / 16u, 1u);
-        let inv_cell = 1.0 / f32(cell_px);
-        let gx = min(px / cell_px, 15u);
-        let gy = min(py / cell_px, 15u);
-        let tx = f32(px - gx * cell_px) * inv_cell;
-        let ty = f32(py - gy * cell_px) * inv_cell;
+        let gx_f = f32(px) * 16.0 / f32(params.dst_w);
+        let gy_f = f32(py) * 16.0 / f32(params.dst_h);
+        let gx = min(u32(gx_f), 15u);
+        let gy = min(u32(gy_f), 15u);
+        let tx = gx_f - f32(gx);
+        let ty = gy_f - f32(gy);
         let r0 = gy * 17u + gx;
         let r1 = (gy + 1u) * 17u + gx;
         let u_l = u_coords[r0] + (u_coords[r1] - u_coords[r0]) * ty;

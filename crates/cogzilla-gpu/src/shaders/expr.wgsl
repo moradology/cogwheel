@@ -392,8 +392,8 @@ fn eval_uv(px: u32, py: u32) -> vec2<f32> {
         return vec2<f32>(u_coords[idx], v_coords[idx]);
     }
     // Grid2D (17x17 coarse warp grid matching cogzilla-proj::CoordPlan::Grid2D)
-    let gx_f = (f32(px) + 0.5) * 16.0 / f32(params.dst_w);
-    let gy_f = (f32(py) + 0.5) * 16.0 / f32(params.dst_h);
+    let gx_f = f32(px) * 16.0 / f32(params.dst_w);
+    let gy_f = f32(py) * 16.0 / f32(params.dst_h);
     let gx0 = min(u32(gx_f), 15u);
     let gy0 = min(u32(gy_f), 15u);
     let fx = gx_f - f32(gx0);
