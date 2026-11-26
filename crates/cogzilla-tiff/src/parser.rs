@@ -144,11 +144,6 @@ impl<'a> Reader<'a> {
             ByteOrder::Big => u64::from_be_bytes(arr),
         })
     }
-
-    #[inline(always)]
-    fn f64_at(&self, offset: u64) -> Result<f64, TiffError> {
-        Ok(f64::from_bits(self.u64_at(offset)?))
-    }
 }
 
 struct TagEntry {
@@ -182,10 +177,19 @@ impl TagEntry {
             .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
             .ok_or(TiffError::Corrupt("SHORT array size overflow"))?;
         let n = self.count as usize;
-        let _ = r.need(self.value_offset, total)?;
+        let bytes = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            out.push(r.u16_at(self.value_offset + (i as u64) * 2)?);
+        match r.bo {
+            ByteOrder::Little => {
+                for ch in bytes.chunks_exact(2) {
+                    out.push(u16::from_le_bytes([ch[0], ch[1]]));
+                }
+            }
+            ByteOrder::Big => {
+                for ch in bytes.chunks_exact(2) {
+                    out.push(u16::from_be_bytes([ch[0], ch[1]]));
+                }
+            }
         }
         Ok(out)
     }
@@ -209,22 +213,37 @@ impl TagEntry {
             .ok_or(TiffError::Corrupt("integer array output size overflow"))?;
         let _ = out_bytes;
         let n = self.count as usize;
-        let _ = r.need(self.value_offset, total)?;
+        let bytes = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
-        match self.ty {
-            TYPE_SHORT => {
-                for i in 0..n {
-                    out.push(r.u16_at(self.value_offset + (i as u64) * 2)? as u64);
+        match (self.ty, r.bo) {
+            (TYPE_SHORT, ByteOrder::Little) => {
+                for ch in bytes.chunks_exact(2) {
+                    out.push(u16::from_le_bytes([ch[0], ch[1]]) as u64);
                 }
             }
-            TYPE_LONG | TYPE_IFD => {
-                for i in 0..n {
-                    out.push(r.u32_at(self.value_offset + (i as u64) * 4)? as u64);
+            (TYPE_SHORT, ByteOrder::Big) => {
+                for ch in bytes.chunks_exact(2) {
+                    out.push(u16::from_be_bytes([ch[0], ch[1]]) as u64);
                 }
             }
-            TYPE_LONG8 | TYPE_IFD8 => {
-                for i in 0..n {
-                    out.push(r.u64_at(self.value_offset + (i as u64) * 8)?);
+            (TYPE_LONG | TYPE_IFD, ByteOrder::Little) => {
+                for ch in bytes.chunks_exact(4) {
+                    out.push(u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]) as u64);
+                }
+            }
+            (TYPE_LONG | TYPE_IFD, ByteOrder::Big) => {
+                for ch in bytes.chunks_exact(4) {
+                    out.push(u32::from_be_bytes([ch[0], ch[1], ch[2], ch[3]]) as u64);
+                }
+            }
+            (TYPE_LONG8 | TYPE_IFD8, ByteOrder::Little) => {
+                for ch in bytes.chunks_exact(8) {
+                    out.push(u64::from_le_bytes(ch.try_into().unwrap()));
+                }
+            }
+            (TYPE_LONG8 | TYPE_IFD8, ByteOrder::Big) => {
+                for ch in bytes.chunks_exact(8) {
+                    out.push(u64::from_be_bytes(ch.try_into().unwrap()));
                 }
             }
             _ => unreachable!(),
@@ -251,22 +270,36 @@ impl TagEntry {
             .ok_or(TiffError::Corrupt("byte count array output size overflow"))?;
         let _ = out_bytes;
         let n = self.count as usize;
-        let _ = r.need(self.value_offset, total)?;
+        let bytes = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
-        match self.ty {
-            TYPE_SHORT => {
-                for i in 0..n {
-                    out.push(r.u16_at(self.value_offset + (i as u64) * 2)? as u32);
+        match (self.ty, r.bo) {
+            (TYPE_SHORT, ByteOrder::Little) => {
+                for ch in bytes.chunks_exact(2) {
+                    out.push(u16::from_le_bytes([ch[0], ch[1]]) as u32);
                 }
             }
-            TYPE_LONG | TYPE_IFD => {
-                for i in 0..n {
-                    out.push(r.u32_at(self.value_offset + (i as u64) * 4)?);
+            (TYPE_SHORT, ByteOrder::Big) => {
+                for ch in bytes.chunks_exact(2) {
+                    out.push(u16::from_be_bytes([ch[0], ch[1]]) as u32);
                 }
             }
-            TYPE_LONG8 | TYPE_IFD8 => {
-                for i in 0..n {
-                    let v = r.u64_at(self.value_offset + (i as u64) * 8)?;
+            (TYPE_LONG | TYPE_IFD, ByteOrder::Little) => {
+                for ch in bytes.chunks_exact(4) {
+                    out.push(u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]));
+                }
+            }
+            (TYPE_LONG | TYPE_IFD, ByteOrder::Big) => {
+                for ch in bytes.chunks_exact(4) {
+                    out.push(u32::from_be_bytes([ch[0], ch[1], ch[2], ch[3]]));
+                }
+            }
+            (TYPE_LONG8 | TYPE_IFD8, bo) => {
+                for ch in bytes.chunks_exact(8) {
+                    let arr: [u8; 8] = ch.try_into().unwrap();
+                    let v = match bo {
+                        ByteOrder::Little => u64::from_le_bytes(arr),
+                        ByteOrder::Big => u64::from_be_bytes(arr),
+                    };
                     out.push(
                         u32::try_from(v)
                             .map_err(|_| TiffError::Corrupt("tile byte count exceeds u32"))?,
@@ -288,10 +321,19 @@ impl TagEntry {
             .filter(|&b| b <= MAX_TAG_ARRAY_BYTES)
             .ok_or(TiffError::Corrupt("DOUBLE array size overflow"))?;
         let n = self.count as usize;
-        let _ = r.need(self.value_offset, total)?;
+        let bytes = r.need(self.value_offset, total)?;
         let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            out.push(r.f64_at(self.value_offset + (i as u64) * 8)?);
+        match r.bo {
+            ByteOrder::Little => {
+                for ch in bytes.chunks_exact(8) {
+                    out.push(f64::from_le_bytes(ch.try_into().unwrap()));
+                }
+            }
+            ByteOrder::Big => {
+                for ch in bytes.chunks_exact(8) {
+                    out.push(f64::from_be_bytes(ch.try_into().unwrap()));
+                }
+            }
         }
         Ok(out)
     }
