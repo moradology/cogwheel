@@ -4124,6 +4124,8 @@ struct StatsRequest<'a> {
     nodata: Option<f32>,
     /// Whether the pixels counted are those of a grid in Web Mercator metres (`dst_crs`).
     mercator: bool,
+    /// Whether the band math is `normalizedIndex`'s, whose values rio-tiler gives as float32.
+    single: bool,
 }
 
 /// The statistics of one feature and the items they were read from, or `None` when the
@@ -4308,6 +4310,7 @@ async fn feature_statistics(
                         for (part, band) in bands.iter_mut().enumerate() {
                             if band[i].is_nan() {
                                 let v = program.eval(part, &pixel);
+                                let v = if req.single { f64::from(v as f32) } else { v };
                                 if v.is_finite() {
                                     band[i] = v;
                                 }
@@ -4353,7 +4356,7 @@ async fn feature_statistics(
 
         // The polygon on the image's grid: once for the mask, once finer for the coverage.
         let rings = rings_on_grid(&mask, bounds, (width, height), mercator);
-        let (opts, cover_scale) = (req.opts.clone(), req.cover_scale);
+        let (opts, cover_scale, single) = (req.opts.clone(), req.cover_scale, req.single);
         let stats = engine
             .store
             .run_heavy_cpu(move || {
@@ -4371,10 +4374,12 @@ async fn feature_statistics(
                             *v = f64::NAN;
                         }
                     }
-                    out.insert(
-                        format!("b{}", n + 1),
-                        zonal::band_statistics(band, &coverage, description, &opts),
-                    );
+                    let stats = if single {
+                        zonal::band_statistics(band, &coverage, description, &float32_bins(&opts, band))
+                    } else {
+                        zonal::band_statistics(band, &coverage, description, &opts)
+                    };
+                    out.insert(format!("b{}", n + 1), stats);
                 }
                 Ok::<_, EngineError>(Value::Object(out))
             })
@@ -4383,6 +4388,36 @@ async fn feature_statistics(
     }
     .await;
     computed.map_err(|e| engine_error(&e))
+}
+
+/// The histogram options for a float32 band, with its bin edges as numpy's `histogram`
+/// makes them and counts against them. Between the band's own least and greatest values
+/// (float32 both), `linspace` works in float32: the step is their difference over the count,
+/// each edge the step times its index plus the first, the last set to the greatest. Between a
+/// range given in the request (Python floats) it works in double precision and casts each
+/// edge to float32. Bins given as edges, and a band of one value, are left as they are.
+fn float32_bins(opts: &StatsOptions, band: &[f64]) -> StatsOptions {
+    let mut out = opts.clone();
+    let zonal::Bins::Count(count) = opts.bins else { return out };
+    if count == 0 {
+        return out;
+    }
+    let edges: Vec<f64> = match opts.range {
+        Some((lo, hi)) => (0..=count).map(|i| f64::from((lo + (hi - lo) * i as f64 / count as f64) as f32)).collect(),
+        None => {
+            let (lo, hi) = band
+                .iter()
+                .filter(|v| v.is_finite())
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v as f32), hi.max(v as f32)));
+            if !(lo < hi) {
+                return out;
+            }
+            let step = (hi - lo) / count as f32;
+            (0..=count).map(|i| f64::from(if i == count { hi } else { i as f32 * step + lo })).collect()
+        }
+    };
+    out.bins = zonal::Bins::Edges(edges);
+    out
 }
 
 /// `POST {base}/statistics`: statistics of the mosaic under each feature of a GeoJSON
@@ -4417,9 +4452,15 @@ async fn mosaic_statistics(
         Ok(mercator) => mercator,
         Err(r) => return r,
     };
-    if query_value(pairs, "algorithm").is_some() {
-        return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet");
-    }
+    // `normalizedIndex` is rio-tiler's band math of the first two bands, written as it
+    // describes it; the other algorithms are not worked out on statistics yet.
+    let index_math = match query_value(pairs, "algorithm").map(str::to_ascii_lowercase).as_deref() {
+        None => None,
+        Some("normalizedindex") if query_value(pairs, "expression").is_none() => Some("(b2 - b1) / (b2 + b1)"),
+        Some(_) => {
+            return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet, but for normalizedIndex without `expression`");
+        }
+    };
     let size = match part_size_from_query(pairs) {
         Ok(s) => s,
         Err(r) => return r,
@@ -4446,7 +4487,8 @@ async fn mosaic_statistics(
         size,
         opts,
         cover_scale,
-        expression: query_value(pairs, "expression"),
+        expression: index_math.or_else(|| query_value(pairs, "expression")),
+        single: index_math.is_some(),
         unscale: pq.unscale,
         nodata: pq.nodata,
         mercator,
@@ -7954,6 +7996,31 @@ mod tests {
             let (algorithm, _, _) = asked(query, ext);
             assert!(algorithm.is_some(), "{query}");
         }
+    }
+
+    #[test]
+    fn a_float32_band_s_bins_are_numpy_s() {
+        let edges = |opts: &StatsOptions, band: &[f64]| match float32_bins(opts, band).bins {
+            zonal::Bins::Edges(e) => e,
+            zonal::Bins::Count(_) => vec![],
+        };
+        let band = [f64::from(-0.759_312_33_f32), 0.1, f64::NAN, f64::from(0.759_312_33_f32)];
+        // From the band's own ends: float32 arithmetic, the last edge the greatest value.
+        let opts = StatsOptions { bins: zonal::Bins::Count(10), ..StatsOptions::default() };
+        let from_values = edges(&opts, &band);
+        assert_eq!(from_values.len(), 11);
+        let (lo, hi) = (-0.759_312_33_f32, 0.759_312_33_f32);
+        let step = (hi - lo) / 10.0;
+        assert_eq!(from_values[3], f64::from(3.0 * step + lo));
+        assert_eq!(from_values[10], f64::from(hi));
+        // From a range given: double precision, each edge cast to float32 (-5/7 is one).
+        let opts = StatsOptions { bins: zonal::Bins::Count(7), range: Some((-1.0, 1.0)), ..StatsOptions::default() };
+        assert_eq!(edges(&opts, &band)[1], f64::from((-1.0 + 2.0 / 7.0) as f32));
+        // Edges given, or one value only: left as they are.
+        let given = StatsOptions { bins: zonal::Bins::Edges(vec![0.0, 1.0]), ..StatsOptions::default() };
+        assert!(matches!(float32_bins(&given, &band).bins, zonal::Bins::Edges(ref e) if e == &vec![0.0, 1.0]));
+        let flat = StatsOptions { bins: zonal::Bins::Count(10), ..StatsOptions::default() };
+        assert!(matches!(float32_bins(&flat, &[2.0, 2.0]).bins, zonal::Bins::Count(10)));
     }
 
     #[test]

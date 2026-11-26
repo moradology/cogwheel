@@ -921,6 +921,13 @@ def main() -> int:
                 f"/searches/{sid}/feature/32x32.npy?assets=red&coord_crs=epsg:3857&dst_crs=epsg:4326", "POST", in_metres)
         # Statistics count the pixels of a grid in `dst_crs`, which is `coord_crs` unless given.
         in_degrees = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [kite]}}
+        # normalizedIndex is band math of the first two bands, its values and bins in float32.
+        o.check("statistics of normalizedIndex", "zonal",
+                f"/searches/{sid}/statistics?assets=red&assets=nir&max_size=64&algorithm=normalizedIndex", "POST", in_degrees)
+        o.check("statistics of normalizedIndex, a histogram range", "zonal",
+                f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&max_size=64&algorithm=normalizedIndex&histogram_range=-1,1&histogram_bins=7", "POST", in_degrees)
+        o.check("statistics of normalizedIndex on one asset", "zonal",
+                f"/searches/{sid}/statistics?assets=visual&max_size=64&algorithm=normalizedIndex", "POST", in_degrees)
         o.check("statistics of where", "zonal",
                 f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&max_size=64&expression=where(b1%3E1000,1,0)", "POST", in_degrees)
         o.check("statistics of logic and minimum", "zonal",
