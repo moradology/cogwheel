@@ -9244,6 +9244,7 @@ where
                             } else {
                                 resp
                             };
+                            let resp = pgstac::item_drawn_placed(resp, &segs[1..], geo_meta);
                             pgstac_cacheable(resp, &method)
                         }
                         Err(resp) => resp,

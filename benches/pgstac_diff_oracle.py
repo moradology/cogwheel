@@ -145,6 +145,23 @@ def compare_geotiffs(cz: bytes, tt: bytes, smooth: bool) -> tuple[bool, str]:
     return ok, f"GeoTIFF, {note}"
 
 
+def same_place(cz, tt) -> tuple[bool, str]:
+    """`Content-Crs` equal, and `Content-Bbox` equal to a millionth of a unit (the last
+    digits of a float worked out another way)."""
+    crs_cz, crs_tt = cz.headers.get("content-crs"), tt.headers.get("content-crs")
+    if crs_cz != crs_tt:
+        return False, f"content-crs {crs_cz} vs {crs_tt}"
+    box_cz, box_tt = cz.headers.get("content-bbox"), tt.headers.get("content-bbox")
+    if (box_cz is None) != (box_tt is None):
+        return False, f"content-bbox {box_cz} vs {box_tt}"
+    if box_cz is None:
+        return True, "neither placed"
+    a, b = [float(v) for v in box_cz.split(",")], [float(v) for v in box_tt.split(",")]
+    if len(a) != 4 or any(abs(x - y) > 1e-6 * max(1.0, abs(y)) for x, y in zip(a, b)):
+        return False, f"content-bbox {box_cz} vs {box_tt}"
+    return True, f"{crs_cz.rsplit('/', 1)[-1]} {box_cz}"
+
+
 def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
     try:
         a = np.array(Image.open(io.BytesIO(cz)).convert("RGBA"), dtype=np.float32)
@@ -299,6 +316,8 @@ class Oracle:
             ok, note = False, f"status {cz.status_code} vs {tt.status_code}: {cz.text[:80]!r}"
         elif kind == "status":
             note = f"{cz.status_code}"
+        elif kind == "placed":
+            ok, note = same_place(cz, tt)
         elif kind == "json":
             try:
                 diff = first_diff(normalize(cz.json(), COGZILLA), normalize(tt.json(), TITILER))
@@ -1291,6 +1310,15 @@ def main() -> int:
         o.check("item preview as an array, rescaled", "image", f"{it}/preview.npy?assets=red&rescale=0,3000&max_size=128")
         o.check("item preview as an array, under a colour map", "image", f"{it}/preview.npy?assets=red&rescale=0,3000&colormap_name=viridis&max_size=128")
         o.check("item preview as a GeoTIFF, band math", "image", f"{it}/preview.tif?assets=red&assets=nir&asset_as_band=true&expression=b2-b1&max_size=128")
+        # Where an item's preview and posted feature lie: the raster's own system, or the one asked for.
+        o.check("item preview, where it lies", "placed", f"{it}/preview.png?assets=visual&max_size=128")
+        o.check("item preview at a size, where it lies", "placed", f"{it}/preview/100x80.png?assets=visual")
+        o.check("item preview as a GeoTIFF, where it lies", "placed", f"{it}/preview.tif?assets=red&max_size=64")
+        inside = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[
+            [6.5, 43.3], [6.6, 43.3], [6.6, 43.4], [6.5, 43.4], [6.5, 43.3]]]}}
+        o.check("item feature, where it lies", "placed", f"{it}/feature/64x64.png?assets=visual", "POST", inside)
+        o.check("item feature drawn in metres, where it lies", "placed",
+                f"{it}/feature.png?assets=visual&max_size=64&dst_crs=epsg:3857", "POST", inside)
         o.check("item tile as an array, in the data's type", "image", f"{itile}.npy?assets=red")
         o.check("item tile as an array, three bands of bytes", "image", f"{itile}.npy?assets=visual")
         o.check("item tile as an array, two assets, no mask", "image", f"{itile}.npy?assets=red&assets=nir&return_mask=false")
