@@ -1827,6 +1827,16 @@ fn parse_resample(pairs: &[(String, String)], name: &str) -> Result<ResampleMode
         None | Some("nearest") => Ok(ResampleMode::Nearest),
         Some("bilinear") => Ok(ResampleMode::Bilinear),
         Some("cubic" | "cubic_spline" | "lanczos") => Ok(ResampleMode::Cubic),
+        // The methods that gather a pixel's whole footprint; the last six are the warp's alone.
+        // `gauss` is not one of the warp's, nor the warp's six one of a read's: a 422, as there.
+        Some("gauss") if name == "reproject" => Err(invalid_param("query", name, "Input should be a resampling method")),
+        Some("max" | "min" | "med" | "q1" | "q3" | "sum") if name != "reproject" => {
+            Err(invalid_param("query", name, "Input should be a resampling method"))
+        }
+        Some(method @ ("average" | "mode" | "gauss" | "rms")) => Ok(super::parse_resample_mode(method).unwrap_or(ResampleMode::Nearest)),
+        Some(method @ ("max" | "min" | "med" | "q1" | "q3" | "sum")) if name == "reproject" => {
+            Ok(super::parse_resample_mode(method).unwrap_or(ResampleMode::Nearest))
+        }
         Some(other) => Err(detail(
             StatusCode::BAD_REQUEST,
             format!("{name} method '{other}' is not supported (use nearest, bilinear or cubic)"),
