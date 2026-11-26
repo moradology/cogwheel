@@ -1274,6 +1274,7 @@ mod tests {
             mask_ifd: None,
             pixel_to_crs: ident,
             crs_to_pixel: ident,
+            gcp_poly: None,
         };
         assert!(matches!(
             decode_tile(&[0u8; 4], &ifd, ByteOrder::Little, None),
@@ -1388,6 +1389,7 @@ mod tests {
                 e: 1.0,
                 f: 0.0,
             },
+            gcp_poly: None,
             tile_offsets: Box::new([0, 32]),
             tile_byte_counts: Box::new([32, 8]),
         };
@@ -1494,6 +1496,7 @@ mod tests {
                 e: 1.0,
                 f: 0.0,
             },
+            gcp_poly: None,
             tile_offsets: Box::new([0]),
             tile_byte_counts: Box::new([8]),
         };

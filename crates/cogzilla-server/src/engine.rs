@@ -317,6 +317,11 @@ impl TileEngine {
     }
 
     pub fn get_or_build_crs(&self, cog: &OpenedCog) -> Result<CrsModel, EngineError> {
+        if !cog.index.is_georeferenced {
+            return Err(EngineError::BadRequest(
+                "dataset has no georeferencing (missing GeoTransform/GCPs); geographic operations require a georeferenced raster".into(),
+            ));
+        }
         if let Some(c) = self.crs_cache.get(&cog.id) {
             return Ok(c.clone());
         }
@@ -393,9 +398,10 @@ impl TileEngine {
             return Ok(bytes);
         }
 
-        let Some(plan) = CoordPlan::<N>::build(
+        let Some(plan) = CoordPlan::<N>::build_with_gcp(
             &crs,
             &ifd.crs_to_pixel,
+            ifd.gcp_poly.as_deref(),
             ifd.width,
             ifd.height,
             req.tile,
@@ -1359,9 +1365,10 @@ impl TileEngine {
         validate_multi_cog_grid(cogs, ifd_idx)?;
         let ifd = &primary.index.ifds[ifd_idx];
 
-        let Some(plan) = CoordPlan::<N>::build(
+        let Some(plan) = CoordPlan::<N>::build_with_gcp(
             &crs,
             &ifd.crs_to_pixel,
+            ifd.gcp_poly.as_deref(),
             ifd.width,
             ifd.height,
             req.tile,
@@ -2087,6 +2094,7 @@ mod tests {
             is_stripped: false,
             pixel_to_crs,
             crs_to_pixel,
+            gcp_poly: None,
             tile_offsets: vec![0u64; n_tiles].into_boxed_slice(),
             tile_byte_counts: vec![128u32; n_tiles].into_boxed_slice(),
         }
@@ -2208,6 +2216,8 @@ mod tests {
         let index = cogzilla_tiff::CogIndex {
             byte_order: cogzilla_tiff::ByteOrder::Little,
             is_bigtiff: false,
+            is_georeferenced: true,
+            gcp_residual_px: None,
             geo_keys,
             nodata: None,
             scales: vec![1.0; 3],
