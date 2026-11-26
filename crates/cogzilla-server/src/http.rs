@@ -4426,6 +4426,33 @@ fn check_feature_collection_len(len: usize) -> Result<(), EngineError> {
     Ok(())
 }
 
+fn is_null_geometry_feature(feat: &serde_json::Value) -> bool {
+    feat.get("type").and_then(|v| v.as_str()) == Some("Feature")
+        && matches!(feat.get("geometry"), Some(serde_json::Value::Null))
+}
+
+fn parse_feature_mask_or_null(
+    feat: &serde_json::Value,
+    coord_crs: Option<&cogzilla_proj::CrsModel>,
+) -> Result<(PolygonMask, [f64; 4]), EngineError> {
+    if is_null_geometry_feature(feat) {
+        return Ok((PolygonMask::empty(), [0.0; 4]));
+    }
+    PolygonMask::from_geojson_in_crs(feat, coord_crs)
+}
+
+fn wrap_feature_error(idx: usize, feat: &serde_json::Value, err: EngineError) -> EngineError {
+    let prefix = match feat.get("id") {
+        Some(serde_json::Value::String(s)) => format!("features[{idx}] (id={s:?})"),
+        Some(v) if !v.is_null() => format!("features[{idx}] (id={v})"),
+        _ => format!("features[{idx}]"),
+    };
+    match err {
+        EngineError::BadRequest(msg) => EngineError::BadRequest(format!("{prefix}: {msg}")),
+        other => other,
+    }
+}
+
 fn insert_feature_stats(feat: &mut serde_json::Value, stats: serde_json::Value) {
     if let Some(props) = feat.get_mut("properties").and_then(|v| v.as_object_mut()) {
         props.insert("statistics".into(), stats);
@@ -5120,18 +5147,36 @@ where
                     Some(c) => Some(c.clone()),
                     None => crate::titiler::extract_geojson_crs(&geojson)?,
                 };
-                let compute_for_geom = |geom: &serde_json::Value| {
+                let compute_for_mask = |mask: PolygonMask, bbox: [f64; 4]| {
                     let eng = engine.clone();
                     let mj_c = mj.clone();
                     let opts = stats_opts.clone();
                     let max_size = pq.max_size;
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
-                    let coord_crs_c = fc_crs.clone();
-                    let geom_owned = geom.clone();
                     async move {
-                        let (mask, bbox) =
-                            PolygonMask::from_geojson_in_crs(&geom_owned, coord_crs_c.as_ref())?;
+                        if mask.is_empty() {
+                            if let Some(first_url) = mj_c.first_asset()
+                                && let Ok(cog) = eng.store.open_uri(first_url).await
+                                && let Ok(stats) = compute_statistics_with_options(
+                                    &eng,
+                                    &cog,
+                                    max_size,
+                                    Some(&mask),
+                                    unscale,
+                                    nodata,
+                                    &opts,
+                                )
+                                .await
+                            {
+                                return Ok(stats);
+                            }
+                            let mut empty = compute_f32_band_stats(&[], "b1", &opts);
+                            if let Some(o) = empty.as_object_mut() {
+                                o.insert("area".into(), serde_json::Value::Null);
+                            }
+                            return Ok(serde_json::json!({"b1": empty}));
+                        }
                         let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
                         let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
                         let urls = mj_c.query_bbox_3857(
@@ -5201,112 +5246,145 @@ where
                         })?;
                     check_feature_collection_len(features.len())?;
                     let n_feats = features.len();
+                    let mut parsed = Vec::with_capacity(n_feats);
+                    for (idx, feat) in features.iter().enumerate() {
+                        let (mask, bbox) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
+                            .map_err(|e| wrap_feature_error(idx, feat, e))?;
+                        parsed.push((mask, bbox));
+                    }
                     if n_feats <= 1 {
-                        for feat in features.iter_mut() {
-                            let stats = compute_for_geom(feat).await?;
-                            insert_feature_stats(feat, stats);
+                        for (idx, (mask, bbox)) in parsed.into_iter().enumerate() {
+                            let stats = compute_for_mask(mask, bbox)
+                                .await
+                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
+                            insert_feature_stats(&mut features[idx], stats);
                         }
                     } else {
-                        let feat_snapshots: Arc<Vec<serde_json::Value>> =
-                            Arc::new(features.clone());
+                        let parsed = Arc::new(parsed);
                         let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                         let workers = fc_worker_count(n_feats);
+                        let eng_m = engine.clone();
+                        let mj_m = mj.clone();
+                        let opts_m = stats_opts.clone();
+                        let max_size = pq.max_size;
+                        let unscale = pq.unscale;
+                        let nodata = pq.nodata;
+                        let compute_shared = Arc::new(move |mask: PolygonMask, bbox: [f64; 4]| {
+                            let eng = eng_m.clone();
+                            let mj_c = mj_m.clone();
+                            let opts = opts_m.clone();
+                            async move {
+                                if mask.is_empty() {
+                                    if let Some(first_url) = mj_c.first_asset()
+                                        && let Ok(cog) = eng.store.open_uri(first_url).await
+                                        && let Ok(stats) = compute_statistics_with_options(
+                                            &eng,
+                                            &cog,
+                                            max_size,
+                                            Some(&mask),
+                                            unscale,
+                                            nodata,
+                                            &opts,
+                                        )
+                                        .await
+                                    {
+                                        return Ok(stats);
+                                    }
+                                    let mut empty = compute_f32_band_stats(&[], "b1", &opts);
+                                    if let Some(o) = empty.as_object_mut() {
+                                        o.insert("area".into(), serde_json::Value::Null);
+                                    }
+                                    return Ok(serde_json::json!({"b1": empty}));
+                                }
+                                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
+                                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
+                                let urls = mj_c.query_bbox_3857(
+                                    mx0.min(mx1),
+                                    my0.min(my1),
+                                    mx0.max(mx1),
+                                    my0.max(my1),
+                                );
+                                let mut last_err: Option<EngineError> = None;
+                                let mut first_empty: Option<serde_json::Value> = None;
+                                for cand in urls.iter().take(16) {
+                                    match eng.store.open_uri(cand).await {
+                                        Ok(cog) => {
+                                            match compute_statistics_with_options(
+                                                &eng,
+                                                &cog,
+                                                max_size,
+                                                Some(&mask),
+                                                unscale,
+                                                nodata,
+                                                &opts,
+                                            )
+                                            .await
+                                            {
+                                                Ok(stats) => {
+                                                    let has_valid = stats
+                                                        .as_object()
+                                                        .is_some_and(|obj| {
+                                                            obj.values().any(|b| {
+                                                                b.get("valid_pixels")
+                                                                    .and_then(|v| v.as_f64())
+                                                                    .unwrap_or(0.0)
+                                                                    > 0.0
+                                                            })
+                                                        });
+                                                    if has_valid {
+                                                        return Ok(stats);
+                                                    }
+                                                    if first_empty.is_none() {
+                                                        first_empty = Some(stats);
+                                                    }
+                                                }
+                                                Err(e) => last_err = Some(e),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            last_err =
+                                                Some(crate::engine::asset_fetch_error(cand, e))
+                                        }
+                                    }
+                                }
+                                if let Some(empty) = first_empty {
+                                    return Ok(empty);
+                                }
+                                Err(last_err.unwrap_or_else(|| {
+                                    EngineError::NotFound(
+                                        "no mosaic scenes intersect requested geometry".into(),
+                                    )
+                                }))
+                            }
+                        });
                         let mut set = tokio::task::JoinSet::new();
                         for _ in 0..workers {
-                            let feats_c = feat_snapshots.clone();
+                            let parsed_c = parsed.clone();
                             let next_c = next_idx.clone();
-                            let eng = engine.clone();
-                            let mj_c = mj.clone();
-                            let opts = stats_opts.clone();
-                            let max_size = pq.max_size;
-                            let unscale = pq.unscale;
-                            let nodata = pq.nodata;
-                            let coord_crs_c = fc_crs.clone();
+                            let compute_c = compute_shared.clone();
                             set.spawn(async move {
                                 let mut local = Vec::new();
                                 loop {
                                     let idx = next_c
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if idx >= feats_c.len() {
+                                    if idx >= parsed_c.len() {
                                         break;
                                     }
-                                    let (mask, bbox) = PolygonMask::from_geojson_in_crs(
-                                        &feats_c[idx],
-                                        coord_crs_c.as_ref(),
-                                    )?;
-                                    let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
-                                    let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
-                                    let urls = mj_c.query_bbox_3857(
-                                        mx0.min(mx1),
-                                        my0.min(my1),
-                                        mx0.max(mx1),
-                                        my0.max(my1),
-                                    );
-                                    let mut last_err: Option<EngineError> = None;
-                                    let mut first_empty: Option<serde_json::Value> = None;
-                                    let mut found: Option<serde_json::Value> = None;
-                                    for cand in urls.iter().take(16) {
-                                        match eng.store.open_uri(cand).await {
-                                            Ok(cog) => {
-                                                match compute_statistics_with_options(
-                                                    &eng,
-                                                    &cog,
-                                                    max_size,
-                                                    Some(&mask),
-                                                    unscale,
-                                                    nodata,
-                                                    &opts,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(stats) => {
-                                                        let has_valid = stats
-                                                            .as_object()
-                                                            .is_some_and(|obj| {
-                                                                obj.values().any(|b| {
-                                                                    b.get("valid_pixels")
-                                                                        .and_then(|v| v.as_f64())
-                                                                        .unwrap_or(0.0)
-                                                                        > 0.0
-                                                                })
-                                                            });
-                                                        if has_valid {
-                                                            found = Some(stats);
-                                                            break;
-                                                        }
-                                                        if first_empty.is_none() {
-                                                            first_empty = Some(stats);
-                                                        }
-                                                    }
-                                                    Err(e) => last_err = Some(e),
-                                                }
-                                            }
-                                            Err(e) => {
-                                                last_err =
-                                                    Some(crate::engine::asset_fetch_error(cand, e))
-                                            }
-                                        }
-                                    }
-                                    let stats = match found.or(first_empty) {
-                                        Some(s) => s,
-                                        None => {
-                                            return Err(last_err.unwrap_or_else(|| {
-                                                EngineError::NotFound(
-                                                    "no mosaic scenes intersect requested geometry"
-                                                        .into(),
-                                                )
-                                            }));
-                                        }
-                                    };
+                                    let (ref mask, bbox) = parsed_c[idx];
+                                    let stats = compute_c(mask.clone(), bbox).await.map_err(|e| (idx, e))?;
                                     local.push((idx, stats));
                                 }
-                                Ok::<_, EngineError>(local)
+                                Ok::<_, (usize, EngineError)>(local)
                             });
                         }
                         while let Some(joined) = set.join_next().await {
-                            let batch = joined.map_err(|e| {
-                                EngineError::BadRequest(format!("statistics worker failed: {e}"))
-                            })??;
+                            let batch = joined
+                                .map_err(|e| {
+                                    EngineError::BadRequest(format!(
+                                        "statistics worker failed: {e}"
+                                    ))
+                                })?
+                                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
                             for (idx, stats) in batch {
                                 insert_feature_stats(&mut features[idx], stats);
                             }
@@ -5314,7 +5392,8 @@ where
                     }
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                 } else {
-                    let stats = compute_for_geom(&geojson).await?;
+                    let (mask, bbox) = parse_feature_mask_or_null(&geojson, fc_crs.as_ref())?;
+                    let stats = compute_for_mask(mask, bbox).await?;
                     if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
                         if let Some(props) =
                             geojson.get_mut("properties").and_then(|v| v.as_object_mut())
@@ -7184,20 +7263,20 @@ where
                         })?;
                     check_feature_collection_len(features.len())?;
                     let n_feats = features.len();
+                    let mut parsed = Vec::with_capacity(n_feats);
+                    for (idx, feat) in features.iter().enumerate() {
+                        let (mask, poly_bbox) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
+                            .map_err(|e| wrap_feature_error(idx, feat, e))?;
+                        parsed.push((Arc::new(mask), poly_bbox));
+                    }
                     if n_feats <= 1 {
-                        for feat in features.iter_mut() {
-                            let (mask, poly_bbox) =
-                                PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
-                            let stats = compute_stac_merged_stats(Arc::new(mask), poly_bbox).await?;
-                            insert_feature_stats(feat, stats);
+                        for (idx, (mask, poly_bbox)) in parsed.into_iter().enumerate() {
+                            let stats = compute_stac_merged_stats(mask, poly_bbox)
+                                .await
+                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
+                            insert_feature_stats(&mut features[idx], stats);
                         }
                     } else {
-                        let mut parsed = Vec::with_capacity(n_feats);
-                        for feat in features.iter() {
-                            let (mask, poly_bbox) =
-                                PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
-                            parsed.push((Arc::new(mask), poly_bbox));
-                        }
                         let parsed = Arc::new(parsed);
                         let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                         let workers = fc_worker_count(n_feats);
@@ -7216,16 +7295,22 @@ where
                                         break;
                                     }
                                     let (ref mask, poly_bbox) = parsed_c[idx];
-                                    let stats = compute_c(mask.clone(), poly_bbox).await?;
+                                    let stats = compute_c(mask.clone(), poly_bbox)
+                                        .await
+                                        .map_err(|e| (idx, e))?;
                                     local.push((idx, stats));
                                 }
-                                Ok::<_, EngineError>(local)
+                                Ok::<_, (usize, EngineError)>(local)
                             });
                         }
                         while let Some(joined) = set.join_next().await {
-                            let batch = joined.map_err(|e| {
-                                EngineError::BadRequest(format!("statistics worker failed: {e}"))
-                            })??;
+                            let batch = joined
+                                .map_err(|e| {
+                                    EngineError::BadRequest(format!(
+                                        "statistics worker failed: {e}"
+                                    ))
+                                })?
+                                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
                             for (idx, stats) in batch {
                                 insert_feature_stats(&mut features[idx], stats);
                             }
@@ -7234,7 +7319,7 @@ where
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                 } else {
                     let (mask, poly_bbox) =
-                        PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
+                        parse_feature_mask_or_null(&geojson, pq.coord_crs.as_ref())?;
                     let stats = compute_stac_merged_stats(Arc::new(mask), poly_bbox).await?;
                     if geojson.get("type").and_then(|v| v.as_str()) == Some("Feature") {
                         if let Some(props) =
@@ -8531,10 +8616,14 @@ where
                             })?;
                         check_feature_collection_len(features.len())?;
                         let n_feats = features.len();
+                        let mut masks = Vec::with_capacity(n_feats);
+                        for (idx, feat) in features.iter().enumerate() {
+                            let (mask, _) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
+                                .map_err(|e| wrap_feature_error(idx, feat, e))?;
+                            masks.push(mask);
+                        }
                         if n_feats <= 1 {
-                            for feat in features.iter_mut() {
-                                let (mask, _) =
-                                    PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
+                            for (idx, mask) in masks.into_iter().enumerate() {
                                 let stats = compute_statistics_with_options(
                                     &engine,
                                     &cogs[0],
@@ -8544,16 +8633,11 @@ where
                                     pq.nodata,
                                     &stats_opts,
                                 )
-                                .await?;
-                                insert_feature_stats(feat, stats);
+                                .await
+                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
+                                insert_feature_stats(&mut features[idx], stats);
                             }
                         } else {
-                            let mut masks = Vec::with_capacity(n_feats);
-                            for feat in features.iter() {
-                                let (mask, _) =
-                                    PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
-                                masks.push(mask);
-                            }
                             let masks = Arc::new(masks);
                             let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                             let workers = fc_worker_count(n_feats);
@@ -8584,18 +8668,23 @@ where
                                             nodata,
                                             &opts_c,
                                         )
-                                        .await?;
+                                        .await
+                                        .map_err(|e| (idx, e))?;
                                         local.push((idx, stats));
                                     }
-                                    Ok::<_, EngineError>(local)
+                                    Ok::<_, (usize, EngineError)>(local)
                                 });
                             }
                             while let Some(joined) = set.join_next().await {
-                                let batch = joined.map_err(|e| {
-                                    EngineError::BadRequest(format!(
-                                        "statistics worker failed: {e}"
-                                    ))
-                                })??;
+                                let batch = joined
+                                    .map_err(|e| {
+                                        EngineError::BadRequest(format!(
+                                            "statistics worker failed: {e}"
+                                        ))
+                                    })?
+                                    .map_err(|(idx, e)| {
+                                        wrap_feature_error(idx, &features[idx], e)
+                                    })?;
                                 for (idx, stats) in batch {
                                     insert_feature_stats(&mut features[idx], stats);
                                 }
@@ -8604,7 +8693,7 @@ where
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                     } else {
                         let (mask, _) =
-                            PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
+                            parse_feature_mask_or_null(&geojson, pq.coord_crs.as_ref())?;
                         let stats = compute_statistics_with_options(
                             &engine,
                             &cogs[0],
