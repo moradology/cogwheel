@@ -575,12 +575,42 @@ fn to_owned_plan(coords: BboxCoordSource<'_>, bc: f32, br: f32) -> OwnedCoordPla
             v_map,
         } => {
             let n = dst_w * dst_h;
-            OwnedCoordPlan::Exact2D {
-                dst_w,
-                dst_h,
-                u: u_map[..n].iter().map(|&x| x - bc).collect(),
-                v: v_map[..n].iter().map(|&y| y - br).collect(),
-            }
+            let shift_slice = |src: &[f32], delta: f32| -> Vec<f32> {
+                if delta == 0.0 {
+                    return src.to_vec();
+                }
+                let mut out = vec![0.0f32; src.len()];
+                if src.len() >= 256 * 256 {
+                    let threads = std::thread::available_parallelism()
+                        .map(|p| p.get().clamp(2, 8))
+                        .unwrap_or(4);
+                    let chunk = src.len().div_ceil(threads);
+                    std::thread::scope(|s| {
+                        for (dst_c, src_c) in out.chunks_mut(chunk).zip(src.chunks(chunk)) {
+                            s.spawn(move || {
+                                for (d, &v) in dst_c.iter_mut().zip(src_c.iter()) {
+                                    *d = v - delta;
+                                }
+                            });
+                        }
+                    });
+                } else {
+                    for (d, &v) in out.iter_mut().zip(src.iter()) {
+                        *d = v - delta;
+                    }
+                }
+                out
+            };
+            let (u, v) = if n >= 256 * 256 {
+                std::thread::scope(|s| {
+                    let hu = s.spawn(|| shift_slice(&u_map[..n], bc));
+                    let v = shift_slice(&v_map[..n], br);
+                    (hu.join().unwrap(), v)
+                })
+            } else {
+                (shift_slice(&u_map[..n], bc), shift_slice(&v_map[..n], br))
+            };
+            OwnedCoordPlan::Exact2D { dst_w, dst_h, u, v }
         }
     }
 }
