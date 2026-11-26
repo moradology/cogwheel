@@ -36,7 +36,7 @@ use crate::titiler::{
     get_algorithm_json,
     list_algorithms_json, native_bbox_dims_in_crs, query_point,
     render_crs_bbox, render_mercator_bbox, render_multi_asset_bbox, render_native_preview,
-    render_wgs84_bbox,
+    render_native_preview_stats, render_wgs84_bbox, render_wgs84_bbox_stats,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -7047,7 +7047,7 @@ where
                         if pq.unscale {
                             apply_unscale_cogs(&mut bands, &cogs);
                         }
-                        let raw = render_native_preview(
+                        let stat = render_native_preview_stats(
                             &engine,
                             &cogs,
                             bbox,
@@ -7055,22 +7055,13 @@ where
                             out_h,
                             &bands,
                             pq.resample,
-                            OutputFormat::RawF32,
                             pq.nodata,
-                            None,
-                            None,
-                            true,
                             pq.unscale,
+                            &desc,
+                            &stats_opts,
                         )
                         .await?;
-                        let pixels: Vec<f32> = raw
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        map.insert(
-                            format!("b{}", idx + 1),
-                            compute_f32_band_stats_with_engine(&engine, &pixels, &desc, &stats_opts),
-                        );
+                        map.insert(format!("b{}", idx + 1), stat);
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
                 }
@@ -7297,16 +7288,12 @@ where
                                 if unscale {
                                     apply_unscale_cogs(&mut bands, &cogs_c);
                                 }
-                                let raw = render_wgs84_bbox(
+                                let stat = render_wgs84_bbox_stats(
                                     &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
-                                    resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
+                                    resample, nodata, unscale, &desc, &stats_opts,
                                 )
                                 .await?;
-                                let pixels: Vec<f32> = raw
-                                    .chunks_exact(4)
-                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                    .collect();
-                                map.insert(format!("b{}", idx + 1), compute_f32_band_stats_with_engine(&eng, &pixels, &desc, &stats_opts));
+                                map.insert(format!("b{}", idx + 1), stat);
                             }
                             return Ok::<_, EngineError>(serde_json::Value::Object(map));
                         }

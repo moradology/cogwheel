@@ -117,5 +117,9 @@ required-features = ["gpu"]
 name = "cold_slab_upload_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "e2e_titiler_fused_stats_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 zune-jpeg.workspace = true
