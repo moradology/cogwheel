@@ -673,15 +673,47 @@ pub fn rasterize_exact_coverage(
             }
 
             // Single linear scanline pass per row: combine prefix run with boundary cell area.
-            for row in 0..win_h {
-                let d_off = row * stride_delta;
-                let a_off = row * win_w;
-                let mut prefix = 0.0_f64;
-                for col in 0..win_w {
-                    prefix += st.run_delta[d_off + col];
-                    let v = (prefix + st.area[a_off + col]).clamp(0.0, 1.0);
-                    if v > 1e-12 {
-                        cov[a_off + col] = (cov[a_off + col] + v).min(1.0);
+            let area_slice = &st.area[..n_px];
+            let delta_slice = &st.run_delta[..win_h * stride_delta];
+            if n_px >= 65_536 && win_h >= 16 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get().clamp(2, 8))
+                    .unwrap_or(4);
+                let rows_per = win_h.div_ceil(threads);
+                std::thread::scope(|s| {
+                    for (ci, cov_chunk) in cov.chunks_mut(rows_per * win_w).enumerate() {
+                        let r_start = ci * rows_per;
+                        let n_rows = cov_chunk.len() / win_w;
+                        s.spawn(move || {
+                            for r in 0..n_rows {
+                                let row = r_start + r;
+                                let d_off = row * stride_delta;
+                                let a_off = row * win_w;
+                                let c_off = r * win_w;
+                                let mut prefix = 0.0_f64;
+                                for col in 0..win_w {
+                                    prefix += delta_slice[d_off + col];
+                                    let v = (prefix + area_slice[a_off + col]).clamp(0.0, 1.0);
+                                    if v > 1e-12 {
+                                        cov_chunk[c_off + col] =
+                                            (cov_chunk[c_off + col] + v).min(1.0);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            } else {
+                for row in 0..win_h {
+                    let d_off = row * stride_delta;
+                    let a_off = row * win_w;
+                    let mut prefix = 0.0_f64;
+                    for col in 0..win_w {
+                        prefix += delta_slice[d_off + col];
+                        let v = (prefix + area_slice[a_off + col]).clamp(0.0, 1.0);
+                        if v > 1e-12 {
+                            cov[a_off + col] = (cov[a_off + col] + v).min(1.0);
+                        }
                     }
                 }
             }
@@ -1649,7 +1681,25 @@ fn try_gpu_weighted_polygon_bands(
         }
         PixelAreaModel::Lattice { .. } => return None,
     };
-    let cov_f32: Vec<f32> = cov.iter().map(|&c| c as f32).collect();
+    let cov_f32: Vec<f32> = if cov.len() >= 256 * 256 {
+        let mut out = vec![0.0f32; cov.len()];
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get().clamp(2, 8))
+            .unwrap_or(4);
+        let chunk = cov.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            for (dst, src) in out.chunks_mut(chunk).zip(cov.chunks(chunk)) {
+                s.spawn(move || {
+                    for (d, &c) in dst.iter_mut().zip(src.iter()) {
+                        *d = c as f32;
+                    }
+                });
+            }
+        });
+        out
+    } else {
+        cov.iter().map(|&c| c as f32).collect()
+    };
     let slices: Vec<&[f32]> = bands.iter().map(|&(_, s)| s).collect();
     let pcts: Vec<f64> = if opts.percentiles.is_empty() {
         vec![2.0, 98.0]
@@ -1949,8 +1999,119 @@ pub async fn compute_native_exact_polygon_stats(
     // Fetch intersecting data blocks in parallel (get_blocks already applies internal mask IFDs).
     let eff_nodata = nodata_override.or(cog.index.nodata);
 
-    let mut band_bufs: Vec<(u16, Vec<f32>)> = Vec::with_capacity(sel_bands.len());
-    match ifd.planar_config {
+    let stitch_band = |tiles: &[Option<Arc<cogzilla_codec::DecodedTile>>],
+                       band_in_tile: usize,
+                       sc: f32,
+                       off: f32|
+     -> Vec<f32> {
+        let mut pixels = vec![f32::NAN; n_px];
+        let nd_finite = eff_nodata.filter(|nd| nd.is_finite());
+        for (bi, tile_opt) in tiles.iter().enumerate() {
+            let Some(tile) = tile_opt else { continue };
+            let Some(band) = tile.bands.get(band_in_tile) else { continue };
+            let ty = ty0 + bi / blocks_x;
+            let tx = tx0 + bi % blocks_x;
+            let tile_x0 = tx * tw;
+            let tile_y0 = ty * th;
+            let rx0 = c0.max(tile_x0);
+            let rx1 = c1.min(tile_x0 + tw);
+            let ry0 = r0.max(tile_y0);
+            let ry1 = r1.min(tile_y0 + th);
+            let span = rx1 - rx0;
+            let lx0 = rx0 - tile_x0;
+            let dst_x0 = rx0 - c0;
+            match &band.data {
+                cogzilla_codec::BandData::F32(slab)
+                    if !unscale && nd_finite.is_none() =>
+                {
+                    let src_slice = slab.as_slice();
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        pixels[d0..d0 + span].copy_from_slice(&src_slice[s0..s0 + span]);
+                    }
+                }
+                cogzilla_codec::BandData::F32(slab) => {
+                    let src_slice = slab.as_slice();
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&src_slice[s0..s0 + span]) {
+                            if !raw.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = nd_finite
+                                && raw == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { raw * sc + off } else { raw };
+                        }
+                    }
+                }
+                cogzilla_codec::BandData::U16 { data, nodata } => {
+                    let nd_u16 = nd_finite.or(nodata.map(|n| n as f32));
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            let v = raw as f32;
+                            if let Some(nd) = nd_u16
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
+                    }
+                }
+                cogzilla_codec::BandData::U8 { data, nodata } => {
+                    let nd_u8 = nd_finite.or(nodata.map(|n| n as f32));
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            let v = raw as f32;
+                            if let Some(nd) = nd_u8
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
+                    }
+                }
+                _ => {
+                    for row in ry0..ry1 {
+                        let ly = row - tile_y0;
+                        let dst_row = (row - r0) * win_w;
+                        for col in rx0..rx1 {
+                            let lx = col - tile_x0;
+                            let mut v = band.data.get_f32(ly * tw + lx);
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            pixels[dst_row + (col - c0)] = v;
+                        }
+                    }
+                }
+            }
+        }
+        pixels
+    };
+
+    let band_bufs: Vec<(u16, Vec<f32>)> = match ifd.planar_config {
         PlanarConfig::Chunky => {
             let mut indices = Vec::with_capacity(blocks_x * blocks_y);
             for ty in ty0..=ty1 {
@@ -1959,113 +2120,109 @@ pub async fn compute_native_exact_polygon_stats(
                 }
             }
             let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
-            for &b1 in &sel_bands {
-                let b0 = (b1 - 1) as usize;
-                let sc = if unscale {
-                    cog.index.scales.get(b0).copied().unwrap_or(1.0)
-                } else {
-                    1.0
-                };
-                let off = if unscale {
-                    cog.index.offsets.get(b0).copied().unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                let mut pixels = vec![f32::NAN; n_px];
-                for (bi, tile_opt) in tiles.iter().enumerate() {
-                    let Some(tile) = tile_opt else { continue };
-                    let Some(band) = tile.bands.get(b0) else { continue };
-                    let ty = ty0 + bi / blocks_x;
-                    let tx = tx0 + bi % blocks_x;
-                    let tile_x0 = tx * tw;
-                    let tile_y0 = ty * th;
-                    let rx0 = c0.max(tile_x0);
-                    let rx1 = c1.min(tile_x0 + tw);
-                    let ry0 = r0.max(tile_y0);
-                    let ry1 = r1.min(tile_y0 + th);
-                    for row in ry0..ry1 {
-                        let ly = row - tile_y0;
-                        let dst_row = (row - r0) * win_w;
-                        for col in rx0..rx1 {
-                            let lx = col - tile_x0;
-                            let src_i = ly * tw + lx;
-                            let mut v = band.data.get_f32(src_i);
-                            if !v.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = eff_nodata
-                                && (nd.is_nan() && v.is_nan() || v == nd)
-                            {
-                                continue;
-                            }
-                            if unscale {
-                                v = v * sc + off;
-                            }
-                            pixels[dst_row + (col - c0)] = v;
-                        }
-                    }
-                }
-                band_bufs.push((b1, pixels));
+            if sel_bands.len() > 1 && n_px >= 65_536 {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = sel_bands
+                        .iter()
+                        .map(|&b1| {
+                            let b0 = (b1 - 1) as usize;
+                            let sc = if unscale {
+                                cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                            } else {
+                                1.0
+                            };
+                            let off = if unscale {
+                                cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            let tiles_ref = &tiles;
+                            let stitch_ref = &stitch_band;
+                            s.spawn(move || (b1, stitch_ref(tiles_ref, b0, sc, off)))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            } else {
+                sel_bands
+                    .iter()
+                    .map(|&b1| {
+                        let b0 = (b1 - 1) as usize;
+                        let sc = if unscale {
+                            cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                        } else {
+                            1.0
+                        };
+                        let off = if unscale {
+                            cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        (b1, stitch_band(&tiles, b0, sc, off))
+                    })
+                    .collect()
             }
         }
         PlanarConfig::Planar => {
+            // Fetch ALL requested planar bands in ONE parallel `get_blocks` batch!
+            let per_band = blocks_x * blocks_y;
+            let mut indices = Vec::with_capacity(per_band * sel_bands.len());
             for &b1 in &sel_bands {
-                let b0 = (b1 - 1) as usize;
-                let mut indices = Vec::with_capacity(blocks_x * blocks_y);
+                let b0 = (b1 - 1) as u16;
                 for ty in ty0..=ty1 {
                     for tx in tx0..=tx1 {
-                        indices.push(Some(ifd.tile_index(tx as u32, ty as u32, b0 as u16) as u32));
+                        indices.push(Some(ifd.tile_index(tx as u32, ty as u32, b0) as u32));
                     }
                 }
-                let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
-                let sc = if unscale {
-                    cog.index.scales.get(b0).copied().unwrap_or(1.0)
-                } else {
-                    1.0
-                };
-                let off = if unscale {
-                    cog.index.offsets.get(b0).copied().unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                let mut pixels = vec![f32::NAN; n_px];
-                for (bi, tile_opt) in tiles.iter().enumerate() {
-                    let Some(tile) = tile_opt else { continue };
-                    let Some(band) = tile.bands.first() else { continue };
-                    let ty = ty0 + bi / blocks_x;
-                    let tx = tx0 + bi % blocks_x;
-                    let tile_x0 = tx * tw;
-                    let tile_y0 = ty * th;
-                    let rx0 = c0.max(tile_x0);
-                    let rx1 = c1.min(tile_x0 + tw);
-                    let ry0 = r0.max(tile_y0);
-                    let ry1 = r1.min(tile_y0 + th);
-                    for row in ry0..ry1 {
-                        let ly = row - tile_y0;
-                        let dst_row = (row - r0) * win_w;
-                        for col in rx0..rx1 {
-                            let lx = col - tile_x0;
-                            let src_i = ly * tw + lx;
-                            let mut v = band.data.get_f32(src_i);
-                            if !v.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = eff_nodata
-                                && (nd.is_nan() && v.is_nan() || v == nd)
-                            {
-                                continue;
-                            }
-                            if unscale {
-                                v = v * sc + off;
-                            }
-                            pixels[dst_row + (col - c0)] = v;
-                        }
-                    }
-                }
-                band_bufs.push((b1, pixels));
+            }
+            let all_tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+            if sel_bands.len() > 1 && n_px >= 65_536 {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = sel_bands
+                        .iter()
+                        .enumerate()
+                        .map(|(bi, &b1)| {
+                            let b0 = (b1 - 1) as usize;
+                            let sc = if unscale {
+                                cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                            } else {
+                                1.0
+                            };
+                            let off = if unscale {
+                                cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            let slice = &all_tiles[bi * per_band..(bi + 1) * per_band];
+                            let stitch_ref = &stitch_band;
+                            s.spawn(move || (b1, stitch_ref(slice, 0, sc, off)))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            } else {
+                sel_bands
+                    .iter()
+                    .enumerate()
+                    .map(|(bi, &b1)| {
+                        let b0 = (b1 - 1) as usize;
+                        let sc = if unscale {
+                            cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                        } else {
+                            1.0
+                        };
+                        let off = if unscale {
+                            cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        let slice = &all_tiles[bi * per_band..(bi + 1) * per_band];
+                        (b1, stitch_band(slice, 0, sc, off))
+                    })
+                    .collect()
             }
         }
-    }
+    };
 
     // Compute exact coverage, ellipsoidal area model (or geodesic line lengths), and weighted statistics.
     let crs_owned = crs.clone();
