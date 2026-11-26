@@ -2411,6 +2411,7 @@ fn compute_statistics_cpu(
     {
         return compute_expression_statistics_cpu(
             cog,
+            ifd_idx,
             ifd,
             poly_mask,
             unscale,
@@ -2699,6 +2700,7 @@ fn compute_statistics_cpu(
 #[allow(clippy::too_many_arguments)]
 fn compute_expression_statistics_cpu(
     cog: &OpenedCog,
+    ifd_idx: usize,
     ifd: &cogzilla_tiff::IfdMeta,
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
@@ -2713,21 +2715,165 @@ fn compute_expression_statistics_cpu(
     exprs: &[(String, cogzilla_kernel::ExprProgram)],
     #[cfg(feature = "gpu")] gpu: Option<&crate::gpu_backend::GpuBackend>,
 ) -> serde_json::Value {
+    #[cfg(not(feature = "gpu"))]
+    let _ = ifd_idx;
     let denom_pixels = if poly_mask.is_some() {
         mask_total_pixels
     } else {
         total_pixels
     };
+    let tile_masks = match &fetched {
+        StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
+    };
+
+    // 1-pass fused GPU fast path for unmasked `/cog/statistics?expression=...`:
+    // evaluates each expression + 3-stage histogram/percentile reduction directly on the GPU
+    // (12 KB readback, zero CPU pixel loop, zero 67 MB Vec<f32> alloc/upload).
+    #[cfg(feature = "gpu")]
+    if poly_mask.is_none()
+        && tile_masks.is_none()
+        && !opts.categorical
+        && opts.histogram_edges.is_none()
+        && let Some(gpu_ref) = gpu
+        && exprs
+            .iter()
+            .all(|(_, prog)| !prog.used_bands.is_empty() && prog.used_bands.len() <= 8)
+    {
+        let (u_cols, v_rows): (Vec<f32>, Vec<f32>) =
+            if let (Some(xs_all), Some(ys_all)) = (tile_xs, tile_ys) {
+                let mut u = Vec::new();
+                for (tx, xs) in xs_all.iter().enumerate() {
+                    let base_x = tx as u32 * ifd.tile_width;
+                    for &lx in xs {
+                        u.push((base_x + lx as u32) as f32);
+                    }
+                }
+                let mut v = Vec::new();
+                for (ty, ys) in ys_all.iter().enumerate() {
+                    let base_y = ty as u32 * ifd.tile_height;
+                    for &ly in ys {
+                        v.push((base_y + ly as u32) as f32);
+                    }
+                }
+                (u, v)
+            } else {
+                let st = step.max(1);
+                let u = (0..ifd.width as usize)
+                    .step_by(st)
+                    .map(|x| x as f32)
+                    .collect();
+                let v = (0..ifd.height as usize)
+                    .step_by(st)
+                    .map(|y| y as f32)
+                    .collect();
+                (u, v)
+            };
+        if u_cols.len().saturating_mul(v_rows.len()) == denom_pixels && !u_cols.is_empty() && !v_rows.is_empty() {
+            let coords = crate::gpu_backend::BboxCoordSource::Separable {
+                u: &u_cols,
+                v: &v_rows,
+            };
+            let hist_bins = opts.histogram_bins.clamp(1, 1000);
+            let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+            let mut gpu_out = serde_json::Map::new();
+            let mut all_ok = true;
+            for (i, (expr_str, prog)) in exprs.iter().enumerate() {
+                let ref_vecs: Vec<(Vec<Option<&cogzilla_codec::DecodedBand>>, (f32, f32))> = prog
+                    .used_bands
+                    .iter()
+                    .map(|&b1| {
+                        let bi = b1.saturating_sub(1) as usize;
+                        let so = if unscale {
+                            (
+                                cog.index.scales.get(bi).copied().unwrap_or(1.0),
+                                cog.index.offsets.get(bi).copied().unwrap_or(0.0),
+                            )
+                        } else {
+                            (1.0, 0.0)
+                        };
+                        let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = match &fetched {
+                            StatsTiles::Chunky { tiles, .. } => tiles
+                                .iter()
+                                .take(n_tiles)
+                                .map(|o| {
+                                    o.as_ref()
+                                        .and_then(|t| t.bands.get(bi))
+                                        .filter(|tb| !tb.stats.all_nodata)
+                                })
+                                .collect(),
+                            StatsTiles::Planar { band_tiles, .. } => {
+                                if let Some(bt) = band_tiles.get(bi) {
+                                    bt.iter()
+                                        .take(n_tiles)
+                                        .map(|o| {
+                                            o.as_ref()
+                                                .and_then(|t| t.bands.first())
+                                                .filter(|tb| !tb.stats.all_nodata)
+                                        })
+                                        .collect()
+                                } else {
+                                    vec![None; n_tiles]
+                                }
+                            }
+                        };
+                        (blocks, so)
+                    })
+                    .collect();
+                let srcs: Vec<BandSource<'_>> = ref_vecs
+                    .iter()
+                    .map(|(blocks, (sc, off))| {
+                        BandSource::new(
+                            ifd.width,
+                            ifd.height,
+                            ifd.tile_width,
+                            ifd.tile_height,
+                            0,
+                            0,
+                            ifd.tiles_across,
+                            ifd.tiles_down,
+                            blocks,
+                        )
+                        .with_nodata_override(nodata_override)
+                        .with_scale_offset(*sc, *off)
+                    })
+                    .collect();
+                let cache_key = crate::gpu_backend::GpuBackend::multiband_key(
+                    cog.id,
+                    ifd_idx,
+                    &prog.used_bands,
+                    &srcs,
+                );
+                if let Some(gs) = gpu_ref.try_render_bbox_expr_stats(
+                    cache_key,
+                    coords,
+                    &srcs,
+                    prog,
+                    ResampleMode::Nearest,
+                    hist_bins,
+                    opts.histogram_range,
+                    &opts.percentiles,
+                ) {
+                    gpu_out.insert(
+                        format!("b{}", i + 1),
+                        gpu_band_stats_to_json(&gs, denom_pixels, expr_str, opts),
+                    );
+                } else {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                return serde_json::Value::Object(gpu_out);
+            }
+        }
+    }
+
     let mut accs: Vec<Vec<f32>> = (0..exprs.len())
         .map(|_| Vec::with_capacity(denom_pixels.min(1 << 20)))
         .collect();
     let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
     let count = ifd.samples_per_pixel as usize;
     let tw = ifd.tile_width as usize;
-
-    let tile_masks = match &fetched {
-        StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
-    };
 
     let has_where: Vec<bool> = exprs
         .iter()
@@ -6378,6 +6524,112 @@ async fn render_bbox_core(
                                 coords,
                                 &srcs,
                                 prog,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::Dem {
+                            band_1based,
+                            algorithm,
+                            ..
+                        } => {
+                            let refs = get_band_refs(*band_1based, 0);
+                            let src = make_src!(&refs);
+                            let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                            let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
+                            let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                            gpu.try_render_bbox_dem_stats(
+                                primary_id,
+                                ifd_idx,
+                                band_1based.saturating_sub(1),
+                                coords,
+                                &src,
+                                *algorithm,
+                                dx_m,
+                                dy_m,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::Spectral1 {
+                            expr, band_1based, ..
+                        } => {
+                            let refs = get_band_refs(*band_1based, 0);
+                            let srcs = [make_src!(&refs)];
+                            let cache_key = if num_cogs == 1 {
+                                crate::gpu_backend::GpuBackend::multiband_key(
+                                    primary_id,
+                                    ifd_idx,
+                                    &[*band_1based],
+                                    &srcs,
+                                )
+                            } else {
+                                None
+                            };
+                            gpu.try_render_bbox_spectral_stats(
+                                cache_key,
+                                coords,
+                                &srcs,
+                                *expr,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::Spectral2 {
+                            expr, bands_1based, ..
+                        } => {
+                            let r0 = get_band_refs(bands_1based[0], 0);
+                            let r1 = get_band_refs(bands_1based[1], 1);
+                            let srcs = [make_src!(&r0), make_src!(&r1)];
+                            let cache_key = if num_cogs == 1 {
+                                crate::gpu_backend::GpuBackend::multiband_key(
+                                    primary_id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &srcs,
+                                )
+                            } else {
+                                None
+                            };
+                            gpu.try_render_bbox_spectral_stats(
+                                cache_key,
+                                coords,
+                                &srcs,
+                                *expr,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::Spectral3 {
+                            expr, bands_1based, ..
+                        } => {
+                            let r0 = get_band_refs(bands_1based[0], 0);
+                            let r1 = get_band_refs(bands_1based[1], 1);
+                            let r2 = get_band_refs(bands_1based[2], 2);
+                            let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                            let cache_key = if num_cogs == 1 {
+                                crate::gpu_backend::GpuBackend::multiband_key(
+                                    primary_id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &srcs,
+                                )
+                            } else {
+                                None
+                            };
+                            gpu.try_render_bbox_spectral_stats(
+                                cache_key,
+                                coords,
+                                &srcs,
+                                *expr,
                                 resample,
                                 hist_bins,
                                 sopts.histogram_range,
