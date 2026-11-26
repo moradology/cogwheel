@@ -16,7 +16,9 @@ This document is the living record of every intentional divergence, **why** it e
   - `sum`: coverage-weighted sum of valid pixel values.
   - `area`: exact ellipsoidal ground area in `m²` covered by valid data for polygons; `null` for `Point`/`MultiPoint`/`LineString`/`MultiLineString` (points and lines have no area).
   - `length`: exact WGS84 geodesic length in metres for `LineString`/`MultiLineString` features (omitted for polygons/points).
-  - `mean`, `std`, `median`, `percentiles`, `histogram`: weighted by `w = cov × area_px` for polygons (or geodesic segment length for lines) when `?area_weighted=true` (default), or `w = cov` when `?area_weighted=false`. Zero-coverage boundary neighbors (`cov ≤ 1e-12`) are excluded from `valid_pixels`, `masked_pixels`, `min`, `max`, `unique`, `majority`, and `minority`.
+  - `mean`, `std`, `median`, `percentiles`: weighted by `w = cov × area_px` for polygons (or geodesic segment length for lines) when `?area_weighted=true` (default), or `w = cov` when `?area_weighted=false`.
+  - `histogram` (numeric and categorical) & `categories`: always reported in **coverage units** summing to `count` regardless of `area_weighted` (so integer class counts never become area-redistributed non-integers). For categorical polygon queries, a sibling `category_areas` map reports the exact ellipsoidal ground area in `m²` per class (summing to `area`).
+  - Boundary precision: vertices within `1e-6 px` of grid lines are snapped before clipping, and pixel-set statistics (`valid_pixels`, `masked_pixels`, `valid_percent`, `min`, `max`, `unique`, `majority`, `minority`, categorical keys) exclude negligible CRS round-off touches (`cov ≤ 1e-6`) while weighted sums retain all slivers (`cov > 1e-12`).
   - `?cover_scale=` and `?all_touched=` are accepted and ignored (since exact coverage is already strictly more accurate and faster).
 - **Client significance:** Strictly more accurate (max error `≤ 8.55e-9` px on analytic shapes vs up to 5× error on binary masks), zero supersampling RAM blowup, and **2.3×–7.9× faster** than in-process `rio-tiler`/GDAL even over HTTP:
 

@@ -1837,10 +1837,7 @@ fn parse_resample(pairs: &[(String, String)], name: &str) -> Result<ResampleMode
         Some(method @ ("max" | "min" | "med" | "q1" | "q3" | "sum")) if name == "reproject" => {
             Ok(super::parse_resample_mode(method).unwrap_or(ResampleMode::Nearest))
         }
-        Some(other) => Err(detail(
-            StatusCode::BAD_REQUEST,
-            format!("{name} method '{other}' is not supported (use nearest, bilinear or cubic)"),
-        )),
+        Some(_) => Err(invalid_param("query", name, "Input should be a resampling method")),
     }
 }
 
@@ -1983,7 +1980,7 @@ fn own_error(e: &str) -> bool {
         return true;
     }
     match error_parameter(e) {
-        Some("reproject" | "asset_as_band" | "histogram_bins") => true,
+        Some("reproject" | "resampling" | "asset_as_band" | "histogram_bins") => true,
         Some("assets") => e.ends_with("in |bidx="),
         _ => false,
     }
@@ -2140,7 +2137,8 @@ impl Window {
                             request.tile_size
                         )));
                     }
-                    return engine.raster_planes(href, bands_1based, request, resampling, reproject).await;
+                    let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject).await?;
+                    return Ok((in_raster_type(planes, sample_type, request.unscale), sample_type));
                 };
                 // The way GDAL's warp reads a tile: from the overview it would pick for
                 // the tile's span at the raster's own resolution.
@@ -4130,6 +4128,31 @@ async fn resampled_planes(
     Ok(planes)
 }
 
+/// Planes read with a resampling that makes values between the raster's own, as GDAL's
+/// warp leaves them: in the raster's type, so whole for a raster of whole numbers. What is
+/// done with them after (statistics, band math, a picture) starts from there.
+fn in_raster_type(mut planes: Vec<Vec<f32>>, sample_type: SampleType, unscale: bool) -> Vec<Vec<f32>> {
+    // A cubic kernel overshoots: the type's own range holds what it can.
+    let range = match sample_type {
+        SampleType::Uint8 => Some((0.0, 255.0)),
+        SampleType::Int8 => Some((-128.0, 127.0)),
+        SampleType::Uint16 => Some((0.0, 65535.0)),
+        SampleType::Int16 => Some((-32768.0, 32767.0)),
+        SampleType::Uint32 => Some((0.0, u32::MAX as f32)),
+        SampleType::Int32 => Some((i32::MIN as f32, i32::MAX as f32)),
+        _ => None,
+    };
+    if let (false, Some((low, high))) = (unscale, range) {
+        for plane in &mut planes {
+            for v in plane.iter_mut() {
+                // NaN, a pixel without data, stays NaN through both.
+                *v = v.round().clamp(low, high);
+            }
+        }
+    }
+    planes
+}
+
 /// A plane brought to another size by taking, for each pixel, the one its centre falls in.
 fn resize_nearest(plane: Vec<f32>, (w, h): (usize, usize), (out_w, out_h): (usize, usize)) -> Vec<f32> {
     if (w, h) == (out_w, out_h) {
@@ -4318,7 +4341,9 @@ async fn feature_statistics(
                 } else if req.nodata.is_some() {
                     Err(EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into()))
                 } else {
-                    resampled_planes(engine, cog, own_bounds, size, resample, req.unscale).await
+                    resampled_planes(engine, cog, own_bounds, size, resample, req.unscale)
+                        .await
+                        .map(|planes| in_raster_type(planes, cog.index.full_res().sample_type, req.unscale))
                 };
                 match read {
                     Ok(read) => {
