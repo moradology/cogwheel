@@ -207,17 +207,15 @@ fn sample_band(band: u32, u: f32, v: f32) -> f32 {
     }
 }
 
-fn eval_expr_vm(u: f32, v: f32) -> f32 {
-    var bvals: array<f32, 8>;
-    let nb = min(params.num_bands, 8u);
-    for (var b: u32 = 0u; b < nb; b = b + 1u) {
-        bvals[b] = sample_band(b, u, v);
-    }
-
+fn eval_expr_vm_range(
+    bvals: ptr<function, array<f32, 8>>,
+    pc_start: u32,
+    pc_end: u32,
+) -> f32 {
     var stack: array<f32, 32>;
     var sp: u32 = 0u;
 
-    for (var pc: u32 = 0u; pc < params.num_instrs; pc = pc + 1u) {
+    for (var pc: u32 = pc_start; pc < pc_end; pc = pc + 1u) {
         let ins = instrs[pc];
         switch ins.opcode {
             case 0u: { // PushConst
@@ -225,7 +223,7 @@ fn eval_expr_vm(u: f32, v: f32) -> f32 {
                 sp += 1u;
             }
             case 1u: { // LoadBand
-                stack[sp] = bvals[ins.imm_u32 & 7u];
+                stack[sp] = (*bvals)[ins.imm_u32 & 7u];
                 sp += 1u;
             }
             case 2u: { // Add
@@ -369,6 +367,15 @@ fn eval_expr_vm(u: f32, v: f32) -> f32 {
         return nan_f32();
     }
     return stack[sp - 1u];
+}
+
+fn eval_expr_vm(u: f32, v: f32) -> f32 {
+    var bvals: array<f32, 8>;
+    let nb = min(params.num_bands, 8u);
+    for (var b: u32 = 0u; b < nb; b = b + 1u) {
+        bvals[b] = sample_band(b, u, v);
+    }
+    return eval_expr_vm_range(&bvals, 0u, params.num_instrs);
 }
 
 fn eval_uv(px: u32, py: u32) -> vec2<f32> {
@@ -582,6 +589,56 @@ fn sar_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     var r = u32(clamp((vv - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
     var g = u32(clamp((vh - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
     var b = u32(clamp((diff - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
+
+    if ((params.formula_flags & 1u) != 0u) {
+        r = lut_u32[r] & 0xffu;
+        g = (lut_u32[g] >> 8u) & 0xffu;
+        b = (lut_u32[b] >> 16u) & 0xffu;
+    }
+    if ((params.formula_flags & 2u) != 0u) {
+        let sat_rgb = apply_lch_sat(r, g, b, params.saturation);
+        r = sat_rgb.x;
+        g = sat_rgb.y;
+        b = sat_rgb.z;
+    }
+
+    dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+}
+
+/// Fused 3-expression CustomExprRgb (`[prog_r, prog_g, prog_b]`) -> rescale ->
+/// Gamma/Sigmoidal LUT -> CIE LCH Saturation -> RGBA8.
+/// `params.num_instrs` packs `len_r | (len_g << 8u) | (len_b << 16u)`.
+@compute @workgroup_size(16, 16, 1)
+fn expr_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.dst_w || py >= params.dst_h) {
+        return;
+    }
+
+    let uv = eval_uv(px, py);
+    var bvals: array<f32, 8>;
+    let nb = min(params.num_bands, 8u);
+    for (var b: u32 = 0u; b < nb; b = b + 1u) {
+        bvals[b] = sample_band(b, uv.x, uv.y);
+    }
+
+    let len0 = params.num_instrs & 0xffu;
+    let len1 = (params.num_instrs >> 8u) & 0xffu;
+    let len2 = (params.num_instrs >> 16u) & 0xffu;
+    let vr = eval_expr_vm_range(&bvals, 0u, len0);
+    let vg = eval_expr_vm_range(&bvals, len0, len0 + len1);
+    let vb = eval_expr_vm_range(&bvals, len0 + len1, len0 + len1 + len2);
+    let out_idx = py * params.dst_w + px;
+
+    if (!is_finite_f32(vr) || !is_finite_f32(vg) || !is_finite_f32(vb)) {
+        dst_words[out_idx] = 0u;
+        return;
+    }
+
+    var r = u32(clamp((vr - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
+    var g = u32(clamp((vg - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
+    var b = u32(clamp((vb - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
 
     if ((params.formula_flags & 1u) != 0u) {
         r = lut_u32[r] & 0xffu;

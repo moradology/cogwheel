@@ -2218,6 +2218,133 @@ impl GpuBackend {
             crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
         })
     }
+
+    /// Compile 3 `ExprProgram`s (`[R, G, B]`) into a single packed GPU instruction buffer
+    /// referencing a unified deduplicated `unique_bands` slice (`<= 8` bands, `<= 256` total ops).
+    pub fn compile_expr_rgb_to_gpu(
+        progs: &[ExprProgram; 3],
+        unique_bands: &[u16],
+    ) -> Option<(Vec<GpuInstr>, [u8; 3])> {
+        if unique_bands.is_empty() || unique_bands.len() > 8 {
+            return None;
+        }
+        let mut packed = Vec::new();
+        let mut lens = [0u8; 3];
+        for (c, prog) in progs.iter().enumerate() {
+            let mut instrs = Self::compile_expr_to_gpu(prog)?;
+            if instrs.len() > 255 {
+                return None;
+            }
+            for ins in &mut instrs {
+                if ins.opcode == 1 {
+                    let b_1based = *prog.used_bands.get(ins.imm_u32 as usize)?;
+                    let unified_slot = unique_bands.iter().position(|&b| b == b_1based)?;
+                    ins.imm_u32 = unified_slot as u32;
+                }
+            }
+            lens[c] = instrs.len() as u8;
+            packed.extend_from_slice(&instrs);
+        }
+        if packed.is_empty() || packed.len() > 256 {
+            return None;
+        }
+        Some((packed, lens))
+    }
+
+    /// Attempt GPU-accelerated 3-expression `CustomExprRgb` rendering (with optional fused
+    /// `ColorFormula` and `GpuMultiBandCache`) for `/cog/preview`, `/cog/bbox`, `/cog/crop`,
+    /// and `/cog/feature`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_expr_rgb(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        unique_bands: &[u16],
+        srcs: &[BandSource<'_>],
+        progs: &[ExprProgram; 3],
+        style: &RgbStyle,
+        color_formula: Option<&ColorFormula>,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(style.resample)?;
+        let gpu_formula = Self::translate_color_formula(color_formula)?;
+        let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {
+            return None;
+        }
+        if !matches!(
+            style.format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) {
+            return None;
+        }
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let upload_bytes = band_upload_bytes + coord_upload_bytes;
+        let readback_bytes = dst_w * dst_h * 4;
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: dst_w * dst_h,
+            upload_bytes,
+            readback_bytes,
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 32,
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::ExprRgb {
+                slab,
+                plan,
+                mode: gpu_mode,
+                instrs,
+                lens,
+                rescale_min: style.rescale_min,
+                rescale_max: style.rescale_max,
+                formula: gpu_formula,
+            })
+            .ok()?;
+        Some(if style.format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3136,6 +3263,116 @@ mod tests {
             assert!(
                 max_diff <= 4,
                 "LUT-folded CustomColormap + ColorFormula max channel diff {max_diff} > 4"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_expr_rgb_and_color_formula_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU CustomExprRgb test (no adapter)");
+            return;
+        };
+        let w = 256u32;
+        let h = 256u32;
+        let mk_band = |base: u16, sx: u16, sy: u16| {
+            let vals: Vec<u16> = (0..(w * h))
+                .map(|i| base + ((i % w) as u16 * sx) + ((i / w) as u16 * sy))
+                .collect();
+            DecodedBand {
+                width: w,
+                height: h,
+                data: BandData::U16 {
+                    data: vals.into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 10.0,
+                    max: 2500.0,
+                },
+            }
+        };
+        let b0 = mk_band(400, 3, 2);
+        let b1 = mk_band(200, 2, 3);
+        let b2 = mk_band(100, 1, 2);
+        let bl0 = [Some(&b0)];
+        let bl1 = [Some(&b1)];
+        let bl2 = [Some(&b2)];
+        let srcs = [
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl0),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl1),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl2),
+        ];
+
+        let progs = [
+            ExprProgram::compile("(b1-b2)/(b1+b2)").unwrap(),
+            ExprProgram::compile("b2*0.001").unwrap(),
+            ExprProgram::compile("sqrt(b3)*0.02").unwrap(),
+        ];
+        let unique_bands = [1u16, 2, 3];
+        let cf = ColorFormula::parse("Gamma RGB 1.5 Sigmoidal RGB 6 0.5 Saturation 1.3").unwrap();
+        let style = RgbStyle {
+            rescale_min: [-1.0, 0.0, 0.0],
+            rescale_max: [1.0, 1.5, 1.0],
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        let n = 512usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * (246.0 / n as f32)).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * (246.0 / n as f32)).collect();
+
+        if let Some(rgba) = gpu.try_render_bbox_expr_rgb(
+            None,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &unique_bands,
+            &srcs,
+            &progs,
+            &style,
+            Some(&cf),
+            true,
+        ) {
+            assert_eq!(rgba.len(), n * n * 4);
+            let inv = [
+                255.0 / (style.rescale_max[0] - style.rescale_min[0]),
+                255.0 / (style.rescale_max[1] - style.rescale_min[1]),
+                255.0 / (style.rescale_max[2] - style.rescale_min[2]),
+            ];
+            let mut max_diff = 0i32;
+            for py in (8..n - 8).step_by(29) {
+                for px in (8..n - 8).step_by(29) {
+                    let s0 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[0], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let s1 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[1], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let s2 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[2], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let vr = (s0 - s1) / (s0 + s1);
+                    let vg = s1 * 0.001;
+                    let vb = s2.sqrt() * 0.02;
+                    let (cr, cg, cb) = cf.apply_rgb(
+                        ((vr - style.rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8,
+                        ((vg - style.rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8,
+                        ((vb - style.rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8,
+                    );
+                    let off = (py * n + px) * 4;
+                    assert_eq!(rgba[off + 3], 255);
+                    max_diff = max_diff
+                        .max((cr as i32 - rgba[off] as i32).abs())
+                        .max((cg as i32 - rgba[off + 1] as i32).abs())
+                        .max((cb as i32 - rgba[off + 2] as i32).abs());
+                }
+            }
+            assert!(
+                max_diff <= 4,
+                "CustomExprRgb + ColorFormula max channel diff {max_diff} > 4"
             );
         }
     }
