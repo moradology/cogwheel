@@ -5033,6 +5033,86 @@ async fn render_bbox_impl(
             let mut max_u = f32::NEG_INFINITY;
             let mut min_v = f32::INFINITY;
             let mut max_v = f32::NEG_INFINITY;
+            let ifd_w_f = ifd_width as f32;
+            let ifd_h_f = ifd_height as f32;
+
+            // Separable 1D fast path: when both dst_crs and src_crs are separable cylindrical/geographic
+            // projections and the raster is axis-aligned, u depends only on px and v depends only on py.
+            // Uses w + h exact evaluations (faster than a 16-px bilinear grid and 100% exact at every row).
+            let is_separable = crs_to_pixel.is_axis_aligned()
+                && matches!(
+                    dst_crs,
+                    cogzilla_proj::CrsModel::Geographic
+                        | cogzilla_proj::CrsModel::Epsg3857
+                        | cogzilla_proj::CrsModel::WorldMercator
+                        | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+                )
+                && matches!(
+                    crs,
+                    cogzilla_proj::CrsModel::Geographic
+                        | cogzilla_proj::CrsModel::Epsg3857
+                        | cogzilla_proj::CrsModel::WorldMercator
+                        | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+                );
+            if is_separable {
+                let mid_y = 0.5 * (bbox[1] + bbox[3]);
+                let mid_x = 0.5 * (bbox[0] + bbox[2]);
+                let mut u_cols = vec![f32::NAN; w];
+                for px in 0..w {
+                    let x_coord = bbox[0] + (px as f64 + 0.5) * dlx;
+                    let (sx, _) = to_src_crs(x_coord, mid_y);
+                    if sx.is_finite() {
+                        let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
+                        if uu >= -1.0 && uu <= ifd_w_f {
+                            u_cols[px] = uu;
+                        }
+                    }
+                }
+                let mut v_rows = vec![f32::NAN; h];
+                for py in 0..h {
+                    let y_coord = bbox[3] - (py as f64 + 0.5) * dly;
+                    let (_, sy) = to_src_crs(mid_x, y_coord);
+                    if sy.is_finite() {
+                        let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
+                        if vv >= -1.0 && vv <= ifd_h_f {
+                            v_rows[py] = vv;
+                        }
+                    }
+                }
+                for py in 0..h {
+                    let vv = v_rows[py];
+                    if !vv.is_finite() {
+                        continue;
+                    }
+                    let row_off = py * w;
+                    if let Some(ref tm) = touched_mask {
+                        for px in 0..w {
+                            let uu = u_cols[px];
+                            if tm[row_off + px] && uu.is_finite() {
+                                u_map[row_off + px] = uu;
+                                v_map[row_off + px] = vv;
+                                min_u = min_u.min(uu);
+                                max_u = max_u.max(uu);
+                                min_v = min_v.min(vv);
+                                max_v = max_v.max(vv);
+                            }
+                        }
+                    } else {
+                        for px in 0..w {
+                            let uu = u_cols[px];
+                            if uu.is_finite() {
+                                u_map[row_off + px] = uu;
+                                v_map[row_off + px] = vv;
+                                min_u = min_u.min(uu);
+                                max_u = max_u.max(uu);
+                                min_v = min_v.min(vv);
+                                max_v = max_v.max(vv);
+                            }
+                        }
+                    }
+                }
+                return (u_map, v_map, min_u, max_u, min_v, max_v);
+            }
 
             const STEP: usize = 16;
             let gw = w.div_ceil(STEP) + 1;
@@ -5053,9 +5133,6 @@ async fn render_bbox_impl(
                     }
                 }
             }
-
-            let ifd_w_f = ifd_width as f32;
-            let ifd_h_f = ifd_height as f32;
 
             for gy in 0..(gh - 1) {
                 let y0 = gy * STEP;
@@ -5105,8 +5182,8 @@ async fn render_bbox_impl(
                             let v_avg = 0.25 * (v00 + v10 + v01 + v11);
                             mu.is_finite()
                                 && mv.is_finite()
-                                && (mu - u_avg).abs() <= 0.05
-                                && (mv - v_avg).abs() <= 0.05
+                                && (mu - u_avg).abs() <= 1e-3
+                                && (mv - v_avg).abs() <= 1e-3
                         } else {
                             false
                         };
