@@ -6397,17 +6397,13 @@ async fn render_bbox_impl(
         };
 
         #[cfg(feature = "gpu")]
-        if custom_lut.is_none()
-            && (color_formula.is_none()
-                || matches!(bands, BandRequest::Rgb { .. } | BandRequest::SarRgb { .. }))
-            && matches!(
-                format,
-                OutputFormat::Png
-                    | OutputFormat::Webp { .. }
-                    | OutputFormat::Jpeg { .. }
-                    | OutputFormat::RawRgba
-            )
-            && let Some((ref gpu, ref stats, primary_id)) = gpu_ctx
+        if matches!(
+            format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) && let Some((ref gpu, ref stats, primary_id)) = gpu_ctx
         {
             let v_rows: Vec<f32> = if native_preview {
                 (0..h).map(|py| v_map[py * w]).collect()
@@ -6432,7 +6428,12 @@ async fn render_bbox_impl(
                     band_1based,
                     rescale,
                     colormap,
-                } => {
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
                     let style = cogzilla_kernel::SingleBandStyle {
@@ -6442,22 +6443,28 @@ async fn render_bbox_impl(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_single_band(
+                    gpu.try_render_bbox_single_band_with_lut(
                         primary_id,
                         ifd_idx,
                         band_1based.saturating_sub(1),
                         coords,
                         &src,
                         &style,
+                        &rgb_lut,
                         return_mask,
                     )
-                }
+                }),
                 BandRequest::Dem {
                     band_1based,
                     algorithm,
                     rescale,
                     colormap,
-                } => {
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
                     let (inv_8dx, inv_8dy) = dem_inv_8dxy();
@@ -6470,7 +6477,7 @@ async fn render_bbox_impl(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_dem(
+                    gpu.try_render_bbox_dem_with_lut(
                         primary_id,
                         ifd_idx,
                         band_1based.saturating_sub(1),
@@ -6480,13 +6487,14 @@ async fn render_bbox_impl(
                         dx_m,
                         dy_m,
                         &style,
+                        &rgb_lut,
                         return_mask,
                     )
-                }
+                }),
                 BandRequest::Terrain {
                     band_1based,
                     encoding,
-                } => {
+                } if custom_lut.is_none() && color_formula.is_none() => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
                     gpu.try_render_bbox_terrain(
@@ -6505,7 +6513,12 @@ async fn render_bbox_impl(
                     prog,
                     rescale,
                     colormap,
-                } => {
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
                     let ref_vecs: Vec<_> = prog
                         .used_bands
                         .iter()
@@ -6529,13 +6542,21 @@ async fn render_bbox_impl(
                     } else {
                         None
                     };
-                    gpu.try_render_bbox_expr(cache_key, coords, &srcs, prog, &style, return_mask)
-                }
+                    gpu.try_render_bbox_expr_with_lut(
+                        cache_key,
+                        coords,
+                        &srcs,
+                        prog,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
                 BandRequest::Rgb {
                     bands_1based,
                     rescale_min,
                     rescale_max,
-                } => {
+                } if custom_lut.is_none() => {
                     let r0 = get_band_refs(bands_1based[0], 0);
                     let r1 = get_band_refs(bands_1based[1], 1);
                     let r2 = get_band_refs(bands_1based[2], 2);
@@ -6569,7 +6590,7 @@ async fn render_bbox_impl(
                     bands_1based,
                     rescale_min,
                     rescale_max,
-                } => {
+                } if custom_lut.is_none() => {
                     let r0 = get_band_refs(bands_1based[0], 0);
                     let r1 = get_band_refs(bands_1based[1], 1);
                     let srcs = [make_src!(&r0), make_src!(&r1)];
@@ -6603,7 +6624,12 @@ async fn render_bbox_impl(
                     band_1based,
                     rescale,
                     colormap,
-                } => {
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
                     let refs = get_band_refs(*band_1based, 0);
                     let srcs = [make_src!(&refs)];
                     let style = cogzilla_kernel::SingleBandStyle {
@@ -6623,14 +6649,27 @@ async fn render_bbox_impl(
                     } else {
                         None
                     };
-                    gpu.try_render_bbox_spectral(cache_key, coords, &srcs, *expr, &style, return_mask)
-                }
+                    gpu.try_render_bbox_spectral_with_lut(
+                        cache_key,
+                        coords,
+                        &srcs,
+                        *expr,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
                 BandRequest::Spectral2 {
                     expr,
                     bands_1based,
                     rescale,
                     colormap,
-                } => {
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
                     let r0 = get_band_refs(bands_1based[0], 0);
                     let r1 = get_band_refs(bands_1based[1], 1);
                     let srcs = [make_src!(&r0), make_src!(&r1)];
@@ -6651,14 +6690,27 @@ async fn render_bbox_impl(
                     } else {
                         None
                     };
-                    gpu.try_render_bbox_spectral(cache_key, coords, &srcs, *expr, &style, return_mask)
-                }
+                    gpu.try_render_bbox_spectral_with_lut(
+                        cache_key,
+                        coords,
+                        &srcs,
+                        *expr,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
                 BandRequest::Spectral3 {
                     expr,
                     bands_1based,
                     rescale,
                     colormap,
-                } => {
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
                     let r0 = get_band_refs(bands_1based[0], 0);
                     let r1 = get_band_refs(bands_1based[1], 1);
                     let r2 = get_band_refs(bands_1based[2], 2);
@@ -6680,8 +6732,16 @@ async fn render_bbox_impl(
                     } else {
                         None
                     };
-                    gpu.try_render_bbox_spectral(cache_key, coords, &srcs, *expr, &style, return_mask)
-                }
+                    gpu.try_render_bbox_spectral_with_lut(
+                        cache_key,
+                        coords,
+                        &srcs,
+                        *expr,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
                 _ => None,
             };
             if let Some(bytes) = gpu_out {

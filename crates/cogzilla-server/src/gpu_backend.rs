@@ -12,8 +12,9 @@ use cogzilla_gpu::{
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
 use cogzilla_kernel::{
-    BandSource, ColorFormula, ColormapLut, ColormapName, DemAlgorithm, ExprProgram, OutputFormat,
-    ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr, TerrainEncoding, encode_rgba_tile,
+    BandSource, ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram,
+    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr, TerrainEncoding,
+    encode_rgba_tile,
 };
 use cogzilla_proj::CoordPlan;
 
@@ -72,18 +73,18 @@ fn map_resample(mode: ResampleMode) -> Option<GpuColormapMode> {
     }
 }
 
-fn build_plte_nodata(lut: &ColormapLut) -> [u8; 768] {
+fn build_plte_nodata(rgb: &[[u8; 3]; 256]) -> [u8; 768] {
     let mut plte = [0u8; 768];
     for i in 1..256 {
         let src_idx = ((i - 1) * 255 + 127) / 254;
-        plte[i * 3] = lut.rgb[src_idx][0];
-        plte[i * 3 + 1] = lut.rgb[src_idx][1];
-        plte[i * 3 + 2] = lut.rgb[src_idx][2];
+        plte[i * 3] = rgb[src_idx][0];
+        plte[i * 3 + 1] = rgb[src_idx][1];
+        plte[i * 3 + 2] = rgb[src_idx][2];
     }
     plte
 }
 
-fn encode_indexed_u8_png(idx_bytes: &[u8], width: u32, height: u32, lut: &ColormapLut) -> Bytes {
+fn encode_indexed_u8_png(idx_bytes: &[u8], width: u32, height: u32, rgb: &[[u8; 3]; 256]) -> Bytes {
     let w = width as usize;
     let h = height as usize;
     let mut filtered = vec![0u8; h * (1 + w)];
@@ -92,7 +93,7 @@ fn encode_indexed_u8_png(idx_bytes: &[u8], width: u32, height: u32, lut: &Colorm
         let dst_row = &mut filtered[py * (1 + w)..(py + 1) * (1 + w)];
         filter_sub_u8_row(src_row, dst_row);
     }
-    let plte = build_plte_nodata(lut);
+    let plte = build_plte_nodata(rgb);
     let trns = [0u8];
     encode_indexed_png(width, height, &plte, Some(&trns), &filtered)
 }
@@ -307,6 +308,33 @@ impl GpuBackend {
         )
     }
 
+    /// Resolve the effective 256-entry RGB LUT for any single-band, DEM, CustomExpr, or Spectral
+    /// GPU render, supporting opaque rescaled `CustomColormap` and zero-cost `ColorFormula`
+    /// folding (all `Gamma` / `Sigmoidal` / `Saturation` / `Brightness` / `Contrast` ops folded
+    /// in ~1 µs on 256 LUT entries instead of millions of pixels).
+    pub fn resolve_styled_rgb_lut(
+        colormap: ColormapName,
+        custom_lut: Option<&CustomColormap>,
+        color_formula: Option<&ColorFormula>,
+    ) -> Option<[[u8; 3]; 256]> {
+        let mut rgb = match custom_lut {
+            None => colormap.lut().rgb,
+            Some(CustomColormap::Discrete {
+                lut,
+                extra,
+                direct_lookup: false,
+            }) if extra.is_empty() && lut.rgba_u32.iter().all(|&p| (p >> 24) == 255) => lut.rgb,
+            Some(_) => return None,
+        };
+        if let Some(cf) = color_formula {
+            for entry in &mut rgb {
+                let (r, g, b) = cf.apply_rgb(entry[0], entry[1], entry[2]);
+                *entry = [r, g, b];
+            }
+        }
+        Some(rgb)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_bbox_single_band(
         &self,
@@ -316,6 +344,7 @@ impl GpuBackend {
         coords: BboxCoordSource<'_>,
         src: &BandSource<'_>,
         style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
@@ -367,8 +396,7 @@ impl GpuBackend {
         }
 
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let lut = style.colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Colormap {
@@ -392,11 +420,12 @@ impl GpuBackend {
         dst_w: usize,
         dst_h: usize,
         style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
     ) -> Bytes {
         match out_kind {
             GpuPixelOutput::IndexedU8 => {
-                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, style.colormap.lut())
+                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, rgb_lut)
             }
             GpuPixelOutput::Rgba8 => {
                 if style.format == OutputFormat::RawRgba {
@@ -421,14 +450,40 @@ impl GpuBackend {
         style: &SingleBandStyle,
         return_mask: bool,
     ) -> Option<Bytes> {
+        self.try_render_bbox_single_band_with_lut(
+            cog_id,
+            ifd_idx,
+            band0,
+            coords,
+            src,
+            style,
+            &style.colormap.lut().rgb,
+            return_mask,
+        )
+    }
+
+    /// Single-band GPU render with an explicit 256-entry RGB LUT (supporting `CustomColormap`
+    /// and zero-cost `ColorFormula` folding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_single_band_with_lut(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
-            cog_id, ifd_idx, band0, coords, src, style, return_mask, active,
+            cog_id, ifd_idx, band0, coords, src, style, rgb_lut, return_mask, active,
         )?;
         let raw = self.coalescer.submit(job).ok()?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, return_mask,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
         ))
     }
 
@@ -477,6 +532,7 @@ impl GpuBackend {
         pixel_size_x_m: f32,
         pixel_size_y_m: f32,
         style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
@@ -546,8 +602,7 @@ impl GpuBackend {
         }
 
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let lut = style.colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Terrain {
@@ -584,6 +639,38 @@ impl GpuBackend {
         style: &SingleBandStyle,
         return_mask: bool,
     ) -> Option<Bytes> {
+        self.try_render_bbox_dem_with_lut(
+            cog_id,
+            ifd_idx,
+            band0,
+            coords,
+            src,
+            alg,
+            pixel_size_x_m,
+            pixel_size_y_m,
+            style,
+            &style.colormap.lut().rgb,
+            return_mask,
+        )
+    }
+
+    /// DEM Horn 3×3 GPU render with an explicit 256-entry RGB LUT (supporting `CustomColormap`
+    /// and zero-cost `ColorFormula` folding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_dem_with_lut(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        alg: DemAlgorithm,
+        pixel_size_x_m: f32,
+        pixel_size_y_m: f32,
+        style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
@@ -596,12 +683,13 @@ impl GpuBackend {
             pixel_size_x_m,
             pixel_size_y_m,
             style,
+            rgb_lut,
             return_mask,
             active,
         )?;
         let raw = self.coalescer.submit(job).ok()?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, return_mask,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
         ))
     }
 
@@ -751,12 +839,13 @@ impl GpuBackend {
         };
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
+        let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
-            cog_id, ifd_idx, band0, coords, src, style, true, active,
+            cog_id, ifd_idx, band0, coords, src, style, rgb_lut, true, active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, true,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
 
@@ -795,6 +884,7 @@ impl GpuBackend {
         };
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
+        let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
             cog_id,
             ifd_idx,
@@ -805,12 +895,13 @@ impl GpuBackend {
             pixel_size_m,
             pixel_size_m,
             style,
+            rgb_lut,
             true,
             active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, true,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
 
@@ -1070,6 +1161,7 @@ impl GpuBackend {
         srcs: &[BandSource<'_>],
         instrs: &[GpuInstr],
         style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
@@ -1130,8 +1222,7 @@ impl GpuBackend {
             return None;
         }
         let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
-        let lut = style.colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Expr {
@@ -1183,12 +1274,13 @@ impl GpuBackend {
         let cache_key = Self::multiband_key(cog_id, ifd_idx, bands_1based, srcs);
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
+        let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
-            cache_key, coords, srcs, &instrs, style, true, active,
+            cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, true,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
 
@@ -1204,8 +1296,31 @@ impl GpuBackend {
         style: &SingleBandStyle,
         return_mask: bool,
     ) -> Option<Bytes> {
+        self.try_render_bbox_spectral_with_lut(
+            cache_key,
+            coords,
+            srcs,
+            expr,
+            style,
+            &style.colormap.lut().rgb,
+            return_mask,
+        )
+    }
+
+    /// Built-in `SpectralExpr` GPU render with an explicit 256-entry RGB LUT.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_spectral_with_lut(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let instrs = Self::compile_spectral_to_gpu(expr)?;
-        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, rgb_lut, return_mask)
     }
 
     /// Attempt GPU-accelerated built-in `SpectralExpr` raw `f32` rendering for `.npy`, `.tif`,
@@ -1256,12 +1371,13 @@ impl GpuBackend {
         let cache_key = Self::multiband_key(cog_id, ifd_idx, &prog.used_bands, srcs);
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
+        let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
-            cache_key, coords, srcs, &instrs, style, true, active,
+            cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
         )?;
         let raw = self.submit_coalesced_async(job).await?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, true,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, true,
         ))
     }
 
@@ -1319,8 +1435,31 @@ impl GpuBackend {
         style: &SingleBandStyle,
         return_mask: bool,
     ) -> Option<Bytes> {
+        self.try_render_bbox_expr_with_lut(
+            cache_key,
+            coords,
+            srcs,
+            prog,
+            style,
+            &style.colormap.lut().rgb,
+            return_mask,
+        )
+    }
+
+    /// Multi-band `ExprProgram` GPU render with an explicit 256-entry RGB LUT.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_expr_with_lut(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        prog: &ExprProgram,
+        style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let instrs = Self::compile_expr_to_gpu(prog)?;
-        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, rgb_lut, return_mask)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1331,6 +1470,7 @@ impl GpuBackend {
         srcs: &[BandSource<'_>],
         instrs: &[GpuInstr],
         style: &SingleBandStyle,
+        rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
     ) -> Option<Bytes> {
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1341,12 +1481,13 @@ impl GpuBackend {
             srcs,
             instrs,
             style,
+            rgb_lut,
             return_mask,
             active,
         )?;
         let raw = self.coalescer.submit(job).ok()?;
         Some(Self::finish_styled_output(
-            raw, out_kind, dst_w, dst_h, style, return_mask,
+            raw, out_kind, dst_w, dst_h, style, rgb_lut, return_mask,
         ))
     }
 
@@ -1555,7 +1696,7 @@ impl GpuBackend {
         drop(mosaic_guard);
 
         Some(match out_kind {
-            GpuPixelOutput::IndexedU8 => encode_indexed_u8_png(&raw, width, height, lut),
+            GpuPixelOutput::IndexedU8 => encode_indexed_u8_png(&raw, width, height, &lut.rgb),
             GpuPixelOutput::Rgba8 => {
                 if format == OutputFormat::RawRgba {
                     Bytes::from(raw)
@@ -1910,7 +2051,7 @@ impl GpuBackend {
             GpuPixelOutput::IndexedU8 => {
                 for i in 0..batch_size {
                     let chunk = &raw[i * per_tile_bytes..(i + 1) * per_tile_bytes];
-                    out.push(encode_indexed_u8_png(chunk, tile_size as u32, tile_size as u32, lut));
+                    out.push(encode_indexed_u8_png(chunk, tile_size as u32, tile_size as u32, &lut.rgb));
                 }
             }
             GpuPixelOutput::Rgba8 => {
@@ -2888,6 +3029,114 @@ mod tests {
                 }
             }
             assert!(max_diff <= 4, "SAR RGB + ColorFormula max channel diff {max_diff} > 4");
+        }
+    }
+
+    #[test]
+    fn color_formula_and_custom_lut_folding_match_cpu() {
+        let cf = ColorFormula::parse("Gamma RGB 1.6 Sigmoidal RGB 6 0.5 Saturation 1.4")
+            .expect("valid color_formula");
+        // Verify direct_lookup or transparent custom LUT safely declines GPU
+        let mut entries = [[100u8, 120, 140, 255]; 256];
+        for (i, e) in entries.iter_mut().enumerate() {
+            *e = [i as u8, (255 - i) as u8, ((i * 3) & 255) as u8, 255];
+        }
+        let direct_cmap = CustomColormap::from_rgba_palette(&entries);
+        assert!(
+            GpuBackend::resolve_styled_rgb_lut(ColormapName::Viridis, Some(&direct_cmap), None)
+                .is_none(),
+            "direct_lookup custom colormap must fall back to CPU"
+        );
+        let opaque_cmap = CustomColormap::Discrete {
+            lut: Box::new(cogzilla_kernel::ColormapLut {
+                rgb: std::array::from_fn(|i| [entries[i][0], entries[i][1], entries[i][2]]),
+                rgba_u32: std::array::from_fn(|i| u32::from_le_bytes(entries[i])),
+            }),
+            extra: std::collections::HashMap::new(),
+            direct_lookup: false,
+        };
+        let folded = GpuBackend::resolve_styled_rgb_lut(
+            ColormapName::Viridis,
+            Some(&opaque_cmap),
+            Some(&cf),
+        )
+        .expect("opaque rescaled custom colormap + ColorFormula should fold");
+
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU LUT formula test (no adapter)");
+            return;
+        };
+        let w = 256u32;
+        let h = 256u32;
+        let data: Vec<u16> = (0..(w * h))
+            .map(|i| 100 + ((i % w) * 3 + (i / w) * 2) as u16)
+            .collect();
+        let band = DecodedBand {
+            width: w,
+            height: h,
+            data: BandData::U16 {
+                data: data.into_boxed_slice(),
+                nodata: None,
+            },
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 100.0,
+                max: 1400.0,
+            },
+        };
+        let refs = [Some(&band)];
+        let src = BandSource::new(w, h, w, h, 0, 0, 1, 1, &refs);
+        let n = 512usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * (246.0 / n as f32)).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| 4.0 + i as f32 * (246.0 / n as f32)).collect();
+        let style = SingleBandStyle {
+            rescale_min: 100.0,
+            rescale_max: 1400.0,
+            colormap: ColormapName::Viridis,
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        if let Some(rgba) = gpu.try_render_bbox_single_band_with_lut(
+            9090,
+            0,
+            0,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &src,
+            &style,
+            &folded,
+            true,
+        ) {
+            assert_eq!(rgba.len(), n * n * 4);
+            let inv255 = 255.0 / 1300.0;
+            let mut max_diff = 0i32;
+            for py in (8..n - 8).step_by(29) {
+                for px in (8..n - 8).step_by(29) {
+                    let v = cogzilla_kernel::sample_general_scaled(
+                        &src,
+                        u_coords[px],
+                        v_coords[py],
+                        1.0,
+                        1.0,
+                        ResampleMode::Lanczos,
+                    );
+                    let ci = ((v - 100.0) * inv255).clamp(0.0, 255.0) as usize;
+                    let (cr, cg, cb) = cf.apply_rgb(entries[ci][0], entries[ci][1], entries[ci][2]);
+                    let off = (py * n + px) * 4;
+                    assert_eq!(rgba[off + 3], 255);
+                    max_diff = max_diff
+                        .max((cr as i32 - rgba[off] as i32).abs())
+                        .max((cg as i32 - rgba[off + 1] as i32).abs())
+                        .max((cb as i32 - rgba[off + 2] as i32).abs());
+                }
+            }
+            assert!(
+                max_diff <= 4,
+                "LUT-folded CustomColormap + ColorFormula max channel diff {max_diff} > 4"
+            );
         }
     }
 }
