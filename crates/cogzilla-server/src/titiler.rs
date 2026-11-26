@@ -5227,38 +5227,14 @@ async fn render_bbox_impl(
     (u_map, v_map, min_u, max_u, min_v, max_v)
     };
 
-    // Empty check
+    // Empty check: zero source pixels mapped into the requested tile/bbox/feature.
     if !min_u.is_finite() {
-        return Ok(match format {
-            OutputFormat::RawF32 | OutputFormat::Npy => {
-                let nb: usize = match bands {
-                    BandRequest::Rgb { .. }
-                    | BandRequest::SarRgb { .. }
-                    | BandRequest::CustomExprRgb { .. }
-                    | BandRequest::Terrain { .. } => 3,
-                    BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
-                    _ => 1,
-                };
-                let mut b = BytesMut::with_capacity(nb * w * h * 4);
-                for _ in 0..(nb * w * h) {
-                    b.put_slice(&f32::NAN.to_le_bytes());
-                }
-                let raw = b.freeze();
-                if format == OutputFormat::Npy {
-                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                        raw,
-                        nb,
-                        h as u32,
-                        w as u32,
-                        return_mask,
-                    )
-                } else {
-                    raw
-                }
-            }
-            OutputFormat::RawRgba => Bytes::from(vec![0u8; w * h * 4]),
-            _ => encode_rgba_output(w, h, &vec![0u8; w * h * 4], format, return_mask),
-        });
+        let full = primary.index.full_res();
+        let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+        return Err(EngineError::NotFound(format!(
+            "request is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+            rb[0], rb[1], rb[2], rb[3]
+        )));
     }
 
     let (footprint_sx, footprint_sy) = if native_preview {
