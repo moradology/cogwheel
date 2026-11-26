@@ -2065,34 +2065,108 @@ fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask:
     typed.unwrap_or(data)
 }
 
-/// What a `/cog` or `/stac` array's type is decided by: the rule, the assets asked for (none
-/// on `/cog`), the band math, and whether a mask was asked for.
-type ArrayAsked = (array_type::ArrayRule, Vec<String>, Option<String>, bool);
+/// What a `/cog` or `/stac` array is decided by.
+#[derive(Clone)]
+enum ArrayAsked {
+    /// The values in their type: the rule, the assets asked for (none on `/cog`), the band
+    /// math, and whether a mask was asked for.
+    Typed(array_type::ArrayRule, Vec<String>, Option<String>, bool),
+    /// The picture's bytes, for a `.npy` asked with a rescale, a colour map or a colour
+    /// formula: the request, which says how they are painted.
+    Shown(Box<ParsedQuery>),
+}
 
-fn array_asked(pq: &ParsedQuery) -> Option<ArrayAsked> {
-    array_type::ArrayRule::of(pq).map(|rule| (rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask))
+/// What decides the array of a request whose path ends in `last`.
+fn array_asked(pq: &ParsedQuery, last: Option<&&str>) -> Option<ArrayAsked> {
+    if let Some(rule) = array_type::ArrayRule::of(pq) {
+        return Some(ArrayAsked::Typed(rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask));
+    }
+    let npy = last.is_some_and(|last| last.ends_with(".npy")) || pq.format_param.as_deref() == Some("npy");
+    let shown = npy && array_type::shown(pq) && pq.algorithm.is_none() && pq.asset_exprs.is_empty();
+    shown.then(|| ArrayAsked::Shown(Box::new(pq.clone())))
+}
+
+/// A float32 `.npy` of raw values painted as the request paints them ([`paint_selected`]),
+/// as TiTiler writes an array asked with a rescale, a colour map or a colour formula: in
+/// bytes, one band when it is grey and red, green and blue otherwise, then the mask (`255`
+/// where a pixel is there) when it was asked for. `first` is the raster read first, for a
+/// colour map of its own. `None` when `data` is not such an array.
+fn shown_array(pq: &ParsedQuery, first: Option<&cogzilla_io::OpenedCog>, data: &[u8]) -> Option<Bytes> {
+    let (shape, start) = cogzilla_kernel::f32_npy_shape(data)?;
+    let [planes, height, width] = shape[..] else { return None };
+    let pixels = height.checked_mul(width)?;
+    let mask = pq.return_mask;
+    let bands = planes.checked_sub(usize::from(mask)).filter(|b| *b > 0)?;
+    let body = data.get(start..start + planes.checked_mul(pixels)?.checked_mul(4)?)?;
+    let floats: Vec<f32> = body.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect();
+    let (values, there) = floats.split_at(bands * pixels);
+    // A pixel that is not there is no value, whatever the renderer filled it with.
+    let values = if mask {
+        values.iter().enumerate().map(|(i, v)| if there[i % pixels] == 0.0 { f32::NAN } else { *v }).collect()
+    } else {
+        values.to_vec()
+    };
+    let selected = pixel_selection::Selected { bands, values };
+    let request = BandRequest::MultiBand { bands_1based: (1..=bands as u16).collect() };
+    let custom = match first {
+        Some(first) => resolve_custom_lut(pq, first, &request).ok()?,
+        None => pq
+            .custom_colormap_json
+            .as_deref()
+            .map(|json| CustomColormap::from_json_str_with_type(json, !pq.rescale.is_empty(), pq.colormap_type_linear))
+            .transpose()
+            .ok()?,
+    };
+    let grey = bands < 3 && pq.colormap == ColormapName::Grayscale && custom.is_none();
+    let rgba = paint_selected(selected, pixels, &request, pq, custom.as_ref()).ok()?;
+    let shown = if grey { 1 } else { 3 };
+    let planes = shown + usize::from(mask);
+    let hdr = cogzilla_kernel::encode_npy_header("|u1", &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels);
+    out.extend_from_slice(&hdr);
+    for band in 0..shown {
+        out.extend(rgba.chunks_exact(4).map(|px| px[band]));
+    }
+    if mask {
+        out.extend(rgba.chunks_exact(4).map(|px| if px[3] == 0 { 0 } else { 255 }));
+    }
+    Some(Bytes::from(out))
 }
 
 /// A `/cog` answer in the type TiTiler writes its array in: the rasters at `urls` are
 /// opened again (they are cached) for their types. Anything but a float32 array, and an
 /// array whose rasters cannot be opened, is left as it is.
 async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
-    let Some((rule, _, expression, mask)) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
+    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
     let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
-    let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
-    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+    match asked {
+        ArrayAsked::Typed(rule, _, expression, mask) => {
+            let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
+            array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+        }
+        ArrayAsked::Shown(pq) => shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data),
+    }
 }
 
 /// A `/stac` answer in the type TiTiler writes its array in, from the types of the item's
 /// assets that were read and the band math as it was rewritten over them. As
 /// [`cog_array_in_its_type`].
 async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
-    let Some((rule, assets, expression, mask)) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
+    let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
+    let (assets, expression) = match &asked {
+        ArrayAsked::Typed(_, assets, expression, _) => (assets.clone(), expression.clone()),
+        ArrayAsked::Shown(pq) => (pq.assets.clone(), pq.expr_raw.clone()),
+    };
     let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
         return data;
     };
-    let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
-    array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+    match asked {
+        ArrayAsked::Typed(rule, _, _, mask) => {
+            let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
+            array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
+        }
+        ArrayAsked::Shown(pq) => shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data),
+    }
 }
 
 /// A rendered `/cog` tile, its array in its type: what the tile cache keeps.
@@ -7113,7 +7187,7 @@ where
         let stac_url_hdr = stac_url.clone();
         let stac_req_assets = pq.assets.clone();
         let stac_req_expr = pq.expr_raw.clone();
-        let stac_array = array_asked(&pq);
+        let stac_array = array_asked(&pq, sub.last());
         let attach_resolved_stac_assets = |resp: &mut Response<Full<Bytes>>| {
             if !resp.status().is_success() {
                 return;
@@ -8994,7 +9068,7 @@ where
     if segs.first() == Some(&"cog") {
         let sub = &segs[1..];
         let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
-        let cog_array = array_asked(&pq);
+        let cog_array = array_asked(&pq, sub.last());
         let cog_urls = pq.urls.clone();
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // 1. GET /cog/info
@@ -11033,6 +11107,31 @@ mod tests {
         let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
         let rgba = paint_selected(selected(3, &[1.0, 2.0, 3.0]), 1, &rgb, &pq, Some(&own)).unwrap();
         assert_eq!(rgba, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn an_array_asked_with_a_rescale_is_the_pictures_bytes() {
+        // One band of 50 and a pixel that is not there, with its mask, as the renderer writes it.
+        let f32_npy = |values: &[f32], mask: bool| {
+            let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(Bytes::from(raw), values.len() / 2, 1, 2, mask)
+        };
+        let body = |npy: &[u8]| npy[10 + usize::from(u16::from_le_bytes([npy[8], npy[9]]))..].to_vec();
+        let shown = |q: &str, npy: &[u8]| shown_array(&parse_query(Some(q)), None, npy).unwrap();
+        let grey = shown("rescale=0,100", &f32_npy(&[50.0, f32::NAN], true));
+        assert!(std::str::from_utf8(&grey[10..60]).unwrap().contains("'descr': '|u1'"));
+        assert!(std::str::from_utf8(&grey[10..80]).unwrap().contains("'shape': (2, 1, 2)"));
+        // 50 of 0..100 is 127, as rio-tiler makes it; the mask is 255 where the pixel is.
+        assert_eq!(body(&grey), [127, 0, 255, 0]);
+        // A colour map is red, green and blue.
+        let mapped = shown("rescale=0,100&colormap_name=viridis", &f32_npy(&[50.0, f32::NAN], true));
+        let rgb = ColormapName::Viridis.lut().rgb[127];
+        assert_eq!(body(&mapped), [rgb[0], 0, rgb[1], 0, rgb[2], 0, 255, 0]);
+        // Without the mask, the band alone.
+        let bare = shown("rescale=0,100&return_mask=false", &f32_npy(&[50.0, 100.0], false));
+        assert_eq!(body(&bare), [127, 255]);
+        // What is not a float32 array is not painted.
+        assert!(shown_array(&parse_query(Some("rescale=0,100")), None, b"not an array").is_none());
     }
 
     #[test]
