@@ -2460,10 +2460,11 @@ impl PlanesTile {
                         band_math_type(math_of(), read)
                     }
                 };
-                // A PNG holds 16 bits as well as 8: one or three bands of 16-bit whole
-                // numbers, asked for as a PNG and as they are, are written so, as GDAL
-                // writes them for TiTiler.
-                if let (Some((OutputFormat::Png, content_type)), false, 1 | 3) = (look.asked, shown, selected.bands)
+                // A PNG holds 16 bits as well as 8: bands of 16-bit whole numbers, asked for
+                // as a PNG and as they are, are written so, as GDAL writes them for TiTiler.
+                // It has room for four samples a pixel, the mask among them.
+                if let (Some((OutputFormat::Png, content_type)), false, 1..=4) =
+                    (look.asked, shown, selected.bands + usize::from(look.return_mask))
                     && kind() == SampleType::Uint16
                 {
                     return Ok((png_of_16_bits(&selected.values, selected.bands, width, height, look.return_mask), content_type));
@@ -5369,9 +5370,11 @@ fn encode_picture(
 
 /// A grey PNG of an RGBA picture whose red is the grey: one channel, or two with `alpha`.
 /// Without it a pixel that is not there is black, as it is in the RGB the renderer writes.
-/// One or three bands of 16-bit whole numbers as a PNG of 16 bits a sample: grey or
-/// colour, and with `alpha` a last sample that is the largest number where any band has
-/// a value and zero elsewhere. A value that is not there is written as zero.
+/// Bands of 16-bit whole numbers as a PNG of 16 bits a sample, with `alpha` a last sample
+/// that is the largest number where any band has a value and zero elsewhere; four samples
+/// at most. What the samples are taken for goes by how many there are, as in GDAL's PNG
+/// driver: one is grey, two grey and alpha, three colour, four colour and alpha, so that
+/// two bands and their mask make a colour picture. A value that is not there is zero.
 fn png_of_16_bits(values: &[f32], bands: usize, width: usize, height: usize, alpha: bool) -> Bytes {
     let pixels = width * height;
     let samples = bands + usize::from(alpha);
@@ -5392,11 +5395,11 @@ fn png_of_16_bits(values: &[f32], bands: usize, width: usize, height: usize, alp
             }
         }
     }
-    let colour_type = match (bands, alpha) {
-        (1, false) => 0,
-        (1, true) => 4,
-        (_, false) => 2,
-        (_, true) => 6,
+    let colour_type = match samples {
+        1 => 0,
+        2 => 4,
+        3 => 2,
+        _ => 6,
     };
     cogzilla_kernel::png_fast::encode_filtered_png_depth(width as u32, height as u32, colour_type, 16, &rows)
 }
