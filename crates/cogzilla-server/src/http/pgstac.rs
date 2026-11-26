@@ -208,6 +208,89 @@ fn parse_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// Whether `s` is a date, or a date and a time, as RFC 3339 writes them.
+fn looks_like_datetime(s: &str) -> bool {
+    let b = s.as_bytes();
+    let digits = |from: usize, n: usize| b.get(from..from + n).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+    if !(digits(0, 4) && b.get(4) == Some(&b'-') && digits(5, 2) && b.get(7) == Some(&b'-') && digits(8, 2)) {
+        return false;
+    }
+    if b.len() == 10 {
+        return true;
+    }
+    if !(matches!(b[10], b'T' | b't' | b' ') && digits(11, 2) && b.get(13) == Some(&b':') && digits(14, 2)) {
+        return false;
+    }
+    let mut at = 16;
+    if b.get(at) == Some(&b':') && digits(at + 1, 2) {
+        at += 3;
+        if b.get(at) == Some(&b'.') {
+            at += 1;
+            let start = at;
+            while b.get(at).is_some_and(u8::is_ascii_digit) {
+                at += 1;
+            }
+            if at == start {
+                return false;
+            }
+        }
+    }
+    match &b[at..] {
+        [] | [b'Z' | b'z'] => true,
+        [b'+' | b'-', rest @ ..] => matches!(rest, [h1, h2, b':', m1, m2] | [h1, h2, m1, m2] if [h1, h2, m1, m2].iter().all(|c| c.is_ascii_digit())),
+        _ => false,
+    }
+}
+
+/// What FastAPI refuses of a picture's parameters before anything is drawn. The routes
+/// that only describe a mosaic (`tilejson.json`, `map.html`, the WMTS document) take the
+/// same parameters as its tiles, and titiler-pgstac checks them there too.
+fn render_query_error(pairs: &[(String, String)]) -> Option<Resp> {
+    let bad = |name: &str, msg: &str| Some(invalid_param("query", name, msg));
+    if let Some(map) = query_value(pairs, "colormap")
+        && !map.is_empty()
+        && (!map.trim_start().starts_with(['{', '[']) || serde_json::from_str::<Value>(map).is_err())
+    {
+        return Some(detail(StatusCode::BAD_REQUEST, "Could not parse the colormap value."));
+    }
+    if let Some(name) = query_value(pairs, "colormap_name")
+        && (ColormapName::from_str_opt(name).is_none() || name.chars().any(char::is_uppercase))
+    {
+        return bad("colormap_name", "Input should be the name of a colour map (see /colorMaps)");
+    }
+    for (key, value) in pairs {
+        let number = || value.parse::<f64>().is_ok();
+        let whole = || value.parse::<i64>().is_ok();
+        let wrong = match key.as_str() {
+            "rescale" => {
+                let parts: Vec<&str> = value.split(',').collect();
+                (parts.len() != 2 || !parts.iter().all(|p| p.trim().parse::<f64>().is_ok())).then_some("Input should be a range, as min,max")
+            }
+            "resampling" | "reproject" => (!matches!(
+                value.as_str(),
+                "nearest" | "bilinear" | "cubic" | "cubic_spline" | "lanczos" | "average" | "mode" | "gauss" | "rms"
+                    | "max" | "min" | "med" | "q1" | "q3" | "sum"
+            ))
+            .then_some("Input should be a resampling method"),
+            "pixel_selection" => Selection::parse(value).is_none().then_some("Input should be a pixel selection method"),
+            "color_formula" => cogzilla_kernel::ColorFormula::parse(value).is_err().then_some("Input should be a colour formula"),
+            "nodata" => (!number() && !matches!(value.to_ascii_lowercase().as_str(), "nan" | "inf" | "-inf")).then_some("Input should be a valid number"),
+            "unscale" | "return_mask" | "asset_as_band" | "exitwhenfull" | "skipcovered" => {
+                parse_bool(value).is_none().then_some("Input should be a valid boolean")
+            }
+            "tilesize" | "items_limit" | "time_limit" | "scan_limit" | "padding" => (!whole()).then_some("Input should be a valid integer"),
+            "buffer" => (!number()).then_some("Input should be a valid number"),
+            "algorithm" => super::get_algorithm_json(value).is_err().then_some("Input should be the name of an algorithm"),
+            "algorithm_params" => serde_json::from_str::<Value>(value).is_err().then_some("Input should be valid JSON"),
+            _ => None,
+        };
+        if let Some(msg) = wrong {
+            return bad(key, msg);
+        }
+    }
+    None
+}
+
 /// `scan_limit`, `items_limit`, `time_limit`, `exitwhenfull` and `skipcovered`.
 fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
     let mut limits = SearchLimits::default();
@@ -775,6 +858,10 @@ fn collection_search(
         }
     }
     if let Some(v) = query_value(pairs, "datetime") {
+        // A date pgSTAC cannot read is the request's fault, and is said so before it is asked.
+        if !v.split('/').all(|part| matches!(part, "" | "..") || looks_like_datetime(part)) || v.split('/').count() > 2 {
+            return Err(invalid_param("query", "datetime", "Input should be a valid datetime"));
+        }
         search.insert("datetime".into(), json!(v));
     }
     if let Some(v) = query_value(pairs, "sortby") {
@@ -6083,6 +6170,26 @@ async fn mosaic_route(
                 StatusCode::OK,
                 &json!({ "search": search, "links": info_links(ctx.host, base, rec) }),
             )
+        }
+        [_, "tilejson.json" | "map.html"] if render_query_error(pairs).is_some() => {
+            render_query_error(pairs).unwrap_or_else(not_found)
+        }
+        [_, "tilejson.json" | "map.html"]
+            if query_value(pairs, "tile_format")
+                .is_some_and(|f| !matches!(f, "png" | "npy" | "tif" | "jpeg" | "jpg" | "jp2" | "webp" | "pngraw")) =>
+        {
+            invalid_param("query", "tile_format", "Input should be an image format")
+        }
+        // A map with nothing to show is refused as its tiles would be.
+        [_, "map.html"] if query_value(pairs, "assets").is_none() => missing_query_param("assets"),
+        [_, "map.html"] if ["tilesize", "minzoom", "maxzoom"].iter().any(|k| query_value(pairs, k).is_some_and(|v| v.parse::<i64>().is_err())) => {
+            invalid_param("query", "tilesize", "Input should be a valid integer")
+        }
+        // The WMTS document says the same with a 400.
+        ["WMTSCapabilities.xml"]
+            if render_query_error(&pairs.iter().filter(|(k, _)| k != "tilesize").cloned().collect::<Vec<_>>()).is_some() =>
+        {
+            detail(StatusCode::BAD_REQUEST, "a parameter of the tiles this document describes is not valid")
         }
         [tms, "tilejson.json"] => tilejson(ctx, base, rec, tms, pairs),
         [tms, "map.html"] => {

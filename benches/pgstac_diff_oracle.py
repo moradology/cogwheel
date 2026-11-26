@@ -870,6 +870,11 @@ def main() -> int:
         o.check("tile, pixel_selection and a colour formula", "image",
                 f"{base12}.png?assets=visual&pixel_selection=mean&color_formula={opt('gamma rgb 1.8')}{every}")
         o.check("tile, a colour formula", "image", f"{base12}.png?assets=visual&color_formula={opt('gamma rgb 1.8')}")
+        # The routes that describe a mosaic check its tiles' parameters as the tiles do.
+        for route in ("WebMercatorQuad/tilejson.json", "WebMercatorQuad/map.html", "WMTSCapabilities.xml"):
+            for bad in ("colormap_name=nope", "rescale=abc", "resampling=nope", "nodata=abc", "unscale=maybe", "algorithm=nope", "items_limit=abc"):
+                o.check(f"{route} with {bad}", "status", f"/searches/{sid}/{route}?assets=red&{bad}")
+        o.check("collection tilejson with a date that is not one", "status", f"/collections/{collection}/WebMercatorQuad/tilejson.json?assets=red&datetime=nope")
         o.check("tile, a colour map's name where a map goes", "status", f"{base12}.png?assets=red&rescale=0,3000&colormap=viridis")
         o.check("tile, a colour map nobody has", "status", f"{base12}.png?assets=red&rescale=0,3000&colormap_name=nope")
         # One band: the formula is on the band's byte, and the colour map is looked up after.
