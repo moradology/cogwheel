@@ -6207,12 +6207,6 @@ pub(super) async fn item_route(
             {
                 return Done(r);
             }
-            if query_value(&pairs, "f") == Some("html") {
-                return Done(detail(
-                    StatusCode::BAD_REQUEST,
-                    "f=html is not supported on tileset routes (use f=json)",
-                ));
-            }
             let extent = match item_extent(ctx, &doc, &item, &readable, pq).await {
                 Ok(e) => e,
                 Err(r) => return Done(r),
@@ -6640,10 +6634,6 @@ async fn mosaic_route(
             };
             wmts(ctx, base, source, pairs)
         }
-        ["tiles"] | ["tiles", _] if query_value(pairs, "f") == Some("html") => detail(
-            StatusCode::BAD_REQUEST,
-            "f=html is not supported on tileset routes (use f=json)",
-        ),
         ["tiles"] => tilesets(ctx, base, &rec.metadata, pairs),
         ["tiles", tms] => tileset(ctx, base, &rec.metadata, tms, pairs),
         ["tiles", _, zs, xs, ys, "assets"] => {

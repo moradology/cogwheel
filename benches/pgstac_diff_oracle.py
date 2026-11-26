@@ -32,6 +32,7 @@ import io
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -316,6 +317,17 @@ class Oracle:
             ok, note = False, f"status {cz.status_code} vs {tt.status_code}: {cz.text[:80]!r}"
         elif kind == "status":
             note = f"{cz.status_code}"
+        elif kind == "page":
+            # An HTML page of the same document: the markup is not TiTiler's templates, so what
+            # is compared is that both are pages and that every tileset ours links to is one
+            # theirs links to.
+            def tileset_links(r, base):
+                hrefs = re.findall(r'href="([^"]+)"', r.text)
+                return {h.replace(base, "").replace("&amp;", "&") for h in hrefs if "/tiles/" in h and "{" not in h}
+            types = (cz.headers.get("content-type", ""), tt.headers.get("content-type", ""))
+            missing = tileset_links(cz, COGZILLA) - tileset_links(tt, TITILER)
+            ok = all(t.startswith("text/html") for t in types) and not missing
+            note = f"{types[0]}" if ok else f"{types} links only ours: {sorted(missing)[:2]}"
         elif kind == "placed":
             ok, note = same_place(cz, tt)
         elif kind == "json":
@@ -712,6 +724,8 @@ def main() -> int:
         print("tilesets and item lists")
         o.check("tileset list", "tilesets", f"/searches/{sid}/tiles")
         o.check("tileset list keeps the query", "tilesets", f"/searches/{sid_meta}/tiles?assets=visual&rescale=0,255")
+        o.check("tileset list as a page", "page", f"/searches/{sid}/tiles?assets=visual&f=html")
+        o.check("tileset as a page", "page", f"/searches/{sid}/tiles/WebMercatorQuad?assets=visual&f=html")
         o.check("tileset", "json", f"/searches/{sid}/tiles/WebMercatorQuad")
         o.check("tileset from search metadata", "json", f"/searches/{sid_meta}/tiles/WebMercatorQuad?assets=visual")
         o.check("tileset with a zoom range", "json", f"/searches/{sid_meta}/tiles/WebMercatorQuad?minzoom=5&maxzoom=7")
@@ -805,6 +819,8 @@ def main() -> int:
                 "/collections/nope/WebMercatorQuad/tilejson.json?assets=visual")
         o.check("collection map viewer", "status", f"{col}/WebMercatorQuad/map.html?assets=visual")
         o.check("collection tileset list", "tilesets", f"{col}/tiles?assets=visual")
+        o.check("collection tileset list as a page", "page", f"{col}/tiles?assets=visual&f=html")
+        o.check("collection tileset as a page", "page", f"{col}/tiles/WebMercatorQuad?assets=visual&f=html")
         o.check("collection tileset", "json", f"{col}/tiles/WebMercatorQuad?assets=visual&minzoom=4&maxzoom=9")
         o.check("collection tileset with a bbox", "json",
                 f"{col}/tiles/WebMercatorQuad?bbox=6,44,8,46&minzoom=6&maxzoom=7")
@@ -1393,6 +1409,8 @@ def main() -> int:
         o.check("item info.geojson", "json", f"{it}/info.geojson?assets=visual")
         o.check("item renders", "json", f"{it}/renders")
         o.check("item tileset list", "tilesets", f"{it}/tiles?assets=visual")
+        o.check("item tileset list as a page", "page", f"{it}/tiles?assets=visual&f=html")
+        o.check("item tileset as a page", "page", f"{it}/tiles/WebMercatorQuad?assets=visual&f=html")
         o.check("item tileset", "json", f"{it}/tiles/WebMercatorQuad?assets=visual")
         o.check("item map viewer", "status", f"{it}/WebMercatorQuad/map.html?assets=visual")
         o.check("item tile", "image", f"{itile}.png?assets=visual")
