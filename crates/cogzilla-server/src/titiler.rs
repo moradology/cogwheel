@@ -662,7 +662,7 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
 }
 
 /// Escape XML text and attribute special characters.
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
