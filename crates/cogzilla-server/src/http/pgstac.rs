@@ -82,17 +82,11 @@ async fn pixel_items(
 type Resp = Response<Full<Bytes>>;
 
 fn json_resp(status: StatusCode, body: &Value) -> Resp {
-    let mut resp = Response::new(Full::new(Bytes::from(body.to_string())));
-    *resp.status_mut() = status;
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    resp.headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    resp
+    super::plain_resp(status, body.to_string(), "application/json")
 }
 
 fn detail(status: StatusCode, msg: impl Into<String>) -> Resp {
-    json_resp(status, &json!({ "detail": msg.into() }))
+    super::json_error_resp(status, &msg.into())
 }
 
 /// FastAPI's body for a required query parameter that is absent.
@@ -120,11 +114,7 @@ fn method_not_allowed(takes: Option<Method>) -> Resp {
 }
 
 fn no_content() -> Resp {
-    let mut resp = Response::new(Full::new(Bytes::new()));
-    *resp.status_mut() = StatusCode::NO_CONTENT;
-    resp.headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    resp
+    super::error_to_http_response(&EngineError::NoContent)
 }
 
 fn db_error(err: &PgStacError) -> Resp {
@@ -154,29 +144,15 @@ pub(super) fn bad_request(message: String) -> Resp {
     detail(StatusCode::BAD_REQUEST, message)
 }
 
+/// The shared answer to an engine's error, but for a method a route does not take: an
+/// item's routes are each for one method, and say so as Starlette does.
 pub(super) fn engine_error(err: &EngineError) -> Resp {
     match err {
         EngineError::Shared(inner) => engine_error(inner),
-        EngineError::NotFound(msg) => detail(StatusCode::NOT_FOUND, msg.clone()),
-        EngineError::BadRequest(msg) => detail(StatusCode::BAD_REQUEST, msg.clone()),
-        // As Starlette answers it. An item's routes are each for one method.
         EngineError::MethodNotAllowed(allow) => {
-            let mut resp = detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
-            let allow = if allow.contains("GET") { "GET" } else { "POST" };
-            resp.headers_mut().insert(hyper::header::ALLOW, HeaderValue::from_static(allow));
-            resp
+            method_not_allowed(Some(if allow.contains("GET") { Method::GET } else { Method::POST }))
         }
-        EngineError::Proj(e) => detail(StatusCode::BAD_REQUEST, e.to_string()),
-        EngineError::Io(e @ cogzilla_io::IoError::InvalidUri(_)) => {
-            detail(StatusCode::BAD_REQUEST, e.to_string())
-        }
-        EngineError::Io(e @ cogzilla_io::IoError::Forbidden(_)) => {
-            detail(StatusCode::FORBIDDEN, e.to_string())
-        }
-        e => {
-            tracing::warn!(error = %e, "pgSTAC tile failed with 500");
-            detail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
+        other => super::error_to_http_response(other),
     }
 }
 
@@ -506,10 +482,7 @@ fn tile_polygon(tile: TileCoord) -> Value {
     let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
     let (west, south) = mercator_to_lonlat_deg(min_x, min_y);
     let (east, north) = mercator_to_lonlat_deg(max_x, max_y);
-    json!({
-        "type": "Polygon",
-        "coordinates": [[[west, south], [west, north], [east, north], [east, south], [west, south]]]
-    })
+    bbox_polygon([west, south, east, north])
 }
 
 fn search_json(rec: &SearchRecord) -> Value {
@@ -1236,15 +1209,6 @@ fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, Strin
     )
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
-/// A float the way Python prints it (`-180.0`, not `-180`).
-fn py_float(v: f64) -> String {
-    json!(v).to_string()
-}
-
 /// What the WMTS document needs to know about the thing being tiled.
 struct WmtsSource<'a> {
     /// Prefix of every layer name: the search hash, or `TiTiler` for an item.
@@ -1352,7 +1316,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
     }
 
     let host = ctx.host;
-    let this_url = xml_escape(&if ctx.raw_query.is_empty() {
+    let this_url = crate::titiler::xml_escape(&if ctx.raw_query.is_empty() {
         format!("{host}{base}/WMTSCapabilities.xml")
     } else {
         format!("{host}{base}/WMTSCapabilities.xml?{}", ctx.raw_query)
@@ -1394,8 +1358,8 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
     xml.push_str("    </ows:OperationsMetadata>\n    <Contents>\n");
     let [w, s, e, n] = source.bounds;
     for (name, qs, (minzoom, maxzoom)) in &layers {
-        let id = xml_escape(&format!("{}_{TMS}_{name}", source.title));
-        let template = xml_escape(&if qs.is_empty() {
+        let id = crate::titiler::xml_escape(&format!("{}_{TMS}_{name}", source.title));
+        let template = crate::titiler::xml_escape(&if qs.is_empty() {
             format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}")
         } else {
             format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}?{qs}")
@@ -1417,10 +1381,10 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
                 <TileMatrixSet>{TMS}</TileMatrixSet>
                 <TileMatrixSetLimits>
 "#,
-            py_float(w),
-            py_float(s),
-            py_float(e),
-            py_float(n)
+            python_float(w),
+            python_float(s),
+            python_float(e),
+            python_float(n)
         ));
         for z in (*minzoom).clamp(0, 30)..=(*maxzoom).clamp(0, 30) {
             let l = tile_limits(z, source.bounds);
@@ -1441,7 +1405,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         let side = 1u64 << z;
         xml.push_str(&format!(
             "            <TileMatrix>\n                <ows:Identifier>{z}</ows:Identifier>\n                <ScaleDenominator>{}</ScaleDenominator>\n                <TopLeftCorner>-20037508.342789244 20037508.342789244</TopLeftCorner>\n                <TileWidth>256</TileWidth>\n                <TileHeight>256</TileHeight>\n                <MatrixWidth>{side}</MatrixWidth>\n                <MatrixHeight>{side}</MatrixHeight>\n            </TileMatrix>\n",
-            py_float(559_082_264.028_717_8 / side as f64)
+            python_float(559_082_264.028_717_8 / side as f64)
         ));
     }
     xml.push_str(&format!(
@@ -1454,12 +1418,16 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
 }
 
 /// Only WGS84 coordinates are taken on the bbox and point routes for now.
-fn check_coord_crs(pairs: &[(String, String)]) -> Result<(), Resp> {
-    match query_value(pairs, "coord_crs").map(str::to_ascii_lowercase).as_deref() {
-        None | Some("epsg:4326" | "ogc:crs84") => Ok(()),
-        Some(other) => Err(detail(
+fn check_coord_crs(pq: &ParsedQuery, pairs: &[(String, String)]) -> Result<(), Resp> {
+    // As the shared parser read it, in any spelling of degrees it takes.
+    match pq.coord_crs_epsg {
+        None | Some(4326) => Ok(()),
+        Some(_) => Err(detail(
             StatusCode::BAD_REQUEST,
-            format!("coord_crs '{other}' is not supported on pgSTAC mosaic routes (use epsg:4326)"),
+            format!(
+                "coord_crs '{}' is not supported on pgSTAC mosaic routes (use epsg:4326)",
+                query_value(pairs, "coord_crs").unwrap_or_default().to_ascii_lowercase()
+            ),
         )),
     }
 }
@@ -1470,7 +1438,7 @@ fn in_degrees(pq: &ParsedQuery, pairs: &[(String, String)], x: f64, y: f64) -> R
     if pq.coord_crs_3857 {
         return Ok(mercator_to_lonlat_deg(x, y));
     }
-    check_coord_crs(pairs).map(|()| (x, y))
+    check_coord_crs(pq, pairs).map(|()| (x, y))
 }
 
 /// `GET {base}/bbox/{minx},{miny},{maxx},{maxy}/assets` and `GET {base}/point/{lon},{lat}/assets`.
@@ -1511,30 +1479,13 @@ async fn listed_items(
     found.map_err(|e| db_error(&e))
 }
 
-/// The tile matrix sets TiTiler registers by default.
-const TITILER_TMS: &[&str] = &[
-    "CDB1GlobalGrid",
-    "CanadianNAD83_LCC",
-    "EuropeanETRS89_LAEAQuad",
-    "GNOSISGlobalGrid",
-    "LINZAntarticaMapTilegrid",
-    "NZTM2000Quad",
-    "UPSAntarcticWGS84Quad",
-    "UPSArcticWGS84Quad",
-    "UTM31WGS84Quad",
-    "WGS1984Quad",
-    "WebMercatorQuad",
-    "WorldCRS84Quad",
-    "WorldMercatorWGS84Quad",
-];
-
 /// Only Web Mercator tiles are served on the mosaic routes for now. A name TiTiler does
 /// not know is a validation error there; one it knows but this server cannot serve is
 /// refused with the reason.
 fn check_tms(tms: &str) -> Result<(), Resp> {
     if tms == "WebMercatorQuad" {
         Ok(())
-    } else if TITILER_TMS.contains(&tms) {
+    } else if crate::tms::lookup_tms(tms).is_some() {
         Err(detail(
             StatusCode::BAD_REQUEST,
             format!("tile matrix set '{tms}' is not supported on pgSTAC mosaic routes (use WebMercatorQuad)"),
@@ -2189,7 +2140,7 @@ impl Window {
                                 wanted.len()
                             )));
                         }
-                        let planes = match resampled_planes(engine, &cog, [w, s, e, n], true, (side, side), &wanted, resample, request.unscale, nodata).await {
+                        let planes = match resampled_planes(engine, &cog, [w, s, e, n], true, (side, side), &wanted, None, resample, request.unscale, nodata).await {
                             Ok(planes) => planes,
                             // The item's footprint meets the tile but this raster does not.
                             Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; side * side]; wanted.len()],
@@ -2255,7 +2206,7 @@ impl Window {
             let out = (width as usize, height as usize);
             let mut planes: Vec<Vec<f32>> = if resample != ResampleMode::Nearest {
                 // Smoothed on a grid in metres: the box renderer, and the shape burned below.
-                match resampled_planes(engine, &cog, bbox, true, out, &wanted, resample, unscale, nodata).await {
+                match resampled_planes(engine, &cog, bbox, true, out, &wanted, None, resample, unscale, nodata).await {
                     Ok(planes) => in_raster_type(planes, sample_type, unscale),
                     // The item's footprint meets the box but this raster does not.
                     Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; out.0 * out.1]; wanted.len()],
@@ -2309,30 +2260,7 @@ impl Window {
                                 // shape: a pixel is inside when its centre is, or when an
                                 // edge passes through it. Each polygon is burned on its own,
                                 // so two that overlap are their union.
-                                let (dx, dy) =
-                                    ((bbox[2] - bbox[0]) / out.0 as f64, (bbox[3] - bbox[1]) / out.1 as f64);
-                                let polygons: Vec<Vec<zonal::Ring>> = mask
-                                    .polygons
-                                    .iter()
-                                    .map(|polygon| {
-                                        polygon
-                                            .iter()
-                                            .map(|ring| {
-                                                ring.iter()
-                                                    .map(|&(lon, lat)| {
-                                                        // The shape is in degrees whatever the grid is in.
-                                                        let (across, up) = if mercator {
-                                                            cogzilla_proj::mercator::lonlat_deg_to_mercator(lon, lat)
-                                                        } else {
-                                                            (lon, lat)
-                                                        };
-                                                        ((across - bbox[0]) / dx, (bbox[3] - up) / dy)
-                                                    })
-                                                    .collect()
-                                            })
-                                            .collect()
-                                    })
-                                    .collect();
+                                let polygons = rings_on_grid(&mask, bbox, out, mercator);
                                 let burned = zonal::cover_counts(&polygons, out.0, out.1, 1).map_err(EngineError::BadRequest)?;
                                 let inside: Vec<bool> = burned.into_iter().map(|n| n > 0).collect();
                                 Ok::<_, EngineError>(inside)
@@ -2350,33 +2278,10 @@ impl Window {
             }
             return Ok((planes, sample_type));
         }
-        // The renderer takes the request's own `nodata` in place of the raster's.
-        let cogs = [cog];
-        let mut planes = Vec::with_capacity(wanted.len());
-        for band in wanted {
-            let bands = BandRequest::Single { band_1based: band, rescale: (0.0, 255.0), colormap: ColormapName::Grayscale };
-            let values = render_wgs84_bbox(
-                engine,
-                &cogs,
-                bbox,
-                width,
-                height,
-                mask.as_ref().map(|(mask, _)| mask.as_ref()),
-                &bands,
-                resample,
-                OutputFormat::RawF32,
-                nodata,
-                None,
-                None,
-                true,
-                unscale,
-            )
-            .await?;
-            if values.len() != pixels * 4 {
-                return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
-            }
-            planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
-        }
+        // The renderer takes the request's own `nodata` in place of the raster's, and burns the shape.
+        let shape = mask.as_ref().map(|(mask, _)| mask.as_ref());
+        let planes =
+            resampled_planes(engine, &cog, bbox, false, (width as usize, height as usize), &wanted, shape, resample, unscale, nodata).await?;
         Ok((in_raster_type(planes, sample_type, unscale), sample_type))
     }
 }
@@ -3113,6 +3018,23 @@ async fn tile_assets(pg: &PgStac, id: &str, tile: TileCoord, pairs: &[(String, S
 }
 
 /// TiTiler's answer for an asset the item does not have: its assets, in jsonb key order.
+/// Where an item's assets are read from, in the order they are named; a name the item
+/// has not got fails the request before anything is read.
+fn asset_hrefs<'a>(item: &MosaicItem, names: impl IntoIterator<Item = &'a str>) -> Result<Vec<String>, Resp> {
+    names
+        .into_iter()
+        .map(|name| item.asset_href(name).map(|href| href.to_string()).ok_or_else(|| unknown_asset(name, item)))
+        .collect()
+}
+
+/// An item as titiler-pgstac names it: `{collection}/{id}`.
+fn item_name(item: &MosaicItem) -> String {
+    match &item.collection {
+        Some(c) => format!("{c}/{}", item.id),
+        None => item.id.clone(),
+    }
+}
+
 fn unknown_asset(asset: &str, item: &MosaicItem) -> Resp {
     let mut names: Vec<String> = item.assets.keys().cloned().collect();
     jsonb_key_order(&mut names);
@@ -3311,20 +3233,13 @@ async fn part_image_of(
     // The box is given in `coord_crs` and drawn in `dst_crs`, which is `coord_crs` unless
     // given: degrees or Web Mercator metres, either way round. A posted shape is in degrees.
     let given_in_metres = pq.coord_crs_3857;
-    if !given_in_metres && let Err(r) = check_coord_crs(pairs) {
+    if !given_in_metres && let Err(r) = check_coord_crs(&pq, pairs) {
         return r;
     }
     // `dst_crs` is read as `coord_crs` is, in any of the spellings TiTiler takes.
-    let mercator = match query_value(pairs, "dst_crs").map(|dst| (dst, super::parse_coord_crs_with_epsg(dst))) {
-        None => given_in_metres,
-        Some((_, Ok((_, 4326)))) => false,
-        Some((_, Ok((_, 3857)))) => true,
-        Some((dst, _)) => {
-            return detail(
-                StatusCode::BAD_REQUEST,
-                format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
-            );
-        }
+    let mercator = match drawn_in_mercator(pairs, given_in_metres) {
+        Ok(mercator) => mercator,
+        Err(r) => return r,
     };
     // Web Mercator ends at 85.05 degrees: a box in degrees that goes past it has no
     // corner there, and is refused sooner than drawn cut short under its own bounds.
@@ -3393,17 +3308,12 @@ async fn part_image_of(
     if items.is_empty() {
         return no_content();
     }
-    let mut scenes: Vec<Vec<String>> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
-    for item in items.iter().take(MAX_SCENES_PER_TILE) {
-        let mut hrefs = Vec::with_capacity(names.len());
-        for asset in &names {
-            match item.asset_href(asset) {
-                Some(href) => hrefs.push(href.to_string()),
-                None => return unknown_asset(asset, item),
-            }
-        }
-        scenes.push(hrefs);
-    }
+    let scenes: Result<Vec<Vec<String>>, Resp> =
+        items.iter().take(MAX_SCENES_PER_TILE).map(|item| asset_hrefs(item, names.iter().map(String::as_str))).collect();
+    let scenes = match scenes {
+        Ok(scenes) => scenes,
+        Err(resp) => return resp,
+    };
 
     let engine = ctx.engine;
     let rendered: Result<(Bytes, &'static str), EngineError> = async {
@@ -3668,6 +3578,20 @@ async fn part_image_of(
     }
 }
 
+/// Whether `dst_crs` asks for a grid in Web Mercator metres and not degrees, in any of the
+/// spellings the shared parser takes; `unset` when it is not given.
+fn drawn_in_mercator(pairs: &[(String, String)], unset: bool) -> Result<bool, Resp> {
+    match query_value(pairs, "dst_crs").map(|dst| (dst, super::parse_coord_crs_with_epsg(dst))) {
+        None => Ok(unset),
+        Some((_, Ok((_, 4326)))) => Ok(false),
+        Some((_, Ok((_, 3857)))) => Ok(true),
+        Some((dst, _)) => Err(detail(
+            StatusCode::BAD_REQUEST,
+            format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
+        )),
+    }
+}
+
 fn bbox_polygon([w, s, e, n]: [f64; 4]) -> Value {
     json!({ "type": "Polygon", "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]] })
 }
@@ -3704,48 +3628,12 @@ async fn feature_image(
     if geojson.get("type").and_then(Value::as_str) != Some("Feature") || !geojson["geometry"].is_object() {
         return not_a_feature();
     }
-    let (mask, bbox) = match polygons_of_collection(&geojson).and_then(|shape| PolygonMask::from_geojson(&shape)) {
+    let (mask, bbox) = match PolygonMask::from_geojson(&geojson) {
         Ok(m) => m,
         Err(e) => return engine_error(&e),
     };
     // As in titiler-pgstac, the items are those of the feature's bounding box.
     part_image(ctx, pg, hash, &bbox_polygon(bbox), bbox, Some(&mask), size, ext, pq, pairs).await
-}
-
-/// A feature whose geometry is a GeometryCollection of polygons, as the one MultiPolygon
-/// the mask reads: GDAL burns every member, which is their union. Any other feature is
-/// returned as it is. A collection with a line or a point in it, or with nothing, is
-/// refused: lines and points are not burned here.
-fn polygons_of_collection(feature: &Value) -> Result<std::borrow::Cow<'_, Value>, EngineError> {
-    fn gather<'a>(geometry: &'a Value, into: &mut Vec<&'a Value>, depth: usize) -> bool {
-        match geometry.get("type").and_then(Value::as_str) {
-            Some("Polygon") => {
-                into.push(&geometry["coordinates"]);
-                true
-            }
-            Some("MultiPolygon") => geometry["coordinates"].as_array().is_some_and(|polygons| {
-                into.extend(polygons);
-                true
-            }),
-            Some("GeometryCollection") if depth < 16 => geometry["geometries"]
-                .as_array()
-                .is_some_and(|members| members.iter().all(|member| gather(member, into, depth + 1))),
-            _ => false,
-        }
-    }
-    let geometry = &feature["geometry"];
-    if geometry.get("type").and_then(Value::as_str) != Some("GeometryCollection") {
-        return Ok(std::borrow::Cow::Borrowed(feature));
-    }
-    let mut polygons = Vec::new();
-    if !gather(geometry, &mut polygons, 0) || polygons.is_empty() {
-        return Err(EngineError::BadRequest(
-            "a GeometryCollection is taken when every member is a Polygon or a MultiPolygon, and it has one".into(),
-        ));
-    }
-    // The geometry alone, which the mask reads as it reads a feature: one copy of the
-    // coordinates, checked against the mask's own limits as any other shape is.
-    Ok(std::borrow::Cow::Owned(json!({ "type": "MultiPolygon", "coordinates": polygons })))
 }
 
 /// GDAL's default grid for a raster warped to WGS84: where it starts and its pixel size.
@@ -4219,8 +4107,26 @@ async fn warp_nearest(
     Ok(if pool { engine.store.run_heavy_cpu(work).await? } else { work() })
 }
 
-/// Every band of one raster on a WGS84 grid through the shared renderer, for the
-/// resampling methods other than nearest neighbour.
+/// A shape's rings in the pixels of a grid over `bounds`, which is in degrees or Web
+/// Mercator metres; the shape is in degrees whatever the grid is in.
+fn rings_on_grid(mask: &PolygonMask, bounds: [f64; 4], (width, height): (usize, usize), mercator: bool) -> Vec<Vec<zonal::Ring>> {
+    let (dx, dy) = ((bounds[2] - bounds[0]) / width as f64, (bounds[3] - bounds[1]) / height as f64);
+    let on_grid = |&(lon, lat): &(f64, f64)| {
+        let (across, up) = if mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) };
+        ((across - bounds[0]) / dx, (bounds[3] - up) / dy)
+    };
+    mask.polygons.iter().map(|polygon| polygon.iter().map(|ring| ring.iter().map(on_grid).collect()).collect()).collect()
+}
+
+/// Little-endian `f32` values as the renderer hands them over.
+fn f32s(raw: &[u8]) -> Vec<f32> {
+    raw.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect()
+}
+
+/// Bands of one raster on a grid in degrees or Web Mercator metres through the shared
+/// renderer, for the resampling methods other than nearest neighbour. A shape is burned
+/// by the renderer on a grid in degrees; on one in metres the caller burns it.
+#[allow(clippy::too_many_arguments)]
 async fn resampled_planes(
     engine: &TileEngine,
     cog: &Arc<cogzilla_io::OpenedCog>,
@@ -4228,6 +4134,7 @@ async fn resampled_planes(
     mercator: bool,
     (width, height): (usize, usize),
     bands: &[u16],
+    shape: Option<&PolygonMask>,
     resample: ResampleMode,
     unscale: bool,
     nodata: Option<f32>,
@@ -4244,12 +4151,12 @@ async fn resampled_planes(
         let raw = if mercator {
             crate::titiler::render_mercator_bbox(engine, cogs, bounds, w, h, &one, resample, OutputFormat::RawF32, nodata, None, None, false, unscale).await?
         } else {
-            render_wgs84_bbox(engine, cogs, bounds, w, h, None, &one, resample, OutputFormat::RawF32, nodata, None, None, false, unscale).await?
+            render_wgs84_bbox(engine, cogs, bounds, w, h, shape, &one, resample, OutputFormat::RawF32, nodata, None, None, shape.is_some(), unscale).await?
         };
         if raw.len() != width * height * 4 {
             return Err(EngineError::BadRequest("unexpected array size from the renderer".into()));
         }
-        planes.push(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+        planes.push(f32s(&raw));
     }
     Ok(planes)
 }
@@ -4377,9 +4284,7 @@ async fn feature_statistics(
     feature: &Value,
     req: &StatsRequest<'_>,
 ) -> Result<Option<(Value, Vec<String>)>, Resp> {
-    let (mask, bbox) = polygons_of_collection(feature)
-        .and_then(|shape| PolygonMask::from_geojson(&shape))
-        .map_err(|e| engine_error(&e))?;
+    let (mask, bbox) = PolygonMask::from_geojson(feature).map_err(|e| engine_error(&e))?;
     // As in titiler-pgstac, the items are those of the feature's bounding box. Each raster
     // is read on a grid of its own, which no one set of sample points stands for, so the
     // numbers come from pgSTAC's list unless the request asks for the lean one.
@@ -4408,18 +4313,8 @@ async fn feature_statistics(
     let mut scenes: Vec<(String, Vec<String>)> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
     let assets = &req.query.assets;
     for item in items.iter().take(MAX_SCENES_PER_TILE) {
-        let mut hrefs = Vec::with_capacity(assets.len());
-        for asset in assets {
-            match item.asset_href(&asset.name) {
-                Some(href) => hrefs.push(href.to_string()),
-                None => return Err(unknown_asset(&asset.name, item)),
-            }
-        }
-        let name = match &item.collection {
-            Some(c) => format!("{c}/{}", item.id),
-            None => item.id.clone(),
-        };
-        scenes.push((name, hrefs));
+        let hrefs = asset_hrefs(item, assets.iter().map(|asset| asset.name.as_str()))?;
+        scenes.push((item_name(item), hrefs));
     }
 
     let engine = ctx.engine;
@@ -4482,7 +4377,7 @@ async fn feature_statistics(
                     warp_nearest(engine, cog, &crs, own_bounds, mercator, size, native, path, req.unscale, true, &[], false, req.nodata).await
                 } else {
                     let every: Vec<u16> = (1..=cog.index.full_res().samples_per_pixel).collect();
-                    resampled_planes(engine, cog, own_bounds, mercator, size, &every, resample, req.unscale, req.nodata)
+                    resampled_planes(engine, cog, own_bounds, mercator, size, &every, None, resample, req.unscale, req.nodata)
                         .await
                         .map(|planes| in_raster_type(planes, cog.index.full_res().sample_type, req.unscale))
                 };
@@ -4632,27 +4527,7 @@ async fn feature_statistics(
         }
 
         // The polygon on the image's grid: once for the mask, once finer for the coverage.
-        let (sx, sy) = (
-            width as f64 / (bounds[2] - bounds[0]),
-            height as f64 / (bounds[3] - bounds[1]),
-        );
-        let rings: Vec<Vec<zonal::Ring>> = mask
-            .polygons
-            .iter()
-            .map(|polygon| {
-                polygon
-                    .iter()
-                    .map(|ring| {
-                        ring.iter()
-                            .map(|&(lon, lat)| {
-                                let (across, up) = if mercator { lonlat_deg_to_mercator(lon, lat) } else { (lon, lat) };
-                                ((across - bounds[0]) * sx, (bounds[3] - up) * sy)
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
+        let rings = rings_on_grid(&mask, bounds, (width, height), mercator);
         let (opts, cover_scale) = (req.opts.clone(), req.cover_scale);
         let stats = engine
             .store
@@ -4709,19 +4584,13 @@ async fn mosaic_statistics(
         Ok(q) => q,
         Err(r) => return r,
     };
-    if let Err(r) = check_coord_crs(pairs) {
+    if let Err(r) = check_coord_crs(&pq, pairs) {
         return r;
     }
     // The pixels counted are those of a grid in `dst_crs`: degrees, or Web Mercator metres.
-    let mercator = match query_value(pairs, "dst_crs").map(|dst| (dst, super::parse_coord_crs_with_epsg(dst))) {
-        None | Some((_, Ok((_, 4326)))) => false,
-        Some((_, Ok((_, 3857)))) => true,
-        Some((dst, _)) => {
-            return detail(
-                StatusCode::BAD_REQUEST,
-                format!("dst_crs '{dst}' is not supported on pgSTAC mosaic routes (use epsg:4326 or epsg:3857)"),
-            );
-        }
+    let mercator = match drawn_in_mercator(pairs, false) {
+        Ok(mercator) => mercator,
+        Err(r) => return r,
     };
     if query_value(pairs, "algorithm").is_some() {
         return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet");
@@ -4861,7 +4730,7 @@ async fn point_values(
     let (lon, lat) = if pq.coord_crs_3857 {
         mercator_to_lonlat_deg(x, y)
     } else {
-        if let Err(r) = check_coord_crs(pairs) {
+        if let Err(r) = check_coord_crs(&pq, pairs) {
             return r;
         }
         (x, y)
@@ -4890,18 +4759,11 @@ async fn point_values(
     // Resolve every asset before reading anything, so a bad name fails the request at once.
     let mut jobs: Vec<(String, Vec<(AssetSpec, String)>)> = Vec::with_capacity(items.len());
     for item in items.iter() {
-        let mut hrefs = Vec::with_capacity(specs.len());
-        for spec in &specs {
-            match item.asset_href(&spec.name) {
-                Some(href) => hrefs.push((spec.clone(), href.to_string())),
-                None => return unknown_asset(&spec.name, item),
-            }
-        }
-        let name = match &item.collection {
-            Some(c) => format!("{c}/{}", item.id),
-            None => item.id.clone(),
+        let hrefs = match asset_hrefs(item, specs.iter().map(|spec| spec.name.as_str())) {
+            Ok(hrefs) => specs.iter().cloned().zip(hrefs).collect(),
+            Err(resp) => return resp,
         };
-        jobs.push((name, hrefs));
+        jobs.push((item_name(item), hrefs));
     }
 
     let gate = Arc::new(tokio::sync::Semaphore::new(POINT_ITEMS_IN_FLIGHT));
@@ -5061,17 +4923,12 @@ async fn tile(
         return no_content();
     }
 
-    let mut scenes: Vec<Vec<String>> = Vec::with_capacity(items.len().min(MAX_SCENES_PER_TILE));
-    for item in items.iter().take(MAX_SCENES_PER_TILE) {
-        let mut hrefs = Vec::with_capacity(names.len());
-        for asset in &names {
-            match item.asset_href(asset) {
-                Some(href) => hrefs.push(href.to_string()),
-                None => return unknown_asset(asset, item),
-            }
-        }
-        scenes.push(hrefs);
-    }
+    let scenes: Result<Vec<Vec<String>>, Resp> =
+        items.iter().take(MAX_SCENES_PER_TILE).map(|item| asset_hrefs(item, names.iter().map(String::as_str))).collect();
+    let scenes = match scenes {
+        Ok(scenes) => scenes,
+        Err(resp) => return resp,
+    };
 
     // An explicit extension, then `format=`, then TiTiler's rule: JPEG when every pixel is
     // valid and PNG when some are not.
@@ -5344,7 +5201,7 @@ async fn tile(
                 let paint = Paint::of(&treq.bands).ok_or_else(|| EngineError::BadRequest("not a band of values".into()))?;
                 treq.format = OutputFormat::RawF32;
                 let raw = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
-                let values: Vec<f32> = raw.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect();
+                let values = f32s(&raw);
                 if values.len() == dim * dim {
                     paint.rgba(&Selected { bands: 1, values }, dim * dim)
                 } else {
@@ -6426,13 +6283,11 @@ pub(super) async fn item_route(
     // A tile that does not touch the item is a 404, as in rio-tiler's `tile_exists`.
     if let (["tiles", "WebMercatorQuad", zs, xs, ys], Some(m)) =
         (rest, extent.as_ref().and_then(|e| e.mercator))
-        && let (Ok(z), Ok(x), Some((y, _, _))) =
-            (zs.parse::<u8>(), xs.parse::<u32>(), parse_y_scale_ext(ys))
-        && z <= 30
-        && u64::from(x) < (1u64 << z)
-        && u64::from(y) < (1u64 << z)
+        && let Some((y, _, _)) = parse_y_scale_ext(ys)
+        && let Ok(Some(tile)) = parse_zxy(zs, xs, y)
     {
-        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(TileCoord { z, x, y });
+        let TileCoord { z, x, y } = tile;
+        let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
         let touches = min_x < m[2] && max_x > m[0] && max_y > m[1] && min_y < m[3];
         if !touches {
             return Done(detail(
@@ -6623,7 +6478,7 @@ fn item_path_error(method: &Method, rest: &[&str], pq: &ParsedQuery, pairs: &[(S
         return Some(method_not_allowed(Some(if get { Method::GET } else { Method::POST })));
     }
     let unknown_tms = |tms: &str| {
-        (!TITILER_TMS.contains(&tms) && crate::tms::lookup_tms(tms).is_none())
+        crate::tms::lookup_tms(tms).is_none()
             .then(|| invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet"))
     };
     let of_path = match rest {
@@ -6862,10 +6717,7 @@ async fn mosaic_route(
                 (Err(r), _) | (_, Err(r)) => return r,
                 (Ok(corners), Ok(l)) => (corners, l),
             };
-            let polygon = json!({
-                "type": "Polygon",
-                "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]]
-            });
+            let polygon = bbox_polygon([w, s, e, n]);
             // A size matters only to the lean lookup, and this route has no size of its own:
             // without a usable one the box is sampled as a 1024-pixel picture would be.
             let size = match part_size_from_query(pairs) {
