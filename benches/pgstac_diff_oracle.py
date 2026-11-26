@@ -606,6 +606,8 @@ def main() -> int:
         o.check("tilesize=128", "image", f"{base12}.png?assets=visual&tilesize=128")
         # A buffered tile: more pixels on every side, from the items of the tile itself.
         o.check("buffer=10", "image", f"{base12}.png?assets=visual&buffer=10")
+        o.check("a range given upside down", "image", f"{base12}.png?assets=red&rescale=3000,0",
+                known="on purpose: numpy's clip with its bounds crossed answers the upper one, so TiTiler paints every pixel 255; cogzilla inverts the ramp")
         o.check("buffer=0.5, one band", "image", f"{base12}.png?assets=red&rescale=0,3000&buffer=0.5")
         o.check("buffer=64 at a low zoom", "image", f"/searches/{sid}/tiles/WebMercatorQuad/8/134/91.png?assets=visual&buffer=64")
         o.check("tilesize=300, one band", "image", f"{base12}.png?assets=red&rescale=0,3000&tilesize=300")
