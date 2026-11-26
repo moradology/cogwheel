@@ -2614,8 +2614,8 @@ fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> + Clone, rea
 
 /// A NumPy array of `bands` planes of `width` by `height`, as TiTiler writes one: in the
 /// type `kind`, a value that is not there as `absent` (the no-data value the request
-/// named) or zero, and after the bands, with `mask`, one
-/// more that holds the type's largest number where any band has a value and zero elsewhere.
+/// named) or zero, and after the bands, with `mask`, one more that holds the type's
+/// largest number where any band has a value and its smallest elsewhere.
 fn npy_array(
     values: &[f32],
     bands: usize,
@@ -7862,8 +7862,9 @@ mod tests {
         // Without the mask, and a missing value as the number the request named.
         let bare = npy_array(&values, 2, 2, 1, SampleType::Uint8, false, Some(9.0));
         assert_eq!(&bare[bare.len() - 4..], [1, 9, 255, 4]);
+        // Where there is nothing, the mask holds the type's smallest number, as rio-tiler's.
         let doubles = npy_array(&[f32::NAN, 0.5], 1, 2, 1, SampleType::Float64, true, None);
-        assert_eq!(&doubles[doubles.len() - 16..doubles.len() - 8], 0f64.to_le_bytes());
+        assert_eq!(&doubles[doubles.len() - 16..doubles.len() - 8], f64::MIN.to_le_bytes());
         assert_eq!(&doubles[doubles.len() - 8..], f64::MAX.to_le_bytes());
     }
 
