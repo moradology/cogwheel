@@ -149,6 +149,7 @@ pub struct GpuExprRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     expr_rgba8_pipeline: wgpu::ComputePipeline,
     expr_indexed_pipeline: wgpu::ComputePipeline,
+    expr_f32_pipeline: wgpu::ComputePipeline,
     rgb_formula_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     instr_buf: wgpu::Buffer,
@@ -272,6 +273,14 @@ impl GpuExprRenderer {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let expr_f32_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cogzilla-expr-f32"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("expr_eval_f32"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let rgb_formula_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("cogzilla-rgb-formula"),
@@ -314,6 +323,7 @@ impl GpuExprRenderer {
             bind_group_layout,
             expr_rgba8_pipeline,
             expr_indexed_pipeline,
+            expr_f32_pipeline,
             rgb_formula_pipeline,
             params_buf,
             instr_buf,
@@ -550,6 +560,92 @@ impl GpuExprRenderer {
             ),
         };
         self.dispatch_and_readback(slab, pipeline, wg_x, wg_y, dst_w, dst_h, words_per_row, output)
+    }
+
+    /// Evaluate a bytecode expression with an arbitrary `GpuCoordPlan` directly to raw
+    /// little-endian `f32` bytes (`dst_w * dst_h * 4` bytes, for `.npy`, `.tif`, `.f32`, and mosaics).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_expr_f32_with_plan(
+        &mut self,
+        slab: &GpuMultiBandSlab,
+        plan: GpuCoordPlan<'_>,
+        resample: GpuColormapMode,
+        instrs: &[GpuInstr],
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D {
+                    u_coords: u,
+                    v_coords: v,
+                } => (u.len(), v.len(), 0, u, v),
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v slice lengths must equal dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
+        if dst_w == 0 || dst_h == 0 || instrs.is_empty() || instrs.len() > 256 {
+            return Err(GpuError::InvalidDimensions(
+                "invalid expr dimensions or instruction count".into(),
+            ));
+        }
+
+        let out_words = dst_w * dst_h;
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
+
+        let resample_mode = match resample {
+            GpuColormapMode::Bilinear => 0u32,
+            GpuColormapMode::Cubic => 1u32,
+            GpuColormapMode::Lanczos3 => 2u32,
+        };
+        let params = ExprParams {
+            src_w: slab.width,
+            src_h: slab.height,
+            src_stride: slab.stride,
+            band_stride: slab.band_stride,
+            dst_w: dst_w as u32,
+            dst_h: dst_h as u32,
+            num_bands: slab.num_bands,
+            num_instrs: instrs.len() as u32,
+            resample_mode,
+            formula_flags: 0,
+            coord_mode,
+            _pad1: 0,
+            rescale_min: 0.0,
+            inv_range_255: 1.0,
+            inv_range_254: 1.0,
+            saturation: 1.0,
+            rgb_min: [0.0; 4],
+            rgb_inv_255: [1.0; 4],
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
+        self.queue
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
+        self.queue
+            .write_buffer(&self.instr_buf, 0, bytemuck::cast_slice(instrs));
+
+        self.dispatch_and_readback(
+            slab,
+            &self.expr_f32_pipeline,
+            (dst_w as u32).div_ceil(16),
+            (dst_h as u32).div_ceil(16),
+            dst_w,
+            dst_h,
+            dst_w,
+            GpuPixelOutput::Rgba8,
+        )
     }
 
     /// Fused 3-band RGB resample -> per-channel rescale -> `GpuColorFormula` (Gamma/Sigmoidal LUT + LCH Saturation) -> `RGBA8`.

@@ -416,6 +416,18 @@ fn expr_eval_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(16, 16, 1)
+fn expr_eval_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.dst_w || py >= params.dst_h) {
+        return;
+    }
+    let uv = eval_uv(px, py);
+    let val = eval_expr_vm(uv.x, uv.y);
+    dst_words[py * params.dst_w + px] = bitcast<u32>(val);
+}
+
+@compute @workgroup_size(16, 16, 1)
 fn expr_eval_indexed_u8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let word_x = gid.x;
     let py = gid.y;
