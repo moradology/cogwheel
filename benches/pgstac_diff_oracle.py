@@ -527,6 +527,21 @@ def main() -> int:
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.npy?assets=red&resampling=bilinear&reproject=bilinear&nodata=400")
         o.check("bbox, average, a nodata of the request's own", "image",
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.npy?assets=red&resampling=nearest&reproject=average&nodata=0")
+        # Paths that do not fit: a 422 where a value cannot be read, and a zero side is worked out.
+        for name, path in (
+            ("point that is not numbers", f"/searches/{sid}/point/abc,1?assets=red"),
+            ("point of three numbers", f"/searches/{sid}/point/8.85,45.55,1?assets=red"),
+            ("items at a point that is not numbers", f"/searches/{sid}/point/abc,1/assets"),
+            ("bbox in a format nobody has", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0.xyz?assets=red"),
+            ("bbox of a size nobody has, in a format nobody has", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x64.xyz?assets=red"),
+            ("bbox of a size that is not numbers", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/axb.png?assets=red"),
+            ("tile in a format nobody has", f"{base12}.xyz?assets=red"),
+            ("tile at a zoom that is not a number", f"/searches/{sid}/tiles/WebMercatorQuad/abc/1/1.png?assets=red"),
+            ("tile at a row that is not a number", f"/searches/{sid}/tiles/WebMercatorQuad/1/1/abc.png?assets=red"),
+        ):
+            o.check(name, "status", path)
+        o.check("bbox, a width of zero is worked out", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/0x64.png?assets=red&rescale=0,3000")
+        o.check("bbox, a height of zero is worked out", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/64x0.npy?assets=red")
         o.check("bbox, tif of one band", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.tif?assets=red")
         o.check("bbox in metres, tif of one band", "image", f"/searches/{sid}/bbox/912000,5700000,990000,5780000/64x64.tif?assets=red&coord_crs=epsg:3857")
         o.check("webp", "image", f"{base12}.webp?assets=visual")
