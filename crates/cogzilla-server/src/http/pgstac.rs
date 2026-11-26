@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use super::{
     ParsedQuery, apply_unscale_cogs, build_band_request, build_tile_request, parse_bbox4,
-    parse_ext_format, parse_wxh_ext, parse_y_scale_ext, percent_decode, read_limited_body,
+    parse_ext_format, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
 use super::pixel_selection::{Fold, Selected, Selection};
@@ -3018,9 +3018,9 @@ fn renderer_assets(pq: &mut ParsedQuery, query: &MosaicQuery) -> Result<Vec<Stri
 /// `Ok(None)` is a tile past the edge of the grid. That is not an error in
 /// titiler-pgstac: no item covers it, so the answer is empty.
 fn parse_zxy(zs: &str, xs: &str, y: u32) -> Result<Option<TileCoord>, Resp> {
-    let bad = || detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
-    let z = zs.parse::<u32>().map_err(|_| bad())?;
-    let x = xs.parse::<u32>().map_err(|_| bad())?;
+    let bad = |name: &str| invalid_param("path", name, "Input should be a valid integer");
+    let z = zs.parse::<u32>().map_err(|_| bad("z"))?;
+    let x = xs.parse::<u32>().map_err(|_| bad("x"))?;
     if z > 30 || (x as u64) >= (1u64 << z) || (y as u64) >= (1u64 << z) {
         return Ok(None);
     }
@@ -3057,6 +3057,48 @@ fn unknown_asset(asset: &str, item: &MosaicItem) -> Resp {
 
 /// The largest side of a `bbox` or `feature` image.
 const MAX_PART_SIDE: u32 = 4096;
+
+/// The `{lon},{lat}` of a path. Without a comma it is no such path; with one, what is
+/// not two numbers is a 422, as in TiTiler.
+fn point_coords(seg: &str) -> Result<(f64, f64), Resp> {
+    let (x, y) = seg.split_once(',').ok_or_else(|| detail(StatusCode::NOT_FOUND, "Not Found"))?;
+    match (x.parse::<f64>(), y.parse::<f64>()) {
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Ok((x, y)),
+        _ => Err(invalid_param("path", "lon,lat", "Input should be two numbers, as lon,lat")),
+    }
+}
+
+/// The `{width}x{height}[.{format}]` of a path. A zero is a side left to follow the other,
+/// or the data's own resolution when both are, as TiTiler has it.
+fn path_size(dims: &str) -> Result<(PartSize, Option<&str>), Resp> {
+    let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
+    let (sides, ext) = match dims.split_once('.') {
+        Some((sides, ext)) => (sides, Some(ext)),
+        None => (dims, None),
+    };
+    let (w, h) = sides.split_once('x').ok_or_else(not_found)?;
+    let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) else {
+        return Err(invalid_param("path", "width", "Input should be a valid integer"));
+    };
+    if w > 4096 || h > 4096 {
+        return Err(not_found());
+    }
+    let size = match (w, h) {
+        (0, 0) => PartSize::Query { max_size: None, width: None, height: None },
+        (w, 0) => PartSize::Query { max_size: None, width: Some(w), height: None },
+        (0, h) => PartSize::Query { max_size: None, width: None, height: Some(h) },
+        (w, h) => PartSize::Exact(w, h),
+    };
+    Ok((size, ext))
+}
+
+/// The answer to a format these routes have no name for: a 422, as FastAPI gives for a
+/// path that does not fit.
+fn format_error(ext: Option<&str>) -> Option<Resp> {
+    let known = |e: &str| matches!(e, "png" | "npy" | "tif" | "tiff" | "jpeg" | "jpg" | "jp2" | "webp" | "pngraw" | "bin" | "raw" | "f32");
+    ext.filter(|e| !e.is_empty() && !known(e))
+        .map(|_| invalid_param("path", "format", "Input should be 'png', 'npy', 'tif', 'tiff', 'jpeg', 'jpg', 'jp2', 'webp' or 'pngraw'"))
+}
 
 /// The size asked for a `bbox` or `feature` image.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3157,6 +3199,9 @@ async fn part_image_of(
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
+    if let Some(resp) = format_error(ext) {
+        return resp;
+    }
     // A GeoTIFF is the array with a place on the ground: made as the array, wrapped at the end.
     // (With `algorithm` no array is written on these routes yet: there it stays the picture.)
     let tiff = matches!(ext.or(pq.format_param.as_deref()), Some("tif" | "tiff")) && pq.algorithm.is_none();
@@ -3569,9 +3614,9 @@ async fn feature_image(
     let (size, ext) = match rest {
         ["feature"] => (part_size_from_query(pairs), None),
         [one] => (part_size_from_query(pairs), one.strip_prefix("feature.")),
-        ["feature", dims] => match parse_wxh_ext(dims).ok() {
-            Some((w, h, ext)) if w > 0 && h > 0 => (Ok(PartSize::Exact(w, h)), ext),
-            _ => return detail(StatusCode::NOT_FOUND, "Not Found"),
+        ["feature", dims] => match path_size(dims) {
+            Ok((size, ext)) => (Ok(size), ext),
+            Err(resp) => return resp,
         },
         _ => return detail(StatusCode::NOT_FOUND, "Not Found"),
     };
@@ -4674,12 +4719,9 @@ async fn point_values(
     pq: &ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
-    let xy = coord
-        .split_once(',')
-        .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)))
-        .filter(|(x, y)| x.is_finite() && y.is_finite());
-    let Some((x, y)) = xy else {
-        return detail(StatusCode::NOT_FOUND, "Not Found");
+    let (x, y) = match point_coords(coord) {
+        Ok(xy) => xy,
+        Err(resp) => return resp,
     };
     if pq.assets.is_empty() {
         return missing_query_param("assets");
@@ -6553,12 +6595,13 @@ async fn mosaic_route(
         ["tiles", _, _, _, _] if tile_bounds_error(pairs).is_some() => tile_bounds_error(pairs).unwrap_or_else(not_found),
         ["tiles", _, zs, xs, ys] => {
             let Some((y, scale, ext)) = parse_y_scale_ext(ys) else {
-                return detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate");
+                return invalid_param("path", "y", "Input should be a valid integer");
             };
             // Without an extension the format is chosen from the rendered pixels.
             let ext = if ys.contains('.') { ext.unwrap_or("") } else { "" };
             match parse_zxy(zs, xs, y) {
                 Err(r) => r,
+                Ok(_) if format_error(Some(ext)).is_some() => format_error(Some(ext)).unwrap_or_else(not_found),
                 Ok(None) if pq.assets.is_empty() => missing_query_param("assets"),
                 Ok(None) => no_content(),
                 Ok(Some(coord)) => tile(ctx, pg, &rec.hash, coord, scale, ext, pq, pairs).await,
@@ -6570,7 +6613,11 @@ async fn mosaic_route(
         ["bbox", seg] => {
             // The format is part of the path here: `{minx},{miny},{maxx},{maxy}.{format}`.
             let Some((bbox, ext)) = parse_bbox4(seg) else {
-                return not_found();
+                // Four numbers and a format nobody has is the format's fault.
+                return match seg.rsplit_once('.') {
+                    Some((numbers, ext)) if parse_bbox4(numbers).is_some() => format_error(Some(ext)).unwrap_or_else(not_found),
+                    _ => not_found(),
+                };
             };
             let Some(ext) = ext else {
                 return invalid_param(
@@ -6610,26 +6657,23 @@ async fn mosaic_route(
             geometry_assets(pg, &rec.hash, polygon, limits, pairs, part_grid(size, [w, s, e, n])).await
         }
         ["bbox", seg, dims] => {
-            let (Some((bbox, None)), Some((w, h, ext))) = (parse_bbox4(seg), parse_wxh_ext(dims).ok())
-            else {
+            let Some((bbox, None)) = parse_bbox4(seg) else {
                 return not_found();
             };
-            if w == 0 || h == 0 {
-                return not_found();
-            }
+            let (size, ext) = match path_size(dims) {
+                Ok(parsed) => parsed,
+                Err(resp) => return resp,
+            };
             let polygon = bbox_polygon(bbox);
-            part_image(ctx, pg, &rec.hash, &polygon, bbox, None, PartSize::Exact(w, h), ext, pq, pairs)
+            part_image(ctx, pg, &rec.hash, &polygon, bbox, None, size, ext, pq, pairs)
                 .await
         }
         ["statistics"] => mosaic_statistics(ctx, pg, &rec.hash, body, pq, pairs).await,
         ["point", lonlat] => point_values(ctx, pg, &rec.hash, lonlat, &pq, pairs).await,
         ["point", lonlat, "assets"] => {
-            let coords = lonlat
-                .split_once(',')
-                .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)))
-                .filter(|(x, y)| x.is_finite() && y.is_finite());
-            let Some((lon, lat)) = coords else {
-                return not_found();
+            let (lon, lat) = match point_coords(lonlat) {
+                Ok(at) => at,
+                Err(resp) => return resp,
             };
             let ((lon, lat), mut limits) = match (in_degrees(&pq, pairs, lon, lat), parse_limits(pairs)) {
                 (Err(r), _) | (_, Err(r)) => return r,
@@ -7770,7 +7814,7 @@ mod tests {
         assert!(parse_zxy("3", "7", 7).unwrap().is_some());
         assert!(parse_zxy("3", "8", 0).unwrap().is_none());
         assert!(parse_zxy("31", "0", 0).unwrap().is_none());
-        assert_eq!(parse_zxy("x", "0", 0).unwrap_err().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(parse_zxy("x", "0", 0).unwrap_err().status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
     #[test]
     fn bounds_are_written_as_python_writes_floats() {

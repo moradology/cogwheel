@@ -4877,6 +4877,8 @@ where
     if method == Method::POST && path == "/admin/clear-cache" {
         engine.store.cache.clear();
         engine.tile_cache.clear();
+        engine.stac_cache.clear();
+        engine.mosaicjson_cache.clear();
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"cleared"), "text/plain"));
     }
 
@@ -5544,9 +5546,18 @@ where
                 };
                 let urls = mj.query_bbox_3857(mx, my, mx, my);
                 let mut assets_out = Vec::new();
+                let mut opened_any = false;
+                let mut last_open_err: Option<EngineError> = None;
                 for asset_url in urls.into_iter().take(16) {
-                    let Ok(cog) = engine.store.open_uri(&asset_url).await else {
-                        continue;
+                    let cog = match engine.store.open_uri(&asset_url).await {
+                        Ok(c) => {
+                            opened_any = true;
+                            c
+                        }
+                        Err(e) => {
+                            last_open_err = Some(crate::engine::asset_fetch_error(&asset_url, e));
+                            continue;
+                        }
                     };
                     match query_point(&engine, &cog, lon, lat, pq.unscale, pq.nodata).await {
                         Ok(mut pt) => {
@@ -5569,6 +5580,11 @@ where
                     }
                 }
                 if assets_out.is_empty() {
+                    if !opened_any
+                        && let Some(err) = last_open_err
+                    {
+                        return Err(err);
+                    }
                     return Err(EngineError::NotFound(format!(
                         "No asset covers point ({lon}, {lat})"
                     )));
@@ -8537,6 +8553,11 @@ where
             (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
                 let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
+                if let Err(e) = engine.store.ensure_uris_fresh(&pq.urls).await {
+                    engine.sync_tile_cache_epoch();
+                    return Ok(error_to_http_response(&EngineError::Io(e)));
+                }
+                engine.sync_tile_cache_epoch();
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || async {
@@ -9221,6 +9242,11 @@ where
                         && full.pixel_to_crs.a > 0.0
                         && full.pixel_to_crs.e < 0.0;
                     if !is_georef {
+                        if ct == GEOTIFF_CONTENT_TYPE {
+                            return Err(EngineError::BadRequest(
+                                "GeoTIFF output requires a georeferenced dataset; use .png, .jpg, .webp, or .npy".into(),
+                            ));
+                        }
                         let d = render_native_preview(
                             &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
                             pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,
@@ -9308,6 +9334,11 @@ where
                         && full.pixel_to_crs.a > 0.0
                         && full.pixel_to_crs.e < 0.0;
                     if !is_georef {
+                        if ct == GEOTIFF_CONTENT_TYPE {
+                            return Err(EngineError::BadRequest(
+                                "GeoTIFF output requires a georeferenced dataset; use .png, .jpg, .webp, or .npy".into(),
+                            ));
+                        }
                         let d = render_native_preview(
                             &engine, &cogs, bbox, out_w, out_h, &bands, pq.resample, fmt,
                             pq.nodata, custom_lut.as_ref(), cf.as_ref(), pq.return_mask, pq.unscale,

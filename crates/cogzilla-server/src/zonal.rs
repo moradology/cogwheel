@@ -1405,7 +1405,7 @@ pub async fn compute_native_exact_polygon_stats(
             } else {
                 crs.from_lonlat_deg(adj_lon, lat)
             };
-            let (c, r) = c2p.forward(sx, sy);
+            let (c, r) = ifd.crs_to_pixel_pt(sx, sy);
             if c.is_finite() && r.is_finite() {
                 min_c = min_c.min(c);
                 max_c = max_c.max(c + 1.0);

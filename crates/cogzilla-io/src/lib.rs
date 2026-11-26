@@ -7,7 +7,9 @@ pub mod limiter;
 pub mod s3;
 pub mod store;
 
-pub use allowlist::{ALLOWED_URL_PREFIXES_ENV, allowlist_enabled, check_uri_allowed};
+pub use allowlist::{
+    ALLOWED_URL_PREFIXES_ENV, ALLOWLIST_RESOLVE_SYMLINKS_ENV, allowlist_enabled, check_uri_allowed,
+};
 pub use backend::{
     CogSource, IoError, IoMetrics, RangeResponse, RemoteValidator, TileByteReq, coalesce_ranges,
     redact_http_url,

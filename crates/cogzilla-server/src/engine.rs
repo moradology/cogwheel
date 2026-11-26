@@ -183,7 +183,10 @@ pub struct EngineStats {
 /// and `400 Bad Request` for invalid URIs / corrupt TIFFs).
 pub fn asset_fetch_error(asset_uri: &str, err: IoError) -> EngineError {
     match err.root() {
-        IoError::Forbidden(_) | IoError::InvalidUri(_) | IoError::Tiff(_) => EngineError::Io(err),
+        IoError::Forbidden(_)
+        | IoError::InvalidUri(_)
+        | IoError::Tiff(_)
+        | IoError::SourceChanged { .. } => EngineError::Io(err),
         _ => {
             let safe = cogzilla_io::redact_http_url(asset_uri);
             EngineError::BadGateway(format!(
