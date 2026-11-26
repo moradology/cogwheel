@@ -47,17 +47,61 @@ struct MosaicParams {
     plane_stride: u32,
     num_scenes: u32,
     method: u32,
-    _pad0: u32,
+    band_stride: u32,
     _pad1: u32,
     _pad2: u32,
     rescale_min: f32,
     inv_range_255: f32,
     inv_range_254: f32,
     _pad3: f32,
+    rescale_min_g: f32,
+    inv_range_255_g: f32,
+    rescale_min_b: f32,
+    inv_range_255_b: f32,
+}
+
+impl MosaicParams {
+    fn rgb(
+        width: u32,
+        height: u32,
+        plane_stride: u32,
+        num_scenes: u32,
+        method: GpuPixelSelection,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+    ) -> Self {
+        let safe_inv = |lo: f32, hi: f32| {
+            let r = hi - lo;
+            let safe = if r.is_finite() && r.abs() > 1e-20 {
+                r
+            } else {
+                1.0
+            };
+            255.0 / safe
+        };
+        Self {
+            width,
+            height,
+            plane_stride,
+            num_scenes,
+            method: method.as_u32(),
+            band_stride: plane_stride * num_scenes,
+            _pad1: 0,
+            _pad2: 0,
+            rescale_min: rescale_min[0],
+            inv_range_255: safe_inv(rescale_min[0], rescale_max[0]),
+            inv_range_254: 1.0,
+            _pad3: 0.0,
+            rescale_min_g: rescale_min[1],
+            inv_range_255_g: safe_inv(rescale_min[1], rescale_max[1]),
+            rescale_min_b: rescale_min[2],
+            inv_range_255_b: safe_inv(rescale_min[2], rescale_max[2]),
+        }
+    }
 }
 
 /// GPU multi-scene mosaic compositor and pixel-selection reducer
-/// (`First`, `Highest`, `Lowest`, `Mean`, `Median`, `Stdev`, `Count`) with fused colormap output.
+/// (`First`, `Highest`, `Lowest`, `Mean`, `Median`, `Stdev`, `Count`) with fused colormap/RGB output.
 pub struct GpuMosaicCompositor {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -65,10 +109,12 @@ pub struct GpuMosaicCompositor {
     f32_pipeline: wgpu::ComputePipeline,
     rgba8_pipeline: wgpu::ComputePipeline,
     indexed_pipeline: wgpu::ComputePipeline,
+    rgb_rgba8_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
     scene_buf: wgpu::Buffer,
     scene_bytes_cap: usize,
+    max_scene_bytes: u64,
     min_storage_align: u64,
     out_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
@@ -161,6 +207,14 @@ impl GpuMosaicCompositor {
             compilation_options: Default::default(),
             cache: None,
         });
+        let rgb_rgba8_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cogzilla-mosaic-rgb-rgba8"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("mosaic_select_rgb_rgba8"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-mosaic-params"),
@@ -179,10 +233,10 @@ impl GpuMosaicCompositor {
         let (out_buf, staging_buf) = Self::alloc_out_pair(&device, init_words);
         let init_scene_bytes = 512 * 512 * 4 * 4;
         let scene_buf = Self::alloc_scene_buf(&device, init_scene_bytes);
-        let min_storage_align = device
-            .limits()
-            .min_storage_buffer_offset_alignment
-            .max(256) as u64;
+        let limits = device.limits();
+        let min_storage_align = limits.min_storage_buffer_offset_alignment.max(256) as u64;
+        let max_scene_bytes = (limits.max_storage_buffer_binding_size as u64)
+            .min(limits.max_buffer_size);
 
         Self {
             device,
@@ -191,10 +245,12 @@ impl GpuMosaicCompositor {
             f32_pipeline,
             rgba8_pipeline,
             indexed_pipeline,
+            rgb_rgba8_pipeline,
             params_buf,
             lut_buf,
             scene_buf,
             scene_bytes_cap: init_scene_bytes,
+            max_scene_bytes,
             min_storage_align,
             out_buf,
             staging_buf,
@@ -275,6 +331,12 @@ impl GpuMosaicCompositor {
         let total_bytes = plane_bytes
             .checked_mul(planes.len())
             .ok_or_else(|| GpuError::InvalidDimensions("total_bytes overflow".into()))?;
+        if (total_bytes as u64) > self.max_scene_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "scene stack {total_bytes} B exceeds adapter limit {} B",
+                self.max_scene_bytes
+            )));
+        }
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-scene-stack"),
             size: total_bytes as u64,
@@ -335,13 +397,17 @@ impl GpuMosaicCompositor {
             plane_stride: stack.plane_stride,
             num_scenes: stack.num_scenes,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min: 0.0,
             inv_range_255: 1.0,
             inv_range_254: 1.0,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -394,13 +460,17 @@ impl GpuMosaicCompositor {
             plane_stride: first.plane_stride,
             num_scenes: first.num_scenes,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min: 0.0,
             inv_range_255: 1.0,
             inv_range_254: 1.0,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -504,13 +574,17 @@ impl GpuMosaicCompositor {
             plane_stride: stack.plane_stride,
             num_scenes: stack.num_scenes,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min,
             inv_range_255: 255.0 / safe_range,
             inv_range_254: 254.0 / safe_range,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -594,6 +668,12 @@ impl GpuMosaicCompositor {
         let total_bytes = plane_bytes
             .checked_mul(planes.len())
             .ok_or_else(|| GpuError::InvalidDimensions("total_bytes overflow".into()))?;
+        if (total_bytes as u64) > self.max_scene_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "scene stack {total_bytes} B exceeds adapter limit {} B",
+                self.max_scene_bytes
+            )));
+        }
         self.ensure_scene_cap(total_bytes);
         for (i, p) in planes.iter().enumerate() {
             self.queue.write_buffer(
@@ -621,13 +701,17 @@ impl GpuMosaicCompositor {
             plane_stride: plane_stride as u32,
             num_scenes: planes.len() as u32,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min: 0.0,
             inv_range_255: 1.0,
             inv_range_254: 1.0,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -699,6 +783,12 @@ impl GpuMosaicCompositor {
         let total_scene_bytes = (aligned_band_stride as usize)
             .checked_mul(band_planes.len())
             .ok_or_else(|| GpuError::InvalidDimensions("batched scene bytes overflow".into()))?;
+        if (total_scene_bytes as u64) > self.max_scene_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "batched scene stack {total_scene_bytes} B exceeds adapter limit {} B",
+                self.max_scene_bytes
+            )));
+        }
         self.ensure_scene_cap(total_scene_bytes);
 
         for (b, planes) in band_planes.iter().enumerate() {
@@ -723,13 +813,17 @@ impl GpuMosaicCompositor {
             plane_stride: plane_stride as u32,
             num_scenes: num_scenes as u32,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min: 0.0,
             inv_range_255: 1.0,
             inv_range_254: 1.0,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -846,13 +940,17 @@ impl GpuMosaicCompositor {
             plane_stride: plane_stride as u32,
             num_scenes: planes.len() as u32,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min,
             inv_range_255: 255.0 / safe_range,
             inv_range_254: 254.0 / safe_range,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -923,13 +1021,17 @@ impl GpuMosaicCompositor {
             plane_stride: plane_stride as u32,
             num_scenes: planes.len() as u32,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min,
             inv_range_255: 255.0 / safe_range,
             inv_range_254: 254.0 / safe_range,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -988,6 +1090,190 @@ impl GpuMosaicCompositor {
         jpeg.readback_jpeg(jpeg_out_bytes, width, height, quality)
     }
 
+    fn write_rgb_scene_planes(
+        &mut self,
+        rgb_planes: &[&[&[f32]]; 3],
+        width: u32,
+        height: u32,
+    ) -> Result<(usize, usize, u64), GpuError> {
+        let num_scenes = rgb_planes[0].len();
+        if num_scenes == 0
+            || num_scenes > 32
+            || width == 0
+            || height == 0
+            || rgb_planes[1].len() != num_scenes
+            || rgb_planes[2].len() != num_scenes
+        {
+            return Err(GpuError::InvalidDimensions(format!(
+                "invalid RGB scene stack: scenes=[{},{},{}], {width}x{height}",
+                rgb_planes[0].len(),
+                rgb_planes[1].len(),
+                rgb_planes[2].len()
+            )));
+        }
+        let plane_stride = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(|| GpuError::InvalidDimensions("plane_stride overflow".into()))?;
+        for (c, planes) in rgb_planes.iter().enumerate() {
+            for (s, p) in planes.iter().enumerate() {
+                if p.len() < plane_stride {
+                    return Err(GpuError::InvalidDimensions(format!(
+                        "RGB band {c} scene {s} len {} < {plane_stride}",
+                        p.len()
+                    )));
+                }
+            }
+        }
+        let plane_bytes = plane_stride
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| GpuError::InvalidDimensions("plane_bytes overflow".into()))?;
+        let band_bytes = plane_bytes
+            .checked_mul(num_scenes)
+            .ok_or_else(|| GpuError::InvalidDimensions("band_bytes overflow".into()))?;
+        let total_bytes = band_bytes
+            .checked_mul(3)
+            .ok_or_else(|| GpuError::InvalidDimensions("total_bytes overflow".into()))?;
+        if (total_bytes as u64) > self.max_scene_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "RGB scene stack {total_bytes} B exceeds adapter limit {} B",
+                self.max_scene_bytes
+            )));
+        }
+        self.ensure_scene_cap(total_bytes);
+        for (c, planes) in rgb_planes.iter().enumerate() {
+            let band_base = (c * band_bytes) as u64;
+            for (s, p) in planes.iter().enumerate() {
+                self.queue.write_buffer(
+                    &self.scene_buf,
+                    band_base + (s * plane_bytes) as u64,
+                    bytemuck::cast_slice(&p[..plane_stride]),
+                );
+            }
+        }
+        Ok((plane_stride, num_scenes, total_bytes as u64))
+    }
+
+    /// 1-pass fused 3-band RGB multi-scene pixel selection + per-channel rescale -> RGBA8
+    /// directly via persistent `scene_buf` (3× smaller readback than 3×f32, zero CPU rescale).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_rgb_styled_direct(
+        &mut self,
+        rgb_planes: &[&[&[f32]]; 3],
+        width: u32,
+        height: u32,
+        method: GpuPixelSelection,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+    ) -> Result<Vec<u8>, GpuError> {
+        let (plane_stride, num_scenes, total_bytes) =
+            self.write_rgb_scene_planes(rgb_planes, width, height)?;
+        self.ensure_out_cap(plane_stride);
+        let params = MosaicParams::rgb(
+            width,
+            height,
+            plane_stride as u32,
+            num_scenes as u32,
+            method,
+            rescale_min,
+            rescale_max,
+        );
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.run_pipeline_binding(
+            wgpu::BufferBinding {
+                buffer: &self.scene_buf,
+                offset: 0,
+                size: std::num::NonZeroU64::new(total_bytes),
+            },
+            &self.rgb_rgba8_pipeline,
+            width.div_ceil(16),
+            height.div_ceil(16),
+            plane_stride * 4,
+        )
+    }
+
+    /// 1-pass fused 3-band RGB multi-scene pixel selection + per-channel rescale -> GPU JPEG
+    /// in **1 `CommandEncoder` → 1 `queue.submit()` → 1 `map_async()`** (zero f32 readback,
+    /// zero RGBA8 readback, zero CPU rescale, zero CPU JPEG encode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_rgb_styled_jpeg_direct(
+        &mut self,
+        rgb_planes: &[&[&[f32]]; 3],
+        width: u32,
+        height: u32,
+        method: GpuPixelSelection,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        jpeg: &mut crate::GpuJpegEncoder,
+        quality: u8,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (plane_stride, num_scenes, total_bytes) =
+            self.write_rgb_scene_planes(rgb_planes, width, height)?;
+        self.ensure_out_cap(plane_stride);
+        let params = MosaicParams::rgb(
+            width,
+            height,
+            plane_stride as u32,
+            num_scenes as u32,
+            method,
+            rescale_min,
+            rescale_max,
+        );
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cogzilla-mosaic-rgb-jpeg-direct-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.scene_buf,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(total_bytes),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cogzilla-mosaic-rgb-jpeg-direct-enc"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-mosaic-rgb-rgba8-direct-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.rgb_rgba8_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+        let jpeg_out_bytes = jpeg.record_encode_rgba8_from_buffer(
+            &mut encoder,
+            &self.out_buf,
+            width,
+            height,
+            quality,
+        )?;
+        self.queue.submit(Some(encoder.finish()));
+        jpeg.readback_jpeg(jpeg_out_bytes, width, height, quality)
+    }
+
     /// Reduce `stack` via `method` fused with rescale + colormap into `Rgba8` or `IndexedU8`.
     #[allow(clippy::too_many_arguments)]
     pub fn composite_styled(
@@ -1020,13 +1306,17 @@ impl GpuMosaicCompositor {
             plane_stride: stack.plane_stride,
             num_scenes: stack.num_scenes,
             method: method.as_u32(),
-            _pad0: 0,
+            band_stride: 0,
             _pad1: 0,
             _pad2: 0,
             rescale_min,
             inv_range_255: 255.0 / safe_range,
             inv_range_254: 254.0 / safe_range,
             _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -1334,6 +1624,104 @@ mod tests {
         assert_eq!(
             fused_jpg, ref_jpg,
             "1-pass fused Mosaic->GPU JPEG must be bit-exact vs 2-pass RGBA8->GPU JPEG"
+        );
+    }
+
+    #[test]
+    fn gpu_mosaic_rgb_rgba8_and_fused_jpeg_match_cpu() {
+        let ctx = match GpuContext::new_default() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping GPU RGB mosaic test (no adapter): {e}");
+                return;
+            }
+        };
+        let mut comp = GpuMosaicCompositor::new(&ctx);
+        let mut jpeg = crate::GpuJpegEncoder::new(&ctx);
+
+        let w = 256u32;
+        let h = 256u32;
+        let n = (w * h) as usize;
+        let num_scenes = 10usize;
+        let make_band = |seed: usize| -> Vec<Vec<f32>> {
+            (0..num_scenes)
+                .map(|s| {
+                    (0..n)
+                        .map(|i| {
+                            // Force some all-NaN pixels in band 0, 1, or 2 to test any-band-NaN masking
+                            if i == 17 + seed || (i + s * 41 + seed * 19) % 7 == 0 {
+                                f32::NAN
+                            } else {
+                                10.0 * (seed as f32) + ((i * 11 + s * 59 + seed * 37) % 300) as f32
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let r_band = make_band(0);
+        let g_band = make_band(1);
+        let b_band = make_band(2);
+        let r_refs: Vec<&[f32]> = r_band.iter().map(Vec::as_slice).collect();
+        let g_refs: Vec<&[f32]> = g_band.iter().map(Vec::as_slice).collect();
+        let b_refs: Vec<&[f32]> = b_band.iter().map(Vec::as_slice).collect();
+        let rgb_planes: [&[&[f32]]; 3] = [&r_refs, &g_refs, &b_refs];
+
+        let rmin = [0.0f32, 10.0, 20.0];
+        let rmax = [300.0f32, 310.0, 320.0];
+        let rgba = comp
+            .composite_rgb_styled_direct(&rgb_planes, w, h, GpuPixelSelection::Median, rmin, rmax)
+            .unwrap();
+        assert_eq!(rgba.len(), n * 4);
+
+        let inv = [
+            255.0 / (rmax[0] - rmin[0]),
+            255.0 / (rmax[1] - rmin[1]),
+            255.0 / (rmax[2] - rmin[2]),
+        ];
+        let mut mask_err = 0usize;
+        let mut max_diff = 0i32;
+        for i in 0..n {
+            let cr = cpu_select(&r_band, i, GpuPixelSelection::Median);
+            let cg = cpu_select(&g_band, i, GpuPixelSelection::Median);
+            let cb = cpu_select(&b_band, i, GpuPixelSelection::Median);
+            let off = i * 4;
+            if cr.is_finite() && cg.is_finite() && cb.is_finite() {
+                if rgba[off + 3] != 255 {
+                    mask_err += 1;
+                } else {
+                    let er = ((cr - rmin[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                    let eg = ((cg - rmin[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                    let eb = ((cb - rmin[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                    max_diff = max_diff
+                        .max((er as i32 - rgba[off] as i32).abs())
+                        .max((eg as i32 - rgba[off + 1] as i32).abs())
+                        .max((eb as i32 - rgba[off + 2] as i32).abs());
+                }
+            } else if rgba[off..off + 4] != [0, 0, 0, 0] {
+                mask_err += 1;
+            }
+        }
+        assert_eq!(mask_err, 0, "RGB mosaic nodata mask mismatch");
+        assert!(max_diff <= 1, "RGB mosaic max channel diff {max_diff} > 1");
+
+        let fused_jpg = comp
+            .composite_rgb_styled_jpeg_direct(
+                &rgb_planes,
+                w,
+                h,
+                GpuPixelSelection::Median,
+                rmin,
+                rmax,
+                &mut jpeg,
+                85,
+            )
+            .unwrap();
+        assert!(fused_jpg.starts_with(&[0xff, 0xd8]) && fused_jpg.ends_with(&[0xff, 0xd9]));
+        let ref_jpg = jpeg.encode_rgba8(&rgba, w, h, 85).unwrap();
+        assert_eq!(
+            fused_jpg, ref_jpg,
+            "1-pass fused RGB Mosaic->GPU JPEG must be bit-exact vs 2-pass RGBA8->GPU JPEG"
         );
     }
 }

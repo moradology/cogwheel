@@ -2487,6 +2487,109 @@ impl GpuBackend {
         })
     }
 
+    /// Attempt 1-pass fused GPU 3-band RGB multi-scene pixel selection + per-channel rescale
+    /// directly to JPEG (1-pass fused Mosaic → GPU JPEG FDCT with zero f32/RGBA8 readback and
+    /// zero CPU JPEG encode), PNG, WebP, or RawRgba (3× smaller readback than 3×f32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_composite_mosaic_rgb_styled(
+        &self,
+        width: u32,
+        height: u32,
+        rgb_planes: &[&[&[f32]]; 3],
+        method: GpuPixelSelection,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let num_scenes = rgb_planes[0].len();
+        if !(2..=32).contains(&num_scenes)
+            || rgb_planes[1].len() != num_scenes
+            || rgb_planes[2].len() != num_scenes
+            || width == 0
+            || height == 0
+        {
+            return None;
+        }
+        if !matches!(
+            format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) {
+            return None;
+        }
+        let pixels = (width as usize).checked_mul(height as usize)?;
+        let upload_bytes = 3usize
+            .saturating_mul(num_scenes)
+            .saturating_mul(pixels)
+            .saturating_mul(4);
+        let readback_bytes = match format {
+            OutputFormat::Jpeg { .. } => {
+                let mcu_w = (width as usize).div_ceil(16);
+                let mcu_h = (height as usize).div_ceil(16);
+                mcu_w.saturating_mul(mcu_h).saturating_mul(192 * 4)
+            }
+            _ => pixels.saturating_mul(4),
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op: Self::mosaic_policy_op(method, num_scenes),
+            dst_pixels: pixels.saturating_mul(3),
+            upload_bytes,
+            readback_bytes,
+            batch_size: 3,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let mut mosaic_guard = self.mosaic.lock().ok()?;
+        if let OutputFormat::Jpeg { quality } = format {
+            if let Ok(mut jpeg_guard) = self.jpeg.lock() {
+                if let Ok(jpg) = mosaic_guard.composite_rgb_styled_jpeg_direct(
+                    rgb_planes,
+                    width,
+                    height,
+                    method,
+                    rescale_min,
+                    rescale_max,
+                    &mut jpeg_guard,
+                    quality,
+                ) {
+                    return Some(Bytes::from(jpg));
+                }
+            }
+        }
+        let rgba = mosaic_guard
+            .composite_rgb_styled_direct(
+                rgb_planes,
+                width,
+                height,
+                method,
+                rescale_min,
+                rescale_max,
+            )
+            .ok()?;
+        drop(mosaic_guard);
+
+        Some(if format == OutputFormat::RawRgba {
+            Bytes::from(rgba)
+        } else {
+            crate::titiler::encode_rgba_output(
+                width as usize,
+                height as usize,
+                &rgba,
+                format,
+                return_mask,
+            )
+        })
+    }
+
     /// Attempt GPU-accelerated raw `f32` single-band resampling for `.npy`, `.tif`, `.f32`,
     /// and multi-scene mosaic scene fetches across `Separable`, `Grid2D`, and `Exact2D`.
     #[allow(clippy::too_many_arguments)]
@@ -3836,6 +3939,24 @@ mod tests {
                     );
                 }
             }
+        }
+
+        // 1-pass fused 3-band RGB Mosaic -> GPU JPEG & RawRgba
+        let rgb_planes: [&[&[f32]]; 3] = [&refs, &refs, &refs];
+        if let Some(rgb_jpg) = gpu.try_composite_mosaic_rgb_styled(
+            w,
+            h,
+            &rgb_planes,
+            GpuPixelSelection::Median,
+            [50.0, 50.0, 50.0],
+            [250.0, 250.0, 250.0],
+            OutputFormat::Jpeg { quality: 85 },
+            false,
+        ) {
+            assert!(
+                rgb_jpg.starts_with(&[0xff, 0xd8]) && rgb_jpg.ends_with(&[0xff, 0xd9]),
+                "fused RGB mosaic JPEG must be valid JFIF"
+            );
         }
     }
 
