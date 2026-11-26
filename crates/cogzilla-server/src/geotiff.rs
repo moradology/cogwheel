@@ -1,4 +1,315 @@
-//! GeoTIFF output.
+//! The one uncompressed Classic (little-endian) GeoTIFF writer behind every `.tif` response.
+//!
+//! [`write_geotiff`] owns the file layout: the TIFF header, a single IFD with its entries in
+//! ascending tag order, the out-of-line tag arrays, the georeferencing tail (`ModelPixelScale`,
+//! `ModelTiepoint`, `GeoKeyDirectory`, optional `GDAL_NODATA`) and one strip (chunky) or one strip
+//! per band (planar) of pixel bytes. Callers decide what the samples mean and produce them.
+
+use bytes::{BufMut, Bytes, BytesMut};
+
+/// Sample type of every band (`BitsPerSample` + `SampleFormat`). Samples are little-endian.
+// The integer and float64 types are for raw-array GeoTIFFs; this crate's own encoders write
+// `U8` and `F32` only.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeoTiffSample {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    F32,
+    F64,
+}
+
+impl GeoTiffSample {
+    /// `BitsPerSample` (tag 258).
+    pub(crate) const fn bits(self) -> u16 {
+        match self {
+            Self::U8 | Self::I8 => 8,
+            Self::U16 | Self::I16 => 16,
+            Self::U32 | Self::I32 | Self::F32 => 32,
+            Self::F64 => 64,
+        }
+    }
+
+    /// `SampleFormat` (tag 339): 1 unsigned integer, 2 signed integer, 3 IEEE float.
+    pub(crate) const fn format(self) -> u16 {
+        match self {
+            Self::U8 | Self::U16 | Self::U32 => 1,
+            Self::I8 | Self::I16 | Self::I32 => 2,
+            Self::F32 | Self::F64 => 3,
+        }
+    }
+}
+
+/// How the pixel bytes handed to [`write_geotiff`] are ordered.
+#[allow(dead_code)] // `Planar` is for band-major raw arrays; this crate's own encoders interleave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeoTiffLayout {
+    /// Pixel-interleaved (`b0 b1 .. bn` per pixel) in one strip: `PlanarConfiguration = 1`.
+    Chunky,
+    /// Band-major (all of band 0, then band 1, ..), one strip per band: `PlanarConfiguration = 2`.
+    /// A single band is the same bytes either way and is written as `PlanarConfiguration = 1`
+    /// with its one strip referenced inline.
+    Planar,
+}
+
+/// `PhotometricInterpretation` (tag 262).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeoTiffPhotometric {
+    /// First band is gray; every further band must be described by `extra_samples`.
+    MinIsBlack = 1,
+    /// First three bands are red, green, blue; every further band must be described by
+    /// `extra_samples`.
+    Rgb = 2,
+}
+
+/// Everything about a GeoTIFF except its pixel bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GeoTiffSpec<'a> {
+    /// `ImageWidth`, at least 1. Not clamped here.
+    pub width: u32,
+    /// `ImageLength`, at least 1. Not clamped here.
+    pub height: u32,
+    /// `SamplesPerPixel`, at least 1, including any mask / alpha band.
+    pub bands: u16,
+    /// Type of every band.
+    pub sample: GeoTiffSample,
+    /// Write the `SampleFormat` tag (339). Readers default to unsigned integer without it, so
+    /// only `U8` / `U16` / `U32` may leave it out.
+    pub sample_format_tag: bool,
+    pub layout: GeoTiffLayout,
+    pub photometric: GeoTiffPhotometric,
+    /// `ExtraSamples` (tag 338), one value per band beyond the photometric ones: `0` unspecified
+    /// data, `1` associated alpha, `2` unassociated alpha (a validity mask). Empty writes no tag.
+    pub extra_samples: &'a [u16],
+    /// `GDAL_NODATA` (tag 42113) text without the trailing NUL, e.g. `"nan"`. `None` writes no tag.
+    pub nodata: Option<&'a str>,
+    /// `[min_x, min_y, max_x, max_y]` of the image in `epsg` units. A geographic bbox whose
+    /// `max_x < min_x` crosses the antimeridian and is unwrapped for the pixel scale.
+    pub bbox: [f64; 4],
+    /// EPSG code for the GeoKey directory: written as `GeographicTypeGeoKey` when
+    /// `cogzilla_proj` knows the code as geographic, as `ProjectedCSTypeGeoKey` otherwise.
+    pub epsg: u16,
+}
+
+impl GeoTiffSpec<'_> {
+    /// Exact number of pixel bytes the file holds:
+    /// `width * height * bands * bytes-per-sample`.
+    pub(crate) fn pixel_bytes(&self) -> usize {
+        (self.width as usize)
+            * (self.height as usize)
+            * (self.bands as usize)
+            * (self.sample.bits() as usize / 8)
+    }
+}
+
+const TIFF_ASCII: u16 = 2;
+const TIFF_SHORT: u16 = 3;
+const TIFF_LONG: u16 = 4;
+const TIFF_DOUBLE: u16 = 12;
+
+/// Bytes a SHORT array of `count` values takes outside its IFD entry (up to two fit inside).
+const fn shorts_out_of_line(count: usize) -> u32 {
+    if count > 2 { (count as u32) * 2 } else { 0 }
+}
+
+/// Value field of a SHORT array entry: the values themselves when they fit, else their offset.
+fn shorts_value(count: usize, at: u32, value: impl Fn(usize) -> u16) -> u32 {
+    match count {
+        0 => 0,
+        1 => value(0) as u32,
+        2 => (value(0) as u32) | ((value(1) as u32) << 16),
+        _ => at,
+    }
+}
+
+/// Write an uncompressed Classic GeoTIFF described by `spec`.
+///
+/// `write_pixels` appends the pixel bytes straight into the output buffer (already sized for the
+/// whole file), in `spec.layout` order: exactly [`GeoTiffSpec::pixel_bytes`] of them. If it
+/// appends fewer the strip is zero-filled; anything beyond is cut off, so the file is always
+/// structurally valid.
+///
+/// Classic TIFF offsets are 32-bit: the caller keeps the file under 4 GiB.
+pub(crate) fn write_geotiff(
+    spec: &GeoTiffSpec<'_>,
+    write_pixels: impl FnOnce(&mut BytesMut),
+) -> Bytes {
+    let bands = spec.bands as usize;
+    let pixel_bytes = spec.pixel_bytes();
+    let planar = spec.layout == GeoTiffLayout::Planar && bands > 1;
+    let n_strips = if planar { bands } else { 1 };
+    let strip_bytes = pixel_bytes / n_strips;
+    let n_extra = spec.extra_samples.len();
+    // ASCII count includes the terminating NUL; up to four bytes live in the entry itself.
+    let nodata_count = spec.nodata.map_or(0, |s| s.len() + 1);
+    debug_assert!(spec.width >= 1 && spec.height >= 1 && bands >= 1);
+    debug_assert!(spec.sample_format_tag || spec.sample.format() == 1);
+
+    let n_entries: u16 = 13
+        + u16::from(n_extra > 0)
+        + u16::from(spec.sample_format_tag)
+        + u16::from(spec.nodata.is_some());
+
+    // Layout:
+    // 0..8      : TIFF header ("II", 42, ifd_offset = 8)
+    // 8..       : IFD (count, 12-byte entries, next-IFD = 0)
+    // then      : out-of-line BitsPerSample / ExtraSamples / SampleFormat (3+ values each),
+    //             StripOffsets + StripByteCounts (planar), ModelPixelScale (24),
+    //             ModelTiepoint (48), GeoKeyDirectory (32), GDAL_NODATA (5+ bytes, even-padded)
+    // pixel_off : strip data
+    let mut next = (8 + 2 + 12 * (n_entries as usize) + 4) as u32;
+    let mut place = |len: u32| {
+        let at = next;
+        next += len;
+        at
+    };
+    let bps_off = place(shorts_out_of_line(bands));
+    let extra_off = place(shorts_out_of_line(n_extra));
+    let sf_off = place(if spec.sample_format_tag { shorts_out_of_line(bands) } else { 0 });
+    let strips_off = place(if planar { 8 * bands as u32 } else { 0 });
+    let scale_off = place(24);
+    let tie_off = place(48);
+    let gkd_off = place(32);
+    let nodata_off =
+        place(if nodata_count > 4 { (nodata_count as u32).next_multiple_of(2) } else { 0 });
+    let pixel_off = next;
+    let file_len = (pixel_off as usize) + pixel_bytes;
+
+    let mut buf = BytesMut::with_capacity(file_len);
+    // TIFF little-endian header
+    buf.put_slice(b"II");
+    buf.put_u16_le(42);
+    buf.put_u32_le(8);
+
+    // IFD entries, in strictly ascending tag order
+    buf.put_u16_le(n_entries);
+    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
+        buf.put_u16_le(tag);
+        buf.put_u16_le(ty);
+        buf.put_u32_le(count);
+        buf.put_u32_le(val);
+    };
+    let bits = spec.sample.bits();
+    let format = spec.sample.format();
+    let (strip_offsets_val, strip_counts_val) = if planar {
+        (strips_off, strips_off + 4 * bands as u32)
+    } else {
+        (pixel_off, strip_bytes as u32)
+    };
+    put_entry(256, TIFF_LONG, 1, spec.width);
+    put_entry(257, TIFF_LONG, 1, spec.height);
+    put_entry(258, TIFF_SHORT, bands as u32, shorts_value(bands, bps_off, |_| bits)); // BitsPerSample
+    put_entry(259, TIFF_SHORT, 1, 1); // Compression = None
+    put_entry(262, TIFF_SHORT, 1, spec.photometric as u32); // PhotometricInterpretation
+    put_entry(273, TIFF_LONG, n_strips as u32, strip_offsets_val); // StripOffsets
+    put_entry(277, TIFF_SHORT, 1, bands as u32); // SamplesPerPixel
+    put_entry(278, TIFF_LONG, 1, spec.height); // RowsPerStrip
+    put_entry(279, TIFF_LONG, n_strips as u32, strip_counts_val); // StripByteCounts
+    put_entry(284, TIFF_SHORT, 1, if planar { 2 } else { 1 }); // PlanarConfiguration
+    if n_extra > 0 {
+        let extra = spec.extra_samples;
+        put_entry(338, TIFF_SHORT, n_extra as u32, shorts_value(n_extra, extra_off, |i| extra[i])); // ExtraSamples
+    }
+    if spec.sample_format_tag {
+        put_entry(339, TIFF_SHORT, bands as u32, shorts_value(bands, sf_off, |_| format)); // SampleFormat
+    }
+    put_entry(33550, TIFF_DOUBLE, 3, scale_off); // ModelPixelScaleTag
+    put_entry(33922, TIFF_DOUBLE, 6, tie_off); // ModelTiepointTag
+    put_entry(34735, TIFF_SHORT, 16, gkd_off); // GeoKeyDirectoryTag
+    if let Some(nodata) = spec.nodata {
+        let val = if nodata_count > 4 {
+            nodata_off
+        } else {
+            let mut inline = [0u8; 4];
+            inline[..nodata.len()].copy_from_slice(nodata.as_bytes());
+            u32::from_le_bytes(inline)
+        };
+        put_entry(42113, TIFF_ASCII, nodata_count as u32, val); // GDAL_NODATA
+    }
+    buf.put_u32_le(0); // Next IFD = 0
+
+    // Out-of-line SHORT arrays
+    if bands > 2 {
+        for _ in 0..bands {
+            buf.put_u16_le(bits);
+        }
+    }
+    if n_extra > 2 {
+        for &es in spec.extra_samples {
+            buf.put_u16_le(es);
+        }
+    }
+    if spec.sample_format_tag && bands > 2 {
+        for _ in 0..bands {
+            buf.put_u16_le(format);
+        }
+    }
+    // One strip per band
+    if planar {
+        for band in 0..bands {
+            buf.put_u32_le(pixel_off + (band * strip_bytes) as u32);
+        }
+        for _ in 0..bands {
+            buf.put_u32_le(strip_bytes as u32);
+        }
+    }
+
+    let is_geographic = matches!(
+        cogzilla_proj::CrsModel::from_epsg(spec.epsg),
+        Ok(cogzilla_proj::CrsModel::Geographic)
+    );
+    let bbox = spec.bbox;
+    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
+    let span_x = if is_geographic && bbox[2] < bbox[0] {
+        (bbox[2] + 360.0) - bbox[0]
+    } else {
+        (bbox[2] - bbox[0]).abs()
+    };
+    let dx = (span_x / (spec.width.max(1) as f64)).max(1e-12);
+    let dy = ((bbox[3] - bbox[1]).abs() / (spec.height.max(1) as f64)).max(1e-12);
+    buf.put_f64_le(dx);
+    buf.put_f64_le(dy);
+    buf.put_f64_le(0.0);
+    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(0.0);
+    buf.put_f64_le(bbox[0]);
+    buf.put_f64_le(bbox[3]);
+    buf.put_f64_le(0.0);
+    // GeoKeyDirectoryTag (16 u16s = 32 bytes)
+    let (model_type, crs_key): (u16, u16) = if is_geographic {
+        (2, 2048) // ModelTypeGeographic, GeographicTypeGeoKey
+    } else {
+        (1, 3072) // ModelTypeProjected, ProjectedCSTypeGeoKey
+    };
+    #[rustfmt::skip]
+    let gkd: [u16; 16] = [
+        1, 1, 0, 3, // version 1.1.0, 3 keys
+        1024, 0, 1, model_type, // GTModelTypeGeoKey
+        1025, 0, 1, 1, // GTRasterTypeGeoKey = PixelIsArea
+        crs_key, 0, 1, spec.epsg, // EPSG code
+    ];
+    for &k in &gkd {
+        buf.put_u16_le(k);
+    }
+    if let Some(nodata) = spec.nodata
+        && nodata_count > 4
+    {
+        buf.put_slice(nodata.as_bytes());
+        buf.resize(pixel_off as usize, 0); // NUL terminator and even padding
+    }
+    debug_assert_eq!(buf.len(), pixel_off as usize);
+
+    write_pixels(&mut buf);
+    debug_assert!(buf.len() <= file_len, "pixel writer overran the strip data");
+    buf.resize(file_len, 0);
+    buf.freeze()
+}
 
 #[cfg(test)]
 mod golden_tests {
@@ -271,5 +582,438 @@ mod golden_tests {
         assert_ne!(fnv1a_128(&a), fnv1a_128(&b));
         assert_eq!(fnv1a_128(b""), 0x6c62272e07bb014262b821756295c58d);
         assert_eq!(fnv1a_128(b"a"), 0xd228cb696f1a8caf78912b704e4a8964);
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    //! Reads `write_geotiff` output back, both with a minimal IFD walker (tag order, counts,
+    //! offsets inside the file) and with `cogzilla_tiff::parse_cog`.
+
+    use bytes::BufMut;
+    use cogzilla_tiff::{PlanarConfig, SampleType, parse_cog};
+
+    use super::*;
+
+    const GEO: [f64; 4] = [8.0, 45.0, 9.0, 46.0];
+    const MERC: [f64; 4] = [-1000.0, 2000.0, 3000.0, 5000.0];
+
+    struct Entry {
+        tag: u16,
+        ty: u16,
+        count: u32,
+        value: [u8; 4],
+    }
+
+    struct Ifd<'a> {
+        file: &'a [u8],
+        entries: Vec<Entry>,
+        /// End of the IFD itself (after the next-IFD pointer).
+        end: usize,
+    }
+
+    fn u16_at(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([b[at], b[at + 1]])
+    }
+
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    /// Walk the single IFD, checking the header and that tags strictly ascend.
+    fn read_ifd(file: &[u8]) -> Ifd<'_> {
+        assert_eq!(&file[..4], b"II\x2a\x00", "little-endian Classic TIFF magic");
+        let at = u32_at(file, 4) as usize;
+        assert_eq!(at, 8);
+        let n = u16_at(file, at) as usize;
+        let entries: Vec<Entry> = (0..n)
+            .map(|i| {
+                let e = at + 2 + 12 * i;
+                Entry {
+                    tag: u16_at(file, e),
+                    ty: u16_at(file, e + 2),
+                    count: u32_at(file, e + 4),
+                    value: [file[e + 8], file[e + 9], file[e + 10], file[e + 11]],
+                }
+            })
+            .collect();
+        assert!(entries.windows(2).all(|w| w[0].tag < w[1].tag), "tags strictly ascending");
+        let end = at + 2 + 12 * n + 4;
+        assert_eq!(u32_at(file, end - 4), 0, "no second IFD");
+        Ifd { file, entries, end }
+    }
+
+    impl Ifd<'_> {
+        fn tags(&self) -> Vec<u16> {
+            self.entries.iter().map(|e| e.tag).collect()
+        }
+
+        fn entry(&self, tag: u16) -> &Entry {
+            self.entries.iter().find(|e| e.tag == tag).unwrap_or_else(|| panic!("tag {tag} missing"))
+        }
+
+        fn has(&self, tag: u16) -> bool {
+            self.entries.iter().any(|e| e.tag == tag)
+        }
+
+        /// File range of an out-of-line value, `None` when it sits in the entry.
+        fn out_of_line(&self, e: &Entry) -> Option<std::ops::Range<usize>> {
+            let size = match e.ty {
+                2 => 1,
+                3 => 2,
+                4 => 4,
+                12 => 8,
+                other => panic!("unexpected field type {other} on tag {}", e.tag),
+            } * e.count as usize;
+            (size > 4).then(|| {
+                let at = u32::from_le_bytes(e.value) as usize;
+                assert_eq!(at % 2, 0, "tag {} value on a word boundary", e.tag);
+                assert!(at >= self.end && at + size <= self.file.len(), "tag {} value in file", e.tag);
+                at..at + size
+            })
+        }
+
+        fn payload(&self, tag: u16, ty: u16) -> Vec<u8> {
+            let e = self.entry(tag);
+            assert_eq!(e.ty, ty, "field type of tag {tag}");
+            match self.out_of_line(e) {
+                Some(range) => self.file[range].to_vec(),
+                None => {
+                    let size = e.count as usize * if ty == 4 { 4 } else { ty as usize - 1 };
+                    e.value[..size].to_vec()
+                }
+            }
+        }
+
+        fn shorts(&self, tag: u16) -> Vec<u16> {
+            self.payload(tag, 3).chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+        }
+
+        fn longs(&self, tag: u16) -> Vec<u32> {
+            self.payload(tag, 4).chunks_exact(4).map(|c| u32_at(c, 0)).collect()
+        }
+
+        fn doubles(&self, tag: u16) -> Vec<f64> {
+            self.payload(tag, 12)
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+    }
+
+    fn sample_type(sample: GeoTiffSample) -> SampleType {
+        match sample {
+            GeoTiffSample::U8 => SampleType::Uint8,
+            GeoTiffSample::I8 => SampleType::Int8,
+            GeoTiffSample::U16 => SampleType::Uint16,
+            GeoTiffSample::I16 => SampleType::Int16,
+            GeoTiffSample::U32 => SampleType::Uint32,
+            GeoTiffSample::I32 => SampleType::Int32,
+            GeoTiffSample::F32 => SampleType::Float32,
+            GeoTiffSample::F64 => SampleType::Float64,
+        }
+    }
+
+    /// Distinct bytes per position so a misplaced strip cannot go unnoticed.
+    fn pixels(spec: &GeoTiffSpec<'_>) -> Vec<u8> {
+        (0..spec.pixel_bytes()).map(|i| (i * 31 + 7) as u8).collect()
+    }
+
+    /// Write `spec` + `data` and check everything that must hold for any spec. Returns the file.
+    fn write_and_check(spec: &GeoTiffSpec<'_>, data: &[u8]) -> Bytes {
+        assert_eq!(data.len(), spec.pixel_bytes());
+        let file = write_geotiff(spec, |buf| buf.put_slice(data));
+        let ifd = read_ifd(&file);
+        let bands = spec.bands as usize;
+        let planar = spec.layout == GeoTiffLayout::Planar && bands > 1;
+
+        let mut want_tags = vec![256, 257, 258, 259, 262, 273, 277, 278, 279, 284];
+        if !spec.extra_samples.is_empty() {
+            want_tags.push(338);
+        }
+        if spec.sample_format_tag {
+            want_tags.push(339);
+        }
+        want_tags.extend([33550, 33922, 34735]);
+        if spec.nodata.is_some() {
+            want_tags.push(42113);
+        }
+        assert_eq!(ifd.tags(), want_tags);
+
+        assert_eq!(ifd.longs(256), [spec.width]);
+        assert_eq!(ifd.longs(257), [spec.height]);
+        assert_eq!(ifd.shorts(258), vec![spec.sample.bits(); bands]);
+        assert_eq!(ifd.shorts(259), [1]);
+        assert_eq!(ifd.shorts(262), [spec.photometric as u16]);
+        assert_eq!(ifd.shorts(277), [spec.bands]);
+        assert_eq!(ifd.longs(278), [spec.height]);
+        assert_eq!(ifd.shorts(284), [if planar { 2 } else { 1 }]);
+        if !spec.extra_samples.is_empty() {
+            assert_eq!(ifd.shorts(338), spec.extra_samples);
+        }
+        if spec.sample_format_tag {
+            assert_eq!(ifd.shorts(339), vec![spec.sample.format(); bands]);
+        }
+
+        // Strips: after every tag value, back to back, ending exactly at end of file, and
+        // holding the input bytes in order.
+        let offsets = ifd.longs(273);
+        let counts = ifd.longs(279);
+        let n_strips = if planar { bands } else { 1 };
+        assert_eq!(offsets.len(), n_strips);
+        assert_eq!(counts.len(), n_strips);
+        let meta_end = ifd
+            .entries
+            .iter()
+            .filter_map(|e| ifd.out_of_line(e))
+            .map(|r| r.end)
+            .max()
+            .unwrap();
+        // (rounded up to a word boundary after odd-length GDAL_NODATA text)
+        assert_eq!(
+            offsets[0] as usize,
+            meta_end.next_multiple_of(2),
+            "pixels follow the last tag value"
+        );
+        let mut at = offsets[0] as usize;
+        for (&off, &count) in offsets.iter().zip(&counts) {
+            assert_eq!(off as usize, at);
+            assert_eq!(count as usize, data.len() / n_strips);
+            at += count as usize;
+        }
+        assert_eq!(at, file.len());
+        assert_eq!(&file[offsets[0] as usize..], data);
+
+        // Georeferencing tail.
+        let dx = (spec.bbox[2] - spec.bbox[0]) / f64::from(spec.width);
+        let dy = (spec.bbox[3] - spec.bbox[1]) / f64::from(spec.height);
+        assert_eq!(ifd.doubles(33550), [dx, dy, 0.0]);
+        assert_eq!(ifd.doubles(33922), [0.0, 0.0, 0.0, spec.bbox[0], spec.bbox[3], 0.0]);
+        let (model, key) = if spec.epsg == 4326 { (2, 2048) } else { (1, 3072) };
+        assert_eq!(
+            ifd.shorts(34735),
+            [1, 1, 0, 3, 1024, 0, 1, model, 1025, 0, 1, 1, key, 0, 1, spec.epsg]
+        );
+        if let Some(nodata) = spec.nodata {
+            let mut want = nodata.as_bytes().to_vec();
+            want.push(0);
+            assert_eq!(ifd.payload(42113, 2), want);
+        }
+
+        // The repo's own reader agrees.
+        let index = parse_cog(&file).expect("cogzilla-tiff opens the file");
+        assert_eq!(index.ifds.len(), 1);
+        assert!(index.is_georeferenced);
+        let full = index.full_res();
+        assert_eq!((full.width, full.height), (spec.width, spec.height));
+        assert_eq!(full.samples_per_pixel, spec.bands);
+        assert_eq!(full.sample_type, sample_type(spec.sample));
+        assert_eq!(
+            full.planar_config,
+            if planar { PlanarConfig::Planar } else { PlanarConfig::Chunky }
+        );
+        assert!(full.is_stripped);
+        assert_eq!((full.tile_width, full.tile_height), (spec.width, spec.height));
+        assert_eq!(full.photometric, spec.photometric as u16);
+        assert_eq!(full.extra_samples, spec.extra_samples);
+        for band in 0..n_strips {
+            assert_eq!(
+                full.tile_byte_range(0, 0, band as u16),
+                Some((u64::from(offsets[band]), counts[band]))
+            );
+        }
+        assert_eq!(full.pixel_to_crs_pt(0.0, 0.0), (spec.bbox[0], spec.bbox[3]));
+        let (x1, y1) = full.pixel_to_crs_pt(f64::from(spec.width), f64::from(spec.height));
+        assert!((x1 - spec.bbox[2]).abs() < 1e-9 && (y1 - spec.bbox[1]).abs() < 1e-9);
+        if spec.epsg == 4326 {
+            assert_eq!(index.geo_keys.model_type, Some(2));
+            assert_eq!(index.geo_keys.geographic_type, Some(4326));
+        } else {
+            assert_eq!(index.geo_keys.model_type, Some(1));
+            assert_eq!(index.geo_keys.projected_cs_type, Some(spec.epsg));
+        }
+        match spec.nodata {
+            None => assert_eq!(index.nodata, None),
+            Some("nan") => assert!(index.nodata.is_some_and(f32::is_nan)),
+            Some(text) => assert_eq!(index.nodata, text.parse::<f32>().ok()),
+        }
+        file
+    }
+
+    fn planar(
+        sample: GeoTiffSample,
+        bands: u16,
+        photometric: GeoTiffPhotometric,
+        extra_samples: &[u16],
+    ) -> GeoTiffSpec<'_> {
+        GeoTiffSpec {
+            width: 5,
+            height: 3,
+            bands,
+            sample,
+            sample_format_tag: true,
+            layout: GeoTiffLayout::Planar,
+            photometric,
+            extra_samples,
+            nodata: None,
+            bbox: GEO,
+            epsg: 4326,
+        }
+    }
+
+    #[test]
+    fn planar_single_band_uint16_is_one_inline_strip() {
+        let spec = planar(GeoTiffSample::U16, 1, GeoTiffPhotometric::MinIsBlack, &[]);
+        let file = write_and_check(&spec, &pixels(&spec));
+        let ifd = read_ifd(&file);
+        // One band is written as chunky with StripOffsets / StripByteCounts in their entries.
+        assert_eq!(ifd.shorts(284), [1]);
+        assert_eq!(ifd.entry(273).count, 1);
+        assert_eq!(ifd.longs(279), [5 * 3 * 2]);
+        assert_eq!(ifd.shorts(258), [16]);
+        assert_eq!(ifd.shorts(339), [1]);
+        assert!(!ifd.has(338));
+        // 14 entries, nothing out of line but the 104-byte geo tail.
+        assert_eq!(file.len(), 8 + 2 + 12 * 14 + 4 + 104 + 30);
+    }
+
+    #[test]
+    fn planar_rgb_uint8_with_mask_band() {
+        let spec = planar(GeoTiffSample::U8, 4, GeoTiffPhotometric::Rgb, &[2]);
+        let data = pixels(&spec);
+        let file = write_and_check(&spec, &data);
+        let ifd = read_ifd(&file);
+        assert_eq!(ifd.shorts(262), [2]);
+        assert_eq!(ifd.shorts(284), [2]);
+        assert_eq!(ifd.shorts(338), [2]);
+        assert_eq!(ifd.shorts(258), [8, 8, 8, 8]);
+        let offsets = ifd.longs(273);
+        assert_eq!(ifd.longs(279), [15, 15, 15, 15]);
+        // Each strip is one whole band of the band-major input.
+        for (band, &off) in offsets.iter().enumerate() {
+            assert_eq!(&file[off as usize..off as usize + 15], &data[band * 15..(band + 1) * 15]);
+        }
+    }
+
+    #[test]
+    fn planar_two_band_int16() {
+        let spec = planar(GeoTiffSample::I16, 2, GeoTiffPhotometric::MinIsBlack, &[0]);
+        let file = write_and_check(&spec, &pixels(&spec));
+        let ifd = read_ifd(&file);
+        // Two SHORTs fit in the entry; two LONG strip offsets do not.
+        assert!(ifd.out_of_line(ifd.entry(258)).is_none());
+        assert!(ifd.out_of_line(ifd.entry(339)).is_none());
+        assert!(ifd.out_of_line(ifd.entry(273)).is_some());
+        assert!(ifd.out_of_line(ifd.entry(279)).is_some());
+        assert_eq!(ifd.shorts(258), [16, 16]);
+        assert_eq!(ifd.shorts(339), [2, 2]);
+        assert_eq!(ifd.shorts(338), [0]);
+        assert_eq!(ifd.longs(279), [30, 30]);
+    }
+
+    #[test]
+    fn planar_float64() {
+        let one = planar(GeoTiffSample::F64, 1, GeoTiffPhotometric::MinIsBlack, &[]);
+        let file = write_and_check(&one, &pixels(&one));
+        let ifd = read_ifd(&file);
+        assert_eq!((ifd.shorts(258), ifd.shorts(339)), (vec![64], vec![3]));
+        assert_eq!(ifd.longs(279), [5 * 3 * 8]);
+
+        // Five data bands and a mask: every SHORT array is out of line.
+        let six = planar(GeoTiffSample::F64, 6, GeoTiffPhotometric::MinIsBlack, &[0, 0, 0, 0, 2]);
+        let file = write_and_check(&six, &pixels(&six));
+        let ifd = read_ifd(&file);
+        for tag in [258, 338, 339, 273, 279] {
+            assert!(ifd.out_of_line(ifd.entry(tag)).is_some(), "tag {tag}");
+        }
+        assert_eq!(ifd.longs(279), [120; 6]);
+    }
+
+    #[test]
+    fn every_sample_type_in_both_layouts() {
+        use GeoTiffSample::*;
+        for sample in [U8, I8, U16, I16, U32, I32, F32, F64] {
+            for layout in [GeoTiffLayout::Chunky, GeoTiffLayout::Planar] {
+                for (bands, extra) in [(1u16, &[][..]), (2, &[2]), (3, &[0, 0]), (4, &[0, 0, 2])] {
+                    let spec = GeoTiffSpec {
+                        layout,
+                        width: 3,
+                        height: 7,
+                        bbox: MERC,
+                        epsg: 3857,
+                        ..planar(sample, bands, GeoTiffPhotometric::MinIsBlack, extra)
+                    };
+                    write_and_check(&spec, &pixels(&spec));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_samples_may_omit_sample_format() {
+        for sample in [GeoTiffSample::U8, GeoTiffSample::U16, GeoTiffSample::U32] {
+            let spec = GeoTiffSpec {
+                sample_format_tag: false,
+                ..planar(sample, 3, GeoTiffPhotometric::MinIsBlack, &[0, 0])
+            };
+            let file = write_and_check(&spec, &pixels(&spec));
+            assert!(!read_ifd(&file).has(339));
+        }
+    }
+
+    #[test]
+    fn nodata_text_inline_and_out_of_line() {
+        // Up to three characters and the NUL fit in the entry; longer text goes after the
+        // GeoKey directory, padded so the pixels start on a word boundary.
+        for (nodata, out_of_line) in [
+            ("0", false),
+            ("nan", false),
+            ("-999", true),
+            ("-32768", true),
+            ("-9999.5", true),
+        ] {
+            for layout in [GeoTiffLayout::Chunky, GeoTiffLayout::Planar] {
+                let spec = GeoTiffSpec {
+                    nodata: Some(nodata),
+                    layout,
+                    ..planar(GeoTiffSample::F32, 3, GeoTiffPhotometric::MinIsBlack, &[0, 0])
+                };
+                let file = write_and_check(&spec, &pixels(&spec));
+                let ifd = read_ifd(&file);
+                let entry = ifd.entry(42113);
+                assert_eq!(entry.count as usize, nodata.len() + 1);
+                assert_eq!(ifd.out_of_line(entry).is_some(), out_of_line, "{nodata}");
+                assert_eq!(ifd.longs(273)[0] % 2, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_writer_shortfall_is_zero_filled() {
+        let spec = planar(GeoTiffSample::U16, 2, GeoTiffPhotometric::MinIsBlack, &[0]);
+        let full = write_and_check(&spec, &pixels(&spec));
+        let short = write_geotiff(&spec, |buf| buf.put_slice(&[9; 7]));
+        assert_eq!(short.len(), full.len());
+        let pixel_off = full.len() - spec.pixel_bytes();
+        assert_eq!(short[..pixel_off], full[..pixel_off]);
+        assert_eq!(short[pixel_off..pixel_off + 7], [9; 7]);
+        assert!(short[pixel_off + 7..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn geographic_antimeridian_bbox_is_unwrapped() {
+        let crossing = [170.0, -10.0, -170.0, 10.0];
+        let spec = GeoTiffSpec {
+            bbox: crossing,
+            ..planar(GeoTiffSample::U8, 1, GeoTiffPhotometric::MinIsBlack, &[])
+        };
+        let file = write_geotiff(&spec, |buf| buf.put_slice(&pixels(&spec)));
+        let ifd = read_ifd(&file);
+        assert_eq!(ifd.doubles(33550), [20.0 / 5.0, 20.0 / 3.0, 0.0]);
+        assert_eq!(ifd.doubles(33922), [0.0, 0.0, 0.0, 170.0, 10.0, 0.0]);
+        // The same numbers in a projected CRS are not a wrap: |max_x - min_x|.
+        let projected = GeoTiffSpec { epsg: 3857, ..spec };
+        let file = write_geotiff(&projected, |buf| buf.put_slice(&pixels(&projected)));
+        assert_eq!(read_ifd(&file).doubles(33550), [340.0 / 5.0, 20.0 / 3.0, 0.0]);
     }
 }

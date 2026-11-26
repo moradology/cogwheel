@@ -1,6 +1,5 @@
 pub mod catalog;
 pub mod engine;
-#[cfg(test)]
 mod geotiff;
 pub mod http;
 pub mod openapi;
