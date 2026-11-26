@@ -2281,12 +2281,16 @@ fn build_band_request(
                     let (lo, hi) = default_rescale_for_dtype(sample_type, false);
                     ([lo; 3], [hi; 3])
                 }
+                1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
                 3 => (
                     [pq.rescale[0].0, pq.rescale[1].0, pq.rescale[2].0],
                     [pq.rescale[0].1, pq.rescale[1].1, pq.rescale[2].1],
                 ),
-                // rio-tiler applies rescale[0] across all bands when len != count
-                _ => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
+                n => {
+                    return Err(EngineError::BadRequest(format!(
+                        "rescale count ({n}) does not match band count (3); expected 1 or 3 rescale ranges"
+                    )));
+                }
             };
             return Ok(BandRequest::CustomExprRgb {
                 progs: [p0, p1, p2],
@@ -2297,6 +2301,12 @@ fn build_band_request(
             return Err(EngineError::BadRequest(format!(
                 "multi-band tile expression must have 1 or 3 semicolon-separated expressions (got {})",
                 parts.len()
+            )));
+        }
+        if pq.rescale.len() > 1 {
+            return Err(EngineError::BadRequest(format!(
+                "rescale count ({}) does not match band count (1); expected 1 rescale range",
+                pq.rescale.len()
             )));
         }
         let prog = ExprProgram::compile(parts[0]).map_err(EngineError::BadRequest)?;
@@ -2336,12 +2346,16 @@ fn build_band_request(
                 let (lo, hi) = default_rescale_for_dtype(sample_type, false);
                 ([lo; 3], [hi; 3])
             }
+            1 => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
             3 => (
                 [pq.rescale[0].0, pq.rescale[1].0, pq.rescale[2].0],
                 [pq.rescale[0].1, pq.rescale[1].1, pq.rescale[2].1],
             ),
-            // rio-tiler applies rescale[0] across all bands when len != count
-            _ => ([pq.rescale[0].0; 3], [pq.rescale[0].1; 3]),
+            n => {
+                return Err(EngineError::BadRequest(format!(
+                    "rescale count ({n}) does not match band count (3); expected 1 or 3 rescale ranges"
+                )));
+            }
         };
         Ok(BandRequest::Rgb {
             bands_1based: bs,
@@ -5317,7 +5331,9 @@ where
                     }
                 }
                 if assets_out.is_empty() {
-                    return Err(EngineError::NoContent);
+                    return Err(EngineError::NotFound(format!(
+                        "No asset covers point ({lon}, {lat})"
+                    )));
                 }
                 let body = serde_json::json!({
                     "coordinates": [x, y],
