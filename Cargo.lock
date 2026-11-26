@@ -367,9 +367,11 @@ dependencies = [
  "bytemuck",
  "cogzilla-codec",
  "cogzilla-kernel",
+ "cogzilla-tiff",
  "pollster",
  "thiserror 2.0.21",
  "wgpu",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -441,6 +443,7 @@ dependencies = [
  "bytes",
  "clap",
  "cogzilla-codec",
+ "cogzilla-gpu",
  "cogzilla-io",
  "cogzilla-kernel",
  "cogzilla-proj",
@@ -456,6 +459,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zune-jpeg",
 ]
 
 [[package]]
