@@ -1575,7 +1575,7 @@ pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes>
             for (i, v) in values.enumerate() {
                 let x: $t = if i < bands * pixels {
                     cast(f64::from(v))
-                } else if v != 0.0 {
+                } else if v.is_finite() && v != 0.0 {
                     <$t>::MAX
                 } else {
                     <$t>::MIN
@@ -6879,6 +6879,15 @@ mod npy_typed_tests {
         assert!(retype_f32_npy(b"not an array", SampleType::Uint16, true).is_none());
         let flat = [encode_npy_header("<f4", &[2]), 1f32.to_le_bytes().repeat(2)].concat();
         assert!(retype_f32_npy(&flat, SampleType::Uint16, false).is_none());
+        // NaN in the mask plane maps to the type's minimum (invalid), not maximum.
+        let raw_nan_mask: Vec<u8> = [5.0f32, 6.0, f32::NAN, 255.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_nan_mask = wrap_raw_f32_as_npy(Bytes::from(raw_nan_mask), 2, 1, 2);
+        let typed_u16 = retype_f32_npy(&f32_nan_mask, SampleType::Uint16, true).unwrap();
+        let words_u16: Vec<u16> = typed_u16[parse(&typed_u16).3..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words_u16, [5, 6, 0, u16::MAX]);
+        let typed_i16 = retype_f32_npy(&f32_nan_mask, SampleType::Int16, true).unwrap();
+        let words_i16: Vec<i16> = typed_i16[parse(&typed_i16).3..].chunks_exact(2).map(|w| i16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words_i16, [5, 6, i16::MIN, i16::MAX]);
     }
 
     #[test]

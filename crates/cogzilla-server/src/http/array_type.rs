@@ -56,7 +56,10 @@ pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> +
             }
             rest = &rest[at + 1 + digits..];
         }
-        !e.bytes().any(|c| c == b'/' || c == b'.' || (c.is_ascii_alphabetic() && c != b'b'))
+        !e.contains("**")
+            && !e
+                .bytes()
+                .any(|c| c == b'/' || c == b'.' || c == b'^' || (c.is_ascii_alphabetic() && c != b'b'))
     };
     // float32 stays float32 through operations and functions alike; a literal with a
     // fraction or an exponent is a double and makes the result one.
@@ -156,6 +159,10 @@ mod tests {
         assert_eq!(kind("b1/2", T::Float32), T::Float32);
         assert_eq!(kind("b1*0.5", T::Float32), T::Float64);
         assert_eq!(kind("b1*2", T::Int32), T::Float64);
+        assert_eq!(kind("b1**-1", T::Uint16), T::Float64);
+        assert_eq!(kind("b1^-1", T::Uint8), T::Float64);
+        assert_eq!(kind("b1**3", T::Uint16), T::Float64);
+        assert_eq!(kind("b1**-1", T::Float32), T::Float32);
     }
 
     #[test]
