@@ -94,25 +94,97 @@ pub enum OwnedCoordPlan {
     Separable1D { u: Vec<f32>, v: Vec<f32> },
     Grid2D { dst_w: usize, dst_h: usize, grid_u: [f32; 289], grid_v: [f32; 289] },
     Exact2D { dst_w: usize, dst_h: usize, u: Vec<f32>, v: Vec<f32> },
+    /// 1D separable axes packed into `uv_packed = [u (dst_w), v (dst_h)]` + 1-bit-per-pixel mask.
+    SeparableMasked {
+        dst_w: usize,
+        dst_h: usize,
+        uv_packed: Vec<f32>,
+        mask_bits: Vec<u32>,
+    },
+    /// 17×17 Grid2D packed into `uv_packed = [grid_u (289), grid_v (289)]` + 1-bit-per-pixel mask.
+    Grid2DMasked {
+        dst_w: usize,
+        dst_h: usize,
+        uv_packed: Vec<f32>,
+        mask_bits: Vec<u32>,
+    },
 }
 
 impl OwnedCoordPlan {
-    fn dims_mode_slices(&self) -> Result<(usize, usize, u32, &[f32], &[f32]), GpuError> {
+    fn dims_mode_slices(&self) -> Result<(usize, usize, u32, &[u8], &[u8]), GpuError> {
         match self {
-            Self::Separable1D { u, v } => Ok((u.len(), v.len(), 0, u.as_slice(), v.as_slice())),
+            Self::Separable1D { u, v } => Ok((
+                u.len(),
+                v.len(),
+                0,
+                bytemuck::cast_slice(u.as_slice()),
+                bytemuck::cast_slice(v.as_slice()),
+            )),
             Self::Grid2D {
                 dst_w,
                 dst_h,
                 grid_u,
                 grid_v,
-            } => Ok((*dst_w, *dst_h, 1, grid_u.as_slice(), grid_v.as_slice())),
+            } => Ok((
+                *dst_w,
+                *dst_h,
+                1,
+                bytemuck::cast_slice(grid_u.as_slice()),
+                bytemuck::cast_slice(grid_v.as_slice()),
+            )),
             Self::Exact2D { dst_w, dst_h, u, v } => {
                 if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
                     return Err(GpuError::InvalidDimensions(
                         "Exact2D u/v len mismatch".into(),
                     ));
                 }
-                Ok((*dst_w, *dst_h, 2, u.as_slice(), v.as_slice()))
+                Ok((
+                    *dst_w,
+                    *dst_h,
+                    2,
+                    bytemuck::cast_slice(u.as_slice()),
+                    bytemuck::cast_slice(v.as_slice()),
+                ))
+            }
+            Self::SeparableMasked {
+                dst_w,
+                dst_h,
+                uv_packed,
+                mask_bits,
+            } => {
+                let need_words = (dst_w * dst_h).div_ceil(32);
+                if uv_packed.len() != dst_w + dst_h || mask_bits.len() < need_words {
+                    return Err(GpuError::InvalidDimensions(
+                        "SeparableMasked uv_packed/mask_bits len mismatch".into(),
+                    ));
+                }
+                Ok((
+                    *dst_w,
+                    *dst_h,
+                    3,
+                    bytemuck::cast_slice(uv_packed.as_slice()),
+                    bytemuck::cast_slice(&mask_bits[..need_words]),
+                ))
+            }
+            Self::Grid2DMasked {
+                dst_w,
+                dst_h,
+                uv_packed,
+                mask_bits,
+            } => {
+                let need_words = (dst_w * dst_h).div_ceil(32);
+                if uv_packed.len() != 578 || mask_bits.len() < need_words {
+                    return Err(GpuError::InvalidDimensions(
+                        "Grid2DMasked uv_packed/mask_bits len mismatch".into(),
+                    ));
+                }
+                Ok((
+                    *dst_w,
+                    *dst_h,
+                    4,
+                    bytemuck::cast_slice(uv_packed.as_slice()),
+                    bytemuck::cast_slice(&mask_bits[..need_words]),
+                ))
             }
         }
     }
@@ -970,7 +1042,7 @@ impl WorkerState {
                     };
                     let out_words = words_per_row * dst_h;
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let range = rescale_max - rescale_min;
                     let safe_range = if range.is_finite() && range.abs() > 1e-20 {
@@ -994,10 +1066,8 @@ impl WorkerState {
                     };
                     self.queue
                         .write_buffer(&slot.cm_params_buf, 0, bytemuck::bytes_of(&params));
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
                     if output == CoalescedOutput::Rgba8 {
                         self.queue
                             .write_buffer(&slot.lut_buf, 0, bytemuck::cast_slice(&lut_u32));
@@ -1126,7 +1196,7 @@ impl WorkerState {
                     };
                     let out_words = words_per_row * dst_h;
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let range = rescale_max - rescale_min;
                     let safe_range = if range.is_finite() && range.abs() > 1e-20 {
@@ -1158,10 +1228,8 @@ impl WorkerState {
                     };
                     self.queue
                         .write_buffer(&slot.tr_params_buf, 0, bytemuck::bytes_of(&params));
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
                     if !is_terrain_rgb && eff_output == CoalescedOutput::Rgba8 {
                         self.queue
                             .write_buffer(&slot.lut_buf, 0, bytemuck::cast_slice(&lut_u32));
@@ -1257,7 +1325,7 @@ impl WorkerState {
                     };
                     let out_words = words_per_row * dst_h;
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let range = rescale_max - rescale_min;
                     let safe_range = if range.is_finite() && range.abs() > 1e-20 {
@@ -1293,10 +1361,8 @@ impl WorkerState {
                         self.queue
                             .write_buffer(&slot.lut_buf, 0, bytemuck::cast_slice(&lut_u32));
                     }
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("coal-expr-bg"),
@@ -1395,7 +1461,7 @@ impl WorkerState {
                     }
                     let out_words = dst_w * dst_h;
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let inv = |min: f32, max: f32| {
                         let d = max - min;
@@ -1440,10 +1506,8 @@ impl WorkerState {
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some(if is_sar { "coal-sar-rgb-bg" } else { "coal-rgb-bg" }),
@@ -1533,7 +1597,7 @@ impl WorkerState {
                     }
                     let out_words = dst_w * dst_h;
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let inv = |min: f32, max: f32| {
                         let d = max - min;
@@ -1583,10 +1647,8 @@ impl WorkerState {
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
                     self.queue
                         .write_buffer(&slot.instr_buf, 0, bytemuck::cast_slice(&instrs));
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("coal-expr-rgb-bg"),
@@ -1660,7 +1722,7 @@ impl WorkerState {
                     }
                     let out_words = dst_w * dst_h * (slab.num_bands as usize);
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let params = ExprParams {
                         src_w: slab.width,
@@ -1684,10 +1746,8 @@ impl WorkerState {
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("coal-mb-f32-bg"),
@@ -1774,7 +1834,7 @@ impl WorkerState {
                     }
                     let out_words = dst_w * dst_h * 3;
                     let slot = &mut frame.slots[slot_idx];
-                    slot.ensure_caps(&self.device, u_slice.len(), v_slice.len(), out_words);
+                    slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
                     let packed_lens = (lens[0] as u32)
                         | ((lens[1] as u32) << 8)
@@ -1803,10 +1863,8 @@ impl WorkerState {
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
                     self.queue
                         .write_buffer(&slot.instr_buf, 0, bytemuck::cast_slice(&instrs));
-                    self.queue
-                        .write_buffer(&slot.u_buf, 0, bytemuck::cast_slice(u_slice));
-                    self.queue
-                        .write_buffer(&slot.v_buf, 0, bytemuck::cast_slice(v_slice));
+                    self.queue.write_buffer(&slot.u_buf, 0, u_slice);
+                    self.queue.write_buffer(&slot.v_buf, 0, v_slice);
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("coal-expr-rgb-f32-bg"),

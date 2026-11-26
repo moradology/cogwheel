@@ -391,6 +391,36 @@ fn eval_uv(px: u32, py: u32) -> vec2<f32> {
         let idx = py * params.dst_w + px;
         return vec2<f32>(u_coords[idx], v_coords[idx]);
     }
+    if (params.coord_mode == 3u) {
+        let idx = py * params.dst_w + px;
+        let word = bitcast<u32>(v_coords[idx >> 5u]);
+        if ((word & (1u << (idx & 31u))) == 0u) {
+            return vec2<f32>(nan_f32(), nan_f32());
+        }
+        return vec2<f32>(u_coords[px], u_coords[params.dst_w + py]);
+    }
+    if (params.coord_mode == 4u) {
+        let idx = py * params.dst_w + px;
+        let word = bitcast<u32>(v_coords[idx >> 5u]);
+        if ((word & (1u << (idx & 31u))) == 0u) {
+            return vec2<f32>(nan_f32(), nan_f32());
+        }
+        let gx_f = f32(px) * 16.0 / f32(params.dst_w);
+        let gy_f = f32(py) * 16.0 / f32(params.dst_h);
+        let gx0 = min(u32(gx_f), 15u);
+        let gy0 = min(u32(gy_f), 15u);
+        let fx = gx_f - f32(gx0);
+        let fy = gy_f - f32(gy0);
+        let i00 = gy0 * 17u + gx0;
+        let i10 = i00 + 1u;
+        let i01 = i00 + 17u;
+        let i11 = i01 + 1u;
+        let u0 = u_coords[i00] + (u_coords[i10] - u_coords[i00]) * fx;
+        let u1 = u_coords[i01] + (u_coords[i11] - u_coords[i01]) * fx;
+        let v0 = u_coords[289u + i00] + (u_coords[289u + i10] - u_coords[289u + i00]) * fx;
+        let v1 = u_coords[289u + i01] + (u_coords[289u + i11] - u_coords[289u + i01]) * fx;
+        return vec2<f32>(u0 + (u1 - u0) * fy, v0 + (v1 - v0) * fy);
+    }
     // Grid2D (17x17 coarse warp grid matching cogzilla-proj::CoordPlan::Grid2D)
     let gx_f = f32(px) * 16.0 / f32(params.dst_w);
     let gy_f = f32(py) * 16.0 / f32(params.dst_h);
