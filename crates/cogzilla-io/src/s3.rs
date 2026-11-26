@@ -896,6 +896,15 @@ async fn fetch_s3_inner(
                 url: crate::backend::redact_http_url(&url),
             });
         }
+        if status == 206
+            && let Some(rng) = range_header
+            && let Some(req_start) = crate::backend::parse_range_header_start(rng)
+            && !crate::backend::validate_content_range_start(&resp, req_start)
+        {
+            return Err(IoError::RangeNotSupported {
+                url: crate::backend::redact_http_url(&url),
+            });
+        }
         if status == 200 || status == 206 {
             // The body can still fail after a good status line (connection reset mid-transfer).
             let body_res = if let Some(cap) = max_bytes {
@@ -909,6 +918,11 @@ async fn fetch_s3_inner(
                         p.on_success();
                     }
                     return Ok(body);
+                }
+                Err(IoError::ResponseTooLarge { .. }) if status == 200 && range_header.is_some() => {
+                    return Err(IoError::RangeNotSupported {
+                        url: crate::backend::redact_http_url(&url),
+                    });
                 }
                 Err(IoError::Http(e))
                     if attempt < cfg.max_retries && is_retryable_transport_error(&e) =>

@@ -57,6 +57,9 @@ pub fn compress_gzip(input: &[u8]) -> Result<Vec<u8>, String> {
 /// Decompress a gzip-encoded buffer using `libdeflater` with an upper bound on decompressed size
 /// to guard against decompression bombs.
 pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {
+    if max_out_bytes == 0 {
+        return Err("gzip payload exceeds 0 B limit".into());
+    }
     if input.len() < 18 || input[0] != 0x1f || input[1] != 0x8b {
         return Err("invalid gzip header".into());
     }
@@ -66,9 +69,14 @@ pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec
         input[input.len() - 2],
         input[input.len() - 1],
     ]) as usize;
+    // Cap initial allocation against an attacker-controlled ISIZE trailer; legitimate high-ratio
+    // streams still grow smoothly via the 2x `InsufficientSpace` loop up to `max_out_bytes`.
+    let max_initial = input.len().saturating_mul(16).max(65_536);
+    let min_cap = 4096usize.min(max_out_bytes);
     let mut cap = isize_hint
+        .min(max_initial)
         .max(input.len().saturating_mul(2))
-        .clamp(4096, max_out_bytes);
+        .clamp(min_cap, max_out_bytes);
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut out = vec![0u8; cap];
@@ -289,6 +297,9 @@ pub fn decode_tile_rows(
             fn drop(&mut self) {
                 if self.0.scratch.capacity() > 4 * 1024 * 1024 {
                     self.0.scratch = Vec::with_capacity(512 * 512 * 4);
+                }
+                if self.0.jpeg_merge.capacity() > 1024 * 1024 {
+                    self.0.jpeg_merge = Vec::new();
                 }
             }
         }
@@ -588,9 +599,12 @@ pub fn decode_tile_rows(
                                 compressed.len(),
                             )
                         };
-                        let cap = if content_sz != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64
-                            && content_sz != zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64
-                        {
+                        if content_sz == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
+                            return Err(CodecError::Lerc(
+                                "invalid LERC_ZSTD frame header".into(),
+                            ));
+                        }
+                        let mut cap = if content_sz != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64 {
                             let sz = content_sz as usize;
                             if sz > max_cap {
                                 return Err(CodecError::Lerc(
@@ -599,22 +613,35 @@ pub fn decode_tile_rows(
                             }
                             sz.max(1)
                         } else {
-                            max_cap
+                            compressed
+                                .len()
+                                .saturating_mul(8)
+                                .clamp(65_536usize.min(max_cap), max_cap)
                         };
-                        let mut out = vec![0u8; cap];
-                        let code = unsafe {
-                            zstd_sys::ZSTD_decompressDCtx(
-                                st.zstd_dctx,
-                                out.as_mut_ptr() as *mut std::ffi::c_void,
-                                out.len(),
-                                compressed.as_ptr() as *const std::ffi::c_void,
-                                compressed.len(),
-                            )
-                        };
-                        if unsafe { zstd_sys::ZSTD_isError(code) } != 0 {
+                        let out = loop {
+                            let mut buf = vec![0u8; cap];
+                            let code = unsafe {
+                                zstd_sys::ZSTD_decompressDCtx(
+                                    st.zstd_dctx,
+                                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                    buf.len(),
+                                    compressed.as_ptr() as *const std::ffi::c_void,
+                                    compressed.len(),
+                                )
+                            };
+                            if unsafe { zstd_sys::ZSTD_isError(code) } == 0 {
+                                buf.truncate(code);
+                                break buf;
+                            }
+                            let err_code = unsafe { zstd_sys::ZSTD_getErrorCode(code) };
+                            if err_code == zstd_sys::ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall
+                                && cap < max_cap
+                            {
+                                cap = cap.saturating_mul(2).min(max_cap);
+                                continue;
+                            }
                             return Err(CodecError::Zstd(code));
-                        }
-                        out.truncate(code);
+                        };
                         Some(out)
                     }
                     _ => None,
@@ -1612,5 +1639,20 @@ mod tests {
         v1.extend_from_slice(&1024u32.to_le_bytes()); // height
         v1.extend_from_slice(&2048u32.to_le_bytes()); // width
         assert_eq!(parse_lerc_header_dims(&v1), Some((2048, 1024, 1)));
+    }
+
+    #[test]
+    fn decompress_gzip_limited_handles_small_cap_and_hostile_isize_trailer() {
+        // Must not panic when max_out_bytes < 4096 or == 0.
+        let gz = compress_gzip(b"hello cogzilla").unwrap();
+        assert_eq!(decompress_gzip_limited(&gz, 64).unwrap(), b"hello cogzilla");
+        assert!(decompress_gzip_limited(&gz, 4).is_err());
+        assert!(decompress_gzip_limited(&gz, 0).is_err());
+        // Hostile 18-byte gzip header with 0xFFFF_FFFF ISIZE trailer must fail cleanly without OOM.
+        let mut hostile = [0u8; 18];
+        hostile[0] = 0x1f;
+        hostile[1] = 0x8b;
+        hostile[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decompress_gzip_limited(&hostile, 64 * 1024 * 1024).is_err());
     }
 }
