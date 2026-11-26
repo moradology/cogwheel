@@ -323,7 +323,9 @@ class Oracle:
             # theirs links to.
             def tileset_links(r, base):
                 hrefs = re.findall(r'href="([^"]+)"', r.text)
-                return {h.replace(base, "").replace("&amp;", "&") for h in hrefs if "/tiles/" in h and "{" not in h}
+                links = {h.replace(base, "").replace("&amp;", "&") for h in hrefs if "/tiles/" in h and "{" not in h}
+                # A page's link to itself (a tileset's `self`) is left out of the comparison.
+                return {h for h in links if h.split("?")[0] != path.split("?")[0]}
             types = (cz.headers.get("content-type", ""), tt.headers.get("content-type", ""))
             missing = tileset_links(cz, COGZILLA) - tileset_links(tt, TITILER)
             ok = all(t.startswith("text/html") for t in types) and not missing
