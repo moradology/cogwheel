@@ -3952,3 +3952,101 @@ async fn audit53_color_formula_with_custom_colormap_and_where_nan_zonal() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn audit55_admin_clear_cache_and_mosaic_tile_cache_freshness() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_audit55_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // 64x64 f32 GeoTIFF in EPSG:3857 covering WebMercator tile 2/1/1 (x in [-10018754..0], y in [0..10018754]).
+    let w = 64u32;
+    let h = 64u32;
+    let tile_span = 20_037_508.342789244 / 2.0; // z=2 tile width in EPSG:3857
+    let px = tile_span / (w as f64);
+    let tif_path = tmp.join("fresh_mosaic.tif");
+    let v1 = vec![10.0f32; (w * h) as usize];
+    write_synthetic_f32_projected_geotiff(
+        &tif_path,
+        w,
+        h,
+        3857,
+        -tile_span,
+        tile_span,
+        px,
+        &v1,
+    );
+
+    // Enable encoded tile_cache (16 MiB) to exercise warm tile_cache freshness on /mosaic/tiles!
+    let engine = Arc::new(TileEngine::with_store_and_tile_cache(
+        Arc::new(cogzilla_io::CogStore::new(16 * 1024 * 1024)),
+        16 * 1024 * 1024,
+    ));
+    let engine_check = engine.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let tif_url = tif_path.to_string_lossy().to_string();
+
+    // Warm /mosaic/tiles cache
+    let r1 = client
+        .get(format!("{base}/mosaic/tiles/2/1/1.png?url={tif_url}&rescale=0,100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let b1 = r1.bytes().await.unwrap();
+
+    // Overwrite local file with different values -> warm tile_cache MUST detect mtime/inode change!
+    let tmp_swap = tmp.join("fresh_mosaic_v2.tif");
+    let v2 = vec![90.0f32; (w * h) as usize];
+    write_synthetic_f32_projected_geotiff(
+        &tmp_swap,
+        w,
+        h,
+        3857,
+        -tile_span,
+        tile_span,
+        px,
+        &v2,
+    );
+    std::fs::rename(&tmp_swap, &tif_path).unwrap();
+
+    let r2 = client
+        .get(format!("{base}/mosaic/tiles/2/1/1.png?url={tif_url}&rescale=0,100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let b2 = r2.bytes().await.unwrap();
+    assert_ne!(
+        b1, b2,
+        "warm tile_cache on /mosaic/tiles must invalidate when backing file is replaced"
+    );
+
+    // POST /admin/clear-cache must bump invalidation_epoch (clearing datasets_by_uri)
+    let ep_before = engine_check
+        .store
+        .invalidation_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    let rc = client
+        .post(format!("{base}/admin/clear-cache"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rc.status(), 200);
+    assert!(
+        engine_check
+            .store
+            .invalidation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            > ep_before,
+        "POST /admin/clear-cache must clear CogStore open URIs and bump invalidation_epoch"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

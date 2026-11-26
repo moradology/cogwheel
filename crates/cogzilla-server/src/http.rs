@@ -4987,6 +4987,7 @@ where
     }
 
     if method == Method::POST && path == "/admin/clear-cache" {
+        engine.store.clear_open_uris();
         engine.store.cache.clear();
         engine.tile_cache.clear();
         engine.stac_cache.clear();
@@ -5065,11 +5066,9 @@ where
                     .body(serde_json::Value::Object(search_body).to_string())
                     .send()
                     .await
-                    .map_err(|e| {
-                        EngineError::BadRequest(format!(
-                            "STAC API search failed: {}",
-                            e.without_url()
-                        ))
+                    .map_err(|e| match cogzilla_io::io_error_from_reqwest(e) {
+                        io_err @ cogzilla_io::IoError::Forbidden(_) => EngineError::Io(io_err),
+                        other => EngineError::BadRequest(format!("STAC API search failed: {other}")),
                     })?;
                 if !resp.status().is_success() {
                     return Err(EngineError::BadRequest(format!(
@@ -5685,7 +5684,15 @@ where
             .await,
             ["mosaicjson", "tiles"] => async {
                 let bounds = if let Some(ref u) = mj_url {
-                    load_mosaicjson(&engine, u).await.ok().map(|m| m.bounds)
+                    match load_mosaicjson(&engine, u).await {
+                        Ok(m) => Some(m.bounds),
+                        Err(EngineError::Io(io))
+                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                        {
+                            return Err(EngineError::Io(io));
+                        }
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 };
@@ -5702,14 +5709,20 @@ where
             .await,
             ["mosaicjson", "tiles", tms] => async {
                 if let Some(tms_def) = crate::tms::lookup_tms(tms) {
-                    let (bounds, minz, maxz) = if let Some(ref u) = mj_url
-                        && let Ok(m) = load_mosaicjson(&engine, u).await
-                    {
-                        (
-                            Some(m.bounds),
-                            pq.minzoom.or(Some(m.minzoom)),
-                            pq.maxzoom.or(Some(m.maxzoom)),
-                        )
+                    let (bounds, minz, maxz) = if let Some(ref u) = mj_url {
+                        match load_mosaicjson(&engine, u).await {
+                            Ok(m) => (
+                                Some(m.bounds),
+                                pq.minzoom.or(Some(m.minzoom)),
+                                pq.maxzoom.or(Some(m.maxzoom)),
+                            ),
+                            Err(EngineError::Io(io))
+                                if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                            {
+                                return Err(EngineError::Io(io));
+                            }
+                            Err(_) => (None, pq.minzoom, pq.maxzoom),
+                        }
                     } else {
                         (None, pq.minzoom, pq.maxzoom)
                     };
@@ -5953,6 +5966,23 @@ where
             | ["mosaicjson", "tiles", zs, xs, ys] => {
                 let tms = if segs.len() == 6 { segs[2] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
+                if let (Some(u), Some(z), Some(x), Some((y, _, _))) = (
+                    mj_url.as_deref(),
+                    parse_u8_like(zs),
+                    parse_u32_like(xs),
+                    parse_y_scale_ext(ys),
+                ) && let Some(mj) = engine.mosaicjson_cache.get(u)
+                    && let Some(tms_def) = crate::tms::lookup_tms(tms)
+                    && let Some(b) = tms_def.tile_bounds(z, x, y, pq.buffer, 256)
+                {
+                    let urls = if tms_def.id == "WebMercatorQuad" {
+                        mj.query_bbox_3857(b[0], b[1], b[2], b[3])
+                    } else {
+                        mj.query_bbox_3857(-20_037_508.34, -20_037_508.34, 20_037_508.34, 20_037_508.34)
+                    };
+                    let _ = engine.store.ensure_uris_fresh(&urls).await;
+                    engine.sync_tile_cache_epoch();
+                }
                 let failed_assets = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
                 let failed_assets_inner = failed_assets.clone();
                 let cached = engine
@@ -6200,6 +6230,18 @@ where
                         pq.urls.len()
                     )))
                 } else {
+                    if let Err(e) = engine.store.ensure_uris_fresh(&pq.urls).await {
+                        engine.sync_tile_cache_epoch();
+                        if !matches!(e.root(), cogzilla_io::IoError::Fs(io) if io.kind() == std::io::ErrorKind::NotFound) {
+                            return Ok(to_http_response(
+                                &engine,
+                                Err(EngineError::Io(e)),
+                                if_none_match.as_deref(),
+                            ));
+                        }
+                    } else {
+                        engine.sync_tile_cache_epoch();
+                    }
                     let failed_assets = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
                     let failed_assets_inner = failed_assets.clone();
                     let cached = engine
@@ -6279,6 +6321,13 @@ where
             (None, _) => Err(EngineError::NotFound(format!("mosaic catalog '{cat_name}'"))),
             (Some(catalog), (Some(z), Some(x), Some((y, sc, ext)))) => {
                 let cache_key = format!("{path}?{raw_query}");
+                if z <= 30 {
+                    let (min_x, min_y, max_x, max_y) =
+                        cogzilla_proj::tile_bounds_3857(TileCoord { z, x, y });
+                    let urls = catalog.query_bbox_3857(min_x, min_y, max_x, max_y);
+                    let _ = engine.store.ensure_uris_fresh(&urls).await;
+                    engine.sync_tile_cache_epoch();
+                }
                 let failed_assets = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
                 let failed_assets_c = failed_assets.clone();
                 let cached = engine
@@ -7396,10 +7445,16 @@ where
 
             // GET /stac/tiles & /stac/tiles/{tms} (OGC TilesetList & Tileset, matching /cog/tiles*)
             (Method::GET, ["tiles"]) => async {
-                let bounds = if let Some(ref u) = stac_url
-                    && let Ok(item) = load_stac_item(&engine.stac_cache, &engine.store, u).await
-                {
-                    item.bbox
+                let bounds = if let Some(ref u) = stac_url {
+                    match load_stac_item(&engine.stac_cache, &engine.store, u).await {
+                        Ok(item) => item.bbox,
+                        Err(EngineError::Io(io))
+                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                        {
+                            return Err(EngineError::Io(io));
+                        }
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 };
@@ -7417,10 +7472,16 @@ where
             (Method::GET, ["tiles", tms]) => async {
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
-                let bounds = if let Some(ref u) = stac_url
-                    && let Ok(item) = load_stac_item(&engine.stac_cache, &engine.store, u).await
-                {
-                    item.bbox
+                let bounds = if let Some(ref u) = stac_url {
+                    match load_stac_item(&engine.stac_cache, &engine.store, u).await {
+                        Ok(item) => item.bbox,
+                        Err(EngineError::Io(io))
+                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                        {
+                            return Err(EngineError::Io(io));
+                        }
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 };
@@ -7641,6 +7702,13 @@ where
             (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
                 let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
                 let cache_key = format!("{path}?{raw_query}");
+                if let Some(u) = stac_url.as_deref()
+                    && let Some(item) = engine.stac_cache.get(u)
+                {
+                    let asset_urls: Vec<String> = item.assets.values().cloned().collect();
+                    let _ = engine.store.ensure_uris_fresh(&asset_urls).await;
+                    engine.sync_tile_cache_epoch();
+                }
                 let stac_tile_geo = TileGeoOpts::from_pq(&pq);
                 let cached = engine
                     .tile_cache
@@ -8780,11 +8848,19 @@ where
 
             // 4. GET /cog/tiles (OGC Tiles list)
             (Method::GET, ["tiles"]) => async {
-                let bounds = if let Ok(cogs) = open_query_urls(&engine, &pq.urls).await
-                    && let Ok(crs) = engine.get_or_build_crs(&cogs[0])
-                {
-                    let full = cogs[0].index.full_res();
-                    Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                let bounds = if !pq.urls.is_empty() {
+                    match open_query_urls(&engine, &pq.urls).await {
+                        Ok(cogs) => engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
+                            let full = cogs[0].index.full_res();
+                            crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                        }),
+                        Err(EngineError::Io(io))
+                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                        {
+                            return Err(EngineError::Io(io));
+                        }
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 };
@@ -8804,21 +8880,38 @@ where
             (Method::GET, ["tiles", tms]) => async {
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
-                let (bounds, minz, maxz) = if let Ok(cogs) = open_query_urls(&engine, &pq.urls).await
-                    && let Ok(crs) = engine.get_or_build_crs(&cogs[0])
-                {
-                    let full = cogs[0].index.full_res();
-                    let coarsest = cogs[0].index.ifds.last().unwrap();
-                    let ov = (full.width as f64 / coarsest.width.max(1) as f64)
-                        .max(full.height as f64 / coarsest.height.max(1) as f64);
-                    let (dmin, dmax) =
-                        tms_def.zoom_range_for_cog(&crs, &full.pixel_to_crs, full.width, full.height, ov);
-                    let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
-                    (
-                        Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
-                        Some(mn),
-                        Some(mx),
-                    )
+                let (bounds, minz, maxz) = if !pq.urls.is_empty() {
+                    match open_query_urls(&engine, &pq.urls).await {
+                        Ok(cogs) => {
+                            if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
+                                let full = cogs[0].index.full_res();
+                                let coarsest = cogs[0].index.ifds.last().unwrap();
+                                let ov = (full.width as f64 / coarsest.width.max(1) as f64)
+                                    .max(full.height as f64 / coarsest.height.max(1) as f64);
+                                let (dmin, dmax) = tms_def.zoom_range_for_cog(
+                                    &crs,
+                                    &full.pixel_to_crs,
+                                    full.width,
+                                    full.height,
+                                    ov,
+                                );
+                                let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                                (
+                                    Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
+                                    Some(mn),
+                                    Some(mx),
+                                )
+                            } else {
+                                (None, pq.minzoom, pq.maxzoom)
+                            }
+                        }
+                        Err(EngineError::Io(io))
+                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                        {
+                            return Err(EngineError::Io(io));
+                        }
+                        Err(_) => (None, pq.minzoom, pq.maxzoom),
+                    }
                 } else {
                     (None, pq.minzoom, pq.maxzoom)
                 };
