@@ -5165,7 +5165,12 @@ async fn tile(
                         kind = wider_type(kind, engine.store.open_uri(uri).await?.index.full_res().sample_type);
                     }
                     let kind = if pq.unscale { SampleType::Float32 } else { kind };
-                    let kind = band_math.map_or(kind, |math| band_math_type(std::iter::once(math), kind));
+                    // Where the math makes doubles the values are still the renderer's 32-bit
+                    // ones: written as float32, half the bytes of TiTiler's float64 and no less told.
+                    let kind = band_math.map_or(kind, |math| match band_math_type(std::iter::once(math), kind) {
+                        SampleType::Float64 => SampleType::Float32,
+                        other => other,
+                    });
                     let whole = band_math.is_none() && !matches!(kind, SampleType::Float32 | SampleType::Float64);
                     // A whole-number raster's values between pixels are rounded to its type.
                     let read = raw
