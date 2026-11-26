@@ -103,6 +103,8 @@ pub enum CodecError {
     Jpeg(String),
     #[error("WebP decompression failed")]
     Webp,
+    #[error("LERC decompression failed: {0}")]
+    Lerc(String),
     #[error("uncompressed tile size mismatch: expected {expected} bytes, got {got}")]
     SizeMismatch { expected: usize, got: usize },
 }
@@ -533,15 +535,207 @@ pub fn decode_tile_rows(
                     return Err(CodecError::Webp);
                 }
             }
+            Compression::Lerc | Compression::LercDeflate | Compression::LercZstd => {
+                let unwrapped: Option<Vec<u8>> = match ifd.compression {
+                    Compression::Lerc => None,
+                    Compression::LercDeflate => {
+                        let max_cap = expected_bytes.saturating_mul(2).clamp(65_536, MAX_DECODED_TILE_BYTES);
+                        let mut cap = expected_bytes.clamp(4096, max_cap);
+                        let buf = loop {
+                            let mut out = vec![0u8; cap];
+                            match st.deflate.zlib_decompress(compressed, &mut out) {
+                                Ok(n) => {
+                                    out.truncate(n);
+                                    break out;
+                                }
+                                Err(libdeflater::DecompressionError::InsufficientSpace) => {
+                                    if cap >= max_cap {
+                                        return Err(CodecError::Lerc(
+                                            "LERC_DEFLATE payload exceeds tile size cap".into(),
+                                        ));
+                                    }
+                                    cap = cap.saturating_mul(2).min(max_cap);
+                                }
+                                Err(e1) => match st.deflate.deflate_decompress(compressed, &mut out) {
+                                    Ok(n) => {
+                                        out.truncate(n);
+                                        break out;
+                                    }
+                                    Err(libdeflater::DecompressionError::InsufficientSpace) => {
+                                        if cap >= max_cap {
+                                            return Err(CodecError::Lerc(
+                                                "LERC_DEFLATE payload exceeds tile size cap".into(),
+                                            ));
+                                        }
+                                        cap = cap.saturating_mul(2).min(max_cap);
+                                    }
+                                    Err(_) => {
+                                        return Err(CodecError::Lerc(format!(
+                                            "LERC_DEFLATE outer inflate failed: {e1:?}"
+                                        )));
+                                    }
+                                },
+                            }
+                        };
+                        Some(buf)
+                    }
+                    Compression::LercZstd => {
+                        let max_cap = expected_bytes.saturating_mul(2).clamp(65_536, MAX_DECODED_TILE_BYTES);
+                        let content_sz = unsafe {
+                            zstd_sys::ZSTD_getFrameContentSize(
+                                compressed.as_ptr() as *const std::ffi::c_void,
+                                compressed.len(),
+                            )
+                        };
+                        let cap = if content_sz != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64
+                            && content_sz != zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64
+                        {
+                            let sz = content_sz as usize;
+                            if sz > max_cap {
+                                return Err(CodecError::Lerc(
+                                    "LERC_ZSTD payload exceeds tile size cap".into(),
+                                ));
+                            }
+                            sz.max(1)
+                        } else {
+                            max_cap
+                        };
+                        let mut out = vec![0u8; cap];
+                        let code = unsafe {
+                            zstd_sys::ZSTD_decompressDCtx(
+                                st.zstd_dctx,
+                                out.as_mut_ptr() as *mut std::ffi::c_void,
+                                out.len(),
+                                compressed.as_ptr() as *const std::ffi::c_void,
+                                compressed.len(),
+                            )
+                        };
+                        if unsafe { zstd_sys::ZSTD_isError(code) } != 0 {
+                            return Err(CodecError::Zstd(code));
+                        }
+                        out.truncate(code);
+                        Some(out)
+                    }
+                    _ => None,
+                };
+                let lerc_blob: &[u8] = unwrapped.as_deref().unwrap_or(compressed);
+                let decoded = lerc_reader::decode_first(lerc_blob)
+                    .map_err(|e| CodecError::Lerc(e.to_string()))?;
+                let w = decoded.info.width as usize;
+                let h = decoded.info.height as usize;
+                let depth = decoded.info.depth as usize;
+                if w == 0 || h == 0 || depth == 0 {
+                    return Err(CodecError::Lerc("empty LERC block".into()));
+                }
+                if w > ifd.tile_width as usize
+                    || h > tile_h as usize
+                    || depth != bands_in_tile
+                {
+                    return Err(CodecError::Lerc(format!(
+                        "LERC shape {}x{}x{} does not match tile {}x{}x{}",
+                        w, h, depth, ifd.tile_width, tile_h, bands_in_tile
+                    )));
+                }
+                raw_slice.fill(0);
+                let tile_w = ifd.tile_width as usize;
+                let mask = decoded.mask.as_deref();
+                let copy_row_major = |raw: &mut [u8], bps: usize, write_sample: &dyn Fn(usize, &mut [u8])| {
+                    for row in 0..h {
+                        for col in 0..w {
+                            let src_px = row * w + col;
+                            let dst_px = row * tile_w + col;
+                            for b in 0..depth {
+                                let si = src_px * depth + b;
+                                let di = (dst_px * depth + b) * bps;
+                                write_sample(si, &mut raw[di..di + bps]);
+                            }
+                        }
+                    }
+                };
+                let is_masked = |si: usize| -> bool {
+                    mask.is_some_and(|m| m.get(si / depth).copied().unwrap_or(1) == 0)
+                };
+                use lerc_core::PixelData;
+                match (&decoded.pixels, ifd.sample_type) {
+                    (PixelData::F32(v), SampleType::Float32) => {
+                        copy_row_major(raw_slice, 4, &|si, dst| {
+                            let val = if is_masked(si) { f32::NAN } else { v[si] };
+                            dst.copy_from_slice(&val.to_le_bytes());
+                        });
+                    }
+                    (PixelData::F64(v), SampleType::Float64) => {
+                        copy_row_major(raw_slice, 8, &|si, dst| {
+                            let val = if is_masked(si) { f64::NAN } else { v[si] };
+                            dst.copy_from_slice(&val.to_le_bytes());
+                        });
+                    }
+                    (PixelData::U8(v), SampleType::Uint8) => {
+                        let nd = nodata.map(|n| n as u8).unwrap_or(0);
+                        copy_row_major(raw_slice, 1, &|si, dst| {
+                            dst[0] = if is_masked(si) { nd } else { v[si] };
+                        });
+                    }
+                    (PixelData::I8(v), SampleType::Int8) => {
+                        let nd = nodata.map(|n| n as i8).unwrap_or(0);
+                        copy_row_major(raw_slice, 1, &|si, dst| {
+                            dst[0] = (if is_masked(si) { nd } else { v[si] }) as u8;
+                        });
+                    }
+                    (PixelData::U16(v), SampleType::Uint16) => {
+                        let nd = nodata.map(|n| n as u16).unwrap_or(0);
+                        copy_row_major(raw_slice, 2, &|si, dst| {
+                            let val = if is_masked(si) { nd } else { v[si] };
+                            dst.copy_from_slice(&val.to_le_bytes());
+                        });
+                    }
+                    (PixelData::I16(v), SampleType::Int16) => {
+                        let nd = nodata.map(|n| n as i16).unwrap_or(0);
+                        copy_row_major(raw_slice, 2, &|si, dst| {
+                            let val = if is_masked(si) { nd } else { v[si] };
+                            dst.copy_from_slice(&val.to_le_bytes());
+                        });
+                    }
+                    (PixelData::U32(v), SampleType::Uint32) => {
+                        let nd = nodata.map(|n| n as u32).unwrap_or(0);
+                        copy_row_major(raw_slice, 4, &|si, dst| {
+                            let val = if is_masked(si) { nd } else { v[si] };
+                            dst.copy_from_slice(&val.to_le_bytes());
+                        });
+                    }
+                    (PixelData::I32(v), SampleType::Int32) => {
+                        let nd = nodata.map(|n| n as i32).unwrap_or(0);
+                        copy_row_major(raw_slice, 4, &|si, dst| {
+                            let val = if is_masked(si) { nd } else { v[si] };
+                            dst.copy_from_slice(&val.to_le_bytes());
+                        });
+                    }
+                    (other, st) => {
+                        return Err(CodecError::Lerc(format!(
+                            "LERC pixel type {:?} does not match TIFF sample type {:?}",
+                            other.data_type(),
+                            st
+                        )));
+                    }
+                }
+            }
         }
 
-        let mut bands = match (ifd.sample_type, ifd.predictor) {
+        let (eff_byte_order, eff_predictor) = if matches!(
+            ifd.compression,
+            Compression::Lerc | Compression::LercDeflate | Compression::LercZstd
+        ) {
+            (ByteOrder::Little, Predictor::None)
+        } else {
+            (byte_order, ifd.predictor)
+        };
+
+        let mut bands = match (ifd.sample_type, eff_predictor) {
             (SampleType::Float32, Predictor::None) => predictor::reconstruct_predictor1(
                 raw_slice,
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 recon_nodata,
             ),
             (SampleType::Float32, Predictor::HorizontalInt) => predictor::reconstruct_predictor2(
@@ -549,7 +743,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 recon_nodata,
             ),
             (SampleType::Float32, Predictor::FloatingPoint) => predictor::reconstruct_predictor3(
@@ -564,7 +758,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 false,
                 recon_nodata,
             ),
@@ -573,7 +767,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 true,
                 recon_nodata,
             ),
@@ -582,7 +776,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 false,
                 recon_nodata,
             ),
@@ -591,7 +785,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 p == Predictor::HorizontalInt,
                 recon_nodata,
             ),
@@ -616,7 +810,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 false,
                 p == Predictor::HorizontalInt,
                 recon_nodata,
@@ -626,7 +820,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 true,
                 p == Predictor::HorizontalInt,
                 recon_nodata,
@@ -636,7 +830,7 @@ pub fn decode_tile_rows(
                 ifd.tile_width,
                 tile_h,
                 bands_in_tile,
-                byte_order,
+                eff_byte_order,
                 p,
                 recon_nodata,
             ),

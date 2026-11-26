@@ -286,6 +286,9 @@ pub fn build_cog_validate(
         cogzilla_tiff::Compression::PackBits => Some("PACKBITS"),
         cogzilla_tiff::Compression::Zstd => Some("ZSTD"),
         cogzilla_tiff::Compression::Webp => Some("WEBP"),
+        cogzilla_tiff::Compression::Lerc => Some("LERC"),
+        cogzilla_tiff::Compression::LercDeflate => Some("LERC_DEFLATE"),
+        cogzilla_tiff::Compression::LercZstd => Some("LERC_ZSTD"),
     };
     let color_space = match full.photometric {
         0 => "MinIsWhite",
