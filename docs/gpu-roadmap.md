@@ -30,5 +30,6 @@ This document tracks GPU acceleration experiments and PRs targeting the `gpu-imp
 | 8 | GPU TIFF Predictor 2/3 unshuffle | Bit-exact zero-scratch single-pass WGSL Predictor 2 & 3 unshuffle + nodata normalization (66.8 GB/s VRAM-only on RTX 3090 Ti) | Merged | #223 |
 | 9 | Multi-block stitching & large-crop GPU API | Multi-block `BandSource` stitching (all dtypes: `F32`/`U16`/`U8`/sparse/scale) + arbitrary-size `/preview`/`/bbox` crop PNG acceleration (up to 87.6× at 4096²) | Merged | #225 |
 | 10 | Curved 17×17 `Grid2D` & `Exact2D` reprojection | In-shader 17×17 bilinear warp grid + `Exact2D` unlocking GPU acceleration for all 3,260+ projected CRS (UTM/Albers/LCC/Polar; up to 436× on RTX 3090 Ti) | Merged | #228 |
-| 11 | Curved `Grid2D`/`Exact2D` DEM & terrain shaders | 17×17 warp-grid + seamless 1-px border extrapolation in `terrain.wgsl` + `TileEngine::try_render_dem` (up to 137× on RTX 3090 Ti, 58.8× on M5) | Merged | (this PR) |
-| 12 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
+| 11 | Curved `Grid2D`/`Exact2D` DEM & terrain shaders | 17×17 warp-grid + seamless 1-px border extrapolation in `terrain.wgsl` + `TileEngine::try_render_dem` (up to 137× on RTX 3090 Ti, 58.8× on M5) | Merged | #231 |
+| 12 | `TileEngine` `CustomExpr` & 3-band `Rgb` GPU wiring | Zero-recompile `ExprProgram` → `GpuInstr` translator + `try_render_expr`/`try_render_rgb` in `TileEngine::render_tile` (up to 36.3× on RTX 3090 Ti, 13.3× on M5 end-to-end PNG) | Merged | (this PR) |
+| 13 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
