@@ -26,6 +26,6 @@ This document tracks GPU acceleration experiments and PRs targeting the `gpu-imp
 | 4 | GPU-resident slab cache + micro-batching | Thread-safe byte-bounded LRU `GpuSlabCache` + 3D `GpuTileBatcher` (`dispatch_workgroups(wg_x, wg_y, K)`) amortizing submit floor | Merged | #216 |
 | 5 | Fused `expr_vm` + `color_formula` + colormap | Multi-band WGSL bytecode VM (zero shader recompile) + fused 3-band RGB `Gamma`/`Sigmoidal`/CIE LCH `Saturation` | Merged | #217 |
 | 6 | Multi-COG / STAC / Mosaic compositing | `GpuSceneStack` + `GpuMosaicCompositor` (`First`/`Highest`/`Lowest`/`Mean`/`Median`/`Stdev`/`Count`) with fused `f32`/`RGBA8`/`IndexedU8` | Merged | #219 |
-| 7 | `cogzilla-server` `--features gpu` integration | Opt-in `GpuBackend` in `TileEngine` (adaptive `DispatchPolicy`, `GpuSlabCache`, fused colormap + DEM/terrain PNG/WebP/JPEG) | Merged | (this PR) |
-| 8 | GPU TIFF Predictor 2/3 unshuffle | Parallel byte-unshuffle + prefix-sum in compute shaders (and batched DEFLATE/ZSTD decode exploration on CUDA) | Planned | — |
+| 7 | `cogzilla-server` `--features gpu` integration | Opt-in `GpuBackend` in `TileEngine` (adaptive `DispatchPolicy`, `GpuSlabCache`, fused colormap + DEM/terrain PNG/WebP/JPEG) | Merged | #221 |
+| 8 | GPU TIFF Predictor 2/3 unshuffle | Bit-exact zero-scratch single-pass WGSL Predictor 2 & 3 unshuffle + nodata normalization (66.8 GB/s VRAM-only on RTX 3090 Ti) | Merged | (this PR) |
 | 9 | Hardware JPEG decode/encode | Explore Apple Media Engine / `nvJPEG` for JPEG COGs and `.jpg` tile output | Planned | — |
