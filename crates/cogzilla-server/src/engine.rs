@@ -1109,6 +1109,20 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_sar_rgb::<N>(
+                                cog.id,
+                                ifd_idx,
+                                *bands_1based,
+                                &plan,
+                                &srcs,
+                                &style,
+                            ) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
                     }
                     PlanarConfig::Planar => {
@@ -1143,6 +1157,20 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_sar_rgb::<N>(
+                                cog.id,
+                                ifd_idx,
+                                *bands_1based,
+                                &plan,
+                                &srcs,
+                                &style,
+                            ) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
                     }
                 }

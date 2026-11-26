@@ -2544,6 +2544,221 @@ impl GpuBackend {
         }
         Some(out)
     }
+
+    /// Attempt GPU-accelerated 2-band Dual-Pol SAR False-Color RGB (`[VV_dB, VH_dB, VV_dB - VH_dB]`)
+    /// tile rendering across all `CoordPlan` variants (`Separable1D`, `Grid2D`, `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_sar_rgb<const N: usize>(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: [u16; 2],
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>; 2],
+        style: &RgbStyle,
+    ) -> Option<Bytes> {
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        };
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
+        self.try_render_bbox_sar_rgb(cache_key, coords, srcs, style, None, true)
+    }
+
+    /// Attempt GPU-accelerated Dual-Pol SAR False-Color RGB (with optional fused `ColorFormula`
+    /// and `GpuMultiBandCache`) for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_sar_rgb(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>; 2],
+        style: &RgbStyle,
+        color_formula: Option<&ColorFormula>,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(style.resample)?;
+        let gpu_formula = Self::translate_color_formula(color_formula)?;
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h, 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        if !matches!(
+            style.format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) {
+            return None;
+        }
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let upload_bytes = band_upload_bytes + coord_upload_bytes;
+        let readback_bytes = dst_w * dst_h * 4;
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: dst_w * dst_h,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let mut expr_guard = self.expr.lock().ok()?;
+        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
+            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
+            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
+            (slab, bc, br)
+        } else {
+            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(2);
+            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+            for src in srcs {
+                let (buf, bc, br, w, h) = stitch_band_source(src)?;
+                if let Some(g) = common_geom {
+                    if g != (bc, br, w, h) {
+                        return None;
+                    }
+                } else {
+                    common_geom = Some((bc, br, w, h));
+                }
+                stitched_vecs.push(buf);
+            }
+            let (base_col, base_row, w, h) = common_geom?;
+            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
+            if let Some(k) = cache_key {
+                self.multi_slab_cache.insert(k, Arc::clone(&slab));
+            }
+            (slab, base_col, base_row)
+        };
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let raw = match coords {
+            BboxCoordSource::Separable { u, v } => {
+                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
+                expr_guard
+                    .render_sar_rgb_formula_with_plan(
+                        &multi_slab,
+                        GpuCoordPlan::Separable1D {
+                            u_coords: &u_local,
+                            v_coords: &v_local,
+                        },
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &gpu_formula,
+                    )
+                    .ok()?
+            }
+            BboxCoordSource::Grid2D {
+                dst_w,
+                dst_h,
+                grid_u,
+                grid_v,
+            } => {
+                let mut gu = [0.0f32; 289];
+                let mut gv = [0.0f32; 289];
+                for i in 0..289 {
+                    gu[i] = grid_u[i] - bc;
+                    gv[i] = grid_v[i] - br;
+                }
+                expr_guard
+                    .render_sar_rgb_formula_with_plan(
+                        &multi_slab,
+                        GpuCoordPlan::Grid2D {
+                            dst_w,
+                            dst_h,
+                            grid_u: &gu,
+                            grid_v: &gv,
+                        },
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &gpu_formula,
+                    )
+                    .ok()?
+            }
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                let n = dst_w * dst_h;
+                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
+                expr_guard
+                    .render_sar_rgb_formula_with_plan(
+                        &multi_slab,
+                        GpuCoordPlan::Exact2D {
+                            dst_w,
+                            dst_h,
+                            u: &u_local,
+                            v: &v_local,
+                        },
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &gpu_formula,
+                    )
+                    .ok()?
+            }
+        };
+        drop(expr_guard);
+
+        Some(if style.format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3253,6 +3468,106 @@ mod tests {
                     .expect("warm single tile should render on GPU");
                 assert_eq!(batch[idx], single, "batched tile {idx} differed from single render");
             }
+        }
+    }
+
+    #[test]
+    fn sar_rgb_and_color_formula_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU SAR RGB test (no adapter)");
+            return;
+        };
+
+        let w = 256u32;
+        let h = 256u32;
+        let mk_band = |base: f32, amp: f32| -> DecodedBand {
+            let mut vals = vec![0u16; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    vals[(y * w + x) as usize] = (base
+                        + amp * (x as f32 * 0.03).sin()
+                        + (amp * 0.5) * (y as f32 * 0.04).cos())
+                        .max(5.0) as u16;
+                }
+            }
+            DecodedBand {
+                width: w,
+                height: h,
+                data: BandData::U16 {
+                    data: vals.into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 5.0,
+                    max: 2500.0,
+                },
+            }
+        };
+        let b0 = mk_band(1000.0, 400.0);
+        let b1 = mk_band(250.0, 120.0);
+        let bl0 = [Some(&b0)];
+        let bl1 = [Some(&b1)];
+        let srcs = [
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl0),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl1),
+        ];
+
+        let n = 512usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| 4.0 + (i as f32 / n as f32) * 246.0).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| 4.0 + (i as f32 / n as f32) * 246.0).collect();
+        let style = RgbStyle {
+            rescale_min: [15.0, 10.0, 0.0],
+            rescale_max: [35.0, 30.0, 15.0],
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        let cf = ColorFormula::parse("Gamma RGB 1.3 Saturation 1.15").unwrap();
+        let key = GpuBackend::multiband_key(5555, 0, &[1, 2], &srcs);
+
+        if let Some(rgba) = gpu.try_render_bbox_sar_rgb(
+            key,
+            BboxCoordSource::Separable {
+                u: &u_coords,
+                v: &v_coords,
+            },
+            &srcs,
+            &style,
+            Some(&cf),
+            true,
+        ) {
+            assert_eq!(rgba.len(), n * n * 4);
+            let inv = [
+                255.0 / (style.rescale_max[0] - style.rescale_min[0]),
+                255.0 / (style.rescale_max[1] - style.rescale_min[1]),
+                255.0 / (style.rescale_max[2] - style.rescale_min[2]),
+            ];
+            let mut max_diff = 0i32;
+            for py in (8..n - 8).step_by(23) {
+                for px in (8..n - 8).step_by(23) {
+                    let p0 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[0], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let p1 = cogzilla_kernel::sample_general_scaled(
+                        &srcs[1], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                    );
+                    let vv = 10.0 * p0.log10();
+                    let vh = 10.0 * p1.log10();
+                    let (cr, cg, cb) = cf.apply_rgb(
+                        ((vv - style.rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8,
+                        ((vh - style.rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8,
+                        (((vv - vh) - style.rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8,
+                    );
+                    let off = (py * n + px) * 4;
+                    assert_eq!(rgba[off + 3], 255);
+                    max_diff = max_diff
+                        .max((cr as i32 - rgba[off] as i32).abs())
+                        .max((cg as i32 - rgba[off + 1] as i32).abs())
+                        .max((cb as i32 - rgba[off + 2] as i32).abs());
+                }
+            }
+            assert!(max_diff <= 4, "SAR RGB + ColorFormula max channel diff {max_diff} > 4");
         }
     }
 }

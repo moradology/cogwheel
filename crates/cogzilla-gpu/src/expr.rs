@@ -151,6 +151,7 @@ pub struct GpuExprRenderer {
     expr_indexed_pipeline: wgpu::ComputePipeline,
     expr_f32_pipeline: wgpu::ComputePipeline,
     rgb_formula_pipeline: wgpu::ComputePipeline,
+    sar_rgb_formula_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     instr_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
@@ -290,6 +291,15 @@ impl GpuExprRenderer {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let sar_rgb_formula_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cogzilla-sar-rgb-formula"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("sar_rgb_color_formula_rgba8"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-expr-params"),
@@ -325,6 +335,7 @@ impl GpuExprRenderer {
             expr_indexed_pipeline,
             expr_f32_pipeline,
             rgb_formula_pipeline,
+            sar_rgb_formula_pipeline,
             params_buf,
             instr_buf,
             lut_buf,
@@ -771,6 +782,113 @@ impl GpuExprRenderer {
         self.dispatch_and_readback(
             slab,
             &self.rgb_formula_pipeline,
+            (dst_w as u32).div_ceil(16),
+            (dst_h as u32).div_ceil(16),
+            dst_w,
+            dst_h,
+            dst_w,
+            GpuPixelOutput::Rgba8,
+        )
+    }
+
+    /// Fused 2-band Dual-Pol SAR False-Color RGB (`[VV_dB, VH_dB, VV_dB - VH_dB]`) +
+    /// `GpuColorFormula` with an arbitrary `GpuCoordPlan` (`Separable1D`, `Grid2D`, `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_sar_rgb_formula_with_plan(
+        &mut self,
+        slab: &GpuMultiBandSlab,
+        plan: GpuCoordPlan<'_>,
+        resample: GpuColormapMode,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        formula: &GpuColorFormula,
+    ) -> Result<Vec<u8>, GpuError> {
+        let (dst_w, dst_h, coord_mode, u_slice, v_slice): (usize, usize, u32, &[f32], &[f32]) =
+            match plan {
+                GpuCoordPlan::Separable1D {
+                    u_coords: u,
+                    v_coords: v,
+                } => (u.len(), v.len(), 0, u, v),
+                GpuCoordPlan::Grid2D {
+                    dst_w,
+                    dst_h,
+                    grid_u,
+                    grid_v,
+                } => (dst_w, dst_h, 1, grid_u.as_slice(), grid_v.as_slice()),
+                GpuCoordPlan::Exact2D { dst_w, dst_h, u, v } => {
+                    if u.len() != dst_w * dst_h || v.len() != dst_w * dst_h {
+                        return Err(GpuError::InvalidDimensions(
+                            "Exact2D u/v slice lengths must equal dst_w * dst_h".into(),
+                        ));
+                    }
+                    (dst_w, dst_h, 2, u, v)
+                }
+            };
+        if slab.num_bands < 2 || dst_w == 0 || dst_h == 0 {
+            return Err(GpuError::InvalidDimensions(
+                "render_sar_rgb_formula requires >= 2 bands and non-zero output dims".into(),
+            ));
+        }
+        let out_words = dst_w * dst_h;
+        self.ensure_capacities(u_slice.len(), v_slice.len(), out_words);
+
+        let inv = |min: f32, max: f32| {
+            let d = max - min;
+            255.0 / if d.is_finite() && d.abs() > 1e-20 { d } else { 1.0 }
+        };
+        let mut flags = 0u32;
+        if let Some(lut) = &formula.rgb_lut {
+            flags |= 1;
+            self.queue
+                .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut));
+        }
+        let sat = if let Some(s) = formula.saturation {
+            flags |= 2;
+            s
+        } else {
+            1.0
+        };
+        let resample_mode = match resample {
+            GpuColormapMode::Bilinear => 0u32,
+            GpuColormapMode::Cubic => 1u32,
+            GpuColormapMode::Lanczos3 => 2u32,
+        };
+        let params = ExprParams {
+            src_w: slab.width,
+            src_h: slab.height,
+            src_stride: slab.stride,
+            band_stride: slab.band_stride,
+            dst_w: dst_w as u32,
+            dst_h: dst_h as u32,
+            num_bands: 2,
+            num_instrs: 0,
+            resample_mode,
+            formula_flags: flags,
+            coord_mode,
+            _pad1: 0,
+            rescale_min: 0.0,
+            inv_range_255: 1.0,
+            inv_range_254: 1.0,
+            saturation: sat,
+            rgb_min: [rescale_min[0], rescale_min[1], rescale_min[2], 0.0],
+            rgb_inv_255: [
+                inv(rescale_min[0], rescale_max[0]),
+                inv(rescale_min[1], rescale_max[1]),
+                inv(rescale_min[2], rescale_max[2]),
+                0.0,
+            ],
+        };
+
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.u_buf, 0, bytemuck::cast_slice(u_slice));
+        self.queue
+            .write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v_slice));
+
+        self.dispatch_and_readback(
+            slab,
+            &self.sar_rgb_formula_pipeline,
             (dst_w as u32).div_ceil(16),
             (dst_h as u32).div_ceil(16),
             dst_w,
