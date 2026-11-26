@@ -6221,9 +6221,9 @@ fn without_search_options(raw_query: &str) -> String {
     kept.join("&")
 }
 
-/// Whether an item request is for a tile or a box whose assets carry band math, or bands
-/// of their own on more than one of them. A box is one with a format in its path, as
-/// titiler-pgstac's item routes have it.
+/// Whether an item request is one the search routes draw: a tile or a box whose assets
+/// carry band math, or bands of their own on more than one of them, or one asked for as an
+/// array. A box is one with a format in its path, as titiler-pgstac's item routes have it.
 fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
     let picture = match rest {
         ["tiles", "WebMercatorQuad", _, _, _] => true,
@@ -6236,6 +6236,17 @@ fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
     };
     if !picture {
         return false;
+    }
+    // An array, as `.npy` or as a GeoTIFF, is written by the search routes in the data's
+    // own type, as titiler-pgstac writes it; the `/stac` routes write float32.
+    let format = rest
+        .last()
+        .and_then(|last| last.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+        .filter(|ext| !ext.contains(','))
+        .or_else(|| query_value(pairs, "format").or_else(|| query_value(pairs, "f")));
+    if matches!(format, Some("npy" | "tif" | "tiff")) {
+        return true;
     }
     let Ok(specs) = parse_assets(pairs) else { return false };
     specs.iter().any(|s| s.expression.is_some()) || (specs.len() > 1 && specs.iter().any(|s| s.indexes.is_some()))
@@ -7545,6 +7556,17 @@ mod tests {
     fn item_pictures_with_options_on_assets_go_to_the_search_routes() {
         let by_asset = |rest: &[&str], q: &str| item_picture_by_asset(rest, &query_pairs(q));
         let tile = ["tiles", "WebMercatorQuad", "11", "1059", "746.png"];
+        // An array, as `.npy` or a GeoTIFF, whatever its assets: of a tile or a box.
+        for array in ["746.npy", "746.tif", "746.tiff"] {
+            assert!(by_asset(&["tiles", "WebMercatorQuad", "11", "1059", array], "assets=red"), "{array}");
+        }
+        assert!(by_asset(&["tiles", "WebMercatorQuad", "11", "1059", "746"], "assets=red&format=npy"));
+        assert!(by_asset(&["bbox", "6.3,43.6,6.5,43.8.npy"], "assets=red"));
+        assert!(by_asset(&["bbox", "6.3,43.6,6.5,43.8", "64x64.tif"], "assets=red"));
+        assert!(!by_asset(&["bbox", "6.3,43.6,6.5,43.8", "64x64.png"], "assets=red"));
+        assert!(!by_asset(&["bbox", "6.3,43.6,6.5,43.8", "64x64"], "assets=red&format=npy"));
+        assert!(!by_asset(&["preview.npy"], "assets=red"));
+        assert!(!by_asset(&tile, "assets=red"));
         // Band math on an asset, and bands chosen on more than one.
         assert!(by_asset(&tile, "assets=red%7Cexpression=b1*2"));
         assert!(by_asset(&tile, "assets=visual%7Cbidx=1&assets=red%7Cbidx=1"));
