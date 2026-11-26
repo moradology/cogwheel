@@ -4472,6 +4472,11 @@ where
     let if_none_match = if is_post { None } else { if_none_match };
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
+    let raw_query = if path.starts_with("/searches/") || path.starts_with("/collections/") {
+        pgstac::plain_numbers(&raw_query)
+    } else {
+        raw_query
+    };
 
     if method == Method::OPTIONS {
         let mut resp = plain_resp(StatusCode::NO_CONTENT, Bytes::new(), "text/plain");

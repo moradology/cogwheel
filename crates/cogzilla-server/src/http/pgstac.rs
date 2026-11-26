@@ -183,6 +183,30 @@ fn query_pairs(raw_query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The query with its numbers written plainly. titiler-pgstac reads a number as Python
+/// does, with space around it, `_` between digits and a whole one as `256.0`; the shared
+/// parser reads only the plain spelling, so that is what it is given. A value that is not
+/// a number is left for the route to refuse.
+pub(super) fn plain_numbers(raw_query: &str) -> String {
+    let plain = |part: &str| -> Option<String> {
+        let (key, value) = part.split_once('=')?;
+        let value = percent_decode(value);
+        let written = match key {
+            "tilesize" | "padding" | "items_limit" | "scan_limit" | "time_limit" if py_whole(&value) => {
+                let n = py_number(&value)?;
+                // More padding than the widest kernel reads changes no pixel.
+                let n = if key == "padding" { n.min(64.0) } else { n };
+                (n.abs() < 1e15).then(|| format!("{}", n as i64))?
+            }
+            "buffer" => py_number(&value).filter(|n| n.is_finite()).map(|n| format!("{n}"))?,
+            _ => return None,
+        };
+        (written != value).then(|| format!("{key}={written}"))
+    };
+    let parts: Vec<String> = raw_query.split('&').map(|part| plain(part).unwrap_or_else(|| part.to_string())).collect();
+    parts.join("&")
+}
+
 fn query_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }

@@ -889,6 +889,11 @@ def main() -> int:
         for twice in ("buffer=0&buffer=1", "padding=0&padding=1", "buffer=1&buffer=0"):
             o.check(f"tile with {twice}", "status", f"{base12}.png?assets=red&{twice}")
             o.check(f"tilejson with {twice}", "status", f"/searches/{sid}/WebMercatorQuad/tilejson.json?assets=red&{twice}")
+        # Numbers as Python reads them.
+        for spelt in ("tilesize=%20256", "tilesize=2_56", "tilesize=512.0", "padding=100", "buffer=1_0", "buffer=%2B1",
+                      "items_limit=5%20", "scan_limit=1_000", "time_limit=%2010", "tilesize=1e2", "padding=1.5", "buffer=abc"):
+            o.check(f"tile with {spelt}", "status", f"{base12}.png?assets=red&{spelt}")
+        o.check("tile, a size written with space around it", "image", f"{base12}.png?assets=visual&tilesize=%20512")
         for fmt in ("tif", "tiff", "pngraw"):
             o.check(f"WMTS with tile_format={fmt}", "status", f"/searches/{sid}/WMTSCapabilities.xml?assets=red&tile_format={fmt}")
         for date in ("20241201", "2024-12-01_00:00:00Z", "", "../.."):
