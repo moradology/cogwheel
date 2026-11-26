@@ -5028,9 +5028,9 @@ where
                                                 .is_some_and(|obj| {
                                                     obj.values().any(|b| {
                                                         b.get("valid_pixels")
-                                                            .and_then(|v| v.as_u64())
-                                                            .unwrap_or(0)
-                                                            > 0
+                                                            .and_then(|v| v.as_f64())
+                                                            .unwrap_or(0.0)
+                                                            > 0.0
                                                     })
                                                 });
                                             if has_valid {
@@ -6783,6 +6783,22 @@ where
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
                             let compiled = expr_progs_c.unwrap();
+                            // Fast exact analytical coverage + ellipsoidal area-weighted native-grid path
+                            // (shared with POST /cog/statistics) whenever assets share the same pixel grid.
+                            if let Some(exact) = crate::zonal::compute_native_exact_multi_cog_expr_stats(
+                                &eng,
+                                &cogs_c,
+                                &mask,
+                                max_size,
+                                unscale,
+                                nodata,
+                                &compiled,
+                                &stats_opts,
+                            )
+                            .await?
+                            {
+                                return Ok::<_, EngineError>(exact);
+                            }
                             let mut map = serde_json::Map::new();
                             for (idx, (desc, prog)) in compiled.into_iter().enumerate() {
                                 let mut bands = BandRequest::CustomExpr {

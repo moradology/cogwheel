@@ -2616,3 +2616,153 @@ async fn sweep15_t1_t2_t3_t4_self_contained() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn sweep16_u1_stac_post_expr_and_u2a_gcp_message() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_sweep16_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Two aligned 64x64 UTM 10N single-band assets (`red` = 30.0, `green` = 10.0) in a STAC item
+    let w = 64u32;
+    let h = 64u32;
+    let ox = 500_000.0_f64;
+    let oy = 4_200_000.0_f64;
+    let px = 30.0_f64;
+    let red_path = tmp.join("red.tif");
+    let green_path = tmp.join("green.tif");
+    write_synthetic_f32_projected_geotiff(&red_path, w, h, 32610, ox, oy, px, &vec![30.0f32; 4096]);
+    write_synthetic_f32_projected_geotiff(&green_path, w, h, 32610, ox, oy, px, &vec![10.0f32; 4096]);
+
+    let stac_path = tmp.join("item.json");
+    let stac = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "u1-test",
+        "bbox": [-123.0, 37.9, -122.9, 38.0],
+        "geometry": null,
+        "properties": {},
+        "assets": {
+            "red": { "href": red_path.to_string_lossy(), "type": "image/tiff; application=geotiff" },
+            "green": { "href": green_path.to_string_lossy(), "type": "image/tiff; application=geotiff" }
+        }
+    });
+    std::fs::write(&stac_path, stac.to_string()).unwrap();
+
+    // Synthetic GCP-only TIFF (ModelTiepointTag with 4 GCPs = 24 f64s, no ModelPixelScaleTag)
+    let gcp_path = tmp.join("gcp_only.tif");
+    {
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let num_entries: u16 = 11;
+        let data_start = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
+        let tp_off = data_start;
+        let pix_off = tp_off + 24 * 8;
+        let push = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push(&mut buf, 256, 4, 1, 8);
+        push(&mut buf, 257, 4, 1, 8);
+        push(&mut buf, 258, 3, 1, 32);
+        push(&mut buf, 259, 3, 1, 1);
+        push(&mut buf, 262, 3, 1, 1);
+        push(&mut buf, 273, 4, 1, pix_off);
+        push(&mut buf, 277, 3, 1, 1);
+        push(&mut buf, 278, 4, 1, 8);
+        push(&mut buf, 279, 4, 1, 8 * 8 * 4);
+        push(&mut buf, 339, 3, 1, 3);
+        push(&mut buf, 33922, 12, 24, tp_off); // 4 GCPs
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for gcp in [
+            [0.0f64, 0.0, 0.0, -122.5, 37.9, 0.0],
+            [8.0, 0.0, 0.0, -122.4, 37.9, 0.0],
+            [0.0, 8.0, 0.0, -122.5, 37.8, 0.0],
+            [8.0, 8.0, 0.0, -122.4, 37.8, 0.0],
+        ] {
+            for v in gcp {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for _ in 0..64 {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        std::fs::write(&gcp_path, &buf).unwrap();
+    }
+
+    let engine = Arc::new(TileEngine::new(32 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine_srv = engine.clone();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine_srv, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let stac_url = stac_path.to_string_lossy().to_string();
+    let gcp_url = gcp_path.to_string_lossy().to_string();
+
+    // U1: Tilted quad in pixel space -> exact shoelace area = 305.5 px (definitely not 4096 or 16M!)
+    let pts = [(10.0, 10.0), (30.0, 12.0), (28.0, 27.0), (9.0, 25.0)];
+    let mut ring: Vec<[f64; 2]> = pts.iter().map(|&(c, r)| [ox + c * px, oy - r * px]).collect();
+    ring.push(ring[0]);
+    let poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": { "type": "Polygon", "coordinates": [ring] }
+    });
+    // Exact shoelace area in pixel space:
+    let mut area2 = 0.0_f64;
+    for i in 0..pts.len() {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % pts.len()];
+        area2 += x0 * y1 - x1 * y0;
+    }
+    let true_px = 0.5 * area2.abs();
+
+    for (label, query, expected_mean) in [
+        ("single-asset red/2", "assets=red&asset_as_band=true&expression=red/2", 15.0),
+        ("two-asset red_b1-green_b1", "expression=(red_b1-green_b1)/(red_b1%2Bgreen_b1)", 0.5),
+        ("two-asset asset_as_band", "assets=red&assets=green&asset_as_band=true&expression=(red-green)/(red%2Bgreen)", 0.5),
+    ] {
+        let r = client
+            .post(format!("{base}/stac/statistics?url={stac_url}&{query}&max_size=0&coord_crs=EPSG:32610"))
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(&poly).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "U1 {label}");
+        let j: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+        let b1 = &j["properties"]["statistics"]["b1"];
+        let cnt = b1["count"].as_f64().unwrap();
+        let mean = b1["mean"].as_f64().unwrap();
+        assert!(
+            (cnt - true_px).abs() < 1e-4,
+            "U1 {label}: expected count={true_px}, got {cnt}"
+        );
+        assert!(
+            (mean - expected_mean).abs() < 1e-5,
+            "U1 {label}: expected mean={expected_mean}, got {mean}"
+        );
+    }
+
+    // U2(a): GCP-only TIFF returns clear 400 mentioning ground control points (not missing georef tags)
+    let r_gcp = client
+        .get(format!("{base}/cog/info?url={gcp_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_gcp.status(), 400);
+    let gcp_body = r_gcp.text().await.unwrap();
+    assert!(
+        gcp_body.to_ascii_lowercase().contains("ground control points"),
+        "U2(a) expected GCP message, got: {gcp_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
