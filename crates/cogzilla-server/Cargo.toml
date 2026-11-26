@@ -44,3 +44,7 @@ required-features = ["gpu"]
 [[example]]
 name = "titiler_bbox_gpu_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "mosaic_server_bench"
+required-features = ["gpu"]

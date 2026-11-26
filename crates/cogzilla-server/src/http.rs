@@ -3496,10 +3496,86 @@ async fn render_mosaic_tile_pixel_selection(
         }
         Some(PixelAcc::LastBand { nb, best_vals, .. }) => (nb, best_vals),
         Some(PixelAcc::Median { nb, scenes }) => {
+            #[cfg(feature = "gpu")]
+            if nb == 1
+                && scenes.len() >= 3
+                && scenes.len() <= 32
+                && first_lut.is_none()
+                && pq.color_formula.is_none()
+                && matches!(
+                    treq.format,
+                    OutputFormat::Png
+                        | OutputFormat::Webp { .. }
+                        | OutputFormat::Jpeg { .. }
+                        | OutputFormat::RawRgba
+                )
+                && let Some(ref gpu) = engine.gpu
+            {
+                let (rescale, cmap) = match &treq.bands {
+                    BandRequest::Single {
+                        rescale, colormap, ..
+                    }
+                    | BandRequest::Dem {
+                        rescale, colormap, ..
+                    }
+                    | BandRequest::CustomExpr {
+                        rescale, colormap, ..
+                    }
+                    | BandRequest::Spectral1 {
+                        rescale, colormap, ..
+                    }
+                    | BandRequest::Spectral2 {
+                        rescale, colormap, ..
+                    }
+                    | BandRequest::Spectral3 {
+                        rescale, colormap, ..
+                    } => (*rescale, *colormap),
+                    _ => ((0.0, 255.0), pq.colormap),
+                };
+                let plane_refs: Vec<&[f32]> = scenes.iter().map(|s| &s[..n_px]).collect();
+                if let Some(bytes) = gpu.try_composite_mosaic_styled(
+                    out_dim,
+                    out_dim,
+                    &plane_refs,
+                    cogzilla_gpu::GpuPixelSelection::Median,
+                    rescale,
+                    cmap,
+                    treq.format,
+                    pq.return_mask,
+                ) {
+                    engine
+                        .stats
+                        .gpu_dispatches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(bytes);
+                }
+            }
+
             let mut out = vec![f32::NAN; nb * n_px];
             let mut scratch = Vec::with_capacity(scenes.len());
             for b in 0..nb {
                 let b_off = b * n_px;
+                #[cfg(feature = "gpu")]
+                if scenes.len() >= 3
+                    && scenes.len() <= 32
+                    && let Some(ref gpu) = engine.gpu
+                {
+                    let plane_refs: Vec<&[f32]> =
+                        scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect();
+                    if let Some(gpu_band) = gpu.try_composite_mosaic_f32(
+                        out_dim,
+                        out_dim,
+                        &plane_refs,
+                        cogzilla_gpu::GpuPixelSelection::Median,
+                    ) {
+                        engine
+                            .stats
+                            .gpu_dispatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        out[b_off..b_off + n_px].copy_from_slice(&gpu_band);
+                        continue;
+                    }
+                }
                 for i in 0..n_px {
                     scratch.clear();
                     for s in &scenes {

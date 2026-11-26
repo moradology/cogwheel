@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use cogzilla_gpu::{
     DispatchPolicy, DispatchRequest, GpuColorFormula, GpuColormapMode, GpuColormapRenderer,
-    GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuMultiBandCache,
-    GpuOp, GpuPixelOutput, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer,
-    MultiBandSlabKey, PolicyOverride, SlabKey, opcodes,
+    GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuMosaicCompositor,
+    GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab,
+    GpuSlabCache, GpuTerrainRenderer, MultiBandSlabKey, PolicyOverride, SlabKey, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
 use cogzilla_kernel::{
-    BandSource, ColorFormula, ColormapLut, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode,
-    RgbStyle, SingleBandStyle, TerrainEncoding, encode_rgba_tile,
+    BandSource, ColorFormula, ColormapLut, ColormapName, DemAlgorithm, ExprProgram, OutputFormat,
+    ResampleMode, RgbStyle, SingleBandStyle, TerrainEncoding, encode_rgba_tile,
 };
 use cogzilla_proj::CoordPlan;
 
@@ -47,6 +47,7 @@ pub struct GpuBackend {
     colormap: Mutex<GpuColormapRenderer>,
     terrain: Mutex<GpuTerrainRenderer>,
     expr: Mutex<GpuExprRenderer>,
+    mosaic: Mutex<GpuMosaicCompositor>,
     in_flight: AtomicUsize,
 }
 
@@ -155,6 +156,7 @@ impl GpuBackend {
         let colormap = Mutex::new(GpuColormapRenderer::new(&ctx));
         let terrain = Mutex::new(GpuTerrainRenderer::new(&ctx));
         let expr = Mutex::new(GpuExprRenderer::new(&ctx));
+        let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
         Some(Arc::new(Self {
             ctx,
             policy,
@@ -164,6 +166,7 @@ impl GpuBackend {
             colormap,
             terrain,
             expr,
+            mosaic,
             in_flight: AtomicUsize::new(0),
         }))
     }
@@ -1716,6 +1719,122 @@ impl GpuBackend {
             crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
         })
     }
+
+    fn mosaic_policy_op(method: GpuPixelSelection, num_scenes: usize) -> GpuOp {
+        match method {
+            GpuPixelSelection::Median if num_scenes >= 6 => GpuOp::DemHornLanczos3,
+            GpuPixelSelection::Median | GpuPixelSelection::Stdev => GpuOp::DemHornCubic,
+            _ => GpuOp::FusedColormapBilinear,
+        }
+    }
+
+    /// Attempt GPU-accelerated multi-scene pixel selection (`First`, `Highest`, `Lowest`, `Mean`,
+    /// `Median`, `Stdev`, `Count`) over `2..=32` aligned `f32` planes, returning reduced `f32` pixels.
+    pub fn try_composite_mosaic_f32(
+        &self,
+        width: u32,
+        height: u32,
+        planes: &[&[f32]],
+        method: GpuPixelSelection,
+    ) -> Option<Vec<f32>> {
+        if planes.len() < 2 || planes.len() > 32 || width == 0 || height == 0 {
+            return None;
+        }
+        let pixels = (width as usize).checked_mul(height as usize)?;
+        let upload_bytes = planes.len().saturating_mul(pixels).saturating_mul(4);
+        let readback_bytes = pixels.saturating_mul(4);
+        let decision = self.policy.decide(&DispatchRequest {
+            op: Self::mosaic_policy_op(method, planes.len()),
+            dst_pixels: pixels,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let mut mosaic_guard = self.mosaic.lock().ok()?;
+        let stack = mosaic_guard.upload_scenes(planes, width, height).ok()?;
+        mosaic_guard.composite_f32(&stack, method).ok()
+    }
+
+    /// Attempt fused GPU multi-scene pixel selection + rescale + colormap directly to PNG / WebP /
+    /// JPEG / RawRgba (using 4×-smaller `IndexedU8` readback for masked PNGs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_composite_mosaic_styled(
+        &self,
+        width: u32,
+        height: u32,
+        planes: &[&[f32]],
+        method: GpuPixelSelection,
+        rescale: (f32, f32),
+        colormap: ColormapName,
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        if planes.len() < 2 || planes.len() > 32 || width == 0 || height == 0 {
+            return None;
+        }
+        let out_kind = match format {
+            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
+            OutputFormat::Png
+            | OutputFormat::Webp { .. }
+            | OutputFormat::Jpeg { .. }
+            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
+            _ => return None,
+        };
+        let pixels = (width as usize).checked_mul(height as usize)?;
+        let upload_bytes = planes.len().saturating_mul(pixels).saturating_mul(4);
+        let readback_bytes = match out_kind {
+            GpuPixelOutput::IndexedU8 => pixels,
+            GpuPixelOutput::Rgba8 => pixels.saturating_mul(4),
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op: Self::mosaic_policy_op(method, planes.len()),
+            dst_pixels: pixels,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let lut = colormap.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let mut mosaic_guard = self.mosaic.lock().ok()?;
+        let stack = mosaic_guard.upload_scenes(planes, width, height).ok()?;
+        let raw = mosaic_guard
+            .composite_styled(&stack, method, rescale.0, rescale.1, &lut_u32, out_kind)
+            .ok()?;
+        drop(mosaic_guard);
+
+        Some(match out_kind {
+            GpuPixelOutput::IndexedU8 => encode_indexed_u8_png(&raw, width, height, lut),
+            GpuPixelOutput::Rgba8 => {
+                if format == OutputFormat::RawRgba {
+                    Bytes::from(raw)
+                } else {
+                    crate::titiler::encode_rgba_output(
+                        width as usize,
+                        height as usize,
+                        &raw,
+                        format,
+                        return_mask,
+                    )
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2044,6 +2163,74 @@ mod tests {
                 }
             }
             assert!(max_diff <= 4, "RGB ColorFormula max channel diff {max_diff} > 4");
+        }
+    }
+
+    #[test]
+    fn mosaic_median_and_styled_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU mosaic test (no adapter)");
+            return;
+        };
+
+        let w = 512u32;
+        let h = 512u32;
+        let n_px = (w * h) as usize;
+        let n_scenes = 12usize;
+        let mut scenes: Vec<Vec<f32>> = Vec::with_capacity(n_scenes);
+        for s in 0..n_scenes {
+            let mut plane = vec![f32::NAN; n_px];
+            for i in 0..n_px {
+                // Sprinkle 15% nodata holes across scenes
+                if (i + s * 37) % 7 != 0 {
+                    plane[i] = 100.0
+                        + 50.0 * ((i as f32) * 0.001 + (s as f32) * 0.7).sin()
+                        + (s as f32) * 8.0;
+                }
+            }
+            scenes.push(plane);
+        }
+        let refs: Vec<&[f32]> = scenes.iter().map(Vec::as_slice).collect();
+
+        if let Some(gpu_med) = gpu.try_composite_mosaic_f32(w, h, &refs, GpuPixelSelection::Median)
+        {
+            assert_eq!(gpu_med.len(), n_px);
+            let mut scratch = Vec::with_capacity(n_scenes);
+            let mut max_err = 0.0f32;
+            for i in (0..n_px).step_by(31) {
+                scratch.clear();
+                for s in &scenes {
+                    if s[i].is_finite() {
+                        scratch.push(s[i]);
+                    }
+                }
+                if scratch.is_empty() {
+                    assert!(gpu_med[i].is_nan());
+                } else {
+                    scratch.sort_unstable_by(|a, b| a.total_cmp(b));
+                    let k = scratch.len();
+                    let cpu_v = if k % 2 == 1 {
+                        scratch[k / 2]
+                    } else {
+                        0.5 * (scratch[k / 2 - 1] + scratch[k / 2])
+                    };
+                    max_err = max_err.max((cpu_v - gpu_med[i]).abs());
+                }
+            }
+            assert!(max_err < 1e-4, "GPU mosaic median max err {max_err} >= 1e-4");
+        }
+
+        if let Some(png) = gpu.try_composite_mosaic_styled(
+            w,
+            h,
+            &refs,
+            GpuPixelSelection::Median,
+            (50.0, 250.0),
+            ColormapName::Viridis,
+            OutputFormat::Png,
+            true,
+        ) {
+            assert!(png.starts_with(b"\x89PNG"), "fused mosaic styled output must be valid PNG");
         }
     }
 }
