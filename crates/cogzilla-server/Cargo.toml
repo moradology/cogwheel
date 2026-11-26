@@ -84,3 +84,7 @@ required-features = ["gpu"]
 [[example]]
 name = "expr_rgb_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "multiband_npy_bench"
+required-features = ["gpu"]

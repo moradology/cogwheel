@@ -6130,6 +6130,83 @@ async fn render_bbox_impl(
                         };
                         gpu.try_render_bbox_spectral_f32(cache_key, coords, &srcs, *expr, resample)
                     }
+                    BandRequest::Rgb { bands_1based, .. } => {
+                        let r0 = get_band_refs(bands_1based[0], 0);
+                        let r1 = get_band_refs(bands_1based[1], 1);
+                        let r2 = get_band_refs(bands_1based[2], 2);
+                        let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                        let cache_key = if num_cogs == 1 {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id,
+                                ifd_idx,
+                                bands_1based,
+                                &srcs,
+                            )
+                        } else {
+                            None
+                        };
+                        gpu.try_render_bbox_multiband_f32(cache_key, coords, &srcs, resample)
+                    }
+                    BandRequest::MultiBand { bands_1based } => {
+                        if bands_1based.is_empty() || bands_1based.len() > 8 {
+                            None
+                        } else {
+                            let ref_vecs: Vec<_> = bands_1based
+                                .iter()
+                                .enumerate()
+                                .map(|(slot, &b)| get_band_refs(b, slot))
+                                .collect();
+                            let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                            let cache_key = if num_cogs == 1 {
+                                crate::gpu_backend::GpuBackend::multiband_key(
+                                    primary_id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &srcs,
+                                )
+                            } else {
+                                None
+                            };
+                            gpu.try_render_bbox_multiband_f32(cache_key, coords, &srcs, resample)
+                        }
+                    }
+                    BandRequest::CustomExprRgb { progs, .. } => {
+                        let mut unique_bands: Vec<u16> = Vec::new();
+                        for prog in progs {
+                            for &b in &prog.used_bands {
+                                if !unique_bands.contains(&b) {
+                                    unique_bands.push(b);
+                                }
+                            }
+                        }
+                        if unique_bands.is_empty() || unique_bands.len() > 8 {
+                            None
+                        } else {
+                            let ref_vecs: Vec<_> = unique_bands
+                                .iter()
+                                .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                                .collect();
+                            let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                            let cache_key = if num_cogs == 1 {
+                                crate::gpu_backend::GpuBackend::multiband_key(
+                                    primary_id,
+                                    ifd_idx,
+                                    &unique_bands,
+                                    &srcs,
+                                )
+                            } else {
+                                None
+                            };
+                            gpu.try_render_bbox_expr_rgb_f32(
+                                cache_key,
+                                coords,
+                                &unique_bands,
+                                &srcs,
+                                progs,
+                                resample,
+                            )
+                        }
+                    }
                     _ => None,
                 };
                 if let Some(raw) = gpu_raw {
