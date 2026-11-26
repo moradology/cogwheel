@@ -295,7 +295,11 @@ impl AlbersEqualArea {
         let sign = if self.n >= 0.0 { 1.0 } else { -1.0 };
         let rho = (dx * dx + dy * dy).sqrt();
         let theta = (sign * dx).atan2(sign * dy);
-        let lon = self.lon0 + theta / self.n;
+        let dlon = theta / self.n;
+        if !dlon.is_finite() || dlon.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let lon = self.lon0 + dlon;
         let q = (self.c - (rho * self.n / self.a).powi(2)) / self.n;
         let qp = Self::q_fn(self.e, self.e2, 1.0);
         if !q.is_finite() || q.abs() > qp + 1e-12 {
@@ -413,6 +417,12 @@ impl LambertConformalConic {
 
     #[inline(always)]
     pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        // Reject the opposite pole where tan(pi/4 - lat/2) overflows to ~1e16 in f64 instead of inf.
+        if (self.n > 0.0 && lat <= -std::f64::consts::FRAC_PI_2 + 1e-12)
+            || (self.n < 0.0 && lat >= std::f64::consts::FRAC_PI_2 - 1e-12)
+        {
+            return (f64::NAN, f64::NAN);
+        }
         let t = Self::t_fn(self.e, lat);
         let rho = self.a * self.f_const * t.powf(self.n);
         let theta = self.n * wrap_dlon(lon - self.lon0);
@@ -429,7 +439,11 @@ impl LambertConformalConic {
         let sign = if self.n >= 0.0 { 1.0 } else { -1.0 };
         let rho = sign * (dx * dx + dy * dy).sqrt();
         let theta = (sign * dx).atan2(sign * dy);
-        let lon = self.lon0 + theta / self.n;
+        let dlon = theta / self.n;
+        if !dlon.is_finite() || dlon.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let lon = self.lon0 + dlon;
         let t = (rho / (self.a * self.f_const)).max(1e-15).powf(1.0 / self.n);
         let mut lat = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
         for _ in 0..7 {
@@ -512,6 +526,10 @@ impl PolarStereographic {
     pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
         let sign = if self.south { -1.0 } else { 1.0 };
         let phi = sign * lat;
+        // Reject the opposite pole where tan(pi/4 - phi/2) overflows to ~1e16 in f64 instead of inf.
+        if phi <= -std::f64::consts::FRAC_PI_2 + 1e-12 {
+            return (f64::NAN, f64::NAN);
+        }
         let sin_p = phi.sin();
         let t = (std::f64::consts::FRAC_PI_4 - 0.5 * phi).tan()
             / ((1.0 - self.e * sin_p) / (1.0 + self.e * sin_p)).powf(0.5 * self.e);
@@ -986,5 +1004,39 @@ mod tests {
         let (lon2, lat2) = aea.inverse(e, n);
         assert!((lon2.to_degrees() + 150.0).abs() < 1e-7);
         assert!((lat2.to_degrees() - 61.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn opposite_poles_and_conic_wedge_return_nan() {
+        // North Polar Stereographic (EPSG:3413) at South Pole must be NaN (not ~2e23 m)
+        let nps = PolarStereographic::new(Ellipsoid::WGS84, 70.0, -45.0, 0.0, 0.0);
+        let (x, y) = nps.forward(0.0, -std::f64::consts::FRAC_PI_2);
+        assert!(x.is_nan() && y.is_nan(), "North Polar Stereo at -90 must be NaN, got ({x}, {y})");
+
+        // South Polar Stereographic (EPSG:3031) at North Pole must be NaN
+        let sps = PolarStereographic::new(Ellipsoid::WGS84, -71.0, 0.0, 0.0, 0.0);
+        let (x, y) = sps.forward(0.0, std::f64::consts::FRAC_PI_2);
+        assert!(x.is_nan() && y.is_nan(), "South Polar Stereo at +90 must be NaN, got ({x}, {y})");
+
+        // Canadian NAD83 LCC (EPSG:3978): South Pole forward must be NaN, and unmapped cone wedge
+        // inverse at (500_000, 15_000_000) must be NaN (not ghost Eurasia)
+        let lcc = LambertConformalConic::new_2sp(
+            Ellipsoid::GRS80,
+            49.0,
+            77.0,
+            49.0,
+            -95.0,
+            0.0,
+            0.0,
+        );
+        let (fx, fy) = lcc.forward(0.0, -std::f64::consts::FRAC_PI_2);
+        assert!(fx.is_nan() && fy.is_nan(), "LCC at -90 must be NaN, got ({fx}, {fy})");
+        let (ilo, ila) = lcc.inverse(500_000.0, 15_000_000.0);
+        assert!(ilo.is_nan() && ila.is_nan(), "LCC unmapped cone wedge must be NaN, got ({ilo}, {ila})");
+
+        // Albers Equal Area (EPSG:5070): unmapped cone wedge north of apex must be NaN
+        let aea = AlbersEqualArea::new(Ellipsoid::GRS80, 29.5, 45.5, 23.0, -96.0, 0.0, 0.0);
+        let (alo, ala) = aea.inverse(500_000.0, 10_000_000.0);
+        assert!(alo.is_nan() && ala.is_nan(), "Albers unmapped cone wedge must be NaN, got ({alo}, {ala})");
     }
 }

@@ -1938,9 +1938,6 @@ fn wants_f32_geotiff(
     {
         return false;
     }
-    if source_cog.is_some_and(|c| c.index.color_map.is_some()) {
-        return false;
-    }
     match bands {
         BandRequest::Terrain { .. } => false,
         BandRequest::Dem { algorithm, .. } => !matches!(
@@ -1948,9 +1945,11 @@ fn wants_f32_geotiff(
             cogzilla_kernel::DemAlgorithm::Hillshade { .. }
                 | cogzilla_kernel::DemAlgorithm::Contours { .. }
         ),
-        BandRequest::Rgb { .. } | BandRequest::Single { .. } => {
-            !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
+        BandRequest::Single { .. } => {
+            !source_cog.is_some_and(|c| c.index.color_map.is_some())
+                && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
         }
+        BandRequest::Rgb { .. } => !matches!(sample_type, cogzilla_tiff::SampleType::Uint8),
         BandRequest::CustomExpr { .. }
         | BandRequest::CustomExprRgb { .. }
         | BandRequest::MultiBand { .. }
