@@ -2727,8 +2727,8 @@ impl MapAfterFormula {
 }
 
 /// Whether the bands are one band's values shown in grey: what a colour formula works on
-/// as a single byte. The renderer's own grey is not that byte (some levels of its grey
-/// table are one below their index), so such a picture is painted here from the values.
+/// as a single byte. The renderer makes that byte in single precision, where rio-tiler's
+/// is `linear_rescale`'s, so such a picture is painted here from the values.
 fn one_grey_band(bands: &BandRequest) -> bool {
     matches!(
         bands,

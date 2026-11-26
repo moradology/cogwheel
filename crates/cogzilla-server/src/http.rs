@@ -22,8 +22,10 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
 mod pgstac;
+#[cfg(test)]
+mod asset_query_pins;
 mod paint;
-mod pixel_selection;
+pub(crate) mod pixel_selection;
 mod cql2_text;
 mod point_expr;
 mod zonal;
@@ -1040,11 +1042,14 @@ fn route_supports_pixel_selection(segs: &[&str]) -> bool {
     match segs {
         ["mosaic", "tiles", ..] => true,
         ["mosaic", _, "tiles", ..] => true,
+        ["mosaicjson", "tiles", .., "assets"] => false,
         ["mosaicjson", "tiles", ..] => true,
         ["mosaicjson", "bbox", _] => true,
         ["mosaicjson", "bbox", _, seg] if *seg != "assets" => true,
+        ["mosaicjson", s] if *s == "feature" || s.starts_with("feature.") => true,
         ["mosaicjson", "feature", ..] => true,
         ["mosaicjson", "statistics"] => true,
+        ["mosaicjson", "viewer"] => true,
         ["mosaicjson", _, "tilejson.json" | "map.html" | "WMTSCapabilities.xml"]
         | ["mosaicjson", "tilejson.json" | "map.html" | "WMTSCapabilities.xml"] => true,
         _ => false,
@@ -3036,8 +3041,9 @@ fn build_tile_request_for_tms(
     };
     let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type);
-    if matches!(bands, BandRequest::MultiBand { .. })
+    if let BandRequest::MultiBand { ref bands_1based } = bands
         && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4))
     {
         return Err(EngineError::BadRequest(
             "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
@@ -3489,6 +3495,16 @@ fn paint_selected(
         (Some(paint @ Paint::Gray { .. }), _) if !three => paint,
         (_, BandRequest::CustomExprRgb { rescale_min, rescale_max, .. }) if three => {
             Paint::Rgb { min: *rescale_min, max: *rescale_max }
+        }
+        (_, BandRequest::MultiBand { .. }) if three && !pq.rescale.is_empty() => {
+            let r0 = pq.rescale[0];
+            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
+            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
+            Paint::Rgb { min: [r0.0, r1.0, r2.0], max: [r0.1, r1.1, r2.1] }
+        }
+        (_, BandRequest::MultiBand { .. }) if !three && !pq.rescale.is_empty() => {
+            let (min, max) = pq.rescale[0];
+            Paint::Gray { min, max, colormap: pq.colormap }
         }
         _ if three => Paint::Rgb { min: [0.0; 3], max: [255.0; 3] },
         _ => Paint::Gray { min: 0.0, max: 255.0, colormap: pq.colormap },
@@ -3986,33 +4002,44 @@ async fn render_mosaic_bbox_composite(
         };
         let cogs = [cog];
         let full = cogs[0].index.full_res();
-        let raw_bands_for_fold = method != Selection::First;
-        let mut bands = build_band_request_for_output(
-            pq,
-            full.samples_per_pixel,
-            full.sample_type,
-            if raw_bands_for_fold {
-                OutputFormat::RawF32
-            } else {
-                fmt
-            },
-            if raw_bands_for_fold {
-                "application/octet-stream"
-            } else {
-                ct
-            },
-        )?;
+        let data_bands = data_band_count(full);
+        let mut bands =
+            build_band_request_for_output(pq, data_bands, full.sample_type, fmt, ct)?;
         let scene_fmt = *eff_fmt.get_or_insert_with(|| {
             geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, full.sample_type)
         });
         let is_f32_out = matches!(scene_fmt, OutputFormat::RawF32 | OutputFormat::Npy);
-        if pq.unscale {
-            apply_unscale_cogs(&mut bands, &cogs);
+        if let BandRequest::MultiBand { ref bands_1based } = bands
+            && !is_f32_out
+            && !(method.by_last_band() && matches!(bands_1based.len(), 2 | 4))
+        {
+            return Err(EngineError::BadRequest(
+                "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
+                    .into(),
+            ));
         }
         if first_bands.is_none() {
             first_bands = Some(bands.clone());
         }
-        let custom_lut = resolve_custom_lut(pq, &cogs[0], &bands)?;
+        if method.by_last_band()
+            && pq.bidx.is_empty()
+            && data_bands >= 2
+            && !matches!(bands, BandRequest::MultiBand { .. })
+        {
+            bands = BandRequest::MultiBand {
+                bands_1based: (1..=data_bands).collect(),
+            };
+        }
+        if pq.unscale {
+            apply_unscale_cogs(&mut bands, &cogs);
+        }
+        let custom_lut = if matches!(method, Selection::Count | Selection::Stdev)
+            && pq.custom_colormap_json.is_none()
+        {
+            None
+        } else {
+            resolve_custom_lut(pq, &cogs[0], &bands)?
+        };
         if first_lut.is_none() && custom_lut.is_some() {
             first_lut = custom_lut.clone();
         }
@@ -4173,7 +4200,7 @@ async fn render_mosaic_bbox_composite(
     }
     let final_fmt = eff_fmt.unwrap_or(fmt);
     if matches!(final_fmt, OutputFormat::RawF32 | OutputFormat::Npy) || method != Selection::First {
-        let (out_nb, combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
+        let (out_nb, mut combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
             Some(Selected { bands, values }) => (bands, values),
             None => {
                 let nb = first_bands
@@ -4183,6 +4210,16 @@ async fn render_mosaic_bbox_composite(
                 (nb, vec![f32::NAN; nb * total_px])
             }
         };
+        if method == Selection::Count
+            && let Some(mask) = poly_mask
+        {
+            let kept = mask.rasterize_all_touched(out_w as usize, out_h as usize, bbox, dst_crs);
+            for (v, &inside) in combined.iter_mut().zip(&kept) {
+                if !inside {
+                    *v = f32::NAN;
+                }
+            }
+        }
         if matches!(final_fmt, OutputFormat::RawF32 | OutputFormat::Npy) {
             let mut raw_buf = bytes::BytesMut::with_capacity(combined.len() * 4);
             for v in combined {
@@ -4215,113 +4252,22 @@ async fn render_mosaic_bbox_composite(
                 used_assets,
             ));
         }
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
-        let mut rgba = vec![0u8; total_px * 4];
-        if out_nb >= 3 {
-            let (rmin, rmax) = match first_bands.as_ref() {
-                Some(
-                    BandRequest::Rgb {
-                        rescale_min,
-                        rescale_max,
-                        ..
-                    }
-                    | BandRequest::SarRgb {
-                        rescale_min,
-                        rescale_max,
-                        ..
-                    }
-                    | BandRequest::CustomExprRgb {
-                        rescale_min,
-                        rescale_max,
-                        ..
-                    },
-                ) => (*rescale_min, *rescale_max),
-                _ => ([0.0, 0.0, 0.0], [255.0, 255.0, 255.0]),
-            };
-            let inv = [
-                255.0 / cogzilla_kernel::safe_rescale_denom(rmin[0], rmax[0]),
-                255.0 / cogzilla_kernel::safe_rescale_denom(rmin[1], rmax[1]),
-                255.0 / cogzilla_kernel::safe_rescale_denom(rmin[2], rmax[2]),
-            ];
-            for i in 0..total_px {
-                let r = combined[i];
-                let g = combined[total_px + i];
-                let b = combined[2 * total_px + i];
-                if r.is_finite() && g.is_finite() && b.is_finite() {
-                    rgba[i * 4] = ((r - rmin[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 1] = ((g - rmin[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 2] = ((b - rmin[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                    rgba[i * 4 + 3] = 255;
-                }
-            }
-            if let Some(ref cf) = cf {
-                cf.apply_buffer_in_place(&mut rgba, 4);
-            }
-        } else {
-            let (rescale, cmap) = match first_bands.as_ref() {
-                Some(
-                    BandRequest::Single {
-                        rescale, colormap, ..
-                    }
-                    | BandRequest::Dem {
-                        rescale, colormap, ..
-                    }
-                    | BandRequest::CustomExpr {
-                        rescale, colormap, ..
-                    }
-                    | BandRequest::Spectral1 {
-                        rescale, colormap, ..
-                    }
-                    | BandRequest::Spectral2 {
-                        rescale, colormap, ..
-                    }
-                    | BandRequest::Spectral3 {
-                        rescale, colormap, ..
-                    },
-                ) => (*rescale, *colormap),
-                _ => (pq.rescale.first().copied().unwrap_or((0.0, 255.0)), pq.colormap),
-            };
-            let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-            let cf_lut = if first_lut.is_none() {
-                cf.as_ref().map(|c| {
-                    let mut t = [0u8; 256];
-                    for i in 0..256 {
-                        let mut px = [i as u8, i as u8, i as u8, 255];
-                        c.apply_buffer_in_place(&mut px, 4);
-                        t[i] = px[0];
-                    }
-                    t
-                })
-            } else {
-                None
-            };
-            let lut = cmap.lut();
-            for i in 0..total_px {
-                let v = combined[i];
-                if v.is_finite() {
-                    let px = if let Some(ref custom) = first_lut {
-                        custom.lookup(v, rescale.0, inv)
-                    } else {
-                        let mut idx = ((v - rescale.0) * inv).clamp(0.0, 255.0) as usize;
-                        if let Some(ref cl) = cf_lut {
-                            idx = cl[idx] as usize;
-                        }
-                        lut.rgba_u32[idx].to_le_bytes()
-                    };
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&px);
-                }
-            }
-            if cf_lut.is_none()
-                && let Some(ref cf) = cf
-            {
-                cf.apply_buffer_in_place(&mut rgba, 4);
-            }
-        }
+        let fallback_bands = BandRequest::Single {
+            band_1based: 1,
+            rescale: (0.0, 255.0),
+            colormap: pq.colormap,
+        };
+        let paint_bands = first_bands.as_ref().unwrap_or(&fallback_bands);
+        let rgba = paint_selected(
+            Selected {
+                bands: out_nb,
+                values: combined,
+            },
+            total_px,
+            paint_bands,
+            pq,
+            first_lut.as_ref(),
+        )?;
         let data = encode_rgba_output(out_w as usize, out_h as usize, &rgba, final_fmt, pq.return_mask);
         return Ok((
             wrap_geotiff_fmt(
@@ -4375,6 +4321,48 @@ async fn compute_mosaic_statistics_with_fold(
     let dst_crs = cogzilla_proj::CrsModel::Geographic;
     let resample = pq.resample;
 
+    // Exact analytical native-grid path for POST /mosaicjson/statistics when no explicit
+    // output width/height resampling was requested and all contributing assets share one grid
+    // (always true for a single-asset mosaic, guaranteeing exact parity with /cog/statistics).
+    if let Some(mask) = poly_mask
+        && pq.width.is_none()
+        && pq.height.is_none()
+    {
+        let mut opened: Vec<(String, Arc<cogzilla_io::OpenedCog>)> =
+            Vec::with_capacity(urls.len());
+        let mut open_err: Option<EngineError> = None;
+        for u in urls {
+            match engine.store.open_uri(u).await {
+                Ok(c) => opened.push((u.clone(), c)),
+                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    return Err(EngineError::Io(e));
+                }
+                Err(e) => open_err = Some(crate::engine::asset_fetch_error(u, e)),
+            }
+        }
+        if opened.is_empty() {
+            return Err(open_err.unwrap_or_else(|| {
+                EngineError::NotFound("no readable mosaic scenes intersect requested bounds".into())
+            }));
+        }
+        if let Some(exact) = crate::zonal::compute_native_exact_mosaic_fold_stats(
+            engine,
+            &opened,
+            mask,
+            pq.max_size,
+            pq.unscale,
+            pq.nodata,
+            method,
+            MAX_MEDIAN_BUFFER_BYTES,
+            stats_opts,
+        )
+        .await?
+        {
+            return Ok(exact);
+        }
+    }
+
+    let mut eff_bbox = wgs_bbox;
     let mut out_dims: Option<(u32, u32)> = None;
     let mut selected_bidx: Vec<u16> = Vec::new();
     let mut band_descs: Vec<String> = Vec::new();
@@ -4403,6 +4391,34 @@ async fn compute_mosaic_statistics_with_fold(
         let (out_w, out_h) = match out_dims {
             Some(d) => d,
             None => {
+                // Expand degenerate Point / axis-aligned LineString bboxes by one native
+                // pixel along the zero-extent axis so render_crs_bbox can sample them.
+                if eff_bbox[2] <= eff_bbox[0] || eff_bbox[3] <= eff_bbox[1] {
+                    let (px_dx, px_dy) = if matches!(
+                        engine.get_or_build_crs(&cogs[0]),
+                        Ok(cogzilla_proj::CrsModel::Geographic)
+                    ) && full.pixel_to_crs.a.abs() > 1e-12
+                        && full.pixel_to_crs.e.abs() > 1e-12
+                    {
+                        (full.pixel_to_crs.a.abs(), full.pixel_to_crs.e.abs())
+                    } else if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
+                        let b = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                        (
+                            ((b[2] - b[0]).abs() / full.width.max(1) as f64).max(1e-6),
+                            ((b[3] - b[1]).abs() / full.height.max(1) as f64).max(1e-6),
+                        )
+                    } else {
+                        (1e-5, 1e-5)
+                    };
+                    if eff_bbox[2] <= eff_bbox[0] {
+                        eff_bbox[0] -= 0.5 * px_dx;
+                        eff_bbox[2] += 0.5 * px_dx;
+                    }
+                    if eff_bbox[3] <= eff_bbox[1] {
+                        eff_bbox[1] -= 0.5 * px_dy;
+                        eff_bbox[3] += 0.5 * px_dy;
+                    }
+                }
                 let cap = if pq.max_size == 0 {
                     4096
                 } else {
@@ -4416,10 +4432,10 @@ async fn compute_mosaic_statistics_with_fold(
                     && full.pixel_to_crs.a.abs() > 1e-12
                     && full.pixel_to_crs.e.abs() > 1e-12
                 {
-                    let nat_w = ((wgs_bbox[2] - wgs_bbox[0]).abs() / full.pixel_to_crs.a.abs())
+                    let nat_w = ((eff_bbox[2] - eff_bbox[0]).abs() / full.pixel_to_crs.a.abs())
                         .round()
                         .max(1.0) as u32;
-                    let nat_h = ((wgs_bbox[3] - wgs_bbox[1]).abs() / full.pixel_to_crs.e.abs())
+                    let nat_h = ((eff_bbox[3] - eff_bbox[1]).abs() / full.pixel_to_crs.e.abs())
                         .round()
                         .max(1.0) as u32;
                     if nat_w.max(nat_h) <= cap {
@@ -4436,7 +4452,7 @@ async fn compute_mosaic_statistics_with_fold(
                         (w, cap)
                     }
                 } else {
-                    capped_native_bbox_dims(engine, &cogs[0], wgs_bbox, wgs_bbox, cap)
+                    capped_native_bbox_dims(engine, &cogs[0], eff_bbox, eff_bbox, cap)
                 };
                 let (w, h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let dims = (w.clamp(1, 4096), h.clamp(1, 4096));
@@ -4476,11 +4492,11 @@ async fn compute_mosaic_statistics_with_fold(
         let raw = match render_crs_bbox(
             engine,
             &cogs,
-            wgs_bbox,
+            eff_bbox,
             &dst_crs,
             out_w,
             out_h,
-            poly_mask,
+            None,
             &bands,
             resample,
             OutputFormat::RawF32,
@@ -4548,7 +4564,7 @@ async fn compute_mosaic_statistics_with_fold(
 
     let (out_w, out_h) = out_dims.unwrap_or((1, 1));
     let total_px = (out_w as usize).saturating_mul(out_h as usize);
-    let (out_nb, mut combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
+    let (out_nb, combined): (usize, Vec<f32>) = match fold.and_then(Fold::finish) {
         Some(Selected { bands, values }) => (bands, values),
         None => {
             let nb = if method == Selection::Count {
@@ -4561,20 +4577,42 @@ async fn compute_mosaic_statistics_with_fold(
             (nb, vec![f32::NAN; nb * total_px])
         }
     };
-    if method == Selection::Count
-        && let Some(mask) = poly_mask
-    {
-        let dx = (wgs_bbox[2] - wgs_bbox[0]) / out_w as f64;
-        let dy = (wgs_bbox[3] - wgs_bbox[1]) / out_h as f64;
-        for row in 0..out_h as usize {
-            let lat = wgs_bbox[3] - (row as f64 + 0.5) * dy;
-            for col in 0..out_w as usize {
-                let lon = wgs_bbox[0] + (col as f64 + 0.5) * dx;
-                if !mask.contains(lon, lat) {
-                    combined[row * out_w as usize + col] = f32::NAN;
-                }
-            }
+    if let Some(mask) = poly_mask {
+        let mut keys_descs: Vec<(String, String)> = Vec::with_capacity(out_nb);
+        for bi in 0..out_nb {
+            let key = if method == Selection::Count {
+                "b1".to_string()
+            } else {
+                let b_num = selected_bidx.get(bi).copied().unwrap_or((bi + 1) as u16);
+                format!("b{b_num}")
+            };
+            let desc = if method == Selection::Count {
+                "count".to_string()
+            } else {
+                band_descs.get(bi).cloned().unwrap_or_else(|| key.clone())
+            };
+            keys_descs.push((key, desc));
         }
+        let plane_refs: Vec<(&str, &str, &[f32])> = keys_descs
+            .iter()
+            .enumerate()
+            .map(|(bi, (k, d))| {
+                (
+                    k.as_str(),
+                    d.as_str(),
+                    &combined[bi * total_px..(bi + 1) * total_px],
+                )
+            })
+            .collect();
+        let json = crate::zonal::compute_exact_grid_polygon_stats(
+            &plane_refs,
+            eff_bbox,
+            out_w as usize,
+            out_h as usize,
+            mask,
+            stats_opts,
+        );
+        return Ok((json, used_assets));
     }
 
     let mut out = serde_json::Map::new();
@@ -7510,7 +7548,31 @@ where
                             {
                                 return Ok::<_, EngineError>(exact);
                             }
-                            let mut map = serde_json::Map::new();
+                            let mut eff_bbox = poly_bbox;
+                            if eff_bbox[2] <= eff_bbox[0] || eff_bbox[3] <= eff_bbox[1] {
+                                let (px_dx, px_dy) = if let Some(first) = cogs_c.first()
+                                    && let Ok(crs) = eng.get_or_build_crs(first)
+                                {
+                                    let f = first.index.full_res();
+                                    let b = crs.wgs84_bounds(&f.pixel_to_crs, f.width, f.height);
+                                    (
+                                        ((b[2] - b[0]).abs() / f.width.max(1) as f64).max(1e-6),
+                                        ((b[3] - b[1]).abs() / f.height.max(1) as f64).max(1e-6),
+                                    )
+                                } else {
+                                    (1e-5, 1e-5)
+                                };
+                                if eff_bbox[2] <= eff_bbox[0] {
+                                    eff_bbox[0] -= 0.5 * px_dx;
+                                    eff_bbox[2] += 0.5 * px_dx;
+                                }
+                                if eff_bbox[3] <= eff_bbox[1] {
+                                    eff_bbox[1] -= 0.5 * px_dy;
+                                    eff_bbox[3] += 0.5 * px_dy;
+                                }
+                            }
+                            let mut rendered: Vec<(String, String, Vec<f32>)> =
+                                Vec::with_capacity(compiled.len());
                             for (idx, (desc, prog)) in compiled.into_iter().enumerate() {
                                 let mut bands = BandRequest::CustomExpr {
                                     prog,
@@ -7521,7 +7583,7 @@ where
                                     apply_unscale_cogs(&mut bands, &cogs_c);
                                 }
                                 let raw = render_wgs84_bbox(
-                                    &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
+                                    &eng, &cogs_c, eff_bbox, out_w, out_h, None, &bands,
                                     resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
                                 )
                                 .await?;
@@ -7529,9 +7591,22 @@ where
                                     .chunks_exact(4)
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                     .collect();
-                                map.insert(format!("b{}", idx + 1), compute_f32_band_stats(&pixels, &desc, &stats_opts));
+                                rendered.push((format!("b{}", idx + 1), desc, pixels));
                             }
-                            return Ok::<_, EngineError>(serde_json::Value::Object(map));
+                            let plane_refs: Vec<(&str, &str, &[f32])> = rendered
+                                .iter()
+                                .map(|(k, d, p)| (k.as_str(), d.as_str(), p.as_slice()))
+                                .collect();
+                            return Ok::<_, EngineError>(
+                                crate::zonal::compute_exact_grid_polygon_stats(
+                                    &plane_refs,
+                                    eff_bbox,
+                                    out_w as usize,
+                                    out_h as usize,
+                                    &mask,
+                                    &stats_opts,
+                                ),
+                            );
                         }
                         let mut set = tokio::task::JoinSet::new();
                         for (idx, cog) in cogs_c.into_iter().enumerate() {
@@ -10849,8 +10924,7 @@ mod tests {
     fn a_pixel_selection_is_painted_by_rio_tilers_rules() {
         let pq = parse_query(None);
         let nan = f32::NAN;
-        // One band without a colour map: the byte is the grey, also where the kernel's
-        // grey table is a level below (33 is 32 there).
+        // One band without a colour map: the byte is the grey.
         let grey = single((0.0, 255.0), ColormapName::Grayscale);
         let rgba = paint_selected(selected(1, &[33.0, 244.0, nan]), 3, &grey, &pq, None).unwrap();
         assert_eq!(rgba, [33, 33, 33, 255, 244, 244, 244, 255, 0, 0, 0, 0]);

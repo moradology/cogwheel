@@ -2712,6 +2712,713 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     Ok(Some(val))
 }
 
+/// Compute exact analytical coverage-weighted & ellipsoidal-area-weighted zonal statistics
+/// over pre-rendered band planes on a Geographic (`EPSG:4326`) grid covering `wgs_bbox`.
+///
+/// Used by heterogeneous-grid / explicit-`width`/`height` `POST /mosaicjson/statistics` and
+/// `POST /stac/statistics` (multi-asset expression fallback) so polygon statistics always
+/// retain fractional coverage weights, ellipsoidal `area` / `category_areas`, and
+/// polygon-relative `valid_percent` / `masked_pixels`.
+pub fn compute_exact_grid_polygon_stats(
+    planes: &[(&str, &str, &[f32])],
+    wgs_bbox: [f64; 4],
+    win_w: usize,
+    win_h: usize,
+    pm: &PolygonMask,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let geom_kind = if !pm.polygons.is_empty() {
+        ZonalGeomKind::Polygon
+    } else if !pm.lines.is_empty() {
+        ZonalGeomKind::Line
+    } else {
+        ZonalGeomKind::Point
+    };
+    let [w, s, e, n] = wgs_bbox;
+    let dx = (e - w) / win_w.max(1) as f64;
+    let dy = (n - s) / win_h.max(1) as f64;
+    let p2c = cogzilla_tiff::Affine2D {
+        a: dx,
+        b: 0.0,
+        c: w,
+        d: 0.0,
+        e: -dy,
+        f: n,
+    };
+    let Some(c2p) = p2c.invert() else {
+        let mut out = serde_json::Map::new();
+        for &(key, desc, _) in planes {
+            out.insert(key.to_string(), compute_f32_band_stats(&[], desc, opts));
+        }
+        return serde_json::Value::Object(out);
+    };
+    let total_verts = pm.vertex_count();
+    let grid_shifts = |ring: &[(f64, f64)]| -> Vec<f64> {
+        let (mut rmin, mut rmax) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &(lon, _) in ring {
+            if lon.is_finite() {
+                rmin = rmin.min(lon);
+                rmax = rmax.max(lon);
+            }
+        }
+        if !rmin.is_finite() {
+            return vec![0.0];
+        }
+        let mut shifts = Vec::new();
+        for s_deg in [-360.0_f64, 0.0, 360.0] {
+            if rmax + s_deg >= w - 1e-9 && rmin + s_deg <= e + 1e-9 {
+                shifts.push(s_deg);
+            }
+        }
+        if shifts.is_empty() {
+            shifts.push(0.0);
+        }
+        shifts
+    };
+
+    let mut polys_px: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(pm.polygons.len());
+    let mut total_poly_area_px_val = 0.0_f64;
+    for poly in &pm.polygons {
+        let shifts = poly
+            .first()
+            .map(|outer| grid_shifts(outer))
+            .unwrap_or_else(|| vec![0.0]);
+        for (si, shift) in shifts.into_iter().enumerate() {
+            let mut rings_px = Vec::with_capacity(poly.len());
+            for ring in poly {
+                rings_px.push(densify_ring_lonlat_to_pixel(
+                    ring,
+                    &CrsModel::Geographic,
+                    &c2p,
+                    None,
+                    true,
+                    false,
+                    shift,
+                    total_verts,
+                ));
+            }
+            if si == 0 {
+                total_poly_area_px_val += polygon_total_area_px(std::slice::from_ref(&rings_px));
+            }
+            polys_px.push(rings_px);
+        }
+    }
+    let mut lines_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(pm.lines.len());
+    for line in &pm.lines {
+        for shift in grid_shifts(line) {
+            lines_px.push(densify_ring_lonlat_to_pixel(
+                line,
+                &CrsModel::Geographic,
+                &c2p,
+                None,
+                true,
+                false,
+                shift,
+                total_verts,
+            ));
+        }
+    }
+    let mut pts_px: Vec<(f64, f64)> = Vec::with_capacity(pm.points.len());
+    for &(lo, la) in &pm.points {
+        let adj_lo = if lo < w && lo + 360.0 <= e {
+            lo + 360.0
+        } else if lo > e && lo - 360.0 >= w {
+            lo - 360.0
+        } else {
+            lo
+        };
+        pts_px.push(c2p.forward(adj_lo, la));
+    }
+
+    let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, 0, 0, win_w, win_h);
+    let line_len_m = if geom_kind == ZonalGeomKind::Line {
+        Some(rasterize_line_geodesic_lengths_m(
+            &lines_px,
+            &CrsModel::Geographic,
+            &p2c,
+            0,
+            0,
+            win_w,
+            win_h,
+        ))
+    } else {
+        None
+    };
+    let area_model = if geom_kind == ZonalGeomKind::Polygon {
+        PixelAreaModel::build(&CrsModel::Geographic, &p2c, 0, 0, win_w, win_h)
+    } else {
+        PixelAreaModel::Constant(1.0)
+    };
+    let total_poly_area_px =
+        (geom_kind == ZonalGeomKind::Polygon).then_some(total_poly_area_px_val);
+
+    let mut out = serde_json::Map::new();
+    for &(key, desc, plane) in planes {
+        out.insert(
+            key.to_string(),
+            compute_weighted_band_stats_with_geom(
+                plane,
+                &cov,
+                win_w,
+                win_h,
+                &area_model,
+                opts.area_weighted,
+                geom_kind,
+                line_len_m.as_deref(),
+                total_poly_area_px,
+                desc,
+                opts,
+            ),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Exact analytical zonal statistics for a MosaicJSON polygon/line/point query when all
+/// contributing assets share one native pixel grid (always true for a single-asset mosaic).
+///
+/// - For a single contributing asset with an identity selection (`first`/`highest`/`lowest`/
+///   `mean`/`median`), delegates directly to `compute_native_exact_polygon_stats` for exact
+///   bit-for-bit parity with `POST /cog/statistics`.
+/// - For multi-asset same-grid mosaics (or `count`/`stdev`/`lastband*`), reads each asset's
+///   native window directly into `pixel_selection::Fold` (honouring `max_fold_bytes` and
+///   `fold.is_done()` early exit) and computes exact coverage + ellipsoidal area statistics.
+/// - Returns `Ok(None)` when contributing assets have heterogeneous grids so the caller can
+///   fall back to the resampled mosaic grid with `compute_exact_grid_polygon_stats`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compute_native_exact_mosaic_fold_stats(
+    engine: &TileEngine,
+    assets: &[(String, Arc<OpenedCog>)],
+    pm: &PolygonMask,
+    max_size: u32,
+    unscale: bool,
+    nodata_override: Option<f32>,
+    method: crate::http::pixel_selection::Selection,
+    max_fold_bytes: usize,
+    opts: &StatsOptions,
+) -> Result<Option<(serde_json::Value, Vec<String>)>, EngineError> {
+    use crate::http::pixel_selection::{Fold, Selected, Selection};
+    if assets.is_empty() {
+        return Ok(None);
+    }
+    let primary = &assets[0].1;
+    let crs = engine.get_or_build_crs(primary)?;
+
+    // Single-asset fast path: exact parity with POST /cog/statistics for identity methods.
+    if assets.len() == 1
+        && !matches!(
+            method,
+            Selection::Count
+                | Selection::Stdev
+                | Selection::LastBandHigh
+                | Selection::LastBandLow
+        )
+    {
+        let stats = compute_native_exact_polygon_stats(
+            engine,
+            primary,
+            &crs,
+            pm,
+            max_size,
+            unscale,
+            nodata_override,
+            opts,
+        )
+        .await?;
+        return Ok(Some((stats, vec![assets[0].0.clone()])));
+    }
+
+    let cogs: Vec<Arc<OpenedCog>> = assets.iter().map(|(_, c)| c.clone()).collect();
+    if cogs.iter().any(|c| c.index.full_res().gcp_poly.is_some())
+        || crate::engine::validate_multi_cog_grid(&cogs, 0).is_err()
+    {
+        return Ok(None);
+    }
+
+    let full = primary.index.full_res();
+    let alpha_idx =
+        cogzilla_codec::alpha_channel_index(full.samples_per_pixel as usize, &full.extra_samples);
+    let sel_bands: Vec<u16> = match &opts.bidx {
+        Some(b) if !b.is_empty() => {
+            for &b1 in b {
+                if b1 == 0 || b1 > full.samples_per_pixel {
+                    return Err(EngineError::BadRequest(format!(
+                        "band index b{b1} out of range (dataset has {} bands)",
+                        full.samples_per_pixel
+                    )));
+                }
+            }
+            b.clone()
+        }
+        _ => (1..=full.samples_per_pixel)
+            .filter(|&b| Some((b - 1) as usize) != alpha_idx)
+            .collect(),
+    };
+    let nb = sel_bands.len();
+    if nb == 0 {
+        return Ok(None);
+    }
+    if method.by_last_band() && nb < 2 {
+        return Err(EngineError::BadRequest(
+            "pixel_selection by the last band needs at least two bands".into(),
+        ));
+    }
+
+    let band_descs: Vec<String> = sel_bands
+        .iter()
+        .map(|&b| {
+            primary
+                .index
+                .band_descriptions
+                .get((b - 1) as usize)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("b{b}"))
+        })
+        .collect();
+
+    let geom_kind = if !pm.polygons.is_empty() {
+        ZonalGeomKind::Polygon
+    } else if !pm.lines.is_empty() {
+        ZonalGeomKind::Line
+    } else {
+        ZonalGeomKind::Point
+    };
+
+    let empty_result = || -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        let out_nb = if method == Selection::Count {
+            1
+        } else if method.by_last_band() {
+            nb.saturating_sub(1).max(1)
+        } else {
+            nb
+        };
+        for bi in 0..out_nb {
+            let key = if method == Selection::Count {
+                "b1".to_string()
+            } else {
+                format!("b{}", sel_bands[bi])
+            };
+            let desc = if method == Selection::Count {
+                "count".to_string()
+            } else {
+                band_descs[bi].clone()
+            };
+            let mut empty = compute_f32_band_stats(&[], &desc, opts);
+            if let Some(o) = empty.as_object_mut() {
+                match geom_kind {
+                    ZonalGeomKind::Polygon => {
+                        o.insert("area".into(), serde_json::json!(0.0));
+                    }
+                    ZonalGeomKind::Line => {
+                        o.insert("area".into(), serde_json::Value::Null);
+                        o.insert("length".into(), serde_json::json!(0.0));
+                    }
+                    ZonalGeomKind::Point => {
+                        o.insert("area".into(), serde_json::Value::Null);
+                    }
+                }
+            }
+            out.insert(key, empty);
+        }
+        serde_json::Value::Object(out)
+    };
+
+    let is_geo = matches!(crs, CrsModel::Geographic);
+    let densify_lonlat = !is_geo && !pm.coord_crs_projected;
+    let total_verts = pm.vertex_count();
+
+    let project_to_ifd = |ifd: &cogzilla_tiff::IfdMeta| {
+        let mut polys_px: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(pm.polygons.len());
+        let mut poly_area_px = 0.0_f64;
+        for poly in &pm.polygons {
+            let shifts = poly
+                .first()
+                .map(|outer| geo_ring_lon_shifts(outer, ifd, is_geo))
+                .unwrap_or_else(|| vec![0.0]);
+            for (si, shift) in shifts.into_iter().enumerate() {
+                let mut rings_px = Vec::with_capacity(poly.len());
+                for ring in poly {
+                    rings_px.push(densify_ring_lonlat_to_pixel(
+                        ring,
+                        &crs,
+                        &ifd.crs_to_pixel,
+                        None,
+                        is_geo,
+                        densify_lonlat,
+                        shift,
+                        total_verts,
+                    ));
+                }
+                if si == 0 {
+                    poly_area_px += polygon_total_area_px(std::slice::from_ref(&rings_px));
+                }
+                polys_px.push(rings_px);
+            }
+        }
+        let mut lines_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(pm.lines.len());
+        for line in &pm.lines {
+            for shift in geo_ring_lon_shifts(line, ifd, is_geo) {
+                lines_px.push(densify_ring_lonlat_to_pixel(
+                    line,
+                    &crs,
+                    &ifd.crs_to_pixel,
+                    None,
+                    is_geo,
+                    densify_lonlat,
+                    shift,
+                    total_verts,
+                ));
+            }
+        }
+        let mut pts_px: Vec<(f64, f64)> = Vec::with_capacity(pm.points.len());
+        for &(lo, la) in &pm.points {
+            let adj_lo = geo_point_lon_shift(lo, ifd, is_geo);
+            let (sx, sy) = if is_geo {
+                (adj_lo, la)
+            } else {
+                crs.from_lonlat_deg(adj_lo, la)
+            };
+            pts_px.push(ifd.crs_to_pixel_pt(sx, sy));
+        }
+        let mut min_c = f64::INFINITY;
+        let mut max_c = f64::NEG_INFINITY;
+        let mut min_r = f64::INFINITY;
+        let mut max_r = f64::NEG_INFINITY;
+        for poly in &polys_px {
+            if let Some(outer) = poly.first() {
+                for &(c, r) in outer {
+                    if c.is_finite() && r.is_finite() {
+                        min_c = min_c.min(c);
+                        max_c = max_c.max(c);
+                        min_r = min_r.min(r);
+                        max_r = max_r.max(r);
+                    }
+                }
+            }
+        }
+        for line in &lines_px {
+            for &(c, r) in line {
+                if c.is_finite() && r.is_finite() {
+                    min_c = min_c.min(c);
+                    max_c = max_c.max(c + 1.0);
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r + 1.0);
+                }
+            }
+        }
+        for &(c, r) in &pts_px {
+            if c.is_finite() && r.is_finite() {
+                min_c = min_c.min(c);
+                max_c = max_c.max(c + 1.0);
+                min_r = min_r.min(r);
+                max_r = max_r.max(r + 1.0);
+            }
+        }
+        if !min_c.is_finite() || !min_r.is_finite() {
+            return (polys_px, poly_area_px, lines_px, pts_px, 0usize, 0usize, 0usize, 0usize);
+        }
+        let c0 = min_c.floor().clamp(0.0, ifd.width as f64) as usize;
+        let c1 = max_c.ceil().clamp(c0 as f64, ifd.width as f64) as usize;
+        let r0 = min_r.floor().clamp(0.0, ifd.height as f64) as usize;
+        let r1 = max_r.ceil().clamp(r0 as f64, ifd.height as f64) as usize;
+        (polys_px, poly_area_px, lines_px, pts_px, c0, c1, r0, r1)
+    };
+
+    let mut ifd_idx = 0usize;
+    let (
+        mut polys_px,
+        mut total_poly_area_px_val,
+        mut lines_px,
+        mut pts_px,
+        mut c0,
+        mut c1,
+        mut r0,
+        mut r1,
+    ) = project_to_ifd(&primary.index.ifds[0]);
+    if c1 <= c0 || r1 <= r0 {
+        return Ok(Some((empty_result(), Vec::new())));
+    }
+    if opts.max_size_explicit && max_size > 0 && (c1 - c0).max(r1 - r0) > max_size as usize {
+        for (i, ov) in primary.index.ifds.iter().enumerate().skip(1) {
+            if crate::engine::validate_multi_cog_grid(&cogs, i).is_err() {
+                break;
+            }
+            let (pp, pa, lp, ptp, oc0, oc1, or0, or1) = project_to_ifd(ov);
+            ifd_idx = i;
+            polys_px = pp;
+            total_poly_area_px_val = pa;
+            lines_px = lp;
+            pts_px = ptp;
+            c0 = oc0;
+            c1 = oc1;
+            r0 = or0;
+            r1 = or1;
+            if (c1 - c0).max(r1 - r0) <= max_size as usize {
+                break;
+            }
+        }
+    }
+    if c1 <= c0 || r1 <= r0 {
+        return Ok(Some((empty_result(), Vec::new())));
+    }
+
+    let ifd = &primary.index.ifds[ifd_idx];
+    let win_w = c1 - c0;
+    let win_h = r1 - r0;
+    let n_px = win_w.saturating_mul(win_h);
+    const MAX_EXACT_WINDOW_PX: usize = 4096 * 4096;
+    if n_px > MAX_EXACT_WINDOW_PX {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window ({win_w}x{win_h} = {n_px} px) exceeds maximum exact statistics window ({MAX_EXACT_WINDOW_PX} px); pass max_size to downsample"
+        )));
+    }
+    if Fold::<f32>::working_bytes(method, nb, n_px) > max_fold_bytes {
+        return Err(EngineError::BadRequest(format!(
+            "pixel_selection working buffer exceeds memory budget ({} MiB limit); reduce max_size or band count",
+            max_fold_bytes / (1024 * 1024)
+        )));
+    }
+
+    let tw = ifd.tile_width as usize;
+    let th = ifd.tile_height as usize;
+    let tx0 = c0 / tw;
+    let tx1 = (c1 - 1) / tw;
+    let ty0 = r0 / th;
+    let ty1 = (r1 - 1) / th;
+    let blocks_x = tx1 - tx0 + 1;
+    let blocks_y = ty1 - ty0 + 1;
+    const MAX_EXACT_BLOCKS: usize = 1024;
+    let per_asset_blocks = match ifd.planar_config {
+        PlanarConfig::Chunky => blocks_x.saturating_mul(blocks_y),
+        PlanarConfig::Planar => nb.saturating_mul(blocks_x.saturating_mul(blocks_y)),
+    };
+    if per_asset_blocks > MAX_EXACT_BLOCKS {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window requires {per_asset_blocks} blocks per asset (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
+        )));
+    }
+
+    let integer = !unscale
+        && matches!(
+            ifd.sample_type,
+            cogzilla_tiff::SampleType::Uint8
+                | cogzilla_tiff::SampleType::Uint16
+                | cogzilla_tiff::SampleType::Uint32
+                | cogzilla_tiff::SampleType::Int8
+                | cogzilla_tiff::SampleType::Int16
+                | cogzilla_tiff::SampleType::Int32
+        );
+    let absent = nodata_override.or(primary.index.nodata).unwrap_or(0.0);
+    let mut fold = Fold::<f32>::new(method, nb, n_px, integer).absent_as(absent);
+    let mut taken = 0usize;
+    let mut used_assets: Vec<String> = Vec::new();
+    let mut scene_buf = vec![f32::NAN; nb * n_px];
+
+    for (scene_i, (url, asset_cog)) in assets.iter().enumerate() {
+        if scene_i > 0 {
+            tokio::task::consume_budget().await;
+        }
+        let asset_ifd = &asset_cog.index.ifds[ifd_idx];
+        if sel_bands.iter().any(|&b1| b1 > asset_ifd.samples_per_pixel) {
+            continue;
+        }
+        taken += 1;
+        if Fold::<f32>::held_bytes(method, taken, nb, n_px) > max_fold_bytes {
+            return Err(EngineError::BadRequest(format!(
+                "pixel_selection=median exceeds memory budget ({} MiB limit); reduce max_size or band count",
+                max_fold_bytes / (1024 * 1024)
+            )));
+        }
+        scene_buf.fill(f32::NAN);
+        let eff_nodata = nodata_override.or(asset_cog.index.nodata);
+        match asset_ifd.planar_config {
+            PlanarConfig::Chunky => {
+                let mut indices = Vec::with_capacity(blocks_x * blocks_y);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        indices.push(Some(asset_ifd.tile_index(tx as u32, ty as u32, 0) as u32));
+                    }
+                }
+                let tiles = engine.store.get_blocks(asset_cog, ifd_idx, &indices).await?;
+                for (plane_i, &b1) in sel_bands.iter().enumerate() {
+                    let b0 = (b1 - 1) as usize;
+                    let sc = if unscale {
+                        asset_cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    let off = if unscale {
+                        asset_cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let dst_plane = &mut scene_buf[plane_i * n_px..(plane_i + 1) * n_px];
+                    for (bi, tile_opt) in tiles.iter().enumerate() {
+                        let Some(tile) = tile_opt else { continue };
+                        let Some(band) = tile.bands.get(b0) else { continue };
+                        let ty = ty0 + bi / blocks_x;
+                        let tx = tx0 + bi % blocks_x;
+                        let tile_x0 = tx * tw;
+                        let tile_y0 = ty * th;
+                        let rx0 = c0.max(tile_x0);
+                        let rx1 = c1.min(tile_x0 + tw);
+                        let ry0 = r0.max(tile_y0);
+                        let ry1 = r1.min(tile_y0 + th);
+                        for row in ry0..ry1 {
+                            let ly = row - tile_y0;
+                            let dst_row = (row - r0) * win_w;
+                            for col in rx0..rx1 {
+                                let lx = col - tile_x0;
+                                let mut v = band.data.get_f32(ly * tw + lx);
+                                if !v.is_finite() {
+                                    continue;
+                                }
+                                if let Some(nd) = eff_nodata
+                                    && (nd.is_nan() && v.is_nan() || v == nd)
+                                {
+                                    continue;
+                                }
+                                if unscale {
+                                    v = v * sc + off;
+                                }
+                                dst_plane[dst_row + (col - c0)] = v;
+                            }
+                        }
+                    }
+                }
+            }
+            PlanarConfig::Planar => {
+                for (plane_i, &b1) in sel_bands.iter().enumerate() {
+                    let b0 = (b1 - 1) as usize;
+                    let mut indices = Vec::with_capacity(blocks_x * blocks_y);
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            indices.push(Some(
+                                asset_ifd.tile_index(tx as u32, ty as u32, b0 as u16) as u32,
+                            ));
+                        }
+                    }
+                    let tiles = engine.store.get_blocks(asset_cog, ifd_idx, &indices).await?;
+                    let sc = if unscale {
+                        asset_cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    let off = if unscale {
+                        asset_cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let dst_plane = &mut scene_buf[plane_i * n_px..(plane_i + 1) * n_px];
+                    for (bi, tile_opt) in tiles.iter().enumerate() {
+                        let Some(tile) = tile_opt else { continue };
+                        let Some(band) = tile.bands.first() else { continue };
+                        let ty = ty0 + bi / blocks_x;
+                        let tx = tx0 + bi % blocks_x;
+                        let tile_x0 = tx * tw;
+                        let tile_y0 = ty * th;
+                        let rx0 = c0.max(tile_x0);
+                        let rx1 = c1.min(tile_x0 + tw);
+                        let ry0 = r0.max(tile_y0);
+                        let ry1 = r1.min(tile_y0 + th);
+                        for row in ry0..ry1 {
+                            let ly = row - tile_y0;
+                            let dst_row = (row - r0) * win_w;
+                            for col in rx0..rx1 {
+                                let lx = col - tile_x0;
+                                let mut v = band.data.get_f32(ly * tw + lx);
+                                if !v.is_finite() {
+                                    continue;
+                                }
+                                if let Some(nd) = eff_nodata
+                                    && (nd.is_nan() && v.is_nan() || v == nd)
+                                {
+                                    continue;
+                                }
+                                if unscale {
+                                    v = v * sc + off;
+                                }
+                                dst_plane[dst_row + (col - c0)] = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fold.add(scene_buf.iter().copied());
+        used_assets.push(url.clone());
+        if fold.is_done() {
+            break;
+        }
+    }
+
+    let (out_nb, combined): (usize, Vec<f32>) = match fold.finish() {
+        Some(Selected { bands, values }) => (bands, values),
+        None => return Ok(Some((empty_result(), used_assets))),
+    };
+
+    let crs_owned = crs.clone();
+    let p2c = ifd.pixel_to_crs;
+    let opts_owned = opts.clone();
+    let compute_cpu = move || -> serde_json::Value {
+        let total_poly_area_px =
+            (geom_kind == ZonalGeomKind::Polygon).then_some(total_poly_area_px_val);
+        let cov = rasterize_exact_coverage(&polys_px, &lines_px, &pts_px, c0, r0, win_w, win_h);
+        let line_len_m = if geom_kind == ZonalGeomKind::Line {
+            Some(rasterize_line_geodesic_lengths_m(
+                &lines_px, &crs_owned, &p2c, c0, r0, win_w, win_h,
+            ))
+        } else {
+            None
+        };
+        let area_model = if geom_kind == ZonalGeomKind::Polygon {
+            PixelAreaModel::build(&crs_owned, &p2c, c0, r0, win_w, win_h)
+        } else {
+            PixelAreaModel::Constant(1.0)
+        };
+        let mut out = serde_json::Map::new();
+        for bi in 0..out_nb {
+            let plane = &combined[bi * n_px..(bi + 1) * n_px];
+            let key = if method == Selection::Count {
+                "b1".to_string()
+            } else {
+                format!("b{}", sel_bands[bi])
+            };
+            let desc = if method == Selection::Count {
+                "count".to_string()
+            } else {
+                band_descs[bi].clone()
+            };
+            out.insert(
+                key,
+                compute_weighted_band_stats_with_geom(
+                    plane,
+                    &cov,
+                    win_w,
+                    win_h,
+                    &area_model,
+                    opts_owned.area_weighted,
+                    geom_kind,
+                    line_len_m.as_deref(),
+                    total_poly_area_px,
+                    &desc,
+                    &opts_owned,
+                ),
+            );
+        }
+        serde_json::Value::Object(out)
+    };
+
+    let val = if n_px >= 65_536 {
+        engine.store.run_heavy_cpu(compute_cpu).await?
+    } else {
+        compute_cpu()
+    };
+    Ok(Some((val, used_assets)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
