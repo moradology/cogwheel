@@ -5207,23 +5207,109 @@ where
                             insert_feature_stats(feat, stats);
                         }
                     } else {
-                        let sem = Arc::new(tokio::sync::Semaphore::new(fc_worker_count(n_feats)));
+                        let feat_snapshots: Arc<Vec<serde_json::Value>> =
+                            Arc::new(features.clone());
+                        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let workers = fc_worker_count(n_feats);
                         let mut set = tokio::task::JoinSet::new();
-                        for (idx, feat) in features.iter().enumerate() {
-                            let fut = compute_for_geom(feat);
-                            let sem_c = sem.clone();
+                        for _ in 0..workers {
+                            let feats_c = feat_snapshots.clone();
+                            let next_c = next_idx.clone();
+                            let eng = engine.clone();
+                            let mj_c = mj.clone();
+                            let opts = stats_opts.clone();
+                            let max_size = pq.max_size;
+                            let unscale = pq.unscale;
+                            let nodata = pq.nodata;
+                            let coord_crs_c = fc_crs.clone();
                             set.spawn(async move {
-                                let _permit = sem_c.acquire_owned().await.map_err(|_| {
-                                    EngineError::BadRequest("statistics worker cancelled".into())
-                                })?;
-                                Ok::<_, EngineError>((idx, fut.await?))
+                                let mut local = Vec::new();
+                                loop {
+                                    let idx = next_c
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if idx >= feats_c.len() {
+                                        break;
+                                    }
+                                    let (mask, bbox) = PolygonMask::from_geojson_in_crs(
+                                        &feats_c[idx],
+                                        coord_crs_c.as_ref(),
+                                    )?;
+                                    let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
+                                    let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
+                                    let urls = mj_c.query_bbox_3857(
+                                        mx0.min(mx1),
+                                        my0.min(my1),
+                                        mx0.max(mx1),
+                                        my0.max(my1),
+                                    );
+                                    let mut last_err: Option<EngineError> = None;
+                                    let mut first_empty: Option<serde_json::Value> = None;
+                                    let mut found: Option<serde_json::Value> = None;
+                                    for cand in urls.iter().take(16) {
+                                        match eng.store.open_uri(cand).await {
+                                            Ok(cog) => {
+                                                match compute_statistics_with_options(
+                                                    &eng,
+                                                    &cog,
+                                                    max_size,
+                                                    Some(&mask),
+                                                    unscale,
+                                                    nodata,
+                                                    &opts,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(stats) => {
+                                                        let has_valid = stats
+                                                            .as_object()
+                                                            .is_some_and(|obj| {
+                                                                obj.values().any(|b| {
+                                                                    b.get("valid_pixels")
+                                                                        .and_then(|v| v.as_f64())
+                                                                        .unwrap_or(0.0)
+                                                                        > 0.0
+                                                                })
+                                                            });
+                                                        if has_valid {
+                                                            found = Some(stats);
+                                                            break;
+                                                        }
+                                                        if first_empty.is_none() {
+                                                            first_empty = Some(stats);
+                                                        }
+                                                    }
+                                                    Err(e) => last_err = Some(e),
+                                                }
+                                            }
+                                            Err(e) => {
+                                                last_err =
+                                                    Some(crate::engine::asset_fetch_error(cand, e))
+                                            }
+                                        }
+                                    }
+                                    let stats = match found.or(first_empty) {
+                                        Some(s) => s,
+                                        None => {
+                                            return Err(last_err.unwrap_or_else(|| {
+                                                EngineError::NotFound(
+                                                    "no mosaic scenes intersect requested geometry"
+                                                        .into(),
+                                                )
+                                            }));
+                                        }
+                                    };
+                                    local.push((idx, stats));
+                                }
+                                Ok::<_, EngineError>(local)
                             });
                         }
                         while let Some(joined) = set.join_next().await {
-                            let (idx, stats) = joined.map_err(|e| {
+                            let batch = joined.map_err(|e| {
                                 EngineError::BadRequest(format!("statistics worker failed: {e}"))
                             })??;
-                            insert_feature_stats(&mut features[idx], stats);
+                            for (idx, stats) in batch {
+                                insert_feature_stats(&mut features[idx], stats);
+                            }
                         }
                     }
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
@@ -6914,23 +7000,25 @@ where
                     None
                 };
                 let stats_opts_post = build_stats_options(&pq, false)?;
-                let compute_stac_merged_stats = |mask: Arc<PolygonMask>, poly_bbox: [f64; 4]| {
+                let eng_stac = engine.clone();
+                let pq_stac = pq.clone();
+                let compute_stac_merged_stats = move |mask: Arc<PolygonMask>, poly_bbox: [f64; 4]| {
                     let cogs_c = cogs.clone();
                     let names_c = names.clone();
-                    let eng = engine.clone();
-                    let max_size = pq.max_size;
-                    let width_opt = pq.width;
-                    let height_opt = pq.height;
-                    let unscale = pq.unscale;
-                    let nodata = pq.nodata;
-                    let resample = pq.resample;
+                    let eng = eng_stac.clone();
+                    let max_size = pq_stac.max_size;
+                    let width_opt = pq_stac.width;
+                    let height_opt = pq_stac.height;
+                    let unscale = pq_stac.unscale;
+                    let nodata = pq_stac.nodata;
+                    let resample = pq_stac.resample;
                     let stats_opts = stats_opts_post.clone();
-                    let asset_bidx_c = pq.asset_bidx.clone();
-                    let pq_bidx_c = pq.bidx.clone();
-                    let asset_as_band = pq.asset_as_band;
+                    let asset_bidx_c = pq_stac.asset_bidx.clone();
+                    let pq_bidx_c = pq_stac.bidx.clone();
+                    let asset_as_band = pq_stac.asset_as_band;
                     let expr_progs_c = post_expr_progs.clone();
-                    let alg_c = pq.algorithm.clone();
-                    let pq_clone = pq.clone();
+                    let alg_c = pq_stac.algorithm.clone();
+                    let pq_clone = pq_stac.clone();
                     let n = names_c.len();
                     async move {
                         if is_dem_alg || expr_progs_c.is_some() {
@@ -7110,23 +7198,37 @@ where
                                 PolygonMask::from_geojson_in_crs(feat, fc_crs.as_ref())?;
                             parsed.push((Arc::new(mask), poly_bbox));
                         }
-                        let sem = Arc::new(tokio::sync::Semaphore::new(fc_worker_count(n_feats)));
+                        let parsed = Arc::new(parsed);
+                        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let workers = fc_worker_count(n_feats);
+                        let compute_shared = Arc::new(compute_stac_merged_stats);
                         let mut set = tokio::task::JoinSet::new();
-                        for (idx, (mask, poly_bbox)) in parsed.into_iter().enumerate() {
-                            let fut = compute_stac_merged_stats(mask, poly_bbox);
-                            let sem_c = sem.clone();
+                        for _ in 0..workers {
+                            let parsed_c = parsed.clone();
+                            let next_c = next_idx.clone();
+                            let compute_c = compute_shared.clone();
                             set.spawn(async move {
-                                let _permit = sem_c.acquire_owned().await.map_err(|_| {
-                                    EngineError::BadRequest("statistics worker cancelled".into())
-                                })?;
-                                Ok::<_, EngineError>((idx, fut.await?))
+                                let mut local = Vec::new();
+                                loop {
+                                    let idx = next_c
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if idx >= parsed_c.len() {
+                                        break;
+                                    }
+                                    let (ref mask, poly_bbox) = parsed_c[idx];
+                                    let stats = compute_c(mask.clone(), poly_bbox).await?;
+                                    local.push((idx, stats));
+                                }
+                                Ok::<_, EngineError>(local)
                             });
                         }
                         while let Some(joined) = set.join_next().await {
-                            let (idx, stats) = joined.map_err(|e| {
+                            let batch = joined.map_err(|e| {
                                 EngineError::BadRequest(format!("statistics worker failed: {e}"))
                             })??;
-                            insert_feature_stats(&mut features[idx], stats);
+                            for (idx, stats) in batch {
+                                insert_feature_stats(&mut features[idx], stats);
+                            }
                         }
                     }
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
