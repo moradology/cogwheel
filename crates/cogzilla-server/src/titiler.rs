@@ -6211,15 +6211,17 @@ async fn render_bbox_impl(
             return raw;
         }
 
-        let cf_single_lut: Option<[u8; 256]> = if matches!(
-            bands,
-            BandRequest::Single { .. }
-                | BandRequest::Dem { .. }
-                | BandRequest::CustomExpr { .. }
-                | BandRequest::Spectral1 { .. }
-                | BandRequest::Spectral2 { .. }
-                | BandRequest::Spectral3 { .. }
-        ) {
+        let cf_single_lut: Option<[u8; 256]> = if custom_lut.is_none()
+            && matches!(
+                bands,
+                BandRequest::Single { .. }
+                    | BandRequest::Dem { .. }
+                    | BandRequest::CustomExpr { .. }
+                    | BandRequest::Spectral1 { .. }
+                    | BandRequest::Spectral2 { .. }
+                    | BandRequest::Spectral3 { .. }
+            )
+        {
             color_formula.map(|cf| {
                 let mut t = [0u8; 256];
                 for i in 0..256 {
@@ -7130,15 +7132,17 @@ async fn render_mixed_grid_bbox(
         return Ok(raw);
     }
 
-    let cf_single_lut: Option<[u8; 256]> = if matches!(
-        bands,
-        BandRequest::Single { .. }
-            | BandRequest::Dem { .. }
-            | BandRequest::CustomExpr { .. }
-            | BandRequest::Spectral1 { .. }
-            | BandRequest::Spectral2 { .. }
-            | BandRequest::Spectral3 { .. }
-    ) {
+    let cf_single_lut: Option<[u8; 256]> = if custom_lut.is_none()
+        && matches!(
+            bands,
+            BandRequest::Single { .. }
+                | BandRequest::Dem { .. }
+                | BandRequest::CustomExpr { .. }
+                | BandRequest::Spectral1 { .. }
+                | BandRequest::Spectral2 { .. }
+                | BandRequest::Spectral3 { .. }
+        )
+    {
         color_formula.map(|cf| {
             let mut t = [0u8; 256];
             for i in 0..256 {
