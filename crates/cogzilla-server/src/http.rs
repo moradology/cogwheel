@@ -6950,6 +6950,37 @@ where
                         apply_unscale_cogs(&mut bands, &cogs);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    if matches!(
+                        bands,
+                        BandRequest::Single { .. }
+                            | BandRequest::Dem { .. }
+                            | BandRequest::CustomExpr { .. }
+                            | BandRequest::Spectral1 { .. }
+                            | BandRequest::Spectral2 { .. }
+                            | BandRequest::Spectral3 { .. }
+                    ) {
+                        let stat = render_native_preview_stats(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            pq.nodata,
+                            pq.unscale,
+                            alg_name,
+                            &stats_opts,
+                        )
+                        .await?;
+                        let mut map = serde_json::Map::new();
+                        map.insert("b1".into(), stat);
+                        return Ok((
+                            Bytes::from(serde_json::Value::Object(map).to_string()),
+                            "application/json",
+                        ));
+                    }
                     let raw = render_native_preview(
                         &engine,
                         &cogs,
@@ -7220,6 +7251,25 @@ where
                                 let n_px = (out_w as usize) * (out_h as usize);
                                 if unscale {
                                     apply_unscale_cogs(&mut bands, &cogs_c);
+                                }
+                                let alg_name = alg_c.as_deref().unwrap_or("algorithm");
+                                if matches!(
+                                    bands,
+                                    BandRequest::Single { .. }
+                                        | BandRequest::Dem { .. }
+                                        | BandRequest::CustomExpr { .. }
+                                        | BandRequest::Spectral1 { .. }
+                                        | BandRequest::Spectral2 { .. }
+                                        | BandRequest::Spectral3 { .. }
+                                ) {
+                                    let stat = render_wgs84_bbox_stats(
+                                        &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
+                                        resample, nodata, unscale, alg_name, &stats_opts,
+                                    )
+                                    .await?;
+                                    let mut map = serde_json::Map::new();
+                                    map.insert("b1".into(), stat);
+                                    return Ok::<_, EngineError>(serde_json::Value::Object(map));
                                 }
                                 let raw = render_wgs84_bbox(
                                     &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
@@ -8643,6 +8693,37 @@ where
                         apply_unscale_cogs(&mut bands, &cogs);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    if matches!(
+                        bands,
+                        BandRequest::Single { .. }
+                            | BandRequest::Dem { .. }
+                            | BandRequest::CustomExpr { .. }
+                            | BandRequest::Spectral1 { .. }
+                            | BandRequest::Spectral2 { .. }
+                            | BandRequest::Spectral3 { .. }
+                    ) {
+                        let stat = render_native_preview_stats(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            pq.nodata,
+                            pq.unscale,
+                            alg_name,
+                            &stats_opts,
+                        )
+                        .await?;
+                        let mut map = serde_json::Map::new();
+                        map.insert("b1".into(), stat);
+                        return Ok((
+                            Bytes::from(serde_json::Value::Object(map).to_string()),
+                            "application/json",
+                        ));
+                    }
                     let raw = render_native_preview(
                         &engine,
                         &cogs,

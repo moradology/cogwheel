@@ -2463,6 +2463,57 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let instrs = Self::compile_expr_to_gpu(prog)?;
+        self.try_render_bbox_instrs_stats(
+            cache_key,
+            coords,
+            srcs,
+            instrs,
+            resample,
+            num_bins,
+            hist_range,
+            percentiles,
+        )
+    }
+
+    /// 1-pass fused GPU built-in spectral index (`SpectralExpr`) + band statistics/histogram/percentiles
+    /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_spectral_stats(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        resample: ResampleMode,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
+        let instrs = Self::compile_spectral_to_gpu(expr)?;
+        self.try_render_bbox_instrs_stats(
+            cache_key,
+            coords,
+            srcs,
+            instrs,
+            resample,
+            num_bins,
+            hist_range,
+            percentiles,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_render_bbox_instrs_stats(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        instrs: Vec<GpuInstr>,
+        resample: ResampleMode,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample(resample)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
@@ -2507,6 +2558,101 @@ impl GpuBackend {
                     instrs,
                     rescale_min: 0.0,
                     rescale_max: 1.0,
+                    lut_u32: [0u32; 256],
+                    output: CoalescedOutput::RawF32,
+                }),
+                nodata: None,
+                num_bins,
+                hist_range,
+            })
+            .ok()?;
+        Some(cogzilla_gpu::decode_stats_readback(
+            &raw,
+            dst_w * dst_h,
+            num_bins,
+            hist_range,
+            percentiles,
+        ))
+    }
+
+    /// 1-pass fused GPU DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`) + band statistics/histogram/percentiles
+    /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_dem_stats(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        alg: DemAlgorithm,
+        pixel_size_x_m: f32,
+        pixel_size_y_m: f32,
+        resample: ResampleMode,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
+        let gpu_mode = map_resample(resample)?;
+        let gpu_alg = match alg {
+            DemAlgorithm::Hillshade {
+                azimuth_deg,
+                altitude_deg,
+                z_factor,
+            } => GpuDemAlgorithm::Hillshade {
+                azimuth_deg,
+                altitude_deg,
+                z_factor,
+            },
+            DemAlgorithm::Slope { z_factor } => GpuDemAlgorithm::Slope { z_factor },
+            DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
+            DemAlgorithm::Contours { .. } => return None,
+        };
+        let (dst_w, dst_h) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len()),
+            BboxCoordSource::Grid2D { dst_w, dst_h, .. } => (dst_w, dst_h),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        let min_px = if self.ctx.info.unified_memory {
+            512 * 1024
+        } else {
+            512 * 512
+        };
+        if dst_w.saturating_mul(dst_h) < min_px {
+            return None;
+        }
+        let key = source_slab_key(cog_id, ifd_idx, band0, src);
+        let warm_slab = self.slab_cache.get(&key);
+        let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::WithStats {
+                inner: Box::new(CoalescedJob::Terrain {
+                    slab,
+                    plan,
+                    mode: gpu_mode,
+                    alg: gpu_alg,
+                    pixel_size_x_m,
+                    pixel_size_y_m,
+                    rescale_min: 0.0,
+                    rescale_max: 255.0,
                     lut_u32: [0u32; 256],
                     output: CoalescedOutput::RawF32,
                 }),

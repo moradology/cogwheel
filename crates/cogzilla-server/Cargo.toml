@@ -121,5 +121,9 @@ required-features = ["gpu"]
 name = "e2e_titiler_fused_stats_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "e2e_dem_spectral_cog_stats_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 zune-jpeg.workspace = true
