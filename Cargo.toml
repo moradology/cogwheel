@@ -25,6 +25,8 @@ zstd-sys = "2"
 libwebp-sys = "0.11"
 jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
+lerc-core = "=0.5.2"
+lerc-reader = { version = "=0.5.2", default-features = false }
 memmap2 = "0.9"
 dashmap = "6"
 parking_lot = "0.12"
