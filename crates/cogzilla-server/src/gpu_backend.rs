@@ -12,7 +12,7 @@ use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
 use cogzilla_kernel::{
     BandSource, ColorFormula, ColormapLut, ColormapName, DemAlgorithm, ExprProgram, OutputFormat,
-    ResampleMode, RgbStyle, SingleBandStyle, TerrainEncoding, encode_rgba_tile,
+    ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr, TerrainEncoding, encode_rgba_tile,
 };
 use cogzilla_proj::CoordPlan;
 
@@ -1276,6 +1276,133 @@ impl GpuBackend {
         }
     }
 
+    /// Compile a built-in `SpectralExpr` (`Db`, `NormalizedDiff`, `Savi`, `Ratio`, `Diff`, `Evi`)
+    /// directly into GPU VM bytecode without string parsing overhead.
+    pub fn compile_spectral_to_gpu(expr: SpectralExpr) -> Option<Vec<GpuInstr>> {
+        let instrs = match expr {
+            SpectralExpr::Db => vec![GpuInstr::load_band(0), GpuInstr::op(opcodes::DB)],
+            SpectralExpr::NormalizedDiff => vec![
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::SUB),
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::ADD),
+                GpuInstr::op(opcodes::DIV),
+            ],
+            SpectralExpr::Savi => vec![
+                GpuInstr::push_const(1.5),
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::SUB),
+                GpuInstr::op(opcodes::MUL),
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::ADD),
+                GpuInstr::push_const(0.5),
+                GpuInstr::op(opcodes::ADD),
+                GpuInstr::op(opcodes::DIV),
+            ],
+            SpectralExpr::Ratio => vec![
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::DIV),
+            ],
+            SpectralExpr::Diff => vec![
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::SUB),
+            ],
+            SpectralExpr::Evi => vec![
+                GpuInstr::push_const(2.5),
+                GpuInstr::load_band(0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::SUB),
+                GpuInstr::op(opcodes::MUL),
+                GpuInstr::load_band(0),
+                GpuInstr::push_const(6.0),
+                GpuInstr::load_band(1),
+                GpuInstr::op(opcodes::MUL),
+                GpuInstr::op(opcodes::ADD),
+                GpuInstr::push_const(7.5),
+                GpuInstr::load_band(2),
+                GpuInstr::op(opcodes::MUL),
+                GpuInstr::op(opcodes::SUB),
+                GpuInstr::push_const(1.0),
+                GpuInstr::op(opcodes::ADD),
+                GpuInstr::op(opcodes::DIV),
+            ],
+            SpectralExpr::SarRgb => return None,
+        };
+        Some(instrs)
+    }
+
+    /// Attempt GPU-accelerated built-in `SpectralExpr` tile rendering across all `CoordPlan`
+    /// variants (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_spectral<const N: usize>(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: &[u16],
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        style: &SingleBandStyle,
+    ) -> Option<Bytes> {
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        };
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, bands_1based, srcs);
+        self.try_render_bbox_spectral(cache_key, coords, srcs, expr, style, true)
+    }
+
+    /// Attempt GPU-accelerated built-in `SpectralExpr` visual rendering for arbitrary
+    /// `BboxCoordSource` (`/cog/preview`, `/cog/bbox`, `/cog/crop`, `/cog/feature`, and tiles).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_spectral(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_spectral_to_gpu(expr)?;
+        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+    }
+
+    /// Attempt GPU-accelerated built-in `SpectralExpr` raw `f32` rendering for `.npy`, `.tif`,
+    /// `.f32`, and multi-scene mosaic routes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_spectral_f32(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        resample: ResampleMode,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_spectral_to_gpu(expr)?;
+        self.try_render_bbox_instrs_f32(cache_key, coords, srcs, &instrs, resample)
+    }
+
     /// Attempt GPU-accelerated multi-band `ExprProgram` tile rendering across all `CoordPlan`
     /// variants (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
     #[allow(clippy::too_many_arguments)]
@@ -1356,6 +1483,20 @@ impl GpuBackend {
         style: &SingleBandStyle,
         return_mask: bool,
     ) -> Option<Bytes> {
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_render_bbox_instrs(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        instrs: &[GpuInstr],
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let gpu_mode = map_resample(style.resample)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
@@ -1375,7 +1516,6 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
-        let instrs = Self::compile_expr_to_gpu(prog)?;
         let out_kind = match style.format {
             OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
             OutputFormat::Png
@@ -2125,6 +2265,19 @@ impl GpuBackend {
         prog: &ExprProgram,
         resample: ResampleMode,
     ) -> Option<Bytes> {
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        self.try_render_bbox_instrs_f32(cache_key, coords, srcs, &instrs, resample)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_render_bbox_instrs_f32(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        instrs: &[GpuInstr],
+        resample: ResampleMode,
+    ) -> Option<Bytes> {
         let gpu_mode = map_resample(resample)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
@@ -2144,7 +2297,6 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
-        let instrs = Self::compile_expr_to_gpu(prog)?;
         let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
         let band_upload_bytes: usize = if warm_slab.is_some() {
             0
@@ -2792,6 +2944,124 @@ mod tests {
                 }
             }
             assert!(max_err < 1e-3, "Expr NDVI RawF32 max err {max_err} >= 1e-3");
+        }
+    }
+
+    #[test]
+    fn spectral_indices_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU spectral test (no adapter)");
+            return;
+        };
+        assert!(GpuBackend::compile_spectral_to_gpu(SpectralExpr::SarRgb).is_none());
+
+        let w = 256u32;
+        let h = 256u32;
+        let mk_band = |base: f32, amp: f32| -> DecodedBand {
+            let mut vals = vec![0u16; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    vals[(y * w + x) as usize] = (base
+                        + amp * (x as f32 * 0.03).sin()
+                        + (amp * 0.6) * (y as f32 * 0.04).cos())
+                        .max(10.0) as u16;
+                }
+            }
+            DecodedBand {
+                width: w,
+                height: h,
+                data: BandData::U16 {
+                    data: vals.into_boxed_slice(),
+                    nodata: None,
+                },
+                stats: BlockStats {
+                    all_nodata: false,
+                    no_nodata: true,
+                    min: 10.0,
+                    max: 2500.0,
+                },
+            }
+        };
+        let b0 = mk_band(1500.0, 400.0);
+        let b1 = mk_band(700.0, 200.0);
+        let b2 = mk_band(400.0, 120.0);
+        let bl0 = [Some(&b0)];
+        let bl1 = [Some(&b1)];
+        let bl2 = [Some(&b2)];
+        let all_srcs = [
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl0),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl1),
+            BandSource::new(w, h, w, h, 0, 0, 1, 1, &bl2),
+        ];
+
+        let n = 512usize;
+        let u_coords: Vec<f32> = (0..n).map(|i| 4.0 + (i as f32 / n as f32) * 246.0).collect();
+        let v_coords: Vec<f32> = (0..n).map(|i| 4.0 + (i as f32 / n as f32) * 246.0).collect();
+
+        // Check Db (1-band), NormalizedDiff / Savi / Ratio / Diff (2-band), and Evi (3-band)
+        for expr in [
+            SpectralExpr::Db,
+            SpectralExpr::NormalizedDiff,
+            SpectralExpr::Savi,
+            SpectralExpr::Ratio,
+            SpectralExpr::Diff,
+            SpectralExpr::Evi,
+        ] {
+            let srcs = &all_srcs[..expr.required_bands()];
+            let bands_1based: Vec<u16> = (1..=srcs.len() as u16).collect();
+            let key = GpuBackend::multiband_key(888, 0, &bands_1based, srcs);
+            if let Some(raw) = gpu.try_render_bbox_spectral_f32(
+                key,
+                BboxCoordSource::Separable {
+                    u: &u_coords,
+                    v: &v_coords,
+                },
+                srcs,
+                expr,
+                ResampleMode::Lanczos,
+            ) {
+                assert_eq!(raw.len(), n * n * 4);
+                let mut max_err = 0.0f32;
+                for py in (8..n - 8).step_by(29) {
+                    for px in (8..n - 8).step_by(29) {
+                        let off = (py * n + px) * 4;
+                        let gv = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                        let c0 = cogzilla_kernel::sample_general_scaled(
+                            &all_srcs[0], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                        );
+                        let cv = match expr.required_bands() {
+                            1 => expr.eval1(c0),
+                            2 => {
+                                let c1 = cogzilla_kernel::sample_general_scaled(
+                                    &all_srcs[1], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                                );
+                                expr.eval2(c0, c1)
+                            }
+                            _ => {
+                                let c1 = cogzilla_kernel::sample_general_scaled(
+                                    &all_srcs[1], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                                );
+                                let c2 = cogzilla_kernel::sample_general_scaled(
+                                    &all_srcs[2], u_coords[px], v_coords[py], 1.0, 1.0, ResampleMode::Lanczos,
+                                );
+                                expr.eval3(c0, c1, c2)
+                            }
+                        };
+                        if cv.is_finite() {
+                            max_err = max_err.max((gv - cv).abs());
+                        }
+                    }
+                }
+                let tol = match expr {
+                    // CPU `fast_db_from_power` uses a fast ~0.01 dB log2 polynomial vs GPU IEEE log10
+                    SpectralExpr::Db | SpectralExpr::Diff => 2e-2,
+                    _ => 5e-3,
+                };
+                assert!(
+                    max_err < tol,
+                    "SpectralExpr::{expr:?} max err {max_err} >= {tol}"
+                );
+            }
         }
     }
 }

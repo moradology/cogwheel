@@ -772,6 +772,21 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu.try_render_spectral::<N>(
+                        cog.id,
+                        ifd_idx,
+                        &[*band_1based],
+                        &plan,
+                        std::slice::from_ref(&src),
+                        *expr,
+                        &style,
+                    ) {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
             }
             BandRequest::SarRgb {
@@ -1108,6 +1123,21 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_spectral::<N>(
+                                cog.id,
+                                ifd_idx,
+                                bands_1based,
+                                &plan,
+                                &srcs,
+                                *expr,
+                                &style,
+                            ) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
                     }
                     PlanarConfig::Planar => {
@@ -1142,6 +1172,21 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_spectral::<N>(
+                                cog.id,
+                                ifd_idx,
+                                bands_1based,
+                                &plan,
+                                &srcs,
+                                *expr,
+                                &style,
+                            ) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
                     }
                 }
@@ -1224,6 +1269,21 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_spectral::<N>(
+                                cog.id,
+                                ifd_idx,
+                                bands_1based,
+                                &plan,
+                                &srcs,
+                                *expr,
+                                &style,
+                            ) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
                     }
                     PlanarConfig::Planar => {
@@ -1278,6 +1338,21 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu.try_render_spectral::<N>(
+                                cog.id,
+                                ifd_idx,
+                                bands_1based,
+                                &plan,
+                                &srcs,
+                                *expr,
+                                &style,
+                            ) {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
                         Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
                     }
                 }
