@@ -360,7 +360,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -539,7 +539,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -664,7 +664,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -1124,7 +1124,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -1410,7 +1410,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -1614,7 +1614,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -1700,7 +1700,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -1791,7 +1791,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -1990,7 +1990,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: active.min(32),
-            in_flight: (active - 1) / 8,
+            in_flight: (active - 1) / 32,
         });
         if !decision.use_gpu {
             return None;
