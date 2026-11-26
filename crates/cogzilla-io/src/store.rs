@@ -598,6 +598,9 @@ impl CogStore {
         self.datasets_by_uri
             .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
         self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some(ref dc) = self.disk_cache {
+            dc.clear();
+        }
     }
 
     /// Validate a cached `OpenedCog` against its backing source.
