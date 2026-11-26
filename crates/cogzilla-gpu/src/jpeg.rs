@@ -149,6 +149,27 @@ impl<'a> BitWriter<'a> {
     fn write_bits(&mut self, bits: u32, len: u32) {
         self.bit_buf = (self.bit_buf << len) | (bits as u64);
         self.bit_cnt += len;
+        if self.bit_cnt >= 32 {
+            self.bit_cnt -= 32;
+            let word = (self.bit_buf >> self.bit_cnt) as u32;
+            let inv = !word;
+            let has_ff = (inv.wrapping_sub(0x0101_0101) & word & 0x8080_8080) != 0;
+            let bytes = word.to_be_bytes();
+            if !has_ff {
+                self.out.extend_from_slice(&bytes);
+            } else {
+                for b in bytes {
+                    self.out.push(b);
+                    if b == 0xff {
+                        self.out.push(0x00);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn flush_align(&mut self) {
         while self.bit_cnt >= 8 {
             self.bit_cnt -= 8;
             let byte = ((self.bit_buf >> self.bit_cnt) & 0xff) as u8;
@@ -157,13 +178,14 @@ impl<'a> BitWriter<'a> {
                 self.out.push(0x00);
             }
         }
-    }
-
-    #[inline]
-    fn flush_align(&mut self) {
         if self.bit_cnt > 0 {
             let pad = 8 - self.bit_cnt;
-            self.write_bits((1u32 << pad) - 1, pad);
+            let byte = (((self.bit_buf << pad) | ((1u64 << pad) - 1)) & 0xff) as u8;
+            self.bit_cnt = 0;
+            self.out.push(byte);
+            if byte == 0xff {
+                self.out.push(0x00);
+            }
         }
     }
 }
@@ -196,13 +218,26 @@ fn encode_block(
     *prev_dc = dc;
     let (dc_nbits, dc_code) = bit_size_and_code(diff);
     let sym = dc_nbits as usize;
-    bw.write_bits(dc_tbl.code[sym] as u32, dc_tbl.len[sym] as u32);
-    if dc_nbits > 0 {
-        bw.write_bits(dc_code, dc_nbits);
+    let h_len = dc_tbl.len[sym] as u32;
+    let h_code = dc_tbl.code[sym] as u32;
+    bw.write_bits((h_code << dc_nbits) | dc_code, h_len + dc_nbits);
+
+    // Fast backward scan in 8×i16 (128-bit) chunks to skip trailing AC zeros.
+    let mut last_chunk = 7usize;
+    while last_chunk > 0 && zz[last_chunk * 8..(last_chunk + 1) * 8] == [0i16; 8] {
+        last_chunk -= 1;
+    }
+    let mut last_nz = last_chunk * 8 + 7;
+    while last_nz > 0 && zz[last_nz] == 0 {
+        last_nz -= 1;
+    }
+    if last_nz == 0 {
+        bw.write_bits(ac_tbl.code[0x00] as u32, ac_tbl.len[0x00] as u32);
+        return;
     }
 
     let mut run = 0usize;
-    for &c in &zz[1..] {
+    for &c in &zz[1..=last_nz] {
         if c == 0 {
             run += 1;
             continue;
@@ -213,11 +248,12 @@ fn encode_block(
         }
         let (nbits, code) = bit_size_and_code(c as i32);
         let rs = (run << 4) | (nbits as usize);
-        bw.write_bits(ac_tbl.code[rs] as u32, ac_tbl.len[rs] as u32);
-        bw.write_bits(code, nbits);
+        let ac_len = ac_tbl.len[rs] as u32;
+        let ac_code = ac_tbl.code[rs] as u32;
+        bw.write_bits((ac_code << nbits) | code, ac_len + nbits);
         run = 0;
     }
-    if run > 0 {
+    if last_nz < 63 {
         bw.write_bits(ac_tbl.code[0x00] as u32, ac_tbl.len[0x00] as u32);
     }
 }
@@ -233,7 +269,14 @@ fn scale_qtable(base: &[u8; 64], quality: u8) -> [u8; 64] {
     out
 }
 
-fn write_jfif_headers(out: &mut Vec<u8>, width: u16, height: u16, q_y: &[u8; 64], q_c: &[u8; 64]) {
+fn write_jfif_headers(
+    out: &mut Vec<u8>,
+    width: u16,
+    height: u16,
+    q_y: &[u8; 64],
+    q_c: &[u8; 64],
+    restart_interval: u16,
+) {
     // SOI
     out.extend_from_slice(&[0xff, 0xd8]);
     // APP0 JFIF
@@ -284,6 +327,17 @@ fn write_jfif_headers(out: &mut Vec<u8>, width: u16, height: u16, q_y: &[u8; 64]
     write_dht(out, 0x10, &AC_LUMA_BITS, &AC_LUMA_VALS);
     write_dht(out, 0x01, &DC_CHROMA_BITS, &DC_CHROMA_VALS);
     write_dht(out, 0x11, &AC_CHROMA_BITS, &AC_CHROMA_VALS);
+    // Optional DRI (Define Restart Interval) for multi-threaded RST0..RST7 encoding
+    if restart_interval > 0 {
+        out.extend_from_slice(&[
+            0xff,
+            0xdd,
+            0x00,
+            0x04,
+            (restart_interval >> 8) as u8,
+            (restart_interval & 0xff) as u8,
+        ]);
+    }
     // SOS
     out.extend_from_slice(&[
         0xff, 0xda, 0x00, 0x0c, 3, 1, 0x00, 2, 0x11, 3, 0x11, 0x00, 0x3f, 0x00,
@@ -450,7 +504,8 @@ impl GpuJpegEncoder {
     }
 
     /// Upload an RGBA8 image to the GPU, run WGSL 4:2:0 YCbCr + 8×8 FDCT + Quantize + Zigzag,
-    /// and emit a standard Baseline JFIF `.jpg`.
+    /// and emit a standard Baseline JFIF `.jpg` (using multi-threaded `DRI`/`RST0..RST7`
+    /// Huffman encoding for images with `>= 1024` MCUs).
     pub fn encode_rgba8(
         &mut self,
         rgba: &[u8],
@@ -472,7 +527,35 @@ impl GpuJpegEncoder {
             self.src_buf = Self::alloc_src(&self.device, self.src_cap_bytes);
         }
         self.queue.write_buffer(&self.src_buf, 0, &rgba[..expected]);
+        let src_buf_ptr = &self.src_buf as *const wgpu::Buffer;
+        // SAFETY: `encode_rgba8_from_buffer_inner` only borrows `src_buf` immutably to create the
+        // bind group and never reallocates `self.src_buf`.
+        unsafe { self.encode_rgba8_from_buffer_inner(&*src_buf_ptr, width, height, quality) }
+    }
 
+    /// Encode an RGBA8 image already resident in a GPU `STORAGE` buffer (zero CPU→GPU upload).
+    pub fn encode_rgba8_from_buffer(
+        &mut self,
+        src_buf: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, GpuError> {
+        if width == 0 || height == 0 || width > 65535 || height > 65535 {
+            return Err(GpuError::InvalidDimensions(
+                "invalid RGBA8 dimensions for GPU JPEG".into(),
+            ));
+        }
+        self.encode_rgba8_from_buffer_inner(src_buf, width, height, quality)
+    }
+
+    fn encode_rgba8_from_buffer_inner(
+        &mut self,
+        src_buf: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, GpuError> {
         let mcu_w = width.div_ceil(16);
         let mcu_h = height.div_ceil(16);
         let total_mcus = (mcu_w as usize) * (mcu_h as usize);
@@ -512,7 +595,7 @@ impl GpuJpegEncoder {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.src_buf.as_entire_binding(),
+                    resource: src_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -556,33 +639,114 @@ impl GpuJpegEncoder {
         let mapped = slice.get_mapped_range();
         let coeffs: &[i16] = bytemuck::cast_slice(&mapped);
 
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let use_parallel = total_mcus >= 1024 && n_threads >= 2;
+        let restart_interval: u16 = if use_parallel {
+            total_mcus.div_ceil(n_threads).clamp(256, 65535) as u16
+        } else {
+            0
+        };
+
         let mut jpg = Vec::with_capacity((width as usize * height as usize) / 4 + 1024);
-        write_jfif_headers(&mut jpg, width as u16, height as u16, &q_y, &q_c);
-        {
-            let mut bw = BitWriter::new(&mut jpg);
-            let mut prev_y = 0i32;
-            let mut prev_cb = 0i32;
-            let mut prev_cr = 0i32;
-            for mcu in 0..total_mcus {
-                let base = mcu * 384;
-                for b in 0..4 {
-                    let blk: &[i16; 64] = coeffs[base + b * 64..base + (b + 1) * 64]
-                        .try_into()
-                        .unwrap();
-                    encode_block(&mut bw, blk, &mut prev_y, &self.dc_luma, &self.ac_luma);
+        write_jfif_headers(
+            &mut jpg,
+            width as u16,
+            height as u16,
+            &q_y,
+            &q_c,
+            restart_interval,
+        );
+
+        let dc_luma = &self.dc_luma;
+        let ac_luma = &self.ac_luma;
+        let dc_chroma = &self.dc_chroma;
+        let ac_chroma = &self.ac_chroma;
+
+        if restart_interval > 0 {
+            let ri = restart_interval as usize;
+            let n_chunks = total_mcus.div_ceil(ri);
+            let mut chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(n_chunks);
+                for chunk_idx in 0..n_chunks {
+                    let start_mcu = chunk_idx * ri;
+                    let end_mcu = (start_mcu + ri).min(total_mcus);
+                    let chunk_coeffs = &coeffs[start_mcu * 384..end_mcu * 384];
+                    let is_last = chunk_idx + 1 == n_chunks;
+                    handles.push(s.spawn(move || {
+                        let mcu_count = end_mcu - start_mcu;
+                        let mut buf = Vec::with_capacity(mcu_count * 32 + 64);
+                        encode_mcu_slice(
+                            &mut buf,
+                            chunk_coeffs,
+                            mcu_count,
+                            dc_luma,
+                            ac_luma,
+                            dc_chroma,
+                            ac_chroma,
+                        );
+                        if !is_last {
+                            buf.push(0xff);
+                            buf.push(0xd0 + ((chunk_idx & 7) as u8));
+                        }
+                        buf
+                    }));
                 }
-                let cb_blk: &[i16; 64] = coeffs[base + 4 * 64..base + 5 * 64].try_into().unwrap();
-                encode_block(&mut bw, cb_blk, &mut prev_cb, &self.dc_chroma, &self.ac_chroma);
-                let cr_blk: &[i16; 64] = coeffs[base + 5 * 64..base + 6 * 64].try_into().unwrap();
-                encode_block(&mut bw, cr_blk, &mut prev_cr, &self.dc_chroma, &self.ac_chroma);
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("jpeg huffman worker"))
+                    .collect()
+            });
+            for c in chunks.drain(..) {
+                jpg.extend_from_slice(&c);
             }
-            bw.flush_align();
+        } else {
+            encode_mcu_slice(
+                &mut jpg,
+                coeffs,
+                total_mcus,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+            );
         }
         jpg.extend_from_slice(&[0xff, 0xd9]); // EOI
         drop(mapped);
         self.staging_buf.unmap();
         Ok(jpg)
     }
+}
+
+fn encode_mcu_slice(
+    out: &mut Vec<u8>,
+    coeffs: &[i16],
+    mcu_count: usize,
+    dc_luma: &HuffTable,
+    ac_luma: &HuffTable,
+    dc_chroma: &HuffTable,
+    ac_chroma: &HuffTable,
+) {
+    let mut bw = BitWriter::new(out);
+    let mut prev_y = 0i32;
+    let mut prev_cb = 0i32;
+    let mut prev_cr = 0i32;
+    for mcu in 0..mcu_count {
+        let base = mcu * 384;
+        for b in 0..4 {
+            let blk: &[i16; 64] = coeffs[base + b * 64..base + (b + 1) * 64]
+                .try_into()
+                .unwrap();
+            encode_block(&mut bw, blk, &mut prev_y, dc_luma, ac_luma);
+        }
+        let cb_blk: &[i16; 64] = coeffs[base + 4 * 64..base + 5 * 64].try_into().unwrap();
+        encode_block(&mut bw, cb_blk, &mut prev_cb, dc_chroma, ac_chroma);
+        let cr_blk: &[i16; 64] = coeffs[base + 5 * 64..base + 6 * 64].try_into().unwrap();
+        encode_block(&mut bw, cr_blk, &mut prev_cr, dc_chroma, ac_chroma);
+    }
+    bw.flush_align();
 }
 
 #[cfg(test)]
@@ -597,7 +761,7 @@ mod tests {
             return;
         };
         let mut enc = GpuJpegEncoder::new(&ctx);
-        for &(w, h, q) in &[(256u32, 256u32, 85u8), (333, 217, 90), (512, 512, 85)] {
+        for &(w, h, q) in &[(256u32, 256u32, 85u8), (333, 217, 90), (512, 512, 85), (1024, 1024, 85)] {
             let mut rgba = Vec::with_capacity((w * h * 4) as usize);
             for y in 0..h {
                 for x in 0..w {

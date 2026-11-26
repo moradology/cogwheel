@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use cogzilla_gpu::{GpuContext, GpuJpegEncoder, GpuOptions};
+use cogzilla_gpu::{GpuContext, GpuJpegEncoder, GpuOptions, wgpu};
 use cogzilla_kernel::jpeg_fast::encode_jpeg_rgba;
 
 fn make_satellite_rgba(w: u32, h: u32) -> Vec<u8> {
@@ -55,18 +55,40 @@ fn main() {
 
     println!();
     println!(
-        "{:<10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>10}",
-        "Size", "CPU ms", "GPU ms", "Speedup", "CPU KB", "GPU KB", "CPU PSNR", "GPU PSNR"
+        "{:<10} {:>9} {:>9} {:>8} {:>9} {:>8} {:>9} {:>9} {:>9} {:>9}",
+        "Size",
+        "CPU ms",
+        "GPU ms",
+        "Speedup",
+        "Dev ms",
+        "DevSpd",
+        "CPU KB",
+        "GPU KB",
+        "CPU PSNR",
+        "GPU PSNR"
     );
-    println!("{}", "-".repeat(86));
+    println!("{}", "-".repeat(102));
 
     for &(size, iters) in &[(512u32, 15usize), (1024, 9), (2048, 5), (4096, 3)] {
         let rgba = make_satellite_rgba(size, size);
         let q = 85u8;
 
+        // Pre-resident GPU RGBA8 buffer (simulates output of a prior GPU render pass)
+        let dev_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench-device-rgba8"),
+            size: rgba.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&dev_buf, 0, &rgba);
+
         // Warmup
         let cpu_jpg = encode_jpeg_rgba(size, size, &rgba, q);
         let gpu_jpg = gpu.encode_rgba8(&rgba, size, size, q).expect("gpu jpeg");
+        let dev_jpg = gpu
+            .encode_rgba8_from_buffer(&dev_buf, size, size, q)
+            .expect("gpu dev jpeg");
+        assert_eq!(gpu_jpg, dev_jpg, "host vs device-resident GPU JPEG mismatch");
 
         let cpu_psnr = decode_psnr(&cpu_jpg, &rgba, size, size);
         let gpu_psnr = decode_psnr(&gpu_jpg, &rgba, size, size);
@@ -84,15 +106,26 @@ fn main() {
             let _ = gpu.encode_rgba8(&rgba, size, size, q).expect("gpu jpeg");
             gpu_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
+        let mut dev_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _ = gpu
+                .encode_rgba8_from_buffer(&dev_buf, size, size, q)
+                .expect("gpu dev jpeg");
+            dev_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
 
         let c = median_ms(cpu_times);
         let g = median_ms(gpu_times);
+        let d = median_ms(dev_times);
         println!(
-            "{:<10} {:>10.2} {:>10.2} {:>8.2}x {:>10.1} {:>10.1} {:>9.2}dB {:>9.2}dB",
+            "{:<10} {:>9.2} {:>9.2} {:>7.2}x {:>9.2} {:>7.2}x {:>9.1} {:>9.1} {:>8.2}dB {:>8.2}dB",
             format!("{size}x{size}"),
             c,
             g,
             c / g,
+            d,
+            c / d,
             cpu_jpg.len() as f64 / 1024.0,
             gpu_jpg.len() as f64 / 1024.0,
             cpu_psnr,
