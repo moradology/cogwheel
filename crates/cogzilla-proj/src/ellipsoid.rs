@@ -787,3 +787,181 @@ impl Sinusoidal {
         (self.lon0 + dlon, lat)
     }
 }
+
+/// Lambert Cylindrical Equal Area (EPSG method 9835 ellipsoidal / 9834 spherical).
+///
+/// Used by NSIDC EASE-Grid 2.0 Global (`EPSG:6933`, WGS84, `lat_ts = 30°`) and legacy
+/// NSIDC EASE-Grid Global (`EPSG:3410`, sphere `R = 6,371,228 m`, `lat_ts = 30°`).
+/// Completely separable in `(lon, lat)`: `x = f(lon)`, `y = g(lat)`.
+#[derive(Debug, Clone, Copy)]
+pub struct CylindricalEqualArea {
+    pub a: f64,
+    pub e: f64,
+    pub e2: f64,
+    pub lon0: f64,
+    /// `k0 = cos(lat_ts) / sqrt(1 - e^2 sin^2(lat_ts))`
+    pub k0: f64,
+    /// Authalic `q` at the pole (`2.0` on a sphere).
+    pub qp: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
+}
+
+impl CylindricalEqualArea {
+    pub fn new(
+        ellip: Ellipsoid,
+        lat_ts_deg: f64,
+        lon0_deg: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let lat_ts = lat_ts_deg.to_radians();
+        let (sin_ts, cos_ts) = lat_ts.sin_cos();
+        let k0 = cos_ts / (1.0 - ellip.e2 * sin_ts * sin_ts).sqrt();
+        let qp = authalic_q(ellip.e, ellip.e2, 1.0);
+        Self {
+            a: ellip.a,
+            e: ellip.e,
+            e2: ellip.e2,
+            lon0: lon0_deg.to_radians(),
+            k0,
+            qp,
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward_x(&self, lon: f64) -> f64 {
+        let dlon = wrap_dlon(lon - self.lon0);
+        self.false_easting + (self.a * self.k0 * dlon) / self.unit
+    }
+
+    #[inline(always)]
+    pub fn forward_y(&self, lat: f64) -> f64 {
+        let q = authalic_q(self.e, self.e2, lat.sin());
+        self.false_northing + (self.a * q / (2.0 * self.k0)) / self.unit
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        (self.forward_x(lon), self.forward_y(lat))
+    }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let x = (easting - self.false_easting) * self.unit;
+        let y = (northing - self.false_northing) * self.unit;
+        let dlon = x / (self.a * self.k0);
+        if dlon.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let q = 2.0 * y * self.k0 / self.a;
+        if q.abs() > self.qp * (1.0 + 1e-9) {
+            return (f64::NAN, f64::NAN);
+        }
+        let lat = lat_from_authalic_q(self.e, self.e2, q.clamp(-self.qp, self.qp), self.qp);
+        (self.lon0 + dlon, lat)
+    }
+}
+
+/// Equal Earth pseudocylindrical equal-area projection (Šavrič et al., 2018; EPSG method 1078).
+///
+/// Covers `EPSG:8857` (Greenwich), `EPSG:8858` (Americas), and `EPSG:8859` (Asia-Pacific).
+#[derive(Debug, Clone, Copy)]
+pub struct EqualEarth {
+    pub a: f64,
+    pub e: f64,
+    pub e2: f64,
+    pub lon0: f64,
+    pub qp: f64,
+    /// Authalic sphere radius `a * sqrt(qp / 2)`.
+    pub rq: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    /// Metres per CRS linear unit (1.0 for metres). False origins are in CRS units.
+    pub unit: f64,
+}
+
+impl EqualEarth {
+    const A1: f64 = 1.340264;
+    const A2: f64 = -0.081106;
+    const A3: f64 = 0.000893;
+    const A4: f64 = 0.003796;
+    /// `sqrt(3) / 2`
+    const M: f64 = 0.866_025_403_784_438_6;
+
+    pub fn new(ellip: Ellipsoid, lon0_deg: f64, false_easting: f64, false_northing: f64) -> Self {
+        let qp = authalic_q(ellip.e, ellip.e2, 1.0);
+        let rq = ellip.a * (0.5 * qp).sqrt();
+        Self {
+            a: ellip.a,
+            e: ellip.e,
+            e2: ellip.e2,
+            lon0: lon0_deg.to_radians(),
+            qp,
+            rq,
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let dlon = wrap_dlon(lon - self.lon0);
+        let sin_b = (authalic_q(self.e, self.e2, lat.sin()) / self.qp).clamp(-1.0, 1.0);
+        let theta = (Self::M * sin_b).asin();
+        let t2 = theta * theta;
+        let t6 = t2 * t2 * t2;
+        let t8 = t6 * t2;
+        let denom = Self::M * (Self::A1 + 3.0 * Self::A2 * t2 + 7.0 * Self::A3 * t6 + 9.0 * Self::A4 * t8);
+        let x = self.rq * dlon * theta.cos() / denom;
+        let y = self.rq * theta * (Self::A1 + Self::A2 * t2 + Self::A3 * t6 + Self::A4 * t8);
+        (
+            self.false_easting + x / self.unit,
+            self.false_northing + y / self.unit,
+        )
+    }
+
+    pub fn inverse(&self, easting: f64, northing: f64) -> (f64, f64) {
+        let x = (easting - self.false_easting) * self.unit / self.rq;
+        let y = (northing - self.false_northing) * self.unit / self.rq;
+        // Maximum |y| at the poles (theta = asin(sqrt(3)/2) = pi/3).
+        const THETA_MAX: f64 = std::f64::consts::FRAC_PI_3;
+        let tm2 = THETA_MAX * THETA_MAX;
+        let tm6 = tm2 * tm2 * tm2;
+        let y_max = THETA_MAX * (Self::A1 + Self::A2 * tm2 + Self::A3 * tm6 + Self::A4 * tm6 * tm2);
+        if y.abs() > y_max * (1.0 + 1e-9) {
+            return (f64::NAN, f64::NAN);
+        }
+        let y_clamped = y.clamp(-y_max, y_max);
+        let mut theta = (y_clamped / Self::A1).clamp(-THETA_MAX, THETA_MAX);
+        for _ in 0..10 {
+            let t2 = theta * theta;
+            let t6 = t2 * t2 * t2;
+            let t8 = t6 * t2;
+            let f = theta * (Self::A1 + Self::A2 * t2 + Self::A3 * t6 + Self::A4 * t8) - y_clamped;
+            let df = Self::A1 + 3.0 * Self::A2 * t2 + 7.0 * Self::A3 * t6 + 9.0 * Self::A4 * t8;
+            let dt = f / df;
+            theta -= dt;
+            if dt.abs() < 1e-13 {
+                break;
+            }
+        }
+        theta = theta.clamp(-THETA_MAX, THETA_MAX);
+        let t2 = theta * theta;
+        let t6 = t2 * t2 * t2;
+        let t8 = t6 * t2;
+        let df = Self::A1 + 3.0 * Self::A2 * t2 + 7.0 * Self::A3 * t6 + 9.0 * Self::A4 * t8;
+        let dlon = x * (Self::M * df) / theta.cos();
+        if dlon.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let sin_b = (theta.sin() / Self::M).clamp(-1.0, 1.0);
+        let lat = lat_from_authalic_q(self.e, self.e2, self.qp * sin_b, self.qp);
+        (self.lon0 + dlon, lat)
+    }
+}

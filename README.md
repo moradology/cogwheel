@@ -76,6 +76,7 @@ Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` rou
 | | |
 | :--- | :--- |
 | [API](docs/api.md) | Every route and parameter, example requests, and live demo links |
+| [Intentional divergences from TiTiler](docs/titiler-divergences.md) | Where `cogzilla` deliberately improves on or diverges from TiTiler 2.4.1 / GDAL |
 | [Running and configuring](docs/configuration.md) | Flags, cache sizing, cloud credentials, and operational endpoints |
 | [AWS Lambda](deploy/lambda/README.md) | One-command deploy script, SAM template, and Terraform snippet |
 | [Benchmarks](docs/benchmarks.md) | Where each number comes from and what it does not show |
