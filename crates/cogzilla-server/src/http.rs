@@ -1176,7 +1176,7 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         if let Some(k) = has(&["algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on point routes"));
         }
-    } else if !(route("bbox") || route("feature") || route("statistics")) {
+    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets"))) {
         if let Some(k) = has(&["coord_crs"]) {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
@@ -2037,16 +2037,24 @@ fn wrap_geotiff_fmt(
     }
 }
 
-/// Whether `data` is a float32 `.npy`, the renderers' array.
-fn is_f32_npy(data: &[u8]) -> bool {
-    data.starts_with(b"\x93NUMPY") && data.get(10..80).is_some_and(|dict| dict.windows(4).any(|w| w == b"<f4'"))
+/// Whether `data` may be an array the renderers wrote in float32: a float32 `.npy`, or a
+/// GeoTIFF (whose samples [`array_in_its_type`] reads before it changes anything).
+fn may_be_f32_array(data: &[u8]) -> bool {
+    let npy = data.starts_with(b"\x93NUMPY") && data.get(10..80).is_some_and(|dict| dict.windows(4).any(|w| w == b"<f4'"));
+    npy || data.starts_with(b"II*\0")
 }
 
-/// An array the renderers wrote in float32, rewritten in `kind`, the type TiTiler writes it
-/// in ([`array_type`]); with `mask`, its last plane is the mask. Left as it is without a
-/// type, or when it is not an array of the planes it says.
+/// An array the renderers wrote in float32, as `.npy` or as a GeoTIFF, rewritten in `kind`,
+/// the type TiTiler writes it in ([`array_type`]); with `mask`, its last band is the mask.
+/// Left as it is without a type, or when it is not a float32 array of the bands it says.
 fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
-    kind.and_then(|kind| cogzilla_kernel::retype_f32_npy(&data, kind, mask)).unwrap_or(data)
+    let Some(kind) = kind else { return data };
+    let typed = if data.starts_with(b"II*\0") {
+        crate::geotiff::retype_f32_geotiff(&data, kind, mask)
+    } else {
+        cogzilla_kernel::retype_f32_npy(&data, kind, mask)
+    };
+    typed.unwrap_or(data)
 }
 
 /// What a `/cog` or `/stac` array's type is decided by: the rule, the assets asked for (none
@@ -2061,7 +2069,7 @@ fn array_asked(pq: &ParsedQuery) -> Option<ArrayAsked> {
 /// opened again (they are cached) for their types. Anything but a float32 array, and an
 /// array whose rasters cannot be opened, is left as it is.
 async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, urls: &[String], data: Bytes) -> Bytes {
-    let Some((rule, _, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Some((rule, _, expression, mask)) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
     let Ok(cogs) = open_query_urls(engine, urls).await else { return data };
     let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
     array_in_its_type(data, rule.kind(&reads, expression.as_deref()), mask)
@@ -2071,7 +2079,7 @@ async fn cog_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, u
 /// assets that were read and the band math as it was rewritten over them. As
 /// [`cog_array_in_its_type`].
 async fn stac_array_in_its_type(engine: &TileEngine, asked: Option<ArrayAsked>, item: &crate::stac::StacItem, data: Bytes) -> Bytes {
-    let Some((rule, assets, expression, mask)) = asked.filter(|_| is_f32_npy(&data)) else { return data };
+    let Some((rule, assets, expression, mask)) = asked.filter(|_| may_be_f32_array(&data)) else { return data };
     let Ok((_, cogs, expression)) = resolve_stac_assets(engine, item, &assets, expression.as_deref()).await else {
         return data;
     };
@@ -2099,7 +2107,7 @@ async fn stac_tile_in_its_type(
     rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
 ) -> Result<(Bytes, &'static str), EngineError> {
     let (data, ct) = rendered.await?;
-    if asked.is_none() || !is_f32_npy(&data) {
+    if asked.is_none() || !may_be_f32_array(&data) {
         return Ok((data, ct));
     }
     match source.load(engine).await {
@@ -3425,6 +3433,7 @@ async fn render_mosaic_tile_pixel_selection(
     urls: &[String],
     treq: TileRequest,
     pq: &ParsedQuery,
+    failed_out: &mut Vec<String>,
 ) -> Result<Bytes, EngineError> {
     let urls = &urls[..urls.len().min(64)];
     let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
@@ -3443,6 +3452,8 @@ async fn render_mosaic_tile_pixel_selection(
     let method = pq.pixel_selection;
     let mut fold: Option<Fold> = None;
     let mut taken = 0usize;
+    let mut any_ok = false;
+    let mut last_err: Option<EngineError> = None;
 
     for (scene_i, url) in urls.iter().enumerate() {
         if scene_i > 0 {
@@ -3453,14 +3464,31 @@ async fn render_mosaic_tile_pixel_selection(
             Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                 return Err(EngineError::Io(e));
             }
-            Err(_) => continue,
+            Err(e) => {
+                failed_out.push(url.clone());
+                last_err = Some(crate::engine::asset_fetch_error(url, e));
+                continue;
+            }
         };
         let cogs = vec![cog];
         let mut scene_bands = treq.bands.clone();
+        let data_bands = data_band_count(cogs[0].index.full_res());
+        if method.by_last_band()
+            && pq.bidx.is_empty()
+            && data_bands >= 2
+            && !matches!(scene_bands, BandRequest::MultiBand { .. })
+        {
+            scene_bands = BandRequest::MultiBand {
+                bands_1based: (1..=data_bands).collect(),
+            };
+        }
         if pq.unscale {
             apply_unscale_cogs(&mut scene_bands, &cogs);
         }
-        if first_lut.is_none() {
+        if first_lut.is_none()
+            && !(matches!(method, Selection::Count | Selection::Stdev)
+                && pq.custom_colormap_json.is_none())
+        {
             first_lut = resolve_custom_lut(pq, &cogs[0], &scene_bands)?;
         }
         let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
@@ -3482,9 +3510,22 @@ async fn render_mosaic_tile_pixel_selection(
         .await
         {
             Ok(b) => b,
-            Err(EngineError::NotFound(_)) => continue,
-            Err(e) => return Err(e),
+            Err(EngineError::NotFound(_)) => {
+                any_ok = true;
+                continue;
+            }
+            Err(EngineError::Io(e))
+                if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+            {
+                return Err(EngineError::Io(e));
+            }
+            Err(e) => {
+                failed_out.push(url.clone());
+                last_err = Some(e);
+                continue;
+            }
         };
+        any_ok = true;
         if n_px == 0 || raw.len() % (n_px * 4) != 0 {
             continue;
         }
@@ -3525,6 +3566,11 @@ async fn render_mosaic_tile_pixel_selection(
         fold.add_le_bytes(&raw);
     }
 
+    if !any_ok
+        && let Some(err) = last_err
+    {
+        return Err(err);
+    }
     let selected = fold.and_then(Fold::finish).unwrap_or_else(|| {
         let bands = default_raw_band_count(&treq.bands, method);
         Selected { bands, values: vec![f32::NAN; bands * n_px] }
@@ -3637,7 +3683,7 @@ async fn render_mosaic_tile_styled(
     failed_out: &mut Vec<String>,
 ) -> Result<Bytes, EngineError> {
     if pq.pixel_selection != Selection::First {
-        return render_mosaic_tile_pixel_selection(engine, urls, treq, pq).await;
+        return render_mosaic_tile_pixel_selection(engine, urls, treq, pq, failed_out).await;
     }
     let mut needs_bbox_mosaic = pq.nodata.is_some()
         || pq.custom_colormap_json.is_some()
@@ -5121,7 +5167,7 @@ where
     let is_head = *req.method() == Method::HEAD;
     let is_post = *req.method() == Method::POST;
     let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
-    let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics");
+    let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics" | "/stats");
     let accepts_gzip = req
         .headers()
         .get(hyper::header::ACCEPT_ENCODING)
@@ -5373,11 +5419,14 @@ where
                     { "href": format!("{host}/algorithms"), "rel": "data", "type": "application/json", "title": "Algorithms" }
                 ]
             });
-            return Ok(plain_resp(
+            let mut resp = plain_resp(
                 StatusCode::OK,
                 Bytes::from(landing.to_string()),
                 "application/json",
-            ));
+            );
+            resp.headers_mut()
+                .insert(hyper::header::VARY, HeaderValue::from_static("Accept"));
+            return Ok(resp);
         }
         let base_path_js = serde_json::to_string(&forwarded_prefix)
             .unwrap_or_else(|_| "\"\"".to_string())
@@ -5386,7 +5435,12 @@ where
             .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
             .replace("{{BASE_PATH}}", &forwarded_prefix)
             .replace("{{BASE_PATH_JS}}", &base_path_js);
-        return Ok(plain_resp(StatusCode::OK, Bytes::from(html), "text/html; charset=utf-8"));
+        let mut resp = plain_resp(StatusCode::OK, Bytes::from(html), "text/html; charset=utf-8");
+        if path == "/" {
+            resp.headers_mut()
+                .insert(hyper::header::VARY, HeaderValue::from_static("Accept"));
+        }
+        return Ok(resp);
     }
 
     if method == Method::GET && (path == "/openapi.json" || path == "/api") {
@@ -5763,14 +5817,7 @@ where
                                 }
                                 return Ok((serde_json::json!({"b1": empty}), Vec::new()));
                             }
-                            let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
-                            let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
-                            let urls = mj_c.query_bbox_3857(
-                                mx0.min(mx1),
-                                my0.min(my1),
-                                mx0.max(mx1),
-                                my0.max(my1),
-                            );
+                            let urls = query_mosaicjson_wgs84_bbox(&mj_c, bbox);
                             compute_mosaic_statistics_with_fold(
                                 &eng,
                                 &urls,
@@ -5893,9 +5940,7 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
-                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
-                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
-                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let urls = query_mosaicjson_wgs84_bbox(&mj, bbox);
                 let ext = feat_ext
                     .strip_prefix("feature.")
                     .or(pq.format_param.as_deref())
@@ -5924,9 +5969,7 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
-                let (mx0, my0) = lonlat_deg_to_mercator(bbox[0], bbox[1]);
-                let (mx1, my1) = lonlat_deg_to_mercator(bbox[2], bbox[3]);
-                let urls = mj.query_bbox_3857(mx0.min(mx1), my0.min(my1), mx0.max(mx1), my0.max(my1));
+                let urls = query_mosaicjson_wgs84_bbox(&mj, bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq)
@@ -9034,7 +9077,7 @@ where
             _ => Err(EngineError::NotFound(path.clone())),
         };
         let res = match res {
-            Ok((data, ct)) if stac_array.is_some() && is_f32_npy(&data) => {
+            Ok((data, ct)) if stac_array.is_some() && may_be_f32_array(&data) => {
                 let source = match &stac_item_hdr {
                     Some(item) => StacSource::Item(item.clone()),
                     None => StacSource::Url(stac_url_hdr.clone()),

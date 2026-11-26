@@ -586,6 +586,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         let mut model_transform: Option<Vec<f64>> = None;
         let mut raw_geo_keys: Option<Vec<u16>> = None;
         let mut double_params: Vec<f64> = Vec::new();
+        let mut ifd_color_map: Option<Vec<[u8; 4]>> = None;
+        let mut ifd_gdal_metadata_xml: Option<String> = None;
+        let mut ifd_nodata: Option<f32> = None;
 
         let to_u32 = |v: u64| -> Result<u32, TiffError> {
             u32::try_from(v).map_err(|_| TiffError::Corrupt("IFD integer tag exceeds u32::MAX"))
@@ -674,6 +677,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 TAG_COLOR_MAP => {
                     if ifds.is_empty()
                         && color_map.is_none()
+                        && ifd_color_map.is_none()
                         && entry.count > 0
                         && entry.count % 3 == 0
                         && entry.count <= 3 * 65_536
@@ -689,7 +693,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                             lut.push([r_c, g_c, b_c, 255]);
                         }
                         if !lut.is_empty() {
-                            color_map = Some(lut);
+                            ifd_color_map = Some(lut);
                         }
                     }
                 }
@@ -786,15 +790,15 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_GDAL_METADATA if ifds.is_empty() => {
                     charge_tag(entry.count, 1)?;
-                    gdal_metadata_xml = Some(entry.read_ascii(&r)?);
+                    ifd_gdal_metadata_xml = Some(entry.read_ascii(&r)?);
                 }
                 TAG_GDAL_NODATA if ifds.is_empty() => {
                     charge_tag(entry.count, 1)?;
                     let s = entry.read_ascii(&r)?;
                     if s.eq_ignore_ascii_case("nan") {
-                        nodata = Some(f32::NAN);
+                        ifd_nodata = Some(f32::NAN);
                     } else if let Ok(v) = s.parse::<f32>() {
-                        nodata = Some(v);
+                        ifd_nodata = Some(v);
                     }
                 }
                 _ => {}
@@ -814,6 +818,11 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                         let ta = width.div_ceil(tile_width);
                         let td = height.div_ceil(tile_height);
                         let exp = (ta as usize).saturating_mul(td as usize);
+                        if offs.len() < exp || cnts.len() < exp {
+                            return Err(TiffError::Corrupt(
+                                "mask IFD tile offset/byte-count table shorter than tile grid",
+                            ));
+                        }
                         let offs: Box<[u64]> = if offs.len() > exp { offs[..exp].into() } else { offs };
                         let cnts: Box<[u32]> = if cnts.len() > exp { cnts[..exp].into() } else { cnts };
                         total_meta_bytes = total_meta_bytes
@@ -849,6 +858,11 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     if width > 0 && height > 0 {
                         let td = height.div_ceil(rps);
                         let exp = td as usize;
+                        if offs.len() < exp || cnts.len() < exp {
+                            return Err(TiffError::Corrupt(
+                                "mask IFD strip offset/byte-count table shorter than strip count",
+                            ));
+                        }
                         let offs: Box<[u64]> = if offs.len() > exp { offs[..exp].into() } else { offs };
                         let cnts: Box<[u32]> = if cnts.len() > exp { cnts[..exp].into() } else { cnts };
                         total_meta_bytes = total_meta_bytes
@@ -877,6 +891,19 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
             }
             continue;
+        }
+
+        // Only commit first-image-IFD metadata after mask IFDs have been skipped.
+        if ifds.is_empty() {
+            if color_map.is_none() {
+                color_map = ifd_color_map;
+            }
+            if gdal_metadata_xml.is_none() {
+                gdal_metadata_xml = ifd_gdal_metadata_xml;
+            }
+            if nodata.is_none() {
+                nodata = ifd_nodata;
+            }
         }
 
         // Accept all 8 standard GDAL numeric sample types (widened to f32 at block decode)
