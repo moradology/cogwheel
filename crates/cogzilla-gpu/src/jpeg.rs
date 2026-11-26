@@ -642,10 +642,13 @@ impl GpuJpegEncoder {
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .clamp(1, 16);
-        let use_parallel = total_mcus >= 1024 && n_threads >= 2;
+            .clamp(1, 8);
+        // Only spawn OS worker threads when MCU count is large enough to amortize
+        // thread-spawn overhead (>= 8192 MCUs ≈ 2048×1024); smaller images finish
+        // sub-millisecond on 1 thread with the SWAR BitWriter + 128-bit tail scan.
+        let use_parallel = total_mcus >= 8192 && n_threads >= 2;
         let restart_interval: u16 = if use_parallel {
-            total_mcus.div_ceil(n_threads).clamp(256, 65535) as u16
+            total_mcus.div_ceil(n_threads).clamp(512, 65535) as u16
         } else {
             0
         };
@@ -761,7 +764,12 @@ mod tests {
             return;
         };
         let mut enc = GpuJpegEncoder::new(&ctx);
-        for &(w, h, q) in &[(256u32, 256u32, 85u8), (333, 217, 90), (512, 512, 85), (1024, 1024, 85)] {
+        for &(w, h, q) in &[
+            (256u32, 256u32, 85u8),
+            (333, 217, 90),
+            (512, 512, 85),
+            (2048, 1024, 85),
+        ] {
             let mut rgba = Vec::with_capacity((w * h * 4) as usize);
             for y in 0..h {
                 for x in 0..w {
