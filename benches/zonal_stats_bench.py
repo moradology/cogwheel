@@ -52,7 +52,24 @@ def build_geometries(fixture: Path) -> list[tuple[str, dict]]:
         utm([(1024.0 + 600.0 * float(np.cos(a)), 1024.0 + 600.0 * float(np.sin(a))) for a in angles])
     )
     small_quad = feat(utm([(600.3, 600.6), (700.1, 620.4), (680.6, 710.2), (590.9, 690.5)]))
-    return [("1M", big_1m), ("circle", circle_10k), ("small", small_quad)]
+    # 1,000 small 20x20-px polygons tiled across the 2048x2048 scene (BB1 FeatureCollection bench)
+    fc_1000 = {
+        "type": "FeatureCollection",
+        "features": [
+            feat(
+                utm(
+                    [
+                        (100.0 + (i % 40) * 45.0, 100.0 + (i // 40) * 60.0),
+                        (120.0 + (i % 40) * 45.0, 100.0 + (i // 40) * 60.0),
+                        (120.0 + (i % 40) * 45.0, 120.0 + (i // 40) * 60.0),
+                        (100.0 + (i % 40) * 45.0, 120.0 + (i // 40) * 60.0),
+                    ]
+                )
+            )
+            for i in range(1000)
+        ],
+    }
+    return [("1M", big_1m), ("circle", circle_10k), ("small", small_quad), ("fc1000", fc_1000)]
 
 
 def wait_ready(client: httpx.Client, base_url: str, timeout_s: float = 10.0) -> None:
@@ -105,11 +122,13 @@ def main() -> int:
         medians: dict[str, float] = {}
         parts: list[str] = []
         for name, body in geoms:
-            for _ in range(args.warmup):
+            iters = min(args.iters, 10) if name == "fc1000" else args.iters
+            warmup = min(args.warmup, 2) if name == "fc1000" else args.warmup
+            for _ in range(warmup):
                 r = client.post(endpoint, json=body)
                 r.raise_for_status()
             times_ms: list[float] = []
-            for _ in range(args.iters):
+            for _ in range(iters):
                 t0 = time.perf_counter()
                 r = client.post(endpoint, json=body)
                 r.raise_for_status()
