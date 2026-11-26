@@ -22,8 +22,8 @@ This document tracks GPU acceleration experiments and PRs targeting the `gpu-imp
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | `cogzilla-gpu` crate foundation | `wgpu` device/queue init, adapter selection (Metal + Vulkan RTX 3090 Ti), buffer pool, Cubic & Lanczos3 compute kernels + benchmark harness | Merged | #210 |
 | 2 | Adaptive `DispatchPolicy` + fused colormap | Startup-calibrated cost model (`COGZILLA_GPU_POLICY`), queue backpressure, fused Bilinear/Cubic/Lanczos3 → rescale → RGBA8 / 4×-smaller packed `IndexedU8` | Merged | #213 |
-| 3 | DEM / terrain compute shaders | Single-pass 18×18 shared-memory Horn 3×3 (`Hillshade`, `Slope`, `Aspect`) + `Terrarium` / `TerrainRGB` (Bilinear/Cubic/Lanczos3) | Merged | (this PR) |
-| 4 | GPU-resident block cache + micro-batching | Persistent VRAM/unified slab atlas + batched 16–64 tile command buffers for pan bursts & pyramid seeding | Planned | — |
+| 3 | DEM / terrain compute shaders | Single-pass 18×18 shared-memory Horn 3×3 (`Hillshade`, `Slope`, `Aspect`) + `Terrarium` / `TerrainRGB` (Bilinear/Cubic/Lanczos3) | Merged | #214 |
+| 4 | GPU-resident slab cache + micro-batching | Thread-safe byte-bounded LRU `GpuSlabCache` + 3D `GpuTileBatcher` (`dispatch_workgroups(wg_x, wg_y, K)`) amortizing submit floor | Merged | (this PR) |
 | 5 | Fused `expr_vm` + `color_formula` + colormap | Compile `ExprProgram` IR to WGSL compute shaders; fuse multi-band math, gamma/sigmoidal, and LUT lookup | Planned | — |
 | 6 | Multi-COG / STAC / Mosaic compositing | GPU compositing & pixel selection (`highest`, `lowest`, `mean`, `median`, `stdev`) over stacked scene planes | Planned | — |
 | 7 | GPU TIFF Predictor 2/3 unshuffle | Parallel byte-unshuffle + prefix-sum in compute shaders (and batched DEFLATE/ZSTD decode exploration on CUDA) | Planned | — |
