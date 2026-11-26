@@ -21,6 +21,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+// TiTiler's reading of `assets` (`AssetSpec`, `AssetOptions`) has no route here yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod asset_options;
 #[cfg(test)]
 mod asset_query_pins;
 mod paint;
@@ -320,6 +323,18 @@ struct ParsedQuery {
     errors: Vec<String>,
 }
 
+/// Add band indexes to those an asset already has, or give it its first. None is nothing.
+fn add_asset_bidx(asset_bidx: &mut Vec<(String, Vec<u16>)>, name: &str, bands: Vec<u16>) {
+    if bands.is_empty() {
+        return;
+    }
+    if let Some((_, existing)) = asset_bidx.iter_mut().find(|(n, _)| n == name) {
+        existing.extend(bands);
+    } else {
+        asset_bidx.push((name.to_string(), bands));
+    }
+}
+
 fn parse_query(q: Option<&str>) -> ParsedQuery {
     let mut pq = ParsedQuery {
         urls: Vec::new(),
@@ -404,54 +419,27 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
             "assets" => {
                 // Preserve literal `+` in per-asset expressions (`assets=red|expression=b1+1`).
                 let dec = percent_decode_opts(v, false);
-                if dec.contains('|') {
-                    // TiTiler `assets=name|bidx=1,2,3`, `assets=name|indexes=1,2,3`, or `assets=name|expression=b1*2`
-                    let mut parts = dec.split('|');
-                    let asset_name = parts.next().map(str::trim).unwrap_or("");
-                    if !asset_name.is_empty() {
-                        pq.assets.push(asset_name.to_string());
+                // TiTiler `assets=name|bidx=1,2,3`, `assets=name|indexes=1,2,3`, or
+                // `assets=name|expression=b1*2`: read by the one reader of `assets`, and each
+                // entry's options gathered here under its name.
+                let mut complaints = Vec::new();
+                asset_options::read_assets(&dec, 0, &mut complaints, |entry| {
+                    let entry = entry.into_loose();
+                    if entry.name.is_empty() {
+                        return;
                     }
-                    let mut parsed = Vec::new();
-                    for opt in parts {
-                        if let Some(bidx_str) = opt
-                            .strip_prefix("bidx=")
-                            .or_else(|| opt.strip_prefix("indexes="))
-                        {
-                            for tok in bidx_str.split(',') {
-                                match tok.trim().parse::<u16>() {
-                                    Ok(b) if b >= 1 => parsed.push(b),
-                                    _ => bad("expected positive integer band indices in |bidx="),
-                                }
-                            }
-                        } else if let Some(expr_str) = opt.strip_prefix("expression=") {
-                            let expr_str = expr_str.trim();
-                            if !asset_name.is_empty() && !expr_str.is_empty() {
-                                if let Some((_, existing)) =
-                                    pq.asset_exprs.iter_mut().find(|(n, _)| n == asset_name)
-                                {
-                                    *existing = expr_str.to_string();
-                                } else {
-                                    pq.asset_exprs
-                                        .push((asset_name.to_string(), expr_str.to_string()));
-                                }
-                            }
-                        }
-                    }
-                    if !asset_name.is_empty() && !parsed.is_empty() {
-                        if let Some((_, existing)) =
-                            pq.asset_bidx.iter_mut().find(|(n, _)| n == asset_name)
-                        {
-                            existing.extend(parsed);
+                    pq.assets.push(entry.name.to_string());
+                    if let Some(expr) = entry.expression {
+                        if let Some((_, existing)) = pq.asset_exprs.iter_mut().find(|(n, _)| n == entry.name) {
+                            *existing = expr.to_string();
                         } else {
-                            pq.asset_bidx.push((asset_name.to_string(), parsed));
+                            pq.asset_exprs.push((entry.name.to_string(), expr.to_string()));
                         }
                     }
-                } else {
-                    for a in dec.split(',') {
-                        if !a.is_empty() {
-                            pq.assets.push(a.to_string());
-                        }
-                    }
+                    add_asset_bidx(&mut pq.asset_bidx, entry.name, entry.indexes);
+                });
+                for _ in complaints.iter().filter(|complaint| complaint.loose()) {
+                    bad("expected positive integer band indices in |bidx=");
                 }
             }
             "asset_bidx" => {
@@ -460,24 +448,16 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     let name = name.trim();
                     let mut parsed = Vec::new();
                     for tok in bidx_str.split(',') {
-                        match tok.trim().parse::<u16>() {
-                            Ok(b) if b >= 1 => parsed.push(b),
-                            _ => bad("expected positive integer band indices in asset_bidx"),
+                        match asset_options::band_index(tok.trim()) {
+                            Some(b) => parsed.push(b),
+                            None => bad("expected positive integer band indices in asset_bidx"),
                         }
                     }
                     if !name.is_empty() {
                         if !pq.assets.iter().any(|a| a == name) {
                             pq.assets.push(name.to_string());
                         }
-                        if !parsed.is_empty() {
-                            if let Some((_, existing)) =
-                                pq.asset_bidx.iter_mut().find(|(n, _)| n == name)
-                            {
-                                existing.extend(parsed);
-                            } else {
-                                pq.asset_bidx.push((name.to_string(), parsed));
-                            }
-                        }
+                        add_asset_bidx(&mut pq.asset_bidx, name, parsed);
                     }
                 } else {
                     bad("expected asset_bidx=name|1,2,3");
