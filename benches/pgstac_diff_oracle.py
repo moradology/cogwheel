@@ -737,6 +737,16 @@ def main() -> int:
         o.check("tile as an array, band math", "image", f"{base12}.npy?assets=red&expression=b1*2")
         o.check("tile as an array, a mean", "image", f"{base12}.npy?assets=red&pixel_selection=mean&items_limit=3")
         o.check("tile as an array, bilinear", "image", f"{base12}.npy?assets=red&resampling=bilinear&reproject=bilinear")
+        # The methods that gather a pixel's footprint. `resampling=nearest` is only there to
+        # mark the comparison as one of smoothed values.
+        for method in ("average", "mode", "rms", "max", "min", "sum", "med", "q1", "q3"):
+            o.check(f"tile as an array, reproject={method}", "image", f"{base12}.npy?assets=red&resampling=nearest&reproject={method}")
+        for method in ("average", "mode", "gauss", "rms"):
+            o.check(f"tile, resampling={method}", "image", f"{base12}.png?assets=red&rescale=0,3000&resampling={method}")
+        o.check("bbox, reproject=average", "image", f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/256x256.npy?assets=red&resampling=nearest&reproject=average")
+        o.check("tile at zoom 9, reproject=sum", "image", f"/searches/{sid}/tiles/WebMercatorQuad/9/268/182.npy?assets=red&resampling=nearest&reproject=sum")
+        o.check("tile, reproject=gauss", "status", f"{base12}.png?assets=red&reproject=gauss")
+        o.check("tile, resampling=max", "status", f"{base12}.png?assets=red&resampling=max")
         o.check("tile as an array, bilinear, three bands", "image", f"{base12}.npy?assets=visual&resampling=bilinear&reproject=bilinear")
         each = "&skipcovered=false&exitwhenfull=false"
         o.check("tile as an array, bilinear, a mean", "image",

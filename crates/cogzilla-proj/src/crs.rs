@@ -681,17 +681,22 @@ impl CrsModel {
             max_lon = 180.0;
         }
 
-        // Check whether North or South Pole lies inside the raster footprint (polar CRSes).
-        // Skip for Web Mercator (clamps ±90° to ±85.0511°) and Geographic (rectangular lon/lat).
+        // Check whether North or South Pole lies inside the raster footprint.
+        // For polar/azimuthal projections, enclosing a pole means the raster spans all longitudes
+        // [-180, 180]; for cylindrical/pseudocylindrical projections (CEA, EqualEarth), poles are
+        // horizontal lines, so only extend min_lat / max_lat without expanding longitude.
         if !matches!(self, Self::Epsg3857 | Self::Geographic | Self::WorldMercator) {
+            let is_line_pole = matches!(self, Self::CylindricalEqualArea(_) | Self::EqualEarth(_));
             if let Some(crs_to_pixel) = pixel_to_crs.invert() {
                 for &pole_lat in &[90.0_f64, -90.0_f64] {
                     let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
                     if px_crs.is_finite() && py_crs.is_finite() {
                         let (col, row) = crs_to_pixel.forward(px_crs, py_crs);
                         if col >= 0.0 && col <= w && row >= 0.0 && row <= h {
-                            min_lon = -180.0;
-                            max_lon = 180.0;
+                            if !is_line_pole {
+                                min_lon = -180.0;
+                                max_lon = 180.0;
+                            }
                             if pole_lat > 0.0 {
                                 max_lat = 90.0;
                             } else {
@@ -829,7 +834,14 @@ impl CrsModel {
                 // At/near a pole, a local center Jacobian explodes because longitude swings 90°-180°
                 // across a few pixels; instead match GDAL's warped-extent diagonal resolution.
                 let mut pole_inside = false;
-                if !matches!(self, Self::Epsg3857 | Self::Geographic | Self::WorldMercator) {
+                if !matches!(
+                    self,
+                    Self::Epsg3857
+                        | Self::Geographic
+                        | Self::WorldMercator
+                        | Self::CylindricalEqualArea(_)
+                        | Self::EqualEarth(_)
+                ) {
                     if let Some(crs_to_pixel) = pixel_to_crs.invert() {
                         for &pole_lat in &[90.0_f64, -90.0_f64] {
                             let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
