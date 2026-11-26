@@ -3,14 +3,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use cogzilla_gpu::{
-    DispatchPolicy, DispatchRequest, GpuColormapMode, GpuColormapRenderer, GpuContext,
-    GpuCoordPlan, GpuDemAlgorithm, GpuOp, GpuPixelOutput, GpuResampler, GpuSlab, GpuSlabCache,
-    GpuTerrainRenderer, PolicyOverride, SlabKey,
+    DispatchPolicy, DispatchRequest, GpuColorFormula, GpuColormapMode, GpuColormapRenderer,
+    GpuContext, GpuCoordPlan, GpuDemAlgorithm, GpuExprRenderer, GpuInstr, GpuOp, GpuPixelOutput,
+    GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer, PolicyOverride, SlabKey, opcodes,
 };
+use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
 use cogzilla_kernel::{
-    BandSource, ColormapLut, DemAlgorithm, OutputFormat, ResampleMode, SingleBandStyle,
-    TerrainEncoding, encode_rgba_tile,
+    BandSource, ColormapLut, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode, RgbStyle,
+    SingleBandStyle, TerrainEncoding, encode_rgba_tile,
 };
 use cogzilla_proj::CoordPlan;
 
@@ -22,6 +23,7 @@ pub struct GpuBackend {
     resampler: GpuResampler,
     colormap: Mutex<GpuColormapRenderer>,
     terrain: Mutex<GpuTerrainRenderer>,
+    expr: Mutex<GpuExprRenderer>,
     in_flight: AtomicUsize,
 }
 
@@ -129,6 +131,7 @@ impl GpuBackend {
         let resampler = GpuResampler::new(&ctx);
         let colormap = Mutex::new(GpuColormapRenderer::new(&ctx));
         let terrain = Mutex::new(GpuTerrainRenderer::new(&ctx));
+        let expr = Mutex::new(GpuExprRenderer::new(&ctx));
         Some(Arc::new(Self {
             ctx,
             policy,
@@ -136,6 +139,7 @@ impl GpuBackend {
             resampler,
             colormap,
             terrain,
+            expr,
             in_flight: AtomicUsize::new(0),
         }))
     }
@@ -757,6 +761,252 @@ impl GpuBackend {
             encode_rgba_tile(&raw, N as u32, false, format)
         })
     }
+
+    /// Translate a compiled `cogzilla-kernel::ExprProgram` into GPU WGSL VM bytecode.
+    /// Returns `None` if the expression uses an op not supported by the GPU VM (e.g. `Median(n)`),
+    /// causing seamless CPU fallback.
+    pub fn compile_expr_to_gpu(prog: &ExprProgram) -> Option<Vec<GpuInstr>> {
+        if prog.ops.is_empty() || prog.ops.len() > 256 || prog.used_bands.len() > 8 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(prog.ops.len());
+        for &op in &prog.ops {
+            let ins = match op {
+                Op::PushConst(v) => GpuInstr::push_const(v),
+                Op::LoadBand(slot) => GpuInstr::load_band(slot as u32),
+                Op::Add => GpuInstr::op(opcodes::ADD),
+                Op::Sub => GpuInstr::op(opcodes::SUB),
+                Op::Mul => GpuInstr::op(opcodes::MUL),
+                Op::Div => GpuInstr::op(opcodes::DIV),
+                Op::Pow => GpuInstr::op(opcodes::POW),
+                Op::Neg => GpuInstr::op(opcodes::NEG),
+                Op::Log10 => GpuInstr::op(opcodes::LOG10),
+                Op::Ln => GpuInstr::op(opcodes::LN),
+                Op::Log2 => GpuInstr::op(opcodes::LOG2),
+                Op::Db => GpuInstr::op(opcodes::DB),
+                Op::Exp => GpuInstr::op(opcodes::EXP),
+                Op::Sqrt => GpuInstr::op(opcodes::SQRT),
+                Op::Abs => GpuInstr::op(opcodes::ABS),
+                Op::Sin => GpuInstr::op(opcodes::SIN),
+                Op::Cos => GpuInstr::op(opcodes::COS),
+                Op::Tan => GpuInstr::op(opcodes::TAN),
+                Op::Min => GpuInstr::op(opcodes::MIN),
+                Op::Max => GpuInstr::op(opcodes::MAX),
+                Op::Clip => GpuInstr::op(opcodes::CLIP),
+                Op::Lt => GpuInstr::op(opcodes::LT),
+                Op::Le => GpuInstr::op(opcodes::LE),
+                Op::Gt => GpuInstr::op(opcodes::GT),
+                Op::Ge => GpuInstr::op(opcodes::GE),
+                Op::Eq => GpuInstr::op(opcodes::EQ),
+                Op::Ne => GpuInstr::op(opcodes::NE),
+                Op::Where => GpuInstr::op(opcodes::WHERE),
+                Op::Ceil => GpuInstr::op(opcodes::CEIL),
+                Op::Floor => GpuInstr::op(opcodes::FLOOR),
+                Op::Round => GpuInstr::op(opcodes::ROUND),
+                _ => return None,
+            };
+            out.push(ins);
+        }
+        Some(out)
+    }
+
+    /// Attempt GPU-accelerated multi-band `ExprProgram` tile rendering (for `BandRequest::Expr`).
+    pub fn try_render_expr<const N: usize>(
+        &self,
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>],
+        prog: &ExprProgram,
+        style: &SingleBandStyle,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(style.resample)?;
+        let CoordPlan::Separable1D { u, v, .. } = plan else {
+            return None;
+        };
+        if srcs.is_empty() || srcs.len() > 8 {
+            return None;
+        }
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        let out_kind = match style.format {
+            OutputFormat::Png => GpuPixelOutput::IndexedU8,
+            OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
+                GpuPixelOutput::Rgba8
+            }
+            _ => return None,
+        };
+
+        // Estimate upload bytes across all referenced bands (cold stitch/upload)
+        let per_band_bytes = Self::estimate_upload_bytes(&None, &srcs[0]);
+        let upload_bytes = per_band_bytes.saturating_mul(srcs.len());
+        let readback_bytes = match out_kind {
+            GpuPixelOutput::IndexedU8 => N * N,
+            GpuPixelOutput::Rgba8 => N * N * 4,
+        };
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: N * N,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        // Stitch all bands to a common aligned grid
+        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
+        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+        for src in srcs {
+            let (buf, bc, br, w, h) = stitch_band_source(src)?;
+            if let Some(g) = common_geom {
+                if g != (bc, br, w, h) {
+                    return None;
+                }
+            } else {
+                common_geom = Some((bc, br, w, h));
+            }
+            stitched_vecs.push(buf);
+        }
+        let (base_col, base_row, w, h) = common_geom?;
+        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let mut u_local = [0.0f32; N];
+        let mut v_local = [0.0f32; N];
+        for i in 0..N {
+            u_local[i] = u[i] - bc;
+            v_local[i] = v[i] - br;
+        }
+
+        let lut = style.colormap.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+
+        let mut expr_guard = self.expr.lock().ok()?;
+        let multi_slab = expr_guard.upload_bands(&refs, w, h, w).ok()?;
+        let raw = expr_guard
+            .render_expr(
+                &multi_slab,
+                &u_local,
+                &v_local,
+                gpu_mode,
+                &instrs,
+                style.rescale_min,
+                style.rescale_max,
+                &lut_u32,
+                out_kind,
+            )
+            .ok()?;
+        drop(expr_guard);
+
+        Some(match out_kind {
+            GpuPixelOutput::IndexedU8 => encode_indexed_u8_png(&raw, N as u32, N as u32, lut),
+            GpuPixelOutput::Rgba8 => {
+                if style.format == OutputFormat::RawRgba {
+                    Bytes::from(raw)
+                } else {
+                    encode_rgba_tile(&raw, N as u32, false, style.format)
+                }
+            }
+        })
+    }
+
+    /// Attempt GPU-accelerated 3-band RGB tile rendering (for heavy Cubic/Lanczos3 `BandRequest::Rgb`).
+    pub fn try_render_rgb<const N: usize>(
+        &self,
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>; 3],
+        style: &RgbStyle,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(style.resample)?;
+        let CoordPlan::Separable1D { u, v, .. } = plan else {
+            return None;
+        };
+        if !matches!(
+            style.format,
+            OutputFormat::Png | OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba
+        ) {
+            return None;
+        }
+        let upload_bytes = Self::estimate_upload_bytes(&None, &srcs[0]).saturating_mul(3);
+        let readback_bytes = N * N * 4;
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: N * N,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(3);
+        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+        for src in srcs {
+            let (buf, bc, br, w, h) = stitch_band_source(src)?;
+            if let Some(g) = common_geom {
+                if g != (bc, br, w, h) {
+                    return None;
+                }
+            } else {
+                common_geom = Some((bc, br, w, h));
+            }
+            stitched_vecs.push(buf);
+        }
+        let (base_col, base_row, w, h) = common_geom?;
+        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let mut u_local = [0.0f32; N];
+        let mut v_local = [0.0f32; N];
+        for i in 0..N {
+            u_local[i] = u[i] - bc;
+            v_local[i] = v[i] - br;
+        }
+
+        let identity = GpuColorFormula {
+            rgb_lut: None,
+            saturation: None,
+        };
+        let mut expr_guard = self.expr.lock().ok()?;
+        let multi_slab = expr_guard.upload_bands(&refs, w, h, w).ok()?;
+        let raw = expr_guard
+            .render_rgb_formula(
+                &multi_slab,
+                &u_local,
+                &v_local,
+                gpu_mode,
+                style.rescale_min,
+                style.rescale_max,
+                &identity,
+            )
+            .ok()?;
+        drop(expr_guard);
+
+        Some(if style.format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            encode_rgba_tile(&raw, N as u32, false, style.format)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -840,5 +1090,16 @@ mod tests {
             }
             assert!(max_diff <= 4, "multi-block U16 crop max channel diff {max_diff} > 4");
         }
+    }
+
+    #[test]
+    fn gpu_expr_vm_translator_and_render_match_cpu() {
+        let prog = ExprProgram::compile("db(b1)-db(b2)+sqrt(b3)").unwrap();
+        let instrs = GpuBackend::compile_expr_to_gpu(&prog).expect("should translate to GPU VM");
+        assert_eq!(instrs.len(), prog.ops.len());
+
+        // Unsupported op (median) must cleanly return None for CPU fallback
+        let med = ExprProgram::compile("median(b1, b2, b3)").unwrap();
+        assert!(GpuBackend::compile_expr_to_gpu(&med).is_none());
     }
 }
