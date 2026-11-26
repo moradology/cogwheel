@@ -1000,11 +1000,9 @@ pub fn compute_weighted_band_stats_with_geom(
     let mut min_v_all = f64::INFINITY;
     let mut max_v_all = f64::NEG_INFINITY;
 
-    // Compact value storage:
-    // - `unit_keys`: 4 B/px when `w_eq_c` and every valid pixel so far has `c == 1.0`.
-    // - `cov_vals`: 16 B/px when `w_eq_c` and any valid pixel has `c != 1.0`.
-    // - `weighted_vals`: 24 B/px only when weight differs from coverage (variable-area or geodesic line).
-    let est_cap = (win_w * win_h).min(16 * 1024 * 1024);
+    // Compact value storage sized to the exact number of covered pixels (`cov > COV_EPS`),
+    // avoiding huge transient over-allocation on sparse lines/points spanning large windows.
+    let est_cap = cov.iter().filter(|&&c| c > COV_EPS).count();
     let mut unit_keys: Vec<u32> = if w_eq_c {
         Vec::with_capacity(est_cap)
     } else {
@@ -1475,13 +1473,16 @@ pub fn compute_weighted_band_stats_with_geom(
             custom_edges.clone()
         } else {
             let nbins = opts.histogram_bins.clamp(1, 1000);
-            let span = if (h_hi - h_lo).abs() < 1e-12 {
-                1.0
-            } else {
-                h_hi - h_lo
-            };
+            let degenerate = (h_hi - h_lo).abs() < 1e-12;
+            let span = if degenerate { 1.0 } else { h_hi - h_lo };
             (0..=nbins)
-                .map(|k| h_lo + span * (k as f64) / (nbins as f64))
+                .map(|k| {
+                    if k == nbins {
+                        if degenerate { h_lo + 1.0 } else { h_hi }
+                    } else {
+                        h_lo + span * (k as f64) / (nbins as f64)
+                    }
+                })
                 .collect()
         };
         let nbins = edges.len() - 1;
@@ -1826,6 +1827,17 @@ pub async fn compute_native_exact_polygon_stats(
             "polygon window requires {} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
             blocks_x * blocks_y
         )));
+    }
+
+    // Validate requested bands against the selected IFD's actual band count (guards against
+    // out-of-range expression bands like `b99` or heterogeneous overview band counts).
+    for &b1 in &sel_bands {
+        if b1 == 0 || b1 > ifd.samples_per_pixel {
+            return Err(EngineError::BadRequest(format!(
+                "band index b{b1} out of range for {}-band dataset",
+                ifd.samples_per_pixel
+            )));
+        }
     }
 
     // Fetch intersecting data blocks in parallel (get_blocks already applies internal mask IFDs).
@@ -2841,6 +2853,47 @@ mod tests {
             assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "cov mismatch on {k}: {a} vs {b}");
         }
         assert_eq!(st_cov["histogram"], st_cov_gen["histogram"]);
+
+        // Verify histogram upper edge pinning never drops max_v due to float rounding (Fix #5)
+        let mut opts_h = StatsOptions::default();
+        opts_h.histogram_bins = 3;
+        opts_h.histogram_range = Some((0.3, 1.0));
+        let st_h1 = compute_weighted_band_stats(
+            &[0.3f32, 0.5, 1.0, 1.0],
+            &[1.0; 4],
+            4,
+            1,
+            &PixelAreaModel::Constant(1.0),
+            false,
+            "b1",
+            &opts_h,
+        );
+        let h1_sum: f64 = st_h1["histogram"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .sum();
+        assert_eq!(h1_sum, 4.0, "max_v=1.0 dropped from histogram: {:?}", st_h1["histogram"]);
+
+        let st_h2 = compute_weighted_band_stats(
+            &[-4.440528e-8_f32, 27.136889_f32],
+            &[1.0; 2],
+            2,
+            1,
+            &PixelAreaModel::Constant(1.0),
+            false,
+            "b1",
+            &StatsOptions::default(),
+        );
+        let h2_sum: f64 = st_h2["histogram"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .sum();
+        assert_eq!(h2_sum, 2.0, "max_v dropped on default 10 bins: {:?}", st_h2["histogram"]);
+
         keys.clear();
     }
 }
