@@ -1802,13 +1802,19 @@ pub(crate) fn tile_box_intersects_cog(
     let wf = full.width as f64;
     let hf = full.height as f64;
     let wrap_lo = src_crs.geographic_0_360_min_lon(&full.pixel_to_crs, full.width);
-    let c2p = &full.crs_to_pixel;
+    let wrap_hi = src_crs.geographic_neg_180_max_lon(&full.pixel_to_crs, full.width);
 
     let dst_pt_in_src = |dx: f64, dy: f64| -> bool {
         let (mut sx, sy) = match dst_crs {
             cogzilla_proj::CrsModel::Epsg3857 => src_crs.from_3857(dx, dy),
             cogzilla_proj::CrsModel::Geographic => {
-                let lon = if dx > 180.0 { dx - 360.0 } else { dx };
+                let lon = if dx > 180.0 {
+                    dx - 360.0
+                } else if dx < -180.0 {
+                    dx + 360.0
+                } else {
+                    dx
+                };
                 src_crs.from_lonlat_deg(lon, dy)
             }
             other => {
@@ -1827,8 +1833,12 @@ pub(crate) fn tile_box_intersects_cog(
             && sx < lo
         {
             sx += 360.0;
+        } else if let Some(hi) = wrap_hi
+            && sx > hi
+        {
+            sx -= 360.0;
         }
-        let (col, row) = c2p.forward(sx, sy);
+        let (col, row) = full.crs_to_pixel_pt(sx, sy);
         col.is_finite()
             && row.is_finite()
             && col >= -0.5
@@ -1884,7 +1894,7 @@ pub(crate) fn tile_box_intersects_cog(
         (wf, 0.5 * hf),
     ];
     for (col, row) in anchors {
-        let (sx, sy) = full.pixel_to_crs.forward(col, row);
+        let (sx, sy) = full.pixel_to_crs_pt(col, row);
         let (lon, lat) = src_crs.to_lonlat_deg(sx, sy);
         if !lon.is_finite() || !lat.is_finite() {
             continue;
@@ -1911,7 +1921,12 @@ fn tile_intersects_cog(
 ) -> Result<bool, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
-    let [cw, cs, ce, cn] = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+    let [cw, cs, ce, cn] = crs.wgs84_bounds_with_gcp(
+        &full.pixel_to_crs,
+        full.gcp_poly.as_deref(),
+        full.width,
+        full.height,
+    );
     if let Some(tms_def) = crate::tms::lookup_tms(tms) {
         let Some(tb) = tms_def.tile_bounds(tile.z, tile.x, tile.y, buffer, tile_size) else {
             return Ok(false);
@@ -1927,8 +1942,9 @@ fn tile_intersects_cog(
                     if !wgs84_bboxes_intersect(tw, [cw, cs, ce, cn]) {
                         return Ok(false);
                     }
-                    // For axis-aligned Mercator/Geographic/CEA rasters, the WGS84 box IS exact.
-                    if full.pixel_to_crs.is_axis_aligned()
+                    // For axis-aligned Mercator/Geographic/CEA rasters without nonlinear GCPs, the WGS84 box IS exact.
+                    if full.gcp_poly.is_none()
+                        && full.pixel_to_crs.is_axis_aligned()
                         && matches!(
                             crs,
                             cogzilla_proj::CrsModel::Epsg3857
@@ -1943,7 +1959,8 @@ fn tile_intersects_cog(
                     if !wgs84_bboxes_intersect(tb, [cw, cs, ce, cn]) {
                         return Ok(false);
                     }
-                    if full.pixel_to_crs.is_axis_aligned()
+                    if full.gcp_poly.is_none()
+                        && full.pixel_to_crs.is_axis_aligned()
                         && matches!(
                             crs,
                             cogzilla_proj::CrsModel::Epsg3857

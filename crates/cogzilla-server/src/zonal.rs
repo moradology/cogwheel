@@ -691,14 +691,32 @@ pub fn rasterize_exact_coverage(
                 if ring.len() < 3 {
                     continue;
                 }
-                let sa = ring_signed_area(ring);
-                if sa.abs() < 1e-18 {
+                // Filter out non-finite projected vertices (e.g. poles/far-antimeridian vertices
+                // outside a projected CRS domain) so the ring remains closed instead of leaking
+                // unmatched `run_delta` across scanlines. Zero-alloc on the all-finite hot path.
+                let finite_ring: Vec<(f64, f64)>;
+                let eff_ring: &[(f64, f64)] =
+                    if ring.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
+                        ring
+                    } else {
+                        finite_ring = ring
+                            .iter()
+                            .copied()
+                            .filter(|&(x, y)| x.is_finite() && y.is_finite())
+                            .collect();
+                        if finite_ring.len() < 3 {
+                            continue;
+                        }
+                        &finite_ring
+                    };
+                let sa = ring_signed_area(eff_ring);
+                if !sa.is_finite() || sa.abs() < 1e-18 {
                     continue;
                 }
                 // Outer ring (ring_idx == 0) must be positively oriented (CCW: sa > 0);
                 // Holes (ring_idx > 0) must be negatively oriented (CW: sa < 0) so they subtract.
                 let need_reverse = if ring_idx == 0 { sa < 0.0 } else { sa > 0.0 };
-                let n = ring.len();
+                let n = eff_ring.len();
                 let ZonalScratch {
                     area,
                     run_delta,
@@ -706,16 +724,16 @@ pub fn rasterize_exact_coverage(
                 } = &mut *st;
                 if need_reverse {
                     for i in 0..n {
-                        let (x0, y0) = ring[(i + 1) % n];
-                        let (x1, y1) = ring[i];
+                        let (x0, y0) = eff_ring[(i + 1) % n];
+                        let (x1, y1) = eff_ring[i];
                         accumulate_edge_exact(
                             x0, y0, x1, y1, c0_i, r0_i, win_w, win_h, area, run_delta, t_breaks,
                         );
                     }
                 } else {
                     for i in 0..n {
-                        let (x0, y0) = ring[i];
-                        let (x1, y1) = ring[(i + 1) % n];
+                        let (x0, y0) = eff_ring[i];
+                        let (x1, y1) = eff_ring[(i + 1) % n];
                         accumulate_edge_exact(
                             x0, y0, x1, y1, c0_i, r0_i, win_w, win_h, area, run_delta, t_breaks,
                         );
@@ -953,10 +971,24 @@ fn ring_area_px(ring: &[(f64, f64)]) -> f64 {
     if ring.len() < 3 {
         return 0.0;
     }
+    let finite: Vec<(f64, f64)>;
+    let eff: &[(f64, f64)] = if ring.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
+        ring
+    } else {
+        finite = ring
+            .iter()
+            .copied()
+            .filter(|&(x, y)| x.is_finite() && y.is_finite())
+            .collect();
+        if finite.len() < 3 {
+            return 0.0;
+        }
+        &finite
+    };
     let mut sum = 0.0_f64;
-    for i in 0..ring.len() {
-        let (x0, y0) = ring[i];
-        let (x1, y1) = ring[(i + 1) % ring.len()];
+    for i in 0..eff.len() {
+        let (x0, y0) = eff[i];
+        let (x1, y1) = eff[(i + 1) % eff.len()];
         sum += x0 * y1 - x1 * y0;
     }
     0.5 * sum.abs()
@@ -3936,5 +3968,23 @@ mod tests {
         assert_eq!(h2_sum, 2.0, "max_v dropped on default 10 bins: {:?}", st_h2["histogram"]);
 
         keys.clear();
+    }
+
+    #[test]
+    fn exact_coverage_ignores_non_finite_projected_ring_vertices_without_scanline_bleed() {
+        // A 4x4 square [2..6, 2..6] with an injected (NaN, NaN) vertex (simulating a pole/out-of-domain vertex)
+        let poly = vec![vec![
+            (2.0, 2.0),
+            (f64::NAN, f64::NAN),
+            (6.0, 2.0),
+            (6.0, 6.0),
+            (2.0, 6.0),
+        ]];
+        assert!((ring_area_px(&poly[0]) - 16.0).abs() < 1e-12);
+        let cov = rasterize_exact_coverage(&[poly], &[], &[], 0, 0, 10, 10);
+        let sum: f64 = cov.iter().sum();
+        assert!((sum - 16.0).abs() < 1e-9, "expected exact 16.0 coverage without bleed, got {sum}");
+        // Pixels to the right of col 6 must remain 0.0 (no unmatched run_delta bleed)
+        assert_eq!(cov[3 * 10 + 8], 0.0);
     }
 }

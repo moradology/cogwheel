@@ -1017,6 +1017,10 @@ pub async fn query_point(
         && norm_lon < lo
     {
         norm_lon + 360.0
+    } else if let Some(hi) = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width)
+        && norm_lon > hi
+    {
+        norm_lon - 360.0
     } else {
         norm_lon
     };
@@ -4933,6 +4937,7 @@ async fn render_bbox_impl(
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let wrap_hi = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
         let gcp_poly = ifd.gcp_poly.clone();
         let ifd_width = ifd.width;
@@ -4953,7 +4958,13 @@ async fn render_bbox_impl(
                 let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
                     cogzilla_proj::CrsModel::Geographic => {
-                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        let lon = if x > 180.0 {
+                            x - 360.0
+                        } else if x < -180.0 {
+                            x + 360.0
+                        } else {
+                            x
+                        };
                         crs.from_lonlat_deg(lon, y)
                     }
                     other => {
@@ -4965,11 +4976,16 @@ async fn render_bbox_impl(
                         }
                     }
                 };
-                if let Some(lo) = wrap_lo
-                    && sx.is_finite()
-                    && sx < lo
-                {
-                    sx += 360.0;
+                if sx.is_finite() {
+                    if let Some(lo) = wrap_lo
+                        && sx < lo
+                    {
+                        sx += 360.0;
+                    } else if let Some(hi) = wrap_hi
+                        && sx > hi
+                    {
+                        sx -= 360.0;
+                    }
                 }
                 (sx, sy)
             };
