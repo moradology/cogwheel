@@ -847,6 +847,11 @@ def main() -> int:
         o.check("point, band math on one asset", "json", f"/searches/{sid}/point/{pt}?assets=visual&expression=b1*2&items_limit=1")
         o.check("point, band math across assets", "json",
                 f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=(b2-b1)/(b2%2Bb1)&items_limit=2")
+        # numexpr beyond arithmetic: comparisons, logic, floor division, where, two arguments.
+        o.check("point, a comparison and where", "json",
+                f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=b1%3E%3Db2;where(b1%3Eb2,b1,b2);(b1%3E1)%26~(b2%3C1)&items_limit=1")
+        o.check("point, floor division and functions of two", "json",
+                f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=b1//7;minimum(b1,b2);arctan2(b1,b2);round(b1/7);log1p(b1)&items_limit=1")
         o.check("point, two expressions", "json",
                 f"/searches/{sid}/point/{pt}?assets=red&assets=nir&expression=b1%2Bb2;b2-b1&items_limit=1")
         o.check("point, expression with an asset name", "json",
@@ -916,6 +921,10 @@ def main() -> int:
                 f"/searches/{sid}/feature/32x32.npy?assets=red&coord_crs=epsg:3857&dst_crs=epsg:4326", "POST", in_metres)
         # Statistics count the pixels of a grid in `dst_crs`, which is `coord_crs` unless given.
         in_degrees = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [kite]}}
+        o.check("statistics of where", "zonal",
+                f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&max_size=64&expression=where(b1%3E1000,1,0)", "POST", in_degrees)
+        o.check("statistics of logic and minimum", "zonal",
+                f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&max_size=64&expression=(b1%3E1000)%26(b2%3E2000);minimum(b1,b2)", "POST", in_degrees)
         o.check("statistics of a feature posted in metres", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&coord_crs=epsg:3857", "POST", in_metres)
         o.check("statistics on a grid in metres", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&dst_crs=epsg:3857", "POST", in_degrees)
         o.check("statistics of band math on a grid in metres", "zonal",

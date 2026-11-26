@@ -1983,9 +1983,10 @@ const MAX_PLANE_VALUES: usize = 64 * 1024 * 1024;
 const MAX_BANDS_PER_ITEM: usize = 32;
 
 /// Whether band math over planes reads every expression of a request. The renderer's own
-/// engine knows names and functions it does not (`ndvi`, `^`, `max(a, b)`).
+/// engine knows names and functions it does not (`ndvi`, `^`, `max(a, b)`); and planes read
+/// plain arithmetic only, whose arrays' type the shared typing of band math knows.
 fn planes_read_all(pq: &ParsedQuery, query: &MosaicQuery) -> bool {
-    let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok();
+    let reads = |e: &String| Program::parse(e, usize::from(u16::MAX)).is_ok_and(|p| p.plain());
     pq.expr_raw.as_ref().is_none_or(reads) && query.assets.iter().all(|a| a.expression.as_ref().is_none_or(reads))
 }
 
@@ -2244,6 +2245,11 @@ type Reading<'a, T> = std::pin::Pin<Box<dyn Future<Output = Result<T, EngineErro
 /// Band math over whole planes, in double precision; a result that is not a number is no data.
 fn band_math(expression: &str, bands: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EngineError> {
     let program = Program::parse(expression, bands.len()).map_err(EngineError::BadRequest)?;
+    if !program.plain() {
+        return Err(EngineError::BadRequest(format!(
+            "expression '{expression}' is read on points and statistics; pictures and arrays take arithmetic and the functions of one argument"
+        )));
+    }
     let len = bands.first().map_or(0, Vec::len);
     let mut out = vec![vec![f32::NAN; len]; program.len()];
     let mut pixel = vec![0f64; bands.len()];
@@ -2413,6 +2419,15 @@ impl PlanesTile {
         height: usize,
         look: &Look<'_>,
     ) -> Result<(Bytes, &'static str), EngineError> {
+        // An asset's band math, as the request's own (see `band_math`), is plain arithmetic
+        // on a picture or an array.
+        for expression in self.assets.iter().filter_map(|a| a.expression.as_deref()) {
+            if Program::parse(expression, usize::from(u16::MAX)).is_ok_and(|p| !p.plain()) {
+                return Err(EngineError::BadRequest(format!(
+                    "expression '{expression}' is read on points and statistics; pictures and arrays take arithmetic and the functions of one argument"
+                )));
+            }
+        }
         let pixels = width * height;
         let mut formula = look.formula;
         let (rgba, bands, full) = match self.mosaic(engine, scenes).await? {
