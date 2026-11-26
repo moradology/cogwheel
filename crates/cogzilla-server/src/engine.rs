@@ -130,6 +130,7 @@ pub struct EngineStats {
     pub empty_short_circuits: AtomicU64,
     pub passthrough_hits: AtomicU64,
     pub http_304_not_modified: AtomicU64,
+    pub gpu_dispatches: AtomicU64,
 }
 
 /// Map a fetch/I/O error on an asset referenced by a STAC item or MosaicJSON document to
@@ -160,6 +161,8 @@ pub struct TileEngine {
     pub tile_cache: Arc<TileCache>,
     tile_cache_epoch: AtomicU64,
     pub stats: Arc<EngineStats>,
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
 }
 
 fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
@@ -304,6 +307,8 @@ impl TileEngine {
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             tile_cache_epoch: AtomicU64::new(0),
             stats: Arc::new(EngineStats::default()),
+            #[cfg(feature = "gpu")]
+            gpu: crate::gpu_backend::GpuBackend::try_init(256 * 1024 * 1024),
         }
     }
 
@@ -315,6 +320,10 @@ impl TileEngine {
         let seen = self.tile_cache_epoch.load(Ordering::Relaxed);
         if cur != seen && self.tile_cache_epoch.swap(cur, Ordering::AcqRel) != cur {
             self.tile_cache.clear();
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &self.gpu {
+                gpu.slab_cache.clear();
+            }
         }
     }
 
@@ -537,6 +546,15 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu.try_render_single_band::<N>(
+                        cog.id, ifd_idx, band0, tx0, ty0, &plan, &src, &style,
+                    ) {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_single_band::<N>(&plan, &src, &style))
             }
             BandRequest::Terrain {
@@ -588,6 +606,24 @@ impl TileEngine {
                 .with_scale_offset(sc, off);
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
+                }
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu.try_render_terrain::<N>(
+                        cog.id,
+                        ifd_idx,
+                        band0,
+                        tx0,
+                        ty0,
+                        &plan,
+                        &src,
+                        *encoding,
+                        req.resample,
+                        req.format,
+                    ) {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
                 }
                 Ok(render_terrain_tile::<N>(
                     &plan,
@@ -661,6 +697,24 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu.try_render_dem::<N>(
+                        cog.id,
+                        ifd_idx,
+                        band0,
+                        tx0,
+                        ty0,
+                        &plan,
+                        &src,
+                        *algorithm,
+                        pixel_size_m,
+                        &style,
+                    ) {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
                 Ok(render_dem_algorithm::<N>(
                     &plan,
                     &src,
