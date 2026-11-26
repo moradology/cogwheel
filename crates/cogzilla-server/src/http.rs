@@ -3552,46 +3552,61 @@ async fn render_mosaic_tile_pixel_selection(
             }
 
             let mut out = vec![f32::NAN; nb * n_px];
-            let mut scratch = Vec::with_capacity(scenes.len());
-            for b in 0..nb {
-                let b_off = b * n_px;
-                #[cfg(feature = "gpu")]
-                if scenes.len() >= 3
-                    && scenes.len() <= 32
-                    && let Some(ref gpu) = engine.gpu
-                {
-                    let plane_refs: Vec<&[f32]> =
-                        scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect();
-                    if let Some(gpu_band) = gpu.try_composite_mosaic_f32(
-                        out_dim,
-                        out_dim,
-                        &plane_refs,
-                        cogzilla_gpu::GpuPixelSelection::Median,
-                    ) {
-                        engine
-                            .stats
-                            .gpu_dispatches
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "gpu")]
+            let mut gpu_done = false;
+            #[cfg(feature = "gpu")]
+            if scenes.len() >= 3
+                && scenes.len() <= 32
+                && let Some(ref gpu) = engine.gpu
+            {
+                let band_planes: Vec<Vec<&[f32]>> = (0..nb)
+                    .map(|b| {
+                        let b_off = b * n_px;
+                        scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect()
+                    })
+                    .collect();
+                if let Some(gpu_bands) = gpu.try_composite_mosaic_f32_bands(
+                    out_dim,
+                    out_dim,
+                    &band_planes,
+                    cogzilla_gpu::GpuPixelSelection::Median,
+                ) {
+                    engine
+                        .stats
+                        .gpu_dispatches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    for (b, gpu_band) in gpu_bands.into_iter().enumerate() {
+                        let b_off = b * n_px;
                         out[b_off..b_off + n_px].copy_from_slice(&gpu_band);
-                        continue;
                     }
+                    gpu_done = true;
                 }
-                for i in 0..n_px {
-                    scratch.clear();
-                    for s in &scenes {
-                        let v = s[b_off + i];
-                        if v.is_finite() {
-                            scratch.push(v);
+            }
+            #[cfg(feature = "gpu")]
+            let run_cpu = !gpu_done;
+            #[cfg(not(feature = "gpu"))]
+            let run_cpu = true;
+            if run_cpu {
+                let mut scratch = Vec::with_capacity(scenes.len());
+                for b in 0..nb {
+                    let b_off = b * n_px;
+                    for i in 0..n_px {
+                        scratch.clear();
+                        for s in &scenes {
+                            let v = s[b_off + i];
+                            if v.is_finite() {
+                                scratch.push(v);
+                            }
                         }
-                    }
-                    let k = scratch.len();
-                    if k > 0 {
-                        scratch.sort_unstable_by(|a, b| a.total_cmp(b));
-                        out[b_off + i] = if k % 2 == 1 {
-                            scratch[k / 2]
-                        } else {
-                            0.5 * (scratch[k / 2 - 1] + scratch[k / 2])
-                        };
+                        let k = scratch.len();
+                        if k > 0 {
+                            scratch.sort_unstable_by(|a, b| a.total_cmp(b));
+                            out[b_off + i] = if k % 2 == 1 {
+                                scratch[k / 2]
+                            } else {
+                                0.5 * (scratch[k / 2 - 1] + scratch[k / 2])
+                            };
+                        }
                     }
                 }
             }
