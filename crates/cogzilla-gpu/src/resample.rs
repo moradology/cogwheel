@@ -34,6 +34,51 @@ pub struct GpuSlab {
     pub stride: u32,
 }
 
+impl GpuSlab {
+    /// Allocate a `STORAGE` buffer with `mapped_at_creation: true` and invoke `fill` directly
+    /// on the mapped `&mut [f32]` slice (`height * stride` floats) — eliminating intermediate
+    /// CPU `Vec<f32>` allocations and extra copies.
+    pub fn from_mapped_fill<F>(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        stride: u32,
+        fill: F,
+    ) -> Result<Self, GpuError>
+    where
+        F: FnOnce(&mut [f32]) -> Result<(), GpuError>,
+    {
+        if width == 0 || height == 0 || stride < width {
+            return Err(GpuError::InvalidDimensions(format!(
+                "invalid slab: {width}x{height} stride={stride}"
+            )));
+        }
+        let total_elems = (height as usize)
+            .checked_mul(stride as usize)
+            .ok_or_else(|| GpuError::InvalidDimensions("slab size overflow".into()))?;
+        let byte_size = (total_elems * std::mem::size_of::<f32>()) as u64;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-slab"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: true,
+        });
+        let res = {
+            let mut mapped = buffer.slice(..).get_mapped_range_mut();
+            let dst: &mut [f32] = bytemuck::cast_slice_mut(&mut mapped);
+            fill(dst)
+        };
+        buffer.unmap();
+        res?;
+        Ok(Self {
+            buffer,
+            width,
+            height,
+            stride,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ResampleTimings {
     pub upload: Duration,
