@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer, GpuColorFormula,
-    GpuColormapMode, GpuColormapRenderer, GpuContext, GpuCoordPlan, GpuDemAlgorithm,
+    GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
     GpuExprRenderer, GpuInstr, GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput,
     GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuTerrainRenderer, GpuTileBatcher,
     MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
@@ -1027,156 +1027,43 @@ impl GpuBackend {
 
     /// Attempt GPU-accelerated built-in `SpectralExpr` tile rendering across all `CoordPlan`
     /// variants (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_spectral<const N: usize>(
-        &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        bands_1based: &[u16],
-        plan: &CoordPlan<N>,
-        srcs: &[BandSource<'_>],
-        expr: SpectralExpr,
-        style: &SingleBandStyle,
-    ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let cache_key = Self::multiband_key(cog_id, ifd_idx, bands_1based, srcs);
-        self.try_render_bbox_spectral(cache_key, coords, srcs, expr, style, true)
-    }
-
-    /// Attempt GPU-accelerated built-in `SpectralExpr` visual rendering for arbitrary
-    /// `BboxCoordSource` (`/cog/preview`, `/cog/bbox`, `/cog/crop`, `/cog/feature`, and tiles).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_spectral(
+    /// Resolve `(Arc<GpuMultiBandSlab>, base_col, base_row)` from `multi_slab_cache` (lock-free on
+    /// warm hit) or stitch + upload via `self.expr` on a cold miss.
+    fn resolve_multiband_slab(
         &self,
         cache_key: Option<MultiBandSlabKey>,
-        coords: BboxCoordSource<'_>,
+        warm_slab: Option<Arc<cogzilla_gpu::GpuMultiBandSlab>>,
         srcs: &[BandSource<'_>],
-        expr: SpectralExpr,
-        style: &SingleBandStyle,
-        return_mask: bool,
-    ) -> Option<Bytes> {
-        let instrs = Self::compile_spectral_to_gpu(expr)?;
-        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
-    }
-
-    /// Attempt GPU-accelerated built-in `SpectralExpr` raw `f32` rendering for `.npy`, `.tif`,
-    /// `.f32`, and multi-scene mosaic routes.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_spectral_f32(
-        &self,
-        cache_key: Option<MultiBandSlabKey>,
-        coords: BboxCoordSource<'_>,
-        srcs: &[BandSource<'_>],
-        expr: SpectralExpr,
-        resample: ResampleMode,
-    ) -> Option<Bytes> {
-        let instrs = Self::compile_spectral_to_gpu(expr)?;
-        self.try_render_bbox_instrs_f32(cache_key, coords, srcs, &instrs, resample)
-    }
-
-    /// Attempt GPU-accelerated multi-band `ExprProgram` tile rendering across all `CoordPlan`
-    /// variants (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_expr<const N: usize>(
-        &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        plan: &CoordPlan<N>,
-        srcs: &[BandSource<'_>],
-        prog: &ExprProgram,
-        style: &SingleBandStyle,
-    ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let cache_key = Self::multiband_key(cog_id, ifd_idx, &prog.used_bands, srcs);
-        self.try_render_bbox_expr(cache_key, coords, srcs, prog, style, true)
-    }
-
-    /// Attempt GPU-accelerated 3-band RGB tile rendering across all `CoordPlan` variants
-    /// (`Separable1D`, `Grid2D` 17×17 UTM/Albers/LCC, and `Exact2D`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_rgb<const N: usize>(
-        &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        bands_1based: [u16; 3],
-        plan: &CoordPlan<N>,
-        srcs: &[BandSource<'_>; 3],
-        style: &RgbStyle,
-    ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
-        self.try_render_bbox_rgb(cache_key, coords, srcs, style, None, true)
-    }
-
-    /// Attempt GPU-accelerated multi-band `ExprProgram` rendering for arbitrary `BboxCoordSource`
-    /// (`Separable`, `Grid2D`, or `Exact2D` for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_expr(
-        &self,
-        cache_key: Option<MultiBandSlabKey>,
-        coords: BboxCoordSource<'_>,
-        srcs: &[BandSource<'_>],
-        prog: &ExprProgram,
-        style: &SingleBandStyle,
-        return_mask: bool,
-    ) -> Option<Bytes> {
-        let instrs = Self::compile_expr_to_gpu(prog)?;
-        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+    ) -> Option<(Arc<cogzilla_gpu::GpuMultiBandSlab>, u32, u32)> {
+        if let Some(slab) = warm_slab {
+            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
+            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
+            return Some((slab, bc, br));
+        }
+        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
+        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+        for src in srcs {
+            let (buf, bc, br, w, h) = stitch_band_source(src)?;
+            if let Some(g) = common_geom {
+                if g != (bc, br, w, h) {
+                    return None;
+                }
+            } else {
+                common_geom = Some((bc, br, w, h));
+            }
+            stitched_vecs.push(buf);
+        }
+        let (base_col, base_row, w, h) = common_geom?;
+        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+        let slab = Arc::new(self.expr.lock().ok()?.upload_bands(&refs, w, h, w).ok()?);
+        if let Some(k) = cache_key {
+            self.multi_slab_cache.insert(k, Arc::clone(&slab));
+        }
+        Some((slab, base_col, base_row))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_render_bbox_instrs(
+    fn prepare_bbox_instrs(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -1184,7 +1071,8 @@ impl GpuBackend {
         instrs: &[GpuInstr],
         style: &SingleBandStyle,
         return_mask: bool,
-    ) -> Option<Bytes> {
+        active: usize,
+    ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
             BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
@@ -1235,152 +1123,243 @@ impl GpuBackend {
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
-
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
         let lut = style.colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-        let mut expr_guard = self.expr.lock().ok()?;
-        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
-            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
-            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
-            (slab, bc, br)
-        } else {
-            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
-            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-            for src in srcs {
-                let (buf, bc, br, w, h) = stitch_band_source(src)?;
-                if let Some(g) = common_geom {
-                    if g != (bc, br, w, h) {
-                        return None;
-                    }
-                } else {
-                    common_geom = Some((bc, br, w, h));
-                }
-                stitched_vecs.push(buf);
-            }
-            let (base_col, base_row, w, h) = common_geom?;
-            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
-            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
-            if let Some(k) = cache_key {
-                self.multi_slab_cache.insert(k, Arc::clone(&slab));
-            }
-            (slab, base_col, base_row)
-        };
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_expr(
-                        &multi_slab,
-                        &u_local,
-                        &v_local,
-                        gpu_mode,
-                        &instrs,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        Some((
+            CoalescedJob::Expr {
+                slab,
+                plan,
+                mode: gpu_mode,
+                instrs: instrs.to_vec(),
+                rescale_min: style.rescale_min,
+                rescale_max: style.rescale_max,
+                lut_u32,
+                output: out_kind.into(),
+            },
+            out_kind,
+            dst_w,
+            dst_h,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_render_spectral<const N: usize>(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: &[u16],
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        style: &SingleBandStyle,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_spectral_to_gpu(expr)?;
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
                 grid_u,
                 grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                expr_guard
-                    .render_expr_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        &instrs,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_expr_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        &instrs,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &lut_u32,
-                        out_kind,
-                    )
-                    .ok()?
-            }
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
         };
-        drop(expr_guard);
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, bands_1based, srcs);
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
+            cache_key, coords, srcs, &instrs, style, true, active,
+        )?;
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, true,
+        ))
+    }
 
-        Some(match out_kind {
-            GpuPixelOutput::IndexedU8 => {
-                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, lut)
-            }
-            GpuPixelOutput::Rgba8 => {
-                if style.format == OutputFormat::RawRgba {
-                    Bytes::from(raw)
-                } else {
-                    crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
-                }
-            }
+    /// Attempt GPU-accelerated built-in `SpectralExpr` visual rendering for arbitrary
+    /// `BboxCoordSource` (`/cog/preview`, `/cog/bbox`, `/cog/crop`, `/cog/feature`, and tiles).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_spectral(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_spectral_to_gpu(expr)?;
+        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+    }
+
+    /// Attempt GPU-accelerated built-in `SpectralExpr` raw `f32` rendering for `.npy`, `.tif`,
+    /// `.f32`, and multi-scene mosaic routes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_spectral_f32(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        expr: SpectralExpr,
+        resample: ResampleMode,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_spectral_to_gpu(expr)?;
+        self.try_render_bbox_instrs_f32(cache_key, coords, srcs, &instrs, resample)
+    }
+
+    /// Attempt GPU-accelerated multi-band `ExprProgram` tile rendering (non-blocking async coalesced).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_render_expr<const N: usize>(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>],
+        prog: &ExprProgram,
+        style: &SingleBandStyle,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        };
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, &prog.used_bands, srcs);
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
+            cache_key, coords, srcs, &instrs, style, true, active,
+        )?;
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, true,
+        ))
+    }
+
+    /// Attempt GPU-accelerated 3-band RGB tile rendering (non-blocking async coalesced).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_render_rgb<const N: usize>(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: [u16; 3],
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>; 3],
+        style: &RgbStyle,
+    ) -> Option<Bytes> {
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        };
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, dst_w, dst_h) =
+            self.prepare_bbox_rgb(cache_key, coords, srcs, style, None, active)?;
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(if style.format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
         })
     }
 
-    /// Attempt GPU-accelerated 3-band RGB rendering (with optional fused `ColorFormula`:
-    /// Gamma/Sigmoidal LUT + CIE LCH Saturation) for arbitrary `BboxCoordSource`
+    /// Attempt GPU-accelerated multi-band `ExprProgram` rendering for arbitrary `BboxCoordSource`
     /// (`Separable`, `Grid2D`, or `Exact2D` for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_rgb(
+    pub fn try_render_bbox_expr(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        prog: &ExprProgram,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        self.try_render_bbox_instrs(cache_key, coords, srcs, &instrs, style, return_mask)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_render_bbox_instrs(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>],
+        instrs: &[GpuInstr],
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
+            cache_key,
+            coords,
+            srcs,
+            instrs,
+            style,
+            return_mask,
+            active,
+        )?;
+        let raw = self.coalescer.submit(job).ok()?;
+        Some(Self::finish_styled_output(
+            raw, out_kind, dst_w, dst_h, style, return_mask,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_bbox_rgb(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
         srcs: &[BandSource<'_>; 3],
         style: &RgbStyle,
         color_formula: Option<&ColorFormula>,
-        return_mask: bool,
-    ) -> Option<Bytes> {
+        active: usize,
+    ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
@@ -1430,117 +1409,46 @@ impl GpuBackend {
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        Some((
+            CoalescedJob::Rgb {
+                slab,
+                plan,
+                mode: gpu_mode,
+                rescale_min: style.rescale_min,
+                rescale_max: style.rescale_max,
+                formula: gpu_formula,
+            },
+            dst_w,
+            dst_h,
+        ))
+    }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    /// Attempt GPU-accelerated 3-band RGB rendering (with optional fused `ColorFormula`:
+    /// Gamma/Sigmoidal LUT + CIE LCH Saturation) for arbitrary `BboxCoordSource`
+    /// (`Separable`, `Grid2D`, or `Exact2D` for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_rgb(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>; 3],
+        style: &RgbStyle,
+        color_formula: Option<&ColorFormula>,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
-
-        let mut expr_guard = self.expr.lock().ok()?;
-        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
-            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
-            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
-            (slab, bc, br)
-        } else {
-            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(3);
-            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-            for src in srcs {
-                let (buf, bc, br, w, h) = stitch_band_source(src)?;
-                if let Some(g) = common_geom {
-                    if g != (bc, br, w, h) {
-                        return None;
-                    }
-                } else {
-                    common_geom = Some((bc, br, w, h));
-                }
-                stitched_vecs.push(buf);
-            }
-            let (base_col, base_row, w, h) = common_geom?;
-            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
-            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
-            if let Some(k) = cache_key {
-                self.multi_slab_cache.insert(k, Arc::clone(&slab));
-            }
-            (slab, base_col, base_row)
-        };
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_rgb_formula(
-                        &multi_slab,
-                        &u_local,
-                        &v_local,
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &gpu_formula,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                expr_guard
-                    .render_rgb_formula_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &gpu_formula,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_rgb_formula_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &gpu_formula,
-                    )
-                    .ok()?
-            }
-        };
-        drop(expr_guard);
-
+        let (job, dst_w, dst_h) =
+            self.prepare_bbox_rgb(cache_key, coords, srcs, style, color_formula, active)?;
+        let raw = self.coalescer.submit(job).ok()?;
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
@@ -1875,117 +1783,34 @@ impl GpuBackend {
             GpuColormapMode::Cubic => GpuOp::DemHornCubic,
             GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
         };
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
         let decision = self.policy.decide(&DispatchRequest {
             op,
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes: dst_w * dst_h * 4,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
-
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
-        let mut expr_guard = self.expr.lock().ok()?;
-        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
-            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
-            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
-            (slab, bc, br)
-        } else {
-            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
-            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-            for src in srcs {
-                let (buf, bc, br, w, h) = stitch_band_source(src)?;
-                if let Some(g) = common_geom {
-                    if g != (bc, br, w, h) {
-                        return None;
-                    }
-                } else {
-                    common_geom = Some((bc, br, w, h));
-                }
-                stitched_vecs.push(buf);
-            }
-            let (base_col, base_row, w, h) = common_geom?;
-            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
-            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
-            if let Some(k) = cache_key {
-                self.multi_slab_cache.insert(k, Arc::clone(&slab));
-            }
-            (slab, base_col, base_row)
-        };
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_expr_f32_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Separable1D {
-                            u_coords: &u_local,
-                            v_coords: &v_local,
-                        },
-                        gpu_mode,
-                        &instrs,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
-                grid_u,
-                grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                expr_guard
-                    .render_expr_f32_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        &instrs,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_expr_f32_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        &instrs,
-                    )
-                    .ok()?
-            }
-        };
-        drop(expr_guard);
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::Expr {
+                slab,
+                plan,
+                mode: gpu_mode,
+                instrs: instrs.to_vec(),
+                rescale_min: 0.0,
+                rescale_max: 1.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            })
+            .ok()?;
         Some(Bytes::from(raw))
     }
 
@@ -2105,52 +1930,16 @@ impl GpuBackend {
         Some(out)
     }
 
-    /// Attempt GPU-accelerated 2-band Dual-Pol SAR False-Color RGB (`[VV_dB, VH_dB, VV_dB - VH_dB]`)
-    /// tile rendering across all `CoordPlan` variants (`Separable1D`, `Grid2D`, `Exact2D`).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_sar_rgb<const N: usize>(
-        &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        bands_1based: [u16; 2],
-        plan: &CoordPlan<N>,
-        srcs: &[BandSource<'_>; 2],
-        style: &RgbStyle,
-    ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
-        self.try_render_bbox_sar_rgb(cache_key, coords, srcs, style, None, true)
-    }
-
-    /// Attempt GPU-accelerated Dual-Pol SAR False-Color RGB (with optional fused `ColorFormula`
-    /// and `GpuMultiBandCache`) for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_sar_rgb(
+    fn prepare_bbox_sar_rgb(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
         srcs: &[BandSource<'_>; 2],
         style: &RgbStyle,
         color_formula: Option<&ColorFormula>,
-        return_mask: bool,
-    ) -> Option<Bytes> {
+        active: usize,
+    ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = match coords {
@@ -2200,119 +1989,88 @@ impl GpuBackend {
             dst_pixels: dst_w * dst_h,
             upload_bytes,
             readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 8,
         });
         if !decision.use_gpu {
             return None;
         }
+        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
+        Some((
+            CoalescedJob::SarRgb {
+                slab,
+                plan,
+                mode: gpu_mode,
+                rescale_min: style.rescale_min,
+                rescale_max: style.rescale_max,
+                formula: gpu_formula,
+            },
+            dst_w,
+            dst_h,
+        ))
+    }
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
-        let mut expr_guard = self.expr.lock().ok()?;
-        let (multi_slab, base_col, base_row) = if let Some(slab) = warm_slab {
-            let bc = srcs[0].tx0.checked_mul(srcs[0].tile_w)?;
-            let br = srcs[0].ty0.checked_mul(srcs[0].tile_h)?;
-            (slab, bc, br)
-        } else {
-            let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(2);
-            let mut common_geom: Option<(u32, u32, u32, u32)> = None;
-            for src in srcs {
-                let (buf, bc, br, w, h) = stitch_band_source(src)?;
-                if let Some(g) = common_geom {
-                    if g != (bc, br, w, h) {
-                        return None;
-                    }
-                } else {
-                    common_geom = Some((bc, br, w, h));
-                }
-                stitched_vecs.push(buf);
-            }
-            let (base_col, base_row, w, h) = common_geom?;
-            let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
-            let slab = Arc::new(expr_guard.upload_bands(&refs, w, h, w).ok()?);
-            if let Some(k) = cache_key {
-                self.multi_slab_cache.insert(k, Arc::clone(&slab));
-            }
-            (slab, base_col, base_row)
-        };
-        let bc = base_col as f32;
-        let br = base_row as f32;
-        let raw = match coords {
-            BboxCoordSource::Separable { u, v } => {
-                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_sar_rgb_formula_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Separable1D {
-                            u_coords: &u_local,
-                            v_coords: &v_local,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &gpu_formula,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Grid2D {
-                dst_w,
-                dst_h,
+    /// Attempt GPU-accelerated 2-band Dual-Pol SAR False-Color RGB (`[VV_dB, VH_dB, VV_dB - VH_dB]`)
+    /// tile rendering (non-blocking async coalesced).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_render_sar_rgb<const N: usize>(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        bands_1based: [u16; 2],
+        plan: &CoordPlan<N>,
+        srcs: &[BandSource<'_>; 2],
+        style: &RgbStyle,
+    ) -> Option<Bytes> {
+        let coords = match plan {
+            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
+                dst_w: N,
+                dst_h: N,
                 grid_u,
                 grid_v,
-            } => {
-                let mut gu = [0.0f32; 289];
-                let mut gv = [0.0f32; 289];
-                for i in 0..289 {
-                    gu[i] = grid_u[i] - bc;
-                    gv[i] = grid_v[i] - br;
-                }
-                expr_guard
-                    .render_sar_rgb_formula_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Grid2D {
-                            dst_w,
-                            dst_h,
-                            grid_u: &gu,
-                            grid_v: &gv,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &gpu_formula,
-                    )
-                    .ok()?
-            }
-            BboxCoordSource::Exact2D {
-                dst_w,
-                dst_h,
-                u_map,
-                v_map,
-            } => {
-                let n = dst_w * dst_h;
-                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
-                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
-                expr_guard
-                    .render_sar_rgb_formula_with_plan(
-                        &multi_slab,
-                        GpuCoordPlan::Exact2D {
-                            dst_w,
-                            dst_h,
-                            u: &u_local,
-                            v: &v_local,
-                        },
-                        gpu_mode,
-                        style.rescale_min,
-                        style.rescale_max,
-                        &gpu_formula,
-                    )
-                    .ok()?
-            }
+            },
+            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
         };
-        drop(expr_guard);
+        let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, dst_w, dst_h) =
+            self.prepare_bbox_sar_rgb(cache_key, coords, srcs, style, None, active)?;
+        let raw = self.submit_coalesced_async(job).await?;
+        Some(if style.format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, true)
+        })
+    }
 
+    /// Attempt GPU-accelerated Dual-Pol SAR False-Color RGB (with optional fused `ColorFormula`
+    /// and `GpuMultiBandCache`) for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_sar_rgb(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        coords: BboxCoordSource<'_>,
+        srcs: &[BandSource<'_>; 2],
+        style: &RgbStyle,
+        color_formula: Option<&ColorFormula>,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InFlightGuard(&self.in_flight);
+        let (job, dst_w, dst_h) =
+            self.prepare_bbox_sar_rgb(cache_key, coords, srcs, style, color_formula, active)?;
+        let raw = self.coalescer.submit(job).ok()?;
         Some(if style.format == OutputFormat::RawRgba {
             Bytes::from(raw)
         } else {
