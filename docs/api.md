@@ -132,7 +132,8 @@ Each of these is answered with a `400` or `404` rather than a different picture:
 - In the tileset list, the twelve tile matrix sets other than `WebMercatorQuad` that titiler-pgstac also lists.
 - A tile or image of one or two bands out of a three-band raster reads other pixels than TiTiler, on purpose: GDAL warps a partial band selection in blocks through its overview grid, so that a band on its own is not the band it is in the whole raster (43% of pixels differ on the reference data). Here a band is the same band however it is asked for. `statistics` still follows GDAL there, to give TiTiler's numbers. Bad band indexes and `asset_as_band` on a multi-band asset are a `400` where TiTiler answers `500`.
 - On tiles and images made from planes (see above): `algorithm`, raw array formats, and four bands as JPEG, which TiTiler sends as CMYK. Any `pixel_selection` other than `first` with a terrain encoding or a raw array format.
-- `buffer` with `algorithm`, or on anything but a tile; bare arrays (`.bin`) of a box or a feature.
+- `buffer` on anything but a tile; bare arrays (`.bin`) of a buffered tile, a box or a feature; `.npy` of a buffered tile, a box or a feature under `algorithm`.
+- A posted shape drawn in Web Mercator (`dst_crs=epsg:3857`) with `algorithm`, with band math only the renderer reads, or over a raster with an alpha band: the renderer cuts a shape out of degrees only. A box in Web Mercator with any of these is drawn.
 - Tile matrix sets other than `WebMercatorQuad`.
 
 ## Notes on TiTiler Compatibility

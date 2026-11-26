@@ -532,6 +532,14 @@ def main() -> int:
                 f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A200%2C%22angle_altitude%22%3A20%7D")
         o.check("bbox, hillshade with its parameters", "status",
                 f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/128x128.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A90%7D")
+        # An algorithm over a buffered tile, and over a box drawn in metres: the renderer draws both.
+        o.check("tile with a buffer, contours", "image", f"{base12}.png?assets=red&algorithm=contours&buffer=2")
+        o.check("tile with half a pixel of buffer, terrarium", "image", f"{base12}.png?assets=red&algorithm=terrarium&buffer=0.5")
+        o.check("tif of a tile with a buffer, contours", "status", f"{base12}.tif?assets=red&algorithm=contours&buffer=2")
+        o.check("bbox in metres, contours", "image",
+                f"/searches/{sid}/bbox/930000,5700000,960000,5730000/200x200.png?coord_crs=epsg:3857&assets=red&algorithm=contours")
+        o.check("bbox drawn in metres, terrarium", "image",
+                f"/searches/{sid}/bbox/8.40,45.70,8.52,45.78/200x200.png?dst_crs=epsg:3857&assets=red&algorithm=terrarium")
         o.check("algorithm parameters of the wrong type", "status",
                 f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%22x%22%7D")
         # Band math read with a smoothing resampling: whole numbers stay whole, rescaled is bytes.
