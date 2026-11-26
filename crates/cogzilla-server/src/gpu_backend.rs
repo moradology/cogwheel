@@ -15,6 +15,20 @@ use cogzilla_kernel::{
 };
 use cogzilla_proj::CoordPlan;
 
+/// Coordinate mapping passed from `titiler::render_bbox_impl` into `GpuBackend`.
+pub enum BboxCoordSource<'a> {
+    /// Separable 1D axes (used by `/cog/preview` native previews — zero 2D coordinate upload).
+    Separable { u: &'a [f32], v: &'a [f32] },
+    /// Per-pixel 2D coordinate maps (used by `/cog/bbox`, `/cog/crop`, `/cog/feature`, curved
+    /// projected CRSs, and GeoJSON polygon masks where outside pixels carry `NaN`).
+    Exact2D {
+        dst_w: usize,
+        dst_h: usize,
+        u_map: &'a [f32],
+        v_map: &'a [f32],
+    },
+}
+
 /// Optional GPU acceleration backend owned by `TileEngine` when built with `--features gpu`.
 pub struct GpuBackend {
     pub ctx: GpuContext,
@@ -204,23 +218,63 @@ impl GpuBackend {
         src: &BandSource<'_>,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
+        self.try_render_bbox_single_band(
+            cog_id,
+            ifd_idx,
+            band0,
+            BboxCoordSource::Separable {
+                u: u_coords,
+                v: v_coords,
+            },
+            src,
+            style,
+            true,
+        )
+    }
+
+    /// Attempt GPU-accelerated single-band rendering for `/cog/preview`, `/cog/bbox`,
+    /// `/cog/crop`, and `/cog/feature` (both separable 1D and exact 2D curved/masked maps).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_single_band(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let gpu_mode = map_resample(style.resample)?;
-        let dst_w = u_coords.len();
-        let dst_h = v_coords.len();
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
         let out_kind = match style.format {
-            OutputFormat::Png => GpuPixelOutput::IndexedU8,
-            OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
-                GpuPixelOutput::Rgba8
-            }
+            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
+            OutputFormat::Png
+            | OutputFormat::Webp { .. }
+            | OutputFormat::Jpeg { .. }
+            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
             _ => return None,
         };
 
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
         let warm_slab = self.slab_cache.get(&key);
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
+        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
@@ -243,26 +297,57 @@ impl GpuBackend {
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
         let bc = base_col as f32;
         let br = base_row as f32;
-        let u_local: Vec<f32> = u_coords.iter().map(|&u| u - bc).collect();
-        let v_local: Vec<f32> = v_coords.iter().map(|&v| v - br).collect();
-
         let lut = style.colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-        let raw = self
-            .colormap
-            .lock()
-            .ok()?
-            .render_slab(
-                &slab,
-                &u_local,
-                &v_local,
-                gpu_mode,
-                style.rescale_min,
-                style.rescale_max,
-                &lut_u32,
-                out_kind,
-            )
-            .ok()?;
+
+        let raw = match coords {
+            BboxCoordSource::Separable { u, v } => {
+                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
+                self.colormap
+                    .lock()
+                    .ok()?
+                    .render_slab(
+                        &slab,
+                        &u_local,
+                        &v_local,
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?
+            }
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                let n = dst_w * dst_h;
+                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
+                self.colormap
+                    .lock()
+                    .ok()?
+                    .render_slab_with_plan(
+                        &slab,
+                        GpuCoordPlan::Exact2D {
+                            dst_w,
+                            dst_h,
+                            u: &u_local,
+                            v: &v_local,
+                        },
+                        gpu_mode,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?
+            }
+        };
 
         Some(match out_kind {
             GpuPixelOutput::IndexedU8 => {
@@ -272,7 +357,7 @@ impl GpuBackend {
                 if style.format == OutputFormat::RawRgba {
                     Bytes::from(raw)
                 } else {
-                    encode_rgba_tile(&raw, dst_w as u32, false, style.format)
+                    crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
                 }
             }
         })
@@ -294,9 +379,54 @@ impl GpuBackend {
         pixel_size_y_m: f32,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
+        self.try_render_bbox_dem(
+            cog_id,
+            ifd_idx,
+            band0,
+            BboxCoordSource::Separable {
+                u: u_coords,
+                v: v_coords,
+            },
+            src,
+            alg,
+            pixel_size_x_m,
+            pixel_size_y_m,
+            style,
+            true,
+        )
+    }
+
+    /// Attempt GPU-accelerated DEM Horn 3×3 rendering for `/cog/preview`, `/cog/bbox`,
+    /// `/cog/crop`, and `/cog/feature` (both separable 1D and exact 2D curved/masked maps).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_dem(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        alg: DemAlgorithm,
+        pixel_size_x_m: f32,
+        pixel_size_y_m: f32,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
         let gpu_mode = map_resample(style.resample)?;
-        let dst_w = u_coords.len();
-        let dst_h = v_coords.len();
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
@@ -315,16 +445,17 @@ impl GpuBackend {
             DemAlgorithm::Contours { .. } => return None,
         };
         let out_kind = match style.format {
-            OutputFormat::Png => GpuPixelOutput::IndexedU8,
-            OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
-                GpuPixelOutput::Rgba8
-            }
+            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
+            OutputFormat::Png
+            | OutputFormat::Webp { .. }
+            | OutputFormat::Jpeg { .. }
+            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
             _ => return None,
         };
 
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
         let warm_slab = self.slab_cache.get(&key);
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
+        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
@@ -351,29 +482,63 @@ impl GpuBackend {
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
         let bc = base_col as f32;
         let br = base_row as f32;
-        let u_local: Vec<f32> = u_coords.iter().map(|&u| u - bc).collect();
-        let v_local: Vec<f32> = v_coords.iter().map(|&v| v - br).collect();
-
         let lut = style.colormap.lut();
         let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
-        let raw = self
-            .terrain
-            .lock()
-            .ok()?
-            .render_slab(
-                &slab,
-                &u_local,
-                &v_local,
-                gpu_mode,
-                gpu_alg,
-                pixel_size_x_m,
-                pixel_size_y_m,
-                style.rescale_min,
-                style.rescale_max,
-                &lut_u32,
-                out_kind,
-            )
-            .ok()?;
+
+        let raw = match coords {
+            BboxCoordSource::Separable { u, v } => {
+                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
+                self.terrain
+                    .lock()
+                    .ok()?
+                    .render_slab(
+                        &slab,
+                        &u_local,
+                        &v_local,
+                        gpu_mode,
+                        gpu_alg,
+                        pixel_size_x_m,
+                        pixel_size_y_m,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?
+            }
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                let n = dst_w * dst_h;
+                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
+                self.terrain
+                    .lock()
+                    .ok()?
+                    .render_slab_with_plan(
+                        &slab,
+                        GpuCoordPlan::Exact2D {
+                            dst_w,
+                            dst_h,
+                            u: &u_local,
+                            v: &v_local,
+                        },
+                        gpu_mode,
+                        gpu_alg,
+                        pixel_size_x_m,
+                        pixel_size_y_m,
+                        style.rescale_min,
+                        style.rescale_max,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?
+            }
+        };
 
         Some(match out_kind {
             GpuPixelOutput::IndexedU8 => {
@@ -383,9 +548,139 @@ impl GpuBackend {
                 if style.format == OutputFormat::RawRgba {
                     Bytes::from(raw)
                 } else {
-                    encode_rgba_tile(&raw, dst_w as u32, false, style.format)
+                    crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
                 }
             }
+        })
+    }
+
+    /// Attempt GPU-accelerated Terrarium / TerrainRGB rendering for `/cog/preview` & `/cog/bbox`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_terrain(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        coords: BboxCoordSource<'_>,
+        src: &BandSource<'_>,
+        encoding: TerrainEncoding,
+        resample: ResampleMode,
+        format: OutputFormat,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(resample)?;
+        let gpu_alg = match encoding {
+            TerrainEncoding::Terrarium => GpuDemAlgorithm::Terrarium,
+            TerrainEncoding::TerrainRgb => GpuDemAlgorithm::TerrainRgb,
+            TerrainEncoding::Contours { .. } => return None,
+        };
+        if !matches!(
+            format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) {
+            return None;
+        }
+        let (dst_w, dst_h, coord_upload_bytes) = match coords {
+            BboxCoordSource::Separable { u, v } => (u.len(), v.len(), 0usize),
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                if u_map.len() < dst_w * dst_h || v_map.len() < dst_w * dst_h {
+                    return None;
+                }
+                (dst_w, dst_h, dst_w * dst_h * 8)
+            }
+        };
+        if dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        let key = source_slab_key(cog_id, ifd_idx, band0, src);
+        let warm_slab = self.slab_cache.get(&key);
+        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
+        let decision = self.policy.decide(&DispatchRequest {
+            op: GpuOp::DemTerrainRgbCubic,
+            dst_pixels: dst_w * dst_h,
+            upload_bytes,
+            readback_bytes: dst_w * dst_h * 4,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let dummy_lut = [0u32; 256];
+        let raw = match coords {
+            BboxCoordSource::Separable { u, v } => {
+                let u_local: Vec<f32> = u.iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v.iter().map(|&y| y - br).collect();
+                self.terrain
+                    .lock()
+                    .ok()?
+                    .render_slab(
+                        &slab,
+                        &u_local,
+                        &v_local,
+                        gpu_mode,
+                        gpu_alg,
+                        30.0,
+                        30.0,
+                        0.0,
+                        255.0,
+                        &dummy_lut,
+                        GpuPixelOutput::Rgba8,
+                    )
+                    .ok()?
+            }
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map,
+                v_map,
+            } => {
+                let n = dst_w * dst_h;
+                let u_local: Vec<f32> = u_map[..n].iter().map(|&x| x - bc).collect();
+                let v_local: Vec<f32> = v_map[..n].iter().map(|&y| y - br).collect();
+                self.terrain
+                    .lock()
+                    .ok()?
+                    .render_slab_with_plan(
+                        &slab,
+                        GpuCoordPlan::Exact2D {
+                            dst_w,
+                            dst_h,
+                            u: &u_local,
+                            v: &v_local,
+                        },
+                        gpu_mode,
+                        gpu_alg,
+                        30.0,
+                        30.0,
+                        0.0,
+                        255.0,
+                        &dummy_lut,
+                        GpuPixelOutput::Rgba8,
+                    )
+                    .ok()?
+            }
+        };
+
+        Some(if format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, format, return_mask)
         })
     }
 
@@ -1007,6 +1302,211 @@ impl GpuBackend {
             encode_rgba_tile(&raw, N as u32, false, style.format)
         })
     }
+
+    /// Attempt GPU-accelerated multi-band `ExprProgram` rendering for arbitrary `(u_coords, v_coords)`
+    /// separable crops (`/cog/preview`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_expr(
+        &self,
+        u_coords: &[f32],
+        v_coords: &[f32],
+        srcs: &[BandSource<'_>],
+        prog: &ExprProgram,
+        style: &SingleBandStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(style.resample)?;
+        let dst_w = u_coords.len();
+        let dst_h = v_coords.len();
+        if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
+            return None;
+        }
+        let instrs = Self::compile_expr_to_gpu(prog)?;
+        let out_kind = match style.format {
+            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
+            OutputFormat::Png
+            | OutputFormat::Webp { .. }
+            | OutputFormat::Jpeg { .. }
+            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
+            _ => return None,
+        };
+        let upload_bytes: usize = srcs
+            .iter()
+            .map(|s| Self::estimate_upload_bytes(&None, s))
+            .sum();
+        let readback_bytes = match out_kind {
+            GpuPixelOutput::IndexedU8 => dst_w * dst_h,
+            GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
+        };
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: dst_w * dst_h,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(srcs.len());
+        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+        for src in srcs {
+            let (buf, bc, br, w, h) = stitch_band_source(src)?;
+            if let Some(g) = common_geom {
+                if g != (bc, br, w, h) {
+                    return None;
+                }
+            } else {
+                common_geom = Some((bc, br, w, h));
+            }
+            stitched_vecs.push(buf);
+        }
+        let (base_col, base_row, w, h) = common_geom?;
+        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let u_local: Vec<f32> = u_coords.iter().map(|&x| x - bc).collect();
+        let v_local: Vec<f32> = v_coords.iter().map(|&y| y - br).collect();
+
+        let lut = style.colormap.lut();
+        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let mut expr_guard = self.expr.lock().ok()?;
+        let multi_slab = expr_guard.upload_bands(&refs, w, h, w).ok()?;
+        let raw = expr_guard
+            .render_expr(
+                &multi_slab,
+                &u_local,
+                &v_local,
+                gpu_mode,
+                &instrs,
+                style.rescale_min,
+                style.rescale_max,
+                &lut_u32,
+                out_kind,
+            )
+            .ok()?;
+        drop(expr_guard);
+
+        Some(match out_kind {
+            GpuPixelOutput::IndexedU8 => {
+                encode_indexed_u8_png(&raw, dst_w as u32, dst_h as u32, lut)
+            }
+            GpuPixelOutput::Rgba8 => {
+                if style.format == OutputFormat::RawRgba {
+                    Bytes::from(raw)
+                } else {
+                    crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+                }
+            }
+        })
+    }
+
+    /// Attempt GPU-accelerated 3-band RGB rendering for arbitrary `(u_coords, v_coords)`
+    /// separable crops (`/cog/preview`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_render_bbox_rgb(
+        &self,
+        u_coords: &[f32],
+        v_coords: &[f32],
+        srcs: &[BandSource<'_>; 3],
+        style: &RgbStyle,
+        return_mask: bool,
+    ) -> Option<Bytes> {
+        let gpu_mode = map_resample(style.resample)?;
+        let dst_w = u_coords.len();
+        let dst_h = v_coords.len();
+        if dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        if !matches!(
+            style.format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) {
+            return None;
+        }
+        let upload_bytes: usize = srcs
+            .iter()
+            .map(|s| Self::estimate_upload_bytes(&None, s))
+            .sum();
+        let readback_bytes = dst_w * dst_h * 4;
+        let op = match gpu_mode {
+            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+            GpuColormapMode::Bilinear => GpuOp::FusedColormapBilinear,
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels: dst_w * dst_h,
+            upload_bytes,
+            readback_bytes,
+            batch_size: 1,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard(&self.in_flight);
+
+        let mut stitched_vecs: Vec<Vec<f32>> = Vec::with_capacity(3);
+        let mut common_geom: Option<(u32, u32, u32, u32)> = None;
+        for src in srcs {
+            let (buf, bc, br, w, h) = stitch_band_source(src)?;
+            if let Some(g) = common_geom {
+                if g != (bc, br, w, h) {
+                    return None;
+                }
+            } else {
+                common_geom = Some((bc, br, w, h));
+            }
+            stitched_vecs.push(buf);
+        }
+        let (base_col, base_row, w, h) = common_geom?;
+        let refs: Vec<&[f32]> = stitched_vecs.iter().map(Vec::as_slice).collect();
+        let bc = base_col as f32;
+        let br = base_row as f32;
+        let u_local: Vec<f32> = u_coords.iter().map(|&x| x - bc).collect();
+        let v_local: Vec<f32> = v_coords.iter().map(|&y| y - br).collect();
+
+        let identity = GpuColorFormula {
+            rgb_lut: None,
+            saturation: None,
+        };
+        let mut expr_guard = self.expr.lock().ok()?;
+        let multi_slab = expr_guard.upload_bands(&refs, w, h, w).ok()?;
+        let raw = expr_guard
+            .render_rgb_formula(
+                &multi_slab,
+                &u_local,
+                &v_local,
+                gpu_mode,
+                style.rescale_min,
+                style.rescale_max,
+                &identity,
+            )
+            .ok()?;
+        drop(expr_guard);
+
+        Some(if style.format == OutputFormat::RawRgba {
+            Bytes::from(raw)
+        } else {
+            crate::titiler::encode_rgba_output(dst_w, dst_h, &raw, style.format, return_mask)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1101,5 +1601,116 @@ mod tests {
         // Unsupported op (median) must cleanly return None for CPU fallback
         let med = ExprProgram::compile("median(b1, b2, b3)").unwrap();
         assert!(GpuBackend::compile_expr_to_gpu(&med).is_none());
+    }
+
+    #[test]
+    fn bbox_exact2d_masked_single_and_dem_match_cpu() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU bbox Exact2D test (no adapter)");
+            return;
+        };
+
+        let w = 256u32;
+        let h = 256u32;
+        let mut vals = vec![0u16; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                vals[(y * w + x) as usize] = (100.0
+                    + 50.0 * (x as f32 * 0.04).sin()
+                    + 40.0 * (y as f32 * 0.05).cos()) as u16;
+            }
+        }
+        let b0 = DecodedBand {
+            width: w,
+            height: h,
+            data: BandData::U16 {
+                data: vals.into_boxed_slice(),
+                nodata: None,
+            },
+            stats: BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 0.0,
+                max: 200.0,
+            },
+        };
+        let blocks = [Some(&b0)];
+        let src = BandSource::new(w, h, w, h, 0, 0, 1, 1, &blocks);
+
+        // Non-square 640x480 curved Exact2D map with a circular polygon mask (outside = NaN)
+        let dst_w = 640usize;
+        let dst_h = 480usize;
+        let mut u_map = vec![f32::NAN; dst_w * dst_h];
+        let mut v_map = vec![f32::NAN; dst_w * dst_h];
+        let cx = dst_w as f32 * 0.5;
+        let cy = dst_h as f32 * 0.5;
+        for py in 0..dst_h {
+            for px in 0..dst_w {
+                let dx = (px as f32 - cx) / cx;
+                let dy = (py as f32 - cy) / cy;
+                if dx * dx + dy * dy <= 0.85 {
+                    let u = 8.0 + (px as f32 / dst_w as f32) * 238.0 + 3.0 * dy.sin();
+                    let v = 8.0 + (py as f32 / dst_h as f32) * 238.0 + 3.0 * dx.cos();
+                    u_map[py * dst_w + px] = u;
+                    v_map[py * dst_w + px] = v;
+                }
+            }
+        }
+
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 200.0,
+            colormap: ColormapName::Viridis,
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        if let Some(rgba) = gpu.try_render_bbox_single_band(
+            777,
+            0,
+            0,
+            BboxCoordSource::Exact2D {
+                dst_w,
+                dst_h,
+                u_map: &u_map,
+                v_map: &v_map,
+            },
+            &src,
+            &style,
+            true,
+        ) {
+            assert_eq!(rgba.len(), dst_w * dst_h * 4);
+            let lut = ColormapName::Viridis.lut();
+            let inv255 = 255.0 / 200.0;
+            let mut checked_inside = 0usize;
+            let mut checked_outside = 0usize;
+            let mut max_diff = 0i32;
+            for py in (0..dst_h).step_by(11) {
+                for px in (0..dst_w).step_by(11) {
+                    let i = py * dst_w + px;
+                    let off = i * 4;
+                    if u_map[i].is_nan() {
+                        assert_eq!(rgba[off + 3], 0, "masked outside pixel must be transparent");
+                        checked_outside += 1;
+                    } else {
+                        assert_eq!(rgba[off + 3], 255);
+                        let v = cogzilla_kernel::sample_general_scaled(
+                            &src,
+                            u_map[i],
+                            v_map[i],
+                            1.0,
+                            1.0,
+                            ResampleMode::Lanczos,
+                        );
+                        let ci = (v * inv255).clamp(0.0, 255.0) as usize;
+                        for ch in 0..3 {
+                            max_diff = max_diff.max((lut.rgb[ci][ch] as i32 - rgba[off + ch] as i32).abs());
+                        }
+                        checked_inside += 1;
+                    }
+                }
+            }
+            assert!(checked_inside > 100 && checked_outside > 50);
+            assert!(max_diff <= 4, "Exact2D masked bbox max channel diff {max_diff} > 4");
+        }
     }
 }

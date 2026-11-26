@@ -5740,6 +5740,11 @@ async fn render_bbox_impl(
     } else {
         None
     };
+    #[cfg(feature = "gpu")]
+    let gpu_ctx = engine
+        .gpu
+        .as_ref()
+        .map(|g| (Arc::clone(g), Arc::clone(&engine.stats), primary.id));
     let render_cpu = move |u_map: Vec<f32>,
                            v_map: Vec<f32>,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
@@ -6243,6 +6248,157 @@ async fn render_bbox_impl(
                 default_cmap.lut().rgba_u32[idx].to_le_bytes()
             }
         };
+
+        #[cfg(feature = "gpu")]
+        if custom_lut.is_none()
+            && color_formula.is_none()
+            && matches!(
+                format,
+                OutputFormat::Png
+                    | OutputFormat::Webp { .. }
+                    | OutputFormat::Jpeg { .. }
+                    | OutputFormat::RawRgba
+            )
+            && let Some((ref gpu, ref stats, primary_id)) = gpu_ctx
+        {
+            let v_rows: Vec<f32> = if native_preview {
+                (0..h).map(|py| v_map[py * w]).collect()
+            } else {
+                Vec::new()
+            };
+            let coords = if native_preview {
+                crate::gpu_backend::BboxCoordSource::Separable {
+                    u: &u_map[..w],
+                    v: &v_rows,
+                }
+            } else {
+                crate::gpu_backend::BboxCoordSource::Exact2D {
+                    dst_w: w,
+                    dst_h: h,
+                    u_map: &u_map,
+                    v_map: &v_map,
+                }
+            };
+            let gpu_out: Option<Bytes> = match bands {
+                BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    colormap,
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_single_band(
+                        primary_id,
+                        ifd_idx,
+                        band_1based.saturating_sub(1),
+                        coords,
+                        &src,
+                        &style,
+                        return_mask,
+                    )
+                }
+                BandRequest::Dem {
+                    band_1based,
+                    algorithm,
+                    rescale,
+                    colormap,
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                    let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
+                    let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_dem(
+                        primary_id,
+                        ifd_idx,
+                        band_1based.saturating_sub(1),
+                        coords,
+                        &src,
+                        *algorithm,
+                        dx_m,
+                        dy_m,
+                        &style,
+                        return_mask,
+                    )
+                }
+                BandRequest::Terrain {
+                    band_1based,
+                    encoding,
+                } => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    gpu.try_render_bbox_terrain(
+                        primary_id,
+                        ifd_idx,
+                        band_1based.saturating_sub(1),
+                        coords,
+                        &src,
+                        *encoding,
+                        resample,
+                        format,
+                        return_mask,
+                    )
+                }
+                BandRequest::CustomExpr {
+                    prog,
+                    rescale,
+                    colormap,
+                } if native_preview => {
+                    let ref_vecs: Vec<_> = prog
+                        .used_bands
+                        .iter()
+                        .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                        .collect();
+                    let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_expr(&u_map[..w], &v_rows, &srcs, prog, &style, return_mask)
+                }
+                BandRequest::Rgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } if native_preview => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let r2 = get_band_refs(bands_1based[2], 2);
+                    let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                    let style = cogzilla_kernel::RgbStyle {
+                        rescale_min: *rescale_min,
+                        rescale_max: *rescale_max,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_rgb(&u_map[..w], &v_rows, &srcs, &style, return_mask)
+                }
+                _ => None,
+            };
+            if let Some(bytes) = gpu_out {
+                stats
+                    .gpu_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return bytes;
+            }
+        }
 
         let mut rgba = vec![0u8; w * h * 4];
         match bands {
