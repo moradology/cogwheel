@@ -537,6 +537,13 @@ def main() -> int:
                 f"/searches/{sid}/feature/128x128.npy?assets=red&dst_crs=epsg:3857&resampling=bilinear&reproject=bilinear", "POST", smoothed_shape)
         o.check("statistics on a grid in metres, average", "status",
                 f"/searches/{sid}/statistics?assets=red&dst_crs=epsg:3857&resampling=average&reproject=average&max_size=128", "POST", smoothed_shape)
+        # An item whose footprint meets the window and whose raster adds no pixel to it.
+        # (Its values at this zoom are as far from the reference's as the tile engine's are:
+        # the kernel's width, a known difference. That it is drawn is what is checked.)
+        o.check("tile, bilinear, a nodata, a raster that misses it", "status",
+                f"/searches/{sid}/tiles/WebMercatorQuad/8/132/92.npy?assets=red&resampling=bilinear&reproject=bilinear&nodata=0")
+        o.check("bbox drawn in metres, bilinear, a raster that misses it", "image",
+                f"/searches/{sid}/bbox/7.0,45.0,9.0,46.5/400x300.npy?assets=red&dst_crs=epsg:3857&resampling=bilinear&reproject=bilinear")
         o.check("bbox, bilinear, a nodata of the request's own", "image",
                 f"/searches/{sid}/bbox/8.2,45.5,8.9,46.0/128x128.npy?assets=red&resampling=bilinear&reproject=bilinear&nodata=400")
         o.check("bbox, average, a nodata of the request's own", "image",

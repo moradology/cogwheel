@@ -2167,8 +2167,12 @@ impl Window {
                                 wanted.len()
                             )));
                         }
-                        let planes =
-                            resampled_planes(engine, &cog, [w, s, e, n], true, (side, side), &wanted, resample, request.unscale, nodata).await?;
+                        let planes = match resampled_planes(engine, &cog, [w, s, e, n], true, (side, side), &wanted, resample, request.unscale, nodata).await {
+                            Ok(planes) => planes,
+                            // The item's footprint meets the tile but this raster does not.
+                            Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; side * side]; wanted.len()],
+                            Err(e) => return Err(e),
+                        };
                         return Ok((in_raster_type(planes, full.sample_type, request.unscale), full.sample_type));
                     }
                     let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject).await?;
@@ -2229,8 +2233,12 @@ impl Window {
             let out = (width as usize, height as usize);
             let mut planes: Vec<Vec<f32>> = if resample != ResampleMode::Nearest {
                 // Smoothed on a grid in metres: the box renderer, and the shape burned below.
-                let planes = resampled_planes(engine, &cog, bbox, true, out, &wanted, resample, unscale, nodata).await?;
-                in_raster_type(planes, sample_type, unscale)
+                match resampled_planes(engine, &cog, bbox, true, out, &wanted, resample, unscale, nodata).await {
+                    Ok(planes) => in_raster_type(planes, sample_type, unscale),
+                    // The item's footprint meets the box but this raster does not.
+                    Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; out.0 * out.1]; wanted.len()],
+                    Err(e) => return Err(e),
+                }
             } else {
             let crs = engine.get_or_build_crs(&cog)?;
             let res = if mercator { mercator_resolution(&crs, &cog) } else { wgs84_resolution(&crs, &cog) }
@@ -5126,7 +5134,7 @@ async fn tile(
             }
             // The renderer draws tiles of 256 and 512 pixels: one of another size is read
             // as planes whatever its resampling, where planes can make it.
-            let odd_size = !matches!(dim, 256 | 512) && planes_can && !raw;
+            let odd_size = !matches!(dim, 256 | 512) && planes_can && !raw && full.extra_samples.is_empty();
             if planes_wanted || !one_grid || preferred || odd_size {
                 if pq.algorithm.is_some() {
                     return Err(EngineError::BadRequest(
