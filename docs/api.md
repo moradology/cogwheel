@@ -123,7 +123,7 @@ Known differences from titiler-pgstac on these routes, inherited from the shared
 Each of these is answered with a `400` or `404` rather than a different picture:
 
 - On mosaic `statistics`: `algorithm`, and `coord_crs` and `dst_crs` other than `epsg:4326`. With `resampling` or `reproject` other than nearest the shared renderer does the reading, and the numbers are then close to TiTiler's rather than equal.
-- Functions other than the common numeric ones (`where` in particular) in `point` and `statistics` expressions, and on the `bbox` and `feature` routes `coord_crs` and `dst_crs` other than `epsg:4326` and `epsg:3857`, `epsg:3857` with a resampling other than nearest or for the coordinates of a posted shape, the `npy` format and images larger than 4096 pixels on a side.
+- Functions other than the common numeric ones (`where` in particular) in `point` and `statistics` expressions, and on the `bbox` and `feature` routes `coord_crs` and `dst_crs` other than `epsg:4326` and `epsg:3857`, the `npy` format and images larger than 4096 pixels on a side.
 - With `resampling` or `reproject` other than nearest, a `bbox` or `feature` image is drawn by the shared bbox renderer: close to TiTiler's rather than equal, and at the data's own resolution a pixel is left empty when any band is zero in a source whose nodata is zero, where TiTiler does so only when every band is.
 - In WMTS documents, the twelve tile matrix sets other than `WebMercatorQuad`, and the `tif`, `tiff`, `jp2` and `pngraw` tile formats.
 - In CQL2 text filters: WKT coordinates written with an exponent, and the handful of malformed geometries and calls titiler-pgstac's converter lets through as function calls (pgSTAC then rejects them with a `500`; here they are a `422`).
@@ -132,7 +132,7 @@ Each of these is answered with a `400` or `404` rather than a different picture:
 - In the tileset list, the twelve tile matrix sets other than `WebMercatorQuad` that titiler-pgstac also lists.
 - A tile or image of one or two bands out of a three-band raster reads other pixels than TiTiler, on purpose: GDAL warps a partial band selection in blocks through its overview grid, so that a band on its own is not the band it is in the whole raster (43% of pixels differ on the reference data). Here a band is the same band however it is asked for. `statistics` still follows GDAL there, to give TiTiler's numbers. Bad band indexes and `asset_as_band` on a multi-band asset are a `400` where TiTiler answers `500`.
 - On tiles and images made from planes (see above): `algorithm`, raw array formats, and four bands as JPEG, which TiTiler sends as CMYK. Any `pixel_selection` other than `first` with a terrain encoding or a raw array format.
-- `nodata` with a resampling other than nearest; `buffer` with one, with `algorithm`, or on anything but a tile; bare arrays (`.bin`) of a box or a feature.
+- `buffer` with a resampling other than nearest, with `algorithm`, or on anything but a tile; bare arrays (`.bin`) of a box or a feature.
 - Tile matrix sets other than `WebMercatorQuad`.
 
 ## Notes on TiTiler Compatibility

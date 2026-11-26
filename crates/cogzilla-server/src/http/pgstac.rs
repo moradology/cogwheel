@@ -2147,22 +2147,33 @@ impl Window {
         pool: bool,
         nodata: Option<f32>,
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
-        // Only the reader of nearest pixels takes a `nodata` of the request's own.
-        let nearest_only = || EngineError::BadRequest("`nodata` is read with nearest-neighbour resampling only".into());
         let (bbox, mercator, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
                 let cog = engine.store.open_uri(href).await?;
                 let crs = engine.get_or_build_crs(&cog)?;
                 let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
                 let Some(res) = mercator_resolution(&crs, &cog).filter(|_| resample == ResampleMode::Nearest) else {
-                    if nodata.is_some() {
-                        return Err(nearest_only());
-                    }
-                    if !matches!(request.tile_size, 256 | 512) {
-                        return Err(EngineError::BadRequest(format!(
-                            "tilesize={} is drawn with nearest-neighbour resampling only; use 256 or 512 otherwise",
-                            request.tile_size
-                        )));
+                    // The tile engine reads the raster's own `nodata` and tiles of 256 and
+                    // 512; a `nodata` of the request's, or another size, is read as a box
+                    // over the tile's bounds is.
+                    if nodata.is_some() || !matches!(request.tile_size, 256 | 512) {
+                        let full = cog.index.full_res();
+                        let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
+                        let (w, s, e, n) = tile_bounds_3857(request.tile);
+                        let side = request.tile_size as usize;
+                        if wanted.len() * side * side > max_values {
+                            return Err(EngineError::BadRequest(format!(
+                                "{} bands of an asset are too many to hold for a tile; choose fewer with `bidx`",
+                                wanted.len()
+                            )));
+                        }
+                        let planes = match resampled_planes(engine, &cog, [w, s, e, n], true, (side, side), &wanted, resample, request.unscale, nodata).await {
+                            Ok(planes) => planes,
+                            // The item's footprint meets the tile but this raster does not.
+                            Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; side * side]; wanted.len()],
+                            Err(e) => return Err(e),
+                        };
+                        return Ok((in_raster_type(planes, full.sample_type, request.unscale), full.sample_type));
                     }
                     let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject).await?;
                     return Ok((in_raster_type(planes, sample_type, request.unscale), sample_type));
@@ -2215,13 +2226,20 @@ impl Window {
             CrsModel::Epsg3857 if mercator => resampling,
             _ => reproject,
         };
-        if mercator && resample != ResampleMode::Nearest {
-            return Err(EngineError::BadRequest("a picture in Web Mercator is read with nearest-neighbour resampling only".into()));
-        }
-        if resample == ResampleMode::Nearest {
+        if resample == ResampleMode::Nearest || mercator {
             // As rio-tiler does: the raster is read at the size its own resolution gives
             // for what was asked, the way GDAL's warp reads it, and brought to the
             // picture's size afterwards.
+            let out = (width as usize, height as usize);
+            let mut planes: Vec<Vec<f32>> = if resample != ResampleMode::Nearest {
+                // Smoothed on a grid in metres: the box renderer, and the shape burned below.
+                match resampled_planes(engine, &cog, bbox, true, out, &wanted, resample, unscale, nodata).await {
+                    Ok(planes) => in_raster_type(planes, sample_type, unscale),
+                    // The item's footprint meets the box but this raster does not.
+                    Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; out.0 * out.1]; wanted.len()],
+                    Err(e) => return Err(e),
+                }
+            } else {
             let crs = engine.get_or_build_crs(&cog)?;
             let res = if mercator { mercator_resolution(&crs, &cog) } else { wgs84_resolution(&crs, &cog) }
                 .ok_or_else(|| EngineError::BadRequest("cannot place an asset in WGS84".into()))?;
@@ -2248,7 +2266,6 @@ impl Window {
                 Err(EngineError::NotFound(_)) => vec![vec![f32::NAN; own.0 * own.1]; all],
                 Err(e) => return Err(e),
             };
-            let out = (width as usize, height as usize);
             let mut planes: Vec<Vec<f32>> = Vec::with_capacity(wanted.len());
             for band in &wanted {
                 let plane = read.get(usize::from(*band) - 1).cloned().ok_or_else(|| {
@@ -2256,6 +2273,8 @@ impl Window {
                 })?;
                 planes.push(resize_nearest(plane, own, out));
             }
+            planes
+            };
             if let Some((mask, inside)) = mask {
                 // Worked out once for the picture, and not on the workers that serve requests.
                 let inside = inside
@@ -3311,10 +3330,10 @@ async fn part_image_of(
     }
     let own_geometry = given_in_metres.then(|| bbox_polygon(in_degrees));
     let geometry = searched.or(own_geometry.as_ref()).unwrap_or(geometry);
-    if mercator && !(nearest && planes_can && pq.algorithm.is_none()) {
+    if mercator && !(planes_can && pq.algorithm.is_none()) {
         return detail(
             StatusCode::BAD_REQUEST,
-            "dst_crs 'epsg:3857' is drawn with nearest-neighbour resampling only, and not with `algorithm` or band math only the renderer reads",
+            "dst_crs 'epsg:3857' is not drawn with `algorithm`, or with band math only the renderer reads",
         );
     }
     // The extension in the path, then `format=`; with neither, the pixels decide.
@@ -4177,38 +4196,30 @@ async fn warp_nearest(
 /// Every band of one raster on a WGS84 grid through the shared renderer, for the
 /// resampling methods other than nearest neighbour.
 async fn resampled_planes(
-    engine: &Arc<TileEngine>,
+    engine: &TileEngine,
     cog: &Arc<cogzilla_io::OpenedCog>,
     bounds: [f64; 4],
+    mercator: bool,
     (width, height): (usize, usize),
+    bands: &[u16],
     resample: ResampleMode,
     unscale: bool,
     nodata: Option<f32>,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
-    let mut planes = Vec::new();
-    for band in 1..=cog.index.full_res().samples_per_pixel {
+    let mut planes = Vec::with_capacity(bands.len());
+    let cogs = std::slice::from_ref(cog);
+    let (w, h) = (width as u32, height as u32);
+    for band in bands {
         let one = BandRequest::Single {
-            band_1based: band,
+            band_1based: *band,
             rescale: (0.0, 1.0),
             colormap: ColormapName::Grayscale,
         };
-        let raw = render_wgs84_bbox(
-            engine,
-            std::slice::from_ref(cog),
-            bounds,
-            width as u32,
-            height as u32,
-            None,
-            &one,
-            resample,
-            OutputFormat::RawF32,
-            nodata,
-            None,
-            None,
-            false,
-            unscale,
-        )
-        .await?;
+        let raw = if mercator {
+            crate::titiler::render_mercator_bbox(engine, cogs, bounds, w, h, &one, resample, OutputFormat::RawF32, nodata, None, None, false, unscale).await?
+        } else {
+            render_wgs84_bbox(engine, cogs, bounds, w, h, None, &one, resample, OutputFormat::RawF32, nodata, None, None, false, unscale).await?
+        };
         if raw.len() != width * height * 4 {
             return Err(EngineError::BadRequest("unexpected array size from the renderer".into()));
         }
@@ -4435,9 +4446,6 @@ async fn feature_statistics(
                     CrsModel::Epsg3857 if mercator => req.query.resampling,
                     _ => req.query.reproject,
                 };
-                if mercator && resample != ResampleMode::Nearest {
-                    return Err(EngineError::BadRequest("statistics in Web Mercator are read with nearest-neighbour resampling only".into()));
-                }
                 // GDAL takes another road when only some of a raster's bands are read.
                 let all = usize::from(cog.index.full_res().samples_per_pixel);
                 let path = match &asset.indexes {
@@ -4447,7 +4455,8 @@ async fn feature_statistics(
                 let read = if resample == ResampleMode::Nearest {
                     warp_nearest(engine, cog, &crs, own_bounds, mercator, size, native, path, req.unscale, true, &[], false, req.nodata).await
                 } else {
-                    resampled_planes(engine, cog, own_bounds, size, resample, req.unscale, req.nodata)
+                    let every: Vec<u16> = (1..=cog.index.full_res().samples_per_pixel).collect();
+                    resampled_planes(engine, cog, own_bounds, mercator, size, &every, resample, req.unscale, req.nodata)
                         .await
                         .map(|planes| in_raster_type(planes, cog.index.full_res().sample_type, req.unscale))
                 };
@@ -5007,10 +5016,9 @@ async fn tile(
     // So is a `nodata` of the request's own: the renderer on this road reads the raster's.
     let nodata = pq.nodata;
     let planes_wanted = wants_planes(&pq, &query) || custom.is_some() || nodata.is_some();
-    let planes_preferred = planes_read_all(&pq, &query)
-        && query.resampling == ResampleMode::Nearest
-        && query.reproject == ResampleMode::Nearest
-        && pq.algorithm.is_none();
+    let planes_can = planes_read_all(&pq, &query) && pq.algorithm.is_none();
+    let planes_preferred =
+        planes_can && query.resampling == ResampleMode::Nearest && query.reproject == ResampleMode::Nearest;
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
     let names = if planes_wanted { expression_names(&pq, &query) } else { renderer_assets(&mut pq, &query) };
@@ -5124,7 +5132,10 @@ async fn tile(
                     spec.indexes = Some((1..=full.samples_per_pixel).collect());
                 }
             }
-            if planes_wanted || !one_grid || preferred {
+            // The renderer draws tiles of 256 and 512 pixels: one of another size is read
+            // as planes whatever its resampling, where planes can make it.
+            let odd_size = !matches!(dim, 256 | 512) && planes_can && !raw && full.extra_samples.is_empty();
+            if planes_wanted || !one_grid || preferred || odd_size {
                 if pq.algorithm.is_some() {
                     return Err(EngineError::BadRequest(
                         "`algorithm` is not supported with these assets and options yet".into(),
@@ -5231,7 +5242,7 @@ async fn tile(
             // planes, which is where a request with nearest-neighbour pixels has gone.
             if treq.tile_size != 256 && treq.tile_size != 512 {
                 return Err(EngineError::BadRequest(format!(
-                    "tilesize={} is drawn with nearest-neighbour resampling, without `algorithm`, as a picture, and of rasters without an alpha band; use 256 or 512 otherwise",
+                    "tilesize={} is drawn without `algorithm`, as a picture or `.npy`, and with band math planes can read; use 256 or 512 otherwise",
                     treq.tile_size
                 )));
             }

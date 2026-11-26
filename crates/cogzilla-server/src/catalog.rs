@@ -494,6 +494,14 @@ impl MosaicJsonCatalog {
         })
     }
 
+    pub fn first_asset(&self) -> Option<&str> {
+        self.tiles
+            .values()
+            .flat_map(|v| v.iter())
+            .next()
+            .map(String::as_str)
+    }
+
     pub fn info_json(&self) -> serde_json::Value {
         let mut quadkeys: Vec<&String> = self.tiles.keys().collect();
         quadkeys.sort();

@@ -138,6 +138,9 @@ pub enum SourceFreshness {
         opened_at: std::time::Instant,
         last_checked_ms: AtomicU64,
     },
+    /// Cloud object store (`s3://`, `gs://`, `az://`, `abfs(s)://`): cached without 5s TTL
+    /// thrashing (clearable via `/admin/clear-cache` or LRU eviction).
+    Cloud,
 }
 
 pub struct OpenedCog {
@@ -152,7 +155,27 @@ impl OpenedCog {
     pub fn remote_validator(&self) -> Option<&crate::backend::RemoteValidator> {
         match &self.freshness {
             SourceFreshness::Remote { validator, .. } => Some(validator),
+            SourceFreshness::Local { .. } | SourceFreshness::Cloud => None,
+        }
+    }
+
+    /// Key for tier-2 `DiskBlockCache`: incorporates the HTTP `ETag`/`Last-Modified` validator
+    /// when present so replaced remote objects never serve stale disk-cached blocks; returns
+    /// `None` for local files.
+    pub fn disk_cache_uri(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match &self.freshness {
             SourceFreshness::Local { .. } => None,
+            SourceFreshness::Cloud => Some(std::borrow::Cow::Borrowed(self.uri.as_str())),
+            SourceFreshness::Remote { validator, .. } => {
+                match validator
+                    .etag
+                    .as_deref()
+                    .or(validator.last_modified.as_deref())
+                {
+                    Some(tag) => Some(std::borrow::Cow::Owned(format!("{}#v={tag}", self.uri))),
+                    None => Some(std::borrow::Cow::Borrowed(self.uri.as_str())),
+                }
+            }
         }
     }
 }
@@ -625,6 +648,7 @@ impl CogStore {
                     Ok(false)
                 }
             }
+            SourceFreshness::Cloud => Ok(true),
         }
     }
 
@@ -876,10 +900,14 @@ impl CogStore {
                                 Err(e) => return Err(IoError::Tiff(e)),
                             }
                         };
-                        let fresh = SourceFreshness::Remote {
-                            validator,
-                            opened_at: std::time::Instant::now(),
-                            last_checked_ms: AtomicU64::new(0),
+                        let fresh = if matches!(source, CogSource::RemoteHttp { .. }) {
+                            SourceFreshness::Remote {
+                                validator,
+                                opened_at: std::time::Instant::now(),
+                                last_checked_ms: AtomicU64::new(0),
+                            }
+                        } else {
+                            SourceFreshness::Cloud
                         };
                         (idx, fresh)
                     }
@@ -953,7 +981,11 @@ impl CogStore {
                 out.push(None);
                 continue;
             };
-            let count = ifd.tile_byte_counts[tile_idx as usize];
+            let count = ifd
+                .tile_byte_counts
+                .get(tile_idx as usize)
+                .copied()
+                .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if count == 0 {
                 out.push(None);
                 continue;
@@ -968,7 +1000,11 @@ impl CogStore {
                 continue;
             }
 
-            let offset = ifd.tile_offsets[tile_idx as usize];
+            let offset = ifd
+                .tile_offsets
+                .get(tile_idx as usize)
+                .copied()
+                .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if cog.source.local_slice(offset, count).is_some() {
                 // If >= 2 local blocks missed, hand off to `get_blocks` so they decode in parallel!
                 if single_local_miss.is_some() {
@@ -1167,7 +1203,11 @@ impl CogStore {
 
         for (slot, &opt_idx) in tile_indices.iter().enumerate() {
             let Some(tile_idx) = opt_idx else { continue };
-            let count = ifd.tile_byte_counts[tile_idx as usize];
+            let count = ifd
+                .tile_byte_counts
+                .get(tile_idx as usize)
+                .copied()
+                .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if count == 0 {
                 continue;
             }
@@ -1184,7 +1224,13 @@ impl CogStore {
                     results[slot] = Some(tile);
                 }
                 LookupResult::Owner => {
-                    let offset = ifd.tile_offsets[tile_idx as usize];
+                    let offset = ifd
+                        .tile_offsets
+                        .get(tile_idx as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            IoError::Tiff(TiffError::Corrupt("tile index out of bounds"))
+                        })?;
                     seen_owned.insert(tile_idx, slot);
                     owned.push((slot, Some(self.cache.guard(key)), offset, count));
                 }
@@ -1467,20 +1513,22 @@ impl CogStore {
             } else {
                 // Tier-2 compressed-block disk cache lookup for remote sources (RAM miss -> disk hit).
                 // Synchronously probe the in-memory index first so 100% cold misses do 0 JoinSet/spawn_blocking hops!
-                if no_sidecar_mask {
-                    if let Some(dc) = &self.disk_cache {
-                        let prev_owned = std::mem::take(&mut owned);
-                        let mut disk_candidates = Vec::new();
-                        for item in prev_owned {
-                            let tidx = tile_indices[item.0].unwrap();
-                            if let Some((key, path)) =
-                                dc.lookup_path(&cog.uri, ifd_idx as u16, tidx)
-                            {
-                                disk_candidates.push((item, key, path));
-                            } else {
-                                owned.push(item);
-                            }
+                if no_sidecar_mask
+                    && let Some(dc) = &self.disk_cache
+                    && let Some(dc_uri) = cog.disk_cache_uri()
+                {
+                    let prev_owned = std::mem::take(&mut owned);
+                    let mut disk_candidates = Vec::new();
+                    for item in prev_owned {
+                        let tidx = tile_indices[item.0].unwrap();
+                        if let Some((key, path)) =
+                            dc.lookup_path(&dc_uri, ifd_idx as u16, tidx)
+                        {
+                            disk_candidates.push((item, key, path));
+                        } else {
+                            owned.push(item);
                         }
+                    }
 
                         if !disk_candidates.is_empty() {
                             let meta = Arc::new(clone_for_decode(ifd));
@@ -1573,7 +1621,6 @@ impl CogStore {
                                 }
                             }
                         }
-                    }
                 }
 
                 if !owned.is_empty() {
@@ -1701,11 +1748,12 @@ impl CogStore {
                                         }
                                         let slice = data.slice(rel_start..rel_end);
                                         let disk_put = self.disk_cache.as_ref().and_then(|dc| {
+                                            let dc_uri = cog.disk_cache_uri()?.into_owned();
                                             tile_indices
                                                 .get(orig_slot)
                                                 .and_then(|o| *o)
                                                 .map(|tidx| {
-                                                    (dc.clone(), cog.uri.clone(), ifd_idx as u16, tidx)
+                                                    (dc.clone(), dc_uri, ifd_idx as u16, tidx)
                                                 })
                                         });
                                         let rows = tile_indices[orig_slot]
@@ -1989,19 +2037,18 @@ impl CogStore {
                                             rows,
                                         ) {
                                             Ok(mut decoded) => {
-                                                if no_sidecar_mask {
-                                                    if let Some(dc) = &self.disk_cache {
-                                                        if let Some(Some(tidx)) =
-                                                            tile_indices.get(*orig_slot)
-                                                        {
-                                                            dc.put_async(
-                                                                &cog.uri,
-                                                                ifd_idx as u16,
-                                                                *tidx,
-                                                                data.slice(rel_start..rel_end),
-                                                            );
-                                                        }
-                                                    }
+                                                if no_sidecar_mask
+                                                    && let Some(dc) = &self.disk_cache
+                                                    && let Some(dc_uri) = cog.disk_cache_uri()
+                                                    && let Some(Some(tidx)) =
+                                                        tile_indices.get(*orig_slot)
+                                                {
+                                                    dc.put_async(
+                                                        &dc_uri,
+                                                        ifd_idx as u16,
+                                                        *tidx,
+                                                        data.slice(rel_start..rel_end),
+                                                    );
                                                 }
                                                 if sparse_transparent_by_slot[idx_in_span] {
                                                     mark_tile_all_nodata(&mut decoded);
@@ -2209,17 +2256,15 @@ impl CogStore {
                 "raw passthrough tile exceeds 16 MiB limit",
             )));
         }
-        let is_local = matches!(cog.source, CogSource::LocalMmap { .. });
         let want = byte_len as usize;
-        if !is_local {
-            if let Some(dc) = &self.disk_cache {
-                if let Some(cached) = dc.get(&cog.uri, ifd_idx as u16, tile_idx).await {
-                    if cached.len() == want {
-                        return Ok(cached);
-                    }
-                    let key = DiskBlockCache::key_bytes(&cog.uri, ifd_idx as u16, tile_idx);
-                    dc.invalidate(key);
+        let dc_uri = cog.disk_cache_uri();
+        if let (Some(dc), Some(dcu)) = (&self.disk_cache, &dc_uri) {
+            if let Some(cached) = dc.get(dcu, ifd_idx as u16, tile_idx).await {
+                if cached.len() == want {
+                    return Ok(cached);
                 }
+                let key = DiskBlockCache::key_bytes(dcu, ifd_idx as u16, tile_idx);
+                dc.invalidate(key);
             }
         }
         let end = offset.checked_add(byte_len as u64).ok_or_else(|| {
@@ -2240,13 +2285,11 @@ impl CogStore {
         } else {
             raw
         };
-        if !is_local {
-            if let Some(dc) = &self.disk_cache {
-                let valid_passthrough_magic = (raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8)
-                    || (raw.len() >= 12 && &raw[0..4] == b"RIFF" && &raw[8..12] == b"WEBP");
-                if valid_passthrough_magic {
-                    dc.put_async(&cog.uri, ifd_idx as u16, tile_idx, raw.clone());
-                }
+        if let (Some(dc), Some(dcu)) = (&self.disk_cache, &dc_uri) {
+            let valid_passthrough_magic = (raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8)
+                || (raw.len() >= 12 && &raw[0..4] == b"RIFF" && &raw[8..12] == b"WEBP");
+            if valid_passthrough_magic {
+                dc.put_async(dcu, ifd_idx as u16, tile_idx, raw.clone());
             }
         }
         Ok(raw)

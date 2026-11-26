@@ -310,7 +310,7 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         ("bbox/6,80,8,88.png?assets=visual&dst_crs=epsg:3857", 400),
         ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:32632", 400),
         ("bbox/6,44,8,46.png?assets=visual&coord_crs=epsg:32632", 400),
-        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:3857&resampling=bilinear", 400),
+        ("bbox/6,44,8,46.png?assets=visual&dst_crs=epsg:3857&resampling=bilinear", 204),
         ("bbox/6,44,8,46.bin?assets=visual", 400),
         ("bbox/6,44,8.png?assets=visual", 404),
         ("feature.png?assets=visual", 405),
