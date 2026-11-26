@@ -32,3 +32,7 @@ reqwest.workspace = true
 [[example]]
 name = "server_gpu_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "crop_gpu_bench"
+required-features = ["gpu"]
