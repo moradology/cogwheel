@@ -15,3 +15,4 @@ wgpu = "24"
 cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
 cogzilla-tiff = { path = "../cogzilla-tiff" }
+zune-jpeg.workspace = true
