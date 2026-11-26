@@ -138,8 +138,11 @@ impl ColorFormula {
                     if !contrast.is_finite() || !bias.is_finite() {
                         return Err("sigmoidal contrast and bias must be finite".into());
                     }
+                    if !(0.0..=1.0).contains(&bias) {
+                        return Err("sigmoidal bias must be in [0, 1]".into());
+                    }
                     idx += 4;
-                    if contrast == 0.0 {
+                    if contrast.abs() < 1e-12 {
                         continue;
                     }
                     // color-operations' `sigmoidal`, term for term: positive contrast raises
@@ -427,6 +430,17 @@ mod rio_tests {
             for c in [edge, f64::from_bits(edge.to_bits().saturating_sub(1)), f64::from_bits(edge.to_bits() + 1)] {
                 assert_eq!(lin_to_byte(c), lin_to_byte_exact(c), "byte {k} at {c}");
             }
+        }
+    }
+
+    #[test]
+    fn sigmoidal_rejects_out_of_range_bias_and_keeps_sub_epsilon_contrast_identity() {
+        assert!(ColorFormula::parse("Sigmoidal RGB 10 1.5").is_err());
+        assert!(ColorFormula::parse("Sigmoidal RGB 10 -0.1").is_err());
+        assert!(ColorFormula::parse("Sigmoidal RGB 1000 5").is_err());
+        for expr in ["Sigmoidal RGB 1e-20 0.5", "Sigmoidal RGB -1e-20 0.5"] {
+            let f = ColorFormula::parse(expr).unwrap();
+            assert_eq!(f.apply_rgb(10, 128, 250), (10, 128, 250), "{expr} must be identity");
         }
     }
 }
