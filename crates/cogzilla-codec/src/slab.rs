@@ -34,6 +34,35 @@ fn pool_for_len(len: usize) -> Option<(&'static Mutex<Vec<SendF32Ptr>>, usize)> 
     }
 }
 
+/// Minimum slab size (2 MiB) for requesting Linux Transparent Huge Pages (`MADV_HUGEPAGE`).
+const HUGE_SLAB_BYTES: usize = 2 * 1024 * 1024;
+
+#[inline]
+fn slab_layout(len: usize) -> Layout {
+    let bytes = len * std::mem::size_of::<f32>();
+    // Page-align large slabs (>= 2 MiB) so `madvise(MADV_HUGEPAGE)` on Linux is guaranteed
+    // page-aligned, reducing TLB pressure in multi-GiB block caches.
+    let align = if bytes >= HUGE_SLAB_BYTES { 4096 } else { 64 };
+    Layout::from_size_align(bytes, align).expect("valid aligned f32 layout")
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+unsafe fn advise_hugepage(ptr: *mut f32, bytes: usize) {
+    // MADV_HUGEPAGE = 14 on Linux (x86_64 and aarch64).
+    const MADV_HUGEPAGE: std::ffi::c_int = 14;
+    unsafe extern "C" {
+        fn madvise(
+            addr: *mut std::ffi::c_void,
+            length: usize,
+            advice: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    if bytes >= HUGE_SLAB_BYTES {
+        let _ = unsafe { madvise(ptr as *mut std::ffi::c_void, bytes, MADV_HUGEPAGE) };
+    }
+}
+
 /// 64-byte-aligned heap-allocated contiguous `f32` slab for SIMD-friendly tile storage.
 /// Recycles standard COG block sizes (`256×256`, `512×512`, `1024×1024`) through a bounded
 /// free-list pool to avoid repeated `mmap`/`munmap` zero-page faults under cold-cache churn.
@@ -63,12 +92,15 @@ impl AlignedF32Slab {
                 }
             }
         }
-        let layout = Layout::from_size_align(len * std::mem::size_of::<f32>(), 64)
-            .expect("valid aligned f32 layout");
+        let layout = slab_layout(len);
         // SAFETY: layout size > 0 and align is power of two; zero-initializing ensures
         // subsequent `&[f32]`/`&mut [f32]` slice views are always valid initialized memory.
         let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
         let ptr = NonNull::new(raw).expect("OOM allocating AlignedF32Slab");
+        #[cfg(target_os = "linux")]
+        unsafe {
+            advise_hugepage(raw, layout.size());
+        }
         Self { ptr, len }
     }
 
@@ -133,8 +165,7 @@ impl Drop for AlignedF32Slab {
                     }
                 }
             }
-            let layout = Layout::from_size_align(self.len * std::mem::size_of::<f32>(), 64)
-                .expect("valid aligned f32 layout");
+            let layout = slab_layout(self.len);
             unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
         }
     }
