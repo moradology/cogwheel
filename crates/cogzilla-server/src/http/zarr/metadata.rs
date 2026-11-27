@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use cogzilla_zarr::{
-    ArrayMeta, CfTimeUnits, DataType, OpenMode, ShardingConfig, ZarrError, ZarrGeo, ZarrVersion,
+    ArrayMeta, CfTimeUnits, SampleType, OpenMode, ShardingConfig, ZarrError, ZarrGeo, ZarrVersion,
     parse_sel_params, read_coord_1d, resolve_geo, resolve_sel_indices, select_variable,
 };
 use http_body_util::Full;
@@ -18,21 +18,8 @@ use crate::tms::{TmsDef, lookup_tms};
 
 use super::{ZarrQuery, json_ok, open_store_and_hierarchy};
 
-fn dtype_str(dt: DataType) -> &'static str {
-    match dt {
-        DataType::Bool => "bool",
-        DataType::Int8 => "int8",
-        DataType::Int16 => "int16",
-        DataType::Int32 => "int32",
-        DataType::Int64 => "int64",
-        DataType::UInt8 => "uint8",
-        DataType::UInt16 => "uint16",
-        DataType::UInt32 => "uint32",
-        DataType::UInt64 => "uint64",
-        DataType::Float16 => "float16",
-        DataType::Float32 => "float32",
-        DataType::Float64 => "float64",
-    }
+fn dtype_str(dt: SampleType) -> &'static str {
+    dt.numpy_name()
 }
 
 fn wgs84_bounds_for_geo(geo: &cogzilla_zarr::ZarrGeo, width: u32, height: u32) -> [f64; 4] {

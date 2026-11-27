@@ -113,8 +113,9 @@ impl OutputDtype {
             Self::Fixed(t) => Some(t),
             Self::SameAsInput => Some(read),
             Self::SumWiden => Some(match read {
-                T::Uint1 | T::Uint4 | T::Uint8 | T::Uint16 | T::Uint32 | T::Uint64 => T::Uint64,
+                T::Bool | T::Uint1 | T::Uint4 | T::Uint8 | T::Uint16 | T::Uint32 | T::Uint64 => T::Uint64,
                 T::Int8 | T::Int16 | T::Int32 | T::Int64 => T::Int64,
+                T::Float16 => T::Float32,
                 T::Float32 | T::Float64 => read,
             }),
             Self::MedianWiden => Some(if matches!(read, T::Float32) { T::Float32 } else { T::Float64 }),

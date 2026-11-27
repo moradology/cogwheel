@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::{ArrayMeta, DataType, Endianness, ZarrError, ZarrVersion};
+use crate::{ArrayMeta, SampleType, Endianness, ZarrError, ZarrVersion};
 
 /// Hard upper bound on a single decoded chunk (128 MiB), matching `cogzilla-codec`'s
 /// `MAX_DECODED_TILE_BYTES` to prevent hostile chunk headers from triggering OOM allocations.
@@ -19,7 +19,7 @@ pub const SUPPORTED_CODECS: &str =
 /// Compute the expected uncompressed byte length of one chunk, enforcing `MAX_DECODED_CHUNK_BYTES`.
 pub fn expected_chunk_bytes(
     chunk_shape: &[u64],
-    dtype: DataType,
+    dtype: SampleType,
     chunk_key: &str,
 ) -> Result<usize, ZarrError> {
     let mut elems: u64 = 1;
@@ -31,7 +31,7 @@ pub fn expected_chunk_bytes(
         })?;
     }
     let bytes_u64 = elems
-        .checked_mul(dtype.size() as u64)
+        .checked_mul(dtype.bytes_per_sample() as u64)
         .ok_or(ZarrError::ChunkTooLarge {
             chunk_key: chunk_key.to_string(),
             bytes: usize::MAX,
@@ -106,7 +106,7 @@ pub fn decode_chunk_with_shape(
                     .get("elementsize")
                     .and_then(Value::as_u64)
                     .map(|v| v as usize)
-                    .unwrap_or_else(|| meta.dtype.size());
+                    .unwrap_or_else(|| meta.dtype.bytes_per_sample());
                 buf = unshuffle_bytes(&buf, elem_size, chunk_key)?;
             }
             "bitshuffle" => {
@@ -115,7 +115,7 @@ pub fn decode_chunk_with_shape(
                     .get("elementsize")
                     .and_then(Value::as_u64)
                     .map(|v| v as usize)
-                    .unwrap_or_else(|| meta.dtype.size());
+                    .unwrap_or_else(|| meta.dtype.bytes_per_sample());
                 buf = unbitshuffle_bytes(&buf, elem_size, chunk_key)?;
             }
             "bytes" => {
@@ -132,13 +132,13 @@ pub fn decode_chunk_with_shape(
                     })
                     .unwrap_or(Endianness::Little);
                 ensure_exact_len(&buf, expected, "bytes", chunk_key)?;
-                convert_endian_to_native(&mut buf, meta.dtype.size(), endian);
+                convert_endian_to_native(&mut buf, meta.dtype.bytes_per_sample(), endian);
                 endian_handled = true;
             }
             "transpose" => {
                 ensure_exact_len(&buf, expected, "transpose", chunk_key)?;
                 let order = parse_transpose_order(&codec.configuration, chunk_shape.len(), chunk_key)?;
-                buf = untranspose(&buf, chunk_shape, &order, meta.dtype.size(), chunk_key)?;
+                buf = untranspose(&buf, chunk_shape, &order, meta.dtype.bytes_per_sample(), chunk_key)?;
             }
             other => {
                 return Err(ZarrError::UnsupportedCodec {
@@ -155,11 +155,11 @@ pub fn decode_chunk_with_shape(
 
     // Zarr v2 carries endianness in dtype (not a `bytes` codec) and optional Fortran order.
     if meta.version == ZarrVersion::V2 && !endian_handled {
-        convert_endian_to_native(&mut buf, meta.dtype.size(), meta.endianness);
+        convert_endian_to_native(&mut buf, meta.dtype.bytes_per_sample(), meta.endianness);
     }
     if meta.order_f && chunk_shape.len() > 1 {
         let f_order: Vec<usize> = (0..chunk_shape.len()).rev().collect();
-        buf = untranspose(&buf, chunk_shape, &f_order, meta.dtype.size(), chunk_key)?;
+        buf = untranspose(&buf, chunk_shape, &f_order, meta.dtype.bytes_per_sample(), chunk_key)?;
     }
 
     Ok(buf)
@@ -696,7 +696,7 @@ mod tests {
     use super::*;
     use crate::{ChunkKeyEncoding, CodecSpec};
 
-    fn make_meta(shape: Vec<u64>, dtype: DataType, endian: Endianness, codecs: Vec<CodecSpec>) -> ArrayMeta {
+    fn make_meta(shape: Vec<u64>, dtype: SampleType, endian: Endianness, codecs: Vec<CodecSpec>) -> ArrayMeta {
         ArrayMeta {
             version: ZarrVersion::V3,
             shape: shape.clone(),
@@ -740,7 +740,7 @@ mod tests {
 
         let meta = make_meta(
             vec![8, 8],
-            DataType::Float32,
+            SampleType::Float32,
             Endianness::Big,
             vec![
                 CodecSpec {
@@ -774,7 +774,7 @@ mod tests {
         let zbuf = cogzilla_codec::compress_zlib(&payload).unwrap();
         let meta_z = make_meta(
             vec![16, 16],
-            DataType::UInt32,
+            SampleType::Uint32,
             Endianness::Little,
             vec![CodecSpec {
                 name: "zlib".into(),
@@ -792,7 +792,7 @@ mod tests {
         lz4_raw.extend_from_slice(&small);
         let meta_lz4 = make_meta(
             vec![4, 4],
-            DataType::UInt8,
+            SampleType::Uint8,
             Endianness::Little,
             vec![CodecSpec {
                 name: "lz4".into(),
@@ -813,7 +813,7 @@ mod tests {
     fn unknown_codec_is_named_error_listing_supported() {
         let meta = make_meta(
             vec![4, 4],
-            DataType::UInt8,
+            SampleType::Uint8,
             Endianness::Little,
             vec![CodecSpec {
                 name: "mystery_codec".into(),
@@ -831,7 +831,7 @@ mod tests {
     fn truncated_and_oversized_payloads_never_panic_or_overallocate() {
         let meta_zstd = make_meta(
             vec![4, 4],
-            DataType::Float32,
+            SampleType::Float32,
             Endianness::Little,
             vec![CodecSpec {
                 name: "zstd".into(),
@@ -844,7 +844,7 @@ mod tests {
         // Hostile LZ4 header claiming 2 GiB
         let meta_lz4 = make_meta(
             vec![4, 4],
-            DataType::Float32,
+            SampleType::Float32,
             Endianness::Little,
             vec![CodecSpec {
                 name: "lz4".into(),
@@ -855,7 +855,7 @@ mod tests {
         assert!(decode_chunk_bytes(&meta_lz4, &hostile, "c/0/0").is_err());
 
         // Chunk shape exceeding MAX_DECODED_CHUNK_BYTES (e.g. 10000 x 10000 f32 = 400 MB)
-        let huge = make_meta(vec![10000, 10000], DataType::Float32, Endianness::Little, vec![]);
+        let huge = make_meta(vec![10000, 10000], SampleType::Float32, Endianness::Little, vec![]);
         let err = decode_chunk_bytes(&huge, &[], "c/0/0").unwrap_err();
         assert!(matches!(err, ZarrError::ChunkTooLarge { .. }), "{err}");
     }

@@ -14,11 +14,11 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
     if a == b {
         return a;
     }
-    let float = |t| matches!(t, T::Float32 | T::Float64);
+    let float = |t| matches!(t, T::Float16 | T::Float32 | T::Float64);
     let signed = |t| matches!(t, T::Int8 | T::Int16 | T::Int32 | T::Int64);
     let bits = |t| match t {
-        T::Uint1 | T::Uint4 | T::Uint8 | T::Int8 => 8u32,
-        T::Uint16 | T::Int16 => 16,
+        T::Bool | T::Uint1 | T::Uint4 | T::Uint8 | T::Int8 => 8u32,
+        T::Uint16 | T::Int16 | T::Float16 => 16,
         T::Uint32 | T::Int32 | T::Float32 => 32,
         T::Uint64 | T::Int64 | T::Float64 => 64,
     };
@@ -104,7 +104,7 @@ pub(super) fn shown(pq: &ParsedQuery) -> bool {
 pub(crate) fn integer_range(kind: SampleType) -> Option<(f64, f64)> {
     use SampleType as T;
     Some(match kind {
-        T::Uint1 => (0.0, 1.0),
+        T::Bool | T::Uint1 => (0.0, 1.0),
         T::Uint4 => (0.0, 15.0),
         T::Uint8 => (0.0, 255.0),
         T::Int8 => (-128.0, 127.0),
@@ -114,25 +114,18 @@ pub(crate) fn integer_range(kind: SampleType) -> Option<(f64, f64)> {
         T::Int32 => (-2_147_483_648.0, 2_147_483_647.0),
         T::Uint64 => (0.0, u64::MAX as f64),
         T::Int64 => (i64::MIN as f64, i64::MAX as f64),
-        T::Float32 | T::Float64 => return None,
+        T::Float16 | T::Float32 | T::Float64 => return None,
     })
 }
 
 /// The type `algorithm_params={"dtype": ...}` names for `cast`, `uint8` when none is named;
-/// `None` for a name that is not a type.
+/// `None` for a name that is not a type supported by `cast`.
 pub(crate) fn cast_type(dtype: Option<&str>) -> Option<SampleType> {
-    use SampleType as T;
-    Some(match dtype.unwrap_or("uint8") {
-        "uint8" => T::Uint8,
-        "int8" => T::Int8,
-        "uint16" => T::Uint16,
-        "int16" => T::Int16,
-        "uint32" => T::Uint32,
-        "int32" => T::Int32,
-        "float32" => T::Float32,
-        "float64" => T::Float64,
-        _ => return None,
-    })
+    let st = SampleType::from_numpy_name(dtype.unwrap_or("uint8"))?;
+    match st {
+        SampleType::Bool | SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint64 | SampleType::Int64 | SampleType::Float16 => None,
+        _ => Some(st),
+    }
 }
 
 /// A number put in an integer `kind` as numpy's `astype` puts it: truncated toward zero

@@ -1301,24 +1301,7 @@ fn capped_native_bbox_dims(
 
 /// Default rescale range matching TiTiler's `dtype_ranges` when `?rescale=` is omitted.
 fn default_rescale_for_dtype(st: cogzilla_tiff::SampleType, single: bool) -> (f32, f32) {
-    use cogzilla_tiff::SampleType;
-    match st {
-        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => (0.0, 255.0),
-        SampleType::Int8 => (-128.0, 127.0),
-        SampleType::Uint16 => (0.0, 65535.0),
-        SampleType::Int16 => (-32768.0, 32767.0),
-        SampleType::Uint32 => (0.0, 4_294_967_295.0),
-        SampleType::Int32 => (-2_147_483_648.0, 2_147_483_647.0),
-        SampleType::Uint64 => (0.0, u64::MAX as f32),
-        SampleType::Int64 => (i64::MIN as f32, i64::MAX as f32),
-        SampleType::Float32 | SampleType::Float64 => {
-            if single {
-                (0.0, 1000.0)
-            } else {
-                (0.0, 1.0)
-            }
-        }
-    }
+    st.value_range().unwrap_or(if single { (0.0, 1000.0) } else { (0.0, 1.0) })
 }
 
 /// The band math of a request whose `algorithm` works over its `expression`'s outputs

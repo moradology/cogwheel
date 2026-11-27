@@ -12,7 +12,7 @@ use cogzilla_kernel::BandSource;
 use futures_util::stream::{self, StreamExt};
 
 use crate::sharding::{ShardIndexCache, ShardingConfig, read_sharded_inner_chunk};
-use crate::{ArrayMeta, DataType, ZarrError, ZarrStore, decode_chunk_bytes};
+use crate::{ArrayMeta, SampleType, ZarrError, ZarrStore, decode_chunk_bytes};
 
 /// Default concurrency limit for chunk fetches inside a single window read.
 pub const DEFAULT_CHUNK_CONCURRENCY: usize = 16;
@@ -166,7 +166,7 @@ impl ChunkWindow {
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(usize::try_from(d).ok()?))
             .unwrap_or(usize::MAX);
-        let chunk_bytes = chunk_elems.saturating_mul(meta.dtype.size());
+        let chunk_bytes = chunk_elems.saturating_mul(meta.dtype.bytes_per_sample());
         let window_bytes = count.saturating_mul(chunk_bytes);
         if window_bytes > caps.max_decoded_window_bytes {
             return Err(ZarrError::CapExceeded {
@@ -440,7 +440,7 @@ pub(crate) fn extract_2d_plane<'a>(
     if meta.rank() == 2 {
         return Ok(decoded);
     }
-    let plane_bytes = ch * cw * meta.dtype.size();
+    let plane_bytes = ch * cw * meta.dtype.bytes_per_sample();
     let start = lz * plane_bytes;
     let end = start + plane_bytes;
     if end > decoded.len() {
@@ -461,7 +461,7 @@ pub(crate) fn extract_2d_plane<'a>(
 /// computed strictly over `0..valid_h, 0..valid_w`.
 pub(crate) fn bytes_to_decoded_band(
     bytes: &[u8],
-    dtype: DataType,
+    dtype: SampleType,
     tile_w: u32,
     tile_h: u32,
     valid_w: u32,
@@ -475,7 +475,7 @@ pub(crate) fn bytes_to_decoded_band(
     let total = tw * th;
 
     match dtype {
-        DataType::UInt8 | DataType::Bool => {
+        SampleType::Uint8 | SampleType::Bool => {
             let nd_u8 = nodata.and_then(|v| {
                 if v.is_finite() && (0.0..=255.0).contains(&v) && v.fract() == 0.0 {
                     Some(v as u8)
@@ -492,7 +492,7 @@ pub(crate) fn bytes_to_decoded_band(
                 stats,
             }
         }
-        DataType::UInt16 => {
+        SampleType::Uint16 => {
             let nd_u16 = nodata.and_then(|v| {
                 if v.is_finite() && (0.0..=65535.0).contains(&v) && v.fract() == 0.0 {
                     Some(v as u16)
@@ -513,30 +513,30 @@ pub(crate) fn bytes_to_decoded_band(
                 stats,
             }
         }
-        DataType::Float32 | DataType::Float16 | DataType::Int8 | DataType::Int16 => {
+        SampleType::Float32 | SampleType::Float16 | SampleType::Int8 | SampleType::Int16 => {
             let mut slab = AlignedF32Slab::new_uninit(total);
             let dst = slab.as_mut_slice();
             let nd_f32 = nodata.and_then(|v| if v.is_nan() { None } else { Some(v as f32) });
             match dtype {
-                DataType::Float32 => {
+                SampleType::Float32 => {
                     for (d, c) in dst.iter_mut().zip(bytes[..total * 4].chunks_exact(4)) {
                         let v = f32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
                         *d = if nd_f32 == Some(v) { f32::NAN } else { v };
                     }
                 }
-                DataType::Float16 => {
+                SampleType::Float16 => {
                     for (d, c) in dst.iter_mut().zip(bytes[..total * 2].chunks_exact(2)) {
                         let v = f16_to_f32(u16::from_ne_bytes([c[0], c[1]]));
                         *d = if nd_f32 == Some(v) { f32::NAN } else { v };
                     }
                 }
-                DataType::Int8 => {
+                SampleType::Int8 => {
                     for (d, &b) in dst.iter_mut().zip(&bytes[..total]) {
                         let v = (b as i8) as f32;
                         *d = if nd_f32 == Some(v) { f32::NAN } else { v };
                     }
                 }
-                DataType::Int16 => {
+                SampleType::Int16 => {
                     for (d, c) in dst.iter_mut().zip(bytes[..total * 2].chunks_exact(2)) {
                         let v = i16::from_ne_bytes([c[0], c[1]]) as f32;
                         *d = if nd_f32 == Some(v) { f32::NAN } else { v };
@@ -553,39 +553,39 @@ pub(crate) fn bytes_to_decoded_band(
             }
         }
         // Wide dtypes stay exact in `BandData::F64` (never truncated through `f32`).
-        DataType::Int32
-        | DataType::UInt32
-        | DataType::Int64
-        | DataType::UInt64
-        | DataType::Float64 => {
+        SampleType::Int32
+        | SampleType::Uint32
+        | SampleType::Int64
+        | SampleType::Uint64
+        | SampleType::Float64 => {
             let mut data = Vec::with_capacity(total);
             let nd_f64 = nodata.filter(|v| !v.is_nan());
             match dtype {
-                DataType::Int32 => {
+                SampleType::Int32 => {
                     for c in bytes[..total * 4].chunks_exact(4) {
                         let v = i32::from_ne_bytes([c[0], c[1], c[2], c[3]]) as f64;
                         data.push(if nd_f64 == Some(v) { f64::NAN } else { v });
                     }
                 }
-                DataType::UInt32 => {
+                SampleType::Uint32 => {
                     for c in bytes[..total * 4].chunks_exact(4) {
                         let v = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) as f64;
                         data.push(if nd_f64 == Some(v) { f64::NAN } else { v });
                     }
                 }
-                DataType::Int64 => {
+                SampleType::Int64 => {
                     for c in bytes[..total * 8].chunks_exact(8) {
                         let v = i64::from_ne_bytes(c.try_into().unwrap()) as f64;
                         data.push(if nd_f64 == Some(v) { f64::NAN } else { v });
                     }
                 }
-                DataType::UInt64 => {
+                SampleType::Uint64 => {
                     for c in bytes[..total * 8].chunks_exact(8) {
                         let v = u64::from_ne_bytes(c.try_into().unwrap()) as f64;
                         data.push(if nd_f64 == Some(v) { f64::NAN } else { v });
                     }
                 }
-                DataType::Float64 => {
+                SampleType::Float64 => {
                     for c in bytes[..total * 8].chunks_exact(8) {
                         let v = f64::from_ne_bytes(c.try_into().unwrap());
                         data.push(if nd_f64 == Some(v) { f64::NAN } else { v });
@@ -601,6 +601,9 @@ pub(crate) fn bytes_to_decoded_band(
                 height: valid_h,
                 stats,
             }
+        }
+        SampleType::Uint1 | SampleType::Uint4 => {
+            unreachable!("Zarr stores never produce sub-byte TIFF sample types")
         }
     }
 }
@@ -777,7 +780,7 @@ mod tests {
     use super::*;
     use crate::{ChunkKeyEncoding, Endianness, MemoryStore, ZarrVersion};
 
-    fn make_2d_meta(h: u64, w: u64, ch: u64, cw: u64, dtype: DataType, fill: Option<f64>) -> ArrayMeta {
+    fn make_2d_meta(h: u64, w: u64, ch: u64, cw: u64, dtype: SampleType, fill: Option<f64>) -> ArrayMeta {
         ArrayMeta {
             version: ZarrVersion::V3,
             shape: vec![h, w],
@@ -796,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn edge_chunk_returns_truncated_dims_and_exact_stats() {
         // 10x10 array with 8x8 chunks -> chunk (1,1) has valid dims (2, 2)
-        let meta = make_2d_meta(10, 10, 8, 8, DataType::Float32, Some(f64::NAN));
+        let meta = make_2d_meta(10, 10, 8, 8, SampleType::Float32, Some(f64::NAN));
         let mut store = MemoryStore::new();
         let mut chunk = vec![999.0f32; 64]; // overhang sentinel must NOT pollute stats
         chunk[0] = 10.0;
@@ -826,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_chunk_with_no_fill_value_is_error() {
-        let meta = make_2d_meta(16, 16, 8, 8, DataType::Float32, None);
+        let meta = make_2d_meta(16, 16, 8, 8, SampleType::Float32, None);
         let store = MemoryStore::new();
         let err = read_chunk_window(&store, "arr", &meta, 0, 0, 8, 8)
             .await
@@ -837,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn wide_dtype_int32_stays_exact_in_f64_band_data() {
-        let meta = make_2d_meta(4, 4, 4, 4, DataType::Int32, Some(-9999.0));
+        let meta = make_2d_meta(4, 4, 4, 4, SampleType::Int32, Some(-9999.0));
         let mut store = MemoryStore::new();
         // Value > 2^24 that would lose precision if cast through f32!
         let exact_val: i32 = 16_777_217;
@@ -858,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn caps_refuse_oversized_fanout_before_first_fetch() {
         // 1024x1024 array with 16x16 chunks = 64x64 = 4096 chunks
-        let meta = make_2d_meta(1024, 1024, 16, 16, DataType::Float32, Some(f64::NAN));
+        let meta = make_2d_meta(1024, 1024, 16, 16, SampleType::Float32, Some(f64::NAN));
         let store = MemoryStore::new();
         let caps = ZarrCaps {
             max_chunks_per_request: 16,

@@ -7,11 +7,11 @@
 //! - `0..360` longitude normalization to `-180..180` reusing `cogzilla_proj::normalize_geographic_lon`
 
 use cogzilla_proj::normalize_geographic_lon;
-use cogzilla_tiff::Affine2D;
+use cogzilla_raster::Affine2D;
 use serde_json::Value;
 
 use crate::crs::{ZarrCrs, resolve_crs};
-use crate::{ArrayMeta, DataType, GroupView, ZarrError, ZarrStore, decode_chunk_bytes};
+use crate::{ArrayMeta, SampleType, GroupView, ZarrError, ZarrStore, decode_chunk_bytes};
 
 const X_NAMES: &[&str] = &["x", "X", "lon", "LON", "longitude", "LONGITUDE", "long"];
 const Y_NAMES: &[&str] = &["y", "Y", "lat", "LAT", "latitude", "LATITUDE"];
@@ -115,10 +115,10 @@ pub fn derive_regular_geo(
         crs,
         x_dim,
         x_vals,
-        DataType::Float64,
+        SampleType::Float64,
         y_dim,
         y_vals,
-        DataType::Float64,
+        SampleType::Float64,
     )
 }
 
@@ -126,10 +126,10 @@ fn derive_regular_geo_with_dtypes(
     crs: ZarrCrs,
     x_dim: String,
     x_vals: &[f64],
-    x_dtype: DataType,
+    x_dtype: SampleType,
     y_dim: String,
     y_vals: &[f64],
-    y_dtype: DataType,
+    y_dtype: SampleType,
 ) -> Result<ZarrGeo, ZarrError> {
     let dx = check_regular_axis_with_dtype(&x_dim, x_vals, x_dtype)?;
     let dy = check_regular_axis_with_dtype(&y_dim, y_vals, y_dtype)?;
@@ -200,13 +200,13 @@ fn derive_regular_geo_with_dtypes(
 /// `vals[1] - vals[0]` (or mean step for float32 coordinates). Refuses non-uniform spacing with
 /// dimension name and offending index.
 pub fn check_regular_axis(dim: &str, vals: &[f64]) -> Result<f64, ZarrError> {
-    check_regular_axis_with_dtype(dim, vals, DataType::Float64)
+    check_regular_axis_with_dtype(dim, vals, SampleType::Float64)
 }
 
 fn check_regular_axis_with_dtype(
     dim: &str,
     vals: &[f64],
-    dtype: DataType,
+    dtype: SampleType,
 ) -> Result<f64, ZarrError> {
     if vals.len() < 2 {
         return Err(ZarrError::IrregularGrid {
@@ -224,7 +224,7 @@ fn check_regular_axis_with_dtype(
             });
         }
     }
-    let step = if matches!(dtype, DataType::Float32) {
+    let step = if matches!(dtype, SampleType::Float32) {
         (vals[vals.len() - 1] - vals[0]) / (vals.len() - 1) as f64
     } else {
         vals[1] - vals[0]
@@ -238,7 +238,7 @@ fn check_regular_axis_with_dtype(
     }
     let max_abs = vals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let base_tol = step.abs() * 1e-4 + 1e-9;
-    let tol = if matches!(dtype, DataType::Float32) {
+    let tol = if matches!(dtype, SampleType::Float32) {
         base_tol.max((f32::EPSILON as f64) * max_abs.max(1.0) * 4.0)
     } else {
         base_tol
@@ -255,7 +255,7 @@ fn check_regular_axis_with_dtype(
                 ),
             });
         }
-        if matches!(dtype, DataType::Float32) {
+        if matches!(dtype, SampleType::Float32) {
             let expected = vals[0] + (i + 1) as f64 * step;
             if (vals[i + 1] - expected).abs() > tol {
                 return Err(ZarrError::IrregularGrid {
@@ -318,59 +318,59 @@ pub async fn read_coord_1d(
     Ok(out)
 }
 
-fn append_native_as_f64(bytes: &[u8], dtype: DataType, count: usize, out: &mut Vec<f64>) {
+fn append_native_as_f64(bytes: &[u8], dtype: SampleType, count: usize, out: &mut Vec<f64>) {
     match dtype {
-        DataType::Float64 => {
+        SampleType::Float64 => {
             for c in bytes[..count * 8].chunks_exact(8) {
                 out.push(f64::from_ne_bytes(c.try_into().unwrap()));
             }
         }
-        DataType::Float32 => {
+        SampleType::Float32 => {
             for c in bytes[..count * 4].chunks_exact(4) {
                 out.push(f32::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::Int64 => {
+        SampleType::Int64 => {
             for c in bytes[..count * 8].chunks_exact(8) {
                 out.push(i64::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::UInt64 => {
+        SampleType::Uint64 => {
             for c in bytes[..count * 8].chunks_exact(8) {
                 out.push(u64::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::Int32 => {
+        SampleType::Int32 => {
             for c in bytes[..count * 4].chunks_exact(4) {
                 out.push(i32::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::UInt32 => {
+        SampleType::Uint32 => {
             for c in bytes[..count * 4].chunks_exact(4) {
                 out.push(u32::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::Int16 => {
+        SampleType::Int16 => {
             for c in bytes[..count * 2].chunks_exact(2) {
                 out.push(i16::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::UInt16 => {
+        SampleType::Uint16 => {
             for c in bytes[..count * 2].chunks_exact(2) {
                 out.push(u16::from_ne_bytes(c.try_into().unwrap()) as f64);
             }
         }
-        DataType::Int8 => {
+        SampleType::Int8 => {
             for &b in &bytes[..count] {
                 out.push((b as i8) as f64);
             }
         }
-        DataType::UInt8 | DataType::Bool => {
+        SampleType::Uint8 | SampleType::Bool => {
             for &b in &bytes[..count] {
                 out.push(b as f64);
             }
         }
-        DataType::Float16 => {
+        SampleType::Float16 => {
             for c in bytes[..count * 2].chunks_exact(2) {
                 let bits = u16::from_ne_bytes([c[0], c[1]]);
                 let sign = ((bits & 0x8000) as u32) << 16;
@@ -385,6 +385,9 @@ fn append_native_as_f64(bytes: &[u8], dtype: DataType, count: usize, out: &mut V
                 };
                 out.push(f as f64);
             }
+        }
+        SampleType::Uint1 | SampleType::Uint4 => {
+            unreachable!("Zarr stores never produce sub-byte TIFF sample types")
         }
     }
 }
@@ -543,12 +546,12 @@ mod tests {
         let x: Vec<f64> = (0..1000)
             .map(|i| (-179.99f32 + i as f32 * 0.01f32) as f64)
             .collect();
-        let step = check_regular_axis_with_dtype("lon", &x, DataType::Float32).unwrap();
+        let step = check_regular_axis_with_dtype("lon", &x, SampleType::Float32).unwrap();
         assert!((step - 0.01).abs() < 1e-6);
 
         // Genuine irregularity (0.05° jump) is still refused even in Float32
         let mut bad = x.clone();
         bad[500] += 0.05;
-        assert!(check_regular_axis_with_dtype("lon", &bad, DataType::Float32).is_err());
+        assert!(check_regular_axis_with_dtype("lon", &bad, SampleType::Float32).is_err());
     }
 }

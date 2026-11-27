@@ -441,7 +441,7 @@ fn days_to_date(days: i64, cal: CfCalendar) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChunkKeyEncoding, DataType, Endianness, ZarrVersion};
+    use crate::{ChunkKeyEncoding, SampleType, Endianness, ZarrVersion};
 
     fn time_meta(units: &str, calendar: Option<&str>) -> ArrayMeta {
         let mut attributes = BTreeMap::new();
@@ -453,7 +453,7 @@ mod tests {
             version: ZarrVersion::V3,
             shape: vec![6],
             chunk_shape: vec![6],
-            dtype: DataType::Int64,
+            dtype: SampleType::Int64,
             endianness: Endianness::Little,
             fill_value: None,
             codecs: vec![],

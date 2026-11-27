@@ -1360,6 +1360,9 @@ fn reconstruct_bands(
         (SampleType::Float64, _, RawTileBuf::Shared(_)) => {
             unreachable!("Float64 with predictor always uses scratch buffer")
         }
+        (SampleType::Bool | SampleType::Float16, _, _) => {
+            unreachable!("TIFF IFDs never produce Bool or Float16 sample types")
+        }
     }
 }
 

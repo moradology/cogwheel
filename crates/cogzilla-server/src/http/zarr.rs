@@ -212,7 +212,7 @@ pub fn zarr_error_status(err: &ZarrError) -> StatusCode {
         | ZarrError::SelOutOfRange { .. }
         | ZarrError::UnsupportedCalendar { .. }
         | ZarrError::UnsupportedRank(_)
-        | ZarrError::UnsupportedDataType(_)
+        | ZarrError::UnsupportedSampleType(_)
         | ZarrError::UnsupportedVersion(_)
         | ZarrError::IrregularGrid { .. }
         | ZarrError::UnsupportedCrs { .. }
@@ -1355,7 +1355,7 @@ async fn handle_point(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery, coords: &s
         src = src.with_nodata_override(Some(nd));
     }
 
-    let val_json = if sel_var.meta.dtype.needs_wide_path() {
+    let val_json = if sel_var.meta.dtype.needs_f64() {
         let v = src.sample_f64_checked(col, row);
         if v.is_nan() { Value::Null } else { json!(v) }
     } else {

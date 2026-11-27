@@ -76,7 +76,7 @@ pub enum ZarrError {
     #[error("unsupported zarr format version {0} (this build reads v2 and v3)")]
     UnsupportedVersion(u64),
     #[error("unsupported data type {0}")]
-    UnsupportedDataType(String),
+    UnsupportedSampleType(String),
     #[error("array has {0} dimensions; a 2D or 3D array is required")]
     UnsupportedRank(usize),
     #[error("prefix is not a Zarr store (looked for {searched})")]
@@ -157,102 +157,48 @@ pub enum ZarrVersion {
 }
 
 /// Byte order of the stored samples. Zarr v3 carries this in the `bytes` codec rather than the
-/// dtype, so it is kept beside [`DataType`] instead of inside it.
+/// dtype, so it is kept beside [`SampleType`] instead of inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endianness {
     Little,
     Big,
 }
 
-/// The sample types cogzilla can render. Zarr's complex and variable-length types are rejected
-/// rather than silently approximated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataType {
-    Bool,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    UInt8,
-    UInt16,
-    UInt32,
-    UInt64,
-    Float16,
-    Float32,
-    Float64,
+pub use cogzilla_raster::{Affine2D, SampleType};
+
+/// Parse a Zarr v2 dtype string such as `"<f4"`, `">i2"` or `"|u1"`.
+pub fn parse_v2_dtype(s: &str) -> Result<(SampleType, Endianness), ZarrError> {
+    let mut chars = s.chars();
+    let (endian, rest) = match chars.next() {
+        Some('<') => (Endianness::Little, chars.as_str()),
+        Some('>') => (Endianness::Big, chars.as_str()),
+        // `|` means "not applicable" (single-byte types); anything else is an implicit
+        // native-order spelling, and every store we care about is little-endian.
+        Some('|') => (Endianness::Little, chars.as_str()),
+        _ => (Endianness::Little, s),
+    };
+    let dt = match rest {
+        "b1" => SampleType::Bool,
+        "i1" => SampleType::Int8,
+        "i2" => SampleType::Int16,
+        "i4" => SampleType::Int32,
+        "i8" => SampleType::Int64,
+        "u1" => SampleType::Uint8,
+        "u2" => SampleType::Uint16,
+        "u4" => SampleType::Uint32,
+        "u8" => SampleType::Uint64,
+        "f2" => SampleType::Float16,
+        "f4" => SampleType::Float32,
+        "f8" => SampleType::Float64,
+        other => return Err(ZarrError::UnsupportedSampleType(other.to_string())),
+    };
+    Ok((dt, endian))
 }
 
-impl DataType {
-    /// Bytes per sample as stored.
-    pub fn size(self) -> usize {
-        match self {
-            DataType::Bool | DataType::Int8 | DataType::UInt8 => 1,
-            DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,
-            DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
-            DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
-        }
-    }
-
-    /// True when the type cannot be carried exactly by `f32`, so the data paths have to keep it in
-    /// its own type or in `f64`. This is the same rule the GeoTIFF side settled in OO1.
-    pub fn needs_wide_path(self) -> bool {
-        matches!(
-            self,
-            DataType::Int32
-                | DataType::UInt32
-                | DataType::Int64
-                | DataType::UInt64
-                | DataType::Float64
-        )
-    }
-
-    /// Parse a v2 dtype string such as `"<f4"`, `">i2"` or `"|u1"`.
-    pub fn from_v2_dtype(s: &str) -> Result<(Self, Endianness), ZarrError> {
-        let mut chars = s.chars();
-        let (endian, rest) = match chars.next() {
-            Some('<') => (Endianness::Little, chars.as_str()),
-            Some('>') => (Endianness::Big, chars.as_str()),
-            // `|` means "not applicable" (single-byte types); anything else is an implicit
-            // native-order spelling, and every store we care about is little-endian.
-            Some('|') => (Endianness::Little, chars.as_str()),
-            _ => (Endianness::Little, s),
-        };
-        let dt = match rest {
-            "b1" => DataType::Bool,
-            "i1" => DataType::Int8,
-            "i2" => DataType::Int16,
-            "i4" => DataType::Int32,
-            "i8" => DataType::Int64,
-            "u1" => DataType::UInt8,
-            "u2" => DataType::UInt16,
-            "u4" => DataType::UInt32,
-            "u8" => DataType::UInt64,
-            "f2" => DataType::Float16,
-            "f4" => DataType::Float32,
-            "f8" => DataType::Float64,
-            other => return Err(ZarrError::UnsupportedDataType(other.to_string())),
-        };
-        Ok((dt, endian))
-    }
-
-    /// Parse a v3 `data_type` name such as `"float32"`.
-    pub fn from_v3_name(s: &str) -> Result<Self, ZarrError> {
-        Ok(match s {
-            "bool" => DataType::Bool,
-            "int8" => DataType::Int8,
-            "int16" => DataType::Int16,
-            "int32" => DataType::Int32,
-            "int64" => DataType::Int64,
-            "uint8" => DataType::UInt8,
-            "uint16" => DataType::UInt16,
-            "uint32" => DataType::UInt32,
-            "uint64" => DataType::UInt64,
-            "float16" => DataType::Float16,
-            "float32" => DataType::Float32,
-            "float64" => DataType::Float64,
-            other => return Err(ZarrError::UnsupportedDataType(other.to_string())),
-        })
-    }
+/// Parse a Zarr v3 `data_type` name such as `"float32"`.
+pub fn parse_v3_dtype(s: &str) -> Result<SampleType, ZarrError> {
+    SampleType::from_numpy_name(s)
+        .ok_or_else(|| ZarrError::UnsupportedSampleType(s.to_string()))
 }
 
 /// One entry of the codec chain, kept as its name plus its untouched configuration so that the
@@ -355,7 +301,7 @@ pub struct ArrayMeta {
     pub shape: Vec<u64>,
     /// Chunk shape, same order as [`ArrayMeta::shape`].
     pub chunk_shape: Vec<u64>,
-    pub dtype: DataType,
+    pub dtype: SampleType,
     pub endianness: Endianness,
     /// `None` where the store says `null`, which means "no fill value": a missing chunk is then an
     /// error rather than a hole.
@@ -397,7 +343,7 @@ impl ArrayMeta {
             .get("dtype")
             .and_then(Value::as_str)
             .ok_or(ZarrError::MissingField { field: "dtype" })?;
-        let (dtype, endianness) = DataType::from_v2_dtype(dtype_str)?;
+        let (dtype, endianness) = parse_v2_dtype(dtype_str)?;
 
         let mut codecs = Vec::new();
         if let Some(filters) = v.get("filters").and_then(Value::as_array) {
@@ -454,7 +400,7 @@ impl ArrayMeta {
             Some(other) => return Err(ZarrError::UnsupportedVersion(other)),
         }
         let shape = u64_vec(v, "shape")?;
-        let dtype = DataType::from_v3_name(
+        let dtype = parse_v3_dtype(
             v.get("data_type")
                 .and_then(Value::as_str)
                 .ok_or(ZarrError::MissingField { field: "data_type" })?,
@@ -709,7 +655,7 @@ mod tests {
         assert_eq!(m.version, ZarrVersion::V2);
         assert_eq!(m.shape, vec![12, 1800, 3600]);
         assert_eq!(m.chunk_shape, vec![1, 600, 600]);
-        assert_eq!(m.dtype, DataType::Float32);
+        assert_eq!(m.dtype, SampleType::Float32);
         assert_eq!(m.endianness, Endianness::Little);
         assert!(m.fill_value.unwrap().is_nan());
         // filters come before the compressor, in declared order
@@ -741,7 +687,7 @@ mod tests {
         let src = br#"{"zarr_format":2,"shape":[4,4],"chunks":[2,2],"dtype":"|u1","fill_value":0}"#;
         let m = ArrayMeta::from_v2(src, None).unwrap();
         assert_eq!(m.chunk_key(&[1, 0]), "1.0");
-        assert_eq!(m.dtype, DataType::UInt8);
+        assert_eq!(m.dtype, SampleType::Uint8);
         assert_eq!(m.fill_value, Some(0.0));
         assert!(m.codecs.is_empty());
     }
@@ -752,7 +698,7 @@ mod tests {
         assert_eq!(m.version, ZarrVersion::V3);
         assert_eq!(m.shape, vec![1800, 3600]);
         assert_eq!(m.chunk_shape, vec![512, 512]);
-        assert_eq!(m.dtype, DataType::UInt16);
+        assert_eq!(m.dtype, SampleType::Uint16);
         assert_eq!(m.endianness, Endianness::Big);
         assert_eq!(m.fill_value, Some(0.0));
         assert_eq!(m.chunks_per_dim(), vec![4, 8]);
@@ -775,7 +721,7 @@ mod tests {
         assert_eq!(m.chunk_key(&[1, 1]), "1.1");
         assert_eq!(m.fill_value, Some(f64::NEG_INFINITY));
         assert_eq!(m.codecs[0].name, "bytes");
-        assert!(m.dtype.needs_wide_path());
+        assert!(m.dtype.needs_f64());
     }
 
     #[test]
@@ -796,7 +742,7 @@ mod tests {
         let src = br#"{"zarr_format":2,"shape":[2,2],"chunks":[1,1],"dtype":"<c8"}"#;
         let err = ArrayMeta::from_v2(src, None).unwrap_err();
         assert!(
-            matches!(&err, ZarrError::UnsupportedDataType(d) if d == "c8"),
+            matches!(&err, ZarrError::UnsupportedSampleType(d) if d == "c8"),
             "{err}"
         );
     }
@@ -810,16 +756,16 @@ mod tests {
     #[test]
     fn wide_dtypes_are_flagged_so_the_data_paths_keep_them_exact() {
         for dt in [
-            DataType::Int32,
-            DataType::UInt32,
-            DataType::Int64,
-            DataType::UInt64,
-            DataType::Float64,
+            SampleType::Int32,
+            SampleType::Uint32,
+            SampleType::Int64,
+            SampleType::Uint64,
+            SampleType::Float64,
         ] {
-            assert!(dt.needs_wide_path(), "{dt:?}");
+            assert!(dt.needs_f64(), "{dt:?}");
         }
-        for dt in [DataType::UInt8, DataType::Int16, DataType::Float32] {
-            assert!(!dt.needs_wide_path(), "{dt:?}");
+        for dt in [SampleType::Uint8, SampleType::Int16, SampleType::Float32] {
+            assert!(!dt.needs_f64(), "{dt:?}");
         }
     }
 }

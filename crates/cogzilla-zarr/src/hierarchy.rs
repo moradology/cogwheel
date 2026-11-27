@@ -816,7 +816,7 @@ impl ZarrStore for FsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DataType;
+    use crate::SampleType;
 
     fn sample_v2_array_json() -> &'static [u8] {
         br#"{"zarr_format":2,"shape":[16,32],"chunks":[8,8],"dtype":"<f4","fill_value":"NaN","order":"C","filters":null,"compressor":null}"#
@@ -932,7 +932,7 @@ mod tests {
         assert_eq!(h3.open_mode, OpenMode::V3Walked);
         let g = h3.group(Some("/level0/")).unwrap();
         assert_eq!(g.variable_names(), vec!["band"]);
-        assert_eq!(g.array("band").unwrap().dtype, DataType::Float32);
+        assert_eq!(g.array("band").unwrap().dtype, SampleType::Float32);
     }
 
     #[tokio::test]
