@@ -719,7 +719,7 @@ impl TileEngine {
             if let Some(b1) = bands_1based {
                 let kind = cog.index.full_res().sample_type;
                 let (minx, miny, maxx, maxy) = cogzilla_proj::tile_bounds_3857(req.tile);
-                return Box::pin(crate::titiler::render_exact_f64_array(
+                return Box::pin(crate::stats::render_exact_f64_array(
                     self,
                     cog,
                     [minx, miny, maxx, maxy],

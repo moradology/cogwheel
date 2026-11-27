@@ -27,10 +27,8 @@ use hyper::{Method, Response, StatusCode};
 use serde_json::{Value, json};
 
 use crate::engine::TileEngine;
-use crate::titiler::{
-    PolygonMask, StatsOptions, compute_f32_band_stats, encode_geotiff_f32,
-    encode_rgba_output,
-};
+use crate::geotiff::encode_geotiff_f32;
+use crate::stats::{PolygonMask, StatsOptions, compute_f32_band_stats, encode_rgba_output};
 use crate::zonal::{
     PixelAreaModel, ZonalGeomKind, compute_weighted_band_stats_with_geom,
     densify_ring_lonlat_to_pixel, rasterize_exact_coverage,

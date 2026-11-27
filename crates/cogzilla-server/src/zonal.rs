@@ -19,8 +19,8 @@ use cogzilla_proj::CrsModel;
 use cogzilla_tiff::{Affine2D, PlanarConfig};
 
 use crate::engine::{EngineError, TileEngine};
-use crate::histogram::{HistDtype, sorted_bin_ranges};
-use crate::titiler::{PolygonMask, StatsOptions, compute_f32_band_stats};
+use crate::stats::histogram::{HistDtype, sorted_bin_ranges};
+use crate::stats::{PolygonMask, StatsOptions, compute_f32_band_stats};
 
 /// WGS84 ellipsoid constants.
 const WGS84_A: f64 = 6_378_137.0;
@@ -108,7 +108,7 @@ impl Ord for OrderedF64 {
     }
 }
 
-use crate::titiler::format_category_key;
+use crate::stats::format_category_key;
 
 /// Semantic geometry dimensionality for zonal statistics (`area` vs `length` vs point weights).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1346,8 +1346,8 @@ pub fn compute_weighted_band_stats_with_geom(
             .filter(|&a| a > COV_EPS)
             .unwrap_or(masked_pixels as f64);
         let dtype = opts.hist_dtype.unwrap_or(HistDtype::Float64);
-        let mut bs = crate::titiler::BandStats::empty(
-            crate::titiler::StatCount::Float(masked_out),
+        let mut bs = crate::stats::BandStats::empty(
+            crate::stats::StatCount::Float(masked_out),
             Some(description.to_string()),
             opts,
             dtype,
@@ -1596,7 +1596,7 @@ pub fn compute_weighted_band_stats_with_geom(
             }
         }
         (
-            crate::titiler::BandHistogram::Categorical(serde_json::json!([cat_counts, cat_vals])),
+            crate::stats::BandHistogram::Categorical(serde_json::json!([cat_counts, cat_vals])),
             Some(cats_obj),
             (geom_kind == ZonalGeomKind::Polygon).then_some(cat_areas_obj),
         )
@@ -1631,7 +1631,7 @@ pub fn compute_weighted_band_stats_with_geom(
                 .collect()
         };
         (
-            crate::titiler::BandHistogram::NumericFloat(hist_w, edges),
+            crate::stats::BandHistogram::NumericFloat(hist_w, edges),
             None,
             None,
         )
@@ -1646,23 +1646,23 @@ pub fn compute_weighted_band_stats_with_geom(
     } else {
         opts.percentiles.clone()
     };
-    crate::titiler::BandStats {
-        min: Some(crate::titiler::StatScalar::F64(min_v)),
-        max: Some(crate::titiler::StatScalar::F64(max_v)),
+    crate::stats::BandStats {
+        min: Some(crate::stats::StatScalar::F64(min_v)),
+        max: Some(crate::stats::StatScalar::F64(max_v)),
         mean: Some(mean),
-        count: crate::titiler::StatCount::Float(count_out),
+        count: crate::stats::StatCount::Float(count_out),
         sum: sum_cov,
         std: Some(std),
-        median: Some(crate::titiler::StatScalar::F64(median)),
-        majority: Some(crate::titiler::StatScalar::F64(maj_val)),
-        minority: Some(crate::titiler::StatScalar::F64(min_val_freq)),
-        unique: crate::titiler::StatCount::Float(unique_count as f64),
+        median: Some(crate::stats::StatScalar::F64(median)),
+        majority: Some(crate::stats::StatScalar::F64(maj_val)),
+        minority: Some(crate::stats::StatScalar::F64(min_val_freq)),
+        unique: crate::stats::StatCount::Float(unique_count as f64),
         valid_percent,
-        masked_pixels: crate::titiler::StatCount::Float(masked_pixels_out),
-        valid_pixels: crate::titiler::StatCount::Float(valid_pixels as f64),
+        masked_pixels: crate::stats::StatCount::Float(masked_pixels_out),
+        valid_pixels: crate::stats::StatCount::Float(valid_pixels as f64),
         percentiles: pcts
             .into_iter()
-            .map(|p| (p, Some(crate::titiler::StatScalar::F64(weighted_quantile(p)))))
+            .map(|p| (p, Some(crate::stats::StatScalar::F64(weighted_quantile(p)))))
             .collect(),
         histogram,
         categories,
@@ -1781,10 +1781,10 @@ fn weighted_gpu_stats_to_json(
 ) -> serde_json::Value {
     let edges = opts.histogram_bin_edges(Some((gs.min, gs.max)), dtype);
     let counts = match values {
-        Some((v, cov)) => crate::histogram::unsorted_weighted_counts(v, cov, COV_EPS, &edges),
+        Some((v, cov)) => crate::stats::histogram::unsorted_weighted_counts(v, cov, COV_EPS, &edges),
         None if gs.min == gs.max => {
             let mut c = vec![0.0f64; edges.len().saturating_sub(1)];
-            if let Some(b) = crate::histogram::bin_of(&edges, gs.min) {
+            if let Some(b) = crate::stats::histogram::bin_of(&edges, gs.min) {
                 c[b] = gs.count_cov;
             }
             c
@@ -1798,26 +1798,26 @@ fn weighted_gpu_stats_to_json(
         gs.masked_pixels,
         total_poly_area_px,
     );
-    crate::titiler::BandStats {
-        min: Some(crate::titiler::StatScalar::F64(gs.min)),
-        max: Some(crate::titiler::StatScalar::F64(gs.max)),
+    crate::stats::BandStats {
+        min: Some(crate::stats::StatScalar::F64(gs.min)),
+        max: Some(crate::stats::StatScalar::F64(gs.max)),
         mean: Some(gs.mean),
-        count: crate::titiler::StatCount::Float(count_out),
+        count: crate::stats::StatCount::Float(count_out),
         sum: gs.sum_cov,
         std: Some(gs.std),
-        median: Some(crate::titiler::StatScalar::F64(gs.median)),
-        majority: Some(crate::titiler::StatScalar::F64(gs.majority)),
-        minority: Some(crate::titiler::StatScalar::F64(gs.minority)),
-        unique: crate::titiler::StatCount::Float(gs.unique_bins as f64),
+        median: Some(crate::stats::StatScalar::F64(gs.median)),
+        majority: Some(crate::stats::StatScalar::F64(gs.majority)),
+        minority: Some(crate::stats::StatScalar::F64(gs.minority)),
+        unique: crate::stats::StatCount::Float(gs.unique_bins as f64),
         valid_percent,
-        masked_pixels: crate::titiler::StatCount::Float(masked_pixels),
-        valid_pixels: crate::titiler::StatCount::Float(gs.valid_pixels as f64),
+        masked_pixels: crate::stats::StatCount::Float(masked_pixels),
+        valid_pixels: crate::stats::StatCount::Float(gs.valid_pixels as f64),
         percentiles: gs
             .percentiles
             .iter()
-            .map(|&(p, val)| (p, Some(crate::titiler::StatScalar::F64(val))))
+            .map(|&(p, val)| (p, Some(crate::stats::StatScalar::F64(val))))
             .collect(),
-        histogram: crate::titiler::BandHistogram::NumericFloat(counts, edges),
+        histogram: crate::stats::BandHistogram::NumericFloat(counts, edges),
         categories: None,
         category_areas: None,
         area: Some(Some(gs.area_valid_m2 * area_scale)),

@@ -10,13 +10,13 @@ pub mod gpu_backend;
 #[cfg(not(feature = "gpu"))]
 #[path = "gpu_stub.rs"]
 pub mod gpu_backend;
-mod geotiff;
-pub mod histogram;
+pub mod geotiff;
 pub mod http;
 pub mod openapi;
 pub mod stac;
 pub mod tile_cache;
-pub mod titiler;
+pub mod multi_asset;
+pub mod stats;
 pub mod tms;
 pub mod zonal;
 

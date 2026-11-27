@@ -6,7 +6,7 @@ use cogzilla_kernel::{
     ColorFormula, ColormapName, CustomColormap, OutputFormat, ResampleMode,
 };
 
-use super::{PolygonMask, encode_rgba_output, render_bbox_impl};
+use crate::stats::{PolygonMask, encode_rgba_output, render_bbox_impl};
 use crate::engine::{BandRequest, EngineError, TileEngine};
 
 /// Fallback multi-COG / STAC renderer when assets have mixed resolutions, tile grids, overview
@@ -62,7 +62,7 @@ pub async fn render_multi_asset_bbox(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn render_mixed_grid_bbox(
+pub(crate) async fn render_mixed_grid_bbox(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
     bbox: [f64; 4],

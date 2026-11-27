@@ -40,7 +40,7 @@ use crate::stac::{StacItem, stac_item_from_json};
 mod tile;
 
 use self::tile::{render_non_mercator_tms_tile, tile};
-use crate::titiler::{
+use crate::stats::{
     PolygonMask, build_map_html, encode_rgba_output_colour, query_point, render_crs_bbox, render_wgs84_bbox,
 };
 
@@ -1314,7 +1314,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
     }
 
     let host = ctx.host;
-    let this_url = crate::titiler::xml_escape(&if ctx.raw_query.is_empty() {
+    let this_url = crate::stats::xml_escape(&if ctx.raw_query.is_empty() {
         format!("{host}{base}/WMTSCapabilities.xml")
     } else {
         format!("{host}{base}/WMTSCapabilities.xml?{}", ctx.raw_query)
@@ -1356,8 +1356,8 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
     xml.push_str("    </ows:OperationsMetadata>\n    <Contents>\n");
     let [w, s, e, n] = source.bounds;
     for (name, qs, (minzoom, maxzoom)) in &layers {
-        let id = crate::titiler::xml_escape(&format!("{}_{TMS}_{name}", source.title));
-        let template = crate::titiler::xml_escape(&if qs.is_empty() {
+        let id = crate::stats::xml_escape(&format!("{}_{TMS}_{name}", source.title));
+        let template = crate::stats::xml_escape(&if qs.is_empty() {
             format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}")
         } else {
             format!("{host}{base}/tiles/{TMS}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{tile_format}?{qs}")
@@ -3835,7 +3835,7 @@ async fn part_image_of(
         // The renderer's picture under `algorithm`, asked for as a GeoTIFF: its RGBA, placed.
         if made.1 == super::GEOTIFF_CONTENT_TYPE && made.0.len() == width * height * 4 {
             let epsg = if mercator { 3857 } else { 4326 };
-            let body = crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &made.0, bbox, epsg, pq.return_mask);
+            let body = crate::geotiff::encode_geotiff_rgba(width as u32, height as u32, &made.0, bbox, epsg, pq.return_mask);
             return Ok((body, made.1));
         }
         Ok(made)
@@ -4450,7 +4450,7 @@ async fn resampled_planes(
             colormap: ColormapName::Grayscale,
         };
         let raw = if mercator {
-            crate::titiler::render_mercator_bbox(engine, cogs, bounds, w, h, &one, resample, OutputFormat::RawF32, nodata, None, None, false, unscale).await?
+            crate::stats::render_mercator_bbox(engine, cogs, bounds, w, h, &one, resample, OutputFormat::RawF32, nodata, None, None, false, unscale).await?
         } else {
             render_wgs84_bbox(engine, cogs, bounds, w, h, shape, &one, resample, OutputFormat::RawF32, nodata, None, None, shape.is_some(), unscale).await?
         };

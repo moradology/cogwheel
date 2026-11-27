@@ -650,7 +650,7 @@ pub fn get_colormap_image(
             rgba[o + 3] = a;
         }
     }
-    Ok(crate::titiler::encode_rgba_output(w, h, &rgba, format, false))
+    Ok(crate::stats::encode_rgba_output(w, h, &rgba, format, false))
 }
 
 // ============================================================================

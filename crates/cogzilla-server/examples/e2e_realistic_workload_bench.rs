@@ -19,7 +19,7 @@ use cogzilla_io::CogStore;
 use cogzilla_kernel::{ColormapName, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode};
 use cogzilla_proj::TileCoord;
 use cogzilla_server::engine::{BandRequest, TileEngine, TileRequest};
-use cogzilla_server::titiler::{
+use cogzilla_server::stats::{
     PolygonMask, StatsOptions, render_wgs84_bbox, render_wgs84_bbox_stats,
 };
 use cogzilla_server::zonal::compute_native_exact_polygon_stats;
