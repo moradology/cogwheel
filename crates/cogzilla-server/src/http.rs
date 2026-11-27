@@ -5920,6 +5920,10 @@ where
                     // `pixel_selection`, and pass over any value of it.
                     pq.keys.retain(|k| k != "pixel_selection");
                     pq.errors.retain(|e| !e.starts_with("unsupported pixel_selection"));
+                    // What the route does not read, titiler-pgstac passes over: not checked,
+                    // and not seen by the routes' own checks of what each takes.
+                    pq.errors.retain(|e| !pgstac::item_passes_over_error(&method, rest, e));
+                    pq.keys.retain(|k| !pgstac::item_passes_over(&method, rest, k));
                     pq.pixel_selection = Selection::First;
                     // Band math on an item's point is applied to the `/stac` answer by
                     // `pgstac::item_fixup`, with TiTiler's names: `/stac` must not apply it first.

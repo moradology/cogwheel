@@ -1498,6 +1498,23 @@ def main() -> int:
         o.check("item statistics, band math on one asset", "stats", f"{it}/statistics?assets=visual&max_size=64&expression=b1-b3;where(b1%3Eb2,1,0)")
         o.check("item statistics, band math by an asset's name", "status",
                 f"{it}/statistics?assets=nir&assets=red&asset_as_band=true&max_size=64&expression=(nir-red)/(nir%2Bred)")
+        # What an item's route reads FastAPI validates first, a 422; what it does not read
+        # titiler-pgstac passes over, whatever it holds.
+        ibox = f"{it}/bbox/{ilon - 0.05},{ilat - 0.05},{ilon + 0.05},{ilat + 0.05}/32x32.png"
+        for label, method, url in (
+            ("tile, nodata unreadable", "GET", f"{itile}.png?assets=red&nodata=abc"),
+            ("tile, return_mask unreadable", "GET", f"{itile}.png?assets=red&return_mask=maybe"),
+            ("tile, a size passed over", "GET", f"{itile}.png?assets=red&max_size=abc&dst_crs=nope"),
+            ("box, buffer and crs passed over", "GET", f"{ibox}?assets=red&buffer=abc&crs=nope"),
+            ("box, a width passed over beside its own size", "GET", f"{ibox}?assets=red&width=abc"),
+            ("box, coord_crs unreadable", "GET", f"{ibox}?assets=red&coord_crs=nope"),
+            ("preview, coord_crs passed over", "GET", f"{it}/preview.png?assets=red&max_size=64&coord_crs=nope"),
+            ("statistics, return_mask passed over", "GET", f"{it}/statistics?assets=red&max_size=64&return_mask=maybe"),
+            ("info, everything passed over", "GET", f"{it}/info?assets=red&width=abc&nodata=abc&dst_crs=nope"),
+            ("map, coord_crs passed over", "GET", f"{it}/WebMercatorQuad/map.html?assets=red&coord_crs=nope&width=abc"),
+            ("point, coord_crs unreadable", "GET", f"{it}/point/{ilon},{ilat}?assets=red&coord_crs=nope"),
+        ):
+            o.check(f"item {label}", "status", url, method)
         # An item's statistics of a posted feature are worked out as a mosaic of the item's:
         # its pixels covered by fractions, in `dst_crs`, finer with `cover_scale`.
         iwedge = {"type": "Feature", "id": "w", "properties": {"name": "wedge"}, "geometry": {"type": "Polygon", "coordinates": [[
