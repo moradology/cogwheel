@@ -1816,6 +1816,14 @@ fn gpu_band_stats_to_json(
     serde_json::Value::Object(obj)
 }
 
+/// The rank rio-tiler takes a quantile `q` (0 to 1) at among `n` sorted values: with every
+/// pixel's weight 1, `numpy.searchsorted(cumsum, q * n)` is the first value whose count reaches
+/// `q * n`, so an even count's median is the lower of its two middle values.
+pub(crate) fn quantile_rank(n: usize, q: f64) -> usize {
+    let target = q * n as f64;
+    (target.ceil() as usize).saturating_sub(1).min(n.saturating_sub(1))
+}
+
 pub(crate) fn percentile_key(p: f64) -> String {
     if p.fract() == 0.0 {
         format!("percentile_{}", p as i64)
@@ -1907,11 +1915,11 @@ impl BandStatsAcc {
                 k as f32
             }
         };
-        let rank_med = valid_px / 2;
+        let rank_med = quantile_rank(valid_px, 0.5);
         let p_ranks: Vec<usize> = opts
             .percentiles
             .iter()
-            .map(|&p| (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize).min(valid_px - 1))
+            .map(|&p| quantile_rank(valid_px, p.clamp(0.0, 100.0) / 100.0))
             .collect();
         let mut p_vals: Vec<f32> = vec![f32::NAN; p_ranks.len()];
 
@@ -2119,15 +2127,11 @@ impl BandStatsAcc {
             .map(|r| r.len() as u64)
             .collect();
         let std = (var_sum / n_f).sqrt() * var_scale;
-        let median = vals[valid_px / 2];
+        let median = vals[quantile_rank(valid_px, 0.5)];
         let p_vals: Vec<T> = opts
             .percentiles
             .iter()
-            .map(|&p| {
-                let idx = (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize)
-                    .min(valid_px - 1);
-                vals[idx]
-            })
+            .map(|&p| vals[quantile_rank(valid_px, p.clamp(0.0, 100.0) / 100.0)])
             .collect();
         build_band_stats_json(
             min,
@@ -10085,4 +10089,24 @@ async fn render_mixed_grid_bbox(
         cf.apply_buffer_in_place(&mut rgba, 4);
     }
     Ok(encode_rgba_output(w, h, &rgba, format, return_mask))
+}
+
+#[cfg(test)]
+mod quantile_rank_tests {
+    use super::quantile_rank;
+
+    #[test]
+    fn ranks_are_rio_tilers() {
+        // An even count's median is its lower middle value; an odd count's, its middle one.
+        assert_eq!(quantile_rank(4, 0.5), 1);
+        assert_eq!(quantile_rank(5, 0.5), 2);
+        assert_eq!(quantile_rank(65536, 0.5), 32767);
+        // A whole `q * n` is that many values in: the last of them.
+        assert_eq!(quantile_rank(100, 0.02), 1);
+        assert_eq!(quantile_rank(65536, 0.25), 16383);
+        // Otherwise the value whose count first passes it.
+        assert_eq!(quantile_rank(50577, 0.02), 1011);
+        assert_eq!(quantile_rank(50577, 0.98), 49565);
+        assert_eq!((quantile_rank(1, 0.5), quantile_rank(0, 0.5), quantile_rank(7, 0.0), quantile_rank(7, 1.0)), (0, 0, 0, 6));
+    }
 }
