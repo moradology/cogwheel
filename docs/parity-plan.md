@@ -311,7 +311,7 @@ Every route and documented parameter of titiler-pgstac 3.2.2 was sent to both se
 
 - (Closed 2026-11-25.) Resampling and reproject methods on mosaics other than nearest, bilinear and cubic were a `400` (29): `average`, `mode`, `max`, `min`, `med`, `q1`, `q3`, `sum`, `rms`, `gauss`.
 - (`algorithm_params`, `buffer` with `algorithm`, and tile sizes other than 256 and 512 under `algorithm`, closed 2026-11-26.) Such a tile as a bare array, or as `.npy` under `algorithm`, is a `400` on mosaic routes; hillshade there is the size asked for where TiTiler crops its own buffer (294 for 300).
-- `padding` changes nothing.
+- `padding` changes nothing, and is left so (decided 2026-11-26). In titiler-pgstac a padded tile is read through a larger window, which changes the overview chosen and the source pixels: 43% of a nearest tile's pixels and 99.6% of a bilinear one's differ from its own unpadded tile. That is GDAL's warp, not a better edge, and is not followed.
 - A `.tif` of 16-bit or float data is a picture, or float32 without a mask when the renderer draws it; titiler-pgstac writes the data in its own type and a mask. A tile's `.npy` (without a `buffer`) has no mask band and is float32 where titiler-pgstac keeps the type.
 - `pixel_selection` by the last band with one band is a `400` (5): titiler-pgstac's answer is one band of zeros, the key band dropped, and is not followed.
 - (Lines and points on statistics and features, `tile_format=tif` and `pngraw` in WMTS, and `f=html` on the tileset routes, closed 2026-11-26.)
