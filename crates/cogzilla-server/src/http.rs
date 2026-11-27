@@ -1377,7 +1377,17 @@ fn build_band_request(
         // A terrain algorithm over band math reads the expression's first output, as rio-tiler
         // gives the algorithm the expression's results.
         let dem_math = match pq.expr_raw.as_deref().and_then(|expr| expression_parts(expr).next()) {
-            Some(first) => Some(ExprProgram::compile(first).map_err(EngineError::BadRequest)?),
+            Some(first) => {
+                let prog = ExprProgram::compile(first).map_err(EngineError::BadRequest)?;
+                // The elevations are read where the bands are: an expression that reads
+                // none has no raster to read them over.
+                if prog.used_bands.is_empty() {
+                    return Err(EngineError::BadRequest(format!(
+                        "a terrain algorithm's expression must read a band: '{first}'"
+                    )));
+                }
+                Some(prog)
+            }
             None => None,
         };
         match def.id {

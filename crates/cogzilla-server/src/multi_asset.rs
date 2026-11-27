@@ -132,6 +132,13 @@ pub(crate) async fn render_mixed_grid_bbox(
                             (at + 1) as u16
                         })
                         .collect();
+                    // Rasters on different grids would come back here from the mixed-grid
+                    // fallback; the expression is not resampled onto a common grid for these.
+                    if !crate::engine::cogs_share_base_grid(&read) {
+                        return Err(EngineError::BadRequest(
+                            "a terrain algorithm over band math reads assets on one grid".into(),
+                        ));
+                    }
                     read
                 } else {
                     return Err(EngineError::BadRequest(

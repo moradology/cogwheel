@@ -217,6 +217,15 @@ where
                     .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
             });
             if is_dem_alg {
+                // Band math reads the stack the image routes read: asset names rewritten and
+                // each asset's bands in its own slots.
+                let mut pq_dem = pq.clone();
+                let (cogs, dem_slots) = if pq.expr_raw.is_some() {
+                    expand_stac_asset_bidx(&mut pq_dem, &names, cogs.clone(), rewritten_expr.clone(), stac_prefix == "stac")?
+                } else {
+                    (cogs.clone(), None)
+                };
+                let pq = &pq_dem;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -225,13 +234,14 @@ where
                 let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
-                let mut bands = build_band_request(&pq, db, full.sample_type)?;
+                let mut bands = build_band_request(pq, db, full.sample_type)?;
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs, None);
+                    apply_unscale_cogs(&mut bands, &cogs, dem_slots.as_deref());
                 }
-                let stats_opts = build_stats_options(&pq, false)?;
+                let stats_opts = build_stats_options(pq, false)?;
                 let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
-                if matches!(
+                if dem_slots.is_none()
+                    && matches!(
                     bands,
                     BandRequest::Single { .. }
                         | BandRequest::Dem { .. }
@@ -261,12 +271,16 @@ where
                         "application/json",
                     ));
                 }
-                let raw = render_native_preview(
+                let raw = render_stac_bbox_opt(
                     &engine,
                     &cogs,
+                    dem_slots.as_deref(),
                     bbox,
+                    &cogzilla_proj::CrsModel::Geographic,
+                    true,
                     out_w,
                     out_h,
+                    None,
                     &bands,
                     pq.resample,
                     OutputFormat::RawF32,
@@ -488,6 +502,15 @@ where
             if post_hist.is_some() {
                 stats_opts_post.hist_dtype = post_hist;
             }
+            // A terrain algorithm's band math reads the stack the image routes read.
+            let (cogs, pq, dem_slots) = if is_dem_alg && pq.expr_raw.is_some() {
+                let mut pq_dem = pq.clone();
+                let (cogs, slots) =
+                    expand_stac_asset_bidx(&mut pq_dem, &names, cogs, rewritten_expr.clone(), stac_prefix == "stac")?;
+                (cogs, pq_dem, slots)
+            } else {
+                (cogs, pq, None)
+            };
             let eng_stac = engine.clone();
             let pq_stac = pq.clone();
             let compute_stac_merged_stats = move |mask: Arc<PolygonMask>, poly_bbox: [f64; 4]| {
@@ -507,6 +530,7 @@ where
                 let slots_c = post_slots.clone();
                 let alg_c = pq_stac.algorithm.clone();
                 let pq_clone = pq_stac.clone();
+                let dem_slots_c = dem_slots.clone();
                 let n = names_c.len();
                 async move {
                     if is_dem_alg || expr_progs_c.is_some() {
@@ -538,10 +562,11 @@ where
                             let (out_w, out_h) = resolve_query_dims(def_w, def_h, width_opt, height_opt);
                             let n_px = (out_w as usize) * (out_h as usize);
                             if unscale {
-                                apply_unscale_cogs(&mut bands, &cogs_c, None);
+                                apply_unscale_cogs(&mut bands, &cogs_c, dem_slots_c.as_deref());
                             }
                             let alg_name = alg_c.as_deref().unwrap_or("algorithm");
-                            if matches!(
+                            if dem_slots_c.is_none()
+                                && matches!(
                                 bands,
                                 BandRequest::Single { .. }
                                     | BandRequest::Dem { .. }
@@ -559,11 +584,20 @@ where
                                 map.insert("b1".into(), stat);
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
-                            let raw = render_wgs84_bbox(
-                                &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
-                                resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
-                            )
-                            .await?;
+                            let raw = if let Some(slots) = dem_slots_c.as_deref() {
+                                render_stac_bbox_opt(
+                                    &eng, &cogs_c, Some(slots), poly_bbox, &cogzilla_proj::CrsModel::Geographic, false,
+                                    out_w, out_h, Some(&mask), &bands, resample, OutputFormat::RawF32, nodata, None, None,
+                                    true, unscale,
+                                )
+                                .await?
+                            } else {
+                                render_wgs84_bbox(
+                                    &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
+                                    resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
+                                )
+                                .await?
+                            };
                             let nb = if n_px > 0 && raw.len() >= n_px * 4 {
                                 (raw.len() / (n_px * 4)).clamp(1, 16)
                             } else {
