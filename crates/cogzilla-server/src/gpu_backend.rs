@@ -111,6 +111,14 @@ pub struct GpuBackend {
     in_flight: AtomicUsize,
 }
 
+impl GpuBackend {
+    /// Number of GPU tile/render operations currently executing.
+    #[inline]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
 struct InFlightGuard<'a>(&'a AtomicUsize);
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {

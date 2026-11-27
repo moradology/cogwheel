@@ -180,8 +180,49 @@ pub struct TileRequest {
 /// algorithms, terrain encodings, spectral indices, SAR dB, and custom band-math expressions.
 #[inline]
 pub(crate) fn needs_source_unscale(bands: &BandRequest, format: OutputFormat) -> bool {
-    matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
-        || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
+    matches!(
+        format,
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64
+    ) || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
+}
+
+/// Wrap raw band-major little-endian `f32` tile bytes into the requested float output format
+/// (`RawF32`, `Npy`, `RawF64`, or `NpyF64`) so float64 requests on multi-COG/mosaic paths never
+/// fall through to RGBA8.
+fn format_float_tile(raw_f32: Bytes, bands: usize, tile_size: u32, fmt: OutputFormat) -> Bytes {
+    match fmt {
+        OutputFormat::Npy => cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+            raw_f32,
+            bands,
+            tile_size,
+            tile_size,
+            true,
+        ),
+        OutputFormat::RawF64 => {
+            let mut out = bytes::BytesMut::with_capacity(raw_f32.len() * 2);
+            for chunk in raw_f32.chunks_exact(4) {
+                let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.freeze()
+        }
+        OutputFormat::NpyF64 => {
+            let vals: Vec<f64> = raw_f32
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .collect();
+            cogzilla_kernel::encode_npy_typed_f64(
+                &vals,
+                bands,
+                tile_size as usize,
+                tile_size as usize,
+                cogzilla_tiff::SampleType::Float64,
+                None,
+                true,
+            )
+        }
+        _ => raw_f32,
+    }
 }
 
 #[derive(Default)]
@@ -493,11 +534,16 @@ impl TileEngine {
         let seen = self.tile_cache_epoch.load(Ordering::Relaxed);
         if cur != seen && self.tile_cache_epoch.swap(cur, Ordering::AcqRel) != cur {
             self.tile_cache.clear();
-            #[cfg(feature = "gpu")]
-            if let Some(gpu) = &self.gpu {
-                gpu.slab_cache.clear();
-                gpu.multi_slab_cache.clear();
-            }
+            self.clear_gpu_caches();
+        }
+    }
+
+    /// Synchronously clear all GPU VRAM slab caches (used by `/admin/clear-cache` and epoch sync).
+    pub fn clear_gpu_caches(&self) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            gpu.slab_cache.clear();
+            gpu.multi_slab_cache.clear();
         }
     }
 
@@ -2050,7 +2096,10 @@ impl TileEngine {
             return self.render_tile(&cogs[0], req).await;
         }
         self.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
-        if req.format == OutputFormat::Npy {
+        if matches!(
+            req.format,
+            OutputFormat::Npy | OutputFormat::RawF64 | OutputFormat::NpyF64
+        ) {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
             let raw = match raw_req.tile_size {
@@ -2062,22 +2111,8 @@ impl TileEngine {
                     )));
                 }
             };
-            let nb = match req.bands {
-                BandRequest::Rgb { .. }
-                | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. }
-                | BandRequest::CustomExprRgb { .. } => 3,
-                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
-                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
-                _ => 1,
-            };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                raw,
-                nb,
-                req.tile_size,
-                req.tile_size,
-                true,
-            ));
+            let nb = Self::value_bands(&req.bands);
+            return Ok(format_float_tile(raw, nb, req.tile_size, req.format));
         }
         match req.tile_size {
             256 => self.render_multi_cog_sized::<256>(cogs, req).await,
@@ -2758,11 +2793,16 @@ impl TileEngine {
         Ok((planes, sample_type))
     }
 
-    /// How many bands of values a request's scenes hold: three for a colour composite, else one.
+    /// How many bands of values a request's scenes hold: three for a colour composite or terrain
+    /// encoding, N for multi-band / multi-expression requests, else one.
     pub fn value_bands(bands: &BandRequest) -> usize {
         match bands {
-            BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+            BandRequest::Rgb { .. }
+            | BandRequest::SarRgb { .. }
+            | BandRequest::Terrain { .. }
+            | BandRequest::CustomExprRgb { .. } => 3,
             BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+            BandRequest::CustomExprMulti { progs } => progs.len().max(1),
             _ => 1,
         }
     }
@@ -2918,9 +2958,12 @@ impl TileEngine {
             return Ok((bytes, Vec::new()));
         }
 
-        // RawF32 / Npy mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
-        // and early exit once every pixel has valid data.
-        if matches!(req.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+        // RawF32 / RawF64 / Npy / NpyF64 mosaic path: composite real float band-major planes (CHW)
+        // with NaN transparency and early exit once every pixel has valid data.
+        if matches!(
+            req.format,
+            OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64
+        ) {
             let mut canvas = vec![f32::NAN; f32_bands * total_pixels];
             let mut filled = 0usize;
             let mut scene_req = req.clone();
@@ -3003,21 +3046,9 @@ impl TileEngine {
                 {
                     return Err(err);
                 }
-                if req.format == OutputFormat::Npy {
-                    let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
-                    return Ok((
-                        cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                            raw,
-                            f32_bands,
-                            req.tile_size,
-                            req.tile_size,
-                            true,
-                        ),
-                        failed_assets,
-                    ));
-                }
+                let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
                 return Ok((
-                    empty_tile_bytes(req.tile_size, req.format, f32_bands),
+                    format_float_tile(raw, f32_bands, req.tile_size, req.format),
                     failed_assets,
                 ));
             }
@@ -3026,19 +3057,10 @@ impl TileEngine {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             let raw = out.freeze();
-            if req.format == OutputFormat::Npy {
-                return Ok((
-                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                        raw,
-                        f32_bands,
-                        req.tile_size,
-                        req.tile_size,
-                        true,
-                    ),
-                    failed_assets,
-                ));
-            }
-            return Ok((raw, failed_assets));
+            return Ok((
+                format_float_tile(raw, f32_bands, req.tile_size, req.format),
+                failed_assets,
+            ));
         }
 
         let mut canvas = vec![0u8; total_pixels * 4];
@@ -3130,24 +3152,13 @@ impl TileEngine {
             self.stats
                 .empty_short_circuits
                 .fetch_add(1, Ordering::Relaxed);
-            let f32_bands = match req.bands {
-                BandRequest::Rgb { .. }
-                | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. }
-                | BandRequest::CustomExprRgb { .. } => 3,
-                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
-                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
-                _ => 1,
-            };
-            if req.format == OutputFormat::Npy {
+            let f32_bands = Self::value_bands(&req.bands);
+            if matches!(
+                req.format,
+                OutputFormat::Npy | OutputFormat::RawF64 | OutputFormat::NpyF64
+            ) {
                 let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
-                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                    raw,
-                    f32_bands,
-                    req.tile_size,
-                    req.tile_size,
-                    true,
-                ));
+                return Ok(format_float_tile(raw, f32_bands, req.tile_size, req.format));
             }
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
@@ -3579,5 +3590,70 @@ mod tests {
             tile_fetch_range_for_plan(&plan, ResampleMode::Average, false, &ifd);
         assert_eq!(tx0, 0, "footprint sx=16 at u=260 must fetch left neighbor tile 0");
         assert_eq!(ty0, 0, "footprint sy=16 at v=260 must fetch top neighbor tile 0");
+    }
+
+    #[test]
+    fn value_bands_covers_custom_expr_and_terrain() {
+        let p = cogzilla_kernel::ExprProgram::compile("b1").unwrap();
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::CustomExprRgb {
+                progs: [p.clone(), p.clone(), p.clone()],
+                rescale_min: [0.0; 3],
+                rescale_max: [1.0; 3],
+            }),
+            3
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::CustomExprMulti {
+                progs: vec![p.clone(), p.clone(), p.clone(), p.clone()],
+            }),
+            4
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::Terrain {
+                band_1based: 1,
+                encoding: cogzilla_kernel::TerrainEncoding::Terrarium,
+            }),
+            3
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::MultiBand {
+                bands_1based: vec![1, 2],
+            }),
+            2
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::Single {
+                band_1based: 1,
+                rescale: (0.0, 255.0),
+                colormap: ColormapName::Grayscale,
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn format_float_tile_handles_raw_f64_and_npy_f64() {
+        let raw_f32: Vec<u8> = [1.5f32, -2.0, 0.25, f32::NAN]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let raw64 = format_float_tile(Bytes::from(raw_f32.clone()), 1, 2, OutputFormat::RawF64);
+        assert_eq!(raw64.len(), 4 * 8);
+        let vals: Vec<f64> = raw64
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(vals[0], 1.5);
+        assert_eq!(vals[1], -2.0);
+        assert_eq!(vals[2], 0.25);
+        assert!(vals[3].is_nan());
+
+        let npy64 = format_float_tile(Bytes::from(raw_f32), 1, 2, OutputFormat::NpyF64);
+        assert_eq!(&npy64[..6], b"\x93NUMPY");
+        let hdr_len = u16::from_le_bytes([npy64[8], npy64[9]]) as usize;
+        let hdr = std::str::from_utf8(&npy64[10..10 + hdr_len]).unwrap();
+        assert!(hdr.contains("<f8"), "expected float64 dtype, got {hdr}");
+        assert!(hdr.contains("(2, 2, 2)"), "expected (band+mask, 2, 2), got {hdr}");
     }
 }

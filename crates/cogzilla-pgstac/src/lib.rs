@@ -292,6 +292,38 @@ impl<V: Clone> TtlCache<V> {
         }
         map.insert(key, (Instant::now(), value));
     }
+
+    fn clear(&self) {
+        self.entries.lock().clear();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+}
+
+/// Snapshot of pgSTAC connection pool and TTL cache occupancy for `/stats` and `/metrics`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PgStacStats {
+    pub pool_size: usize,
+    pub pool_available: usize,
+    pub pool_waiting: usize,
+    pub cache_items: usize,
+    pub cache_searches: usize,
+    pub cache_collections: usize,
+    pub cache_item_docs: usize,
+    pub cache_plans: usize,
+}
+
+impl PgStacStats {
+    /// Total entries currently held across all pgSTAC TTL caches.
+    pub fn total_cache_entries(&self) -> usize {
+        self.cache_items
+            + self.cache_searches
+            + self.cache_collections
+            + self.cache_item_docs
+            + self.cache_plans
+    }
 }
 
 /// A pooled connection to one pgSTAC database.
@@ -352,6 +384,40 @@ impl PgStac {
         let client = self.client().await?;
         let row = client.query_one("SELECT get_version()", &[]).await?;
         row.try_get(0).map_err(|e| PgStacError::Shape(e.to_string()))
+    }
+
+    /// Clear all in-memory pgSTAC TTL caches (items, searches, collections, item docs, and lean plans).
+    pub fn clear_caches(&self) {
+        if let Some(c) = &self.items {
+            c.clear();
+        }
+        if let Some(c) = &self.searches {
+            c.clear();
+        }
+        if let Some(c) = &self.collections {
+            c.clear();
+        }
+        if let Some(c) = &self.item_docs {
+            c.clear();
+        }
+        if let Some(c) = &self.plans {
+            c.clear();
+        }
+    }
+
+    /// Snapshot current deadpool-postgres pool status and TTL cache entry counts.
+    pub fn stats(&self) -> PgStacStats {
+        let s = self.pool.status();
+        PgStacStats {
+            pool_size: s.size,
+            pool_available: s.available,
+            pool_waiting: s.waiting,
+            cache_items: self.items.as_ref().map_or(0, TtlCache::len),
+            cache_searches: self.searches.as_ref().map_or(0, TtlCache::len),
+            cache_collections: self.collections.as_ref().map_or(0, TtlCache::len),
+            cache_item_docs: self.item_docs.as_ref().map_or(0, TtlCache::len),
+            cache_plans: self.plans.as_ref().map_or(0, TtlCache::len),
+        }
     }
 
     /// Register a search (or return the existing row for an identical one), as
@@ -806,5 +872,21 @@ mod tests {
         let l = SearchLimits::default();
         assert_eq!((l.scan_limit, l.items_limit, l.time_limit_secs), (10_000, 100, 5));
         assert!(l.exitwhenfull && l.skipcovered);
+    }
+
+    #[test]
+    fn ttl_cache_clear_and_len() {
+        let cache = TtlCache {
+            ttl: Duration::from_secs(60),
+            max_entries: 8,
+            entries: Mutex::new(Default::default()),
+        };
+        assert_eq!(cache.len(), 0);
+        cache.put("k1".into(), 1usize);
+        cache.put("k2".into(), 2usize);
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get("k1").is_none());
     }
 }

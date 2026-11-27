@@ -5541,7 +5541,12 @@ where
     let is_post = *req.method() == Method::POST;
     let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
     let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics" | "/stats");
-    let bypass_aimd = is_health_or_metrics || *req.method() == Method::OPTIONS;
+    let is_control_plane = is_health_or_metrics
+        || matches!(
+            req.uri().path(),
+            "/admin/clear-cache" | "/searches" | "/searches/list" | "/searches/register"
+        );
+    let bypass_aimd = is_control_plane || *req.method() == Method::OPTIONS;
     let mut aimd_permit = if bypass_aimd {
         None
     } else {
@@ -5607,7 +5612,8 @@ where
     if let Some(permit) = aimd_permit.as_mut()
         && (resp.status().is_client_error()
             || resp.status().is_server_error()
-            || resp.status() == StatusCode::NOT_MODIFIED)
+            || resp.status() == StatusCode::NOT_MODIFIED
+            || resp.status() == StatusCode::NO_CONTENT)
     {
         permit.ignore_rtt();
     }
@@ -5945,6 +5951,42 @@ where
                 "read_errors": s.read_errors,
             })
         });
+        #[cfg(feature = "gpu")]
+        let gpu_stats = engine.gpu.as_ref().map(|gpu| {
+            let s = gpu.slab_cache.stats();
+            let ms = gpu.multi_slab_cache.stats();
+            serde_json::json!({
+                "dispatches": engine.stats.gpu_dispatches.load(Ordering::Relaxed),
+                "in_flight": gpu.in_flight(),
+                "slab_cache": {
+                    "hits": s.hits,
+                    "misses": s.misses,
+                    "bytes_used": s.used_bytes,
+                    "max_bytes": s.max_bytes,
+                },
+                "multi_slab_cache": {
+                    "hits": ms.hits,
+                    "misses": ms.misses,
+                    "bytes_used": ms.used_bytes,
+                    "max_bytes": ms.max_bytes,
+                },
+            })
+        });
+        #[cfg(not(feature = "gpu"))]
+        let gpu_stats: Option<serde_json::Value> = None;
+        let pgstac_stats = engine.pgstac().map(|pg| {
+            let s = pg.stats();
+            serde_json::json!({
+                "pool_size": s.pool_size,
+                "pool_available": s.pool_available,
+                "pool_waiting": s.pool_waiting,
+                "cache_items": s.cache_items,
+                "cache_searches": s.cache_searches,
+                "cache_collections": s.cache_collections,
+                "cache_item_docs": s.cache_item_docs,
+                "cache_plans": s.cache_plans,
+            })
+        });
         let body = serde_json::json!({
             "tiles_served": engine.stats.tiles_served.load(Ordering::Relaxed),
             "empty_short_circuits": engine.stats.empty_short_circuits.load(Ordering::Relaxed),
@@ -5964,6 +6006,8 @@ where
             "remote_range_requests": engine.store.metrics.remote_range_requests.load(Ordering::Relaxed),
             "remote_bytes_fetched": engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed),
             "disk_cache": disk,
+            "gpu": gpu_stats,
+            "pgstac": pgstac_stats,
         })
         .to_string();
         return Ok(plain_resp(StatusCode::OK, Bytes::from(body), "application/json"));
@@ -5982,8 +6026,12 @@ where
         engine.store.clear_open_uris();
         engine.store.cache.clear();
         engine.tile_cache.clear();
+        engine.clear_gpu_caches();
         engine.stac_cache.clear();
         engine.mosaicjson_cache.clear();
+        if let Some(pg) = engine.pgstac() {
+            pg.clear_caches();
+        }
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"cleared"), "text/plain"));
     }
 
@@ -6111,7 +6159,12 @@ where
         };
         let list = matches!(segs[..], ["searches"] | ["searches", "" | "list"]);
         let cacheable = method == Method::GET && !list;
-        let resp = Box::pin(pgstac::handle(ctx, &method, &segs, pq, req)).await;
+        let mut resp = Box::pin(pgstac::handle(ctx, &method, &segs, pq, req)).await;
+        if list && method == Method::GET && resp.status() == StatusCode::OK {
+            // Prevent handle_request's default GET Cache-Control from caching live search listings.
+            resp.headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         return Ok(if cacheable { pgstac_cacheable(resp, &Method::GET) } else { resp });
     }
     if pq.keys.iter().any(|k| k == "pixel_selection") && !route_supports_pixel_selection(&segs) {
@@ -11517,6 +11570,50 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
         let _ = writeln!(out, "cogzilla_disk_cache_misses_total {}", s.misses);
         let _ = writeln!(out, "# TYPE cogzilla_disk_cache_bytes gauge");
         let _ = writeln!(out, "cogzilla_disk_cache_bytes {}", s.bytes_used);
+    }
+
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = &engine.gpu {
+        let s = gpu.slab_cache.stats();
+        let ms = gpu.multi_slab_cache.stats();
+        let _ = writeln!(out, "# HELP cogzilla_gpu_dispatches_total Total GPU compute dispatches.");
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_dispatches_total counter");
+        let _ = writeln!(
+            out,
+            "cogzilla_gpu_dispatches_total {}",
+            engine.stats.gpu_dispatches.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "# HELP cogzilla_gpu_in_flight Current in-flight GPU operations.");
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_in_flight gauge");
+        let _ = writeln!(out, "cogzilla_gpu_in_flight {}", gpu.in_flight());
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_hits_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_slab_cache_hits_total {}", s.hits);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_misses_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_slab_cache_misses_total {}", s.misses);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_bytes gauge");
+        let _ = writeln!(out, "cogzilla_gpu_slab_cache_bytes {}", s.used_bytes);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_hits_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_hits_total {}", ms.hits);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_misses_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_misses_total {}", ms.misses);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_bytes gauge");
+        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_bytes {}", ms.used_bytes);
+    }
+
+    if let Some(pg) = engine.pgstac() {
+        let s = pg.stats();
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_size Current pgSTAC connection pool size.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_size gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_pool_size {}", s.pool_size);
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_available Available idle pgSTAC connections.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_available gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_pool_available {}", s.pool_available);
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_waiting Tasks waiting for a pgSTAC connection.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_waiting gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_pool_waiting {}", s.pool_waiting);
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_cache_entries Total entries across pgSTAC TTL caches.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_cache_entries gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_cache_entries {}", s.total_cache_entries());
     }
     out
 }
