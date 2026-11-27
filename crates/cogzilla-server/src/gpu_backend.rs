@@ -171,222 +171,18 @@ pub fn stitch_band_source_geom(src: &BandSource<'_>) -> Option<(u32, u32, u32, u
 /// sparse blocks, nodata override, scale/offset) directly into a caller-provided `out` slice
 /// (e.g. a `mapped_at_creation` GPU buffer) using block-wise hoisted SIMD-friendly loops.
 pub fn stitch_band_source_into(src: &BandSource<'_>, w: u32, h: u32, out: &mut [f32]) {
-    use cogzilla_codec::BandData;
-
     let w_us = w as usize;
     let h_us = h as usize;
-    let tw = src.tile_w as usize;
     let th = src.tile_h as usize;
-    let nd_ovr = src.nodata_override;
-    let sc_off = src.scale_offset;
-
-    // Only pre-fill NaN if any block is missing/all_nodata or shorter than the tile grid.
-    let all_full = (src.grid_w as usize * tw == w_us)
-        && (src.grid_h as usize * th == h_us)
-        && src.blocks.iter().all(|b| {
-            b.is_some_and(|blk| {
-                !blk.stats.all_nodata && blk.width as usize == tw && blk.height as usize == th
-            })
-        });
-    if !all_full {
-        out[..w_us * h_us].fill(f32::NAN);
+    if w_us == 0 || h_us == 0 || th == 0 {
+        return;
     }
-
-    for gy in 0..src.grid_h as usize {
-        let dst_y0 = gy * th;
-        if dst_y0 >= h_us {
+    let strip_elems = th * w_us;
+    for (gy, strip) in out[..w_us * h_us].chunks_mut(strip_elems).enumerate() {
+        if gy >= src.grid_h as usize {
             break;
         }
-        let max_rows = (h_us - dst_y0).min(th);
-        for gx in 0..src.grid_w as usize {
-            let dst_x0 = gx * tw;
-            if dst_x0 >= w_us {
-                break;
-            }
-            let max_cols = (w_us - dst_x0).min(tw);
-            let Some(blk) = src.blocks[gy * (src.grid_w as usize) + gx] else {
-                continue;
-            };
-            if blk.stats.all_nodata {
-                continue;
-            }
-            let copy_h = max_rows.min(blk.height as usize);
-            let copy_w = max_cols.min(blk.width as usize);
-            if copy_h == 0 || copy_w == 0 {
-                continue;
-            }
-
-            match &blk.data {
-                BandData::F32(slab) => {
-                    let sdata = slab.as_slice();
-                    if nd_ovr.is_none() && sc_off.is_none() {
-                        for ly in 0..copy_h {
-                            let s0 = ly * tw;
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            out[d0..d0 + copy_w].copy_from_slice(&sdata[s0..s0 + copy_w]);
-                        }
-                    } else {
-                        for ly in 0..copy_h {
-                            let srow = &sdata[ly * tw..ly * tw + copy_w];
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (d, &v) in drow.iter_mut().zip(srow) {
-                                let mut val = v;
-                                if let Some(nd) = nd_ovr
-                                    && val == nd
-                                {
-                                    val = f32::NAN;
-                                }
-                                if let Some((sc, off)) = sc_off
-                                    && !val.is_nan()
-                                {
-                                    val = val * sc + off;
-                                }
-                                *d = val;
-                            }
-                        }
-                    }
-                }
-                BandData::F64(data) => {
-                    for ly in 0..copy_h {
-                        let srow = &data[ly * tw..ly * tw + copy_w];
-                        let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                        let drow = &mut out[d0..d0 + copy_w];
-                        for (d, &v) in drow.iter_mut().zip(srow) {
-                            let mut val = v as f32;
-                            if let Some(nd) = nd_ovr
-                                && val == nd
-                            {
-                                val = f32::NAN;
-                            }
-                            if let Some((sc, off)) = sc_off
-                                && !val.is_nan()
-                            {
-                                val = val * sc + off;
-                            }
-                            *d = val;
-                        }
-                    }
-                }
-                BandData::U16 { data, nodata } => {
-                    let nd_u16 = *nodata;
-                    if nd_u16.is_none() && nd_ovr.is_none() && sc_off.is_none() {
-                        for ly in 0..copy_h {
-                            let srow = &data[ly * tw..ly * tw + copy_w];
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (d, &s) in drow.iter_mut().zip(srow) {
-                                *d = s as f32;
-                            }
-                        }
-                    } else {
-                        for ly in 0..copy_h {
-                            let srow = &data[ly * tw..ly * tw + copy_w];
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (d, &s) in drow.iter_mut().zip(srow) {
-                                let mut val = if nd_u16 == Some(s) {
-                                    f32::NAN
-                                } else {
-                                    s as f32
-                                };
-                                if let Some(nd) = nd_ovr
-                                    && val == nd
-                                {
-                                    val = f32::NAN;
-                                }
-                                if let Some((sc, off)) = sc_off
-                                    && !val.is_nan()
-                                {
-                                    val = val * sc + off;
-                                }
-                                *d = val;
-                            }
-                        }
-                    }
-                }
-                BandData::U8 { data, nodata } => {
-                    let nd_u8 = *nodata;
-                    if nd_u8.is_none() && nd_ovr.is_none() && sc_off.is_none() {
-                        for ly in 0..copy_h {
-                            let srow = &data[ly * tw..ly * tw + copy_w];
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (d, &s) in drow.iter_mut().zip(srow) {
-                                *d = s as f32;
-                            }
-                        }
-                    } else {
-                        for ly in 0..copy_h {
-                            let srow = &data[ly * tw..ly * tw + copy_w];
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (d, &s) in drow.iter_mut().zip(srow) {
-                                let mut val = if nd_u8 == Some(s) {
-                                    f32::NAN
-                                } else {
-                                    s as f32
-                                };
-                                if let Some(nd) = nd_ovr
-                                    && val == nd
-                                {
-                                    val = f32::NAN;
-                                }
-                                if let Some((sc, off)) = sc_off
-                                    && !val.is_nan()
-                                {
-                                    val = val * sc + off;
-                                }
-                                *d = val;
-                            }
-                        }
-                    }
-                }
-                BandData::RgbU8Channel {
-                    rgb,
-                    channel,
-                    nodata,
-                } => {
-                    let ch = *channel as usize;
-                    let nd_u8 = *nodata;
-                    if nd_u8.is_none() && nd_ovr.is_none() && sc_off.is_none() {
-                        for ly in 0..copy_h {
-                            let sbase = ly * tw * 3 + ch;
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (lx, d) in drow.iter_mut().enumerate() {
-                                *d = rgb[sbase + lx * 3] as f32;
-                            }
-                        }
-                    } else {
-                        for ly in 0..copy_h {
-                            let sbase = ly * tw * 3 + ch;
-                            let d0 = (dst_y0 + ly) * w_us + dst_x0;
-                            let drow = &mut out[d0..d0 + copy_w];
-                            for (lx, d) in drow.iter_mut().enumerate() {
-                                let s = rgb[sbase + lx * 3];
-                                let mut val = if nd_u8 == Some(s) {
-                                    f32::NAN
-                                } else {
-                                    s as f32
-                                };
-                                if let Some(nd) = nd_ovr
-                                    && val == nd
-                                {
-                                    val = f32::NAN;
-                                }
-                                if let Some((sc, off)) = sc_off
-                                    && !val.is_nan()
-                                {
-                                    val = val * sc + off;
-                                }
-                                *d = val;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        stitch_band_row_strip(src, w_us, gy, strip);
     }
 }
 
@@ -415,14 +211,10 @@ pub fn stitch_band_source_into_parallel(src: &BandSource<'_>, w: u32, h: u32, ou
 }
 
 fn stitch_band_row_strip(src: &BandSource<'_>, w_us: usize, gy: usize, strip: &mut [f32]) {
-    use cogzilla_codec::BandData;
-
     let tw = src.tile_w as usize;
     let th = src.tile_h as usize;
     let strip_rows = strip.len() / w_us;
     let max_rows = strip_rows.min(th);
-    let nd_ovr = src.nodata_override;
-    let sc_off = src.scale_offset;
 
     let row_blocks = &src.blocks[gy * (src.grid_w as usize)..(gy + 1) * (src.grid_w as usize)];
     let all_full = (src.grid_w as usize * tw == w_us)
@@ -450,179 +242,21 @@ fn stitch_band_row_strip(src: &BandSource<'_>, w_us: usize, gy: usize, strip: &m
         }
         let copy_h = max_rows.min(blk.height as usize);
         let copy_w = max_cols.min(blk.width as usize);
-        if copy_h == 0 || copy_w == 0 {
-            continue;
-        }
-        match &blk.data {
-            BandData::F32(slab) => {
-                let sdata = slab.as_slice();
-                if nd_ovr.is_none() && sc_off.is_none() {
-                    for ly in 0..copy_h {
-                        let s0 = ly * tw;
-                        let d0 = ly * w_us + dst_x0;
-                        strip[d0..d0 + copy_w].copy_from_slice(&sdata[s0..s0 + copy_w]);
-                    }
-                } else {
-                    for ly in 0..copy_h {
-                        let srow = &sdata[ly * tw..ly * tw + copy_w];
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (d, &v) in drow.iter_mut().zip(srow) {
-                            let mut val = v;
-                            if let Some(nd) = nd_ovr
-                                && val == nd
-                            {
-                                val = f32::NAN;
-                            }
-                            if let Some((sc, off)) = sc_off
-                                && !val.is_nan()
-                            {
-                                val = val * sc + off;
-                            }
-                            *d = val;
-                        }
-                    }
-                }
-            }
-            BandData::F64(data) => {
-                for ly in 0..copy_h {
-                    let srow = &data[ly * tw..ly * tw + copy_w];
-                    let d0 = ly * w_us + dst_x0;
-                    let drow = &mut strip[d0..d0 + copy_w];
-                    for (d, &v) in drow.iter_mut().zip(srow) {
-                        let mut val = v as f32;
-                        if let Some(nd) = nd_ovr
-                            && val == nd
-                        {
-                            val = f32::NAN;
-                        }
-                        if let Some((sc, off)) = sc_off
-                            && !val.is_nan()
-                        {
-                            val = val * sc + off;
-                        }
-                        *d = val;
-                    }
-                }
-            }
-            BandData::U16 { data, nodata } => {
-                let nd_u16 = *nodata;
-                if nd_u16.is_none() && nd_ovr.is_none() && sc_off.is_none() {
-                    for ly in 0..copy_h {
-                        let srow = &data[ly * tw..ly * tw + copy_w];
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (d, &s) in drow.iter_mut().zip(srow) {
-                            *d = s as f32;
-                        }
-                    }
-                } else {
-                    for ly in 0..copy_h {
-                        let srow = &data[ly * tw..ly * tw + copy_w];
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (d, &s) in drow.iter_mut().zip(srow) {
-                            let mut val = if nd_u16 == Some(s) {
-                                f32::NAN
-                            } else {
-                                s as f32
-                            };
-                            if let Some(nd) = nd_ovr
-                                && val == nd
-                            {
-                                val = f32::NAN;
-                            }
-                            if let Some((sc, off)) = sc_off
-                                && !val.is_nan()
-                            {
-                                val = val * sc + off;
-                            }
-                            *d = val;
-                        }
-                    }
-                }
-            }
-            BandData::U8 { data, nodata } => {
-                let nd_u8 = *nodata;
-                if nd_u8.is_none() && nd_ovr.is_none() && sc_off.is_none() {
-                    for ly in 0..copy_h {
-                        let srow = &data[ly * tw..ly * tw + copy_w];
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (d, &s) in drow.iter_mut().zip(srow) {
-                            *d = s as f32;
-                        }
-                    }
-                } else {
-                    for ly in 0..copy_h {
-                        let srow = &data[ly * tw..ly * tw + copy_w];
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (d, &s) in drow.iter_mut().zip(srow) {
-                            let mut val = if nd_u8 == Some(s) {
-                                f32::NAN
-                            } else {
-                                s as f32
-                            };
-                            if let Some(nd) = nd_ovr
-                                && val == nd
-                            {
-                                val = f32::NAN;
-                            }
-                            if let Some((sc, off)) = sc_off
-                                && !val.is_nan()
-                            {
-                                val = val * sc + off;
-                            }
-                            *d = val;
-                        }
-                    }
-                }
-            }
-            BandData::RgbU8Channel {
-                rgb,
-                channel,
-                nodata,
-            } => {
-                let ch = *channel as usize;
-                let nd_u8 = *nodata;
-                if nd_u8.is_none() && nd_ovr.is_none() && sc_off.is_none() {
-                    for ly in 0..copy_h {
-                        let sbase = ly * tw * 3 + ch;
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (lx, d) in drow.iter_mut().enumerate() {
-                            *d = rgb[sbase + lx * 3] as f32;
-                        }
-                    }
-                } else {
-                    for ly in 0..copy_h {
-                        let sbase = ly * tw * 3 + ch;
-                        let d0 = ly * w_us + dst_x0;
-                        let drow = &mut strip[d0..d0 + copy_w];
-                        for (lx, d) in drow.iter_mut().enumerate() {
-                            let s = rgb[sbase + lx * 3];
-                            let mut val = if nd_u8 == Some(s) {
-                                f32::NAN
-                            } else {
-                                s as f32
-                            };
-                            if let Some(nd) = nd_ovr
-                                && val == nd
-                            {
-                                val = f32::NAN;
-                            }
-                            if let Some((sc, off)) = sc_off
-                                && !val.is_nan()
-                            {
-                                val = val * sc + off;
-                            }
-                            *d = val;
-                        }
-                    }
-                }
-            }
-        }
+        cogzilla_kernel::copy_band_data_rect_to_f32(
+            &blk.data,
+            tw,
+            0,
+            0,
+            copy_w,
+            copy_h,
+            strip,
+            w_us,
+            dst_x0,
+            0,
+            src.nodata_override,
+            src.scale_offset,
+            false,
+        );
     }
 }
 
@@ -1781,15 +1415,15 @@ impl GpuBackend {
         self.submit_rgba_async(job, dst_w, dst_h, format, true).await
     }
 
-    /// Translate a compiled `cogzilla-kernel::ExprProgram` into GPU WGSL VM bytecode.
-    /// Returns `None` if the expression uses an op not supported by the GPU VM (e.g. `Median(n)`),
-    /// causing seamless CPU fallback.
-    pub fn compile_expr_to_gpu(prog: &ExprProgram) -> Option<Vec<GpuInstr>> {
-        if prog.ops.is_empty() || prog.ops.len() > 256 || prog.used_bands.len() > 8 {
+    /// Translate a slice of `cogzilla-kernel::expr_vm::Op` into GPU WGSL VM bytecode.
+    /// Returns `None` if any op is unsupported by the GPU VM (e.g. `Median(n)`), causing seamless
+    /// CPU fallback.
+    pub fn compile_ops_to_gpu(ops: &[Op]) -> Option<Vec<GpuInstr>> {
+        if ops.is_empty() || ops.len() > 256 {
             return None;
         }
-        let mut out = Vec::with_capacity(prog.ops.len());
-        for &op in &prog.ops {
+        let mut out = Vec::with_capacity(ops.len());
+        for &op in ops {
             let ins = match op {
                 Op::PushConst(v) => GpuInstr::push_const(v),
                 Op::LoadBand(slot) => GpuInstr::load_band(slot as u32),
@@ -1827,6 +1461,14 @@ impl GpuBackend {
             out.push(ins);
         }
         Some(out)
+    }
+
+    /// Translate a compiled `cogzilla-kernel::ExprProgram` into GPU WGSL VM bytecode.
+    pub fn compile_expr_to_gpu(prog: &ExprProgram) -> Option<Vec<GpuInstr>> {
+        if prog.used_bands.len() > 8 {
+            return None;
+        }
+        Self::compile_ops_to_gpu(&prog.ops)
     }
 
     /// Build a cache key for a single-COG multi-band `GpuMultiBandSlab` when all band sources
@@ -1888,64 +1530,9 @@ impl GpuBackend {
     }
 
     /// Compile a built-in `SpectralExpr` (`Db`, `NormalizedDiff`, `Savi`, `Ratio`, `Diff`, `Evi`)
-    /// directly into GPU VM bytecode without string parsing overhead.
+    /// directly into GPU VM bytecode via `SpectralExpr::to_ops()` (single source of truth).
     pub fn compile_spectral_to_gpu(expr: SpectralExpr) -> Option<Vec<GpuInstr>> {
-        let instrs = match expr {
-            SpectralExpr::Db => vec![GpuInstr::load_band(0), GpuInstr::op(opcodes::DB)],
-            SpectralExpr::NormalizedDiff => vec![
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::SUB),
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::ADD),
-                GpuInstr::op(opcodes::DIV),
-            ],
-            SpectralExpr::Savi => vec![
-                GpuInstr::push_const(1.5),
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::SUB),
-                GpuInstr::op(opcodes::MUL),
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::ADD),
-                GpuInstr::push_const(0.5),
-                GpuInstr::op(opcodes::ADD),
-                GpuInstr::op(opcodes::DIV),
-            ],
-            SpectralExpr::Ratio => vec![
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::DIV),
-            ],
-            SpectralExpr::Diff => vec![
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::SUB),
-            ],
-            SpectralExpr::Evi => vec![
-                GpuInstr::push_const(2.5),
-                GpuInstr::load_band(0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::SUB),
-                GpuInstr::op(opcodes::MUL),
-                GpuInstr::load_band(0),
-                GpuInstr::push_const(6.0),
-                GpuInstr::load_band(1),
-                GpuInstr::op(opcodes::MUL),
-                GpuInstr::op(opcodes::ADD),
-                GpuInstr::push_const(7.5),
-                GpuInstr::load_band(2),
-                GpuInstr::op(opcodes::MUL),
-                GpuInstr::op(opcodes::SUB),
-                GpuInstr::push_const(1.0),
-                GpuInstr::op(opcodes::ADD),
-                GpuInstr::op(opcodes::DIV),
-            ],
-            SpectralExpr::SarRgb => return None,
-        };
-        Some(instrs)
+        Self::compile_ops_to_gpu(expr.to_ops()?)
     }
 
     /// Attempt GPU-accelerated built-in `SpectralExpr` tile rendering across all `CoordPlan`

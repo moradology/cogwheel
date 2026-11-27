@@ -22,4 +22,4 @@ pub use kernel::{
     render_sar_rgb, render_single_band, render_terrain_tile, safe_rescale_denom, sample_cubic,
     sample_f64_general, sample_general, sample_general_scaled, wrap_raw_f32_as_npy, wrap_raw_f32_as_npy_with_mask,
 };
-pub use source::BandSource;
+pub use source::{BandSource, copy_band_data_rect_to_f32};

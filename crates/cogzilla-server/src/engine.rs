@@ -227,14 +227,12 @@ pub struct TileEngine {
     pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
 }
 
-/// Run a synchronous CPU tile render, moving heavy non-Nearest renders (`N >= 256`) off Tokio's
-/// async I/O worker pool via `block_in_place` (when running on a multi-threaded Tokio runtime)
-/// so `/healthz`, `/metrics`, and AIMD `429 Too Many Requests` shedding stay responsive under
-/// CPU-only saturation.
+/// Run a synchronous CPU-heavy closure via `tokio::task::block_in_place` when `should_offload` is
+/// true and we are on a multi-threaded Tokio runtime, so `/healthz`, `/metrics`, and AIMD
+/// `429 Too Many Requests` shedding stay responsive under CPU-only saturation.
 #[inline]
-fn run_cpu_render<R>(n: usize, resample: ResampleMode, f: impl FnOnce() -> R) -> R {
-    if n >= 256
-        && !matches!(resample, ResampleMode::Nearest)
+pub(crate) fn block_in_place_if_multithread<R>(should_offload: bool, f: impl FnOnce() -> R) -> R {
+    if should_offload
         && tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
     {
@@ -242,6 +240,13 @@ fn run_cpu_render<R>(n: usize, resample: ResampleMode, f: impl FnOnce() -> R) ->
     } else {
         f()
     }
+}
+
+/// Run a synchronous CPU tile render, moving heavy non-Nearest renders (`N >= 256`) off Tokio's
+/// async I/O worker pool via [`block_in_place_if_multithread`].
+#[inline]
+fn run_cpu_render<R>(n: usize, resample: ResampleMode, f: impl FnOnce() -> R) -> R {
+    block_in_place_if_multithread(n >= 256 && !matches!(resample, ResampleMode::Nearest), f)
 }
 
 fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {

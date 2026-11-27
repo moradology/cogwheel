@@ -349,6 +349,16 @@ struct ParsedQuery {
     errors: Vec<String>,
 }
 
+impl ParsedQuery {
+    fn parse_color_formula(&self) -> Result<Option<ColorFormula>, EngineError> {
+        self.color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)
+    }
+}
+
 fn parse_bool_param(v: &str) -> Option<bool> {
     match percent_decode(v).trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" | "t" | "y" => Some(true),
@@ -3868,12 +3878,18 @@ async fn render_mosaic_tile_pixel_selection(
     #[cfg(not(feature = "gpu"))]
     let gpu_selected: Option<Selected<f32>> = None;
 
-    let selected = gpu_selected
-        .or_else(|| fold.and_then(Fold::finish))
-        .unwrap_or_else(|| {
-            let bands = default_raw_band_count(&treq.bands, method);
-            Selected { bands, values: vec![f32::NAN; bands * n_px] }
-        });
+    let offload_cpu = gpu_selected.is_none()
+        && fold.is_some()
+        && n_px >= 256 * 256
+        && (matches!(method, Selection::Median) || n_px >= 512 * 512);
+    let selected = crate::engine::block_in_place_if_multithread(offload_cpu, || {
+        gpu_selected
+            .or_else(|| fold.and_then(Fold::finish))
+            .unwrap_or_else(|| {
+                let bands = default_raw_band_count(&treq.bands, method);
+                Selected { bands, values: vec![f32::NAN; bands * n_px] }
+            })
+    });
 
     if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
         let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
@@ -3893,7 +3909,9 @@ async fn render_mosaic_tile_pixel_selection(
         return Ok(raw);
     }
 
-    let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
+    let rgba = crate::engine::block_in_place_if_multithread(offload_cpu, || {
+        paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())
+    })?;
     #[cfg(feature = "gpu")]
     if let Some(ref gpu) = engine.gpu {
         return Ok(gpu.encode_rgba_output(
@@ -3904,12 +3922,9 @@ async fn render_mosaic_tile_pixel_selection(
             pq.return_mask,
         ));
     }
-    Ok(encode_rgba_output(
-        out_dim as usize,
-        out_dim as usize,
-        &rgba,
-        treq.format,
-        pq.return_mask,
+    Ok(crate::engine::block_in_place_if_multithread(
+        offload_cpu,
+        || encode_rgba_output(out_dim as usize, out_dim as usize, &rgba, treq.format, pq.return_mask),
     ))
 }
 
@@ -3926,12 +3941,7 @@ fn paint_selected(
     pq: &ParsedQuery,
     custom: Option<&CustomColormap>,
 ) -> Result<Vec<u8>, EngineError> {
-    let formula = pq
-        .color_formula
-        .as_deref()
-        .map(ColorFormula::parse)
-        .transpose()
-        .map_err(EngineError::BadRequest)?;
+    let formula = pq.parse_color_formula()?;
     let three = selected.bands >= 3;
     // The request's own ranges and colour map where it has them for this many bands;
     // otherwise bytes as they are.
@@ -4160,12 +4170,7 @@ async fn render_mosaic_tile_styled(
             }
             return Ok(raw);
         }
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+        let cf = pq.parse_color_formula()?;
         let mut comp = vec![0u8; n_px * 4];
         let mut filled = 0usize;
         let mut any_ok = false;
@@ -4258,12 +4263,7 @@ async fn render_mosaic_tile_styled(
     if (pq.color_formula.is_some() || !pq.return_mask)
         && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
     {
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+        let cf = pq.parse_color_formula()?;
         let orig_format = treq.format;
         treq.format = OutputFormat::RawRgba;
         let (raw, failed) = engine.render_mosaic_tile_with_report(urls, &treq).await?;
@@ -4589,12 +4589,7 @@ async fn render_mosaic_bbox_composite(
         if first_lut.is_none() && custom_lut.is_some() {
             first_lut = custom_lut.clone();
         }
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+        let cf = pq.parse_color_formula()?;
         let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), epsg);
         if urls.len() == 1 && method == Selection::First {
             let d = render_crs_bbox(
@@ -7558,12 +7553,7 @@ where
                                 || !crate::engine::cogs_share_base_grid(&cogs);
                             if needs_general_path {
                                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
-                                let cf = pq
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
+                                let cf = pq.parse_color_formula()?;
                                 let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                                 let bbox_3857 = web_mercator_buffered_3857_bbox(
                                     z,
@@ -7602,12 +7592,7 @@ where
                             } else if (pq.color_formula.is_some() || !pq.return_mask)
                                 && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                             {
-                                let cf = pq
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
+                                let cf = pq.parse_color_formula()?;
                                 let orig_format = treq.format;
                                 treq.format = OutputFormat::RawRgba;
                                 let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -8759,7 +8744,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                 let data = render_stac_bbox_opt(
                     &engine, &cogs, slot_bands.as_deref(), out_bbox, &dst_crs, false, out_w, out_h, None, &bands, resample, fmt,
@@ -8991,12 +8976,7 @@ where
                         }
                         if needs_general {
                             let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
-                            let cf = pq_stac
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq_stac.parse_color_formula()?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq_stac.buffer).round() as u32;
                             let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
                                 let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
@@ -9077,12 +9057,7 @@ where
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                         {
-                            let cf = pq_stac
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq_stac.parse_color_formula()?;
                             let orig_format = treq.format;
                             treq.format = OutputFormat::RawRgba;
                             let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -9292,12 +9267,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, pq_stac.max_size);
@@ -9380,12 +9350,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
@@ -9472,12 +9437,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let wgs_bbox_src = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
                 let bbox_max = effective_bbox_max_size(&pq_stac);
                 let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
@@ -9566,12 +9526,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let (data, out_bbox, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
                     let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
                         bbox
@@ -9655,12 +9610,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq_stac);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
@@ -9724,12 +9674,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq_stac);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
@@ -10371,12 +10316,7 @@ where
 
                         if needs_general_path {
                             let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
-                            let cf = pq
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq.parse_color_formula()?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                             let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
                                 let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
@@ -10439,12 +10379,7 @@ where
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                         {
-                            let cf = pq
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq.parse_color_formula()?;
                             let orig_format = treq.format;
                             treq.format = OutputFormat::RawRgba;
                             let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -10839,7 +10774,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg.unwrap_or(0));
                 let data = render_crs_bbox(
                     &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
@@ -10994,7 +10929,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, pq.max_size);
@@ -11092,7 +11027,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
@@ -11181,7 +11116,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let wgs_bbox_src = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
                 let bbox_max = effective_bbox_max_size(&pq);
                 let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
@@ -11258,7 +11193,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let (data, out_bbox, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
                     let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
                         bbox
@@ -11337,7 +11272,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
@@ -11392,7 +11327,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
