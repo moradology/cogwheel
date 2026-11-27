@@ -1157,24 +1157,24 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
     }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics") || family == "colorMaps") {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics") || family == "colorMaps") {
         if let Some(k) = has(&["width", "height"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on preview, bbox, feature, map, statistics, and colorMaps routes"
+                "parameter '{k}' is only supported on preview, bbox, feature, map, wms, statistics, and colorMaps routes"
             ));
         }
     }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics")) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics")) {
         if let Some(k) = has(&["dst_crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on preview, bbox, feature, map, and statistics routes"
+                "parameter '{k}' is only supported on preview, bbox, feature, map, wms, and statistics routes"
             ));
         }
     }
-    if !(route("bounds") || route("info") || is_ogc_map || is_tileset_meta) {
+    if !(route("bounds") || route("info") || is_ogc_map || route("wms") || is_tileset_meta) {
         if let Some(k) = has(&["crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on bounds, info, tiles, and map routes"
+                "parameter '{k}' is only supported on bounds, info, tiles, map, and wms routes"
             ));
         }
     }
@@ -1349,6 +1349,229 @@ fn apply_info_bounds_crs(
 
 const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
 
+/// Build an OGC WMS 1.3.0 `WMS_Capabilities` XML document for a COG dataset.
+fn build_wms_capabilities(
+    host: &str,
+    raw_query: &str,
+    bounds: [f64; 4],
+    native_epsg: Option<u16>,
+) -> String {
+    let base_url = format!("{}/cog/wms", host.trim_end_matches('/'));
+    let filtered_q = filter_tile_template_query(raw_query);
+    let online_href = if filtered_q.is_empty() {
+        base_url
+    } else {
+        format!("{base_url}?{filtered_q}")
+    };
+    let href_esc = crate::titiler::xml_escape(&online_href);
+    let [w, s, e, n] = bounds;
+    let [mw, ms, me, mn] = crate::catalog::wgs84_bbox_to_3857(bounds);
+    let extra_crs = match native_epsg {
+        Some(code) if code != 4326 && code != 3857 => {
+            format!("      <CRS>EPSG:{code}</CRS>\n")
+        }
+        _ => String::new(),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <Service>
+    <Name>WMS</Name>
+    <Title>cogzilla COG WMS</Title>
+    <OnlineResource xlink:type="simple" xlink:href="{href_esc}"/>
+    <MaxWidth>4096</MaxWidth>
+    <MaxHeight>4096</MaxHeight>
+  </Service>
+  <Capability>
+    <Request>
+      <GetCapabilities>
+        <Format>text/xml</Format>
+        <Format>application/xml</Format>
+        <DCPType><HTTP><Get><OnlineResource xlink:type="simple" xlink:href="{href_esc}"/></Get></HTTP></DCPType>
+      </GetCapabilities>
+      <GetMap>
+        <Format>image/png</Format>
+        <Format>image/jpeg</Format>
+        <Format>image/webp</Format>
+        <Format>image/tiff</Format>
+        <DCPType><HTTP><Get><OnlineResource xlink:type="simple" xlink:href="{href_esc}"/></Get></HTTP></DCPType>
+      </GetMap>
+    </Request>
+    <Exception>
+      <Format>XML</Format>
+    </Exception>
+    <Layer queryable="0">
+      <Name>cog</Name>
+      <Title>Cloud Optimized GeoTIFF</Title>
+      <CRS>CRS:84</CRS>
+      <CRS>EPSG:4326</CRS>
+      <CRS>EPSG:3857</CRS>
+{extra_crs}      <EX_GeographicBoundingBox>
+        <westBoundLongitude>{w}</westBoundLongitude>
+        <eastBoundLongitude>{e}</eastBoundLongitude>
+        <southBoundLatitude>{s}</southBoundLatitude>
+        <northBoundLatitude>{n}</northBoundLatitude>
+      </EX_GeographicBoundingBox>
+      <BoundingBox CRS="CRS:84" minx="{w}" miny="{s}" maxx="{e}" maxy="{n}"/>
+      <BoundingBox CRS="EPSG:4326" minx="{s}" miny="{w}" maxx="{n}" maxy="{e}"/>
+      <BoundingBox CRS="EPSG:3857" minx="{mw}" miny="{ms}" maxx="{me}" maxy="{mn}"/>
+    </Layer>
+  </Capability>
+</WMS_Capabilities>"#
+    )
+}
+
+/// Parse an OGC WMS `FORMAT` parameter (`image/png`, `image/jpeg`, `image/webp`, `image/tiff`,
+/// or short extensions) into `(OutputFormat, content_type)`.
+fn parse_wms_format(
+    raw: Option<&str>,
+    webp_quality: Option<f32>,
+    jpeg_quality: u8,
+) -> Result<(OutputFormat, &'static str), EngineError> {
+    let ext = match raw.map(|s| s.split(';').next().unwrap_or(s).trim()) {
+        None | Some("") | Some("image/png") | Some("png") => "png",
+        Some("image/jpeg") | Some("image/jpg") | Some("jpeg") | Some("jpg") => "jpg",
+        Some("image/webp") | Some("webp") => "webp",
+        Some("image/tiff") | Some("image/geotiff") | Some("tif") | Some("tiff") => "tif",
+        Some(other) => {
+            return Err(EngineError::BadRequest(format!(
+                "unsupported WMS FORMAT '{other}' (use image/png, image/jpeg, image/webp, or image/tiff)"
+            )));
+        }
+    };
+    parse_ext_format(ext, webp_quality, jpeg_quality)
+}
+
+/// Handle OGC WMS 1.1.1 / 1.3.0 (`GET /cog/wms`) `GetCapabilities` and `GetMap` requests.
+async fn handle_cog_wms(
+    engine: &TileEngine,
+    host: &str,
+    raw_query: &str,
+    pq: &ParsedQuery,
+    geo_meta: &mut Option<([f64; 4], Option<u16>, bool)>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let mut wms_request: Option<String> = None;
+    let mut wms_version: Option<String> = None;
+    let mut wms_srs: Option<String> = None;
+    let mut wms_crs_raw: Option<String> = None;
+    let mut wms_transparent: Option<bool> = None;
+    for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "request" => wms_request = Some(percent_decode(v).to_ascii_lowercase()),
+            "version" => wms_version = Some(percent_decode(v)),
+            "srs" => wms_srs = Some(percent_decode(v)),
+            "crs" => wms_crs_raw = Some(percent_decode(v)),
+            "transparent" => {
+                if let Some(b) = parse_bool_param(v) {
+                    wms_transparent = Some(b);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match wms_request.as_deref() {
+        Some("getcapabilities") => {
+            let cogs = open_query_urls(engine, &pq.urls, None).await?;
+            let crs = engine.get_or_build_crs(&cogs[0])?;
+            let full = cogs[0].index.full_res();
+            let bounds = crs.wgs84_bounds_with_gcp(
+                &full.pixel_to_crs,
+                full.gcp_poly.as_deref(),
+                full.width,
+                full.height,
+            );
+            let native_epsg = cogs[0]
+                .index
+                .geo_keys
+                .projected_cs_type
+                .or(cogs[0].index.geo_keys.geographic_type)
+                .filter(|&c| c != 32767);
+            let xml = build_wms_capabilities(host, raw_query, bounds, native_epsg);
+            Ok((Bytes::from(xml), "application/xml"))
+        }
+        Some("getmap") => {
+            let mut bbox = pq
+                .bbox_param
+                .ok_or_else(|| EngineError::BadRequest("WMS GetMap requires BBOX=minx,miny,maxx,maxy".into()))?;
+            let out_w = pq
+                .width
+                .ok_or_else(|| EngineError::BadRequest("WMS GetMap requires WIDTH".into()))?
+                .clamp(1, 4096);
+            let out_h = pq
+                .height
+                .ok_or_else(|| EngineError::BadRequest("WMS GetMap requires HEIGHT".into()))?
+                .clamp(1, 4096);
+            let crs_str = wms_crs_raw
+                .as_deref()
+                .or(wms_srs.as_deref())
+                .unwrap_or("EPSG:3857");
+            let (dst_crs, dst_epsg) =
+                parse_coord_crs_with_epsg(crs_str).map_err(EngineError::BadRequest)?;
+            let is_wms_130 = wms_version
+                .as_deref()
+                .map(|v| v.starts_with("1.3"))
+                .unwrap_or(true);
+            let crs_lower = crs_str.trim().to_ascii_lowercase();
+            let is_crs84 = crs_lower == "crs:84"
+                || crs_lower == "crs84"
+                || crs_lower.ends_with(":crs84")
+                || crs_lower.ends_with("/crs84");
+            // OGC WMS 1.3.0 specifies (lat, lon) axis order for EPSG:4326 (unlike CRS:84 and WMS 1.1.1).
+            if is_wms_130 && dst_epsg == 4326 && !is_crs84 {
+                bbox = [bbox[1], bbox[0], bbox[3], bbox[2]];
+            }
+            let bbox = resolve_input_bbox(bbox, Some(&dst_crs))?;
+            let (fmt, ct) = parse_wms_format(
+                pq.format_param.as_deref(),
+                pq.webp_quality,
+                pq.jpeg_quality,
+            )?;
+            let return_mask = wms_transparent.unwrap_or(pq.return_mask);
+            let cogs = open_query_urls(engine, &pq.urls, pq.nodata).await?;
+            let full = cogs[0].index.full_res();
+            let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
+            let st = widest_sample_type(&cogs);
+            let mut bands = build_band_request_for_output(pq, db, st, fmt, ct)?;
+            let fmt = geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+            if pq.unscale {
+                apply_unscale_cogs(&mut bands, &cogs);
+            }
+            let custom_lut = resolve_custom_lut(pq, &cogs[0], &bands)?;
+            let cf = pq.parse_color_formula()?;
+            let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), dst_epsg);
+            let data = render_crs_bbox(
+                engine,
+                &cogs,
+                bbox,
+                &dst_crs,
+                out_w,
+                out_h,
+                None,
+                &bands,
+                resample,
+                fmt,
+                pq.nodata,
+                custom_lut.as_ref(),
+                cf.as_ref(),
+                return_mask,
+                pq.unscale,
+            )
+            .await?;
+            let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, bbox, dst_epsg, return_mask);
+            *geo_meta = Some((bbox, Some(dst_epsg), is_crs84));
+            Ok((data, ct))
+        }
+        Some(other) => Err(EngineError::BadRequest(format!(
+            "unsupported WMS REQUEST '{other}' (use GetCapabilities or GetMap)"
+        ))),
+        None => Err(EngineError::BadRequest(
+            "WMS requires REQUEST=GetCapabilities or REQUEST=GetMap".into(),
+        )),
+    }
+}
+
 /// Parse a TiTiler CRS string (`EPSG:32610`, `EPSG:900913`, `CRS84`, `http://.../EPSG/0/32610`,
 /// `urn:ogc:def:crs:EPSG::32610`, etc.) into `(CrsModel, epsg_code)` using our 3,260+ EPSG table.
 pub(crate) fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16), String> {
@@ -1359,7 +1582,11 @@ pub(crate) fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::Crs
         .unwrap_or(raw_trimmed)
         .trim();
     let lower = trimmed.to_ascii_lowercase();
-    if lower == "crs84" || lower.ends_with(":crs84") || lower.ends_with("/crs84") {
+    if lower == "crs84"
+        || lower == "crs:84"
+        || lower.ends_with(":crs84")
+        || lower.ends_with("/crs84")
+    {
         return Ok((cogzilla_proj::CrsModel::Geographic, 4326));
     }
     if lower == "esri:102100" || lower == "esri:102113" {
@@ -10819,6 +11046,9 @@ where
                 Ok((data, ct))
             }
             .await,
+            (Method::GET, ["wms"]) => {
+                handle_cog_wms(&engine, &host, &raw_query, &pq, &mut geo_meta).await
+            }
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let explicit_tms = (sub.len() == 2).then_some(sub[0]);
@@ -11389,7 +11619,7 @@ where
                 Err(EngineError::MethodNotAllowed("POST"))
             }
             (_, ["feature", _]) => Err(EngineError::MethodNotAllowed("POST")),
-            (_, ["info"] | ["info.geojson"] | ["bounds"] | ["validate"] | ["stac"] | ["tiles"] | ["tiles", ..] | ["point", _] | ["preview", ..] | ["bbox", ..] | ["map"] | ["viewer"] | ["tilejson.json"] | [_, "tilejson.json"] | ["map.html"] | [_, "map.html"] | ["WMTSCapabilities.xml"] | [_, "WMTSCapabilities.xml"]) => {
+            (_, ["info"] | ["info.geojson"] | ["bounds"] | ["validate"] | ["stac"] | ["tiles"] | ["tiles", ..] | ["point", _] | ["preview", ..] | ["bbox", ..] | ["map"] | ["wms"] | ["viewer"] | ["tilejson.json"] | [_, "tilejson.json"] | ["map.html"] | [_, "map.html"] | ["WMTSCapabilities.xml"] | [_, "WMTSCapabilities.xml"]) => {
                 Err(EngineError::MethodNotAllowed("GET, HEAD"))
             }
 
@@ -12399,6 +12629,17 @@ mod tests {
 
         let pq_wmts = parse_query(Some("url=a.tif&minzoom=4&maxzoom=12&tile_format=png&tile_scale=2"));
         assert!(validate_query(&["cog", "WebMercatorQuad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
+        let pq_wms = parse_query(Some("url=https://example.com/a.tif&SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=CRS:84&BBOX=-123,37,-122,38&WIDTH=256&HEIGHT=256&FORMAT=image/png"));
+        assert!(pq_wms.errors.is_empty(), "wms errors: {:?}", pq_wms.errors);
+        assert!(validate_query(&["cog", "wms"], &pq_wms).is_ok());
+        assert_eq!(parse_coord_crs_with_epsg("CRS:84").unwrap().1, 4326);
+        assert!(parse_wms_format(Some("image/png"), None, 85).is_ok());
+        assert!(parse_wms_format(Some("image/tiff"), None, 85).is_ok());
+        assert!(parse_wms_format(Some("image/gif"), None, 85).is_err());
+        let cap = build_wms_capabilities("https://example.com", "url=https://example.com/a.tif&REQUEST=GetCapabilities", [-123.0, 37.0, -122.0, 38.0], Some(32610));
+        assert!(cap.contains("<WMS_Capabilities version=\"1.3.0\""));
+        assert!(cap.contains("<CRS>EPSG:32610</CRS>"));
+        assert!(cap.contains("<BoundingBox CRS=\"EPSG:4326\" minx=\"37\" miny=\"-123\" maxx=\"38\" maxy=\"-122\"/>"));
         assert!(validate_query(&["mosaicjson", "WorldCRS84Quad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
         assert!(validate_query(&["mosaicjson", "NotATms", "WMTSCapabilities.xml"], &pq_wmts).is_err());
     }
