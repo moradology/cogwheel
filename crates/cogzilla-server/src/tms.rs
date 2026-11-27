@@ -3,7 +3,7 @@
 //! `pointOfOrigin`, `matrixWidth`, and `matrixHeight` matches TiTiler bit-for-bit.
 
 use cogzilla_proj::CrsModel;
-use cogzilla_tiff::Affine2D;
+use cogzilla_raster::Affine2D;
 
 use crate::engine::EngineError;
 

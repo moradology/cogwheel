@@ -1,7 +1,5 @@
-use crate::types::{
-    Affine2D, ByteOrder, CogIndex, Compression, GeoKeys, IfdMeta, MaskIfdMeta, PlanarConfig,
-    Predictor, SampleType, TiffError,
-};
+use cogzilla_raster::{Affine2D, SampleType};
+use crate::types::{ByteOrder, CogIndex, Compression, GeoKeys, IfdMeta, MaskIfdMeta, PlanarConfig, Predictor, TiffError};
 
 // Defensive parser caps against hostile BigTIFF/TIFF overflows and OOMs
 const MAX_IFD_ENTRIES: u64 = 65_536;

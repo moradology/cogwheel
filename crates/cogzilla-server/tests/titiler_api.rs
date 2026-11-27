@@ -1088,7 +1088,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(parsed_nad83.geo_keys.model_type, Some(2));
             assert_eq!(parsed_nad83.geo_keys.geographic_type, Some(4269));
             assert_eq!(parsed_nad83.geo_keys.projected_cs_type, None);
-            assert_eq!(parsed_nad83.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+            assert_eq!(parsed_nad83.full_res().sample_type, cogzilla_raster::SampleType::Float32);
 
             // Styled .tif with rescale+colormap must still emit 8-bit visual GeoTIFF
             let styled_tif_resp = client
@@ -1100,7 +1100,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .unwrap();
             assert_eq!(styled_tif_resp.status(), 200);
             let parsed_styled = cogzilla_tiff::parse_cog(&styled_tif_resp.bytes().await.unwrap()).unwrap();
-            assert_eq!(parsed_styled.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
+            assert_eq!(parsed_styled.full_res().sample_type, cogzilla_raster::SampleType::Uint8);
 
             // Audit c42 regression checks:
             // Unstyled float32 DEM .tif on /mosaic/tiles must emit Float32 GeoTIFF (not corrupt RGBA8)
@@ -1113,7 +1113,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .unwrap();
             assert_eq!(mosaic_f32_tif.status(), 200);
             let parsed_mosaic_f32 = cogzilla_tiff::parse_cog(&mosaic_f32_tif.bytes().await.unwrap()).unwrap();
-            assert_eq!(parsed_mosaic_f32.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+            assert_eq!(parsed_mosaic_f32.full_res().sample_type, cogzilla_raster::SampleType::Float32);
 
             // ?algorithm=contours .tif must emit 8-bit visual GeoTIFF (not Float32)
             let contours_tif = client
@@ -1125,7 +1125,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
                 .unwrap();
             assert_eq!(contours_tif.status(), 200);
             let parsed_contours = cogzilla_tiff::parse_cog(&contours_tif.bytes().await.unwrap()).unwrap();
-            assert_eq!(parsed_contours.full_res().sample_type, cogzilla_tiff::SampleType::Uint8);
+            assert_eq!(parsed_contours.full_res().sample_type, cogzilla_raster::SampleType::Uint8);
 
             // Audit c45 regression check: unknown/malformed TMS on WMTSCapabilities.xml must return 404/422 (never 200 XML)
             let bad_wmts = client
@@ -5329,7 +5329,7 @@ async fn audit75_power_expr_npy_and_unscale_heterogeneous_geotiff_dtypes() {
     let idx_unscale = cogzilla_tiff::parse_cog(&tif_unscale).unwrap();
     assert_eq!(
         idx_unscale.full_res().sample_type,
-        cogzilla_tiff::SampleType::Float32,
+        cogzilla_raster::SampleType::Float32,
         "unscale=true on Uint8 COG must emit Float32 GeoTIFF"
     );
 
@@ -5347,7 +5347,7 @@ async fn audit75_power_expr_npy_and_unscale_heterogeneous_geotiff_dtypes() {
     let idx_stac = cogzilla_tiff::parse_cog(&tif_stac).unwrap();
     assert_eq!(
         idx_stac.full_res().sample_type,
-        cogzilla_tiff::SampleType::Float32,
+        cogzilla_raster::SampleType::Float32,
         "heterogeneous STAC (u8, u16, f32) must emit Float32 GeoTIFF"
     );
     assert_eq!(idx_stac.full_res().samples_per_pixel, 3);
@@ -5688,7 +5688,7 @@ async fn sweeps_34_to_37_kk1_ii1_jj1_hh1_self_contained() {
         assert_eq!(r.status(), 200, "KK1 tif {url} failed");
         let tif = r.bytes().await.unwrap();
         let idx = cogzilla_tiff::parse_cog(&tif).unwrap();
-        assert_eq!(idx.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+        assert_eq!(idx.full_res().sample_type, cogzilla_raster::SampleType::Float32);
         assert_eq!(idx.nodata, None, "KK1 expected nodata=None for {url}, got {:?}", idx.nodata);
     }
     // Styled mosaic .npy with rescale returns |u1 matching /cog
@@ -6303,7 +6303,7 @@ async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
 
     let tif = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.tif?url={p_u32}&resampling=nearest&return_mask=false")).send().await.unwrap().bytes().await.unwrap();
     let parsed = cogzilla_tiff::parse_cog(&tif).unwrap();
-    assert_eq!(parsed.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    assert_eq!(parsed.full_res().sample_type, cogzilla_raster::SampleType::Uint32);
     let dec = cogzilla_codec::decode_tile(
         &tif[parsed.full_res().tile_offsets[0] as usize..parsed.full_res().tile_offsets[0] as usize + parsed.full_res().tile_byte_counts[0] as usize],
         parsed.full_res(),
@@ -6353,7 +6353,7 @@ async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
         .unwrap();
     let idx_m = cogzilla_tiff::parse_cog(&tif_masked).unwrap();
     assert_eq!(idx_m.full_res().samples_per_pixel, 2);
-    assert_eq!(idx_m.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    assert_eq!(idx_m.full_res().sample_type, cogzilla_raster::SampleType::Uint32);
     let mask_off = idx_m.full_res().tile_offsets[1] as usize;
     let mask_len = idx_m.full_res().tile_byte_counts[1] as usize;
     let mask_slice = &tif_masked[mask_off..mask_off + mask_len];
@@ -6384,7 +6384,7 @@ async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
     let multi_bytes = multi_tif.bytes().await.unwrap();
     let idx_multi = cogzilla_tiff::parse_cog(&multi_bytes).unwrap();
     assert_eq!(idx_multi.full_res().samples_per_pixel, 2);
-    assert_eq!(idx_multi.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    assert_eq!(idx_multi.full_res().sample_type, cogzilla_raster::SampleType::Uint32);
 
     // 4. Extreme f64 statistics (f64::MIN + f64::MAX) must produce finite mean, std, and histogram edges (no JSON null).
     let mut f64_ext_raw = Vec::with_capacity(64 * 8);

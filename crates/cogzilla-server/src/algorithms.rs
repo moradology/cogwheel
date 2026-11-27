@@ -5,7 +5,7 @@
 //! DEM margin / output band count queries, `http.rs` `BandRequest` dispatch, and `pgstac.rs`
 //! `BandAlgorithm` dispatch — derives its behaviour from [`ALGORITHMS`] and [`AlgorithmId`].
 
-use cogzilla_tiff::SampleType;
+use cogzilla_raster::SampleType;
 use serde_json::{Map, Value, json};
 
 use crate::engine::EngineError;

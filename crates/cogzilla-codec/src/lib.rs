@@ -4,9 +4,8 @@ pub mod slab;
 
 use std::cell::RefCell;
 
-use cogzilla_tiff::{
-    ByteOrder, Compression, IfdMeta, MaskIfdMeta, PlanarConfig, Predictor, SampleType,
-};
+use cogzilla_raster::SampleType;
+use cogzilla_tiff::{ByteOrder, Compression, IfdMeta, MaskIfdMeta, PlanarConfig, Predictor};
 use thiserror::Error;
 
 pub use slab::{AlignedF32Slab, BandData, BlockStats, DecodedBand, DecodedTile};
@@ -1603,7 +1602,7 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cogzilla_tiff::Affine2D;
+    use cogzilla_raster::Affine2D;
 
     #[test]
     fn hostile_tile_dimension_overflow_is_rejected_without_allocation() {
@@ -1736,7 +1735,7 @@ mod tests {
             jpeg_tables: None,
             mask_ifd: None,
             is_stripped: true,
-            pixel_to_crs: cogzilla_tiff::Affine2D {
+            pixel_to_crs: cogzilla_raster::Affine2D {
                 a: 1.0,
                 b: 0.0,
                 c: 0.0,
@@ -1744,7 +1743,7 @@ mod tests {
                 e: 1.0,
                 f: 0.0,
             },
-            crs_to_pixel: cogzilla_tiff::Affine2D {
+            crs_to_pixel: cogzilla_raster::Affine2D {
                 a: 1.0,
                 b: 0.0,
                 c: 0.0,
@@ -1843,7 +1842,7 @@ mod tests {
             jpeg_tables: None,
             mask_ifd: None,
             is_stripped: false,
-            pixel_to_crs: cogzilla_tiff::Affine2D {
+            pixel_to_crs: cogzilla_raster::Affine2D {
                 a: 1.0,
                 b: 0.0,
                 c: 0.0,
@@ -1851,7 +1850,7 @@ mod tests {
                 e: 1.0,
                 f: 0.0,
             },
-            crs_to_pixel: cogzilla_tiff::Affine2D {
+            crs_to_pixel: cogzilla_raster::Affine2D {
                 a: 1.0,
                 b: 0.0,
                 c: 0.0,

@@ -326,8 +326,8 @@ fn write_geotiff_placed(
 }
 
 /// The sample type of a raw-array GeoTIFF of `kind`.
-pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
-    use cogzilla_tiff::SampleType as T;
+pub(crate) fn geotiff_sample(kind: cogzilla_raster::SampleType) -> GeoTiffSample {
+    use cogzilla_raster::SampleType as T;
     match kind {
         T::Bool | T::Uint1 | T::Uint4 | T::Uint8 => GeoTiffSample::U8,
         T::Int8 => GeoTiffSample::I8,
@@ -348,7 +348,7 @@ pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
 /// `GDAL_NODATA` of `nan` goes, as TiTiler writes none. Values are cast as
 /// `cogzilla_kernel::retype_f32_npy` casts them; with `mask`, the last band is the mask,
 /// written as the type's largest number where it is not zero and its smallest where it is.
-pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, mask: bool) -> Option<Bytes> {
+pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_raster::SampleType, mask: bool) -> Option<Bytes> {
     retype_f32_geotiff_with(tif, kind, mask, |v| v)
 }
 
@@ -356,7 +356,7 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
 /// cast, as `cogzilla_kernel::retype_f32_npy_with` does.
 pub(crate) fn retype_f32_geotiff_with(
     tif: &[u8],
-    kind: cogzilla_tiff::SampleType,
+    kind: cogzilla_raster::SampleType,
     mask: bool,
     prepare: impl Fn(f64) -> f64,
 ) -> Option<Bytes> {
@@ -470,7 +470,7 @@ pub(crate) fn retype_f32_geotiff_with(
                 }
             }};
         }
-        use cogzilla_tiff::SampleType as T;
+        use cogzilla_raster::SampleType as T;
         match kind {
             T::Bool | T::Uint1 | T::Uint4 | T::Uint8 => put!(u8, |v: f64| v as u8),
             T::Int8 => put!(i8, |v: f64| v as i8),
@@ -494,7 +494,7 @@ pub(crate) fn write_geotiff_typed_f64(
     bands: usize,
     width: u32,
     height: u32,
-    kind: cogzilla_tiff::SampleType,
+    kind: cogzilla_raster::SampleType,
     bbox: [f64; 4],
     epsg: u16,
     return_mask: bool,
@@ -547,7 +547,7 @@ pub(crate) fn write_geotiff_typed_f64(
                 }
             }};
         }
-        use cogzilla_tiff::SampleType as T;
+        use cogzilla_raster::SampleType as T;
         match kind {
             T::Bool | T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8, true),
             T::Int8 => put_planes!(i8, |v: f64| v as i8, true),
@@ -1005,7 +1005,8 @@ mod writer_tests {
     //! offsets inside the file) and with `cogzilla_tiff::parse_cog`.
 
     use bytes::BufMut;
-    use cogzilla_tiff::{PlanarConfig, SampleType, parse_cog};
+    use cogzilla_raster::SampleType;
+    use cogzilla_tiff::{PlanarConfig, parse_cog};
 
     use super::*;
 
@@ -1437,7 +1438,7 @@ mod writer_tests {
 #[cfg(test)]
 mod retype_tests {
     use super::*;
-        use cogzilla_tiff::SampleType as T;
+        use cogzilla_raster::SampleType as T;
 
     fn f32s(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()

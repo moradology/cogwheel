@@ -1,6 +1,6 @@
 //! Precomputed tile coordinate plans (`CoordPlan`) mapping output XYZ/TMS pixels to source IFD space.
 
-use cogzilla_tiff::Affine2D;
+use cogzilla_raster::Affine2D;
 
 use crate::crs::CrsModel;
 use crate::mercator::{TileCoord, mercator_to_lonlat_deg, mercator_to_lonlat_rad, tile_bounds_3857};

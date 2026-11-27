@@ -51,7 +51,7 @@ pub enum Predictor {
     FloatingPoint,
 }
 
-pub use cogzilla_raster::{Affine2D, SampleType};
+use cogzilla_raster::{Affine2D, SampleType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanarConfig {

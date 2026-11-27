@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use cogzilla_io::OpenedCog;
 use cogzilla_proj::CrsModel;
-use cogzilla_tiff::{Affine2D, PlanarConfig};
+use cogzilla_raster::Affine2D;
+use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{EngineError, TileEngine};
 use crate::stats::histogram::{HistDtype, sorted_bin_ranges};
@@ -3241,7 +3242,7 @@ pub fn compute_exact_grid_polygon_stats(
     let [w, s, e, n] = wgs_bbox;
     let dx = (e - w) / win_w.max(1) as f64;
     let dy = (n - s) / win_h.max(1) as f64;
-    let p2c = cogzilla_tiff::Affine2D {
+    let p2c = cogzilla_raster::Affine2D {
         a: dx,
         b: 0.0,
         c: w,
@@ -3621,16 +3622,16 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let integer = !unscale
         && matches!(
             ifd.sample_type,
-            cogzilla_tiff::SampleType::Uint1
-                | cogzilla_tiff::SampleType::Uint4
-                | cogzilla_tiff::SampleType::Uint8
-                | cogzilla_tiff::SampleType::Uint16
-                | cogzilla_tiff::SampleType::Uint32
-                | cogzilla_tiff::SampleType::Uint64
-                | cogzilla_tiff::SampleType::Int8
-                | cogzilla_tiff::SampleType::Int16
-                | cogzilla_tiff::SampleType::Int32
-                | cogzilla_tiff::SampleType::Int64
+            cogzilla_raster::SampleType::Uint1
+                | cogzilla_raster::SampleType::Uint4
+                | cogzilla_raster::SampleType::Uint8
+                | cogzilla_raster::SampleType::Uint16
+                | cogzilla_raster::SampleType::Uint32
+                | cogzilla_raster::SampleType::Uint64
+                | cogzilla_raster::SampleType::Int8
+                | cogzilla_raster::SampleType::Int16
+                | cogzilla_raster::SampleType::Int32
+                | cogzilla_raster::SampleType::Int64
         );
     let absent = nodata_override.or(primary.index.nodata).unwrap_or(0.0);
     let mut fold = Fold::<f32>::new(method, nb, n_px, integer).absent_as(absent);

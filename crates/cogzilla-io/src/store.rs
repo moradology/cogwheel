@@ -694,11 +694,11 @@ impl CogStore {
         let px = (ifd.tile_width as usize) * (ifd.tile_height as usize);
         let wide = matches!(
             ifd.sample_type,
-            cogzilla_tiff::SampleType::Uint32
-                | cogzilla_tiff::SampleType::Int32
-                | cogzilla_tiff::SampleType::Uint64
-                | cogzilla_tiff::SampleType::Int64
-                | cogzilla_tiff::SampleType::Float64
+            cogzilla_raster::SampleType::Uint32
+                | cogzilla_raster::SampleType::Int32
+                | cogzilla_raster::SampleType::Uint64
+                | cogzilla_raster::SampleType::Int64
+                | cogzilla_raster::SampleType::Float64
         );
         let band = || cogzilla_codec::DecodedBand {
             data: if wide {
@@ -2786,7 +2786,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             f64_cog.index.ifds[0].sample_type,
-            cogzilla_tiff::SampleType::Float64
+            cogzilla_raster::SampleType::Float64
         );
         let over_cap = vec![Some(0u32); 129];
         let err = store
@@ -2812,7 +2812,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             i8_cog.index.ifds[0].sample_type,
-            cogzilla_tiff::SampleType::Int8
+            cogzilla_raster::SampleType::Int8
         );
         let i8_over = vec![Some(0u32); 257];
         assert!(
@@ -2832,7 +2832,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             u8_cog.index.ifds[0].sample_type,
-            cogzilla_tiff::SampleType::Uint8
+            cogzilla_raster::SampleType::Uint8
         );
         let u8_blocks = vec![Some(0u32); 300];
         assert!(store.get_blocks(&u8_cog, 0, &u8_blocks).await.is_ok());
@@ -2847,7 +2847,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             i32_cog.index.ifds[0].sample_type,
-            cogzilla_tiff::SampleType::Int32
+            cogzilla_raster::SampleType::Int32
         );
         assert!(
             store.get_blocks(&i32_cog, 0, &over_cap).await.is_err(),

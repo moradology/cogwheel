@@ -1,4 +1,4 @@
-use crate::types::Affine2D;
+use cogzilla_raster::Affine2D;
 
 /// Maximum pixel residual (in pixels) below which a GCP set is represented as an exact
 /// `Affine2D` with zero runtime polynomial overhead.

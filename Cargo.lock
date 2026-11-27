@@ -425,6 +425,7 @@ name = "cogzilla-codec"
 version = "0.8.0"
 dependencies = [
  "brotli",
+ "cogzilla-raster",
  "cogzilla-tiff",
  "lerc-core",
  "lerc-reader",
@@ -443,7 +444,6 @@ dependencies = [
  "cogzilla-codec",
  "cogzilla-kernel",
  "cogzilla-raster",
- "cogzilla-tiff",
  "pollster",
  "thiserror 2.0.21",
  "wgpu",
@@ -457,6 +457,7 @@ dependencies = [
  "ahash",
  "bytes",
  "cogzilla-codec",
+ "cogzilla-raster",
  "cogzilla-tiff",
  "crc32fast",
  "dashmap",
@@ -525,6 +526,7 @@ dependencies = [
 name = "cogzilla-proj"
 version = "0.8.0"
 dependencies = [
+ "cogzilla-raster",
  "cogzilla-tiff",
  "thiserror 2.0.21",
 ]

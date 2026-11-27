@@ -16,12 +16,12 @@ pub(super) enum BandStatsAcc {
 }
 
 impl BandStatsAcc {
-    pub(super) fn for_sample_type(st: cogzilla_tiff::SampleType, capacity_hint: usize) -> Self {
+    pub(super) fn for_sample_type(st: cogzilla_raster::SampleType, capacity_hint: usize) -> Self {
         match st {
-            cogzilla_tiff::SampleType::Uint1
-            | cogzilla_tiff::SampleType::Uint4
-            | cogzilla_tiff::SampleType::Uint8 => Self::HistU8([0u64; 256]),
-            cogzilla_tiff::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
+            cogzilla_raster::SampleType::Uint1
+            | cogzilla_raster::SampleType::Uint4
+            | cogzilla_raster::SampleType::Uint8 => Self::HistU8([0u64; 256]),
+            cogzilla_raster::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
             s if s.needs_f64() => Self::Floats64(Vec::with_capacity(capacity_hint)),
             _ => Self::Floats(Vec::with_capacity(capacity_hint)),
         }
@@ -1199,7 +1199,7 @@ impl BandStatsAcc {
                     description,
                     opts,
                     dtype.unwrap_or(HistDtype::for_sample_type(
-                        cogzilla_tiff::SampleType::Uint16,
+                        cogzilla_raster::SampleType::Uint16,
                         unscale,
                     )),
                 )
@@ -1221,7 +1221,7 @@ impl BandStatsAcc {
                     description,
                     opts,
                     dtype.unwrap_or(HistDtype::for_sample_type(
-                        cogzilla_tiff::SampleType::Uint16,
+                        cogzilla_raster::SampleType::Uint16,
                         unscale,
                     )),
                 )
