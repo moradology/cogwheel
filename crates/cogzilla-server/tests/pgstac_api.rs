@@ -199,8 +199,10 @@ async fn search_routes_match_titiler_pgstac_shapes() {
 
     let unknown_tms = client.get(format!("{base}/searches/{id}/tiles/Nope/8/133/91?assets=visual")).send().await.unwrap();
     assert_eq!(unknown_tms.status().as_u16(), 422);
-    let unsupported_tms = client.get(format!("{base}/searches/{id}/tiles/WorldCRS84Quad/8/133/91?assets=visual")).send().await.unwrap();
-    assert_eq!(unsupported_tms.status().as_u16(), 400);
+    for tms in ["WorldCRS84Quad", "EuropeanETRS89_LAEAQuad"] {
+        let resp = client.get(format!("{base}/searches/{id}/tiles/{tms}/4/8/5?assets=visual")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 204, "supported non-WebMercator TMS {tms} should serve 204 over empty search");
+    }
 
     for (what, query) in [
         ("a pixel selection nobody has", "assets=visual&pixel_selection=nope"),
@@ -254,10 +256,10 @@ async fn search_routes_match_titiler_pgstac_shapes() {
     let resp = client.get(format!("{base}/searches/{id}/nope")).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 404);
 
-    // Tilesets: the limits follow the search's bounds and zoom range.
+    // Tilesets: all 13 built-in TMSs are listed (WebMercatorQuad first), and limits follow the search's bounds and zoom range.
     let list = get_json(&client, format!("{base}/searches/{id}/tiles?assets=visual")).await;
     let sets = list["tilesets"].as_array().unwrap();
-    assert_eq!(sets.len(), 1);
+    assert_eq!(sets.len(), 13);
     assert_eq!(sets[0]["links"][0]["href"], json!(format!("{base}/searches/{id}/tiles/WebMercatorQuad?assets=visual")));
     let set = get_json(&client, format!("{base}/searches/{id}/tiles/WebMercatorQuad?assets=visual")).await;
     assert_eq!(set["links"][0]["href"], json!(format!("{base}/searches/{id}/tiles/WebMercatorQuad")));
