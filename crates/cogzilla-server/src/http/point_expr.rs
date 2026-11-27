@@ -66,8 +66,9 @@ enum Cmp {
 }
 
 /// `x` as a whole number for numexpr's bit operations, which take no fractions.
+/// Exact integer range of IEEE-754 `f64` (`|x| <= 2^53`).
 fn whole(x: f64) -> Option<i64> {
-    (x.is_finite() && x.fract() == 0.0 && x.abs() < 9.0e15).then_some(x as i64)
+    (x.is_finite() && x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0).then_some(x as i64)
 }
 
 /// numpy's `minimum` and `maximum`: a NaN on either side is the answer.
@@ -774,15 +775,24 @@ mod tests {
         // Bit shifts over whole numbers (`<<` and `>>`), with precedence between `&` and `+`.
         assert_eq!(one("b1<<2"), f64::from(77 << 2));
         assert_eq!(one("b1>>2"), f64::from(77 >> 2));
+        assert_eq!(one("b1<<0"), 77.0);
+        assert_eq!(one("b1<<2>>1"), f64::from((77 << 2) >> 1));
         assert_eq!(one("1+2<<1"), 6.0);
         assert_eq!(one("b1&(3<<2)"), f64::from(77 & (3 << 2)));
         assert_eq!(one("b1&3<<2"), f64::from(77 & (3 << 2)));
+        assert_eq!(one("b1<<1<1000"), 1.0);
+        assert_eq!(one("b1<1<<7"), 1.0);
+        assert_eq!(one("b1<<1<=154"), 1.0);
+        assert_eq!(one("~(b1<<1)"), f64::from(!(77 << 1)));
+        assert_eq!(one("(b1>0)<<1"), 2.0);
         assert_eq!(one("b1<<64"), 0.0);
         assert_eq!(one("b1>>64"), 0.0);
         assert_eq!(one("(-b1)>>64"), -1.0);
-        // Negative shift count produces NaN -> 0.0 via nan_to_num when all bands are present.
+        // Negative / fractional shift count produces NaN -> 0.0 via nan_to_num when all bands are present.
         assert_eq!(one("b1<<(-1)"), 0.0);
+        assert_eq!(one("b1<<1.5"), 0.0);
         assert_eq!(Program::parse("b1<<2", 2).unwrap().kind(), Kind::Whole);
+        assert_eq!(Program::parse("(b1>0)<<1", 2).unwrap().kind(), Kind::Whole);
         assert!(!Program::parse("b1<<2", 2).unwrap().plain());
         // A band with no value is no value through all of it.
         assert_eq!(run("where(b1>0,1,0);~(b1>0)", &[None, Some(1.0)]).unwrap().0, [None, None]);

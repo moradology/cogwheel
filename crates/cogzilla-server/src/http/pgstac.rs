@@ -2705,18 +2705,31 @@ fn npy_array(
     cogzilla_kernel::encode_npy_typed(values, bands, height, width, kind, absent, mask)
 }
 
-/// Encode an RGBA buffer as a NumPy `|u1` array of shape `(3, H, W)` (or `(4, H, W)` with mask).
-fn rgba_to_npy_u8(rgba: &[u8], width: usize, height: usize, return_mask: bool) -> Bytes {
+/// Encode an RGBA buffer as a NumPy `|u1` array of shape `(C, H, W)` (or `(C + 1, H, W)` with mask),
+/// where `C` is `1` when `grey` is true and `3` otherwise. Short buffers are zero-padded to `H * W`.
+fn rgba_to_npy_u8(rgba: &[u8], width: usize, height: usize, grey: bool, return_mask: bool) -> Bytes {
     let pixels = width.saturating_mul(height);
-    let planes = 3 + usize::from(return_mask);
+    let shown = if grey { 1 } else { 3 };
+    let planes = shown + usize::from(return_mask);
     let hdr = cogzilla_kernel::encode_npy_header("|u1", &[planes, height, width]);
-    let mut out = Vec::with_capacity(hdr.len() + planes * pixels);
+    let body = planes.saturating_mul(pixels);
+    let mut out = Vec::with_capacity(hdr.len().saturating_add(body));
     out.extend_from_slice(&hdr);
-    for band in 0..3 {
-        out.extend(rgba.chunks_exact(4).take(pixels).map(|px| px[band]));
+    for band in 0..shown {
+        out.extend(
+            rgba.chunks_exact(4)
+                .map(|px| px[band])
+                .chain(std::iter::repeat(0u8))
+                .take(pixels),
+        );
     }
     if return_mask {
-        out.extend(rgba.chunks_exact(4).take(pixels).map(|px| if px[3] == 0 { 0 } else { 255 }));
+        out.extend(
+            rgba.chunks_exact(4)
+                .map(|px| if px[3] == 0 { 0 } else { 255 })
+                .chain(std::iter::repeat(0u8))
+                .take(pixels),
+        );
     }
     Bytes::from(out)
 }
@@ -3453,8 +3466,10 @@ async fn part_image_of(
         }
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
-        // With a pixel selection other than `first`: every scene's values, and how to colour them.
-        let mut selecting: Option<(Fold, Paint)> = None;
+        // With a pixel selection other than `first`, or raw `.npy` under `algorithm`: every scene's values,
+        // optional painter (not needed for raw `.npy`), and expected band count.
+        let mut selecting: Option<(Fold, Option<Paint>, usize)> = None;
+        let visual_array = pq.colormap_explicit || formula.is_some() || !pq.rescale.is_empty();
         // Degrees, or Web Mercator metres for a box drawn there.
         let drawn_in = if mercator { CrsModel::Epsg3857 } else { CrsModel::Geographic };
         // One band under a colour map, with a colour formula: drawn grey, coloured at the end.
@@ -3512,16 +3527,20 @@ async fn part_image_of(
                 (CrsModel::Geographic, false) | (CrsModel::Epsg3857, true) => query.resampling,
                 _ => query.reproject,
             };
-            let array_f32 = array && !matches!(bands, BandRequest::Terrain { .. });
-            if let Some(method) = query.selection.or((exact || array_f32).then_some(Selection::First)) {
+            let raw_npy = array && !visual_array && !matches!(bands, BandRequest::Terrain { .. });
+            if let Some(method) = query.selection.or((exact || raw_npy).then_some(Selection::First)) {
                 // The scene's values rather than its colours; only `first` stops early.
                 let count = TileEngine::value_bands(&bands);
                 if n == 0 {
-                    let paint = Paint::of(&bands).ok_or_else(|| {
-                        EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
-                    })?;
+                    let paint = if raw_npy {
+                        None
+                    } else {
+                        Some(Paint::of(&bands).ok_or_else(|| {
+                            EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
+                        })?)
+                    };
                     let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
-                    selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint));
+                    selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint, count));
                 }
                 let values = render_crs_bbox(
                     engine,
@@ -3541,7 +3560,7 @@ async fn part_image_of(
                     pq.unscale,
                 )
                 .await?;
-                if let Some((fold, _)) = &mut selecting
+                if let Some((fold, _, _)) = &mut selecting
                     && values.len() == count * width * height * 4
                 {
                     fold.add_le_bytes(&values);
@@ -3589,9 +3608,9 @@ async fn part_image_of(
                 break;
             }
         }
-        if let Some((fold, paint)) = selecting {
+        if let Some((fold, paint, count)) = selecting {
             if let Some(selected) = fold.finish() {
-                if array {
+                if array && !visual_array {
                     let npy = npy_array(
                         &selected.values,
                         selected.bands,
@@ -3603,16 +3622,16 @@ async fn part_image_of(
                     );
                     return Ok((npy, "application/x-binary"));
                 }
-                canvas = paint.rgba(&selected, width * height);
-            } else if array {
-                let empty = vec![f32::NAN; width * height];
+                if let Some(paint) = paint {
+                    canvas = paint.rgba(&selected, width * height);
+                }
+            } else if array && !visual_array {
+                let empty = vec![f32::NAN; count.saturating_mul(width).saturating_mul(height)];
                 return Ok((
-                    npy_array(&empty, 1, width, height, SampleType::Float32, pq.return_mask, None),
+                    npy_array(&empty, count, width, height, SampleType::Float32, pq.return_mask, None),
                     "application/x-binary",
                 ));
             }
-        } else if array {
-            return Ok((rgba_to_npy_u8(&canvas, width, height, pq.return_mask), "application/x-binary"));
         }
         match (&map_after, formula) {
             (Some(map_after), _) => map_after.colour(&mut canvas),
@@ -3626,6 +3645,11 @@ async fn part_image_of(
             }
             (None, None) => {}
         }
+        // One band, or a count, is a grey picture as on tiles: one channel, or two with the mask.
+        let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+        if array {
+            return Ok((rgba_to_npy_u8(&canvas, width, height, grey, pq.return_mask), "application/x-binary"));
+        }
         let (format, content_type) = match format {
             Some((f, ct)) => (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }),
             None => {
@@ -3633,8 +3657,6 @@ async fn part_image_of(
                 parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?
             }
         };
-        // One band, or a count, is a grey picture as on tiles: one channel, or two with the mask.
-        let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
         let made = if grey {
             encode_picture(canvas, width, height, None, Some((format, content_type)), pq.jpeg_quality, pq.return_mask, true)?
         } else {
@@ -5461,7 +5483,8 @@ async fn render_non_mercator_tms_tile(
             .transpose()
             .map_err(EngineError::BadRequest)?;
         let mut canvas = vec![0u8; dim * dim * 4];
-        let mut selecting: Option<(Fold, Paint)> = None;
+        let mut selecting: Option<(Fold, Option<Paint>, usize)> = None;
+        let visual_array = pq.colormap_explicit || formula.is_some() || !pq.rescale.is_empty();
         let mut map_after: Option<MapAfterFormula> = None;
         let mut one_grey = false;
         for (n, scene) in scenes.iter().enumerate() {
@@ -5493,19 +5516,25 @@ async fn render_non_mercator_tms_tile(
             let exact = formula.is_some() && one_grey_band(&bands) && (map_after.is_some() || one_grey);
             let same_crs = cogs[0].index.geo_keys.projected_cs_type == Some(tms_def.epsg);
             let resample = if same_crs { query.resampling } else { query.reproject };
-            let force_values = (want_array || (tiff && pq.algorithm.is_none())) && Paint::of(&bands).is_some();
-            if let Some(method) = query.selection.or((exact || force_values).then_some(Selection::First)) {
+            let raw_values = ((want_array && !visual_array) || (tiff && pq.algorithm.is_none()))
+                && !matches!(bands, BandRequest::Terrain { .. });
+            if let Some(method) = query.selection.or((exact || raw_values).then_some(Selection::First)) {
                 let count = TileEngine::value_bands(&bands);
                 if n == 0 {
-                    let paint = Paint::of(&bands).ok_or_else(|| {
-                        EngineError::BadRequest(
-                            "pixel_selection other than 'first' cannot be used with a terrain encoding".into(),
-                        )
-                    })?;
+                    let paint = if raw_values {
+                        None
+                    } else {
+                        Some(Paint::of(&bands).ok_or_else(|| {
+                            EngineError::BadRequest(
+                                "pixel_selection other than 'first' cannot be used with a terrain encoding".into(),
+                            )
+                        })?)
+                    };
                     let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
                     selecting = Some((
                         fold_within_limits(method, scenes.len(), count, dim * dim, integer, false)?,
                         paint,
+                        count,
                     ));
                 }
                 let values = render_crs_bbox(
@@ -5526,7 +5555,7 @@ async fn render_non_mercator_tms_tile(
                     pq.unscale,
                 )
                 .await?;
-                if let Some((fold, _)) = &mut selecting
+                if let Some((fold, _, _)) = &mut selecting
                     && values.len() == count * dim * dim * 4
                 {
                     fold.add_le_bytes(&values);
@@ -5574,9 +5603,10 @@ async fn render_non_mercator_tms_tile(
                 break;
             }
         }
-        if let Some((fold, paint)) = selecting {
+        let raw_output = (want_array && !visual_array) || (tiff && pq.algorithm.is_none());
+        if let Some((fold, paint, count)) = selecting {
             if let Some(selected) = fold.finish() {
-                if want_array || tiff {
+                if raw_output {
                     let npy = npy_array(
                         &selected.values,
                         selected.bands,
@@ -5589,30 +5619,42 @@ async fn render_non_mercator_tms_tile(
                     let made = (npy, "application/x-binary");
                     return Ok(as_geotiff(made, tiff, bbox, tms_def.epsg, pq.return_mask));
                 }
-                canvas = paint.rgba(&selected, dim * dim);
-            } else if want_array {
-                let empty = vec![f32::NAN; dim * dim];
-                return Ok((
-                    npy_array(&empty, 1, dim, dim, SampleType::Float32, pq.return_mask, None),
+                if let Some(paint) = paint {
+                    canvas = paint.rgba(&selected, dim * dim);
+                }
+            } else if raw_output {
+                let empty = vec![f32::NAN; count.saturating_mul(dim).saturating_mul(dim)];
+                let made = (
+                    npy_array(&empty, count, dim, dim, SampleType::Float32, pq.return_mask, None),
                     "application/x-binary",
-                ));
+                );
+                return Ok(as_geotiff(made, tiff, bbox, tms_def.epsg, pq.return_mask));
             }
-        } else if want_array {
-            return Ok((rgba_to_npy_u8(&canvas, dim, dim, pq.return_mask), "application/x-binary"));
         }
-        if let Some(map_after) = &map_after {
-            map_after.colour(&mut canvas);
+        match (&map_after, formula) {
+            (Some(map_after), _) => map_after.colour(&mut canvas),
+            (None, Some(formula)) => {
+                let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+                formula.apply_buffer_in_place(&mut canvas, 4);
+                if grey {
+                    canvas.chunks_exact_mut(4).for_each(|p| (p[1], p[2]) = (p[0], p[0]));
+                }
+            }
+            (None, None) => {}
         }
         let grey = one_grey
             && canvas
                 .chunks_exact(4)
                 .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+        if want_array {
+            return Ok((rgba_to_npy_u8(&canvas, dim, dim, grey, pq.return_mask), "application/x-binary"));
+        }
         let asked = format.map(|(f, ct)| (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }));
         let made = encode_picture(
             canvas,
             dim,
             dim,
-            if map_after.is_some() { None } else { formula.as_ref() },
+            None,
             asked,
             pq.jpeg_quality,
             pq.return_mask,
@@ -9005,7 +9047,7 @@ mod tests {
     fn rgba_to_npy_u8_writes_chw_planes_and_optional_mask() {
         // 2x1 RGBA image: pixel 0 opaque (10,20,30,255), pixel 1 transparent (40,50,60,0).
         let rgba = [10u8, 20, 30, 255, 40, 50, 60, 0];
-        let with_mask = rgba_to_npy_u8(&rgba, 2, 1, true);
+        let with_mask = rgba_to_npy_u8(&rgba, 2, 1, false, true);
         assert!(with_mask.starts_with(b"\x93NUMPY"));
         let hdr_len = 10 + u16::from_le_bytes([with_mask[8], with_mask[9]]) as usize;
         let hdr = std::str::from_utf8(&with_mask[10..hdr_len]).unwrap();
@@ -9013,11 +9055,18 @@ mod tests {
         assert!(hdr.contains("(4, 1, 2)"));
         assert_eq!(&with_mask[hdr_len..], &[10, 40, 20, 50, 30, 60, 255, 0]);
 
-        let no_mask = rgba_to_npy_u8(&rgba, 2, 1, false);
+        let no_mask = rgba_to_npy_u8(&rgba, 2, 1, false, false);
         let hdr_len2 = 10 + u16::from_le_bytes([no_mask[8], no_mask[9]]) as usize;
         let hdr2 = std::str::from_utf8(&no_mask[10..hdr_len2]).unwrap();
         assert!(hdr2.contains("(3, 1, 2)"));
         assert_eq!(&no_mask[hdr_len2..], &[10, 40, 20, 50, 30, 60]);
+
+        // Grey 1-band + mask and short-buffer zero-padding safety.
+        let grey_short = rgba_to_npy_u8(&[77, 77, 77, 255], 2, 1, true, true);
+        let hdr_len3 = 10 + u16::from_le_bytes([grey_short[8], grey_short[9]]) as usize;
+        let hdr3 = std::str::from_utf8(&grey_short[10..hdr_len3]).unwrap();
+        assert!(hdr3.contains("(2, 1, 2)"));
+        assert_eq!(&grey_short[hdr_len3..], &[77, 0, 255, 0]);
     }
 
     #[test]
