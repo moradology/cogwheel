@@ -699,7 +699,6 @@ pub fn compute_f32_band_stats_with_engine(
     description: &str,
     opts: &StatsOptions,
 ) -> serde_json::Value {
-    #[cfg(feature = "gpu")]
     {
         if !opts.categorical
             && opts.histogram_edges.is_none()
@@ -911,11 +910,10 @@ struct BandStatsFinalize<'a> {
     dtype: Option<HistDtype>,
 }
 
-#[cfg(feature = "gpu")]
 /// `values`, when the band's values are at hand, are binned here as numpy bins them; without
 /// them the GPU's own counts are kept against numpy's edges.
 fn gpu_band_stats_to_json(
-    gs: &cogzilla_gpu::GpuBandStats,
+    gs: &crate::gpu_backend::GpuBandStats,
     denom_pixels: usize,
     description: &str,
     opts: &StatsOptions,
@@ -1714,7 +1712,7 @@ fn compute_statistics_cpu(
     sample_dims: Option<(usize, usize)>,
     fetched: StatsTiles,
     opts: &StatsOptions,
-    #[cfg(feature = "gpu")] gpu: Option<&crate::gpu_backend::GpuBackend>,
+    gpu: Option<&crate::gpu_backend::GpuBackend>,
 ) -> serde_json::Value {
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
@@ -1782,7 +1780,6 @@ fn compute_statistics_cpu(
             fetched,
             opts,
             exprs,
-            #[cfg(feature = "gpu")]
             gpu,
         );
     }
@@ -1790,7 +1787,6 @@ fn compute_statistics_cpu(
     // 1-pass fused GPU fast path for unmasked float/int `/cog/statistics`:
     // skips CPU pixel extraction and per-band Vec<f32> allocations completely, and
     // submits multi-band requests concurrently so GpuCoalescer packs all bands into 1 submit.
-    #[cfg(feature = "gpu")]
     {
         let tile_masks_none = match &fetched {
             StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => {
@@ -2136,7 +2132,6 @@ fn compute_statistics_cpu(
         let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
         let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
         let bname = format!("b{band_1based}");
-        #[cfg(feature = "gpu")]
         if let BandStatsAcc::Floats(ref vals) = acc
             && !opts.categorical
             && opts.histogram_edges.is_none()
@@ -2178,7 +2173,6 @@ fn compute_statistics_cpu(
     serde_json::Value::Object(out)
 }
 
-#[cfg(feature = "gpu")]
 fn build_stats_separable_coords(
     ifd: &cogzilla_tiff::IfdMeta,
     step: usize,
@@ -2215,7 +2209,6 @@ fn build_stats_separable_coords(
     }
 }
 
-#[cfg(feature = "gpu")]
 fn stats_band_blocks(
     fetched: &StatsTiles,
     n_tiles: usize,
@@ -2264,10 +2257,8 @@ fn compute_expression_statistics_cpu(
     fetched: StatsTiles,
     opts: &StatsOptions,
     exprs: &[(String, cogzilla_kernel::ExprProgram)],
-    #[cfg(feature = "gpu")] gpu: Option<&crate::gpu_backend::GpuBackend>,
+    gpu: Option<&crate::gpu_backend::GpuBackend>,
 ) -> serde_json::Value {
-    #[cfg(not(feature = "gpu"))]
-    let _ = ifd_idx;
     let denom_pixels = if poly_mask.is_some() {
         mask_total_pixels
     } else {
@@ -2280,7 +2271,6 @@ fn compute_expression_statistics_cpu(
     // 1-pass fused GPU fast path for unmasked `/cog/statistics?expression=...`:
     // evaluates each expression + 3-stage histogram/percentile reduction directly on the GPU
     // (12 KB readback, zero CPU pixel loop, zero 67 MB Vec<f32> alloc/upload).
-    #[cfg(feature = "gpu")]
     if poly_mask.is_none()
         && tile_masks.is_none()
         && !opts.categorical
@@ -2564,7 +2554,6 @@ fn compute_expression_statistics_cpu(
 
     let mut out = serde_json::Map::new();
     for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs).enumerate() {
-        #[cfg(feature = "gpu")]
         if !opts.categorical
             && opts.histogram_edges.is_none()
             && let Some(gpu_ref) = gpu
@@ -3773,7 +3762,6 @@ pub async fn compute_statistics_with_options(
         let cog_owned = cog.clone();
         let pm_owned = poly_mask.cloned();
         let opts_owned = opts.clone();
-        #[cfg(feature = "gpu")]
         let gpu_owned = engine.gpu.clone();
         let val = engine
             .store
@@ -3789,7 +3777,6 @@ pub async fn compute_statistics_with_options(
                     sample_dims,
                     fetched,
                     &opts_owned,
-                    #[cfg(feature = "gpu")]
                     gpu_owned.as_deref(),
                 )
             })
@@ -3807,7 +3794,6 @@ pub async fn compute_statistics_with_options(
             sample_dims,
             fetched,
             opts,
-            #[cfg(feature = "gpu")]
             engine.gpu.as_deref(),
         ))
     }
@@ -4478,7 +4464,6 @@ pub async fn render_mercator_bbox(
 
 enum BboxRenderOutput {
     Bytes(Bytes),
-    #[cfg(feature = "gpu")]
     Stats(serde_json::Value),
 }
 
@@ -4666,7 +4651,6 @@ impl BboxCoordMap {
         }
     }
 
-    #[cfg(feature = "gpu")]
     fn as_gpu_source(&self, w: usize, h: usize) -> crate::gpu_backend::BboxCoordSource<'_> {
         match self {
             Self::Separable { u_cols, v_rows } => {
@@ -4748,7 +4732,6 @@ pub async fn render_native_preview_stats(
     ))
     .await?
     {
-        #[cfg(feature = "gpu")]
         BboxRenderOutput::Stats(val) => Ok(val),
         BboxRenderOutput::Bytes(raw) => {
             let pixels: Vec<f32> = raw
@@ -4804,7 +4787,6 @@ pub async fn render_wgs84_bbox_stats(
     ))
     .await?
     {
-        #[cfg(feature = "gpu")]
         BboxRenderOutput::Stats(val) => Ok(val),
         BboxRenderOutput::Bytes(raw) => {
             let pixels: Vec<f32> = raw
@@ -4920,7 +4902,6 @@ async fn render_bbox_impl(
     .await?
     {
         BboxRenderOutput::Bytes(b) => Ok(b),
-        #[cfg(feature = "gpu")]
         BboxRenderOutput::Stats(_) => unreachable!("fused_stats is None"),
     }
 }
@@ -6066,7 +6047,6 @@ async fn render_bbox_core(
     };
     // Shrinking convolution requests stay on the CPU, which widens the kernel like GDAL (the
     // shaders keep the fixed taps).
-    #[cfg(feature = "gpu")]
     let gpu_ctx = engine.gpu.as_ref().filter(|_| !widen_kernel).map(|g| {
         let asset_ids: Vec<u64> = cogs.iter().map(|c| c.id).collect();
         (Arc::clone(g), Arc::clone(&engine.stats), primary.id, asset_ids)
@@ -6078,8 +6058,6 @@ async fn render_bbox_core(
                            color_formula: Option<&ColorFormula>,
                            fused_stats: Option<(&StatsOptions, &str)>|
           -> BboxRenderOutput {
-        #[cfg(not(feature = "gpu"))]
-        let _ = fused_stats;
         let ifd_w_i = ifd_width as i32;
         let ifd_h_i = ifd_height as i32;
         // Same-CRS boxes and previews have separable maps: lazily initialize the 2-pass separable
@@ -6359,7 +6337,6 @@ async fn render_bbox_core(
 
         // Real RawF32 / Npy output for single-band / expression / DEM / Terrain / RGB requests
         if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
-            #[cfg(feature = "gpu")]
             if let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx {
                 let single_band_key = |b1: u16| -> (u64, u16) {
                     if num_cogs > 1 {
@@ -6410,7 +6387,7 @@ async fn render_bbox_core(
                         )
                         .and_then(GpuBboxResult::into_stats)
                     };
-                    let gpu_stats: Option<cogzilla_gpu::GpuBandStats> = match bands {
+                    let gpu_stats: Option<crate::gpu_backend::GpuBandStats> = match bands {
                         BandRequest::Single { band_1based, .. } => {
                             let refs = get_band_refs(*band_1based, 0);
                             let src = make_src!(&refs);
@@ -6954,7 +6931,6 @@ async fn render_bbox_core(
             }
         };
 
-        #[cfg(feature = "gpu")]
         if matches!(
             format,
             OutputFormat::Png

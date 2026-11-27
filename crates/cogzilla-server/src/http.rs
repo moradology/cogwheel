@@ -2558,8 +2558,7 @@ async fn render_mosaic_tile_pixel_selection(
     {
         return Err(err);
     }
-    #[cfg(feature = "gpu")]
-    let gpu_selected: Option<Selected<f32>> = if let Some(ref gpu) = engine.gpu
+    let gpu_selected: Option<Selected<f32>> = if let Some(gpu) = engine.accelerated()
         && let Some(ref f) = fold
         && let Some((nb, scenes)) = f.median_scenes()
         && scenes.len() <= 32
@@ -2574,7 +2573,7 @@ async fn render_mosaic_tile_pixel_selection(
             width: out_dim,
             height: out_dim,
             input: crate::gpu_backend::MosaicCompositeInput::Bands(&band_planes),
-            method: cogzilla_gpu::GpuPixelSelection::Median,
+            method: crate::gpu_backend::GpuPixelSelection::Median,
             output: crate::gpu_backend::MosaicCompositeOutput::F32,
         })
         .and_then(crate::gpu_backend::MosaicCompositeResult::into_f32_bands)
@@ -2592,8 +2591,6 @@ async fn render_mosaic_tile_pixel_selection(
     } else {
         None
     };
-    #[cfg(not(feature = "gpu"))]
-    let gpu_selected: Option<Selected<f32>> = None;
 
     let offload_cpu = gpu_selected.is_none()
         && fold.is_some()
@@ -2626,8 +2623,7 @@ async fn render_mosaic_tile_pixel_selection(
         }
 
         let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
-        #[cfg(feature = "gpu")]
-        if let Some(ref gpu) = engine.gpu {
+        if let Some(gpu) = engine.accelerated() {
             return Ok(gpu.encode_rgba_output(
                 out_dim as usize,
                 out_dim as usize,
@@ -3680,14 +3676,11 @@ async fn render_mosaic_bbox_composite(
         ));
     }
     let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
-    #[cfg(feature = "gpu")]
-    let data = if let Some(gpu) = engine.gpu.as_ref() {
+    let data = if let Some(gpu) = engine.accelerated() {
         gpu.encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
     } else {
         encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
     };
-    #[cfg(not(feature = "gpu"))]
-    let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask);
     Ok((
         wrap_geotiff_fmt(
             data,

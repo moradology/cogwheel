@@ -1703,7 +1703,6 @@ fn weighted_valid_percent_and_masked(
     }
 }
 
-#[cfg(feature = "gpu")]
 struct GpuZonalWeights {
     row_areas: Vec<f32>,
     area_scale: f64,
@@ -1711,7 +1710,6 @@ struct GpuZonalWeights {
     pcts: Vec<f64>,
 }
 
-#[cfg(feature = "gpu")]
 fn prepare_gpu_zonal_weights(
     cov: &[f64],
     win_h: usize,
@@ -1771,10 +1769,9 @@ fn prepare_gpu_zonal_weights(
 /// `values` (with `cov`), when at hand, are binned here as numpy bins them, in coverage units;
 /// without them the GPU's own counts are kept against numpy's edges (or synthesized directly
 /// when the band is constant so widened edges receive all coverage in the exact bin of `min`).
-#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn weighted_gpu_stats_to_json(
-    gs: &cogzilla_gpu::GpuWeightedBandStats,
+    gs: &crate::gpu_backend::GpuWeightedBandStats,
     area_scale: f64,
     total_poly_area_px: Option<f64>,
     description: &str,
@@ -1830,7 +1827,6 @@ fn weighted_gpu_stats_to_json(
     .to_json()
 }
 
-#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn try_gpu_weighted_polygon_bands(
     gpu: &crate::gpu_backend::GpuBackend,
@@ -1885,7 +1881,6 @@ fn try_gpu_weighted_polygon_bands(
     )
 }
 
-#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn try_gpu_weighted_polygon_exprs(
     gpu: &crate::gpu_backend::GpuBackend,
@@ -1912,7 +1907,7 @@ fn try_gpu_weighted_polygon_exprs(
     }
 
     // Compile each expression to GPU bytecode and remap LoadBand(local_slot) -> shared raw_bands index.
-    let mut compiled: Vec<(Vec<cogzilla_gpu::GpuInstr>, u32)> = Vec::with_capacity(exprs.len());
+    let mut compiled: Vec<(Vec<crate::gpu_backend::GpuInstr>, u32)> = Vec::with_capacity(exprs.len());
     for (_, prog) in exprs {
         let mut instrs = crate::gpu_backend::GpuBackend::compile_expr_to_gpu(prog)?;
         let mut band_mask = 0u32;
@@ -1933,7 +1928,7 @@ fn try_gpu_weighted_polygon_exprs(
 
     let weights = prepare_gpu_zonal_weights(cov, win_h, area_model, opts)?;
     let raw_slices: Vec<&[f32]> = band_bufs.iter().map(|(_, b)| b.as_slice()).collect();
-    let expr_refs: Vec<(&[cogzilla_gpu::GpuInstr], u32)> = compiled
+    let expr_refs: Vec<(&[crate::gpu_backend::GpuInstr], u32)> = compiled
         .iter()
         .map(|(ins, mask)| (ins.as_slice(), *mask))
         .collect();
@@ -2507,9 +2502,7 @@ pub async fn compute_native_exact_polygon_stats(
     } else {
         ZonalGeomKind::Point
     };
-    #[cfg(feature = "gpu")]
     let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
-    #[cfg(feature = "gpu")]
     let gpu_stats_counter = Arc::clone(&engine.stats);
     let compute_cpu = move || -> serde_json::Value {
         let total_poly_area_px =
@@ -2529,7 +2522,6 @@ pub async fn compute_native_exact_polygon_stats(
         };
         let mut out = serde_json::Map::new();
         if let Some(ref exprs) = opts_owned.expressions {
-            #[cfg(feature = "gpu")]
             if geom_kind == ZonalGeomKind::Polygon
                 && let Some(ref gpu) = gpu_opt
                 && let Some(vals) = try_gpu_weighted_polygon_exprs(
@@ -2611,7 +2603,6 @@ pub async fn compute_native_exact_polygon_stats(
                 }
                 expr_bufs.push((desc.as_str(), expr_px));
             }
-            #[cfg(feature = "gpu")]
             if geom_kind == ZonalGeomKind::Polygon
                 && let Some(ref gpu) = gpu_opt
             {
@@ -2747,7 +2738,6 @@ pub async fn compute_native_exact_polygon_stats(
                         .unwrap_or_else(|| format!("b{b1}"))
                 })
                 .collect();
-            #[cfg(feature = "gpu")]
             if geom_kind == ZonalGeomKind::Polygon
                 && let Some(ref gpu) = gpu_opt
             {
@@ -3065,9 +3055,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     } else {
         HistDtype::Float64
     };
-    #[cfg(feature = "gpu")]
     let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
-    #[cfg(feature = "gpu")]
     let gpu_stats_counter = Arc::clone(&engine.stats);
     let compute_cpu = move || -> serde_json::Value {
         let total_poly_area_px =
@@ -3086,7 +3074,6 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             PixelAreaModel::Constant(0.0)
         };
         let mut out = serde_json::Map::new();
-        #[cfg(feature = "gpu")]
         if geom_kind == ZonalGeomKind::Polygon
             && let Some(ref gpu) = gpu_opt
             && let Some(vals) = try_gpu_weighted_polygon_exprs(
@@ -3168,7 +3155,6 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             }
             expr_bufs.push((desc.as_str(), expr_px));
         }
-        #[cfg(feature = "gpu")]
         if geom_kind == ZonalGeomKind::Polygon
             && let Some(ref gpu) = gpu_opt
         {

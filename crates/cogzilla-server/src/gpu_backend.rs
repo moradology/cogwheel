@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+pub use cogzilla_gpu::{GpuBandStats, GpuInstr, GpuPixelSelection, GpuWeightedBandStats};
 use cogzilla_gpu::{
-    CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuBandStats, GpuCoalescer,
-    GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuInstr, GpuJpegEncoder,
-    GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuSlab,
-    GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
+    CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer,
+    GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuJpegEncoder,
+    GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuSlab,
+    GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedStatsReducer,
     MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, pack_rgb_lut,
 };
 use cogzilla_kernel::expr_vm::Op;

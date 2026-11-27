@@ -301,7 +301,6 @@ pub struct TileEngine {
     pub stats: Arc<EngineStats>,
     pgstac: std::sync::OnceLock<Arc<cogzilla_pgstac::PgStac>>,
     pub aimd: crate::aimd::AimdLimiter,
-    #[cfg(feature = "gpu")]
     pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
 }
 
@@ -536,12 +535,8 @@ impl TileEngine {
     }
 
     pub fn with_store_and_tile_cache(store: Arc<CogStore>, tile_cache_max_bytes: usize) -> Self {
-        #[cfg(feature = "gpu")]
         let gpu = crate::gpu_backend::GpuBackend::try_init(256 * 1024 * 1024);
-        #[cfg(feature = "gpu")]
         let has_gpu = gpu.is_some();
-        #[cfg(not(feature = "gpu"))]
-        let has_gpu = false;
 
         Self {
             store,
@@ -555,9 +550,15 @@ impl TileEngine {
             stats: Arc::new(EngineStats::default()),
             pgstac: std::sync::OnceLock::new(),
             aimd: crate::aimd::AimdLimiter::from_env(has_gpu),
-            #[cfg(feature = "gpu")]
             gpu,
         }
+    }
+
+    /// Returns the active GPU backend when the `gpu` feature is enabled and hardware initialized,
+    /// or `None` on CPU-only builds / hosts without a usable GPU.
+    #[inline]
+    pub fn accelerated(&self) -> Option<&crate::gpu_backend::GpuBackend> {
+        self.gpu.as_deref()
     }
 
     /// Build a `TileEngine` from `EngineBootConfig`, opening the optional tier-2
@@ -636,7 +637,6 @@ impl TileEngine {
 
     /// Synchronously clear all GPU VRAM slab caches (used by `/admin/clear-cache` and epoch sync).
     pub fn clear_gpu_caches(&self) {
-        #[cfg(feature = "gpu")]
         if let Some(gpu) = &self.gpu {
             gpu.slab_cache.clear();
             gpu.multi_slab_cache.clear();
@@ -798,7 +798,6 @@ impl TileEngine {
         let mut results: Vec<Option<Result<Bytes, EngineError>>> =
             (0..reqs.len()).map(|_| None).collect();
 
-        #[cfg(feature = "gpu")]
         if reqs.len() >= 2
             && let Some(ref gpu) = self.gpu
             && let Ok(crs) = self.get_or_build_crs(cog)
@@ -1146,7 +1145,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu
                     && let Some(bytes) = gpu
                         .try_render_single_band::<N>(
@@ -1211,7 +1209,6 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu
                     && let Some(bytes) = gpu
                         .try_render_terrain::<N>(
@@ -1298,7 +1295,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu
                     && let Some(bytes) = gpu
                         .try_render_dem::<N>(
@@ -1370,7 +1366,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu
                     && let Some(bytes) = gpu
                         .try_render_spectral::<N>(
@@ -1456,7 +1451,6 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_sar_rgb::<N>(
@@ -1508,7 +1502,6 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_sar_rgb::<N>(
@@ -1615,7 +1608,6 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
@@ -1687,7 +1679,6 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
@@ -1769,7 +1760,6 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
@@ -1822,7 +1812,6 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
@@ -1923,7 +1912,6 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
@@ -1996,7 +1984,6 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
@@ -2094,7 +2081,6 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
@@ -2148,7 +2134,6 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        #[cfg(feature = "gpu")]
                         if let Some(gpu) = &self.gpu
                             && let Some(bytes) = gpu
                                 .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
@@ -2322,7 +2307,6 @@ impl TileEngine {
             .with_scale_offset(sc, off))
         };
 
-        #[cfg(feature = "gpu")]
         let scene_cog_id = |bands_1based: &[u16]| -> u64 {
             // Deterministic FNV-1a hash with high-bit tag so multi-COG scene keys never collide
             // with single-COG `OpenedCog::id` values in `GpuMultiBandCache`.
@@ -2354,7 +2338,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let cid = cogs[band_1based.saturating_sub(1) as usize].id;
                     if let Some(bytes) = gpu
@@ -2374,7 +2357,6 @@ impl TileEngine {
                 encoding,
             } => {
                 let src = make_src(*band_1based)?;
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let cid = cogs[band_1based.saturating_sub(1) as usize].id;
                     if let Some(bytes) = gpu
@@ -2418,7 +2400,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let cid = cogs[band_1based.saturating_sub(1) as usize].id;
                     if let Some(bytes) = gpu
@@ -2458,7 +2439,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let cid = cogs[band_1based.saturating_sub(1) as usize].id;
                     if let Some(bytes) = gpu
@@ -2493,7 +2473,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let sid = scene_cog_id(bands_1based);
                     if let Some(bytes) = gpu
@@ -2522,7 +2501,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let sid = scene_cog_id(bands_1based);
                     if let Some(bytes) = gpu
@@ -2555,7 +2533,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let sid = scene_cog_id(bands_1based);
                     if let Some(bytes) = gpu
@@ -2594,7 +2571,6 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let sid = scene_cog_id(bands_1based);
                     if let Some(bytes) = gpu
@@ -2630,7 +2606,6 @@ impl TileEngine {
                 for &b in &prog.used_bands {
                     ordered.push(make_src(b)?);
                 }
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let sid = scene_cog_id(&prog.used_bands);
                     if let Some(bytes) = gpu
