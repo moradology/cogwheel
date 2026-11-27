@@ -5854,41 +5854,75 @@ pub async fn handle_bytes_request(
     Response::from_parts(rparts, bytes)
 }
 
-fn header_accepts_gzip(val: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferredEncoding {
+    None,
+    Gzip,
+    Brotli,
+}
+
+/// Negotiate `Accept-Encoding` across all header lines per RFC 9110 §5.3 & §12.5.3,
+/// supporting `br`, `gzip`/`x-gzip`, `identity`, and `*`. Prefers `br` over `gzip` when both
+/// have equal explicit positive q-values, and falls back to `gzip` for bare `*`.
+fn negotiate_encoding<'a>(vals: impl IntoIterator<Item = &'a str>) -> PreferredEncoding {
+    let mut br_q: Option<f32> = None;
     let mut gzip_q: Option<f32> = None;
+    let mut identity_q: Option<f32> = None;
     let mut star_q: Option<f32> = None;
-    for part in val.split(',') {
-        let mut iter = part.split(';');
-        let enc = iter.next().unwrap_or("").trim();
-        let is_gzip = enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip");
-        let is_star = enc == "*";
-        if !is_gzip && !is_star {
-            continue;
-        }
-        let mut q_val = 1.0f32;
-        let mut valid = true;
-        for param in iter {
-            let p = param.trim();
-            if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                match qv.trim().parse::<f32>() {
-                    Ok(q) if q.is_finite() && (0.0..=1.0).contains(&q) => q_val = q,
-                    _ => {
-                        valid = false;
-                        break;
+    for val in vals {
+        for part in val.split(',') {
+            let mut iter = part.split(';');
+            let enc = iter.next().unwrap_or("").trim();
+            let is_br = enc.eq_ignore_ascii_case("br");
+            let is_gzip = enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip");
+            let is_identity = enc.eq_ignore_ascii_case("identity");
+            let is_star = enc == "*";
+            if !is_br && !is_gzip && !is_identity && !is_star {
+                continue;
+            }
+            let mut q_val = 1.0f32;
+            let mut valid = true;
+            for param in iter {
+                let p = param.trim();
+                if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                    match qv.trim().parse::<f32>() {
+                        Ok(q) if q.is_finite() && (0.0..=1.0).contains(&q) => q_val = q,
+                        _ => {
+                            valid = false;
+                            break;
+                        }
                     }
                 }
             }
-        }
-        if !valid {
-            continue;
-        }
-        if is_gzip {
-            gzip_q = Some(gzip_q.map_or(q_val, |prev| prev.max(q_val)));
-        } else {
-            star_q = Some(star_q.map_or(q_val, |prev| prev.max(q_val)));
+            if !valid {
+                continue;
+            }
+            if is_br {
+                br_q = Some(br_q.map_or(q_val, |prev| prev.max(q_val)));
+            } else if is_gzip {
+                gzip_q = Some(gzip_q.map_or(q_val, |prev| prev.max(q_val)));
+            } else if is_identity {
+                identity_q = Some(identity_q.map_or(q_val, |prev| prev.max(q_val)));
+            } else {
+                star_q = Some(star_q.map_or(q_val, |prev| prev.max(q_val)));
+            }
         }
     }
-    gzip_q.or(star_q).is_some_and(|q| q > 0.0)
+    let eff_br = br_q.or(star_q).unwrap_or(0.0);
+    let eff_gzip = gzip_q.or(star_q).unwrap_or(0.0);
+    let best_compressed = eff_br.max(eff_gzip);
+    if best_compressed <= 0.0 || identity_q.is_some_and(|iq| iq > best_compressed) {
+        return PreferredEncoding::None;
+    }
+    if eff_br > eff_gzip {
+        PreferredEncoding::Brotli
+    } else if eff_gzip > eff_br {
+        PreferredEncoding::Gzip
+    } else if br_q.is_some() {
+        PreferredEncoding::Brotli
+    } else {
+        PreferredEncoding::Gzip
+    }
 }
 
 fn is_compressible_content_type(ct: &str) -> bool {
@@ -5950,11 +5984,12 @@ where
             }
         }
     };
-    let accepts_gzip = req
-        .headers()
-        .get(hyper::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(header_accepts_gzip);
+    let preferred_enc = negotiate_encoding(
+        req.headers()
+            .get_all(hyper::header::ACCEPT_ENCODING)
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     engine.sync_tile_cache_epoch();
     let retry_head = if is_get_or_head {
         Some((req.method().clone(), req.uri().clone(), req.headers().clone()))
@@ -6056,7 +6091,7 @@ where
             resp.headers_mut()
                 .insert(hyper::header::VARY, HeaderValue::from_static("Accept-Encoding"));
         }
-        if accepts_gzip
+        if preferred_enc != PreferredEncoding::None
             && !is_head
             && !resp.headers().contains_key(hyper::header::CONTENT_ENCODING)
         {
@@ -6066,18 +6101,30 @@ where
                 .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            if raw.len() >= 500
-                && let Ok(gz) = cogzilla_codec::compress_gzip(&raw)
-                && gz.len() < raw.len()
+            let compressed = if raw.len() >= 500 {
+                match preferred_enc {
+                    PreferredEncoding::Brotli => {
+                        cogzilla_codec::compress_brotli(&raw).ok().map(|b| (b, "br"))
+                    }
+                    PreferredEncoding::Gzip => {
+                        cogzilla_codec::compress_gzip(&raw).ok().map(|b| (b, "gzip"))
+                    }
+                    PreferredEncoding::None => None,
+                }
+            } else {
+                None
+            };
+            if let Some((enc_bytes, enc_name)) = compressed
+                && enc_bytes.len() < raw.len()
             {
                 parts.headers.insert(
                     hyper::header::CONTENT_ENCODING,
-                    HeaderValue::from_static("gzip"),
+                    HeaderValue::from_static(enc_name),
                 );
-                if let Ok(hv) = HeaderValue::from_str(&gz.len().to_string()) {
+                if let Ok(hv) = HeaderValue::from_str(&enc_bytes.len().to_string()) {
                     parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
                 }
-                resp = Response::from_parts(parts, Full::new(Bytes::from(gz)));
+                resp = Response::from_parts(parts, Full::new(Bytes::from(enc_bytes)));
             } else {
                 resp = Response::from_parts(parts, Full::new(raw));
             }
@@ -12758,16 +12805,16 @@ mod tests {
 
     #[test]
     fn audit87_header_accepts_gzip_rfc9110_precedence_and_nan() {
-        assert!(!header_accepts_gzip("gzip;q=0, *"));
-        assert!(!header_accepts_gzip("*, gzip;q=0"));
-        assert!(!header_accepts_gzip("x-gzip;q=0, *;q=1"));
-        assert!(!header_accepts_gzip("gzip;q=NaN"));
-        assert!(!header_accepts_gzip("gzip;q=inf"));
-        assert!(!header_accepts_gzip("gzip;q=-0.5"));
-        assert!(!header_accepts_gzip("br, deflate"));
-        assert!(header_accepts_gzip("br, *;q=0.5"));
-        assert!(header_accepts_gzip("x-gzip;q=0.1"));
-        assert!(header_accepts_gzip("gzip, deflate"));
+        assert_eq!(negotiate_encoding(["gzip;q=0, *"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["*, gzip;q=0"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["x-gzip;q=0, *;q=1"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip;q=NaN"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["gzip;q=inf"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["gzip;q=-0.5"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["br, deflate"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["br, *;q=0.5"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["x-gzip;q=0.1"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip, deflate"]), PreferredEncoding::Gzip);
     }
 
     #[test]
@@ -13065,5 +13112,25 @@ mod tests {
             .await
             .expect("server should drain and exit promptly")
             .unwrap();
+    }
+
+    #[test]
+    fn negotiate_encoding_prefers_brotli_and_honours_rfc9110_q_values() {
+        assert_eq!(negotiate_encoding(["gzip, deflate, br"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["br"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip, deflate"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["br;q=0, gzip"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip;q=1.0, br;q=0.5"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip;q=0.5, br;q=0.8"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip;q=0.5, *"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["br;q=0.5, *"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["*"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip;q=0, *"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip;q=0, br;q=0, *"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["identity;q=1.0, br;q=0.5"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["br;q=NaN"]), PreferredEncoding::None);
+        // Multi-header HTTP/1.1 & HTTP/2 Accept-Encoding lines
+        assert_eq!(negotiate_encoding(["gzip", "br"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["*", "gzip;q=0", "br;q=0"]), PreferredEncoding::None);
     }
 }
