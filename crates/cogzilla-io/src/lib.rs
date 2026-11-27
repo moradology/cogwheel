@@ -1,5 +1,6 @@
 pub mod allowlist;
 pub mod backend;
+pub mod budget;
 pub mod cache;
 pub mod cloud;
 pub mod disk_cache;
@@ -16,6 +17,7 @@ pub use backend::{
     CogSource, IoError, IoMetrics, RangeResponse, RemoteValidator, TileByteReq, coalesce_ranges,
     io_error_from_reqwest, redact_http_url,
 };
+pub use budget::{ByteBudget, EvictTarget};
 pub use cache::{BlockKey, SingleflightBlockCache};
 pub use cloud::{
     AzureConfig, AzureTarget, GcsConfig, GcsTokenCache, fetch_azure_object_capped,

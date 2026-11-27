@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cogzilla_codec::DecodedTile;
 use dashmap::DashMap;
 use tokio::sync::Notify;
 
 use crate::backend::IoError;
+use crate::budget::{ByteBudget, EvictTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockKey {
@@ -72,11 +73,7 @@ fn tile_bytes(tile: &DecodedTile) -> usize {
 /// Hits stay lock-free (one relaxed store into the entry).
 pub struct SingleflightBlockCache {
     map: DashMap<BlockKey, CacheEntry, ahash::RandomState>,
-    current_bytes: AtomicUsize,
-    max_bytes: usize,
-    evicting: AtomicBool,
-    /// Logical clock for recency stamps; ticks on every insert and hit.
-    clock: AtomicU64,
+    budget: ByteBudget,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub coalesced_waiters: AtomicU64,
@@ -94,10 +91,7 @@ impl SingleflightBlockCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             map: DashMap::with_capacity_and_hasher(2048, ahash::RandomState::new()),
-            current_bytes: AtomicUsize::new(0),
-            max_bytes,
-            evicting: AtomicBool::new(false),
-            clock: AtomicU64::new(0),
+            budget: ByteBudget::new(max_bytes as u64),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             coalesced_waiters: AtomicU64::new(0),
@@ -106,7 +100,7 @@ impl SingleflightBlockCache {
 
     #[inline(always)]
     fn tick(&self) -> u64 {
-        self.clock.fetch_add(1, Ordering::Relaxed)
+        self.budget.touch()
     }
 
     /// Check current state of `key`: `Some(Ok(tile))` if ready, `Some(Err(current_flight))` if
@@ -163,18 +157,18 @@ impl SingleflightBlockCache {
 
     /// Complete an in-flight fetch, storing the decoded tile and waking all singleflight waiters.
     pub fn complete(&self, key: BlockKey, tile: Arc<DecodedTile>) {
-        let new_bytes = tile_bytes(&tile);
+        let new_bytes = tile_bytes(&tile) as u64;
         // Account for `new_bytes` *before* making the entry visible in `self.map` so a concurrent
         // eviction or `clear()` can never subtract `new_bytes` before we add it (which would clamp
         // `saturating_sub` to 0 and permanently leak `new_bytes` into `current_bytes`).
-        let mut now_bytes = self.current_bytes.fetch_add(new_bytes, Ordering::AcqRel) + new_bytes;
+        let mut now_bytes = self.budget.add(new_bytes);
         let entry = CacheEntry::Ready {
             tile: tile.clone(),
             last_used: AtomicU64::new(self.tick()),
         };
         let (flight, old_bytes) = match self.map.insert(key, entry) {
             Some(CacheEntry::InFlight(f)) => (Some(f), 0),
-            Some(CacheEntry::Ready { tile: old, .. }) => (None, tile_bytes(&old)),
+            Some(CacheEntry::Ready { tile: old, .. }) => (None, tile_bytes(&old) as u64),
             None => (None, 0),
         };
         if let Some(f) = flight {
@@ -182,10 +176,10 @@ impl SingleflightBlockCache {
             f.notify.notify_waiters();
         }
         if old_bytes > 0 {
-            now_bytes = Self::atomic_saturating_sub_usize(&self.current_bytes, old_bytes);
+            now_bytes = self.budget.sub(old_bytes);
         }
-        if now_bytes > self.max_bytes {
-            self.evict_some();
+        if now_bytes > self.budget.max_bytes() {
+            self.budget.evict_to_budget(self);
         }
     }
 
@@ -228,30 +222,19 @@ impl SingleflightBlockCache {
     /// Clear all cached Ready blocks while preserving active InFlight singleflight entries so
     /// parked waiters never deadlock.
     pub fn clear(&self) {
-        let mut removed_bytes = 0usize;
+        let mut removed_bytes = 0u64;
         self.map.retain(|_, entry| match entry {
             CacheEntry::InFlight(_) => true,
             CacheEntry::Ready { tile, .. } => {
-                removed_bytes = removed_bytes.saturating_add(tile_bytes(tile));
+                removed_bytes = removed_bytes.saturating_add(tile_bytes(tile) as u64);
                 false
             }
         });
-        Self::atomic_saturating_sub_usize(&self.current_bytes, removed_bytes);
-    }
-
-    fn atomic_saturating_sub_usize(atom: &AtomicUsize, delta: usize) -> usize {
-        let mut cur = atom.load(Ordering::Acquire);
-        loop {
-            let next = cur.saturating_sub(delta);
-            match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return next,
-                Err(actual) => cur = actual,
-            }
-        }
+        self.budget.sub(removed_bytes);
     }
 
     pub fn current_bytes(&self) -> usize {
-        self.current_bytes.load(Ordering::Acquire)
+        self.budget.current_bytes_acquire() as usize
     }
 
     /// Recompute actual Ready bytes in the map (for diagnostics and invariant tests).
@@ -272,109 +255,41 @@ impl SingleflightBlockCache {
             .filter(|item| matches!(item.value(), CacheEntry::InFlight(_)))
             .count()
     }
+}
 
-    fn evict_some(&self) {
-        loop {
-            if self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
-                return;
-            }
-            // Non-blocking guard: at most 1 worker evicts while all other workers stay lock-free
-            if self
-                .evicting
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
+impl EvictTarget for SingleflightBlockCache {
+    type Key = BlockKey;
 
-            let mut removed_any = false;
-            {
-                struct Reset<'a>(&'a AtomicBool);
-                impl Drop for Reset<'_> {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
-                    }
+    fn candidates(&self) -> Vec<(u64, BlockKey)> {
+        self.map
+            .iter()
+            .filter_map(|item| match item.value() {
+                CacheEntry::Ready { last_used, .. } => {
+                    Some((last_used.load(Ordering::Relaxed), *item.key()))
                 }
-                let _reset = Reset(&self.evicting);
+                CacheEntry::InFlight(_) => None,
+            })
+            .collect()
+    }
 
-                // Drain until within cap (aiming to free excess + 25% of max_bytes so we don't
-                // re-trigger on every subsequent insert).
-                loop {
-                    let cur = self.current_bytes.load(Ordering::Acquire);
-                    if cur <= self.max_bytes {
-                        break;
-                    }
-                    let excess = cur - self.max_bytes;
-                    let target_drop = excess.max(self.max_bytes / 4);
+    fn remove_if_cold(&self, key: &BlockKey, expected_stamp: u64) -> Option<u64> {
+        let removed = self.map.remove_if(key, |_, v| {
+            matches!(v, CacheEntry::Ready { last_used, .. }
+                if last_used.load(Ordering::Relaxed) == expected_stamp)
+        });
+        match removed {
+            Some((_, CacheEntry::Ready { tile, .. })) => Some(tile_bytes(&tile) as u64),
+            _ => None,
+        }
+    }
 
-                    let mut candidates: Vec<(u64, BlockKey)> = self
-                        .map
-                        .iter()
-                        .filter_map(|item| match item.value() {
-                            CacheEntry::Ready { last_used, .. } => {
-                                Some((last_used.load(Ordering::Relaxed), *item.key()))
-                            }
-                            CacheEntry::InFlight(_) => None,
-                        })
-                        .collect();
-                    if candidates.is_empty() {
-                        break;
-                    }
-                    candidates.sort_unstable_by_key(|&(stamp, _)| stamp);
-
-                    let mut dropped = 0usize;
-                    let mut skipped: Vec<BlockKey> = Vec::new();
-
-                    // Pass 1: drop genuinely cold blocks whose recency stamp hasn't advanced.
-                    for (stamp, key) in candidates {
-                        if dropped >= target_drop {
-                            break;
-                        }
-                        let removed = self.map.remove_if(&key, |_, v| {
-                            matches!(v, CacheEntry::Ready { last_used, .. }
-                                if last_used.load(Ordering::Relaxed) == stamp)
-                        });
-                        if let Some((_, CacheEntry::Ready { tile, .. })) = removed {
-                            let sz = tile_bytes(&tile);
-                            dropped += sz;
-                            removed_any = true;
-                            Self::atomic_saturating_sub_usize(&self.current_bytes, sz);
-                        } else {
-                            skipped.push(key);
-                        }
-                    }
-
-                    // Pass 2: if concurrent reads touched every candidate and we are still over cap,
-                    // evict the oldest Ready entries from the snapshot regardless of recent hits so
-                    // memory stays strictly bounded under thundering herds.
-                    if self.current_bytes.load(Ordering::Acquire) > self.max_bytes {
-                        for key in skipped {
-                            if self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
-                                break;
-                            }
-                            let removed = self
-                                .map
-                                .remove_if(&key, |_, v| matches!(v, CacheEntry::Ready { .. }));
-                            if let Some((_, CacheEntry::Ready { tile, .. })) = removed {
-                                let sz = tile_bytes(&tile);
-                                dropped += sz;
-                                removed_any = true;
-                                Self::atomic_saturating_sub_usize(&self.current_bytes, sz);
-                            }
-                        }
-                    }
-
-                    if dropped == 0 {
-                        break;
-                    }
-                }
-            }
-
-            // Re-check after releasing `evicting` to close the lost-wakeup race where another
-            // thread inserted while we were exiting `evict_some`.
-            if !removed_any || self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
-                return;
-            }
+    fn remove_now(&self, key: &BlockKey) -> Option<u64> {
+        let removed = self
+            .map
+            .remove_if(key, |_, v| matches!(v, CacheEntry::Ready { .. }));
+        match removed {
+            Some((_, CacheEntry::Ready { tile, .. })) => Some(tile_bytes(&tile) as u64),
+            _ => None,
         }
     }
 }
