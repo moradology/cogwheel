@@ -926,10 +926,20 @@ pub(super) fn openapi_paths() -> Value {
     Value::Object(paths)
 }
 
+/// Returns true for content-negotiation query parameters (`f=html`/`f=json` or
+/// `format=html`/`format=json`) that select the metadata representation itself and must not
+/// be forwarded into generated tile URL templates.
+fn is_doc_negotiation_param(k: &str, v: &str) -> bool {
+    k.eq_ignore_ascii_case("f")
+        || (k.eq_ignore_ascii_case("format")
+            && matches!(v.to_ascii_lowercase().as_str(), "html" | "json"))
+}
+
 /// The request's query string, re-encoded the way TiTiler writes it into links.
 fn encoded_query(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
+        .filter(|(k, v)| !is_doc_negotiation_param(k, v))
         .map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v)))
         .collect::<Vec<_>>()
         .join("&")
@@ -1511,7 +1521,10 @@ fn tilejson(
     let dropped = ["tilematrixsetid", "tile_format", "tile_scale", "minzoom", "maxzoom"];
     let mut qs: Vec<String> = pairs
         .iter()
-        .filter(|(k, _)| !dropped.contains(&k.to_ascii_lowercase().as_str()))
+        .filter(|(k, v)| {
+            !dropped.contains(&k.to_ascii_lowercase().as_str())
+                && !is_doc_negotiation_param(k, v)
+        })
         .map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v)))
         .collect();
     if query_value(pairs, "tilesize").is_none() {
@@ -3461,7 +3474,8 @@ async fn part_image_of(
         };
         // The renderer's picture under `algorithm`, asked for as a GeoTIFF: its RGBA, placed.
         if made.1 == super::GEOTIFF_CONTENT_TYPE && made.0.len() == width * height * 4 {
-            let body = crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &made.0, bbox, 4326, pq.return_mask);
+            let epsg = if mercator { 3857 } else { 4326 };
+            let body = crate::titiler::encode_geotiff_rgba(width as u32, height as u32, &made.0, bbox, epsg, pq.return_mask);
             return Ok((body, made.1));
         }
         Ok(made)
@@ -7084,6 +7098,8 @@ async fn mosaic_route(
             let mut resp = Response::new(Full::new(Bytes::from(build_map_html(&tilejson_url))));
             resp.headers_mut()
                 .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+            resp.headers_mut()
+                .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             resp
         }
         ["WMTSCapabilities.xml"] => {
@@ -8643,6 +8659,24 @@ mod tests {
         assert!(MapAfterFormula::take(&formula, &mut bands).is_none());
         let mut rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
         assert!(MapAfterFormula::take(&formula, &mut rgb).is_none());
+    }
+
+    #[test]
+    fn encoded_query_strips_doc_negotiation_params() {
+        let pairs = vec![
+            ("assets".to_string(), "data".to_string()),
+            ("f".to_string(), "html".to_string()),
+            ("format".to_string(), "json".to_string()),
+            ("rescale".to_string(), "0,255".to_string()),
+        ];
+        assert_eq!(encoded_query(&pairs), "assets=data&rescale=0%2C255");
+
+        // Image tile format=png is preserved.
+        let img = vec![
+            ("assets".to_string(), "data".to_string()),
+            ("format".to_string(), "png".to_string()),
+        ];
+        assert_eq!(encoded_query(&img), "assets=data&format=png");
     }
 
 }
