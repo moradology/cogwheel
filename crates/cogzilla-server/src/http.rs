@@ -8426,7 +8426,7 @@ where
                                 });
                                 on_stack.push(b);
                             }
-                        } else if single_band_per_asset {
+                        } else if single_band_per_asset && single_pick.is_none() {
                             if let Some(v) = vs.first() {
                                 all_vals.push(v.clone());
                                 all_names.push(if pq.asset_as_band {
@@ -8439,7 +8439,9 @@ where
                         } else {
                             for (i, v) in vs.iter().enumerate() {
                                 all_vals.push(v.clone());
-                                all_names.push(format!("{name}_b{}", i + 1));
+                                // (Every band of one asset read for its pick: the asset names
+                                // the band it gives under `asset_as_band`.)
+                                all_names.push(if pq.asset_as_band { name.clone() } else { format!("{name}_b{}", i + 1) });
                                 on_stack.push((i + 1) as u16);
                             }
                         }

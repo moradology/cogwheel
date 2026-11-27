@@ -6768,6 +6768,8 @@ async fn stac_stacks_every_band_of_several_assets() {
     // An asset's `{asset}_b{k}` is its band `k` whatever was picked; `bN` the Nth picked.
     assert_eq!(point("&assets=a%7Cbidx%3D2&expression=a_b2").await, described(&[(5.0, "a_b2")]));
     assert_eq!(point("&assets=a%7Cbidx%3D2,1&expression=a_b1;b1").await, described(&[(3.0, "a_b1"), (5.0, "a_b2")]));
+    // ... and under `asset_as_band` the band picked is the asset's, named after it.
+    assert_eq!(point("&assets=a%7Cbidx%3D2&asset_as_band=true&expression=b1").await, described(&[(5.0, "a")]));
     let feature = serde_json::json!({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon",
         "coordinates": [[[10.1, 40.1], [10.5, 40.1], [10.5, 40.5], [10.1, 40.5], [10.1, 40.1]]]}});
     let posted = |q: &str| {
