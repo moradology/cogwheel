@@ -507,3 +507,51 @@ async fn crs_and_geo_resolve_correctly_across_all_fixtures() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn time_3d_noleap_fixture_round_trips_sel_and_reads_slices() {
+    let Some(dir) = fixtures_dir() else {
+        eprintln!("skipping: benches/fixtures/zarr not generated");
+        return;
+    };
+
+    use cogzilla_zarr::{
+        CfTimeUnits, parse_sel_params, read_chunk_window_for_band, read_coord_1d,
+        resolve_sel_indices, select_variable,
+    };
+
+    let store = FsStore::new(dir.join("time_3d_noleap.zarr"));
+    let h = ZarrHierarchy::open(&store).await.unwrap();
+    // Auto-select single data variable `tas`
+    let sel_var = select_variable(&h, None, None).unwrap();
+    assert_eq!(sel_var.name, "tas");
+    assert_eq!(sel_var.dims.extra_name.as_deref(), Some("time"));
+
+    // Read & decode CF noleap time coordinates
+    let root = h.group(None).unwrap();
+    let time_meta = root.array("time").unwrap();
+    let cf = CfTimeUnits::from_meta(time_meta).unwrap().unwrap();
+    let raw_times = read_coord_1d(&store, "time", time_meta).await.unwrap();
+    assert_eq!(raw_times, vec![0.0, 31.0, 59.0, 90.0, 120.0, 151.0]);
+
+    // Every decoded timestamp round-trips back to its exact index via `?sel=time=<iso>`
+    for (expected_idx, &v) in raw_times.iter().enumerate() {
+        let iso = cf.decode_to_iso(v);
+        let parsed = parse_sel_params(&[format!("time={iso}")]).unwrap();
+        let idxs = resolve_sel_indices(&parsed[0], &raw_times, Some(&cf)).unwrap();
+        assert_eq!(idxs, vec![expected_idx], "round-trip failed for {iso}");
+    }
+
+    // Read slice 0 vs slice 5 through read_chunk_window_for_band (they have different seeds/offsets)
+    let wb0 = read_chunk_window_for_band(&store, "tas", sel_var.meta, Some(0), 0, 0, 64, 64, 4)
+        .await
+        .unwrap();
+    let wb5 = read_chunk_window_for_band(&store, "tas", sel_var.meta, Some(5), 0, 0, 64, 64, 4)
+        .await
+        .unwrap();
+    let r0 = wb0.block_refs();
+    let r5 = wb5.block_refs();
+    let v0 = wb0.as_band_source(&r0).sample_checked(10, 10);
+    let v5 = wb5.as_band_source(&r5).sample_checked(10, 10);
+    assert!(v0.is_finite() && v5.is_finite() && (v5 - v0).abs() > 1.0);
+}

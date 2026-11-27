@@ -36,6 +36,8 @@ pub mod crs;
 pub mod geo;
 pub mod hierarchy;
 pub mod reader;
+pub mod sel;
+pub mod select;
 pub mod sharding;
 
 use std::collections::BTreeMap;
@@ -47,6 +49,12 @@ pub use crs::{ZarrCrs, resolve_crs};
 pub use geo::{ZarrGeo, read_coord_1d, resolve_geo};
 pub use hierarchy::{FsStore, GroupMeta, GroupView, MemoryStore, OpenMode, ZarrHierarchy, ZarrNode, ZarrStore};
 pub use reader::{ChunkWindow, ZarrWindowBlocks, read_chunk_window, read_chunk_window_for_band};
+pub use sel::{
+    CfCalendar, CfTimeUnits, SelDimSpec, SelMethod, parse_sel_params, resolve_sel_indices,
+};
+pub use select::{
+    ArrangedDims, SelectedVariable, arrange_dims, select_variable, select_variables, valid_min_max,
+};
 pub use sharding::{IndexLocation, ShardIndex, ShardIndexCache, ShardingConfig};
 
 /// Anything that can go wrong reading Zarr metadata, navigating a store, or decoding chunks.
@@ -100,6 +108,24 @@ pub enum ZarrError {
         index: usize,
         detail: String,
     },
+    #[error("variable {requested:?} not found (available variables: {available:?})")]
+    VariableNotFound {
+        requested: String,
+        available: Vec<String>,
+    },
+    #[error("variable parameter is required or ambiguous (available variables: {available:?})")]
+    AmbiguousVariable { available: Vec<String> },
+    #[error("invalid sel parameter: {detail}")]
+    InvalidSel { detail: String },
+    #[error("sel value {requested:?} for dimension {dim:?} is outside available range [{min}, {max}]")]
+    SelOutOfRange {
+        dim: String,
+        requested: String,
+        min: String,
+        max: String,
+    },
+    #[error("unsupported CF calendar {calendar:?}: {detail}")]
+    UnsupportedCalendar { calendar: String, detail: String },
 }
 
 /// Which revision of the Zarr specification a store was written to.
