@@ -6253,7 +6253,9 @@ pub(super) fn item_fixup(
                     described.iter().enumerate().map(|(i, d)| (d.clone(), format!("b{}", i + 1))).collect();
                 match super::algorithm_math::over_results(alg, None, None, 0.0, &parts) {
                     Ok(Some(composed)) => Some(composed.outputs.into_iter().map(|(desc, _)| desc).collect()),
-                    _ => Some(described),
+                    // Non-band-math algorithms (e.g. hillshade/slope/contours) keep their own description.
+                    Ok(None) => None,
+                    Err(_) => Some(described),
                 }
             }
             (described, _) => described,

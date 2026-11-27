@@ -203,7 +203,7 @@ impl ExprProgram {
     pub fn compile_with_limit(input: &str, max_ops: usize) -> Result<Self, String> {
         let max_ops = max_ops.max(Self::MAX_OPS);
         // Characters in proportion to the ops allowed: 4096 for an expression as written.
-        let max_expr_chars = 16 * max_ops;
+        let max_expr_chars = 16usize.saturating_mul(max_ops);
         if input.len() > max_expr_chars {
             return Err(format!(
                 "expression length ({}) exceeds limit ({max_expr_chars})",
