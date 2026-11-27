@@ -176,6 +176,18 @@ impl CrsModel {
         matches!(self.unshifted(), Self::Geographic)
     }
 
+    /// Returns `true` for degree-based CRSes (currently identical to [`Self::is_geographic`]).
+    #[inline]
+    pub fn is_degree_based(&self) -> bool {
+        self.is_geographic()
+    }
+
+    /// Returns `true` for Web Mercator (`EPSG:3857`), including any datum-shifted wrapper.
+    #[inline]
+    pub fn is_web_mercator(&self) -> bool {
+        matches!(self.unshifted(), Self::Epsg3857)
+    }
+
     /// Unwrap any outer `DatumShifted` wrapper to inspect the underlying projection model.
     #[inline]
     fn unshifted(&self) -> &Self {
@@ -851,7 +863,7 @@ impl CrsModel {
     /// overhang), so longitudes `< min_lon` should be wrapped by `+360.0` while longitudes in
     /// `[min_lon, 0.0)` remain directly in column 0.
     pub fn geographic_0_360_min_lon(&self, pixel_to_crs: &Affine2D, width: u32) -> Option<f64> {
-        if !matches!(self, CrsModel::Geographic) {
+        if !self.is_geographic() {
             return None;
         }
         let (x0, _) = pixel_to_crs.forward(0.0, 0.0);
@@ -866,7 +878,7 @@ impl CrsModel {
     /// west-antimeridian longitudes (e.g. `[-190, -170]`), so longitudes `> max_lon` (e.g. `+175°E`)
     /// should be wrapped by `-360.0` into the raster's domain.
     pub fn geographic_neg_180_max_lon(&self, pixel_to_crs: &Affine2D, width: u32) -> Option<f64> {
-        if !matches!(self, CrsModel::Geographic) {
+        if !self.is_geographic() {
             return None;
         }
         let (x0, _) = pixel_to_crs.forward(0.0, 0.0);

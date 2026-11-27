@@ -1,0 +1,89 @@
+name: Differential Oracle
+
+# Runs the live TiTiler 2.4 vs cogzilla-server HTTP differential oracle (#450)
+# across /cog, /stac, and /mosaicjson on a nightly schedule, on manual dispatch,
+# or on any pull request carrying the `run-oracle` label.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      families:
+        description: "Comma-separated route families to test (cog,stac,mosaicjson)"
+        type: string
+        default: "cog,stac,mosaicjson"
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diff-oracle-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+jobs:
+  oracle:
+    name: TiTiler Differential Oracle
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'run-oracle') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'run-oracle'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Python environment (TiTiler + MosaicJSON)
+        run: |
+          uv venv --python 3.12 benches/.venv
+          uv pip install --python benches/.venv/bin/python \
+            rasterio rio-tiler titiler.core titiler.mosaic uvicorn numpy pillow httpx
+
+      - name: Generate fixtures
+        run: |
+          benches/.venv/bin/python benches/generate_fixtures.py
+          benches/.venv/bin/python benches/generate_landsat_sar_fixtures.py
+
+      - name: Build cogzilla-server (release)
+        run: cargo build --release --locked -p cogzilla-server
+
+      - name: Run TiTiler differential oracle
+        env:
+          FAMILIES: ${{ inputs.families || 'cog,stac,mosaicjson' }}
+        run: |
+          mkdir -p benches/results
+          benches/.venv/bin/python benches/titiler_diff_oracle.py \
+            --families "$FAMILIES" \
+            --skip-build \
+            --json-out benches/results/titiler_diff_oracle.json \
+            | tee benches/results/titiler_diff_oracle.txt
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## TiTiler Differential Oracle"
+            echo
+            echo '```text'
+            [ -f benches/results/titiler_diff_oracle.txt ] && tail -n 30 benches/results/titiler_diff_oracle.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: titiler-diff-oracle
+          path: |
+            benches/results/titiler_diff_oracle.json
+            benches/results/titiler_diff_oracle.txt
+          if-no-files-found: warn

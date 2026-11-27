@@ -35,7 +35,7 @@ mod wms;
 mod zarr;
 mod zonal;
 
-use query::{ParsedQuery, parse_bool_encoded as parse_bool_param, parse_query, parse_resample_mode};
+use query::{ParsedQuery, parse_bool_encoded as parse_bool_param, parse_query};
 
 pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
 pub(crate) use self::geo::{parse_coord_crs_with_epsg, tile_box_intersects_cog};
@@ -242,7 +242,7 @@ fn resolve_input_bbox(
             bbox[1], bbox[3]
         )));
     }
-    let is_geo = matches!(coord_crs, None | Some(cogzilla_proj::CrsModel::Geographic));
+    let is_geo = coord_crs.is_none_or(cogzilla_proj::CrsModel::is_geographic);
     if is_geo {
         // Symmetric ±2-turn longitude normalisation (matching point routes) before RFC 7946 §5.2
         // antimeridian unwrap: shift both bounds by the same whole multiple of 360° if needed.

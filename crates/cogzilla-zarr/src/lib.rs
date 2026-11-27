@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Zarr v2 and v3 array metadata, for serving Zarr the way cogzilla already serves COGs.
 //!
 //! # Why this crate is small on purpose

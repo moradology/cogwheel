@@ -1,12 +1,11 @@
 //! Pure-Rust Blosc 1.x container decoder.
 //!
 //! Parses the 16-byte Blosc header and block offset table, dispatches each block/stream to the
-//! workspace's existing decoders (`zstd-sys`, `libdeflater` zlib, pure-Rust `lz4`, and pure-Rust
+//! workspace's existing decoders (`cogzilla-codec` zstd/zlib, pure-Rust `lz4`, and pure-Rust
 //! `blosclz`), and applies the header's `shuffle` or `bitshuffle` inverse filter.
 
 use crate::codecs::{
-    MAX_DECODED_CHUNK_BYTES, decompress_lz4_block, decompress_zlib_raw, decompress_zstd_raw,
-    unbitshuffle_bytes, unshuffle_bytes,
+    MAX_DECODED_CHUNK_BYTES, decompress_lz4_block, unbitshuffle_bytes, unshuffle_bytes,
 };
 use crate::ZarrError;
 
@@ -275,14 +274,55 @@ fn decompress_blosc_stream(
             decompress_lz4_block(src, out, expected, chunk_key)
         }
         COMP_ZLIB => {
-            let dec = decompress_zlib_raw(src, expected, chunk_key)?;
-            out.extend_from_slice(&dec);
-            Ok(())
+            cogzilla_codec::validate_deflate_header(src, cogzilla_codec::DeflateWrapper::Zlib)
+                .map_err(|e| ZarrError::Codec {
+                    codec: "zlib".into(),
+                    chunk_key: chunk_key.into(),
+                    detail: e.to_string(),
+                })?;
+            let start = out.len();
+            out.resize(start + expected, 0);
+            match cogzilla_codec::inflate_into(
+                src,
+                &mut out[start..start + expected],
+                cogzilla_codec::DeflateWrapper::Zlib,
+            ) {
+                Ok(n) => {
+                    out.truncate(start + n);
+                    Ok(())
+                }
+                Err(e) => {
+                    out.truncate(start);
+                    Err(ZarrError::Codec {
+                        codec: "zlib".into(),
+                        chunk_key: chunk_key.into(),
+                        detail: e.to_string(),
+                    })
+                }
+            }
         }
         COMP_ZSTD => {
-            let dec = decompress_zstd_raw(src, expected, chunk_key)?;
-            out.extend_from_slice(&dec);
-            Ok(())
+            cogzilla_codec::validate_zstd_header(src, expected).map_err(|e| ZarrError::Codec {
+                codec: "zstd".into(),
+                chunk_key: chunk_key.into(),
+                detail: e.to_string(),
+            })?;
+            let start = out.len();
+            out.resize(start + expected, 0);
+            match cogzilla_codec::zstd_into(src, &mut out[start..start + expected]) {
+                Ok(n) => {
+                    out.truncate(start + n);
+                    Ok(())
+                }
+                Err(e) => {
+                    out.truncate(start);
+                    Err(ZarrError::Codec {
+                        codec: "zstd".into(),
+                        chunk_key: chunk_key.into(),
+                        detail: e.to_string(),
+                    })
+                }
+            }
         }
         COMP_SNAPPY => Err(blosc_err(
             chunk_key,
