@@ -238,24 +238,14 @@ pub fn zarr_error_to_response(err: &ZarrError) -> Response<Full<Bytes>> {
     }
     let status = zarr_error_status(err);
     let body = serde_json::to_vec(&json!({ "detail": err.to_string() })).unwrap_or_default();
-    let mut resp = Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
+    let mut resp = super::plain_resp(status, Bytes::from(body), "application/json");
     append_vary_accept(resp.headers_mut());
     resp
 }
 
 fn json_ok(val: &Value, content_type: &'static str) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec(val).unwrap_or_default();
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
-        .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
+    let mut resp = super::plain_resp(StatusCode::OK, Bytes::from(body), content_type);
     append_vary_accept(resp.headers_mut());
     resp
 }
@@ -449,8 +439,10 @@ impl ZarrStore for ServerZarrStore {
     }
 }
 
-/// Parsed `/zarr/*` query parameters.
-#[derive(Debug, Default)]
+/// Parsed `/zarr/*` query parameters, projected from the shared [`super::query::parse_zarr_request`]
+/// parser so all 12 common parameters follow the exact same rules as `/cog`, `/stac`,
+/// `/mosaicjson`, and `/searches`.
+#[derive(Debug)]
 struct ZarrQuery {
     url: Option<String>,
     variable: Option<String>,
@@ -460,8 +452,8 @@ struct ZarrQuery {
     decode_times: bool,
     show_times: bool,
     rescale: Option<(f32, f32)>,
-    colormap_name: Option<String>,
-    resampling: Option<String>,
+    colormap: ColormapName,
+    resample: ResampleMode,
     nodata: Option<f32>,
     unscale: bool,
     return_mask: bool,
@@ -473,115 +465,52 @@ struct ZarrQuery {
 
 impl ZarrQuery {
     fn parse(raw_query: &str) -> Self {
-        let mut q = Self {
-            decode_times: true,
-            return_mask: true,
-            ..Default::default()
+        let req = super::query::parse_zarr_request(raw_query);
+        let common = req.common;
+        let super::query::FamilyParams::Zarr(zp) = req.family else {
+            unreachable!("parse_zarr_request always returns FamilyParams::Zarr");
         };
-        for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = percent_decode(k);
-            let val = percent_decode(v);
-            match key.as_str() {
-                "url" => q.url = Some(val),
-                "variable" => q.variable = Some(val),
-                "group" => q.group = Some(val),
-                "sel" => q.sel.push(val),
-                "bidx" => {
-                    if let Ok(b) = val.parse::<u64>()
-                        && b >= 1
-                    {
-                        q.bidx = Some(b - 1);
-                    }
-                }
-                "decode_times" => {
-                    q.decode_times = !matches!(
-                        val.to_ascii_lowercase().as_str(),
-                        "false" | "0" | "no"
-                    );
-                }
-                "show_times" => {
-                    q.show_times = matches!(
-                        val.to_ascii_lowercase().as_str(),
-                        "true" | "1" | "yes"
-                    );
-                }
-                "rescale" => {
-                    if let Some((a, b)) = val.split_once(',')
-                        && let (Ok(lo), Ok(hi)) = (a.trim().parse::<f32>(), b.trim().parse::<f32>())
-                        && lo.is_finite()
-                        && hi.is_finite()
-                    {
-                        q.rescale = Some((lo, hi));
-                    }
-                }
-                "colormap_name" => q.colormap_name = Some(val),
-                "resampling" | "reproject" => q.resampling = Some(val),
-                "nodata" => {
-                    if let Ok(nd) = val.parse::<f32>() {
-                        q.nodata = Some(nd);
-                    }
-                }
-                "unscale" => {
-                    q.unscale = matches!(
-                        val.to_ascii_lowercase().as_str(),
-                        "true" | "1" | "yes"
-                    );
-                }
-                "return_mask" => {
-                    q.return_mask = !matches!(
-                        val.to_ascii_lowercase().as_str(),
-                        "false" | "0" | "no"
-                    );
-                }
-                "max_size" => {
-                    if let Ok(ms) = val.parse::<u32>() {
-                        q.max_size = Some(ms);
-                    }
-                }
-                "tilesize" => {
-                    if let Ok(ts) = val.parse::<u32>() {
-                        q.tilesize = Some(ts);
-                    }
-                }
-                "format" | "f" => q.format = Some(val),
-                "coord_crs" => {
-                    let up = val.trim().to_ascii_uppercase();
-                    if let Some(rest) = up.strip_prefix("EPSG:")
-                        && let Ok(code) = rest.parse::<u16>()
-                    {
-                        q.coord_crs = Some(code);
-                    }
-                }
-                _ => {}
-            }
+        let has_key = |names: &[&str]| common.keys.iter().any(|k| names.contains(&k.as_str()));
+        Self {
+            url: common.urls.last().cloned(),
+            variable: zp.variable,
+            group: zp.group,
+            sel: zp.sel,
+            bidx: zp.bidx,
+            decode_times: zp.decode_times,
+            show_times: zp.show_times,
+            rescale: common.rescale.last().copied(),
+            colormap: common.colormap,
+            resample: zp.resample,
+            nodata: common.nodata,
+            unscale: common.unscale,
+            return_mask: common.return_mask,
+            max_size: has_key(&["max_size"])
+                .then_some(if common.max_size_zero { 0 } else { common.max_size }),
+            tilesize: zp.tilesize,
+            format: common.format_param,
+            coord_crs: zp.coord_crs_raw_epsg,
         }
-        q
     }
 
     fn resample_mode(&self) -> ResampleMode {
-        self.resampling
-            .as_deref()
-            .and_then(|s| super::parse_resample_mode(&s.to_ascii_lowercase()))
-            .unwrap_or(ResampleMode::Nearest)
+        self.resample
     }
 
     fn colormap(&self) -> ColormapName {
-        self.colormap_name
-            .as_deref()
-            .and_then(ColormapName::from_str_opt)
-            .unwrap_or(ColormapName::Grayscale)
+        self.colormap
     }
 }
 
 fn parse_output_format(ext: Option<&str>, q_fmt: Option<&str>) -> (OutputFormat, &'static str) {
     let raw = ext.or(q_fmt).unwrap_or("png").to_ascii_lowercase();
     match raw.as_str() {
-        "jpg" | "jpeg" => (OutputFormat::Jpeg { quality: 85 }, "image/jpeg"),
-        "webp" => (OutputFormat::Webp { quality: Some(80.0) }, "image/webp"),
-        "npy" => (OutputFormat::Npy, "application/x-binary"),
         "tif" | "tiff" => (OutputFormat::RawF32, "image/tiff; application=geotiff"),
-        _ => (OutputFormat::Png, "image/png"),
+        // Zarr encoders treat `OutputFormat::RawF32` as GeoTIFF, so do not route raw binary
+        // extensions through `parse_ext_format`'s `RawF32` sentinel.
+        "f32" | "bin" | "raw" => (OutputFormat::Png, "image/png"),
+        other => super::parse_ext_format(other, Some(80.0), 85)
+            .unwrap_or((OutputFormat::Png, "image/png")),
     }
 }
 
@@ -594,20 +523,16 @@ fn binary_ok_with_etag(
     let etag_hdr = crate::tile_cache::compute_keyed_etag(etag_key, &body);
     let etag = etag_hdr.to_str().unwrap_or("");
     let cc = zarr_cache_control_header().clone();
-    if let Some(inm) = if_none_match {
-        let matched = inm.trim() == "*"
-            || inm
-                .split(',')
-                .any(|t| t.trim().trim_start_matches("W/") == etag);
-        if matched {
-            return Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(ETAG, etag_hdr)
-                .header(CACHE_CONTROL, cc)
-                .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
-                .body(Full::new(Bytes::new()))
-                .unwrap();
-        }
+    if let Some(inm) = if_none_match
+        && super::etag_matches(inm, etag)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(ETAG, etag_hdr)
+            .header(CACHE_CONTROL, cc)
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
     }
     Response::builder()
         .status(StatusCode::OK)
