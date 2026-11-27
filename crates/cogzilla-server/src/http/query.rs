@@ -149,12 +149,27 @@ pub(super) enum HistogramBinsSpec {
     Edges(Vec<f64>),
 }
 
+/// One asset as the query names it, in `ParsedQuery::assets`' order: its own band math (the
+/// last `|expression=` of its `assets=` entry) and its own bands (the last `|bidx=` or
+/// `|indexes=` of it). `listed` when it came from `assets=`, not from `asset_bidx` alone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct AssetEntry {
+    pub(super) name: String,
+    pub(super) expression: Option<String>,
+    pub(super) bands: Option<Vec<u16>>,
+    pub(super) listed: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct ParsedQuery {
     pub(super) urls: Vec<String>,
     pub(super) assets: Vec<String>,
     pub(super) asset_bidx: Vec<(String, Vec<u16>)>,
     pub(super) asset_exprs: Vec<(String, String)>,
+    /// Each of `assets`, entry by entry, while it is the list as parsed.
+    pub(super) asset_entries: Vec<AssetEntry>,
+    /// What `asset_bidx=name|...` gives each asset, by name.
+    pub(super) asset_bidx_by_name: Vec<(String, Vec<u16>)>,
     /// The assets' own band math as it was folded into `expr_raw`, for typing an array as
     /// numpy types it: each `assets` entry's band math (`None` for a plain asset), one per
     /// raster read, and the request expression over their results. `None` when nothing was
@@ -229,6 +244,15 @@ pub(super) struct ParsedQuery {
     pub(super) keys: Vec<String>,
     /// Values that could not be parsed or name something unsupported.
     pub(super) errors: Vec<String>,
+}
+
+impl ParsedQuery {
+    /// Drop the entry-by-entry record of the assets, for a caller that has replaced the
+    /// assets' options by name: their readers then read those (`stac_entry_options`).
+    pub(super) fn forget_asset_entries(&mut self) {
+        self.asset_entries.clear();
+        self.asset_bidx_by_name.clear();
+    }
 }
 
 impl ParsedQuery {
@@ -440,6 +464,8 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
         assets: Vec::new(),
         asset_bidx: Vec::new(),
         asset_exprs: Vec::new(),
+        asset_entries: Vec::new(),
+        asset_bidx_by_name: Vec::new(),
         asset_math_stages: None,
         asset_as_band: false,
         bidx: Vec::new(),
@@ -530,34 +556,43 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                     // TiTiler `assets=name|bidx=1,2,3`, `assets=name|indexes=1,2,3`, or `assets=name|expression=b1*2`
                     let mut parts = dec.split('|');
                     let asset_name = parts.next().map(str::trim).unwrap_or("");
-                    if !asset_name.is_empty() {
-                        pq.assets.push(asset_name.to_string());
-                    }
                     let mut parsed = Vec::new();
+                    let mut entry_bands: Option<Vec<u16>> = None;
+                    let mut entry_expr: Option<&str> = None;
                     for opt in parts {
                         if let Some(bidx_str) = opt
                             .strip_prefix("bidx=")
                             .or_else(|| opt.strip_prefix("indexes="))
                         {
+                            let mut these = Vec::new();
                             for tok in bidx_str.split(',') {
                                 match tok.trim().parse::<u16>() {
-                                    Ok(b) if b >= 1 => parsed.push(b),
+                                    Ok(b) if b >= 1 => these.push(b),
                                     _ => bad("expected positive integer band indices in |bidx="),
                                 }
                             }
+                            parsed.extend_from_slice(&these);
+                            entry_bands = Some(these);
                         } else if let Some(expr_str) = opt.strip_prefix("expression=") {
                             let expr_str = expr_str.trim();
-                            if !asset_name.is_empty() && !expr_str.is_empty() {
-                                if let Some((_, existing)) =
-                                    pq.asset_exprs.iter_mut().find(|(n, _)| n == asset_name)
-                                {
-                                    *existing = expr_str.to_string();
-                                } else {
-                                    pq.asset_exprs
-                                        .push((asset_name.to_string(), expr_str.to_string()));
-                                }
+                            if !expr_str.is_empty() {
+                                entry_expr = Some(expr_str);
                             }
                         }
+                    }
+                    if !asset_name.is_empty() {
+                        pq.assets.push(asset_name.to_string());
+                        pq.asset_entries.push(AssetEntry {
+                            name: asset_name.to_string(),
+                            expression: entry_expr.map(str::to_string),
+                            bands: entry_bands.filter(|b| !b.is_empty()),
+                            listed: true,
+                        });
+                    }
+                    // One per `assets=` entry, the last `|expression=` of it: an asset asked
+                    // for twice keeps both.
+                    if let Some(expr_str) = entry_expr.filter(|_| !asset_name.is_empty()) {
+                        pq.asset_exprs.push((asset_name.to_string(), expr_str.to_string()));
                     }
                     if !asset_name.is_empty() && !parsed.is_empty() {
                         if let Some((_, existing)) =
@@ -572,6 +607,7 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                     for a in dec.split(',') {
                         if !a.is_empty() {
                             pq.assets.push(a.to_string());
+                            pq.asset_entries.push(AssetEntry { name: a.to_string(), listed: true, ..AssetEntry::default() });
                         }
                     }
                 }
@@ -590,6 +626,13 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                     if !name.is_empty() {
                         if !pq.assets.iter().any(|a| a == name) {
                             pq.assets.push(name.to_string());
+                            pq.asset_entries.push(AssetEntry { name: name.to_string(), ..AssetEntry::default() });
+                        }
+                        if !parsed.is_empty() {
+                            match pq.asset_bidx_by_name.iter_mut().find(|(n, _)| n == name) {
+                                Some((_, existing)) => existing.extend_from_slice(&parsed),
+                                None => pq.asset_bidx_by_name.push((name.to_string(), parsed.clone())),
+                            }
                         }
                         if !parsed.is_empty() {
                             if let Some((_, existing)) =

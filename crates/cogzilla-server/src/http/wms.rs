@@ -254,7 +254,7 @@ pub(super) async fn handle_cog_wms(
             let mut bands = build_band_request_for_output(pq, db, st, fmt, ct)?;
             let fmt = geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
             if pq.unscale {
-                apply_unscale_cogs(&mut bands, &cogs);
+                apply_unscale_cogs(&mut bands, &cogs, None);
             }
             let custom_lut = resolve_custom_lut(pq, &cogs[0], &bands)?;
             let cf = pq.parse_color_formula()?;

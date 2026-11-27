@@ -6615,3 +6615,102 @@ async fn ogc_wms_getcapabilities_and_getmap_end_to_end() {
         .unwrap();
     assert_eq!(bad_t.status().as_u16(), 400);
 }
+
+/// The shape and values of a `.npy` in any of the types an array is written in.
+fn decode_npy_any(bytes: &[u8]) -> (Vec<usize>, Vec<f64>) {
+    assert_eq!(&bytes[..6], b"\x93NUMPY", "not a .npy");
+    let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let header = std::str::from_utf8(&bytes[10..10 + header_len]).unwrap();
+    let descr = header.split("'descr': '").nth(1).unwrap().split('\'').next().unwrap();
+    let shape: Vec<usize> = header.split("'shape': (").nth(1).unwrap().split(')').next().unwrap()
+        .split(',').filter_map(|d| d.trim().parse().ok()).collect();
+    let data = &bytes[10 + header_len..];
+    let values = match descr {
+        "|u1" => data.iter().map(|&v| f64::from(v)).collect(),
+        "<u2" => data.chunks_exact(2).map(|c| f64::from(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        "<i4" => data.chunks_exact(4).map(|c| f64::from(i32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect(),
+        "<f4" => data.chunks_exact(4).map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect(),
+        "<f8" => data.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect(),
+        other => panic!("unexpected dtype {other}"),
+    };
+    (shape, values)
+}
+
+/// Several assets of more than one band are stacked as rio-tiler stacks a STAC item: every band
+/// of each, one after another, so `bN` is the Nth band of the stack; an asset's own band math
+/// is at its place in the stack, and a request expression is over the results.
+#[tokio::test]
+async fn stac_stacks_every_band_of_several_assets() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_stac_stack_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let bounds = [10.0, 40.0, 10.64, 40.64];
+    let (a, b) = (tmp.join("a.tif"), tmp.join("b.tif"));
+    write_synthetic_u16_2band_4326_geotiff(&a, 64, 64, bounds, 3, 5, None);
+    write_synthetic_u16_2band_4326_geotiff(&b, 64, 64, bounds, 11, 13, None);
+    let asset = |p: &PathBuf| serde_json::json!({"href": p.to_string_lossy(), "type": "image/tiff; application=geotiff", "roles": ["data"]});
+    let item = serde_json::json!({
+        "type": "Feature", "stac_version": "1.0.0", "id": "two", "bbox": bounds,
+        "geometry": {"type": "Polygon", "coordinates": [[[10.0, 40.0], [10.64, 40.0], [10.64, 40.64], [10.0, 40.64], [10.0, 40.0]]]},
+        "properties": {"datetime": "2024-01-01T00:00:00Z"},
+        "assets": {"a": asset(&a), "b": asset(&b), "b2": asset(&b)},
+    });
+    let item_path = tmp.join("item.json");
+    std::fs::write(&item_path, item.to_string()).unwrap();
+    let url = item_path.to_string_lossy().to_string();
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let pixel = |q: &str| {
+        let q = q.to_string();
+        let (client, base, url) = (client.clone(), base.clone(), url.clone());
+        async move {
+            let resp = client.get(format!("{base}/stac/preview.npy?url={url}&max_size=16{q}")).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{q}");
+            let (shape, values) = decode_npy_any(&resp.bytes().await.unwrap());
+            let plane = shape[1] * shape[2];
+            // The data bands at the middle pixel, without the mask.
+            (0..shape[0] - 1).map(|k| values[k * plane + plane / 2]).collect::<Vec<f64>>()
+        }
+    };
+    assert_eq!(pixel("&assets=a&assets=b").await, [3.0, 5.0, 11.0, 13.0]);
+    assert_eq!(pixel("&assets=a&assets=b&expression=b2;b3*2;b4").await, [5.0, 22.0, 13.0]);
+    assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b").await, [5.0, 11.0, 13.0]);
+    assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b").await, [8.0, 11.0, 13.0]);
+    assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await, [104.0]);
+    // An asset's name in the request expression is its first band.
+    assert_eq!(pixel("&assets=a&assets=b&expression=b_b1-a_b1").await, [8.0]);
+    // ... and `bN` beside it is still the Nth band of the stack.
+    assert_eq!(pixel("&assets=a&assets=b&expression=b_b1%2Bb2").await, [16.0]);
+    // An asset named as a band would be is read as the asset, as before stacking.
+    assert_eq!(pixel("&assets=a&assets=b2&expression=b2").await, [11.0]);
+    // An asset asked for twice keeps what each time asked.
+    assert_eq!(pixel("&assets=a&assets=a%7Cexpression%3Db1*2").await, [3.0, 5.0, 6.0]);
+    assert_eq!(pixel("&assets=a%7Cexpression%3Db1*2&assets=a").await, [6.0, 3.0, 5.0]);
+    assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=a%7Cbidx%3D1").await, [5.0, 3.0]);
+    // `asset_bidx` for one asset beside another's own `|bidx=`.
+    assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b&asset_bidx=b%7C2").await, [5.0, 13.0]);
+    // `:all:` reads every asset of the item, and an asset's band math named beside it goes to
+    // that asset; its array is typed as numpy types that math (b1*2 over uint16 is int32).
+    let all = client.get(format!("{base}/stac/preview.npy?url={url}&max_size=16&assets=:all:&assets=b%7Cexpression%3Db1*2")).send().await.unwrap();
+    assert_eq!(all.status().as_u16(), 200);
+    let all = all.bytes().await.unwrap();
+    assert!(String::from_utf8_lossy(&all[..64]).contains("'<i4'"), "{}", String::from_utf8_lossy(&all[..80]));
+    // Sixteen bands are read for band math, but an answer of them all holds at most fifteen.
+    let sixteen = "&assets=a".repeat(8);
+    let too_many = client.get(format!("{base}/stac/preview.npy?url={url}{sixteen}")).send().await.unwrap();
+    assert_eq!(too_many.status().as_u16(), 400, "sixteen bands with no band math");
+    assert_eq!(pixel(&format!("{sixteen}&expression=b1%2Bb16")).await, [8.0]);
+    assert_eq!(pixel(&format!("{sixteen}&bidx=16")).await, [5.0]);
+    // Under `asset_as_band` each asset gives one band, however it is chosen.
+    assert_eq!(pixel("&assets=a%7Cbidx%3D1&assets=b%7Cexpression%3Db2&asset_as_band=true").await, [3.0, 13.0]);
+    for q in ["&assets=a&assets=b", "&assets=a%7Cexpression%3Db1;b2&assets=b%7Cbidx%3D1", "&assets=a%7Cbidx%3D1,2&assets=b%7Cbidx%3D1", "&assets=a"] {
+        let refused = client.get(format!("{base}/stac/preview.npy?url={url}{q}&asset_as_band=true")).send().await.unwrap();
+        assert_eq!(refused.status().as_u16(), 400, "asset_as_band over an asset of two bands: {q}");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}

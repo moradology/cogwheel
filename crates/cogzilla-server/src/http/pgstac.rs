@@ -1904,7 +1904,8 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// the wrong bands for several; here each asset keeps its own. Band math on one asset is
 /// not something those handlers do. A tile or a box with it never gets here: the search
 /// routes draw those (`item_picture_by_asset`). A point reads every band of such an asset
-/// and works it out afterwards (`item_fixup`); a preview and the statistics read it as one
+/// and works it out afterwards (`item_fixup`); a preview is not planned here, but stacked
+/// entry by entry as rio-tiler stacks an item (`expand_stac_asset_bidx`); the statistics read it as one
 /// expression over the stacked bands (`item_asset_math`). On what is left, an image over a
 /// posted shape or the info, it is refused, not left out.
 ///
@@ -1912,6 +1913,10 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// options. Only the info, statistics and point handlers read bands asset by asset; on
 /// the others several assets with bands of their own are refused too.
 pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
+    // A preview reads each entry's own options as the shared parser records them.
+    if item_preview_route(rest) {
+        return Ok(None);
+    }
     let pairs = query_pairs(raw_query);
     let mut specs = parse_assets(&pairs)?;
     // Bands chosen on an asset with band math, which the shared parser has kept: dropped
@@ -1964,17 +1969,23 @@ pub(super) fn asset_math_asked(pairs: &[(String, String)]) -> bool {
     pairs.iter().any(|(k, v)| k == "assets" && v.split('|').skip(1).any(|option| option.starts_with("expression=")))
 }
 
-/// The item routes whose `/stac` handler reads an asset's band math as one expression over
-/// the stacked bands: the preview and the statistics.
+/// The item routes whose `/stac` handler is not given the assets' own band math but reads it
+/// as one expression over the stacked bands: the statistics.
 fn item_asset_math_route(rest: &[&str]) -> bool {
+    matches!(rest, ["statistics"])
+}
+
+/// An item's preview, which the `/stac` preview stacks as rio-tiler does, each asset's own
+/// options with it (`expand_stac_asset_bidx`).
+pub(super) fn item_preview_route(rest: &[&str]) -> bool {
     match rest {
-        ["preview", ..] | ["statistics"] => true,
+        ["preview", ..] => true,
         [one] => one.starts_with("preview."),
         _ => false,
     }
 }
 
-/// Band math on the assets of an item's preview or statistics (`assets=red|expression=b1*2`),
+/// Band math on the assets of an item's statistics (`assets=red|expression=b1*2`),
 /// as one expression over the bands the `/stac` handler stacks, with what titiler-pgstac
 /// calls each result: `{asset}_{part}` for an asset's own band math, `{asset}_b1` for a
 /// plain asset, and a request `expression` over those with each `bN` replaced by the Nth
@@ -2007,7 +2018,7 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
             Some(expression) => {
                 let program = Program::parse(expression, if several { 1 } else { MAX_BANDS_PER_ITEM }).map_err(|e| {
                     if several && Program::parse(expression, MAX_BANDS_PER_ITEM).is_ok() {
-                        format!("assets={}|expression= reads past the asset's first band, which an item's preview or statistics of several assets does not stack yet", spec.name)
+                        format!("assets={}|expression= reads past the asset's first band, which an item's statistics of several assets do not stack yet", spec.name)
                     } else {
                         e
                     }
@@ -2018,7 +2029,7 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
             // The first band, which is what is read, may be asked for; no other.
             None if chosen.get(slot).is_some_and(|c| c.as_ref().is_some_and(|c| c.as_slice() != [1])) => {
                 return Err(format!(
-                    "assets={}|bidx= with band math on another asset is not supported on an item's preview or statistics yet, but for the first band",
+                    "assets={}|bidx= with band math on another asset is not supported on an item's statistics yet, but for the first band",
                     spec.name
                 ));
             }
@@ -2080,7 +2091,7 @@ pub(super) fn item_asset_math_stages(rest: &[&str], pairs: &[(String, String)]) 
 
 /// [`item_asset_math`] over several assets reads each asset's first band, which is the
 /// whole of an asset with band math over `b1` alone, but not of a plain asset of more bands
-/// than one: titiler-pgstac stacks all of those, which the `/stac` preview and statistics do
+/// than one: titiler-pgstac stacks all of those, which the `/stac` statistics do
 /// not yet. Such a request is refused rather than read short.
 pub(super) fn check_item_asset_math(
     raw_query: &str,
@@ -2102,7 +2113,7 @@ pub(super) fn check_item_asset_math(
         });
         if plain_unselected && bands > 1 {
             return Err(EngineError::BadRequest(format!(
-                "assets={name} has {bands} bands: an item's preview or statistics of several assets with band math of their own takes plain assets of one band only, for now"
+                "assets={name} has {bands} bands: an item's statistics of several assets with band math of their own take plain assets of one band only, for now"
             )));
         }
     }
@@ -3727,7 +3738,7 @@ async fn part_image_of(
                 continue;
             }
             if pq.unscale {
-                apply_unscale_cogs(&mut bands, &cogs);
+                apply_unscale_cogs(&mut bands, &cogs, None);
             }
             let rgba = render_crs_bbox(
                 engine,
@@ -5441,6 +5452,7 @@ pub(super) fn point_asset_math_reads(pq: &mut ParsedQuery, raw_query: &str) {
     pq.assets = specs.into_iter().map(|s| s.name).collect();
     pq.bidx.clear();
     pq.asset_exprs.clear();
+    pq.forget_asset_entries();
     pq.asset_as_band = false;
 }
 
@@ -5829,7 +5841,7 @@ async fn render_non_mercator_tms_tile(
                 continue;
             }
             if pq.unscale {
-                apply_unscale_cogs(&mut bands, &cogs);
+                apply_unscale_cogs(&mut bands, &cogs, None);
             }
             let rgba = render_crs_bbox(
                 engine,
@@ -8064,7 +8076,7 @@ async fn mosaic_route(
 mod tests {
     use super::*;
 
-    /// An asset's own band math on an item's preview or statistics is one expression over the
+    /// An asset's own band math on an item's statistics is one expression over the
     /// stacked bands, described as titiler-pgstac describes it (each asked of it, 2026-11-27).
     #[test]
     fn asset_math_is_one_expression_with_titiler_pgstacs_names() {
@@ -8090,13 +8102,10 @@ mod tests {
         assert!(math("assets=visual%7Cexpression%3Db1%3Bb2&asset_as_band=true").is_err());
         assert_eq!(math("assets=red&expression=b1*2"), Ok(None), "no asset's own band math");
         assert_eq!(item_asset_math(&["point", "1,2"], &query_pairs("assets=red%7Cexpression%3Db1*2")), Ok(None));
-        // Preview route variants are supported identically to statistics.
+        // A preview is stacked with the assets' band math (`expand_stac_asset_bidx`), not
+        // rewritten here.
         for route in [&["preview"][..], &["preview.png"][..], &["preview", "64x64.png"][..]] {
-            assert_eq!(
-                item_asset_math(route, &query_pairs("assets=red%7Cexpression%3Db1*2")),
-                some("b1*2", &["red_b1*2"]),
-                "{route:?}"
-            );
+            assert_eq!(item_asset_math(route, &query_pairs("assets=red%7Cexpression%3Db1*2")), Ok(None), "{route:?}");
         }
         // Empty expression and `:all:` are rejected, and syntax errors keep their real message when several == true.
         assert!(math("assets=red%7Cexpression%3D").is_err(), "empty asset expression must error");
@@ -8125,7 +8134,7 @@ mod tests {
     /// stacks the assets' results before the request expression is worked out over them.
     #[test]
     fn asset_math_is_typed_from_its_stacked_results() {
-        let stages = |q: &str| item_asset_math_stages(&["preview.npy"], &query_pairs(q));
+        let stages = |q: &str| item_asset_math_stages(&["statistics"], &query_pairs(q));
         assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some((vec![Some("b1/2;b1".into())], "b2".into())));
         assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some((vec![Some("b1*2".into()), None], "b1-b2".into())));
         assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), Some((vec![Some("b1*2".into())], String::new())), "the results are the answer");
