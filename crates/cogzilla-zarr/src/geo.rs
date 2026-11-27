@@ -536,4 +536,19 @@ mod tests {
         assert_eq!(gr.lon_wrap_shift, 0);
         assert_eq!(gr.bounds, [-170.0, 19.0, -166.0, 21.0]);
     }
+
+    #[test]
+    fn float32_regular_coords_tolerate_f32_ulp_but_refuse_irregular() {
+        // 0.01° grid quantized to f32 near -180° (MUR SST pattern)
+        let x: Vec<f64> = (0..1000)
+            .map(|i| (-179.99f32 + i as f32 * 0.01f32) as f64)
+            .collect();
+        let step = check_regular_axis_with_dtype("lon", &x, DataType::Float32).unwrap();
+        assert!((step - 0.01).abs() < 1e-6);
+
+        // Genuine irregularity (0.05° jump) is still refused even in Float32
+        let mut bad = x.clone();
+        bad[500] += 0.05;
+        assert!(check_regular_axis_with_dtype("lon", &bad, DataType::Float32).is_err());
+    }
 }

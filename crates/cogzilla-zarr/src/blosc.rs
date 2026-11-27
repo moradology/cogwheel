@@ -416,6 +416,48 @@ mod tests {
     }
 
     #[test]
+    fn blosc_trailing_partial_block_is_not_split() {
+        // Construct a valid Blosc 1.x split-shuffle payload with 2 blocks:
+        // block 0: full blocksize=16 (typesize=4 -> 4 split streams of 4 uncompressed bytes each)
+        // block 1: trailing partial bsize=8 < blocksize=16 (NOT split -> 1 stream of 8 bytes)
+        let typesize = 4usize;
+        let blocksize = 16usize;
+        let nbytes = 24usize;
+        let b0_shuffled = [
+            0u8, 4, 8, 12, // stream 0
+            1, 5, 9, 13, // stream 1
+            2, 6, 10, 14, // stream 2
+            3, 7, 11, 15, // stream 3
+        ];
+        let b1_shuffled = [16u8, 20, 17, 21, 18, 22, 19, 23];
+
+        let mut buf = vec![0u8; 16 + 8]; // 16-byte header + 2 * 4-byte bstarts
+        let b0_start = buf.len() as i32;
+        for s in 0..4 {
+            buf.extend_from_slice(&4i32.to_le_bytes()); // uncompressed stream
+            buf.extend_from_slice(&b0_shuffled[s * 4..(s + 1) * 4]);
+        }
+        let b1_start = buf.len() as i32;
+        buf.extend_from_slice(&8i32.to_le_bytes()); // single unsplit stream for partial block
+        buf.extend_from_slice(&b1_shuffled);
+
+        let cbytes = buf.len() as i32;
+        buf[0] = 2; // version
+        buf[1] = 1; // versionlz
+        buf[2] = BLOSC_DOSHUFFLE | 0x20; // shuffle + split (BLOSC_NON_SPLIT=0) + LZ4
+        buf[3] = typesize as u8;
+        buf[4..8].copy_from_slice(&(nbytes as i32).to_le_bytes());
+        buf[8..12].copy_from_slice(&(blocksize as i32).to_le_bytes());
+        buf[12..16].copy_from_slice(&cbytes.to_le_bytes());
+        buf[16..20].copy_from_slice(&b0_start.to_le_bytes());
+        buf[20..24].copy_from_slice(&b1_start.to_le_bytes());
+
+        let decoded = decompress_blosc(&buf, nbytes, "era5/0.0.0").unwrap();
+        let expected: Vec<u8> = (0u8..24).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
     #[ignore]
     fn bench_blosc_throughput_4mb() {
         let dir = std::path::Path::new("/tmp/blosc_bench");

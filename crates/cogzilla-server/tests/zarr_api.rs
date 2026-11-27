@@ -377,6 +377,36 @@ async fn zarr_raster_routes_and_geotiff_twin_http_tile_parity() {
     assert_eq!(st2, StatusCode::OK, "mutated store must return 200, not stale 304");
     assert_ne!(etag2.as_deref(), Some(etag1.as_str()));
     assert_eq!(&body2[0..4], b"\x89PNG");
+
+    // 14. HEAD /zarr/tiles returns 200 + ETag + Content-Length > 0 with empty body
+    let head_req = Request::builder()
+        .method(hyper::Method::HEAD)
+        .uri(&tile_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let head_resp = handle_request(Arc::clone(&engine), head_req).await.unwrap();
+    assert_eq!(head_resp.status(), StatusCode::OK);
+    assert!(head_resp.headers().contains_key(hyper::header::ETAG));
+    let cl: usize = head_resp
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(cl > 0, "HEAD must advertise non-zero Content-Length");
+    let head_body = head_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(head_body.is_empty(), "HEAD body must be empty");
+
+    // 15. Percent-encoded query key (%75%72%6C = "url") works (#408) & tiles_served incremented
+    let pct_uri = format!("/zarr/bounds?%75%72%6C={tmp_url}");
+    let (st_pct, v_pct) = get_json(&engine, &pct_uri).await;
+    assert_eq!(st_pct, StatusCode::OK);
+    assert!(v_pct["bounds"].is_array());
+    assert!(
+        engine.stats.tiles_served.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "Zarr tile requests must increment engine.stats.tiles_served"
+    );
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
