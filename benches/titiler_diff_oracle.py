@@ -560,6 +560,10 @@ def main(argv: list[str] | None = None):
             ("GET /cog/tiles/...?algorithm=bitonal (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=bitonal", None, "png"),
             ("GET /cog/tiles/...?algorithm=grayscale (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=grayscale&rescale=0,0.35&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=mean (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=mean&rescale=0,0.35&reproject=bilinear", None, "png"),
+            # An algorithm over band math: the expression first, then the algorithm over its outputs.
+            ("GET /cog/tiles/...npy?expression=b1/3&algorithm=ceil (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.npy?url={u8_path}&expression=b1/3&algorithm=ceil", None, "npy"),
+            ("GET /cog/statistics?expression=b1*2;b1&algorithm=floor (uint8)", "GET", f"/cog/statistics?url={u8_path}&expression=b1*2;b1&algorithm=floor", None, "json_stats"),
+            ("GET /cog/statistics?expression=b1/2;b2&algorithm=max", "GET", f"/cog/statistics?url={sat}&expression=b1/2;b2&algorithm=max&max_size=256", None, "json_stats"),
             ("GET /cog/tiles/...?algorithm=median (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=median&rescale=0,0.35&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=min (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=min&rescale=0,0.35&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=max (3-band)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&bidx=3&algorithm=max&rescale=0,0.35&reproject=bilinear", None, "png"),

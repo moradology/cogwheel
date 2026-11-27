@@ -219,6 +219,14 @@ impl ArrayRule {
         let first = *reads.first()?;
         let read = if unscale { SampleType::Float32 } else { reads[1..].iter().fold(first, |a, b| wider_type(a, *b)) };
         if let Self::Algorithm { name, cast, .. } = self {
+            // Over band math, the algorithm works on the expression's outputs, in their type.
+            let read = match expression {
+                Some(expression) => {
+                    let parts: Vec<String> = expression.split(';').map(str::to_string).collect();
+                    band_math_type(parts.iter(), read)
+                }
+                None => read,
+            };
             return algorithm_type(name, *cast, read);
         }
         if !math {

@@ -6245,6 +6245,21 @@ pub(super) fn item_fixup(
                 .and_then(|e| Program::parse(e, names.len()).ok())
                 .map(|program| program.describe(&names)),
         };
+        // An algorithm over the band math describes its outputs from those descriptions.
+        let described = match (described, query_value(&pairs, "algorithm")) {
+            (Some(described), Some(alg)) => {
+                // Only the descriptions are wanted: each output stands as its own band.
+                let parts: Vec<(String, String)> =
+                    described.iter().enumerate().map(|(i, d)| (d.clone(), format!("b{}", i + 1))).collect();
+                match super::algorithm_math::over_results(alg, None, None, 0.0, &parts) {
+                    Ok(Some(composed)) => Some(composed.outputs.into_iter().map(|(desc, _)| desc).collect()),
+                    // Non-band-math algorithms (e.g. hillshade/slope/contours) keep their own description.
+                    Ok(None) => None,
+                    Err(_) => Some(described),
+                }
+            }
+            (described, _) => described,
+        };
         if let (Some(described), Ok(mut doc)) = (described, serde_json::from_slice::<Value>(&body)) {
             describe_item_statistics(&mut doc, &described);
             return Ok((Bytes::from(doc.to_string()), content_type));

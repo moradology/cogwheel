@@ -175,6 +175,13 @@ pub(super) struct ParsedQuery {
     /// raster read, and the request expression over their results. `None` when nothing was
     /// folded.
     pub(super) asset_math_stages: Option<(Vec<Option<String>>, String)>,
+    /// The type of the band math's results where the assets' own band math was folded into
+    /// it (`expand_stac_asset_bidx`), as numpy types them stage by stage: what an algorithm
+    /// over them is given. `None` when the expression is the request's own.
+    pub(super) band_math_type: Option<cogzilla_tiff::SampleType>,
+    /// The ops the band math may compile to: more than an expression as written only where
+    /// an algorithm was worked over its outputs (`algorithm_math::over_results`).
+    pub(super) expr_op_budget: usize,
     pub(super) asset_as_band: bool,
     pub(super) bidx: Vec<u16>,
     pub(super) rescale: Vec<(f32, f32)>,
@@ -467,6 +474,8 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
         asset_entries: Vec::new(),
         asset_bidx_by_name: Vec::new(),
         asset_math_stages: None,
+        band_math_type: None,
+        expr_op_budget: cogzilla_kernel::ExprProgram::MAX_OPS,
         asset_as_band: false,
         bidx: Vec::new(),
         rescale: Vec::new(),
