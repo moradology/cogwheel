@@ -170,9 +170,13 @@ pub fn decompress_blosc(
         let mut pos = bstart as usize;
         block_scratch.clear();
 
-        // Blosc splits a block into `typesize` independent streams when BLOSC_SPLIT is set
-        // (provided bsize is a multiple of typesize and at least typesize).
-        let is_split_block = split && hdr.typesize > 1 && bsize >= hdr.typesize && bsize % hdr.typesize == 0;
+        // Blosc 1.x splits a full block into `typesize` independent streams when BLOSC_SPLIT is
+        // set; the trailing partial block (`bsize < hdr.blocksize`) is never split.
+        let is_split_block = split
+            && hdr.typesize > 1
+            && bsize == hdr.blocksize
+            && bsize >= hdr.typesize
+            && bsize % hdr.typesize == 0;
         let nstreams = if is_split_block { hdr.typesize } else { 1 };
         let stream_uncomp = bsize / nstreams;
 

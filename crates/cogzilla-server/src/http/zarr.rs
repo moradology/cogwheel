@@ -108,9 +108,15 @@ fn zarr_hierarchy_cache() -> &'static DashMap<String, CachedZarrStore> {
     CACHE.get_or_init(DashMap::new)
 }
 
-/// Flush all cached Zarr store hierarchies (called by `POST /admin/clear-cache`, #387).
+fn zarr_http_chunk_cache() -> &'static DashMap<String, Vec<u8>> {
+    static CACHE: OnceLock<DashMap<String, Vec<u8>>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+/// Flush all cached Zarr store hierarchies and remote chunks (called by `POST /admin/clear-cache`, #387).
 pub(crate) fn clear_zarr_cache() {
     zarr_hierarchy_cache().clear();
+    zarr_http_chunk_cache().clear();
 }
 
 fn zarr_cache_ttl() -> Duration {
@@ -321,6 +327,9 @@ impl ZarrStore for ServerZarrStore {
                 let client = client.clone();
                 let key_owned = key.to_string();
                 Box::pin(async move {
+                    if let Some(cached) = zarr_http_chunk_cache().get(&url) {
+                        return Ok(Some(cached.value().clone()));
+                    }
                     let resp = client.get(&url).send().await.map_err(|e| {
                         if e.is_timeout() {
                             ZarrError::UpstreamTimeout {
@@ -354,7 +363,15 @@ impl ZarrStore for ServerZarrStore {
                         key: key_owned,
                         detail: e.to_string(),
                     })?;
-                    Ok(Some(bytes.to_vec()))
+                    let vec = bytes.to_vec();
+                    if vec.len() <= 16 * 1024 * 1024 {
+                        let cache = zarr_http_chunk_cache();
+                        if cache.len() >= 64 {
+                            cache.clear();
+                        }
+                        cache.insert(url, vec.clone());
+                    }
+                    Ok(Some(vec))
                 })
             }
         }
@@ -1919,7 +1936,7 @@ async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
     let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
 
-    let (sx, sy) = if let Some(epsg) = q.coord_crs {
+    let (mut sx, sy) = if let Some(epsg) = q.coord_crs {
         let src_crs = CrsModel::from_epsg(epsg).map_err(|e| ZarrError::UnsupportedCrs {
             crs: format!("EPSG:{epsg}"),
             detail: e.to_string(),
@@ -1933,14 +1950,20 @@ async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes
         geo.crs.model.from_lonlat_deg(lon, py)
     };
 
+    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as i32;
+    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as i32;
+    if let Some(min_lon) = geo.crs.model.geographic_0_360_min_lon(&geo.affine, ifd_w as u32) {
+        if sx < min_lon {
+            sx += 360.0;
+        }
+    }
+
     let crs_to_pixel = geo.affine.invert().ok_or_else(|| ZarrError::IrregularGrid {
         dim: geo.x_dim.clone(),
         index: 0,
         detail: "singular affine transform".into(),
     })?;
     let (col_f, row_f) = crs_to_pixel.forward(sx, sy);
-    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as i32;
-    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as i32;
     let col = col_f.floor() as i32;
     let row = row_f.floor() as i32;
     if col < 0 || row < 0 || col >= ifd_w || row >= ifd_h {

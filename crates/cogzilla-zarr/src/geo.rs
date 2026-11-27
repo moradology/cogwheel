@@ -99,7 +99,7 @@ pub async fn resolve_geo(
         });
     }
 
-    derive_regular_geo(crs, x_name, &x_vals, y_name, &y_vals)
+    derive_regular_geo_with_dtypes(crs, x_name, &x_vals, x_meta.dtype, y_name, &y_vals, y_meta.dtype)
 }
 
 /// Derive a regular affine and bounds from 1-D cell-center coordinate arrays, enforcing uniform
@@ -111,8 +111,28 @@ pub fn derive_regular_geo(
     y_dim: String,
     y_vals: &[f64],
 ) -> Result<ZarrGeo, ZarrError> {
-    let dx = check_regular_axis(&x_dim, x_vals)?;
-    let dy = check_regular_axis(&y_dim, y_vals)?;
+    derive_regular_geo_with_dtypes(
+        crs,
+        x_dim,
+        x_vals,
+        DataType::Float64,
+        y_dim,
+        y_vals,
+        DataType::Float64,
+    )
+}
+
+fn derive_regular_geo_with_dtypes(
+    crs: ZarrCrs,
+    x_dim: String,
+    x_vals: &[f64],
+    x_dtype: DataType,
+    y_dim: String,
+    y_vals: &[f64],
+    y_dtype: DataType,
+) -> Result<ZarrGeo, ZarrError> {
+    let dx = check_regular_axis_with_dtype(&x_dim, x_vals, x_dtype)?;
+    let dy = check_regular_axis_with_dtype(&y_dim, y_vals, y_dtype)?;
 
     let w = x_vals.len() as f64;
     let h = y_vals.len() as f64;
@@ -125,7 +145,11 @@ pub fn derive_regular_geo(
     let mut lon_0_360 = false;
     let mut lon_wrap_shift = 0u32;
 
-    // 0..360 geographic longitude normalization (reusing cogzilla_proj::normalize_geographic_lon).
+    // 0..360 geographic longitude normalization.
+    // - Regional [180..360] grids shift `x_origin` by -360° directly.
+    // - Global grids spanning across 180° keep their true `0..360` pixel-to-CRS affine so
+    //   `cogzilla_proj::CoordPlan` wraps western-hemisphere longitudes without column shifting,
+    //   while reporting WGS84 bounds via `CrsModel::wgs84_bounds`.
     if matches!(crs.model, CrsModel::Geographic) {
         let x_min = x_vals.first().copied().unwrap_or(0.0).min(x_vals.last().copied().unwrap_or(0.0));
         let x_max = x_vals.first().copied().unwrap_or(0.0).max(x_vals.last().copied().unwrap_or(0.0));
@@ -137,13 +161,8 @@ pub fn derive_regular_geo(
                     x_origin = norm_first - 0.5 * dx;
                 }
             } else if dx > 0.0 {
-                // Spans across 180° (e.g. global 0..360): find first column >= 180° and wrap it
-                // to the western half [-180..0].
                 if let Some(split) = x_vals.iter().position(|&lon| lon >= 180.0) {
                     lon_wrap_shift = split as u32;
-                    if let Some(norm_west) = normalize_geographic_lon(x_vals[split]) {
-                        x_origin = norm_west - 0.5 * dx;
-                    }
                 }
             }
         }
@@ -158,9 +177,13 @@ pub fn derive_regular_geo(
         f: y_origin,
     };
 
-    let (x0, y0) = affine.forward(0.0, 0.0);
-    let (x1, y1) = affine.forward(w, h);
-    let bounds = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+    let bounds = if lon_0_360 && lon_wrap_shift > 0 {
+        crs.model.wgs84_bounds(&affine, x_vals.len() as u32, y_vals.len() as u32)
+    } else {
+        let (x0, y0) = affine.forward(0.0, 0.0);
+        let (x1, y1) = affine.forward(w, h);
+        [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
+    };
 
     Ok(ZarrGeo {
         crs,
@@ -174,8 +197,17 @@ pub fn derive_regular_geo(
 }
 
 /// Check that a 1-D coordinate array has uniform spacing within tolerance, returning the step
-/// `vals[1] - vals[0]`. Refuses non-uniform spacing with dimension name and offending index.
+/// `vals[1] - vals[0]` (or mean step for float32 coordinates). Refuses non-uniform spacing with
+/// dimension name and offending index.
 pub fn check_regular_axis(dim: &str, vals: &[f64]) -> Result<f64, ZarrError> {
+    check_regular_axis_with_dtype(dim, vals, DataType::Float64)
+}
+
+fn check_regular_axis_with_dtype(
+    dim: &str,
+    vals: &[f64],
+    dtype: DataType,
+) -> Result<f64, ZarrError> {
     if vals.len() < 2 {
         return Err(ZarrError::IrregularGrid {
             dim: dim.to_string(),
@@ -192,7 +224,11 @@ pub fn check_regular_axis(dim: &str, vals: &[f64]) -> Result<f64, ZarrError> {
             });
         }
     }
-    let step = vals[1] - vals[0];
+    let step = if matches!(dtype, DataType::Float32) {
+        (vals[vals.len() - 1] - vals[0]) / (vals.len() - 1) as f64
+    } else {
+        vals[1] - vals[0]
+    };
     if !step.is_finite() || step == 0.0 {
         return Err(ZarrError::IrregularGrid {
             dim: dim.to_string(),
@@ -200,18 +236,38 @@ pub fn check_regular_axis(dim: &str, vals: &[f64]) -> Result<f64, ZarrError> {
             detail: format!("zero or invalid initial spacing ({} -> {})", vals[0], vals[1]),
         });
     }
-    let tol = step.abs() * 1e-4 + 1e-9;
-    for i in 1..vals.len() - 1 {
+    let max_abs = vals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let base_tol = step.abs() * 1e-4 + 1e-9;
+    let tol = if matches!(dtype, DataType::Float32) {
+        base_tol.max((f32::EPSILON as f64) * max_abs.max(1.0) * 4.0)
+    } else {
+        base_tol
+    };
+    for i in 0..vals.len() - 1 {
         let d = vals[i + 1] - vals[i];
         if (d - step).abs() > tol {
             return Err(ZarrError::IrregularGrid {
                 dim: dim.to_string(),
                 index: i + 1,
                 detail: format!(
-                    "spacing {d} at index {} differs from initial spacing {step} (tolerance {tol:.2e})",
+                    "spacing {d} at index {} differs from expected spacing {step} (tolerance {tol:.2e})",
                     i + 1
                 ),
             });
+        }
+        if matches!(dtype, DataType::Float32) {
+            let expected = vals[0] + (i + 1) as f64 * step;
+            if (vals[i + 1] - expected).abs() > tol {
+                return Err(ZarrError::IrregularGrid {
+                    dim: dim.to_string(),
+                    index: i + 1,
+                    detail: format!(
+                        "coordinate {} at index {} drifts from regular grid {expected} (tolerance {tol:.2e})",
+                        vals[i + 1],
+                        i + 1
+                    ),
+                });
+            }
         }
     }
     Ok(step)

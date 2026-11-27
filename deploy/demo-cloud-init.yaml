@@ -19,7 +19,7 @@ write_files:
   - path: /etc/cogzilla-demo.env
     permissions: "0644"
     content: |
-      COGZILLA_ALLOWED_URL_PREFIXES=https://copernicus-dem-30m.s3.amazonaws.com/,https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/,s3://copernicus-dem-30m/,https://sentinel-cogs.s3.us-west-2.amazonaws.com/,s3://sentinel-cogs/
+      COGZILLA_ALLOWED_URL_PREFIXES=https://copernicus-dem-30m.s3.amazonaws.com/,https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/,s3://copernicus-dem-30m/,https://sentinel-cogs.s3.us-west-2.amazonaws.com/,s3://sentinel-cogs/,https://storage.googleapis.com/gcp-public-data-arco-era5/
       COGZILLA_CACHE_CONTROL_MAX_AGE=86400
       AWS_NO_SIGN_REQUEST=YES
       AWS_REGION=us-west-2
