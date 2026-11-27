@@ -726,7 +726,11 @@ impl GpuBackend {
                 return None;
             }
         };
-        let policy = DispatchPolicy::calibrate(&ctx);
+        let mut policy = DispatchPolicy::calibrate(&ctx);
+        // `GpuCoalescer` packs up to 32 concurrent jobs per batch asynchronously (without
+        // blocking Tokio worker threads), so allow up to 32 coalesced batches (1,024 concurrent
+        // requests) before shedding load to synchronous CPU fallback.
+        policy.max_in_flight = 32;
         tracing::info!(
             adapter = %ctx.info.name,
             backend = ?ctx.info.backend,
@@ -820,9 +824,17 @@ impl GpuBackend {
     }
 
     async fn submit_coalesced_async(&self, job: CoalescedJob) -> Option<Vec<u8>> {
+        struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cancel_guard = CancelOnDrop(Arc::clone(&cancelled));
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.coalescer
-            .submit_with_callback(job, move |res| {
+            .submit_cancellable(job, cancelled, move |res| {
                 let _ = tx.send(res);
             })
             .ok()?;
@@ -2354,7 +2366,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -2406,7 +2418,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: nb,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -2466,7 +2478,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -2583,7 +2595,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes,
             batch_size: 3,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
         });
         if !decision.use_gpu {
             return None;
@@ -3130,7 +3142,7 @@ impl GpuBackend {
             upload_bytes,
             readback_bytes: per_tile_bytes.saturating_mul(batch_size),
             batch_size,
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
         });
         if !decision.use_gpu {
             return None;
