@@ -1919,6 +1919,9 @@ const CHECKED: [&str; 11] =
 /// (each asked with each, 2026-11-26): what a route reads FastAPI validates, a 422 when it
 /// cannot be read, before the item is looked for; what it does not read it passes over.
 fn item_route_reads(method: &Method, rest: &[&str], name: &str) -> bool {
+    if matches!(name, "algorithm" | "algorithm_params") {
+        return item_applies_algorithm(rest);
+    }
     const TILE: [&str; 5] = ["nodata", "unscale", "return_mask", "buffer", "padding"];
     const PICTURE: [&str; 8] = ["coord_crs", "dst_crs", "max_size", "width", "height", "nodata", "unscale", "return_mask"];
     let reads = |list: &[&str]| list.contains(&name);
@@ -1941,10 +1944,21 @@ fn item_route_reads(method: &Method, rest: &[&str], name: &str) -> bool {
     }
 }
 
+/// Whether an item's route applies `algorithm`: as a mosaic's routes, and its preview and
+/// statistics; not its point, `asset_statistics` or `info`.
+fn item_applies_algorithm(rest: &[&str]) -> bool {
+    match rest {
+        ["preview" | "statistics", ..] => true,
+        [one] if one.starts_with("preview.") => true,
+        _ => applies_algorithm(rest),
+    }
+}
+
 /// Whether an item's route passes over the parameter `name`, one the shared parser checks
-/// but the route does not read: the request goes on without it, as in titiler-pgstac.
+/// (or `algorithm` and its parameters) but the route does not read: the request goes on
+/// without it, as in titiler-pgstac.
 pub(super) fn item_passes_over(method: &Method, rest: &[&str], name: &str) -> bool {
-    CHECKED.contains(&name) && !item_route_reads(method, rest, name)
+    (CHECKED.contains(&name) || matches!(name, "algorithm" | "algorithm_params")) && !item_route_reads(method, rest, name)
 }
 
 /// Whether the shared parser's complaint `e` is about a parameter [`item_passes_over`].
@@ -4230,47 +4244,12 @@ impl BandAlgorithm {
     /// not take, and a parameter out of titiler's range an error, as pydantic refuses it.
     fn parse(name: &str, params: Option<&str>) -> Result<Option<Self>, String> {
         let params: Value = params.and_then(|p| serde_json::from_str(p).ok()).unwrap_or(Value::Null);
-        let number = |key: &str, default: f64| params.get(key).and_then(Value::as_f64).unwrap_or(default);
-        // pydantic's words for a parameter out of the algorithm's model, as titiler-pgstac
-        // passes them on.
-        let model = match name {
-            "hillshade" => "HillShade",
-            "slope" => "Slope",
-            "contours" => "Contours",
-            _ => "TerrainRGB",
-        };
-        let refused = |key: &str, v: &Value, what: String, kind: &str| {
-            let input_type = if v.is_i64() || v.is_u64() { "int" } else if v.is_f64() { "float" } else { "str" };
-            format!("1 validation error for {model}\n{key}\n  {what} [type={kind}, input_value={v}, input_type={input_type}]")
-        };
-        let bounded = |key: &str, v: &Value, n: f64, lo: f64, hi: f64| -> Result<(), String> {
-            let shown = |x: f64| if x.fract() == 0.0 && x.abs() < 1e15 { format!("{}", x as i64) } else { format!("{x}") };
-            if n < lo {
-                Err(refused(key, v, format!("Input should be greater than or equal to {}", shown(lo)), "greater_than_equal"))
-            } else if n > hi {
-                Err(refused(key, v, format!("Input should be less than or equal to {}", shown(hi)), "less_than_equal"))
-            } else {
-                Ok(())
-            }
-        };
-        // A parameter titiler types as `int` and bounds.
-        let whole = |key: &str, default: i64, lo: i64, hi: i64| -> Result<i64, String> {
-            let Some(v) = params.get(key) else { return Ok(default) };
-            let n = match (v.as_i64(), v.as_f64()) {
-                (Some(n), _) => n,
-                (None, Some(f)) if f.fract() == 0.0 => f as i64,
-                (None, Some(_)) => {
-                    return Err(refused(key, v, "Input should be a valid integer, got a number with a fractional part".into(), "int_from_float"));
-                }
-                _ => return Err(refused(key, v, "Input should be a valid integer".into(), "int_type")),
-            };
-            bounded(key, v, n as f64, lo as f64, hi as f64).map(|()| n)
-        };
-        let within = |key: &str, default: f64, lo: f64, hi: f64| -> Result<f64, String> {
-            let Some(v) = params.get(key) else { return Ok(default) };
-            let n = v.as_f64().ok_or_else(|| refused(key, v, "Input should be a valid number".into(), "float_type"))?;
-            bounded(key, v, n, lo, hi).map(|()| n)
-        };
+        let empty = serde_json::Map::new();
+        let params = params.as_object().unwrap_or(&empty);
+        // TiTiler's models' checks, shared with every route that applies an algorithm; what
+        // they take is then read as pydantic's lax mode reads it.
+        super::algorithm_params::check(name, params)?;
+        let number = |key: &str, default: f64| super::algorithm_params::number(params, key).unwrap_or(default);
         Ok(Some(match name {
             "min" => Self::Min,
             "max" => Self::Max,
@@ -4287,17 +4266,17 @@ impl BandAlgorithm {
             "terrarium" => Self::Terrarium,
             "terrainrgb" => Self::TerrainRgb { interval: number("interval", 0.1), baseval: number("baseval", -10000.0) },
             "hillshade" => Self::Hillshade {
-                azimuth: whole("azimuth", 45, 0, 360)? as f64,
-                altitude: within("angle_altitude", 45.0, -90.0, 90.0)?,
-                buffer: whole("buffer", 3, 0, 99)? as usize,
-                z: within("z_exaggeration", 1.0, 1e-6, 1e6)?,
+                azimuth: number("azimuth", 45.0),
+                altitude: number("angle_altitude", 45.0),
+                buffer: number("buffer", 3.0) as usize,
+                z: number("z_exaggeration", 1.0),
             },
-            "slope" => Self::Slope { buffer: whole("buffer", 3, 0, 99)? as usize, z: within("z_exaggeration", 1.0, 1e-6, 1e6)? },
+            "slope" => Self::Slope { buffer: number("buffer", 3.0) as usize, z: number("z_exaggeration", 1.0) },
             "contours" => Self::Contours {
-                increment: whole("increment", 35, 0, 999)? as f64,
-                thickness: whole("thickness", 1, 0, 10)? as f64,
-                minz: whole("minz", -12000, -99999, 99999)? as f64,
-                maxz: whole("maxz", 8000, -99999, 99999)? as f64,
+                increment: number("increment", 35.0),
+                thickness: number("thickness", 1.0),
+                minz: number("minz", -12000.0),
+                maxz: number("maxz", 8000.0),
             },
             _ => return Ok(None),
         }))
@@ -6943,6 +6922,22 @@ fn item_path_error(method: &Method, rest: &[&str], pq: &ParsedQuery, pairs: &[(S
         [one] if one.starts_with("preview.") => format_error(one.strip_prefix("preview.")),
         _ => None,
     };
+    // An algorithm's parameters, before the item is looked for, where the route applies one.
+    let of_path = of_path.or_else(|| {
+        if !item_applies_algorithm(rest) {
+            return None;
+        }
+        if let Some(input) = &pq.algorithm_params_unread {
+            if rest == ["WMTSCapabilities.xml"] {
+                return Some(detail(StatusCode::BAD_REQUEST, "invalid JSON content in algorithm_params"));
+            }
+            return Some(json_resp(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &json!({ "detail": [{ "type": "value_error", "loc": ["query", "algorithm_params"], "msg": "Value error, invalid JSON content", "input": input }] }),
+            ));
+        }
+        pq.algorithm_error.as_ref().map(|msg| detail(StatusCode::BAD_REQUEST, msg.clone()))
+    });
     // A size that is not a number. One that is, and is out of the range drawn here, stays
     // the 400 of a limit; `padding` and `buffer` are answered for where tiles are checked.
     of_path.or_else(|| {
@@ -6955,6 +6950,18 @@ fn item_path_error(method: &Method, rest: &[&str], pq: &ParsedQuery, pairs: &[(S
             e.starts_with("invalid ").then(|| parse_error(e))
         })
     })
+}
+
+/// Whether a route of a mosaic applies `algorithm`: its tiles and what points at them, its
+/// pictures of a box or a feature, and its statistics; not the items under a tile, a box or
+/// a point, nor `info`.
+fn applies_algorithm(rest: &[&str]) -> bool {
+    match rest {
+        [.., "assets"] => false,
+        ["tiles", ..] | [_, "tilejson.json" | "map.html"] | ["WMTSCapabilities.xml"] | ["bbox", ..] | ["statistics"] => true,
+        [one, ..] => *one == "feature" || one.starts_with("feature."),
+        _ => false,
+    }
 }
 
 /// The method each route of a mosaic takes, by the shape of its path; `None` for a path
@@ -7021,6 +7028,22 @@ async fn mosaic_route(
     let takes_body = route_method(rest) == Some(Method::POST);
     if body.is_some() != takes_body {
         return if body.is_some() && route_method(rest).is_none() { not_found() } else { method_not_allowed(route_method(rest)) };
+    }
+    // An algorithm's parameters, checked as TiTiler's models check them, where it is applied:
+    // not JSON is FastAPI's 422 (WMTS answers 400), what the model refuses a 400.
+    if applies_algorithm(rest) {
+        if let Some(input) = &pq.algorithm_params_unread {
+            if rest == ["WMTSCapabilities.xml"] {
+                return detail(StatusCode::BAD_REQUEST, "invalid JSON content in algorithm_params");
+            }
+            return json_resp(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &json!({ "detail": [{ "type": "value_error", "loc": ["query", "algorithm_params"], "msg": "Value error, invalid JSON content", "input": input }] }),
+            );
+        }
+        if let Some(msg) = &pq.algorithm_error {
+            return detail(StatusCode::BAD_REQUEST, msg.clone());
+        }
     }
     // What is posted in Web Mercator metres is read in degrees from here on, the one place
     // a posted geometry changes system. As in TiTiler, a picture of it is then drawn in

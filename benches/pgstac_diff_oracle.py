@@ -1498,6 +1498,21 @@ def main() -> int:
         o.check("item statistics, band math on one asset", "stats", f"{it}/statistics?assets=visual&max_size=64&expression=b1-b3;where(b1%3Eb2,1,0)")
         o.check("item statistics, band math by an asset's name", "status",
                 f"{it}/statistics?assets=nir&assets=red&asset_as_band=true&max_size=64&expression=(nir-red)/(nir%2Bred)")
+        # An algorithm's parameters, checked as TiTiler's models check them where one is
+        # applied (a 400 in pydantic's words; not JSON is a 422), and passed over elsewhere.
+        far_azimuth = "algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A400%7D"
+        for label, url in (
+            ("search tile, an azimuth out of range", f"{base12}.png?assets=red&{far_azimuth}"),
+            ("search tile, an azimuth as text", f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%2230%22%7D"),
+            ("search tile, algorithm_params not JSON", f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=notjson"),
+            ("search tile, contours thicker than 10", f"{base12}.png?assets=red&algorithm=contours&algorithm_params=%7B%22thickness%22%3A11%7D"),
+            ("search info, an azimuth passed over", f"/searches/{sid}/info?assets=red&{far_azimuth}"),
+            ("item tile outside it, an azimuth out of range", f"{it}/tiles/WebMercatorQuad/3/0/0.png?assets=red&{far_azimuth}"),
+            ("item preview, an azimuth out of range", f"{it}/preview.png?assets=red&max_size=64&{far_azimuth}"),
+            ("item point, an algorithm passed over", f"{it}/point/{ilon},{ilat}?assets=red&{far_azimuth}"),
+            ("item asset_statistics, an algorithm passed over", f"{it}/asset_statistics?assets=red&max_size=64&{far_azimuth}"),
+        ):
+            o.check(label, "status", url)
         # What an item's route reads FastAPI validates first, a 422; what it does not read
         # titiler-pgstac passes over, whatever it holds.
         ibox = f"{it}/bbox/{ilon - 0.05},{ilat - 0.05},{ilon + 0.05},{ilat + 0.05}/32x32.png"
