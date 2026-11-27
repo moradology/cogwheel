@@ -7765,21 +7765,48 @@ async fn render_bbox_core(
         let _ = fused_stats;
         let ifd_w_i = ifd_width as i32;
         let ifd_h_i = ifd_height as i32;
-        // Same-CRS boxes and previews have separable maps: the widened sampler then filters each
-        // band's whole plane in two passes (`plane_of`), read directly by the common outputs.
-        let wide = widen_kernel.then(|| {
-            match &coord_map {
-                BboxCoordMap::Separable { u_cols, v_rows } => cogzilla_kernel::WidenedSampler::with_grid(
-                    resample,
-                    footprint_sx,
-                    footprint_sy,
-                    u_cols.clone(),
-                    v_rows.clone(),
-                ),
-                _ => None,
-            }
-            .unwrap_or_else(|| cogzilla_kernel::WidenedSampler::new_uncached(resample, footprint_sx, footprint_sy))
-        });
+        // Same-CRS boxes and previews have separable maps: lazily initialize the 2-pass separable
+        // convolution sampler only when CPU rendering actually runs (zero allocation on GPU hits).
+        // For `CubicSpline` and `Lanczos` at `scale <= 1.0` (`!widen_kernel`), `with_grid` turns
+        // per-pixel 2D 4x4/6x6 sampling into two 1D passes (~8x faster on 1024x1024 Lanczos).
+        // If `with_grid` declines (`> WIDE_GRID_MAX_PIXELS`) when `!widen_kernel`, return `None`
+        // rather than falling back to `new_uncached`.
+        let use_separable_conv = matches!(coord_map, BboxCoordMap::Separable { .. })
+            && matches!(resample, ResampleMode::CubicSpline | ResampleMode::Lanczos);
+        let wide_cell: std::cell::OnceCell<Option<cogzilla_kernel::WidenedSampler>> =
+            std::cell::OnceCell::new();
+        let get_wide = || -> Option<&cogzilla_kernel::WidenedSampler> {
+            wide_cell
+                .get_or_init(|| {
+                    if !widen_kernel && !use_separable_conv {
+                        return None;
+                    }
+                    let grid = match &coord_map {
+                        BboxCoordMap::Separable { u_cols, v_rows } => {
+                            cogzilla_kernel::WidenedSampler::with_grid(
+                                resample,
+                                footprint_sx,
+                                footprint_sy,
+                                u_cols.clone(),
+                                v_rows.clone(),
+                            )
+                        }
+                        _ => None,
+                    };
+                    if grid.is_some() {
+                        grid
+                    } else if widen_kernel {
+                        Some(cogzilla_kernel::WidenedSampler::new_uncached(
+                            resample,
+                            footprint_sx,
+                            footprint_sy,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .as_ref()
+        };
         let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
             if !u.is_finite() || !v.is_finite() {
                 return f32::NAN;
@@ -7803,9 +7830,9 @@ async fn render_bbox_core(
                 | ResampleMode::Cubic
                 | ResampleMode::CubicSpline
                 | ResampleMode::Lanczos
-                    if widen_kernel =>
+                    if get_wide().is_some() =>
                 {
-                    wide.as_ref().map_or(f32::NAN, |w| w.sample(src, u, v))
+                    get_wide().map_or(f32::NAN, |w| w.sample(src, u, v))
                 }
                 ResampleMode::Cubic => cogzilla_kernel::sample_cubic(src, u, v),
                 ResampleMode::Bilinear => {
@@ -7863,7 +7890,7 @@ async fn render_bbox_core(
             }
         };
         // The widened plane of a band on separable maps (`None` otherwise: sample per pixel).
-        let plane_of = |src: &BandSource<'_>| wide.as_ref().and_then(|wd| wd.grid_plane(src));
+        let plane_of = |src: &BandSource<'_>| get_wide().and_then(|wd| wd.grid_plane(src));
 
         let apply_source_unscale = unscale
             && (crate::engine::needs_source_unscale(bands, format)
