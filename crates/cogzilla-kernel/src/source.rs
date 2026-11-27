@@ -535,7 +535,7 @@ pub fn copy_band_data_rect_to_f32(
     if copy_w == 0 || copy_h == 0 {
         return;
     }
-    let nd_ovr = nodata_override.filter(|nd| nd.is_finite());
+    let nd_ovr = nodata_override.filter(|nd| !nd.is_nan());
 
     match data {
         BandData::F32(slab) => {

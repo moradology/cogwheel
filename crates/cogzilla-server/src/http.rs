@@ -3879,50 +3879,51 @@ async fn render_mosaic_tile_pixel_selection(
         && fold.is_some()
         && n_px >= 256 * 256
         && (matches!(method, Selection::Median) || n_px >= 512 * 512);
-    let selected = crate::engine::block_in_place_if_multithread(offload_cpu, || {
-        gpu_selected
+    crate::engine::block_in_place_if_multithread(offload_cpu, || {
+        let selected = gpu_selected
             .or_else(|| fold.and_then(Fold::finish))
             .unwrap_or_else(|| {
                 let bands = default_raw_band_count(&treq.bands, method);
                 Selected { bands, values: vec![f32::NAN; bands * n_px] }
-            })
-    });
+            });
 
-    if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
-        let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
-        for v in &selected.values {
-            out.extend_from_slice(&v.to_le_bytes());
+        if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+            let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
+            for v in &selected.values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            let raw = out.freeze();
+            if matches!(treq.format, OutputFormat::Npy) {
+                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    selected.bands,
+                    out_dim,
+                    out_dim,
+                    pq.return_mask,
+                ));
+            }
+            return Ok(raw);
         }
-        let raw = out.freeze();
-        if matches!(treq.format, OutputFormat::Npy) {
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                raw,
-                selected.bands,
-                out_dim,
-                out_dim,
+
+        let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
+        #[cfg(feature = "gpu")]
+        if let Some(ref gpu) = engine.gpu {
+            return Ok(gpu.encode_rgba_output(
+                out_dim as usize,
+                out_dim as usize,
+                &rgba,
+                treq.format,
                 pq.return_mask,
             ));
         }
-        return Ok(raw);
-    }
-
-    let rgba = crate::engine::block_in_place_if_multithread(offload_cpu, || {
-        paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())
-    })?;
-    #[cfg(feature = "gpu")]
-    if let Some(ref gpu) = engine.gpu {
-        return Ok(gpu.encode_rgba_output(
+        Ok(encode_rgba_output(
             out_dim as usize,
             out_dim as usize,
             &rgba,
             treq.format,
             pq.return_mask,
-        ));
-    }
-    Ok(crate::engine::block_in_place_if_multithread(
-        offload_cpu,
-        || encode_rgba_output(out_dim as usize, out_dim as usize, &rgba, treq.format, pq.return_mask),
-    ))
+        ))
+    })
 }
 
 /// The picture of what a pixel selection left: `pixels` RGBA pixels, by the rules in
