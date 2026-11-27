@@ -265,4 +265,69 @@ async fn zarr_raster_routes_and_geotiff_twin_http_tile_parity() {
     assert_eq!(cs_st, StatusCode::OK);
     assert_eq!(zstats["b1"]["count"], cstats["b1"]["count"]);
     assert!((zstats["b1"]["mean"].as_f64().unwrap() - cstats["b1"]["mean"].as_f64().unwrap()).abs() < 1e-4);
+
+    // 9. POST /zarr/statistics matches POST /cog/statistics on the exact same polygon (#374)
+    let poly = serde_json::json!({
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [-122.4, 37.6],
+                [-122.0, 37.6],
+                [-122.0, 37.9],
+                [-122.4, 37.9],
+                [-122.4, 37.6]
+            ]]
+        },
+        "properties": {}
+    });
+    let poly_bytes = Bytes::from(serde_json::to_vec(&poly).unwrap());
+
+    let post_json = |uri: String, body: Bytes| {
+        let eng = Arc::clone(&engine);
+        async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("Content-Type", "application/json")
+                .body(Full::new(body))
+                .unwrap();
+            let resp = handle_request(eng, req).await.unwrap();
+            let st = resp.status();
+            let b = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+
+    let (zps_st, zps) = post_json(format!("/zarr/statistics?url={zarr_url}"), poly_bytes.clone()).await;
+    let (cps_st, cps) = post_json(format!("/cog/statistics?url={tif_url}&max_size=0"), poly_bytes.clone()).await;
+    assert_eq!(zps_st, StatusCode::OK, "POST /zarr/statistics failed: {zps}");
+    assert_eq!(cps_st, StatusCode::OK);
+    let zb1 = &zps["properties"]["statistics"]["b1"];
+    let cb1 = &cps["properties"]["statistics"]["b1"];
+    assert!((zb1["count"].as_f64().unwrap() - cb1["count"].as_f64().unwrap()).abs() < 1e-6);
+    assert!((zb1["mean"].as_f64().unwrap() - cb1["mean"].as_f64().unwrap()).abs() < 1e-4);
+    assert!((zb1["area"].as_f64().unwrap() - cb1["area"].as_f64().unwrap()).abs() < 1e-2);
+
+    // 10. POST /zarr/feature/64x64.png returns a valid PNG
+    let feat_req = Request::builder()
+        .method("POST")
+        .uri(&format!("/zarr/feature/64x64.png?url={zarr_url}&rescale=100,900"))
+        .header("Content-Type", "application/json")
+        .body(Full::new(poly_bytes))
+        .unwrap();
+    let feat_resp = handle_request(Arc::clone(&engine), feat_req).await.unwrap();
+    assert_eq!(feat_resp.status(), StatusCode::OK);
+    let feat_png = feat_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&feat_png[0..4], b"\x89PNG");
+
+    // 11. /metrics exposes Zarr counters (#386)
+    let (mst, _, mbody) = get_bytes(&engine, "/metrics", None).await;
+    assert_eq!(mst, StatusCode::OK);
+    let mtxt = std::str::from_utf8(&mbody).unwrap();
+    assert!(mtxt.contains("cogzilla_zarr_chunks_fetched_total"));
+    assert!(mtxt.contains("cogzilla_zarr_chunk_holes_total"));
+    assert!(mtxt.contains("cogzilla_zarr_bytes_decoded_total"));
+    assert!(mtxt.contains("cogzilla_zarr_cap_refusals_total"));
 }

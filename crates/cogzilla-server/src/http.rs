@@ -9831,10 +9831,18 @@ where
     }
 
     // ------------------------------------------------------------------------
-    // Zarr API: /zarr/* (metadata, introspection, and raster routes)
+    // Zarr API: /zarr/* (metadata, introspection, raster, and POST zonal routes)
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"zarr") {
         let sub = &segs[1..];
+        let body_bytes = if method == Method::POST {
+            match read_limited_body(req.into_body()).await {
+                Ok(b) => Some(b),
+                Err(e) => return Ok(error_to_http_response(&e)),
+            }
+        } else {
+            None
+        };
         let resp = Box::pin(zarr::handle_zarr_request(
             &engine,
             method,
@@ -9842,6 +9850,7 @@ where
             &raw_query,
             &host,
             if_none_match.as_deref(),
+            body_bytes,
         ))
         .await;
         return Ok(resp);
@@ -11562,6 +11571,7 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
     let _ = writeln!(out, "cogzilla_upstream_throttles_total {}", engine.store.upstream_limiter.throttle_events());
     let _ = writeln!(out, "# TYPE cogzilla_remote_range_requests_total counter");
     let _ = writeln!(out, "cogzilla_remote_range_requests_total {}", engine.store.metrics.remote_range_requests.load(Ordering::Relaxed));
+    zarr::append_zarr_metrics(&mut out);
     let _ = writeln!(out, "# TYPE cogzilla_remote_bytes_fetched_total counter");
     let _ = writeln!(out, "cogzilla_remote_bytes_fetched_total {}", engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed));
 
