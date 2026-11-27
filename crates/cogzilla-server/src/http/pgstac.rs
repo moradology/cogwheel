@@ -108,11 +108,7 @@ fn invalid_param(location: &str, name: &str, msg: impl Into<String>) -> Resp {
 
 /// A 405 that says which method the route does take.
 fn method_not_allowed(takes: Option<Method>) -> Resp {
-    let mut resp = detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
-    if let Some(Ok(allow)) = takes.map(|m| HeaderValue::from_str(m.as_str())) {
-        resp.headers_mut().insert(hyper::header::ALLOW, allow);
-    }
-    resp
+    super::method_not_allowed_opt(takes.as_ref().map(Method::as_str))
 }
 
 fn no_content() -> Resp {
@@ -222,47 +218,7 @@ fn quote_plus(s: &str) -> String {
     out
 }
 
-fn parse_bool(v: &str) -> Option<bool> {
-    match v.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" | "t" | "y" => Some(true),
-        "false" | "0" | "no" | "off" | "f" | "n" => Some(false),
-        _ => None,
-    }
-}
-
-/// Whether `s` is a date, or a date and a time, as RFC 3339 writes them.
-fn looks_like_datetime(s: &str) -> bool {
-    let b = s.as_bytes();
-    let digits = |from: usize, n: usize| b.get(from..from + n).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
-    if !(digits(0, 4) && b.get(4) == Some(&b'-') && digits(5, 2) && b.get(7) == Some(&b'-') && digits(8, 2)) {
-        return false;
-    }
-    if b.len() == 10 {
-        return true;
-    }
-    if !(matches!(b[10], b'T' | b't' | b' ' | b'_') && digits(11, 2) && b.get(13) == Some(&b':') && digits(14, 2)) {
-        return false;
-    }
-    let mut at = 16;
-    if b.get(at) == Some(&b':') && digits(at + 1, 2) {
-        at += 3;
-        if b.get(at) == Some(&b'.') {
-            at += 1;
-            let start = at;
-            while b.get(at).is_some_and(u8::is_ascii_digit) {
-                at += 1;
-            }
-            if at == start {
-                return false;
-            }
-        }
-    }
-    match &b[at..] {
-        [] | [b'Z' | b'z'] => true,
-        [b'+' | b'-', rest @ ..] => matches!(rest, [h1, h2, b':', m1, m2] | [h1, h2, m1, m2] if [h1, h2, m1, m2].iter().all(|c| c.is_ascii_digit())),
-        _ => false,
-    }
-}
+use super::query::{looks_like_rfc3339_datetime as looks_like_datetime, parse_bool};
 
 /// A number as Python reads one from text: space around it and `_` between digits allowed.
 fn py_number(s: &str) -> Option<f64> {
@@ -1821,18 +1777,10 @@ fn parse_resample(pairs: &[(String, String)], name: &str) -> Result<ResampleMode
     }
 }
 
-/// The method a `resampling` or `reproject` names, of those rasterio has for each: the
-/// shared parser's, but that `gauss` is a read's alone and `max`, `min`, `med`, `q1`, `q3`
-/// and `sum` the warp's alone, as titiler-pgstac has them.
+/// The method a `resampling` or `reproject` names, of those rasterio has for each: delegates
+/// to [`super::query::parse_resample_mode_strict`].
 fn resample_method(parameter: &str, method: &str) -> Option<ResampleMode> {
-    let of_the_warp = parameter == "reproject";
-    match method {
-        "gauss" if of_the_warp => None,
-        "max" | "min" | "med" | "q1" | "q3" | "sum" if !of_the_warp => None,
-        // A spelling the shared routes take and rasterio has not.
-        "cubicspline" => None,
-        _ => super::parse_resample_mode(method),
-    }
+    super::query::parse_resample_mode_strict(parameter, method)
 }
 
 /// A tileset list or tileset asked for in a format other than `html` and `json`, as FastAPI
@@ -4576,23 +4524,21 @@ fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Re
     }
     if let Some(v) = query_value(pairs, "histogram_bins") {
         let bad = || invalid_param("query", "histogram_bins", r"String should match pattern '^\d+(,\d+)*$'");
-        let parts: Option<Vec<u32>> = v.split(',').map(|p| p.parse::<u32>().ok()).collect();
-        opts.bins = match parts.as_deref() {
-            Some([n]) if (1..=65_536).contains(n) => Bins::Count(*n as usize),
-            Some(edges) if edges.len() > 1 && edges.windows(2).all(|w| w[0] <= w[1]) => {
-                Bins::Edges(edges.iter().map(|e| f64::from(*e)).collect())
-            }
-            _ => return Err(bad()),
+        // FastAPI's regex requires unsigned integer tokens; delegate range & monotonicity checks to query.rs.
+        if !v.split(',').all(|p| p.parse::<u32>().is_ok()) {
+            return Err(bad());
+        }
+        opts.bins = match super::query::parse_histogram_bins_spec(v, 65_536, usize::MAX, false) {
+            Ok(super::query::HistogramBinsSpec::Count(n)) => Bins::Count(n),
+            Ok(super::query::HistogramBinsSpec::Edges(edges)) => Bins::Edges(edges),
+            Err(_) => return Err(bad()),
         };
     }
     if let Some(v) = query_value(pairs, "histogram_range") {
-        let range = v
-            .split_once(',')
-            .and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))
-            .filter(|(a, b)| a.is_finite() && b.is_finite() && a <= b);
-        opts.range = Some(range.ok_or_else(|| {
+        let range = super::query::parse_histogram_range_strict(v, true).map_err(|_| {
             invalid_param("query", "histogram_range", "Input should be two numbers, the lower one first")
-        })?);
+        })?;
+        opts.range = Some(range);
     }
     let cover_scale = match query_value(pairs, "cover_scale") {
         None => 10,
