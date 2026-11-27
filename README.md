@@ -56,18 +56,18 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda
 
 ## What it does
 
-- **TiTiler's routes**: `/cog`, `/stac`, `/mosaicjson`, `/colorMaps` and `/tileMatrixSets`, with tiles, TileJSON, previews, crops, point queries and statistics.
-- **Any COG**: all eight numeric types, DEFLATE, ZSTD, LZW, JPEG and WebP compression, and sources in 3,260 EPSG coordinate systems (UTM, state plane, national Lambert and Albers grids, polar grids, LAEA Europe) plus MODIS sinusoidal.
-- **Rendering per request**: rescaling, all 211 `rio-tiler` colormaps, band math (`expression=` or presets such as `ndvi`), multi-file composites and mosaics.
-- **Terrain**: hillshade, slope and aspect, plus Terrarium and Terrain-RGB tiles for 3D maps.
+- **TiTiler's routes**: `/cog`, `/stac`, `/mosaicjson`, `/algorithms`, `/colorMaps`, `/tileMatrixSets`, and optional [pgSTAC](docs/api.md#pgstac) (`/searches`, `/collections`), with tiles, TileJSON, WMTS, previews, crops, point queries, OGC Maps, and statistics.
+- **Any COG**: all eight numeric types, DEFLATE, ZSTD, LZW, LERC (`LERC`, `LERC_DEFLATE`, `LERC_ZSTD`), JPEG and WebP compression, and sources in 3,260+ EPSG coordinate systems (UTM, state plane, national Lambert and Albers grids, polar grids, LAEA Europe, World Mercator `3395`, EASE-Grid 2.0 Global `6933`, Equal Earth `8857`, and MODIS sinusoidal).
+- **Rendering per request**: rescaling, all 211 `rio-tiler` colormaps, all 15 GDAL resampling methods, band math (`expression=` or presets such as `ndvi`), multi-file composites and mosaics, plus automatic `wgpu` GPU acceleration (Metal/Vulkan) with silent CPU fallback.
+- **Terrain**: hillshade, slope, aspect, and contours, plus Terrarium and Terrain-RGB tiles for 3D maps.
 - **Cloud storage**: S3, GCS, Azure Blob and plain HTTP, configured with the same environment variables as GDAL.
-- **Operations**: a single binary with no GDAL or Python to install, a block cache with an optional disk tier, `ETag` and `Cache-Control` headers, and Prometheus metrics.
+- **Operations**: a single binary with no GDAL or Python to install, a block cache with an optional disk tier, lock-free AIMD admission control, `ETag` and `Cache-Control` headers, and Prometheus metrics.
 
 ## Coming from TiTiler
 
-Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` routes pass 39 of 39 differential checks against a live TiTiler 2.4; the mosaic routes and terrain algorithms are newer and not yet in that set. Outputs are the same picture but not the same bytes.
+Change the base URL. The `/cog`, `/stac`, `/algorithms`, `/colorMaps`, and `/tileMatrixSets` routes pass **174 of 174** differential checks against a live TiTiler 2.4.1 (`benches/titiler_diff_oracle.py`). Outputs are the same picture, not necessarily the same bytes.
 
-`cogzilla` is not a general replacement. Its [pgSTAC support](docs/api.md#pgstac) covers titiler-pgstac's search, collection and item routes with [some options still missing](docs/api.md#not-there-yet), it has no custom Python algorithms or readers, and it only reads GeoTIFFs in the [coordinate systems it can place exactly](docs/api.md#coordinate-systems). For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` rather than being ignored; the full list is in [docs/api.md](docs/api.md#differences-from-titiler).
+`cogzilla` is not a general replacement. Its [pgSTAC support](docs/api.md#pgstac) covers titiler-pgstac's search, collection and item routes with [some options still missing](docs/api.md#not-there-yet), it has no custom Python algorithms or readers, and it only reads GeoTIFFs in the [coordinate systems it can place exactly](docs/api.md#coordinate-systems). For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` or `422` rather than being ignored; intentional differences are documented in [docs/titiler-divergences.md](docs/titiler-divergences.md) and [docs/api.md](docs/api.md#notes-on-titiler-compatibility).
 
 **Running it on the public internet?** Set `COGZILLA_ALLOWED_URL_PREFIXES`. By default the server opens any `url=` it is given, including local paths.
 
@@ -75,11 +75,12 @@ Change the base URL. The `/cog`, `/stac`, `/colorMaps` and `/tileMatrixSets` rou
 
 | | |
 | :--- | :--- |
-| [API](docs/api.md) | Every route and parameter, example requests, and live demo links |
+| [API](docs/api.md) | Every route and parameter, pgSTAC support, example requests, and live demo links |
 | [Intentional divergences from TiTiler](docs/titiler-divergences.md) | Where `cogzilla` deliberately improves on or diverges from TiTiler 2.4.1 / GDAL |
-| [Running and configuring](docs/configuration.md) | Flags, cache sizing, cloud credentials, and operational endpoints |
+| [Running and configuring](docs/configuration.md) | Flags, cache sizing, GPU/AIMD tuning, cloud credentials, pgSTAC, and operational endpoints |
 | [AWS Lambda](deploy/lambda/README.md) | One-command deploy script, SAM template, and Terraform snippet |
 | [Benchmarks](docs/benchmarks.md) | Where each number comes from and what it does not show |
+| [GPU benchmarks](docs/gpu-benchmarks.md) | Metal/Vulkan GPU continuous batching and sustained map-server soak benchmarks |
 | [How it works](docs/architecture.md) | Why there is no GDAL, the four pipeline stages, and the crates |
 
 ## License
