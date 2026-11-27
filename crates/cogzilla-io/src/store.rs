@@ -1134,7 +1134,7 @@ impl CogStore {
     ) -> Result<Option<Vec<Option<Arc<DecodedTile>>>>, IoError> {
         let ifd = &cog.index.ifds[ifd_idx];
         let mut out = Vec::with_capacity(tile_indices.len());
-        let mut single_local_miss: Option<(usize, u32, BlockKey, u64, u32)> = None;
+        let mut single_local_miss: Option<(usize, u32, BlockKey, &[u8])> = None;
 
         for (slot, &opt_idx) in tile_indices.iter().enumerate() {
             let Some(tile_idx) = opt_idx else {
@@ -1165,20 +1165,19 @@ impl CogStore {
                 .get(tile_idx as usize)
                 .copied()
                 .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
-            if cog.source.local_slice(offset, count).is_some() {
+            if let Some(slice) = cog.source.local_slice(offset, count) {
                 // If >= 2 local blocks missed, hand off to `get_blocks` so they decode in parallel!
                 if single_local_miss.is_some() {
                     return Ok(None);
                 }
-                single_local_miss = Some((slot, tile_idx, key, offset, count));
+                single_local_miss = Some((slot, tile_idx, key, slice));
                 out.push(None);
             } else {
                 return Ok(None);
             }
         }
 
-        if let Some((slot, tile_idx, key, offset, count)) = single_local_miss {
-            let slice = cog.source.local_slice(offset, count).unwrap();
+        if let Some((slot, tile_idx, key, slice)) = single_local_miss {
             match self.cache.acquire(key) {
                 LookupResult::Hit(hit) => out[slot] = Some(hit),
                 LookupResult::Owner => {

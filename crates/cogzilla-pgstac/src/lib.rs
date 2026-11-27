@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! A small client for a pgSTAC database.
 //!
 //! The compatibility path runs the same SQL titiler-pgstac runs (`search_query` to

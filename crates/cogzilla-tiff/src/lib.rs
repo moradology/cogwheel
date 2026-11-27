@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod gcp;
 pub mod parser;
 pub mod types;

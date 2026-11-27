@@ -264,6 +264,7 @@ fn decompress_zstd(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u
         });
     }
     // Check declared frame content size when available so hostile headers fail immediately.
+    // SAFETY: `src.as_ptr()` is valid for `src.len()` readable bytes.
     let content_size = unsafe { zstd_sys::ZSTD_getFrameContentSize(src.as_ptr().cast(), src.len()) };
     if content_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
         return Err(ZarrError::Codec {
@@ -281,6 +282,8 @@ fn decompress_zstd(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u
     }
 
     let mut out = vec![0u8; expected];
+    // SAFETY: `out` is a freshly allocated writable buffer of `out.len()` bytes and
+    // `src` is a valid non-overlapping readable slice of `src.len()` bytes.
     let rc = unsafe {
         zstd_sys::ZSTD_decompress(
             out.as_mut_ptr().cast(),
@@ -289,6 +292,7 @@ fn decompress_zstd(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u
             src.len(),
         )
     };
+    // SAFETY: `ZSTD_isError` is a pure inspection of the return code `rc`.
     let is_err = unsafe { zstd_sys::ZSTD_isError(rc) } != 0;
     if is_err {
         return Err(ZarrError::Codec {
