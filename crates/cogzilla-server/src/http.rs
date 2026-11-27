@@ -967,6 +967,9 @@ fn apply_array_asked(
                     .flatten()
                     .map(|stacked| {
                     use cogzilla_tiff::SampleType;
+                    if request.is_empty() {
+                        return stacked;
+                    }
                     let request: Vec<String> = request.split(';').map(str::to_string).collect();
                     let whole = array_type::band_math_type(request.iter(), SampleType::Uint16) == SampleType::Int32;
                     if stacked == SampleType::Int32 && whole {
