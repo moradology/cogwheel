@@ -1029,10 +1029,29 @@ async fn stac_array_in_its_type(
         ArrayAsked::Typed(_, assets, expression, _, _) => (assets.clone(), expression.clone()),
         ArrayAsked::Shown(pq) => (pq.assets.clone(), pq.expr_raw.clone()),
     };
-    let Ok((_, cogs, expression)) =
+    let Ok((names, cogs, expression)) =
         resolve_stac_assets(engine, item, &assets, expression.as_deref(), None).await
     else {
         return data;
+    };
+    let asked = match asked {
+        // The assets read are not the entries asked (`:all:`): each read asset's band math is
+        // found by its name and how many times it came before, as the stack finds it.
+        ArrayAsked::Typed(rule, entries, expr, mask, Some((own, request))) if entries != names => {
+            let of_name = |name: &String| -> Vec<&String> {
+                entries.iter().zip(&own).filter(|(n, _)| *n == name).filter_map(|(_, e)| e.as_ref()).collect()
+            };
+            let own = names
+                .iter()
+                .zip(occurrences(&names))
+                .map(|(name, nth)| {
+                    let exprs = of_name(name);
+                    exprs.get(nth).or(exprs.last()).map(|e| (*e).clone())
+                })
+                .collect();
+            ArrayAsked::Typed(rule, entries, expr, mask, Some((own, request)))
+        }
+        asked => asked,
     };
     apply_array_asked(Some(asked), &cogs, expression.as_deref(), data)
 }

@@ -6694,6 +6694,12 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=a%7Cbidx%3D1").await, [5.0, 3.0]);
     // `asset_bidx` for one asset beside another's own `|bidx=`.
     assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b&asset_bidx=b%7C2").await, [5.0, 13.0]);
+    // `:all:` reads every asset of the item, and an asset's band math named beside it goes to
+    // that asset; its array is typed as numpy types that math (b1*2 over uint16 is int32).
+    let all = client.get(format!("{base}/stac/preview.npy?url={url}&max_size=16&assets=:all:&assets=b%7Cexpression%3Db1*2")).send().await.unwrap();
+    assert_eq!(all.status().as_u16(), 200);
+    let all = all.bytes().await.unwrap();
+    assert!(String::from_utf8_lossy(&all[..64]).contains("'<i4'"), "{}", String::from_utf8_lossy(&all[..80]));
     // Sixteen bands are read for band math, but an answer of them all holds at most fifteen.
     let sixteen = "&assets=a".repeat(8);
     let too_many = client.get(format!("{base}/stac/preview.npy?url={url}{sixteen}")).send().await.unwrap();
