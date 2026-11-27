@@ -4080,7 +4080,7 @@ async fn render_mosaic_tile_pixel_selection(
         }
         let cog = match engine.store.open_uri(url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
             Ok(c) => c,
-            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+            Err(e) if e.is_fatal() => {
                 return Err(EngineError::Io(e));
             }
             Err(e) => {
@@ -4136,7 +4136,7 @@ async fn render_mosaic_tile_pixel_selection(
                 continue;
             }
             Err(EngineError::Io(e))
-                if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                if e.is_fatal() =>
             {
                 return Err(EngineError::Io(e));
             }
@@ -4403,7 +4403,7 @@ async fn render_mosaic_tile_styled(
                 }
                 let cog = match engine.store.open_uri(url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                     Ok(c) => c,
-                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    Err(e) if e.is_fatal() => {
                         return Err(EngineError::Io(e));
                     }
                     Err(e) => {
@@ -4441,7 +4441,7 @@ async fn render_mosaic_tile_styled(
                         continue;
                     }
                     Err(EngineError::Io(e))
-                        if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                        if e.is_fatal() =>
                     {
                         return Err(EngineError::Io(e));
                     }
@@ -4532,7 +4532,7 @@ async fn render_mosaic_tile_styled(
             }
             let cog = match engine.store.open_uri(url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                 Ok(c) => c,
-                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                Err(e) if e.is_fatal() => {
                     return Err(EngineError::Io(e));
                 }
                 Err(e) => {
@@ -4571,7 +4571,7 @@ async fn render_mosaic_tile_styled(
                     continue;
                 }
                 Err(EngineError::Io(e))
-                    if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                    if e.is_fatal() =>
                 {
                     return Err(EngineError::Io(e));
                 }
@@ -4874,7 +4874,7 @@ async fn render_mosaic_bbox_composite(
         }
         let cog = match engine.store.open_uri(u).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
             Ok(c) => c,
-            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+            Err(e) if e.is_fatal() => {
                 return Err(EngineError::Io(e));
             }
             Err(e) => {
@@ -5232,7 +5232,7 @@ async fn compute_mosaic_statistics_with_fold(
         for u in urls {
             match engine.store.open_uri(u).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                 Ok(c) => opened.push((u.clone(), c)),
-                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                Err(e) if e.is_fatal() => {
                     return Err(EngineError::Io(e));
                 }
                 Err(e) => open_err = Some(crate::engine::asset_fetch_error(u, e)),
@@ -5291,7 +5291,7 @@ async fn compute_mosaic_statistics_with_fold(
         }
         let cog = match engine.store.open_uri(u).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
             Ok(c) => c,
-            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+            Err(e) if e.is_fatal() => {
                 return Err(EngineError::Io(e));
             }
             Err(e) => {
@@ -5866,7 +5866,7 @@ async fn open_first_mosaic_cog(
     for u in urls.iter().take(16) {
         match engine.store.open_uri(u).await {
             Ok(c) => return Ok(c),
-            Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+            Err(e) if e.is_fatal() => {
                 return Err(EngineError::Io(e));
             }
             Err(e) => last_err = Some(crate::engine::asset_fetch_error(u, e)),
@@ -6832,7 +6832,7 @@ where
                     .send()
                     .await
                     .map_err(|e| match cogzilla_io::io_error_from_reqwest(e) {
-                        io_err @ cogzilla_io::IoError::Forbidden(_) => EngineError::Io(io_err),
+                        io_err if io_err.is_fatal() => EngineError::Io(io_err),
                         other => EngineError::BadRequest(format!("STAC API search failed: {other}")),
                     })?;
                 if !resp.status().is_success() {
@@ -6941,10 +6941,7 @@ where
                                             return Ok((stats, Vec::new()));
                                         }
                                         Err(e)
-                                            if matches!(
-                                                e.root(),
-                                                cogzilla_io::IoError::Forbidden(_)
-                                            ) =>
+                                            if e.is_fatal() =>
                                         {
                                             return Err(EngineError::Io(e));
                                         }
@@ -7272,15 +7269,8 @@ where
             .await,
             ["mosaicjson", "tiles"] => async {
                 let bounds = if let Some(ref u) = mj_url {
-                    match load_mosaicjson(&engine, u).await {
-                        Ok(m) => Some(m.bounds),
-                        Err(EngineError::Io(io))
-                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => None,
-                    }
+                    crate::engine::tolerate_asset_failure(load_mosaicjson(&engine, u).await)?
+                        .map(|m| m.bounds)
                 } else {
                     None
                 };
@@ -7298,18 +7288,15 @@ where
             ["mosaicjson", "tiles", tms] => async {
                 if let Some(tms_def) = crate::tms::lookup_tms(tms) {
                     let (bounds, minz, maxz) = if let Some(ref u) = mj_url {
-                        match load_mosaicjson(&engine, u).await {
-                            Ok(m) => (
+                        match crate::engine::tolerate_asset_failure(
+                            load_mosaicjson(&engine, u).await,
+                        )? {
+                            Some(m) => (
                                 Some(m.bounds),
                                 pq.minzoom.or(Some(m.minzoom)),
                                 pq.maxzoom.or(Some(m.maxzoom)),
                             ),
-                            Err(EngineError::Io(io))
-                                if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                            {
-                                return Err(EngineError::Io(io));
-                            }
-                            Err(_) => (None, pq.minzoom, pq.maxzoom),
+                            None => (None, pq.minzoom, pq.maxzoom),
                         }
                     } else {
                         (None, pq.minzoom, pq.maxzoom)
@@ -7357,7 +7344,7 @@ where
                             opened_any = true;
                             c
                         }
-                        Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        Err(e) if e.is_fatal() => {
                             return Err(EngineError::Io(e));
                         }
                         Err(e) => {
@@ -9121,15 +9108,8 @@ where
 
             // GET /stac/tiles & /stac/tiles/{tms} (OGC TilesetList & Tileset, matching /cog/tiles*)
             (Method::GET, ["tiles"]) => async {
-                let bounds = match stac_source.load(&engine).await {
-                    Ok(item) => item.bbox,
-                    Err(EngineError::Io(io))
-                        if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                    {
-                        return Err(EngineError::Io(io));
-                    }
-                    Err(_) => None,
-                };
+                let bounds = crate::engine::tolerate_asset_failure(stac_source.load(&engine).await)?
+                    .and_then(|item| item.bbox);
                 let body = build_ogc_tilesets_list(
                     &host,
                     &forwarded_prefix,
@@ -9144,15 +9124,8 @@ where
             (Method::GET, ["tiles", tms]) => async {
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
-                let bounds = match stac_source.load(&engine).await {
-                    Ok(item) => item.bbox,
-                    Err(EngineError::Io(io))
-                        if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                    {
-                        return Err(EngineError::Io(io));
-                    }
-                    Err(_) => None,
-                };
+                let bounds = crate::engine::tolerate_asset_failure(stac_source.load(&engine).await)?
+                    .and_then(|item| item.bbox);
                 let body = build_ogc_tileset_json(
                     &host,
                     &forwarded_prefix,
@@ -10663,18 +10636,13 @@ where
             // 4. GET /cog/tiles (OGC Tiles list)
             (Method::GET, ["tiles"]) => async {
                 let bounds = if !pq.urls.is_empty() {
-                    match open_query_urls(&engine, &pq.urls, None).await {
-                        Ok(cogs) => engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
-                            let full = cogs[0].index.full_res();
-                            crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
-                        }),
-                        Err(EngineError::Io(io))
-                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => None,
-                    }
+                    crate::engine::tolerate_asset_failure(open_query_urls(&engine, &pq.urls, None).await)?
+                        .and_then(|cogs| {
+                            engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
+                                let full = cogs[0].index.full_res();
+                                crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                            })
+                        })
                 } else {
                     None
                 };
@@ -10695,36 +10663,32 @@ where
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
                 let (bounds, minz, maxz) = if !pq.urls.is_empty() {
-                    match open_query_urls(&engine, &pq.urls, None).await {
-                        Ok(cogs) => {
-                            if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
-                                let full = cogs[0].index.full_res();
-                                let coarsest = cogs[0].index.ifds.last().unwrap();
-                                let ov = (full.width as f64 / coarsest.width.max(1) as f64)
-                                    .max(full.height as f64 / coarsest.height.max(1) as f64);
-                                let (dmin, dmax) = tms_def.zoom_range_for_cog(
-                                    &crs,
-                                    &full.pixel_to_crs,
-                                    full.width,
-                                    full.height,
-                                    ov,
-                                );
-                                let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
-                                (
-                                    Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
-                                    Some(mn),
-                                    Some(mx),
-                                )
-                            } else {
-                                (None, pq.minzoom, pq.maxzoom)
-                            }
+                    if let Some(cogs) =
+                        crate::engine::tolerate_asset_failure(open_query_urls(&engine, &pq.urls, None).await)?
+                    {
+                        if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
+                            let full = cogs[0].index.full_res();
+                            let coarsest = cogs[0].index.ifds.last().unwrap();
+                            let ov = (full.width as f64 / coarsest.width.max(1) as f64)
+                                .max(full.height as f64 / coarsest.height.max(1) as f64);
+                            let (dmin, dmax) = tms_def.zoom_range_for_cog(
+                                &crs,
+                                &full.pixel_to_crs,
+                                full.width,
+                                full.height,
+                                ov,
+                            );
+                            let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                            (
+                                Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
+                                Some(mn),
+                                Some(mx),
+                            )
+                        } else {
+                            (None, pq.minzoom, pq.maxzoom)
                         }
-                        Err(EngineError::Io(io))
-                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => (None, pq.minzoom, pq.maxzoom),
+                    } else {
+                        (None, pq.minzoom, pq.maxzoom)
                     }
                 } else {
                     (None, pq.minzoom, pq.maxzoom)

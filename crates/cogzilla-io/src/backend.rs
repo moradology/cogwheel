@@ -52,6 +52,13 @@ impl IoError {
         }
         cur
     }
+
+    /// An error that must never be absorbed by a per-asset fallback:
+    /// allowlist rejection (`COGZILLA_ALLOWED_URL_PREFIXES`), where silence
+    /// would hide a security refusal.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self.root(), IoError::Forbidden(_))
+    }
 }
 
 #[derive(Default)]
@@ -784,5 +791,24 @@ mod tests {
         assert_eq!(parse_range_header_start("bytes=262144-524287"), Some(262144));
         assert_eq!(parse_range_header_start("bytes=0-1023"), Some(0));
         assert_eq!(parse_range_header_start("items=0-10"), None);
+    }
+
+    #[test]
+    fn io_error_is_fatal_identifies_forbidden_through_shared_wrappers() {
+        use super::IoError;
+        use std::sync::Arc;
+
+        let direct = IoError::Forbidden("https://evil.example/a.tif".into());
+        assert!(direct.is_fatal());
+        let wrapped = IoError::Shared(Arc::new(IoError::Shared(Arc::new(direct))));
+        assert!(wrapped.is_fatal());
+
+        assert!(!IoError::HttpStatus {
+            status: 404,
+            url: "https://ok.example/missing.tif".into(),
+        }
+        .is_fatal());
+        assert!(!IoError::InvalidUri("ftp://example/a.tif".into()).is_fatal());
+        assert!(!IoError::Fs(std::io::Error::new(std::io::ErrorKind::NotFound, "nope")).is_fatal());
     }
 }
