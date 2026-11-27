@@ -7664,8 +7664,10 @@ async fn render_bbox_core(
     } else {
         None
     };
+    // Shrinking convolution requests stay on the CPU, which widens the kernel like GDAL (the
+    // shaders keep the fixed taps).
     #[cfg(feature = "gpu")]
-    let gpu_ctx = engine.gpu.as_ref().map(|g| {
+    let gpu_ctx = engine.gpu.as_ref().filter(|_| !widen_kernel).map(|g| {
         let asset_ids: Vec<u64> = cogs.iter().map(|c| c.id).collect();
         (Arc::clone(g), Arc::clone(&engine.stats), primary.id, asset_ids)
     });
@@ -7683,13 +7685,17 @@ async fn render_bbox_core(
         // Same-CRS boxes and previews have separable maps: the widened sampler then filters each
         // band's whole plane in two passes (`plane_of`), read directly by the common outputs.
         let wide = widen_kernel.then(|| {
-            cogzilla_kernel::separable_axes(&u_map, &v_map, w, h)
-                .and_then(|(us, vs)| {
-                    cogzilla_kernel::WidenedSampler::with_grid(resample, footprint_sx, footprint_sy, us, vs)
-                })
-                .unwrap_or_else(|| {
-                    cogzilla_kernel::WidenedSampler::new_uncached(resample, footprint_sx, footprint_sy)
-                })
+            match &coord_map {
+                BboxCoordMap::Separable { u_cols, v_rows } => cogzilla_kernel::WidenedSampler::with_grid(
+                    resample,
+                    footprint_sx,
+                    footprint_sy,
+                    u_cols.clone(),
+                    v_rows.clone(),
+                ),
+                _ => None,
+            }
+            .unwrap_or_else(|| cogzilla_kernel::WidenedSampler::new_uncached(resample, footprint_sx, footprint_sy))
         });
         let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
             if !u.is_finite() || !v.is_finite() {

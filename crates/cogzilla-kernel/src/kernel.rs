@@ -2329,66 +2329,78 @@ fn sample_footprint_exact(
 #[inline]
 pub fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
     match plan {
-        CoordPlan::Separable1D { u, v, .. } => {
-            let denom = (N.saturating_sub(1)).max(1) as f32;
-            let sx = (u[N - 1] - u[0]).abs() / denom;
-            let sy = (v[N - 1] - v[0]).abs() / denom;
-            (
-                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
-                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
-            )
+        CoordPlan::Separable1D { u, v, .. } => separable_coord_scale(&u[..], &v[..]),
+        CoordPlan::Grid2D { grid_u, grid_v, .. } => grid_coord_scale(grid_u, grid_v, N, N),
+        CoordPlan::Exact2D { u, v, .. } => exact_coord_scale(&u[..], &v[..], N, N),
+    }
+}
+
+#[inline(always)]
+fn usable_scale(s: f32) -> f32 {
+    if s.is_finite() && s > 1e-4 { s } else { 1.0 }
+}
+
+/// [`coord_plan_scale`] of separable axes `u` (columns) x `v` (rows).
+#[inline]
+pub fn separable_coord_scale(u: &[f32], v: &[f32]) -> (f32, f32) {
+    let span = |c: &[f32]| match (c.first(), c.last()) {
+        (Some(a), Some(b)) => (b - a).abs() / (c.len().saturating_sub(1)).max(1) as f32,
+        _ => 1.0,
+    };
+    (usable_scale(span(u)), usable_scale(span(v)))
+}
+
+/// [`coord_plan_scale`] of a `GRID_DIM` x `GRID_DIM` warp grid over a `dst_w` x `dst_h` output.
+#[inline]
+pub fn grid_coord_scale(grid_u: &[f32], grid_v: &[f32], dst_w: usize, dst_h: usize) -> (f32, f32) {
+    let mid = (GRID_DIM - 1) / 2;
+    let i00 = mid * GRID_DIM + mid;
+    let i10 = i00 + 1;
+    let i01 = (mid + 1) * GRID_DIM + mid;
+    let cell_x = (dst_w / (GRID_DIM - 1)).max(1) as f32;
+    let cell_y = (dst_h / (GRID_DIM - 1)).max(1) as f32;
+    let sx = (grid_u[i10] - grid_u[i00]).hypot(grid_v[i10] - grid_v[i00]) / cell_x;
+    let sy = (grid_u[i01] - grid_u[i00]).hypot(grid_v[i01] - grid_v[i00]) / cell_y;
+    (usable_scale(sx), usable_scale(sy))
+}
+
+/// [`coord_plan_scale`] of dense row-major `w` x `h` coordinate maps: the first pixel step found
+/// with finite, non-degenerate neighbours (centre first, then a coarse and a full scan).
+pub fn exact_coord_scale(u: &[f32], v: &[f32], w: usize, h: usize) -> (f32, f32) {
+    if w <= 1 || h <= 1 || u.len() < w * h || v.len() < w * h {
+        return (1.0, 1.0);
+    }
+    let probe = |py: usize, px: usize| -> Option<(f32, f32)> {
+        let i00 = py * w + px;
+        let i10 = i00 + 1;
+        let i01 = (py + 1) * w + px;
+        let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
+        let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
+        if sx.is_finite() && sx > 1e-4 && sy.is_finite() && sy > 1e-4 {
+            Some((sx, sy))
+        } else {
+            None
         }
-        CoordPlan::Grid2D { grid_u, grid_v, .. } => {
-            let cell_px = (N / (GRID_DIM - 1)).max(1) as f32;
-            let mid = (GRID_DIM - 1) / 2;
-            let i00 = mid * GRID_DIM + mid;
-            let i10 = i00 + 1;
-            let i01 = (mid + 1) * GRID_DIM + mid;
-            let sx = (grid_u[i10] - grid_u[i00]).hypot(grid_v[i10] - grid_v[i00]) / cell_px;
-            let sy = (grid_u[i01] - grid_u[i00]).hypot(grid_v[i01] - grid_v[i00]) / cell_px;
-            (
-                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
-                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
-            )
-        }
-        CoordPlan::Exact2D { u, v, .. } => {
-            if N <= 1 {
-                return (1.0, 1.0);
-            }
-            let probe = |py: usize, px: usize| -> Option<(f32, f32)> {
-                let i00 = py * N + px;
-                let i10 = i00 + 1;
-                let i01 = (py + 1) * N + px;
-                let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
-                let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
-                if sx.is_finite() && sx > 1e-4 && sy.is_finite() && sy > 1e-4 {
-                    Some((sx, sy))
-                } else {
-                    None
-                }
-            };
-            let mid = (N / 2).min(N - 2);
-            if let Some(s) = probe(mid, mid) {
+    };
+    if let Some(s) = probe((h / 2).min(h - 2), (w / 2).min(w - 2)) {
+        return s;
+    }
+    let (step_y, step_x) = ((h / 16).max(1), (w / 16).max(1));
+    for py in (0..h - 1).step_by(step_y) {
+        for px in (0..w - 1).step_by(step_x) {
+            if let Some(s) = probe(py, px) {
                 return s;
             }
-            let step = (N / 16).max(1);
-            for py in (0..N - 1).step_by(step) {
-                for px in (0..N - 1).step_by(step) {
-                    if let Some(s) = probe(py, px) {
-                        return s;
-                    }
-                }
-            }
-            for py in 0..N - 1 {
-                for px in 0..N - 1 {
-                    if let Some(s) = probe(py, px) {
-                        return s;
-                    }
-                }
-            }
-            (1.0, 1.0)
         }
     }
+    for py in 0..h - 1 {
+        for px in 0..w - 1 {
+            if let Some(s) = probe(py, px) {
+                return s;
+            }
+        }
+    }
+    (1.0, 1.0)
 }
 
 #[inline(always)]
