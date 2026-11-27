@@ -1447,7 +1447,51 @@ impl GpuBackend {
                 Op::PushConst(v) => GpuInstr::push_const(v),
                 Op::LoadBand(slot) => GpuInstr::load_band(slot as u32),
                 Op::ModPow2(c) => GpuInstr::op_f32(opcode, c),
-                _ => GpuInstr::op(opcode),
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Pow
+                | Op::Neg
+                | Op::Log10
+                | Op::Ln
+                | Op::Log2
+                | Op::Db
+                | Op::Exp
+                | Op::Sqrt
+                | Op::Abs
+                | Op::Sin
+                | Op::Cos
+                | Op::Tan
+                | Op::Min
+                | Op::Max
+                | Op::Clip
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::Eq
+                | Op::Ne
+                | Op::Where
+                | Op::Ceil
+                | Op::Floor
+                | Op::Round
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitNot
+                | Op::Log1p
+                | Op::Expm1
+                | Op::Sign
+                | Op::Arcsin
+                | Op::Arccos
+                | Op::Arctan
+                | Op::Arctan2
+                | Op::Sinh
+                | Op::Cosh
+                | Op::Tanh
+                | Op::Trunc => GpuInstr::op(opcode),
+                Op::Median(_) | Op::Std(_) | Op::Var(_) => return None,
             };
             out.push(ins);
         }
@@ -2974,6 +3018,13 @@ mod tests {
             b1_vals[i] = -0.8 + (i as f32 / n as f32) * 1.6;
             b2_vals[i] = 0.25 + (i as f32 / n as f32) * 3.5;
         }
+        // Inject edge-case pixels: NaN, 0.0, -1.0, out-of-domain ±1.5, small ±1e-5.
+        let edge_b1 = [f32::NAN, 0.0, -1.0, 1.5, -1.5, 1e-5, -1e-5, 0.0];
+        let edge_b2 = [1.0, 0.0, 2.0, f32::NAN, -2.5, 1e-5, -1e-5, -1.0];
+        for (idx, (&x, &y)) in edge_b1.iter().zip(edge_b2.iter()).enumerate() {
+            b1_vals[idx] = x;
+            b2_vals[idx] = y;
+        }
         let slab = Arc::new(
             cogzilla_gpu::GpuMultiBandSlab::upload_bands(
                 &gpu.ctx.device,
@@ -2990,16 +3041,19 @@ mod tests {
 
         for expr in [
             "b2 % 3.0",
+            "b1 % 3.0",
             "b2 % 4",
             "(floor(b2 * 10) & 7) | 1",
             "~where(b1 > 0, 1, 0)",
             "log1p(b2)",
+            "log1p(b1)",
             "expm1(b1)",
             "sign(b1)",
             "arcsin(b1)",
             "arccos(b1)",
             "arctan(b1)",
             "arctan2(b1, b2)",
+            "arctan2(b1, b1)",
             "sinh(b1)",
             "cosh(b1)",
             "tanh(b1)",
@@ -3298,8 +3352,8 @@ mod tests {
             return;
         };
 
-        let w = 256u32;
-        let h = 256u32;
+        let w = 512u32;
+        let h = 512u32;
         let n_px = (w * h) as usize;
         let n_scenes = 12usize;
         let mut scenes: Vec<Vec<f32>> = Vec::with_capacity(n_scenes);
@@ -3721,8 +3775,8 @@ mod tests {
             return;
         };
 
-        let w = 256u32;
-        let h = 256u32;
+        let w = 512u32;
+        let h = 512u32;
         let mut vals = vec![0u16; (w * h) as usize];
         for y in 0..h {
             for x in 0..w {

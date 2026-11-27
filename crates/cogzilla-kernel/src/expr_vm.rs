@@ -124,7 +124,7 @@ impl Op {
 
     /// Exhaustive list of `(name, wire_opcode)` pairs for every GPU-supported opcode,
     /// verified against `common_expr_vm.wgsl` by unit tests.
-    pub const GPU_WIRE_OPCODES: &'static [(&'static str, u32)] = &[
+    pub const GPU_WIRE_OPCODES: &[(&str, u32)] = &[
         ("PushConst", 0),
         ("LoadBand", 1),
         ("Add", 2),
@@ -1694,6 +1694,69 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn wire_opcode_table_matches_every_op_variant() {
+        let all_gpu_ops: [(&str, Op); 47] = [
+            ("PushConst", Op::PushConst(0.0)),
+            ("LoadBand", Op::LoadBand(0)),
+            ("Add", Op::Add),
+            ("Sub", Op::Sub),
+            ("Mul", Op::Mul),
+            ("Div", Op::Div),
+            ("Pow", Op::Pow),
+            ("Neg", Op::Neg),
+            ("Log10", Op::Log10),
+            ("Ln", Op::Ln),
+            ("Log2", Op::Log2),
+            ("Db", Op::Db),
+            ("Exp", Op::Exp),
+            ("Sqrt", Op::Sqrt),
+            ("Abs", Op::Abs),
+            ("Sin", Op::Sin),
+            ("Cos", Op::Cos),
+            ("Tan", Op::Tan),
+            ("Min", Op::Min),
+            ("Max", Op::Max),
+            ("Clip", Op::Clip),
+            ("Lt", Op::Lt),
+            ("Le", Op::Le),
+            ("Gt", Op::Gt),
+            ("Ge", Op::Ge),
+            ("Eq", Op::Eq),
+            ("Ne", Op::Ne),
+            ("Where", Op::Where),
+            ("Ceil", Op::Ceil),
+            ("Floor", Op::Floor),
+            ("Round", Op::Round),
+            ("Mod", Op::Mod),
+            ("ModPow2", Op::ModPow2(4.0)),
+            ("BitAnd", Op::BitAnd),
+            ("BitOr", Op::BitOr),
+            ("BitNot", Op::BitNot),
+            ("Log1p", Op::Log1p),
+            ("Expm1", Op::Expm1),
+            ("Sign", Op::Sign),
+            ("Arcsin", Op::Arcsin),
+            ("Arccos", Op::Arccos),
+            ("Arctan", Op::Arctan),
+            ("Arctan2", Op::Arctan2),
+            ("Sinh", Op::Sinh),
+            ("Cosh", Op::Cosh),
+            ("Tanh", Op::Tanh),
+            ("Trunc", Op::Trunc),
+        ];
+        assert_eq!(all_gpu_ops.len(), Op::GPU_WIRE_OPCODES.len());
+        for ((name, op), &(table_name, table_id)) in all_gpu_ops.iter().zip(Op::GPU_WIRE_OPCODES.iter()) {
+            assert_eq!(*name, table_name);
+            assert_eq!(op.wire_opcode(), Some(table_id), "mismatch for {name}");
+            assert!(op.gpu_supported(), "{name} should be gpu_supported");
+        }
+        for cpu_only in [Op::Median(3), Op::Std(3), Op::Var(3)] {
+            assert_eq!(cpu_only.wire_opcode(), None);
+            assert!(!cpu_only.gpu_supported());
         }
     }
 }

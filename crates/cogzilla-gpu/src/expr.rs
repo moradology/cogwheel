@@ -163,21 +163,41 @@ mod tests {
     /// with `Op::GPU_WIRE_OPCODES` (the single source of truth in `cogzilla-kernel`).
     #[test]
     fn wgsl_switch_matches_kernel_wire_opcodes() {
+        assert_eq!(super::GpuInstr::push_const(0.0).opcode, Op::PushConst(0.0).wire_opcode().unwrap());
+        assert_eq!(super::GpuInstr::load_band(0).opcode, Op::LoadBand(0).wire_opcode().unwrap());
+
         let wgsl = include_str!("shaders/common_expr_vm.wgsl");
-        let mut wgsl_cases: Vec<u32> = Vec::new();
+        let mut wgsl_cases: Vec<(String, u32)> = Vec::new();
         for line in wgsl.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("case ")
-                && let Some(num_str) = rest.split("u:").next()
+                && let Some((num_str, after)) = rest.split_once("u:")
                 && let Ok(n) = num_str.parse::<u32>()
             {
-                wgsl_cases.push(n);
+                let comment = after
+                    .split_once("//")
+                    .map(|(_, c)| c.split_whitespace().next().unwrap_or(""))
+                    .unwrap_or("")
+                    .to_string();
+                wgsl_cases.push((comment, n));
             }
         }
-        let expected: Vec<u32> = Op::GPU_WIRE_OPCODES.iter().map(|&(_, id)| id).collect();
+        let expected: Vec<(String, u32)> = Op::GPU_WIRE_OPCODES
+            .iter()
+            .map(|&(name, id)| (name.to_string(), id))
+            .collect();
         assert_eq!(
-            wgsl_cases, expected,
-            "common_expr_vm.wgsl switch cases drifted from Op::GPU_WIRE_OPCODES"
+            wgsl_cases.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            expected.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            "common_expr_vm.wgsl switch case IDs drifted from Op::GPU_WIRE_OPCODES"
         );
+        // Verify each case's ID and that its comment names the matching opcode (for ops >= 28
+        // where comments match Op variant names verbatim).
+        for ((wname, wid), (ename, eid)) in wgsl_cases.iter().zip(expected.iter()) {
+            assert_eq!(wid, eid);
+            if *wid >= 28 {
+                assert_eq!(wname, ename, "WGSL case {wid}u comment '{wname}' != expected '{ename}'");
+            }
+        }
     }
 }
