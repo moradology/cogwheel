@@ -263,11 +263,28 @@ async fn main() {
         ExprProgram::compile("(b2-b1)/(b2+b1)").unwrap(),
     )]);
 
-    let cases: [(&str, &StatsOptions); 4] = [
+    let mut area_3expr = area_4band.clone();
+    area_3expr.expressions = Some(vec![
+        (
+            "(b2-b1)/(b2+b1)".to_string(),
+            ExprProgram::compile("(b2-b1)/(b2+b1)").unwrap(),
+        ),
+        (
+            "(b3-b2)/(b3+b2)".to_string(),
+            ExprProgram::compile("(b3-b2)/(b3+b2)").unwrap(),
+        ),
+        (
+            "2.5*(b4-b3)/(b4+6*b3-7.5*b1+10000)".to_string(),
+            ExprProgram::compile("2.5*(b4-b3)/(b4+6*b3-7.5*b1+10000)").unwrap(),
+        ),
+    ]);
+
+    let cases: [(&str, &StatsOptions); 5] = [
         ("4-band F32 coverage-weighted (`area_weighted=false`)", &cov_4band),
         ("4-band F32 ellipsoidal area-weighted (`PerRow`)", &area_4band),
         ("1-band F32 ellipsoidal area-weighted (`bidx=1`)", &area_1band),
-        ("NDVI expr ellipsoidal area-weighted", &area_ndvi),
+        ("NDVI expr ellipsoidal area-weighted (1-pass GPU VM)", &area_ndvi),
+        ("3x expr (NDVI;NDWI;EVI) area-weighted (1-pass GPU VM)", &area_3expr),
     ];
 
     println!("| Native Exact Zonal Workload (`2048×2048` diamond AOI) | CPU (ms) | GPU Weighted (ms) | Speedup vs CPU | GPU Dispatches |");
