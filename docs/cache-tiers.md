@@ -1,6 +1,6 @@
 # Two-tier block cache: behavior
 
-Status: proposal. Nothing here is implemented. The "Today" section describes the code as of v0.1.2.
+> **Status: Implemented.** The two-tier block cache (`--disk-cache-dir`, `--disk-cache-mb`), LRU RAM eviction, compact `u8`/`u16` slabs, and remote source revalidation (`COGZILLA_CACHE_TTL_SECS`) are implemented on `main` (see [configuration.md](configuration.md)). The original v0.1.2 design proposal is preserved below for historical context.
 
 ## Summary
 

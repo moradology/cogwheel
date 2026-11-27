@@ -1,6 +1,6 @@
 # GPU Acceleration & Sustained Workload Benchmarks
 
-`cogzilla-server` builds with `wgpu` GPU acceleration enabled by default (`default = ["gpu"]`, adding **+1.94 MiB** to the stripped release binary: `10.13 MiB` vs `8.19 MiB` CPU-only, with zero bundled C/CUDA libraries). At startup, `GpuBackend` auto-detects hardware Vulkan or Metal adapters, rejects software renderers (`llvmpipe`/SwiftShader), calibrates its `DispatchPolicy` against the adapter's measured dispatch floor, and falls back silently to CPU if no hardware GPU is present or if `COGZILLA_GPU=never` is set. `cogzilla-lambda` stays strictly CPU-only (`default-features = false`, zero GPU crates).
+`cogzilla-server` builds with `wgpu` GPU acceleration enabled by default (`default = ["gpu"]`, adding **+1.94 MiB** to the stripped release binary: `10.13 MiB` vs `8.19 MiB` CPU-only, with zero bundled C/CUDA libraries). At startup, `GpuBackend` auto-detects hardware Vulkan or Metal adapters, rejects software renderers (`llvmpipe`/SwiftShader), calibrates its `DispatchPolicy` against the adapter's measured dispatch floor, and falls back silently to CPU if no hardware GPU is present or if `COGZILLA_GPU_POLICY=never` is set. `cogzilla-lambda` stays strictly CPU-only (`default-features = false`, zero GPU crates).
 
 For the full 49-PR implementation history, see [gpu-roadmap.md](gpu-roadmap.md).
 
