@@ -1321,11 +1321,46 @@ fn default_rescale_for_dtype(st: cogzilla_tiff::SampleType, single: bool) -> (f3
     }
 }
 
+/// The band math of a request whose `algorithm` works over its `expression`'s outputs
+/// ([`algorithm_math::over_results`]), with the algorithm's own default range for a picture
+/// when none was asked; `None` when there is no such pair.
+fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::SampleType>) -> Result<Option<ParsedQuery>, EngineError> {
+    let (Some(alg), Some(expr)) = (pq.algorithm.as_deref(), pq.expr_raw.as_deref()) else {
+        return Ok(None);
+    };
+    if SpectralExpr::from_str_opt(expr).is_some() {
+        return Ok(None);
+    }
+    let parts: Vec<(String, String)> = expression_parts(expr).map(|p| (p.to_string(), p.to_string())).collect();
+    let Some(outputs) = algorithm_math::over_results(alg, read.map(|r| (r, pq.unscale)), pq.cast_dtype.as_deref(), pq.threshold, &parts)? else {
+        return Ok(None);
+    };
+    let lower = alg.to_ascii_lowercase();
+    let range = match lower.as_str() {
+        "cast" | "ceil" | "floor" => algorithm_math::integer_band(&lower, 1, None, pq.cast_dtype.as_deref()).1,
+        "normalizedindex" => Some((-1.0, 1.0)),
+        "bitonal" => Some((0.0, 255.0)),
+        _ => None,
+    };
+    let mut composed = pq.clone();
+    composed.expr_raw = Some(outputs.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join(";"));
+    composed.algorithm = None;
+    if composed.rescale.is_empty()
+        && let Some(range) = range
+    {
+        composed.rescale = vec![range];
+    }
+    Ok(Some(composed))
+}
+
 fn build_band_request(
     pq: &ParsedQuery,
     default_bands: u16,
     sample_type: cogzilla_tiff::SampleType,
 ) -> Result<BandRequest, EngineError> {
+    if let Some(composed) = algorithm_over_expression(pq, Some(sample_type))? {
+        return build_band_request(&composed, default_bands, sample_type);
+    }
     if let Some(def) = pq.algorithm.as_deref().and_then(crate::algorithms::lookup_algorithm) {
         use crate::algorithms::AlgorithmId;
         let band_1based = pq.bidx.first().copied().unwrap_or(1);
@@ -2034,6 +2069,7 @@ fn keep_algorithm_bands(
     let array = fmt == OutputFormat::Npy || ct == GEOTIFF_CONTENT_TYPE;
     let asked = if pq.bidx.is_empty() { usize::from(default_bands) } else { pq.bidx.len() };
     if matches!(pq.algorithm.as_deref(), Some("cast" | "ceil" | "floor"))
+        && pq.expr_raw.is_none()
         && array
         && !array_type::shown(pq)
         && pq.asset_exprs.is_empty()
@@ -2221,14 +2257,47 @@ pub(crate) fn array_type_range(kind: cogzilla_tiff::SampleType) -> Option<(f64, 
     array_type::integer_range(kind)
 }
 
-fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
-    build_stats_options_with_bands(pq, allow_expr, 0)
+/// The type that holds every band of `cogs` as read.
+fn reads_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_tiff::SampleType {
+    cogs.iter()
+        .map(|cog| cog.index.full_res().sample_type)
+        .reduce(array_type::wider_type)
+        .unwrap_or(cogzilla_tiff::SampleType::Float32)
 }
 
+/// The statistics' band math, each output's description and expression compiled, with the
+/// request's band-math `algorithm` worked over the outputs ([`algorithm_math::over_results`]).
+fn compile_stats_parts(
+    pq: &ParsedQuery,
+    parts: Vec<(String, String)>,
+    read: Option<cogzilla_tiff::SampleType>,
+) -> Result<Vec<(String, ExprProgram)>, EngineError> {
+    if parts.len() > 16 {
+        return Err(EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
+    }
+    let parts = match pq.algorithm.as_deref() {
+        Some(alg) => {
+            let read = read.map(|r| (r, pq.unscale));
+            algorithm_math::over_results(alg, read, pq.cast_dtype.as_deref(), pq.threshold, &parts)?.unwrap_or(parts)
+        }
+        None => parts,
+    };
+    parts
+        .into_iter()
+        .map(|(desc, text)| Ok((desc, ExprProgram::compile(&text).map_err(EngineError::BadRequest)?)))
+        .collect()
+}
+
+fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
+    build_stats_options_with_bands(pq, allow_expr, 0, None)
+}
+
+/// The statistics' options; `read` is the type of the bands, when it is known.
 fn build_stats_options_with_bands(
     pq: &ParsedQuery,
     allow_expr: bool,
     default_bands: u16,
+    read: Option<cogzilla_tiff::SampleType>,
 ) -> Result<StatsOptions, EngineError> {
     let mut opts = StatsOptions { resample: pq.resample, ..StatsOptions::default() };
     if !pq.percentiles.is_empty() {
@@ -2253,16 +2322,8 @@ fn build_stats_options_with_bands(
     if allow_expr
         && let Some(raw) = pq.expr_raw.as_deref()
     {
-        let mut compiled = Vec::new();
-        for part in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let prog = ExprProgram::compile(part).map_err(EngineError::BadRequest)?;
-            compiled.push((part.to_string(), prog));
-            if compiled.len() > 16 {
-                return Err(EngineError::BadRequest(
-                    "expression exceeds max 16 semicolon-separated outputs".into(),
-                ));
-            }
-        }
+        let parts: Vec<(String, String)> = expression_parts(raw).map(|p| (p.to_string(), p.to_string())).collect();
+        let compiled = compile_stats_parts(pq, parts, read)?;
         if !compiled.is_empty() {
             opts.expressions = Some(compiled);
         }
@@ -7122,20 +7183,19 @@ where
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .collect();
-                    let mut compiled = Vec::with_capacity(parts.len());
-                    for (idx, part) in parts.iter().enumerate() {
-                        let prog = ExprProgram::compile(part).map_err(EngineError::BadRequest)?;
-                        let desc = raw_parts.get(idx).copied().unwrap_or(part).to_string();
-                        compiled.push((desc, prog));
-                    }
-                    expr_progs = Some(compiled);
+                    let described = parts
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, part)| (raw_parts.get(idx).copied().unwrap_or(part).to_string(), part.to_string()))
+                        .collect();
+                    expr_progs = Some(compile_stats_parts(&pq, described, Some(reads_type(&cogs)))?);
                 } else if pq.algorithm.is_some() {
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
                         data_band_count(cogs[0].index.full_res())
                     };
-                    expr_progs = build_stats_options_with_bands(&pq, true, db)?.expressions;
+                    expr_progs = build_stats_options_with_bands(&pq, true, db, Some(reads_type(&cogs)))?.expressions;
                 }
                 if let Some(compiled) = expr_progs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
@@ -7258,24 +7318,15 @@ where
                         .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
                 });
                 let post_expr_progs: Option<Vec<(String, ExprProgram)>> = if let Some(ref expr_str) = rewritten_expr {
-                    let parts: Vec<&str> = expr_str.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
-                    if parts.len() > 16 {
-                        return Err(EngineError::BadRequest(
-                            "expression exceeds max 16 semicolon-separated outputs".into(),
-                        ));
-                    }
-                    let mut compiled = Vec::with_capacity(parts.len());
-                    for part in parts {
-                        compiled.push((part.to_string(), ExprProgram::compile(part).map_err(EngineError::BadRequest)?));
-                    }
-                    Some(compiled)
+                    let parts = expression_parts(expr_str).map(|p| (p.to_string(), p.to_string())).collect();
+                    Some(compile_stats_parts(&pq, parts, Some(reads_type(&cogs)))?)
                 } else if pq.algorithm.is_some() && !is_dem_alg {
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
                         data_band_count(cogs[0].index.full_res())
                     };
-                    build_stats_options_with_bands(&pq, true, db)?.expressions
+                    build_stats_options_with_bands(&pq, true, db, Some(reads_type(&cogs)))?.expressions
                 } else {
                     None
                 };
@@ -8991,7 +9042,7 @@ where
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
                 }
-                let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
+                let stats_opts = build_stats_options_with_bands(&pq, true, db, Some(reads_type(&cogs)))?;
                 let json = compute_statistics_with_options(
                     &engine,
                     &cogs[0],
@@ -9009,7 +9060,7 @@ where
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let db = data_band_count(cogs[0].index.full_res());
-                let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
+                let stats_opts = build_stats_options_with_bands(&pq, true, db, Some(reads_type(&cogs)))?;
                 if body_bytes.is_empty() {
                     let json = compute_statistics_with_options(
                         &engine,

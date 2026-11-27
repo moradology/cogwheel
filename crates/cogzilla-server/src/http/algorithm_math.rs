@@ -103,10 +103,90 @@ pub(super) fn band_math(
     })
 }
 
+/// Band math and TiTiler's one-output algorithm `alg` together, as rio-tiler works them: the
+/// expression's outputs first, then the algorithm over them as its bands (a post-process of
+/// what was read). `parts` are each output's description and band math, and what comes back
+/// are the algorithm's outputs, described as TiTiler describes them: `cast`, `ceil` and
+/// `floor` keep each output and its description, `normalizedIndex` writes its formula over
+/// the descriptions, and the rest are one output named after the algorithm. `None` for an
+/// algorithm that is not band math (a terrain or DEM algorithm draws from the bands).
+///
+/// `read` is the type of the bands the band math is over, when it is known: the outputs are
+/// then typed as numexpr types them, and whole numbers are what `grayscale` truncates back
+/// to and what needs no rounding.
+pub(super) fn over_results(
+    alg: &str,
+    read: Option<(SampleType, bool)>,
+    cast_dtype: Option<&str>,
+    threshold: f32,
+    parts: &[(String, String)],
+) -> Result<Option<Vec<(String, String)>>, super::EngineError> {
+    let alg = alg.to_ascii_lowercase();
+    let texts: Vec<String> = parts.iter().map(|(_, text)| text.clone()).collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let whole = read.and_then(|(read, unscale)| {
+        let read = if unscale { SampleType::Float32 } else { read };
+        whole_numbers(super::array_type::band_math_type(texts.iter(), read), false)
+    });
+    if matches!(alg.as_str(), "cast" | "ceil" | "floor") {
+        let one = integer_band(&alg, 1, whole, cast_dtype).0;
+        return parts
+            .iter()
+            .map(|(desc, text)| Ok((desc.clone(), super::compose_over_results(&one, std::slice::from_ref(text))?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some);
+    }
+    if !matches!(
+        alg.as_str(),
+        "normalizedindex" | "min" | "max" | "sum" | "mean" | "median" | "var" | "std" | "grayscale" | "bitonal"
+    ) {
+        return Ok(None);
+    }
+    let bands: Vec<u16> = (1..=parts.len().min(usize::from(u16::MAX)) as u16).collect();
+    let expr = band_math(&alg, &bands, whole, cast_dtype, threshold).map_err(super::EngineError::BadRequest)?;
+    let desc = if alg == "normalizedindex" {
+        super::substitute_band_tokens(&expr, |k| parts.get(k.wrapping_sub(1)).map(|(desc, _)| desc.clone()))
+    } else {
+        alg.clone()
+    };
+    Ok(Some(vec![(desc, super::compose_over_results(&expr, &texts)?)]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cogzilla_kernel::ExprProgram;
+
+    #[test]
+    fn an_algorithm_works_over_band_math_results() {
+        let parts = |exprs: &[&str]| exprs.iter().map(|e| (e.to_string(), e.to_string())).collect::<Vec<_>>();
+        let over = |alg: &str, exprs: &[&str]| over_results(alg, None, None, 127.0, &parts(exprs)).unwrap().unwrap();
+        // floor(77 / 2) == 38, each output kept with its description.
+        let floor = over("floor", &["b1/2", "b1*300"]);
+        assert_eq!(floor.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(), ["b1/2", "b1*300"]);
+        assert_eq!(eval(&floor[0].1, &[77.0]), 38.0);
+        assert_eq!(eval(&floor[1].1, &[1.0]), 44.0);
+        // One output, named after the algorithm; normalizedIndex's formula over the parts.
+        let max = over("max", &["b1/2", "b1*3"]);
+        assert_eq!(max.len(), 1);
+        assert_eq!(max[0].0, "max");
+        assert_eq!(eval(&max[0].1, &[10.0]), 30.0);
+        let ndi = over("normalizedIndex", &["b1/2", "b1"]);
+        assert_eq!(ndi[0].0, "(b1 - b1/2) / (b1 + b1/2)");
+        assert!((eval(&ndi[0].1, &[6.0]) - 1.0 / 3.0).abs() < 1e-6);
+        // Not band math, and nothing to work over.
+        assert!(over_results("hillshade", None, None, 127.0, &parts(&["b1"])).unwrap().is_none());
+        assert!(over_results("floor", None, None, 127.0, &[]).unwrap().is_none());
+        assert!(over_results("normalizedIndex", None, None, 127.0, &parts(&["b1"])).is_err());
+        // Over whole numbers, `grayscale` truncates back to them, as TiTiler casts to the
+        // type it was given; over fractions it does not.
+        let gray = |read| over_results("grayscale", read, None, 127.0, &parts(&["b1", "b2", "b3"])).unwrap().unwrap();
+        assert_eq!(eval(&gray(Some((SampleType::Uint8, false)))[0].1, &[101.0, 200.0, 50.0]), 153.0);
+        assert!((eval(&gray(Some((SampleType::Uint8, true)))[0].1, &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
+        assert!((eval(&gray(None)[0].1, &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
+    }
 
     fn eval(expr: &str, values: &[f32]) -> f32 {
         ExprProgram::compile(expr).unwrap().eval(values)

@@ -6714,3 +6714,50 @@ async fn stac_stacks_every_band_of_several_assets() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// An algorithm with band math works over the expression's outputs, as rio-tiler applies it
+/// after the read: `floor(b1 * 101 / 2)` is 151 where the band is 3, not `floor(3)`, and the
+/// array is the algorithm's type.
+#[tokio::test]
+async fn an_algorithm_works_over_band_math_results() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_alg_over_math_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cog = tmp.join("ab.tif");
+    write_synthetic_u16_2band_4326_geotiff(&cog, 64, 64, [10.0, 40.0, 10.64, 40.64], 3, 5, None);
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}/cog");
+    let url = cog.to_string_lossy().to_string();
+    let client = reqwest::Client::new();
+    let get = |path: String| {
+        let client = client.clone();
+        async move {
+            let resp = client.get(path).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            resp.bytes().await.unwrap()
+        }
+    };
+    let middle = |bytes: &[u8]| {
+        let (shape, values) = decode_npy_any(bytes);
+        let plane = shape[1] * shape[2];
+        (0..shape[0] - 1).map(|k| values[k * plane + plane / 2]).collect::<Vec<f64>>()
+    };
+    let npy = get(format!("{base}/preview.npy?url={url}&max_size=16&expression=b1*101/2;b2*100&algorithm=floor")).await;
+    assert!(String::from_utf8_lossy(&npy[..64]).contains("'|u1'"), "floor writes bytes");
+    // floor(151.5) and 500 wrapped into a byte, as numpy's astype wraps.
+    assert_eq!(middle(&npy), [151.0, 244.0]);
+    let max = get(format!("{base}/preview.npy?url={url}&max_size=16&expression=b1/2;b2&algorithm=max")).await;
+    assert_eq!(middle(&max), [5.0]);
+    let stats: serde_json::Value = serde_json::from_slice(
+        &get(format!("{base}/statistics?url={url}&expression=b1;b2*3&algorithm=normalizedIndex")).await,
+    )
+    .unwrap();
+    // (15 - 3) / (15 + 3), described over the expression's outputs.
+    assert!((stats["b1"]["mean"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-6, "{stats}");
+    assert_eq!(stats["b1"]["description"], "(b2*3 - b1) / (b2*3 + b1)");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
