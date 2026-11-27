@@ -1014,10 +1014,10 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(resp.status(), 200, "algorithm={alg} failed");
             let bytes = resp.bytes().await.unwrap();
             assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            // Grayscale (0) for clean grayscale DEMs or indexed-palette PNG (3)
+            // Grayscale (0), Gray+Alpha (4), or indexed-palette PNG (3)
             assert!(
-                matches!(bytes[25], 0 | 3),
-                "expected grayscale or indexed PNG for algorithm={alg}, got color_type={}",
+                matches!(bytes[25], 0 | 3 | 4),
+                "expected grayscale, gray+alpha, or indexed PNG for algorithm={alg}, got color_type={}",
                 bytes[25]
             );
         }

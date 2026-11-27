@@ -180,7 +180,23 @@ impl OpenedCog {
                     .or(validator.last_modified.as_deref())
                 {
                     Some(tag) => Some(std::borrow::Cow::Owned(format!("{}#v={tag}", self.uri))),
-                    None => Some(std::borrow::Cow::Borrowed(self.uri.as_str())),
+                    // Without an ETag or Last-Modified validator, scope the disk cache key to this
+                    // process instance and `OpenedCog::id` so RAM-eviction spills still hit disk
+                    // within the TTL window, while TTL re-opens and restarts never serve stale data.
+                    None => {
+                        static PROCESS_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                        let nonce = *PROCESS_NONCE.get_or_init(|| {
+                            let nanos = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            nanos ^ ((std::process::id() as u64).rotate_left(32))
+                        });
+                        Some(std::borrow::Cow::Owned(format!(
+                            "{}#g={nonce:x}-{}",
+                            self.uri, self.id
+                        )))
+                    }
                 }
             }
         }

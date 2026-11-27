@@ -326,6 +326,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "reqwest",
+ "ring",
  "sha2 0.10.9",
  "thiserror",
  "time",

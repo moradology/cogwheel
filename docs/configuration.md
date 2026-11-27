@@ -34,7 +34,9 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | :--- | :--- |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Static or temporary credentials. |
 | `AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE` | Credentials from a shared credentials file. |
-| (none) | ECS task roles and EC2 instance roles (IMDSv2) are picked up automatically. Set `AWS_EC2_METADATA_DISABLED=true` to skip the instance lookup. |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | ECS task roles and EKS Pod Identity container credentials (reads `_FILE` when the plain token variable is unset). |
+| `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_ROLE_SESSION_NAME`, `AWS_STS_REGIONAL_ENDPOINTS` | EKS IRSA web-identity credentials via STS `AssumeRoleWithWebIdentity`, cached to `Expiration` ahead of EC2 IMDSv2. |
+| (none) | EC2 instance roles (IMDSv2) are picked up automatically when earlier providers are unset. Set `AWS_EC2_METADATA_DISABLED=true` to skip the instance lookup. |
 | `AWS_NO_SIGN_REQUEST=YES` | Send unsigned requests, for public buckets. |
 | `AWS_REQUEST_PAYER=requester` | Access requester-pays buckets. |
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | Default region. A bucket in another region is discovered from S3's redirect and remembered. |
@@ -49,8 +51,8 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `COGZILLA_BODY_TIMEOUT_SECS` | Maximum time in seconds to read a `POST` request body before aborting with `408 Request Timeout` (default `30`; `0` disables the timeout). Bodies exceeding 16 MiB are rejected with `413 Content Too Large`. |
 | `COGZILLA_MAX_OPEN_URIS` | Maximum cached opened-COG headers in memory (default 4,096, LRU-evicted). |
 | `COGZILLA_CACHE_CONTROL_MAX_AGE` | `Cache-Control: public, max-age=<N>` seconds on tile responses and on what a `GET` of a pgSTAC route finds, the list of searches apart (default `3600`; `0` emits `no-cache`). All tile responses also emit strong `ETag` and honor `If-None-Match` (`304 Not Modified`). |
-| `GS_OAUTH2_ACCESS_TOKEN`, `GS_NO_SIGN_REQUEST`, `GS_USER_PROJECT`, `GS_ENDPOINT_URL` | Google Cloud Storage (`gs://`, `/vsigs/`) auth (falls back to GCE/GKE/Cloud Run metadata server) and requester-pays project. |
-| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_ACCESS_KEY`, `AZURE_STORAGE_ACCESS_TOKEN`, `AZURE_NO_SIGN_REQUEST` | Azure Blob (`az://`, `abfs[s]://`, `/vsiaz/`) SAS token, Bearer token, or SharedKey HMAC-SHA256 signing. |
+| `GS_OAUTH2_ACCESS_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`, `GS_ACCESS_KEY_ID`, `GS_SECRET_ACCESS_KEY`, `GS_NO_SIGN_REQUEST`, `GS_USER_PROJECT`, `GS_ENDPOINT_URL` | Google Cloud Storage (`gs://`, `/vsigs/`) auth: static OAuth2 token, service-account JSON key exchange (RS256 JWT cached to expiry), S3-compatible HMAC keys (SigV4), or GCE/GKE/Cloud Run metadata server fallback; plus requester-pays project. |
+| `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_ACCESS_KEY`, `AZURE_STORAGE_ACCESS_TOKEN`, `AZURE_CLIENT_ID`, `AZURE_NO_SIGN_REQUEST` | Azure Blob (`az://`, `abfs[s]://`, `/vsiaz/`) auth: portal connection string, SAS token, Bearer token, SharedKey HMAC-SHA256 signing, or Azure Managed Identity (IMDS / `MSI_ENDPOINT` / `IDENTITY_ENDPOINT`, cached to `expires_on`). Set `AZURE_IMDS_DISABLED=true` to skip the IMDS lookup. |
 | `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
 
 ### pgSTAC database
