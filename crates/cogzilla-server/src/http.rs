@@ -9349,7 +9349,11 @@ where
                     pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
                 }
                 let mut pq_stac = pq;
-                pq_stac.expr_raw = rewritten_expr;
+                // An item's band math is over `b1..bn`, and may be made of its assets' own
+                // (`pgstac::item_asset_math`): its asset names are not rewritten.
+                if stac_prefix == "stac" {
+                    pq_stac.expr_raw = rewritten_expr;
+                }
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
@@ -9439,7 +9443,11 @@ where
                     pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
                 }
                 let mut pq_stac = pq;
-                pq_stac.expr_raw = rewritten_expr;
+                // An item's band math is over `b1..bn`, and may be made of its assets' own
+                // (`pgstac::item_asset_math`): its asset names are not rewritten.
+                if stac_prefix == "stac" {
+                    pq_stac.expr_raw = rewritten_expr;
+                }
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();

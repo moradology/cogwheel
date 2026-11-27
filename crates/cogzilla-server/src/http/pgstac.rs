@@ -1609,6 +1609,40 @@ fn parse_assets(pairs: &[(String, String)]) -> Result<Vec<AssetSpec>, Resp> {
         .collect()
 }
 
+/// The bands each `assets` entry chooses, in [`parse_assets`]'s order: its own `|bidx=` or
+/// `|indexes=` (the last of them), else what `asset_bidx=name|...` gives its asset, as the
+/// shared parser reads them. `None` for every band.
+fn entry_selections(pairs: &[(String, String)]) -> Vec<Option<Vec<u16>>> {
+    let by_name: Vec<(String, Vec<u16>)> = pairs
+        .iter()
+        .filter(|(k, _)| k == "asset_bidx")
+        .filter_map(|(_, v)| {
+            let (name, bands) = v.split_once('|')?;
+            Some((name.trim().to_string(), bands.split(',').filter_map(|b| b.trim().parse().ok()).collect()))
+        })
+        .collect();
+    pairs
+        .iter()
+        .filter(|(k, _)| k == "assets")
+        .flat_map(|(_, v)| {
+            let whole = v.contains('|');
+            v.split(move |c| c == ',' && !whole).filter(|part| !part.is_empty())
+        })
+        .map(|entry| {
+            let mut options = entry.split('|');
+            let name = options.next().unwrap_or_default();
+            let own = options
+                .filter_map(|o| o.strip_prefix("bidx=").or_else(|| o.strip_prefix("indexes=")))
+                .last()
+                .map(|bands| bands.split(',').filter_map(|b| b.trim().parse().ok()).collect::<Vec<u16>>());
+            own.or_else(|| {
+                let of_it: Vec<u16> = by_name.iter().filter(|(n, _)| n == name).flat_map(|(_, b)| b.clone()).collect();
+                (!of_it.is_empty()).then_some(of_it)
+            })
+        })
+        .collect()
+}
+
 /// What an asset gives to the stacked bands of an item.
 enum AssetBands {
     /// These of its bands, counted from zero.
@@ -1976,6 +2010,7 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
     let mut parts: Vec<String> = Vec::new();
     let mut described: Vec<String> = Vec::new();
     let several = specs.len() > 1;
+    let chosen = entry_selections(pairs);
     for (slot, spec) in specs.iter().enumerate() {
         let first = [format!("b{}", slot + 1)];
         let (own, names): (Vec<String>, Vec<String>) = match &spec.expression {
@@ -1990,9 +2025,10 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
                 let own = if several { program.describe(&first) } else { program.sources().map(str::to_string).collect() };
                 (own, program.sources().map(|part| format!("{}_{part}", spec.name)).collect())
             }
-            None if spec.indexes.is_some() => {
+            // The first band, which is what is read, may be asked for; no other.
+            None if chosen.get(slot).is_some_and(|c| c.as_ref().is_some_and(|c| c.as_slice() != [1])) => {
                 return Err(format!(
-                    "assets={}|bidx= with band math on another asset is not supported on an item's preview or statistics yet",
+                    "assets={}|bidx= with band math on another asset is not supported on an item's statistics yet, but for the first band",
                     spec.name
                 ));
             }
@@ -5138,12 +5174,13 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
     if specs.iter().all(|s| s.expression.is_none()) {
         return Ok(());
     }
+    let chosen = entry_selections(pairs);
     let as_band = query_value(pairs, "asset_as_band").and_then(parse_bool).unwrap_or(false);
     let values: Vec<f64> =
         doc["values"].as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect();
     let descriptions: Vec<String> =
         doc["band_descriptions"].as_array().into_iter().flatten().map(|d| d.as_str().unwrap_or_default().to_string()).collect();
-    if values.len() != descriptions.len() {
+    if values.len() != descriptions.len() || chosen.len() != specs.len() {
         return Ok(());
     }
     // `{asset}_b{k}`: the band of the asset a description names.
@@ -5153,28 +5190,19 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
     };
     let (mut out, mut described) = (Vec::new(), Vec::new());
     let mut at = 0;
-    for spec in &specs {
-        // An asset's run of values: the bands it chose, or all of its bands from the first,
-        // so that an asset asked for twice is read twice.
-        let n = match (&spec.expression, &spec.indexes) {
-            (None, Some(chosen)) => chosen.len(),
-            _ => descriptions[at..].iter().enumerate().take_while(|(i, d)| band_of(&spec.name, d) == Some(i + 1)).count(),
-        };
-        if n == 0 || at + n > values.len() || descriptions[at..at + n].iter().any(|d| band_of(&spec.name, d).is_none()) {
+    for (spec, chosen) in specs.iter().zip(chosen) {
+        // Every asset is read whole (`point_asset_math_reads`): its run is its bands from the
+        // first, so an asset asked for twice is read twice.
+        let n = descriptions[at..].iter().enumerate().take_while(|(i, d)| band_of(&spec.name, d) == Some(i + 1)).count();
+        if n == 0 {
             return Ok(());
         }
         let bands = &values[at..at + n];
         at += n;
-        if spec.expression.is_none() {
-            out.extend_from_slice(bands);
-            match (as_band, n) {
-                (false, _) => described.extend_from_slice(&descriptions[at - n..at]),
-                (true, 1) => described.push(spec.name.clone()),
-                (true, _) => return Err("Can't use `asset_as_band` for multibands asset".into()),
-            }
-            continue;
-        }
-        let (plan, names) = asset_bands(spec, n, as_band)?;
+        // An asset's band math is over all of its bands; a plain asset's choice of bands is
+        // taken from what was read.
+        let spec = AssetSpec { indexes: if spec.expression.is_some() { None } else { chosen }, ..spec.clone() };
+        let (plan, names) = asset_bands(&spec, n, as_band)?;
         let mut results = Vec::new();
         plan.pixel(bands, &mut results);
         out.extend(results);
@@ -5190,14 +5218,16 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
 }
 
 /// What an item's point with an asset's own band math gives the `/stac` handler, which reads
-/// the bands for [`point_asset_math`] to work out: every band of such an asset, whatever
-/// band selection (`|bidx=`, `|indexes=`, `asset_bidx=`) or request `bidx` came with it, as
-/// titiler-pgstac reads it; and only the assets of `assets=`, as titiler-pgstac has no
-/// `asset_bidx` to add others with.
+/// the bands for [`point_asset_math`] to work out: every band of every asset, without the
+/// request's `bidx`; [`point_asset_math`] applies each entry's own choice of bands (`|bidx=`,
+/// `|indexes=`, `asset_bidx=`), and none to an asset with band math, as titiler-pgstac reads
+/// it. Only the assets of `assets=` are read, as titiler-pgstac has no `asset_bidx` to add
+/// others with.
 pub(super) fn point_asset_math_reads(pq: &mut ParsedQuery, raw_query: &str) {
     let Ok(specs) = parse_assets(&query_pairs(raw_query)) else { return };
-    let plain: Vec<&str> = specs.iter().filter(|s| s.expression.is_none()).map(|s| s.name.as_str()).collect();
-    pq.asset_bidx.retain(|(name, _)| plain.contains(&name.as_str()));
+    // Every asset is read whole; each entry's choice of bands is applied afterwards, so that
+    // an asset asked for twice is read for each time as asked.
+    pq.asset_bidx.clear();
     pq.assets.retain(|a| specs.iter().any(|s| s.name == a.split('|').next().unwrap_or(a)));
     pq.bidx.clear();
     pq.asset_exprs.clear();
@@ -7479,7 +7509,9 @@ mod tests {
         // An asset's band math wins over its band selection.
         assert_eq!(math("assets=red%7Cexpression%3Db1*2%7Cbidx%3D1"), some("b1*2", &["red_b1*2"]));
         assert!(math("assets=visual%7Cexpression%3Db3&assets=red%7Cexpression%3Db1").is_err(), "past an asset's first band");
-        assert!(math("assets=red%7Cexpression%3Db1&assets=nir%7Cbidx%3D1").is_err(), "a band selection beside band math");
+        assert!(math("assets=red%7Cexpression%3Db1&assets=nir%7Cbidx%3D2").is_err(), "a band selection beside band math");
+        assert!(math("assets=red%7Cexpression%3Db1&assets=nir&asset_bidx=nir%7C2").is_err(), "however it is spelled");
+        assert_eq!(math("assets=red%7Cexpression%3Db1&assets=nir%7Cindexes%3D1"), some("b1;b2", &["red_b1", "nir_b1"]), "the first band is what is read");
         assert!(math("assets=visual%7Cexpression%3Db1%3Bb2&asset_as_band=true").is_err());
         assert_eq!(math("assets=red&expression=b1*2"), Ok(None), "no asset's own band math");
         assert_eq!(item_asset_math(&["point", "1,2"], &query_pairs("assets=red%7Cexpression%3Db1*2")), Ok(None));
@@ -7527,10 +7559,23 @@ mod tests {
         let mut doc = json!({ "values": [10.0, 750.0], "band_descriptions": ["red_b1_b1", "red_b1"] });
         point_asset_math(&mut doc, &query_pairs("assets=red_b1%7Cexpression%3Db1*2&assets=red")).unwrap();
         assert_eq!((&doc["values"], &doc["band_descriptions"]), (&json!([20.0, 750.0]), &json!(["red_b1_b1*2", "red_b1"])));
-        // A plain asset's chosen bands are its run, in the order chosen.
-        let mut doc = json!({ "values": [83.0, 77.0, 750.0], "band_descriptions": ["visual_b3", "visual_b1", "red_b1"] });
-        point_asset_math(&mut doc, &query_pairs("assets=visual%7Cbidx%3D3,1&assets=red%7Cexpression%3Db1*2")).unwrap();
-        assert_eq!(doc["values"], json!([83.0, 77.0, 1500.0]));
+        // Every asset is read whole and each entry's choice of bands taken from it, in the
+        // order chosen, whichever way it is spelled; an asset with band math takes none.
+        let whole = || json!({ "values": [77.0, 81.0, 83.0, 750.0], "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "red_b1"] });
+        for (q, want) in [
+            ("assets=visual%7Cbidx%3D3,1&assets=red%7Cexpression%3Db1*2", json!([83.0, 77.0, 1500.0])),
+            ("assets=visual%7Cindexes%3D3&assets=red%7Cexpression%3Db1*2", json!([83.0, 1500.0])),
+            ("assets=visual&assets=red%7Cexpression%3Db1*2&asset_bidx=visual%7C3", json!([83.0, 1500.0])),
+            ("assets=visual&assets=red%7Cexpression%3Db1*2&asset_bidx=red%7C1", json!([77.0, 81.0, 83.0, 1500.0])),
+        ] {
+            let mut doc = whole();
+            point_asset_math(&mut doc, &query_pairs(q)).unwrap();
+            assert_eq!(doc["values"], want, "{q}");
+        }
+        // The same asset with band math, then plain with a band chosen.
+        let mut doc = json!({ "values": [77.0, 81.0, 83.0, 77.0, 81.0, 83.0], "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "visual_b1", "visual_b2", "visual_b3"] });
+        point_asset_math(&mut doc, &query_pairs("assets=visual%7Cexpression%3Db3&assets=visual%7Cbidx%3D1")).unwrap();
+        assert_eq!((&doc["values"], &doc["band_descriptions"]), (&json!([83.0, 77.0]), &json!(["visual_b3", "visual_b1"])));
     }
 
     #[test]
