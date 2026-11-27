@@ -2799,10 +2799,36 @@ pub async fn compute_native_exact_polygon_stats(
 /// across 1 or more same-grid STAC assets (`cogs[0]` = `b1`, `cogs[1]` = `b2`, ...) on their
 /// native pixel grid. Returns `Ok(None)` if `cogs` have heterogeneous grids (so the caller can
 /// fall back to reprojected bbox rendering).
+/// `slot_bands`: the band (from one) each of `cogs` is read for, when not its first (the
+/// assets of a STAC item stacked band by band, one slot per band).
 #[allow(clippy::too_many_arguments)]
 pub async fn compute_native_exact_multi_cog_expr_stats(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
+    slot_bands: Option<&[u16]>,
+    pm: &PolygonMask,
+    max_size: u32,
+    unscale: bool,
+    nodata_override: Option<f32>,
+    exprs: &[(String, cogzilla_kernel::ExprProgram)],
+    opts: &StatsOptions,
+) -> Result<Option<serde_json::Value>, EngineError> {
+    // Two builds of one body: reading the first band of each asset compiles as it did
+    // before slots were read (measured: the slot handling slowed it by 1.5% otherwise).
+    match slot_bands {
+        None => exact_multi_cog_expr_stats::<false>(engine, cogs, &[], pm, max_size, unscale, nodata_override, exprs, opts).await,
+        Some(slots) => {
+            exact_multi_cog_expr_stats::<true>(engine, cogs, slots, pm, max_size, unscale, nodata_override, exprs, opts).await
+        }
+    }
+}
+
+/// [`compute_native_exact_multi_cog_expr_stats`]; `SLOTS`: `slot_bands` gives each asset's band.
+#[allow(clippy::too_many_arguments)]
+async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    slot_bands: &[u16],
     pm: &PolygonMask,
     max_size: u32,
     unscale: bool,
@@ -2815,7 +2841,15 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     }
     let primary = &cogs[0];
     let crs = engine.get_or_build_crs(primary)?;
-    if cogs.len() == 1 {
+    // The band each slot reads (from zero).
+    let slot_band = |slot: usize| {
+        if SLOTS {
+            slot_bands.get(slot).map_or(0, |&b| usize::from(b.saturating_sub(1)))
+        } else {
+            0
+        }
+    };
+    if cogs.len() == 1 && !SLOTS {
         let mut opts_e = opts.clone();
         opts_e.expressions = Some(exprs.to_vec());
         return Ok(Some(
@@ -2962,7 +2996,20 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         let slot = (b1 - 1) as usize;
         let store = Arc::clone(&engine.store);
         let asset_cog = Arc::clone(&cogs[slot]);
-        let idx_clone = indices.clone();
+        // A planar raster keeps each band in its own blocks.
+        let plane = slot_band(slot);
+        let asset_ifd = &asset_cog.index.ifds[ifd_idx];
+        let idx_clone = if SLOTS && plane > 0 && matches!(asset_ifd.planar_config, PlanarConfig::Planar) {
+            let mut planar = Vec::with_capacity(indices.len());
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    planar.push(Some(asset_ifd.tile_index(tx as u32, ty as u32, plane as u16) as u32));
+                }
+            }
+            planar
+        } else {
+            indices.clone()
+        };
         js.spawn(async move {
             let tiles = store.get_blocks(&asset_cog, ifd_idx, &idx_clone).await?;
             Ok::<_, EngineError>((order, b1, slot, tiles))
@@ -2985,16 +3032,19 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         let asset_tw = asset_ifd.tile_width as usize;
         let asset_th = asset_ifd.tile_height as usize;
         let eff_nodata = nodata_override.or(asset_cog.index.nodata);
+        let b0 = slot_band(slot);
         let scale_off = unscale.then(|| {
             (
-                asset_cog.index.scales.first().copied().unwrap_or(1.0),
-                asset_cog.index.offsets.first().copied().unwrap_or(0.0),
+                asset_cog.index.scales.get(b0).copied().unwrap_or(1.0),
+                asset_cog.index.offsets.get(b0).copied().unwrap_or(0.0),
             )
         });
+        // A chunky block holds every band; a planar one, the band its plane is.
+        let in_block = if !SLOTS || matches!(asset_ifd.planar_config, PlanarConfig::Planar) { 0 } else { b0 };
         let mut pixels = vec![f32::NAN; n_px];
         for (bi, tile_opt) in tiles.iter().enumerate() {
             let Some(tile) = tile_opt else { continue };
-            let Some(band) = tile.bands.first() else { continue };
+            let Some(band) = tile.bands.get(in_block) else { continue };
             let ty = ty0 + bi / blocks_x;
             let tx = tx0 + bi % blocks_x;
             let tile_x0 = tx * asset_tw;

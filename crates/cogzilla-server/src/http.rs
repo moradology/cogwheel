@@ -3346,6 +3346,79 @@ fn expand_stac_asset_bidx(
     Ok((expanded_cogs, Some(slot_bands)))
 }
 
+/// A STAC item's band math for its statistics, read as rio-tiler stacks the assets: every band
+/// of each (or those its `|bidx=` picks), an asset's own band math in its place, and the
+/// request's expression over the stack ([`expand_stac_asset_bidx`]). Gives the slots to read
+/// (the band of each, when not one band of each asset in order) and each result compiled and
+/// described as TiTiler and titiler-pgstac describe it, in the names of the stacked bands;
+/// no band math when the request and its assets have none. `on_stac`: the `/stac` routes,
+/// where assets are named in band math.
+#[allow(clippy::type_complexity)]
+fn stac_stats_band_math(
+    pq: &ParsedQuery,
+    names: &[String],
+    cogs: Vec<Arc<cogzilla_io::OpenedCog>>,
+    rewritten_expr: Option<String>,
+    on_stac: bool,
+) -> Result<
+    (
+        Vec<Arc<cogzilla_io::OpenedCog>>,
+        Option<Vec<u16>>,
+        Option<(Vec<(String, ExprProgram)>, Option<crate::stats::histogram::HistDtype>)>,
+    ),
+    EngineError,
+> {
+    let options = stac_entry_options(pq, names);
+    if rewritten_expr.is_none() && options.iter().all(|(own, _)| own.is_none()) {
+        return Ok((cogs, None, None));
+    }
+    let counts: Vec<u16> = cogs.iter().map(|c| data_band_count(c.index.full_res())).collect();
+    let stack_names = pgstac::item_stack_names(names, &counts, &options, pq.asset_as_band);
+    // One band of each asset, as read: the stack is the assets in order, and the rewritten
+    // expression reads it as it is.
+    let one_band_each = counts.iter().all(|&c| c == 1) && options.iter().all(|(own, sel)| own.is_none() && sel.is_none());
+    let mut slot_bands = None;
+    let mut expanded = None;
+    let (cogs, expr) = if one_band_each {
+        (cogs, rewritten_expr.unwrap_or_default())
+    } else {
+        let mut stacked = pq.clone();
+        let (cogs, slots) = expand_stac_asset_bidx(&mut stacked, names, cogs, rewritten_expr, on_stac)?;
+        slot_bands = slots;
+        let expr = stacked.expr_raw.clone().unwrap_or_default();
+        expanded = Some(stacked);
+        (cogs, expr)
+    };
+    let stacked = expanded.as_ref().unwrap_or(pq);
+    let parts: Vec<&str> = expression_parts(&expr).collect();
+    if parts.len() > 16 {
+        return Err(EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
+    }
+    let descriptions: Vec<String> = match pq.expr_raw.as_deref() {
+        Some(request) => expression_parts(request)
+            .map(|part| {
+                substitute_band_tokens(part, |k| {
+                    // On `/stac` an asset may be named like a band; it is read as the asset,
+                    // and stays as written.
+                    let token = format!("b{k}");
+                    if on_stac && names.contains(&token) {
+                        return None;
+                    }
+                    stack_names.get(k.wrapping_sub(1)).cloned()
+                })
+            })
+            .collect(),
+        None => stack_names,
+    };
+    let described = parts
+        .iter()
+        .enumerate()
+        .map(|(idx, part)| (descriptions.get(idx).cloned().unwrap_or_else(|| part.to_string()), part.to_string()))
+        .collect();
+    let compiled = compile_stats_parts(stacked, described, Some(reads_type(&cogs)))?;
+    Ok((cogs, slot_bands, Some(compiled)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_stac_bbox_opt(
     engine: &TileEngine,
@@ -7185,68 +7258,11 @@ where
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
                 }
-                let mut expr_progs: Option<Vec<(String, ExprProgram)>> = None;
-                let mut expr_hist = None;
-                // Band math reads the assets stacked as rio-tiler stacks them, every band of each
-                // (`expand_stac_asset_bidx`): the bands of several are read one slot each.
-                let mut slot_bands: Option<Vec<u16>> = None;
-                let options = stac_entry_options(&pq, &names);
-                let cogs = if rewritten_expr.is_some() || options.iter().any(|(own, _)| own.is_some()) {
-                    let counts: Vec<u16> = cogs.iter().map(|c| data_band_count(c.index.full_res())).collect();
-                    let stack_names = pgstac::item_stack_names(&names, &counts, &options, pq.asset_as_band);
-                    // One band of each asset, as read: the stack is the assets in order, and the
-                    // rewritten expression reads it as it is.
-                    let one_band_each =
-                        counts.iter().all(|&c| c == 1) && options.iter().all(|(own, sel)| own.is_none() && sel.is_none());
-                    let mut expanded = None;
-                    let (cogs, expr) = if one_band_each {
-                        (cogs, rewritten_expr.clone().unwrap_or_default())
-                    } else {
-                        let mut stacked = pq.clone();
-                        let (cogs, slots) =
-                            expand_stac_asset_bidx(&mut stacked, &names, cogs, rewritten_expr.clone(), stac_prefix == "stac")?;
-                        slot_bands = slots;
-                        let expr = stacked.expr_raw.clone().unwrap_or_default();
-                        expanded = Some(stacked);
-                        (cogs, expr)
-                    };
-                    let stacked = expanded.as_ref().unwrap_or(&pq);
-                    let parts: Vec<&str> = expression_parts(&expr).collect();
-                    if parts.len() > 16 {
-                        return Err(EngineError::BadRequest(
-                            "expression exceeds max 16 semicolon-separated outputs".into(),
-                        ));
-                    }
-                    // Each result is described as TiTiler and titiler-pgstac describe it: the
-                    // expression in the names of the stacked bands (an asset named in it, on
-                    // `/stac`, stays as written).
-                    let descriptions: Vec<String> = match pq.expr_raw.as_deref() {
-                        Some(request) => expression_parts(request)
-                            .map(|part| {
-                                substitute_band_tokens(part, |k| {
-                                    // On `/stac` an asset may be named like a band; it is read
-                                    // as the asset, and stays as written.
-                                    let token = format!("b{k}");
-                                    if stac_prefix == "stac" && names.contains(&token) {
-                                        return None;
-                                    }
-                                    stack_names.get(k.wrapping_sub(1)).cloned()
-                                })
-                            })
-                            .collect(),
-                        None => stack_names,
-                    };
-                    let described = parts
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, part)| (descriptions.get(idx).cloned().unwrap_or_else(|| part.to_string()), part.to_string()))
-                        .collect();
-                    let (compiled, hist) = compile_stats_parts(stacked, described, Some(reads_type(&cogs)))?;
-                    expr_progs = Some(compiled);
-                    expr_hist = hist;
-                    cogs
-                } else {
-                    cogs
+                let (cogs, slot_bands, math) =
+                    stac_stats_band_math(&pq, &names, cogs, rewritten_expr.clone(), stac_prefix == "stac")?;
+                let (mut expr_progs, expr_hist) = match math {
+                    Some((compiled, hist)) => (Some(compiled), hist),
+                    None => (None, None),
                 };
                 if expr_progs.is_none() && pq.algorithm.is_some() {
                     let db = if cogs.len() > 1 {
@@ -7396,8 +7412,19 @@ where
                         .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
                 });
                 let mut post_hist = None;
-                let post_expr_progs: Option<Vec<(String, ExprProgram)>> = if let Some(ref expr_str) = rewritten_expr {
-                    let parts = expression_parts(expr_str).map(|p| (p.to_string(), p.to_string())).collect();
+                // Band math reads the assets stacked band by band, as the GET statistics do.
+                let (cogs, post_slots, math) = if is_dem_alg {
+                    (cogs, None, None)
+                } else {
+                    stac_stats_band_math(&pq, &names, cogs, rewritten_expr.clone(), stac_prefix == "stac")?
+                };
+                let post_expr_progs: Option<Vec<(String, ExprProgram)>> = if let Some((compiled, hist)) = math {
+                    post_hist = hist;
+                    Some(compiled)
+                } else if rewritten_expr.is_some() && is_dem_alg {
+                    let parts = expression_parts(rewritten_expr.as_deref().unwrap_or_default())
+                        .map(|p| (p.to_string(), p.to_string()))
+                        .collect();
                     let (compiled, hist) = compile_stats_parts(&pq, parts, Some(reads_type(&cogs)))?;
                     post_hist = hist;
                     Some(compiled)
@@ -7431,6 +7458,7 @@ where
                     let pq_bidx_c = pq_stac.bidx.clone();
                     let asset_as_band = pq_stac.asset_as_band;
                     let expr_progs_c = post_expr_progs.clone();
+                    let slots_c = post_slots.clone();
                     let alg_c = pq_stac.algorithm.clone();
                     let pq_clone = pq_stac.clone();
                     let n = names_c.len();
@@ -7531,6 +7559,7 @@ where
                                 && let Some(exact) = crate::zonal::compute_native_exact_multi_cog_expr_stats(
                                     &eng,
                                     &cogs_c,
+                                    slots_c.as_deref(),
                                     &mask,
                                     max_size,
                                     unscale,
@@ -7574,13 +7603,25 @@ where
                                     colormap: ColormapName::Grayscale,
                                 };
                                 if unscale {
-                                    apply_unscale_cogs(&mut bands, &cogs_c, None);
+                                    apply_unscale_cogs(&mut bands, &cogs_c, slots_c.as_deref());
                                 }
-                                let raw = render_wgs84_bbox(
-                                    &eng, &cogs_c, eff_bbox, out_w, out_h, None, &bands,
-                                    resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
-                                )
-                                .await?;
+                                let raw = match slots_c.as_deref() {
+                                    Some(slots) => {
+                                        render_stac_bbox_opt(
+                                            &eng, &cogs_c, Some(slots), eff_bbox, &cogzilla_proj::CrsModel::Geographic, false,
+                                            out_w, out_h, None, &bands, resample, OutputFormat::RawF32, nodata, None, None,
+                                            true, unscale,
+                                        )
+                                        .await?
+                                    }
+                                    None => {
+                                        render_wgs84_bbox(
+                                            &eng, &cogs_c, eff_bbox, out_w, out_h, None, &bands,
+                                            resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
+                                        )
+                                        .await?
+                                    }
+                                };
                                 let pixels: Vec<f32> = raw
                                     .chunks_exact(4)
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -8284,12 +8325,49 @@ where
                 }
                 let mut all_vals = Vec::new();
                 let mut all_names = Vec::new();
-                let single_asset_expr = names.len() == 1 && rewritten_expr.is_some();
-                let single_band_per_asset = (names.len() > 1 && rewritten_expr.is_some()) || pq.asset_as_band;
-                let mut used_asset_bidx = false;
                 let entry_opts = stac_entry_options(&pq, &names);
+                // One plain asset's band math reads its bands as they are; with its own band
+                // math or bands chosen, the request's is over those, as over several assets.
+                // One asset's band pick under band math: every band is read, and the expression
+                // is read over the pick as the statistics read it (`bN` the Nth chosen).
+                let single_pick: Option<Vec<u16>> = match entry_opts.as_slice() {
+                    [(None, Some(sel))] if rewritten_expr.is_some() => Some(sel.clone()),
+                    _ => None,
+                };
+                let single_asset_expr = names.len() == 1
+                    && rewritten_expr.is_some()
+                    && (single_pick.is_some() || entry_opts.iter().all(|(own, sel)| own.is_none() && sel.is_none()));
+                // Band math over several assets reads every band of each, stacked as rio-tiler
+                // stacks them (or the bands each `|bidx=` picks); `asset_as_band` reads one.
+                let single_band_per_asset = pq.asset_as_band;
+                let mut used_asset_bidx = false;
+                // Asset names in `/stac` band math read the asset's place in the stack.
+                let named = stac_prefix == "stac"
+                    && names.len() > 1
+                    && pq.expr_raw.as_deref().is_some_and(|expr| names_in_expression(expr, &names));
+                if named && entry_opts.iter().any(|(own, _)| own.is_some()) {
+                    return Err(EngineError::BadRequest(
+                        "an expression over the results of the assets' own band math takes b1..bn, not asset names".into(),
+                    ));
+                }
+                let asset_names = names.clone();
+                let mut stacked: Vec<Vec<u16>> = Vec::with_capacity(names.len());
                 for ((name, pt), (own, sel)) in names.into_iter().zip(ordered).zip(entry_opts) {
+                    // The bands this asset puts on the stack, by number (0 for band math).
+                    let mut on_stack: Vec<u16> = Vec::new();
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
+                        if pq.asset_as_band {
+                            let gives = match (own.as_deref(), sel.as_deref()) {
+                                (Some(own), _) => expression_parts(own).count(),
+                                (None, Some(sel)) => sel.len(),
+                                (None, None) => vs.len(),
+                            };
+                            if gives > 1 {
+                                return Err(EngineError::BadRequest(format!(
+                                    "Can't use `asset_as_band` for multibands asset ('{name}' gives {gives} bands)"
+                                )));
+                            }
+                        }
                         if !single_asset_expr
                             && let Some(expr_str) = own.as_deref()
                         {
@@ -8322,6 +8400,7 @@ where
                                     serde_json::Value::Null
                                 });
                                 all_names.push(format!("{name}_{expr}"));
+                                on_stack.push(0);
                             }
                         } else if !single_asset_expr
                             && let Some(sel) = sel.as_deref()
@@ -8345,8 +8424,9 @@ where
                                 } else {
                                     format!("{name}_b{b}")
                                 });
+                                on_stack.push(b);
                             }
-                        } else if single_band_per_asset {
+                        } else if single_band_per_asset && single_pick.is_none() {
                             if let Some(v) = vs.first() {
                                 all_vals.push(v.clone());
                                 all_names.push(if pq.asset_as_band {
@@ -8354,15 +8434,61 @@ where
                                 } else {
                                     format!("{name}_b1")
                                 });
+                                on_stack.push(1);
                             }
                         } else {
                             for (i, v) in vs.iter().enumerate() {
                                 all_vals.push(v.clone());
-                                all_names.push(format!("{name}_b{}", i + 1));
+                                // (Every band of one asset read for its pick: the asset names
+                                // the band it gives under `asset_as_band`.)
+                                all_names.push(if pq.asset_as_band { name.clone() } else { format!("{name}_b{}", i + 1) });
+                                on_stack.push((i + 1) as u16);
                             }
                         }
                     }
+                    stacked.push(on_stack);
                 }
+                let stack_names = all_names.clone();
+                let rewritten_expr = match pq.expr_raw.as_deref() {
+                    Some(expr) if named => {
+                        let mut at = 0usize;
+                        let offsets: Vec<usize> = stacked
+                            .iter()
+                            .map(|bands| {
+                                let first = at;
+                                at += bands.len();
+                                first
+                            })
+                            .collect();
+                        Some(crate::stac::rewrite_stac_expr_to(expr, &asset_names, |asset, name, band| {
+                            let place = match band {
+                                None => Some(0),
+                                Some(k) => stacked[asset - 1].iter().position(|&b| usize::from(b) == k),
+                            };
+                            place.map(|p| offsets[asset - 1] + p + 1).ok_or_else(|| {
+                                EngineError::BadRequest(format!("band {} of asset '{name}' is not read", band.unwrap_or(0)))
+                            })
+                        })?)
+                    }
+                    Some(expr) if single_pick.is_some() => {
+                        let sel = single_pick.as_deref().unwrap_or_default();
+                        let read: &[String] = if stac_prefix == "stac" { &asset_names } else { &[] };
+                        Some(crate::stac::rewrite_stac_expr_with(
+                            expr,
+                            read,
+                            |_, _, band| Ok(band.unwrap_or_else(|| sel.first().map_or(1, |&b| usize::from(b)))),
+                            |k| match sel.get(k.wrapping_sub(1)) {
+                                Some(&b) => Ok(Some(usize::from(b))),
+                                None => Err(EngineError::BadRequest(format!(
+                                    "band {k} out of range for asset '{}' ({} bands chosen)",
+                                    asset_names[0],
+                                    sel.len()
+                                ))),
+                            },
+                        )?)
+                    }
+                    _ => rewritten_expr,
+                };
                 let band_names: Vec<String> =
                     (1..=all_vals.len()).map(|i| format!("b{i}")).collect();
                 let mut pt_json = serde_json::json!({
@@ -8377,6 +8503,24 @@ where
                     &pq.bidx
                 };
                 apply_point_filters(&mut pt_json, rewritten_expr.as_deref(), point_bidx)?;
+                // Band math is described, as TiTiler describes it, in the names of the stacked
+                // bands (an asset named in it, on `/stac`, stays as written); over one asset's
+                // pick, from the bands it reads.
+                let describe = if single_pick.is_some() { rewritten_expr.as_deref() } else { pq.expr_raw.as_deref() };
+                if let Some(request) = describe {
+                    let described: Vec<serde_json::Value> = expression_parts(request)
+                        .map(|part| {
+                            serde_json::json!(substitute_band_tokens(part, |k| {
+                                let token = format!("b{k}");
+                                if single_pick.is_none() && stac_prefix == "stac" && asset_names.contains(&token) {
+                                    return None;
+                                }
+                                stack_names.get(k.wrapping_sub(1)).cloned()
+                            }))
+                        })
+                        .collect();
+                    pt_json["band_descriptions"] = serde_json::Value::Array(described);
+                }
                 Ok((Bytes::from(pt_json.to_string()), "application/json"))
             }
             .await,
