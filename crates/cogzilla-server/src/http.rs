@@ -3229,7 +3229,33 @@ fn expand_stac_asset_bidx(
                 pq.asset_bidx.clear();
                 pq.bidx.clear();
             }
-            (None, Some(sel)) if pq.bidx.is_empty() => pq.bidx = sel.clone(),
+            // Band math over the bands chosen reads them in their order: `bN` is the Nth
+            // chosen (an asset's name, written for its own band, is left to it).
+            (None, Some(sel)) if pq.bidx.is_empty() => match pq.expr_raw.as_deref() {
+                Some(expr) if !named => {
+                    let mut beyond = None;
+                    let parts: Vec<String> = expression_parts(expr)
+                        .map(|part| {
+                            substitute_band_tokens(part, |k| match sel.get(k.wrapping_sub(1)) {
+                                Some(b) => Some(format!("b{b}")),
+                                None => {
+                                    beyond.get_or_insert(k);
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
+                    if let Some(k) = beyond {
+                        return Err(EngineError::BadRequest(format!(
+                            "band {k} out of range for asset '{}' ({} bands chosen)",
+                            names[0],
+                            sel.len()
+                        )));
+                    }
+                    pq.expr_raw = Some(parts.join(";"));
+                }
+                _ => pq.bidx = sel.clone(),
+            },
             _ => {}
         }
         return Ok((cogs, None));
@@ -5174,9 +5200,6 @@ where
     let mut pgstac_item: Option<Arc<StacItem>> = None;
     let mut pgstac_item_extent: Option<pgstac::ItemExtent> = None;
     let mut stac_prefix = String::from("stac");
-    // An item's statistics whose assets carry band math of their own, rewritten
-    // as the request's expression (`pgstac::item_asset_math`).
-    let mut item_asset_math = false;
     let item_preview: Option<String>;
     let item_rest: Option<Vec<&str>> = match segs.as_slice() {
         ["collections", c, "items", i, rest @ ..] if !rest.is_empty() => {
@@ -5231,37 +5254,16 @@ where
                         }
                         Ok(None) => {}
                     }
-                    // Each asset's band math on a preview or the statistics: one expression
-                    // over the stacked bands, read whole.
                     let pairs = pgstac::query_pairs(&raw_query);
                     let has_asset_math = pgstac::asset_math_asked(&pairs);
-                    let math = if has_asset_math {
-                        pgstac::item_asset_math(rest, &pairs)
-                    } else {
-                        Ok(None)
-                    };
-                    match math {
-                        Err(message) => return Ok(pgstac::bad_request(message)),
-                        Ok(Some((expression, _))) => {
-                            item_asset_math = true;
-                            pq.asset_math_stages = pgstac::item_asset_math_stages(rest, &pairs);
-                            if let Some(names) = pgstac::asset_entry_names(&raw_query) {
-                                pq.assets = names;
-                            }
-                            pq.expr_raw = Some(expression);
-                            pq.asset_exprs.clear();
-                            pq.asset_bidx.clear();
-                            pq.forget_asset_entries();
-                            pq.bidx.clear();
-                        }
-                        Ok(None) => {}
-                    }
                     // Each asset's band math on a point is applied by `pgstac::item_fixup` to
                     // every band of the asset, named as such; `asset_as_band` names them there.
                     // A preview's stack is planned over the `assets=` entries, each with its own
                     // band math and bands (`expand_stac_asset_bidx`).
                     // titiler-pgstac reads the listed assets only, not one `asset_bidx` adds.
-                    if pgstac::item_preview_route(rest) && pq.asset_entries.iter().any(|e| e.listed) {
+                    if (pgstac::item_preview_route(rest) || matches!(rest, ["statistics"]))
+                        && pq.asset_entries.iter().any(|e| e.listed)
+                    {
                         pq.asset_entries.retain(|e| e.listed);
                         pq.assets = pq.asset_entries.iter().map(|e| e.name.clone()).collect();
                     }
@@ -7080,17 +7082,13 @@ where
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
-                // An item's band math is over `b1..bn` only, and may be one made of its assets'
-                // own (`pgstac::item_asset_math`): an asset named `b2` is not read for `b2`.
+                // An item's band math is over `b1..bn` of the stack only: an asset named `b2` is
+                // not read for `b2`, and a name is refused as titiler-pgstac refuses it.
                 let rewritten_expr = if stac_prefix != "stac" { pq.expr_raw.clone() } else { rewritten_expr };
-                if item_asset_math {
-                    pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
-                } else if stac_prefix != "stac"
+                if stac_prefix != "stac"
                     && let Some(expression) = pq.expr_raw.as_deref()
                 {
-                    let bands: Vec<usize> = cogs.iter().map(|c| usize::from(c.index.full_res().samples_per_pixel)).collect();
-                    let selected = !pq.bidx.is_empty() || pq.assets.iter().any(|a| stac_asset_selected_bands(&pq, a).is_some());
-                    pgstac::check_item_statistics_expression(expression, &bands, pq.asset_as_band, selected)?;
+                    pgstac::check_item_band_math_names(expression)?;
                 }
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
                     crate::algorithms::lookup_algorithm(a)
@@ -7186,49 +7184,68 @@ where
                 }
                 let mut expr_progs: Option<Vec<(String, ExprProgram)>> = None;
                 let mut expr_hist = None;
-                if let Some(ref expr_str) = rewritten_expr {
-                    let parts: Vec<&str> = expr_str
-                        .split(';')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect();
+                // Band math reads the assets stacked as rio-tiler stacks them, every band of each
+                // (`expand_stac_asset_bidx`): the bands of several are read one slot each.
+                let mut slot_bands: Option<Vec<u16>> = None;
+                let options = stac_entry_options(&pq, &names);
+                let cogs = if rewritten_expr.is_some() || options.iter().any(|(own, _)| own.is_some()) {
+                    let counts: Vec<u16> = cogs.iter().map(|c| data_band_count(c.index.full_res())).collect();
+                    let stack_names = pgstac::item_stack_names(&names, &counts, &options, pq.asset_as_band);
+                    // One band of each asset, as read: the stack is the assets in order, and the
+                    // rewritten expression reads it as it is.
+                    let one_band_each =
+                        counts.iter().all(|&c| c == 1) && options.iter().all(|(own, sel)| own.is_none() && sel.is_none());
+                    let mut expanded = None;
+                    let (cogs, expr) = if one_band_each {
+                        (cogs, rewritten_expr.clone().unwrap_or_default())
+                    } else {
+                        let mut stacked = pq.clone();
+                        let (cogs, slots) =
+                            expand_stac_asset_bidx(&mut stacked, &names, cogs, rewritten_expr.clone(), stac_prefix == "stac")?;
+                        slot_bands = slots;
+                        let expr = stacked.expr_raw.clone().unwrap_or_default();
+                        expanded = Some(stacked);
+                        (cogs, expr)
+                    };
+                    let stacked = expanded.as_ref().unwrap_or(&pq);
+                    let parts: Vec<&str> = expression_parts(&expr).collect();
                     if parts.len() > 16 {
                         return Err(EngineError::BadRequest(
                             "expression exceeds max 16 semicolon-separated outputs".into(),
                         ));
                     }
-                    let raw_parts: Vec<&str> = pq
-                        .expr_raw
-                        .as_deref()
-                        .unwrap_or(expr_str)
-                        .split(';')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect();
+                    // Each result is described as TiTiler and titiler-pgstac describe it: the
+                    // expression in the names of the stacked bands (an asset named in it, on
+                    // `/stac`, stays as written).
+                    let descriptions: Vec<String> = match pq.expr_raw.as_deref() {
+                        Some(request) => expression_parts(request)
+                            .map(|part| {
+                                substitute_band_tokens(part, |k| {
+                                    // On `/stac` an asset may be named like a band; it is read
+                                    // as the asset, and stays as written.
+                                    let token = format!("b{k}");
+                                    if stac_prefix == "stac" && names.contains(&token) {
+                                        return None;
+                                    }
+                                    stack_names.get(k.wrapping_sub(1)).cloned()
+                                })
+                            })
+                            .collect(),
+                        None => stack_names,
+                    };
                     let described = parts
                         .iter()
                         .enumerate()
-                        .map(|(idx, part)| (raw_parts.get(idx).copied().unwrap_or(part).to_string(), part.to_string()))
+                        .map(|(idx, part)| (descriptions.get(idx).cloned().unwrap_or_else(|| part.to_string()), part.to_string()))
                         .collect();
-                    // An item's assets' own band math, folded into this expression, types the
-                    // results stage by stage (what an algorithm over them is given).
-                    let staged;
-                    let typed_pq = match pq.asset_math_stages.as_ref() {
-                        Some((own, request)) if pq.band_math_type.is_none() => {
-                            let reads: Vec<cogzilla_tiff::SampleType> =
-                                cogs.iter().map(|c| c.index.full_res().sample_type).collect();
-                            let mut typed = pq.clone();
-                            typed.band_math_type =
-                                array_type::ArrayRule::Math { unscale: pq.unscale }.staged_kind(&reads, own, request);
-                            staged = typed;
-                            &staged
-                        }
-                        _ => &pq,
-                    };
-                    let (compiled, hist) = compile_stats_parts(typed_pq, described, Some(reads_type(&cogs)))?;
+                    let (compiled, hist) = compile_stats_parts(stacked, described, Some(reads_type(&cogs)))?;
                     expr_progs = Some(compiled);
                     expr_hist = hist;
-                } else if pq.algorithm.is_some() {
+                    cogs
+                } else {
+                    cogs
+                };
+                if expr_progs.is_none() && pq.algorithm.is_some() {
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
@@ -7256,22 +7273,38 @@ where
                             colormap: ColormapName::Grayscale,
                         };
                         if pq.unscale {
-                            apply_unscale_cogs(&mut bands, &cogs, None);
+                            apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                         }
-                        let stat = render_native_preview_stats(
-                            &engine,
-                            &cogs,
-                            bbox,
-                            out_w,
-                            out_h,
-                            &bands,
-                            pq.resample,
-                            pq.nodata,
-                            pq.unscale,
-                            &desc,
-                            &stats_opts,
-                        )
-                        .await?;
+                        let stat = match slot_bands.as_deref() {
+                            // Several bands of one asset: read slot by slot, then counted.
+                            Some(slots) => {
+                                let raw = render_stac_bbox_opt(
+                                    &engine, &cogs, Some(slots), bbox, &cogzilla_proj::CrsModel::Geographic, true, out_w, out_h,
+                                    None, &bands, pq.resample, OutputFormat::RawF32, pq.nodata, None, None, true, pq.unscale,
+                                )
+                                .await?;
+                                let n_px = (out_w as usize) * (out_h as usize);
+                                let pixels: Vec<f32> =
+                                    raw.chunks_exact(4).take(n_px).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                compute_f32_band_stats_with_engine(&engine, &pixels, &desc, &stats_opts)
+                            }
+                            None => {
+                                render_native_preview_stats(
+                                    &engine,
+                                    &cogs,
+                                    bbox,
+                                    out_w,
+                                    out_h,
+                                    &bands,
+                                    pq.resample,
+                                    pq.nodata,
+                                    pq.unscale,
+                                    &desc,
+                                    &stats_opts,
+                                )
+                                .await?
+                            }
+                        };
                         map.insert(format!("b{}", idx + 1), stat);
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
