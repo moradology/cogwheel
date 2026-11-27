@@ -595,25 +595,11 @@ pub fn get_colormap_image(
     let (def_w, def_h) = if vertical { (20u32, 256u32) } else { (256u32, 20u32) };
     let w = width.unwrap_or(def_w).clamp(1, 4096) as usize;
     let h = height.unwrap_or(def_h).clamp(1, 4096) as usize;
-    let mut rgba = vec![0u8; w * h * 4];
     let denom = if vertical {
         (h.saturating_sub(1)).max(1)
     } else {
         (w.saturating_sub(1)).max(1)
     };
-    for y in 0..h {
-        let row_off = y * w * 4;
-        for x in 0..w {
-            let pos = if vertical { y } else { x };
-            let idx = ((pos * 255 + denom / 2) / denom).min(255);
-            let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
-            let o = row_off + x * 4;
-            rgba[o] = r;
-            rgba[o + 1] = g;
-            rgba[o + 2] = b;
-            rgba[o + 3] = a;
-        }
-    }
     if matches!(format, cogzilla_kernel::OutputFormat::Npy) {
         let mut dict = format!(
             "{{'descr': '|u1', 'fortran_order': False, 'shape': (4, {h}, {w}), }}"
@@ -629,11 +615,29 @@ pub fn get_colormap_image(
         out.extend_from_slice(&hlen.to_le_bytes());
         out.extend_from_slice(dict.as_bytes());
         for ch in 0..4usize {
-            for p in 0..pixels {
-                out.push(rgba[p * 4 + ch]);
+            for y in 0..h {
+                for x in 0..w {
+                    let pos = if vertical { y } else { x };
+                    let idx = ((pos * 255 + denom / 2) / denom).min(255);
+                    out.push(lut.rgba_u32[idx].to_le_bytes()[ch]);
+                }
             }
         }
         return Ok(Bytes::from(out));
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let row_off = y * w * 4;
+        for x in 0..w {
+            let pos = if vertical { y } else { x };
+            let idx = ((pos * 255 + denom / 2) / denom).min(255);
+            let [r, g, b, a] = lut.rgba_u32[idx].to_le_bytes();
+            let o = row_off + x * 4;
+            rgba[o] = r;
+            rgba[o + 1] = g;
+            rgba[o + 2] = b;
+            rgba[o + 3] = a;
+        }
     }
     Ok(crate::titiler::encode_rgba_output(w, h, &rgba, format, false))
 }

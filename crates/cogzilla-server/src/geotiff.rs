@@ -353,6 +353,17 @@ pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
 /// `cogzilla_kernel::retype_f32_npy` casts them; with `mask`, the last band is the mask,
 /// written as the type's largest number where it is not zero and its smallest where it is.
 pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, mask: bool) -> Option<Bytes> {
+    retype_f32_geotiff_with(tif, kind, mask, |v| v)
+}
+
+/// [`retype_f32_geotiff`], each sample (not the mask) passed through `prepare` before it is
+/// cast, as `cogzilla_kernel::retype_f32_npy_with` does.
+pub(crate) fn retype_f32_geotiff_with(
+    tif: &[u8],
+    kind: cogzilla_tiff::SampleType,
+    mask: bool,
+    prepare: impl Fn(f64) -> f64,
+) -> Option<Bytes> {
     let u16_at = |at: usize| tif.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |at: usize| tif.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let f64_at = |at: usize| tif.get(at..at + 8).map(|b| f64::from_le_bytes(b.try_into().unwrap()));
@@ -453,7 +464,7 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
                 for i in 0..total_samples {
                     let v = read_sample(i);
                     let x: $t = if !is_mask(i) {
-                        cast(v)
+                        cast(prepare(v))
                     } else if v.is_finite() && v > 0.0 {
                         <$t>::MAX
                     } else {
@@ -524,10 +535,10 @@ pub(crate) fn write_geotiff_typed_f64(
     write_geotiff(&spec, |buf| {
         let data = &values[..(bands * pixels).min(values.len())];
         macro_rules! put_planes {
-            ($t:ty, $cast:expr) => {{
+            ($t:ty, $cast:expr, $nan_to_zero:expr) => {{
                 let cast = $cast;
                 for &v in data {
-                    let x: $t = cast(if v.is_nan() { 0.0 } else { v });
+                    let x: $t = cast(if $nan_to_zero && v.is_nan() { 0.0 } else { v });
                     buf.put_slice(&x.to_le_bytes());
                 }
                 if return_mask {
@@ -542,16 +553,16 @@ pub(crate) fn write_geotiff_typed_f64(
         }
         use cogzilla_tiff::SampleType as T;
         match kind {
-            T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8),
-            T::Int8 => put_planes!(i8, |v: f64| v as i8),
-            T::Uint16 => put_planes!(u16, |v: f64| v as u16),
-            T::Int16 => put_planes!(i16, |v: f64| v as i16),
-            T::Uint32 => put_planes!(u32, |v: f64| v as u32),
-            T::Int32 => put_planes!(i32, |v: f64| v as i32),
-            T::Uint64 => put_planes!(u64, |v: f64| v as u64),
-            T::Int64 => put_planes!(i64, |v: f64| v as i64),
-            T::Float32 => put_planes!(f32, |v: f64| v as f32),
-            T::Float64 => put_planes!(f64, |v: f64| v),
+            T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8, true),
+            T::Int8 => put_planes!(i8, |v: f64| v as i8, true),
+            T::Uint16 => put_planes!(u16, |v: f64| v as u16, true),
+            T::Int16 => put_planes!(i16, |v: f64| v as i16, true),
+            T::Uint32 => put_planes!(u32, |v: f64| v as u32, true),
+            T::Int32 => put_planes!(i32, |v: f64| v as i32, true),
+            T::Uint64 => put_planes!(u64, |v: f64| v as u64, true),
+            T::Int64 => put_planes!(i64, |v: f64| v as i64, true),
+            T::Float32 => put_planes!(f32, |v: f64| v as f32, false),
+            T::Float64 => put_planes!(f64, |v: f64| v, false),
         }
     })
 }

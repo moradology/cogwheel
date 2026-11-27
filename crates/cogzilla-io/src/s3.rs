@@ -489,11 +489,11 @@ pub fn parse_sts_xml_credentials(xml: &str) -> Option<AwsCredentials> {
         let end = start + xml[start..].find(&close)?;
         let raw = xml[start..end].trim();
         let decoded = raw
-            .replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
-            .replace("&apos;", "'");
+            .replace("&apos;", "'")
+            .replace("&amp;", "&");
         Some(decoded)
     }
 
@@ -617,7 +617,7 @@ pub fn parse_aws_json_credentials(body: &str) -> Option<AwsCredentials> {
 }
 
 /// Minimal ISO-8601 UTC timestamp parser (`YYYY-MM-DDTHH:MM:SSZ`) returning Unix epoch seconds.
-fn parse_iso8601_utc_epoch(s: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_utc_epoch(s: &str) -> Option<u64> {
     let s = s.trim();
     let bytes = s.as_bytes();
     if bytes.len() < 19

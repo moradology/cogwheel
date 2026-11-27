@@ -302,6 +302,23 @@ def main():
             "type": "FeatureCollection",
             "features": [poly_feature, tri_feature],
         }
+        hole_feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [-122.80, 37.60], [-122.50, 37.60],
+                        [-122.50, 37.90], [-122.80, 37.90], [-122.80, 37.60],
+                    ],
+                    [
+                        [-122.725, 37.675], [-122.575, 37.675],
+                        [-122.575, 37.825], [-122.725, 37.825], [-122.725, 37.675],
+                    ],
+                ],
+            },
+            "properties": {},
+        }
         discrete_cmap = quote(json.dumps({"0": [0, 0, 0, 0], "100": [255, 0, 0, 255], "200": [0, 255, 0, 255]}))
         interval_cmap = quote(json.dumps([[[0, 200], [0, 0, 255, 255]], [[200, 600], [0, 255, 0, 255]], [[600, 1200], [255, 0, 0, 255]]]))
         hs_params = quote(json.dumps({"buffer": 0}))
@@ -535,6 +552,13 @@ def main():
             # --- Sweep #5 parity regressions (M3, M6) ---
             ("OGC /cog/map bbox-crs=EPSG:32610 native dims", "GET", f"/cog/map?url={sat}&bbox=540000,4170000,550000,4190000&bbox-crs=EPSG:32610&bidx=1&bidx=2&bidx=3&rescale=0,0.35", None, "png"),
             ("GET /cog/point?expression=b1;b2*2", "GET", f"/cog/point/-122.65,37.773?url={sat}&expression=b1;b2*2", None, "json_point"),
+            # --- Oracle Completeness & Audit #102 regressions ---
+            ("POST /cog/feature/64x64.png (Polygon with hole)", "POST", f"/cog/feature/64x64.png?url={sat}&bidx=1&bidx=2&bidx=3&rescale=0,0.35", hole_feature, "png"),
+            ("POST /cog/statistics (Polygon with hole)", "POST", f"/cog/statistics?url={sat}&max_size=256", hole_feature, "json_post_stats"),
+            ("GET /cog/bbox (2-band expr .npy)", "GET", f"/cog/bbox/-122.8,37.6,-122.5,37.9/64x64.npy?url={sat}&expression={quote('b1+b2;b2-b3')}", None, "npy"),
+            ("GET /cog/bbox (2-band expr .tif)", "GET", f"/cog/bbox/-122.8,37.6,-122.5,37.9/64x64.tif?url={sat}&expression={quote('b1+b2;b2-b3')}", None, "geotiff"),
+            ("GET /cog/tiles (float64 .npy return_mask=false)", "GET", f"/cog/tiles/WebMercatorQuad/10/163/396.npy?url={dtype_paths['float64'][0]}&return_mask=false", None, "npy"),
+            ("STAC [2-asset per-asset expr .npy]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.npy?url={stac_item}&assets=red|expression=b1*2&assets=green|expression=b1*3", None, "npy"),
         ])
 
         print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks) ===")
