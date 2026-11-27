@@ -5637,7 +5637,8 @@ where
     let is_head = *req.method() == Method::HEAD;
     let is_post = *req.method() == Method::POST;
     let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
-    let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics" | "/stats");
+    let is_health_or_metrics =
+        matches!(req.uri().path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
     let is_control_plane = is_health_or_metrics
         || matches!(
             req.uri().path(),
@@ -5914,6 +5915,40 @@ where
 
     if method == Method::GET && path == "/healthz" {
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"ok"), "text/plain"));
+    }
+
+    if method == Method::GET && path == "/readyz" {
+        if let Some(pg) = engine.pgstac() {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), pg.version()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "readiness check failed: pgSTAC unreachable");
+                    let mut resp = plain_resp(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Bytes::from_static(b"not ready: pgSTAC unreachable"),
+                        "text/plain",
+                    );
+                    resp.headers_mut()
+                        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    return Ok(resp);
+                }
+                Err(_) => {
+                    tracing::warn!("readiness check failed: pgSTAC timed out");
+                    let mut resp = plain_resp(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Bytes::from_static(b"not ready: pgSTAC timed out"),
+                        "text/plain",
+                    );
+                    resp.headers_mut()
+                        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    return Ok(resp);
+                }
+            }
+        }
+        let mut resp = plain_resp(StatusCode::OK, Bytes::from_static(b"ok"), "text/plain");
+        resp.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(resp);
     }
 
     if method == Method::GET && (path == "/conformance" || path == "/conformance/") {
@@ -11404,6 +11439,7 @@ where
         path.as_str(),
         "/" | "/index.html"
             | "/healthz"
+            | "/readyz"
             | "/metrics"
             | "/conformance"
             | "/conformance/"
@@ -11880,13 +11916,24 @@ async fn shutdown_signal() {
 }
 
 pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> std::io::Result<()> {
-    let shutdown = shutdown_signal();
+    serve_listener_with_shutdown(engine, listener, shutdown_signal()).await
+}
+
+pub async fn serve_listener_with_shutdown<F>(
+    engine: Arc<TileEngine>,
+    listener: TcpListener,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     tokio::pin!(shutdown);
     loop {
         let (stream, _) = tokio::select! {
             _ = &mut shutdown => {
-                tracing::info!("shutdown signal received; stopping listener");
-                return Ok(());
+                tracing::info!("shutdown signal received; draining in-flight connections");
+                break;
             }
             accept_res = listener.accept() => match accept_res {
                 Ok(pair) => pair,
@@ -11901,16 +11948,37 @@ pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> s
         let _ = stream.set_nodelay(true);
         let io = TokioIo::new(stream);
         let eng = engine.clone();
+        let svc = service_fn(move |req| handle_request(eng.clone(), req));
+        let mut builder = ServerBuilder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(std::time::Duration::from_secs(15));
+        let conn = builder.serve_connection(io, svc).into_owned();
+        let fut = graceful.watch(conn);
         tokio::spawn(async move {
-            let svc = service_fn(move |req| handle_request(eng.clone(), req));
-            let mut builder = ServerBuilder::new(TokioExecutor::new());
-            builder
-                .http1()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(std::time::Duration::from_secs(15));
-            let _ = builder.serve_connection(io, svc).await;
+            let _ = fut.await;
         });
     }
+    // Close the listening socket immediately so load balancers get ECONNREFUSED instead of
+    // queueing new handshakes in the kernel backlog while in-flight connections drain.
+    drop(listener);
+    let drain_secs = std::env::var("COGZILLA_SHUTDOWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(drain_secs),
+        graceful.shutdown(),
+    )
+    .await
+    {
+        Ok(()) => tracing::info!("all in-flight connections drained"),
+        Err(_) => {
+            tracing::warn!(timeout_secs = drain_secs, "graceful shutdown timed out; forcing exit");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -12925,5 +12993,84 @@ mod tests {
             assert!(!pq.errors.is_empty(), "expected validation error for {q}");
         }
         assert!(parse_query(Some("return_mask=false&unscale=1&categorical=yes")).errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readyz_and_graceful_shutdown_drain() {
+        let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/readyz")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        // HEAD /readyz -> 200 with no-store and empty body; POST /readyz -> 405.
+        let head_req = Request::builder()
+            .method(Method::HEAD)
+            .uri("/readyz")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let head_resp = handle_request(engine.clone(), head_req).await.unwrap();
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert_eq!(
+            head_resp.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let post_req = Request::builder()
+            .method(Method::POST)
+            .uri("/readyz")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let post_resp = handle_request(engine.clone(), post_req).await.unwrap();
+        assert_eq!(post_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // Unreachable pgSTAC -> 503 with Cache-Control: no-store.
+        let dead_port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let pg_cfg = cogzilla_pgstac::PgStacConfig::from_connection_string(&format!(
+            "postgresql://u:p@127.0.0.1:{dead_port}/db?connect_timeout=1"
+        ))
+        .unwrap();
+        let pg = Arc::new(cogzilla_pgstac::PgStac::new(pg_cfg).unwrap());
+        let pg_engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+        pg_engine.set_pgstac(pg);
+        let unready_req = Request::builder()
+            .method(Method::GET)
+            .uri("/readyz")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let unready_resp = handle_request(pg_engine, unready_req).await.unwrap();
+        assert_eq!(unready_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unready_resp.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = tokio::spawn(async move {
+            serve_listener_with_shutdown(engine, listener, async move {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let r = client.get(format!("http://{addr}/readyz")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.text().await.unwrap(), "ok");
+
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), srv)
+            .await
+            .expect("server should drain and exit promptly")
+            .unwrap();
     }
 }

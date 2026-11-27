@@ -110,6 +110,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Fails on clippy errors only; existing warnings are reported, not denied.
       - run: cargo clippy --workspace --all-targets --locked
+      - name: Check CPU-only server and Lambda builds
+        run: |
+          cargo check -p cogzilla-server --no-default-features --locked
+          cargo check -p cogzilla-lambda --locked
 
   docker:
     name: Docker build

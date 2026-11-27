@@ -96,11 +96,11 @@ This document is the living record of every intentional divergence, **why** it e
 - **TiTiler / GDAL:** Opening a public `s3://` URI without AWS credentials fails with `500 InvalidCredentials: No valid AWS credentials found`.
 - **`cogzilla`:** Falls back automatically to unsigned HTTPS with S3 bucket-region discovery for public `s3://` buckets, while supporting static env vars, `AWS_PROFILE`, ECS task roles, EKS Pod Identity (`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`), EKS IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`), and EC2 IMDSv2 for private buckets.
 
-### 1.11 Exact `grayscale` of Whole Numbers, and Algorithms TiTiler Cannot Finish
+### 1.11 Exact `grayscale` of Whole Numbers, and Unsigned `sum`
 
-- **TiTiler:** `grayscale` sums `r*299/1000 + g*587/1000 + b*114/1000` term by term in float64 and truncates, so a grey picture stored as RGB (three equal bands) comes out one lower than its own value on about 5.5% of pixels (`0.299·a + 0.587·a + 0.114·a` lands just under `a`). `sum` over unsigned integer bands answers `500`, as does `grayscale` over a single band; `std` and `var` over a single band mask every pixel (`ddof=1` over one value).
-- **`cogzilla`:** Sums whole-number bands exactly (`(r*299 + g*587 + b*114) / 1000`) before truncating, so equal bands give back their value, and otherwise matches TiTiler's type and values (`ddof=1` spread, truncation, `astype` wrapping for `cast`/`ceil`/`floor`). `sum` of unsigned bands is written as `uint64`; `grayscale` of one band is that band; `std`/`var` of one band is `0`.
-- **Client significance:** Grey RGB imagery keeps its values through `grayscale`, and the algorithms answer where TiTiler fails.
+- **TiTiler:** `grayscale` sums `r*299/1000 + g*587/1000 + b*114/1000` term by term in float64 and truncates, so a grey picture stored as RGB (three equal bands) comes out one lower than its own value on about 5.5% of pixels (`0.299·a + 0.587·a + 0.114·a` lands just under `a`). `sum` over unsigned integer bands answers `500`.
+- **`cogzilla`:** Sums whole-number bands exactly (`(r*299 + g*587 + b*114) / 1000`) before truncating, so equal bands give back their value, and writes `sum` of unsigned integer bands as `uint64`. Otherwise matches TiTiler's types, edge cases, and values (`ddof=1` spread with single-band `std`/`var` masked, `grayscale` requiring `≥ 3` bands, truncation, and `astype` wrapping for `cast`/`ceil`/`floor`).
+- **Client significance:** Grey RGB imagery keeps its values through `grayscale`, and `sum` over unsigned bands succeeds where TiTiler fails.
 
 ---
 
@@ -108,7 +108,13 @@ This document is the living record of every intentional divergence, **why** it e
 
 `algorithm_params` are checked as TiTiler's pydantic models check them (2026-11-26): each algorithm reads its own fields in pydantic's lax mode (`"45"`, `45.0` and `true` are the integer they spell), within its bounds, and passes over other keys; what it refuses is a `400` in pydantic's words (without the line that links to pydantic's documentation), and parameters that are not JSON are FastAPI's `422`, on the routes that apply an algorithm. One field is wider: `contours`' `increment` may be a fraction, for data whose values lie between whole numbers (reflectance, say), where TiTiler takes only a whole number. Parameters that are JSON but not an object, which TiTiler fails on with a `500`, are a `400` here.
 
-### 1.13 Native Zero-GDAL Zarr v2/v3 Support (`/zarr/*`, PR #359)
+### 1.13 The Overview of a Warped, Smoothed Read Is Chosen by Ground Size
+
+A box, feature or statistics read into another projection with a smoothing method (`bilinear`, `cubic`, `average`, `lanczos`, ...) is, in rio-tiler, a read of a GDAL warped VRT at a size. GDAL chooses the overview by the least-reduced axis, as cogzilla does, but measures it in the VRT's own pixels: square in degrees (or Web Mercator metres), sized from the raster's diagonal. In degrees a pixel of longitude is shorter on the ground than one of latitude by `cos(latitude)`, so away from the equator GDAL can read an overview coarser than the output's pixels across. For example, a 64×43 box at 45.7°N has pixels of 146 m across and 207 m down; GDAL reads Sentinel-2's 160 m overview, and cogzilla reads the 80 m one with a kernel widened to each pixel's footprint. Whether GDAL drops a level then depends on the box's aspect: a 64×64 box over the same ground reads 80 m in both.
+
+cogzilla keeps its choice. Against the area mean of the 10 m pixels (the ideal value of each output pixel), cogzilla's 64×43 box has RMSE 35 to 53 under `average`, `bilinear`, `cubic` and `lanczos`. GDAL's choice, made by titiler-pgstac or tried in cogzilla, has RMSE 70 to 88 for the same requests, and is blurrier: its spread is 211 to 226 against 247. So where the two choices differ, cogzilla's pictures and statistics are expected to differ from TiTiler's by being sharper (as in that test): 31 to 40 dB from titiler-pgstac at such sizes, with a higher `std` and a wider range. Where they agree (a 64×64 or 300×200 box), they match TiTiler's to 56 to 70 dB.
+
+### 1.14 Native Zero-GDAL Zarr v2/v3 Support (`/zarr/*`, PR #359)
 
 `/zarr/*` has left the parked list and now routes directly through the same `BandSource` + `cogzilla-kernel` + `zonal.rs` pipeline as `/cog/*` (zero parallel render pipeline):
 - **Unified semantic HTTP statuses (#388):** Every `/zarr/*` failure maps through a single status table (`400` for missing/ambiguous variable listing available variables, out-of-range `sel` with available `[min, max]` never silently clamped, irregular/curvilinear grid naming dimension & index, named unmodellable CRS never silently falling back to `EPSG:4326`, or cap exceeded; `403` for upstream 401/403; `404` for missing store or out-of-bounds tile; `501` for unknown codec listing supported codecs; `502`/`504` for corrupt chunks, missing chunks without a fill value, or origin timeouts).
