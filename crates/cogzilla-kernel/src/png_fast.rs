@@ -38,171 +38,30 @@ fn write_chunk(out: &mut BytesMut, chunk_type: [u8; 4], data: &[u8]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn filter_sub_rgba_avx2(src: &[u8], out: &mut [u8]) {
+unsafe fn filter_sub_avx2<const BPP: usize, const SHIFT: i32>(src: &[u8], out: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = src.len();
     let mut i = 0usize;
-    let mut prev = _mm_setzero_si128();
-    while i + 16 <= len {
-        let cur = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let left = _mm_alignr_epi8::<12>(cur, prev);
-        let diff = _mm_sub_epi8(cur, left);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, diff);
-        prev = cur;
-        i += 16;
-    }
-    while i < len {
-        let left = if i >= 4 { src[i - 4] } else { 0 };
-        out[i] = src[i].wrapping_sub(left);
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn filter_sub_rgb_avx2(src: &[u8], out: &mut [u8]) {
-    use std::arch::x86_64::*;
-    let len = src.len();
-    let mut i = 0usize;
-    let mut prev = _mm_setzero_si128();
-    while i + 16 <= len {
-        let cur = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let left = _mm_alignr_epi8::<13>(cur, prev);
-        let diff = _mm_sub_epi8(cur, left);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, diff);
-        prev = cur;
-        i += 16;
-    }
-    while i < len {
-        let left = if i >= 3 { src[i - 3] } else { 0 };
-        out[i] = src[i].wrapping_sub(left);
-        i += 1;
-    }
-}
-
-/// Apply PNG Sub filter (type = 1) to an RGBA8 scanline (`bpp = 4`) using ARM64 NEON or x86_64 AVX2.
-#[inline(always)]
-pub fn filter_sub_rgba_row(src_rgba: &[u8], dst_filtered: &mut [u8]) {
-    dst_filtered[0] = 1;
-    let out = &mut dst_filtered[1..1 + src_rgba.len()];
-    let len = src_rgba.len();
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        let mut i = 0usize;
-        let mut prev = unsafe { vdupq_n_u8(0) };
+    unsafe {
+        let mut prev = _mm_setzero_si128();
         while i + 16 <= len {
-            unsafe {
-                let cur = vld1q_u8(src_rgba.as_ptr().add(i));
-                let left = vextq_u8::<12>(prev, cur);
-                let diff = vsubq_u8(cur, left);
-                vst1q_u8(out.as_mut_ptr().add(i), diff);
-                prev = cur;
-            }
+            let cur = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+            let left = _mm_alignr_epi8::<SHIFT>(cur, prev);
+            let diff = _mm_sub_epi8(cur, left);
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, diff);
+            prev = cur;
             i += 16;
         }
-        while i < len {
-            let left = if i >= 4 { src_rgba[i - 4] } else { 0 };
-            out[i] = src_rgba[i].wrapping_sub(left);
-            i += 1;
-        }
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe { filter_sub_rgba_avx2(src_rgba, out) };
-            return;
-        }
-    }
-
-    #[allow(unreachable_code)]
-    {
-        for i in 0..4.min(len) {
-            out[i] = src_rgba[i];
-        }
-        for i in 4..len {
-            out[i] = src_rgba[i].wrapping_sub(src_rgba[i - 4]);
-        }
-    }
-}
-
-/// Apply PNG Sub filter (type = 1) to an opaque RGB8 scanline (`bpp = 3`) using NEON or AVX2.
-#[inline(always)]
-pub fn filter_sub_rgb_row(src_rgb: &[u8], dst_filtered: &mut [u8]) {
-    dst_filtered[0] = 1;
-    let out = &mut dst_filtered[1..1 + src_rgb.len()];
-    let len = src_rgb.len();
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        let mut i = 0usize;
-        let mut prev = unsafe { vdupq_n_u8(0) };
-        while i + 16 <= len {
-            unsafe {
-                let cur = vld1q_u8(src_rgb.as_ptr().add(i));
-                let left = vextq_u8::<13>(prev, cur);
-                let diff = vsubq_u8(cur, left);
-                vst1q_u8(out.as_mut_ptr().add(i), diff);
-                prev = cur;
-            }
-            i += 16;
-        }
-        while i < len {
-            let left = if i >= 3 { src_rgb[i - 3] } else { 0 };
-            out[i] = src_rgb[i].wrapping_sub(left);
-            i += 1;
-        }
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe { filter_sub_rgb_avx2(src_rgb, out) };
-            return;
-        }
-    }
-
-    #[allow(unreachable_code)]
-    {
-        for i in 0..3.min(len) {
-            out[i] = src_rgb[i];
-        }
-        for i in 3..len {
-            out[i] = src_rgb[i].wrapping_sub(src_rgb[i - 3]);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn filter_sub_u8_avx2(src: &[u8], out: &mut [u8]) {
-    use std::arch::x86_64::*;
-    let len = src.len();
-    let mut i = 0usize;
-    let mut prev = _mm_setzero_si128();
-    while i + 16 <= len {
-        let cur = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let left = _mm_alignr_epi8::<15>(cur, prev);
-        let diff = _mm_sub_epi8(cur, left);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, diff);
-        prev = cur;
-        i += 16;
     }
     while i < len {
-        let left = if i >= 1 { src[i - 1] } else { 0 };
+        let left = if i >= BPP { src[i - BPP] } else { 0 };
         out[i] = src[i].wrapping_sub(left);
         i += 1;
     }
 }
 
-/// Apply PNG Sub filter (type = 1) to an 8-bit indexed/grayscale scanline (`bpp = 1`) using NEON or AVX2.
 #[inline(always)]
-pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
+fn filter_sub_row<const BPP: usize, const SHIFT: i32>(src: &[u8], dst_filtered: &mut [u8]) {
     dst_filtered[0] = 1;
     let out = &mut dst_filtered[1..1 + src.len()];
     let len = src.len();
@@ -215,7 +74,7 @@ pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
         while i + 16 <= len {
             unsafe {
                 let cur = vld1q_u8(src.as_ptr().add(i));
-                let left = vextq_u8::<15>(prev, cur);
+                let left = vextq_u8::<SHIFT>(prev, cur);
                 let diff = vsubq_u8(cur, left);
                 vst1q_u8(out.as_mut_ptr().add(i), diff);
                 prev = cur;
@@ -223,7 +82,7 @@ pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
             i += 16;
         }
         while i < len {
-            let left = if i >= 1 { src[i - 1] } else { 0 };
+            let left = if i >= BPP { src[i - BPP] } else { 0 };
             out[i] = src[i].wrapping_sub(left);
             i += 1;
         }
@@ -233,31 +92,44 @@ pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
-            unsafe { filter_sub_u8_avx2(src, out) };
+            unsafe { filter_sub_avx2::<BPP, SHIFT>(src, out) };
             return;
         }
     }
 
     #[allow(unreachable_code)]
     {
-        if len > 0 {
-            out[0] = src[0];
+        for i in 0..BPP.min(len) {
+            out[i] = src[i];
         }
-        for i in 1..len {
-            out[i] = src[i].wrapping_sub(src[i - 1]);
+        for i in BPP..len {
+            out[i] = src[i].wrapping_sub(src[i - BPP]);
         }
     }
 }
 
-/// Apply PNG Sub filter (type = 1) to a Gray+Alpha (`bpp = 2`) scanline.
+/// Apply PNG Sub filter (type = 1) to an RGBA8 scanline (`bpp = 4`) using ARM64 NEON or x86_64 AVX2.
+#[inline(always)]
+pub fn filter_sub_rgba_row(src_rgba: &[u8], dst_filtered: &mut [u8]) {
+    filter_sub_row::<4, 12>(src_rgba, dst_filtered);
+}
+
+/// Apply PNG Sub filter (type = 1) to an opaque RGB8 scanline (`bpp = 3`) using NEON or AVX2.
+#[inline(always)]
+pub fn filter_sub_rgb_row(src_rgb: &[u8], dst_filtered: &mut [u8]) {
+    filter_sub_row::<3, 13>(src_rgb, dst_filtered);
+}
+
+/// Apply PNG Sub filter (type = 1) to an 8-bit indexed/grayscale scanline (`bpp = 1`) using NEON or AVX2.
+#[inline(always)]
+pub fn filter_sub_u8_row(src: &[u8], dst_filtered: &mut [u8]) {
+    filter_sub_row::<1, 15>(src, dst_filtered);
+}
+
+/// Apply PNG Sub filter (type = 1) to a Gray+Alpha (`bpp = 2`) scanline using NEON or AVX2.
 #[inline(always)]
 pub fn filter_sub_ga_row(src_ga: &[u8], dst_filtered: &mut [u8]) {
-    dst_filtered[0] = 1;
-    let out = &mut dst_filtered[1..1 + src_ga.len()];
-    for i in 0..src_ga.len() {
-        let left = if i >= 2 { src_ga[i - 2] } else { 0 };
-        out[i] = src_ga[i].wrapping_sub(left);
-    }
+    filter_sub_row::<2, 14>(src_ga, dst_filtered);
 }
 
 /// Compress already-filtered PNG scanlines in a single whole-buffer `libdeflate` call

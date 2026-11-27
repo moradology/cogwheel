@@ -31,32 +31,8 @@ impl GpuSlab {
         let total_elems = (height as usize)
             .checked_mul(stride as usize)
             .ok_or_else(|| GpuError::InvalidDimensions("slab size overflow".into()))?;
-        let byte_size = total_elems
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| GpuError::InvalidDimensions("slab byte size overflow".into()))?
-            as u64;
-        let limits = device.limits();
-        let max_bytes = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size as u64);
-        if byte_size > max_bytes {
-            return Err(GpuError::InvalidDimensions(format!(
-                "slab buffer {byte_size} B exceeds adapter limit {max_bytes} B"
-            )));
-        }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cogzilla-slab"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: true,
-        });
-        let res = {
-            let mut mapped = buffer.slice(..).get_mapped_range_mut();
-            let dst: &mut [f32] = bytemuck::cast_slice_mut(&mut mapped);
-            fill(dst)
-        };
-        buffer.unmap();
-        res?;
+        let buffer =
+            crate::wgpu_util::create_mapped_f32_storage(device, "cogzilla-slab", total_elems, fill)?;
         Ok(Self {
             buffer,
             width,

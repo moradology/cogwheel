@@ -57,8 +57,7 @@ var<workgroup> sh_cdf: array<atomic<u32>, 1024>;
 var<workgroup> sh_var: array<f32, 256>;
 
 fn is_valid_pixel(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    if ((bits & 0x7f800000u) == 0x7f800000u) {
+    if (!is_finite_f32(v)) {
         return false;
     }
     if (params.has_nodata != 0u && v == params.nodata_val) {

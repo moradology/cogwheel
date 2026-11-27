@@ -118,3 +118,25 @@ fn sample_lanczos3(u: f32, v: f32) -> f32 {
     }
     return sample_bilinear_raw(u, v);
 }
+
+fn sample_nearest(u: f32, v: f32) -> f32 {
+    if (!is_finite_f32(u) || !is_finite_f32(v)
+        || u < -0.5 || v < -0.5
+        || u > f32(params.src_w) - 0.5
+        || v > f32(params.src_h) - 0.5) {
+        return nan_f32();
+    }
+    return sample_checked(i32(floor(u + 0.5)), i32(floor(v + 0.5)));
+}
+
+fn sample_mode_1band(mode: u32, u: f32, v: f32) -> f32 {
+    if (mode == 0u) {
+        return sample_bilinear(u, v);
+    } else if (mode == 1u) {
+        return sample_cubic(u, v);
+    } else if (mode == 3u) {
+        return sample_nearest(u, v);
+    } else {
+        return sample_lanczos3(u, v);
+    }
+}

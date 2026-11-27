@@ -13,6 +13,17 @@ const MAGIC: [u8; 4] = *b"CGZ1";
 const HEADER_LEN: usize = 8;
 const WRITE_QUEUE_CAP: usize = 256;
 
+fn atomic_saturating_sub_u64(atom: &AtomicU64, delta: u64) -> u64 {
+    let mut cur = atom.load(Ordering::Acquire);
+    loop {
+        let next = cur.saturating_sub(delta);
+        match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 struct DiskEntry {
     path: PathBuf,
     bytes: u64,
@@ -362,13 +373,7 @@ impl DiskBlockCache {
             .unwrap_or(0);
 
         if old_sz > 0 {
-            now = self
-                .current_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    Some(c.saturating_sub(old_sz))
-                })
-                .unwrap_or(0)
-                .saturating_sub(old_sz);
+            now = atomic_saturating_sub_u64(&self.current_bytes, old_sz);
         }
 
         // If `clear()` ran concurrently between rename and insert, immediately remove the stale entry.
@@ -385,11 +390,7 @@ impl DiskBlockCache {
     fn remove_entry(&self, key: [u8; 16]) {
         if let Some((_, entry)) = self.entries.remove(&key) {
             let _ = fs::remove_file(&entry.path);
-            let _ = self
-                .current_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    Some(c.saturating_sub(entry.bytes))
-                });
+            atomic_saturating_sub_u64(&self.current_bytes, entry.bytes);
         }
     }
 
@@ -438,11 +439,7 @@ impl DiskBlockCache {
                             dropped += entry.bytes;
                             removed_any = true;
                             self.evictions.fetch_add(1, Ordering::Relaxed);
-                            let _ = self.current_bytes.fetch_update(
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                                |c| Some(c.saturating_sub(entry.bytes)),
-                            );
+                            atomic_saturating_sub_u64(&self.current_bytes, entry.bytes);
                         }
                     }
                 }
