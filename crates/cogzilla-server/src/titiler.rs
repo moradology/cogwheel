@@ -3821,13 +3821,7 @@ pub fn native_bbox_dims_in_crs(
     if dx > 1e-12 && dy > 1e-12 && ifd.width > 0 && ifd.height > 0 && ifd.gcp_poly.is_none() {
         let (sx0, sy0) = ifd.pixel_to_crs.forward(0.0, 0.0);
         let (sx1, sy1) = ifd.pixel_to_crs.forward(ifd.width as f64, ifd.height as f64);
-        let both_geographic = matches!(
-            (src_crs, dst_crs),
-            (
-                cogzilla_proj::CrsModel::Geographic,
-                cogzilla_proj::CrsModel::Geographic
-            )
-        );
+        let both_geographic = src_crs.is_geographic() && dst_crs.is_geographic();
         if both_geographic {
             let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
             let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
@@ -3869,7 +3863,7 @@ pub fn native_bbox_dims_in_crs(
             } else {
                 dx1 - dx0
             };
-            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && ddx.abs() > 180.0 {
+            if dst_crs.is_geographic() && ddx.abs() > 180.0 {
                 let (lon_mid, _) = src_crs.to_lonlat_deg(0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1));
                 // Wrap only when the midpoint lies on the opposite hemisphere from the arithmetic
                 // mean of endpoints (antimeridian-crossing scene), NOT on wide/global scenes
@@ -5097,7 +5091,7 @@ impl PolygonMask {
             bbox
         };
         let coord_crs_projected =
-            effective_crs.is_some_and(|c| !matches!(c, cogzilla_proj::CrsModel::Geographic));
+            effective_crs.is_some_and(|c| !c.is_geographic());
         Ok((Self { polygons, lines, points, bbox, raw_bbox, coord_crs_projected }, bbox))
     }
 
@@ -5710,7 +5704,7 @@ pub async fn render_exact_f64_array(
                 bbox[0], bbox[1], bbox[2], bbox[3]
             )));
         }
-        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+        if dst_crs.is_geographic() && bbox[0] > bbox[2] {
             bbox[2] += 360.0;
         }
         if bbox[0] >= bbox[2] {
@@ -6649,7 +6643,7 @@ async fn render_bbox_core(
         }
         // RFC 7946 antimeridian-crossing geographic bboxes use w > e (e.g. [177, -20, -178, -16]);
         // unwrap e into (180, 540] so dlx > 0 and clamp() never sees min > max.
-        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+        if dst_crs.is_geographic() && bbox[0] > bbox[2] {
             bbox[2] += 360.0;
         }
         if bbox[0] >= bbox[2] {

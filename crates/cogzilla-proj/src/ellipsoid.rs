@@ -10,6 +10,9 @@ pub struct Ellipsoid {
 impl Ellipsoid {
     pub const WGS84: Self = Self::from_a_inv_f(6_378_137.0, 298.257_223_563);
     pub const GRS80: Self = Self::from_a_inv_f(6_378_137.0, 298.257_222_101);
+    pub const AIRY_1830: Self = Self::from_a_inv_f(6_377_563.396, 299.324_964_6);
+    pub const BESSEL_1841: Self = Self::from_a_inv_f(6_377_397.155, 299.152_812_8);
+    pub const CLARKE_1866: Self = Self::from_a_inv_f(6_378_206.4, 294.978_698_213_898_2);
 
     pub const fn from_a_inv_f(a: f64, inv_f: f64) -> Self {
         let f = 1.0 / inv_f;
@@ -1000,6 +1003,555 @@ impl EqualEarth {
     }
 }
 
+/// Solve `asinh(tan(lat)) - e * atanh(e * sin(lat)) = psi` for geodetic latitude `lat` (rad).
+#[inline(always)]
+fn inverse_isometric_lat(psi: f64, e: f64) -> f64 {
+    if !psi.is_finite() {
+        return if psi.is_nan() {
+            f64::NAN
+        } else {
+            psi.signum() * std::f64::consts::FRAC_PI_2
+        };
+    }
+    if psi.abs() > 35.0 {
+        return psi.signum() * std::f64::consts::FRAC_PI_2;
+    }
+    let mut lat = psi.sinh().atan();
+    if e == 0.0 {
+        return lat;
+    }
+    let e2 = e * e;
+    for _ in 0..6 {
+        let sin_lat = lat.sin();
+        let cos_lat = lat.cos();
+        if cos_lat.abs() < 1e-15 {
+            break;
+        }
+        let f = lat.tan().asinh() - e * (e * sin_lat).atanh() - psi;
+        let df = (1.0 - e2) / (cos_lat * (1.0 - e2 * sin_lat * sin_lat));
+        let step = f / df;
+        lat = (lat - step).clamp(-std::f64::consts::FRAC_PI_2 + 1e-15, std::f64::consts::FRAC_PI_2 - 1e-15);
+        if step.abs() < 1e-13 {
+            break;
+        }
+    }
+    lat
+}
+
+/// Equirectangular / Equidistant Cylindrical projection (PROJ `+proj=eqc`, GeoTIFF `CT_Equirectangular = 17`).
+///
+/// Covers `EPSG:32662` (Plate Carrée), `EPSG:32663`, `EPSG:4087` (World Equidistant Cylindrical),
+/// and user-defined Equirectangular CRSes.
+#[derive(Debug, Clone, Copy)]
+pub struct Equirectangular {
+    pub a: f64,
+    pub lon0: f64,
+    pub lat0: f64,
+    pub cos_lat_ts: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    pub unit: f64,
+}
+
+impl Equirectangular {
+    pub fn new(
+        ellip: Ellipsoid,
+        lat_ts_deg: f64,
+        lat0_deg: f64,
+        lon0_deg: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        Self {
+            a: ellip.a,
+            lon0: lon0_deg.to_radians(),
+            lat0: lat0_deg.to_radians(),
+            cos_lat_ts: lat_ts_deg.to_radians().cos(),
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward_x(&self, lon: f64) -> f64 {
+        (self.a * wrap_dlon(lon - self.lon0) * self.cos_lat_ts) / self.unit + self.false_easting
+    }
+
+    #[inline(always)]
+    pub fn forward_y(&self, lat: f64) -> f64 {
+        (self.a * (lat - self.lat0)) / self.unit + self.false_northing
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        (self.forward_x(lon), self.forward_y(lat))
+    }
+
+    #[inline(always)]
+    pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let dlon = (x - self.false_easting) * self.unit / (self.a * self.cos_lat_ts);
+        let lat = self.lat0 + (y - self.false_northing) * self.unit / self.a;
+        if dlon.abs() > std::f64::consts::PI + 1e-9 || lat.abs() > std::f64::consts::FRAC_PI_2 + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        (self.lon0 + dlon, lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2))
+    }
+}
+
+/// Ellipsoidal / Spherical Mercator 1SP & 2SP projection (PROJ `+proj=merc`, GeoTIFF `CT_Mercator = 7`).
+///
+/// Covers `EPSG:3395`, `EPSG:3832` (PDC Mercator), `EPSG:3994` (Mercator 41), and user-defined Mercator CRSes.
+#[derive(Debug, Clone, Copy)]
+pub struct Mercator {
+    pub e: f64,
+    pub lon0: f64,
+    /// `a * k0` (metres)
+    pub ak: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    pub unit: f64,
+}
+
+impl Mercator {
+    pub fn new_1sp(
+        ellip: Ellipsoid,
+        lon0_deg: f64,
+        k0: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        Self {
+            e: ellip.e,
+            lon0: lon0_deg.to_radians(),
+            ak: ellip.a * k0,
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    pub fn new_2sp(
+        ellip: Ellipsoid,
+        lat_ts_deg: f64,
+        lon0_deg: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let lat_ts = lat_ts_deg.to_radians();
+        let sin_ts = lat_ts.sin();
+        let k = lat_ts.cos() / (1.0 - ellip.e2 * sin_ts * sin_ts).sqrt();
+        Self::new_1sp(ellip, lon0_deg, k, false_easting, false_northing)
+    }
+
+    #[inline(always)]
+    pub fn forward_x(&self, lon: f64) -> f64 {
+        (self.ak * wrap_dlon(lon - self.lon0)) / self.unit + self.false_easting
+    }
+
+    #[inline(always)]
+    pub fn forward_y(&self, lat: f64) -> f64 {
+        if lat.abs() >= std::f64::consts::FRAC_PI_2 - 1e-9 {
+            return f64::NAN;
+        }
+        let psi = lat.tan().asinh() - self.e * (self.e * lat.sin()).atanh();
+        (self.ak * psi) / self.unit + self.false_northing
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        (self.forward_x(lon), self.forward_y(lat))
+    }
+
+    #[inline(always)]
+    pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let dlon = (x - self.false_easting) * self.unit / self.ak;
+        if dlon.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let psi = (y - self.false_northing) * self.unit / self.ak;
+        let lat = inverse_isometric_lat(psi, self.e);
+        (self.lon0 + dlon, lat)
+    }
+}
+
+/// Oblique Stereographic double projection (EPSG method 9809, PROJ `+proj=sterea`, GeoTIFF `CT_ObliqueStereographic = 16`).
+///
+/// Covers Dutch RD New (`EPSG:28992`), New Brunswick (`EPSG:2036`), Romania Stereo 70 (`EPSG:31700`), etc.
+#[derive(Debug, Clone, Copy)]
+pub struct ObliqueStereographic {
+    pub e: f64,
+    pub lon0: f64,
+    pub k0: f64,
+    pub r: f64,
+    pub n: f64,
+    pub c: f64,
+    pub ln_c: f64,
+    pub chi0: f64,
+    pub sin_chi0: f64,
+    pub cos_chi0: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    pub unit: f64,
+}
+
+impl ObliqueStereographic {
+    pub fn new(
+        ellip: Ellipsoid,
+        lat0_deg: f64,
+        lon0_deg: f64,
+        k0: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let lat0 = lat0_deg.to_radians();
+        let lon0 = lon0_deg.to_radians();
+        let e = ellip.e;
+        let e2 = ellip.e2;
+        let sin0 = lat0.sin();
+        let cos0 = lat0.cos();
+        let one_minus_e2_sin2 = 1.0 - e2 * sin0 * sin0;
+        let rho0 = ellip.a * (1.0 - e2) / one_minus_e2_sin2.powf(1.5);
+        let nu0 = ellip.a / one_minus_e2_sin2.sqrt();
+        let r = (rho0 * nu0).sqrt();
+        let n = (1.0 + e2 * cos0.powi(4) / (1.0 - e2)).sqrt();
+        let s1 = (1.0 + sin0) / (1.0 - sin0);
+        let s2 = (1.0 - e * sin0) / (1.0 + e * sin0);
+        let w1 = (s1 * s2.powf(e)).powf(n);
+        let sin_chi0_init = (w1 - 1.0) / (w1 + 1.0);
+        let c = (n + sin0) * (1.0 - sin_chi0_init) / ((n - sin0) * (1.0 + sin_chi0_init));
+        let w2 = c * w1;
+        let chi0 = 2.0 * w2.sqrt().atan() - std::f64::consts::FRAC_PI_2;
+        Self {
+            e,
+            lon0,
+            k0,
+            r,
+            n,
+            c,
+            ln_c: c.ln(),
+            chi0,
+            sin_chi0: chi0.sin(),
+            cos_chi0: chi0.cos(),
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        if lat.abs() >= std::f64::consts::FRAC_PI_2 - 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let sin_lat = lat.sin();
+        let sa = (1.0 + sin_lat) / (1.0 - sin_lat);
+        let sb = (1.0 - self.e * sin_lat) / (1.0 + self.e * sin_lat);
+        let w = self.c * (sa * sb.powf(self.e)).powf(self.n);
+        let chi = 2.0 * w.sqrt().atan() - std::f64::consts::FRAC_PI_2;
+        let lam = self.n * wrap_dlon(lon - self.lon0);
+        let (sin_chi, cos_chi) = chi.sin_cos();
+        let (sin_lam, cos_lam) = lam.sin_cos();
+        let b = 1.0 + sin_chi * self.sin_chi0 + cos_chi * self.cos_chi0 * cos_lam;
+        if b < 1e-12 {
+            return (f64::NAN, f64::NAN);
+        }
+        let scale = 2.0 * self.r * self.k0 / (b * self.unit);
+        let easting = self.false_easting + scale * cos_chi * sin_lam;
+        let northing = self.false_northing
+            + scale * (sin_chi * self.cos_chi0 - cos_chi * self.sin_chi0 * cos_lam);
+        (easting, northing)
+    }
+
+    #[inline(always)]
+    pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let dx = (x - self.false_easting) * self.unit;
+        let dy = (y - self.false_northing) * self.unit;
+        let rho = dx.hypot(dy);
+        let (chi, lam) = if rho < 1e-12 {
+            (self.chi0, 0.0)
+        } else {
+            let ce = 2.0 * (rho / (2.0 * self.r * self.k0)).atan();
+            let (sin_ce, cos_ce) = ce.sin_cos();
+            let chi = (cos_ce * self.sin_chi0 + dy * sin_ce * self.cos_chi0 / rho)
+                .clamp(-1.0, 1.0)
+                .asin();
+            let lam = (dx * sin_ce).atan2(rho * self.cos_chi0 * cos_ce - dy * self.sin_chi0 * sin_ce);
+            (chi, lam)
+        };
+        let lon = self.lon0 + lam / self.n;
+        let psi_chi = 0.5 * ((1.0 + chi.sin()) / (1.0 - chi.sin())).ln();
+        let iso = (psi_chi - 0.5 * self.ln_c) / self.n;
+        let lat = inverse_isometric_lat(iso, self.e);
+        (lon, lat)
+    }
+}
+
+/// Swiss Oblique Cylindrical / Mercator projection (EPSG method 9815, PROJ `+proj=somerc`).
+///
+/// Covers Swiss CH1903+ / LV95 (`EPSG:2056`) and CH1903 / LV03 (`EPSG:21781`).
+#[derive(Debug, Clone, Copy)]
+pub struct SwissObliqueMercator {
+    pub e: f64,
+    pub lon0: f64,
+    pub alpha: f64,
+    pub b0: f64,
+    pub sin_b0: f64,
+    pub cos_b0: f64,
+    pub k: f64,
+    pub r: f64,
+    pub false_easting: f64,
+    pub false_northing: f64,
+    pub unit: f64,
+}
+
+impl SwissObliqueMercator {
+    pub fn new(
+        ellip: Ellipsoid,
+        lat0_deg: f64,
+        lon0_deg: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Self {
+        let lat0 = lat0_deg.to_radians();
+        let lon0 = lon0_deg.to_radians();
+        let e = ellip.e;
+        let e2 = ellip.e2;
+        let sin0 = lat0.sin();
+        let cos0 = lat0.cos();
+        let alpha = (1.0 + (e2 / (1.0 - e2)) * cos0.powi(4)).sqrt();
+        let b0 = (sin0 / alpha).asin();
+        let k = (std::f64::consts::FRAC_PI_4 + 0.5 * b0).tan().ln()
+            - alpha * (std::f64::consts::FRAC_PI_4 + 0.5 * lat0).tan().ln()
+            + alpha * e * 0.5 * ((1.0 + e * sin0) / (1.0 - e * sin0)).ln();
+        let r = ellip.a * (1.0 - e2).sqrt() / (1.0 - e2 * sin0 * sin0);
+        Self {
+            e,
+            lon0,
+            alpha,
+            b0,
+            sin_b0: b0.sin(),
+            cos_b0: b0.cos(),
+            k,
+            r,
+            false_easting,
+            false_northing,
+            unit: 1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forward(&self, lon: f64, lat: f64) -> (f64, f64) {
+        if lat.abs() >= std::f64::consts::FRAC_PI_2 - 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let sin_lat = lat.sin();
+        let s = self.alpha * (std::f64::consts::FRAC_PI_4 + 0.5 * lat).tan().ln()
+            - self.alpha * self.e * 0.5 * ((1.0 + self.e * sin_lat) / (1.0 - self.e * sin_lat)).ln()
+            + self.k;
+        let b = 2.0 * (s.exp().atan() - std::f64::consts::FRAC_PI_4);
+        let l = self.alpha * wrap_dlon(lon - self.lon0);
+        let (sin_l, cos_l) = l.sin_cos();
+        let (sin_b, cos_b) = b.sin_cos();
+        let l_rot = (cos_b * sin_l).atan2(self.sin_b0 * sin_b + self.cos_b0 * cos_b * cos_l);
+        let sin_br = (self.cos_b0 * sin_b - self.sin_b0 * cos_b * cos_l).clamp(-1.0, 1.0);
+        if (1.0 - sin_br.abs()) < 1e-12 {
+            return (f64::NAN, f64::NAN);
+        }
+        let easting = self.false_easting + (self.r * l_rot) / self.unit;
+        let northing = self.false_northing
+            + (0.5 * self.r * ((1.0 + sin_br) / (1.0 - sin_br)).ln()) / self.unit;
+        (easting, northing)
+    }
+
+    #[inline(always)]
+    pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let l_rot = (x - self.false_easting) * self.unit / self.r;
+        if l_rot.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
+        let b_rot = 2.0 * (((y - self.false_northing) * self.unit / self.r).exp().atan()
+            - std::f64::consts::FRAC_PI_4);
+        let (sin_br, cos_br) = b_rot.sin_cos();
+        let (sin_lr, cos_lr) = l_rot.sin_cos();
+        let b = (self.cos_b0 * sin_br + self.sin_b0 * cos_br * cos_lr)
+            .clamp(-1.0, 1.0)
+            .asin();
+        let l = (cos_br * sin_lr).atan2(self.cos_b0 * cos_br * cos_lr - self.sin_b0 * sin_br);
+        let lon = self.lon0 + l / self.alpha;
+        let iso = ((std::f64::consts::FRAC_PI_4 + 0.5 * b).tan().ln() - self.k) / self.alpha;
+        let lat = inverse_isometric_lat(iso, self.e);
+        (lon, lat)
+    }
+}
+
+/// 7-parameter Position Vector Helmert datum shift between a local ellipsoid datum and WGS84
+/// (EPSG method 9606).
+#[derive(Debug, Clone, Copy)]
+pub struct HelmertTransform {
+    pub local_ellip: Ellipsoid,
+    pub dx: f64,
+    pub dy: f64,
+    pub dz: f64,
+    /// Rotation angles in radians (Position Vector convention, local → WGS84).
+    pub rx: f64,
+    pub ry: f64,
+    pub rz: f64,
+    /// Scale factor `1 + ds_ppm * 1e-6`.
+    pub scale: f64,
+}
+
+impl HelmertTransform {
+    pub const fn position_vector(
+        local_ellip: Ellipsoid,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        rx_arcsec: f64,
+        ry_arcsec: f64,
+        rz_arcsec: f64,
+        ds_ppm: f64,
+    ) -> Self {
+        const ARCSEC_TO_RAD: f64 = std::f64::consts::PI / (180.0 * 3600.0);
+        Self {
+            local_ellip,
+            dx,
+            dy,
+            dz,
+            rx: rx_arcsec * ARCSEC_TO_RAD,
+            ry: ry_arcsec * ARCSEC_TO_RAD,
+            rz: rz_arcsec * ARCSEC_TO_RAD,
+            scale: 1.0 + ds_ppm * 1e-6,
+        }
+    }
+
+    /// OSGB36 (Airy 1830) → WGS84 (EPSG:1314, British National Grid `EPSG:27700`).
+    pub const OSGB36_TO_WGS84: Self = Self::position_vector(
+        Ellipsoid::AIRY_1830,
+        446.448,
+        -125.157,
+        542.060,
+        0.1502,
+        0.2470,
+        0.8421,
+        -20.4894,
+    );
+
+    /// Amersfoort (Bessel 1841) → WGS84 (EPSG:15934, Dutch RD New `EPSG:28992`).
+    pub const AMERSFOORT_TO_WGS84: Self = Self::position_vector(
+        Ellipsoid::BESSEL_1841,
+        565.4171,
+        50.3319,
+        465.5524,
+        -0.398957,
+        0.343988,
+        -1.87740,
+        4.0725,
+    );
+
+    /// CH1903 / CH1903+ (Bessel 1841) → WGS84 (EPSG:1676, Swiss LV95 `EPSG:2056` & LV03 `EPSG:21781`).
+    pub const CH1903_TO_WGS84: Self = Self::position_vector(
+        Ellipsoid::BESSEL_1841,
+        674.374,
+        15.056,
+        405.346,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    );
+
+    /// NAD27 CONUS (Clarke 1866) → WGS84 (EPSG:1173, `EPSG:4267` & NAD27 UTM `EPSG:26701..=26723`).
+    pub const NAD27_TO_WGS84: Self = Self::position_vector(
+        Ellipsoid::CLARKE_1866,
+        -8.0,
+        160.0,
+        176.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    );
+
+    #[inline(always)]
+    fn geodetic_to_ecef(ellip: Ellipsoid, lon: f64, lat: f64) -> (f64, f64, f64) {
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        let (sin_lon, cos_lon) = lon.sin_cos();
+        let nu = ellip.a / (1.0 - ellip.e2 * sin_lat * sin_lat).sqrt();
+        (
+            nu * cos_lat * cos_lon,
+            nu * cos_lat * sin_lon,
+            nu * (1.0 - ellip.e2) * sin_lat,
+        )
+    }
+
+    #[inline(always)]
+    fn ecef_to_geodetic(ellip: Ellipsoid, x: f64, y: f64, z: f64) -> (f64, f64) {
+        let lon = y.atan2(x);
+        let p = x.hypot(y);
+        if p < 1e-12 {
+            let lat = if z >= 0.0 {
+                std::f64::consts::FRAC_PI_2
+            } else {
+                -std::f64::consts::FRAC_PI_2
+            };
+            return (lon, lat);
+        }
+        let mut lat = (z / (p * (1.0 - ellip.e2))).atan();
+        for _ in 0..5 {
+            let sin_lat = lat.sin();
+            let nu = ellip.a / (1.0 - ellip.e2 * sin_lat * sin_lat).sqrt();
+            let next = ((z + ellip.e2 * nu * sin_lat) / p).atan();
+            if (next - lat).abs() < 1e-13 {
+                lat = next;
+                break;
+            }
+            lat = next;
+        }
+        (lon, lat)
+    }
+
+    /// Transform `(lon_deg, lat_deg)` from local datum to WGS84.
+    #[inline(always)]
+    pub fn datum_to_wgs84_deg(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
+        if !lon_deg.is_finite() || !lat_deg.is_finite() {
+            return (f64::NAN, f64::NAN);
+        }
+        let (x, y, z) = Self::geodetic_to_ecef(
+            self.local_ellip,
+            lon_deg.to_radians(),
+            lat_deg.to_radians(),
+        );
+        let xw = self.dx + self.scale * (x - self.rz * y + self.ry * z);
+        let yw = self.dy + self.scale * (self.rz * x + y - self.rx * z);
+        let zw = self.dz + self.scale * (-self.ry * x + self.rx * y + z);
+        let (lon, lat) = Self::ecef_to_geodetic(Ellipsoid::WGS84, xw, yw, zw);
+        (lon.to_degrees(), lat.to_degrees())
+    }
+
+    /// Transform `(lon_deg, lat_deg)` from WGS84 to local datum (exact algebraic inverse of `datum_to_wgs84_deg`).
+    #[inline(always)]
+    pub fn wgs84_to_datum_deg(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
+        if !lon_deg.is_finite() || !lat_deg.is_finite() {
+            return (f64::NAN, f64::NAN);
+        }
+        let (xw, yw, zw) =
+            Self::geodetic_to_ecef(Ellipsoid::WGS84, lon_deg.to_radians(), lat_deg.to_radians());
+        let vx = (xw - self.dx) / self.scale;
+        let vy = (yw - self.dy) / self.scale;
+        let vz = (zw - self.dz) / self.scale;
+        // Exact inverse of R = [[1, -rz, ry], [rz, 1, -rx], [-ry, rx, 1]]
+        // det(R) = 1 + rx^2 + ry^2 + rz^2
+        let (rx, ry, rz) = (self.rx, self.ry, self.rz);
+        let inv_det = 1.0 / (1.0 + rx * rx + ry * ry + rz * rz);
+        let x = ((1.0 + rx * rx) * vx + (rx * ry + rz) * vy + (rx * rz - ry) * vz) * inv_det;
+        let y = ((rx * ry - rz) * vx + (1.0 + ry * ry) * vy + (ry * rz + rx) * vz) * inv_det;
+        let z = ((rx * rz + ry) * vx + (ry * rz - rx) * vy + (1.0 + rz * rz) * vz) * inv_det;
+        let (lon, lat) = Self::ecef_to_geodetic(self.local_ellip, x, y, z);
+        (lon.to_degrees(), lat.to_degrees())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,5 +1624,102 @@ mod tests {
         let (sx, sy) = s_lcc.forward(0.5, -std::f64::consts::FRAC_PI_2);
         assert!(sx.abs() < 1e-6, "Southern LCC South Pole X must be 0, got {sx}");
         assert!((sy - s_lcc.rho0).abs() < 1e-6, "Southern LCC South Pole Y must equal rho0, got {sy} vs {}", s_lcc.rho0);
+    }
+
+    #[test]
+    fn oblique_stereographic_matches_epsg_gn7_2_amersfoort() {
+        // EPSG Guidance Note 7-2 §1.3.13 worked example (EPSG:28992 Amersfoort / RD New):
+        // lat = 53° N, lon = 6° E (on Bessel 1841) => E = 196105.283 m, N = 557057.739 m.
+        let rd = ObliqueStereographic::new(
+            Ellipsoid::BESSEL_1841,
+            52.156_160_555_555_55,
+            5.387_638_888_888_89,
+            0.999_907_9,
+            155_000.0,
+            463_000.0,
+        );
+        let (e, n) = rd.forward(6.0_f64.to_radians(), 53.0_f64.to_radians());
+        assert!((e - 196_105.283).abs() < 1e-2, "RD New easting {e}");
+        assert!((n - 557_057.739).abs() < 1e-2, "RD New northing {n}");
+        let (lon, lat) = rd.inverse(e, n);
+        assert!((lon.to_degrees() - 6.0).abs() < 1e-9);
+        assert!((lat.to_degrees() - 53.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn swiss_oblique_mercator_matches_swisstopo_origin_and_roundtrips() {
+        let lv95 = SwissObliqueMercator::new(
+            Ellipsoid::BESSEL_1841,
+            46.952_405_555_555_56,
+            7.439_583_333_333_333,
+            2_600_000.0,
+            1_200_000.0,
+        );
+        // Bern origin maps to exact false easting/northing.
+        let (e0, n0) = lv95.forward(
+            7.439_583_333_333_333_f64.to_radians(),
+            46.952_405_555_555_56_f64.to_radians(),
+        );
+        assert!((e0 - 2_600_000.0).abs() < 1e-3, "LV95 origin E={e0}");
+        assert!((n0 - 1_200_000.0).abs() < 1e-3, "LV95 origin N={n0}");
+        // Zurich (CH1903: 8.54°E, 47.37°N) round-trips to sub-nanometre.
+        let (ez, nz) = lv95.forward(8.54_f64.to_radians(), 47.37_f64.to_radians());
+        let (lon, lat) = lv95.inverse(ez, nz);
+        assert!((lon.to_degrees() - 8.54).abs() < 1e-9);
+        assert!((lat.to_degrees() - 47.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn osgb36_bng_and_helmert_roundtrip() {
+        // Caister Water Tower (OS Guide to Coordinate Systems):
+        // OSGB36: 52°39'27.2531"N, 1°43'04.5177"E => BNG E = 651409.903 m, N = 313177.270 m
+        let bng_tm = TransverseMercator::new(
+            Ellipsoid::AIRY_1830,
+            -2.0,
+            49.0,
+            0.999_601_271_7,
+            400_000.0,
+            -100_000.0,
+        );
+        let lat_osgb: f64 = 52.0 + 39.0 / 60.0 + 27.2531 / 3600.0;
+        let lon_osgb: f64 = 1.0 + 43.0 / 60.0 + 4.5177 / 3600.0;
+        let (e, n) = bng_tm.forward(lon_osgb.to_radians(), lat_osgb.to_radians());
+        assert!((e - 651_409.903).abs() < 1e-2, "BNG E={e}");
+        assert!((n - 313_177.270).abs() < 1e-2, "BNG N={n}");
+
+        // Full EPSG:27700 via Helmert from WGS84 (52.657977°N, 1.716038°E) lands within ~2 m.
+        let (dlon, dlat) = HelmertTransform::OSGB36_TO_WGS84.wgs84_to_datum_deg(1.716_038, 52.657_977);
+        let (ew, nw) = bng_tm.forward(dlon.to_radians(), dlat.to_radians());
+        assert!((ew - 651_409.9).abs() < 5.0, "WGS84->BNG E={ew}");
+        assert!((nw - 313_177.3).abs() < 5.0, "WGS84->BNG N={nw}");
+
+        // Exact algebraic inverse on all 4 built-in Helmert transforms.
+        for (h, lon, lat) in [
+            (HelmertTransform::OSGB36_TO_WGS84, -0.1276, 51.5072),
+            (HelmertTransform::AMERSFOORT_TO_WGS84, 4.9041, 52.3676),
+            (HelmertTransform::CH1903_TO_WGS84, 7.4474, 46.9480),
+            (HelmertTransform::NAD27_TO_WGS84, -122.4194, 37.7749),
+        ] {
+            let (dlon, dlat) = h.wgs84_to_datum_deg(lon, lat);
+            let (lon2, lat2) = h.datum_to_wgs84_deg(dlon, dlat);
+            // 2D-only (h=0) round-trip across different ellipsoids has ~1 mm height-projection residual.
+            assert!((lon2 - lon).abs() < 1e-7, "Helmert lon round-trip: {lon} -> {lon2}");
+            assert!((lat2 - lat).abs() < 1e-7, "Helmert lat round-trip: {lat} -> {lat2}");
+        }
+    }
+
+    #[test]
+    fn equirectangular_and_mercator_roundtrip() {
+        let eqc = Equirectangular::new(Ellipsoid::WGS84, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let (ex, ey) = eqc.forward((-122.4_f64).to_radians(), 37.8_f64.to_radians());
+        let (elo, ela) = eqc.inverse(ex, ey);
+        assert!((elo.to_degrees() + 122.4).abs() < 1e-10);
+        assert!((ela.to_degrees() - 37.8).abs() < 1e-10);
+
+        let m2 = Mercator::new_2sp(Ellipsoid::WGS84, -41.0, 100.0, 0.0, 0.0);
+        let (mx, my) = m2.forward(145.0_f64.to_radians(), (-37.8_f64).to_radians());
+        let (mlo, mla) = m2.inverse(mx, my);
+        assert!((mlo.to_degrees() - 145.0).abs() < 1e-10);
+        assert!((mla.to_degrees() + 37.8).abs() < 1e-10);
     }
 }
