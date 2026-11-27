@@ -6700,6 +6700,36 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(all.status().as_u16(), 200);
     let all = all.bytes().await.unwrap();
     assert!(String::from_utf8_lossy(&all[..64]).contains("'<i4'"), "{}", String::from_utf8_lossy(&all[..80]));
+    // Statistics of band math read the same stack.
+    let means = |q: &str| {
+        let (client, base, url) = (client.clone(), base.clone(), url.clone());
+        let q = q.to_string();
+        async move {
+            let resp = client.get(format!("{base}/stac/statistics?url={url}&max_size=16{q}")).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{q}");
+            let doc: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+            (1..=doc.as_object().unwrap().len())
+                .map(|k| {
+                    let band = &doc[format!("b{k}")];
+                    (band["mean"].as_f64().unwrap(), band["description"].as_str().unwrap().to_string())
+                })
+                .collect::<Vec<(f64, String)>>()
+        }
+    };
+    // Each result is described, as TiTiler describes it, in the names of the stacked bands.
+    let described = |pairs: &[(f64, &str)]| pairs.iter().map(|&(m, d)| (m, d.to_string())).collect::<Vec<_>>();
+    assert_eq!(means("&assets=a&assets=b&expression=b2;b3*2").await, described(&[(5.0, "a_b2"), (22.0, "b_b1*2")]));
+    assert_eq!(
+        means("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await,
+        described(&[(104.0, "a_b1+b2*b_b2")])
+    );
+    assert_eq!(means("&assets=a%7Cbidx%3D2&assets=b&expression=b1%2Bb3").await, described(&[(18.0, "a_b2+b_b2")]));
+    assert_eq!(
+        means("&assets=a&assets=b").await,
+        described(&[(3.0, "a_b1"), (5.0, "a_b2"), (11.0, "b_b1"), (13.0, "b_b2")])
+    );
+    // An asset named like a band (`b2`) stays as written.
+    assert_eq!(means("&assets=a&assets=b2&expression=b2%2B1").await[0].1, "b2+1");
     // Sixteen bands are read for band math, but an answer of them all holds at most fifteen.
     let sixteen = "&assets=a".repeat(8);
     let too_many = client.get(format!("{base}/stac/preview.npy?url={url}{sixteen}")).send().await.unwrap();
