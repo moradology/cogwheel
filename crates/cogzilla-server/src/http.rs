@@ -9108,15 +9108,8 @@ where
 
             // GET /stac/tiles & /stac/tiles/{tms} (OGC TilesetList & Tileset, matching /cog/tiles*)
             (Method::GET, ["tiles"]) => async {
-                let bounds = match stac_source.load(&engine).await {
-                    Ok(item) => item.bbox,
-                    Err(EngineError::Io(io))
-                        if io.is_fatal() =>
-                    {
-                        return Err(EngineError::Io(io));
-                    }
-                    Err(_) => None,
-                };
+                let bounds = crate::engine::tolerate_asset_failure(stac_source.load(&engine).await)?
+                    .and_then(|item| item.bbox);
                 let body = build_ogc_tilesets_list(
                     &host,
                     &forwarded_prefix,
@@ -9131,15 +9124,8 @@ where
             (Method::GET, ["tiles", tms]) => async {
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
-                let bounds = match stac_source.load(&engine).await {
-                    Ok(item) => item.bbox,
-                    Err(EngineError::Io(io))
-                        if io.is_fatal() =>
-                    {
-                        return Err(EngineError::Io(io));
-                    }
-                    Err(_) => None,
-                };
+                let bounds = crate::engine::tolerate_asset_failure(stac_source.load(&engine).await)?
+                    .and_then(|item| item.bbox);
                 let body = build_ogc_tileset_json(
                     &host,
                     &forwarded_prefix,
@@ -10650,18 +10636,13 @@ where
             // 4. GET /cog/tiles (OGC Tiles list)
             (Method::GET, ["tiles"]) => async {
                 let bounds = if !pq.urls.is_empty() {
-                    match open_query_urls(&engine, &pq.urls, None).await {
-                        Ok(cogs) => engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
-                            let full = cogs[0].index.full_res();
-                            crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
-                        }),
-                        Err(EngineError::Io(io))
-                            if io.is_fatal() =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => None,
-                    }
+                    crate::engine::tolerate_asset_failure(open_query_urls(&engine, &pq.urls, None).await)?
+                        .and_then(|cogs| {
+                            engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
+                                let full = cogs[0].index.full_res();
+                                crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                            })
+                        })
                 } else {
                     None
                 };
@@ -10682,36 +10663,32 @@ where
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
                 let (bounds, minz, maxz) = if !pq.urls.is_empty() {
-                    match open_query_urls(&engine, &pq.urls, None).await {
-                        Ok(cogs) => {
-                            if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
-                                let full = cogs[0].index.full_res();
-                                let coarsest = cogs[0].index.ifds.last().unwrap();
-                                let ov = (full.width as f64 / coarsest.width.max(1) as f64)
-                                    .max(full.height as f64 / coarsest.height.max(1) as f64);
-                                let (dmin, dmax) = tms_def.zoom_range_for_cog(
-                                    &crs,
-                                    &full.pixel_to_crs,
-                                    full.width,
-                                    full.height,
-                                    ov,
-                                );
-                                let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
-                                (
-                                    Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
-                                    Some(mn),
-                                    Some(mx),
-                                )
-                            } else {
-                                (None, pq.minzoom, pq.maxzoom)
-                            }
+                    if let Some(cogs) =
+                        crate::engine::tolerate_asset_failure(open_query_urls(&engine, &pq.urls, None).await)?
+                    {
+                        if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
+                            let full = cogs[0].index.full_res();
+                            let coarsest = cogs[0].index.ifds.last().unwrap();
+                            let ov = (full.width as f64 / coarsest.width.max(1) as f64)
+                                .max(full.height as f64 / coarsest.height.max(1) as f64);
+                            let (dmin, dmax) = tms_def.zoom_range_for_cog(
+                                &crs,
+                                &full.pixel_to_crs,
+                                full.width,
+                                full.height,
+                                ov,
+                            );
+                            let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
+                            (
+                                Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
+                                Some(mn),
+                                Some(mx),
+                            )
+                        } else {
+                            (None, pq.minzoom, pq.maxzoom)
                         }
-                        Err(EngineError::Io(io))
-                            if io.is_fatal() =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => (None, pq.minzoom, pq.maxzoom),
+                    } else {
+                        (None, pq.minzoom, pq.maxzoom)
                     }
                 } else {
                     (None, pq.minzoom, pq.maxzoom)
