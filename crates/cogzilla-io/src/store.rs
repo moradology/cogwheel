@@ -272,8 +272,6 @@ pub struct CogStore {
     datasets_by_uri: DashMap<String, OpenSlot, ahash::RandomState>,
     /// `?nodata=` views keyed by `(parent OpenedCog::id, override bits)`; see [`CogStore::with_nodata`].
     nodata_views: DashMap<(u64, u32), Arc<OpenedCog>, ahash::RandomState>,
-    /// Unwritten tiles of `nodata_views` with a `sparse_fill`, per `(view id, IFD)`.
-    sparse_tiles: DashMap<(u64, u16), Arc<DecodedTile>, ahash::RandomState>,
     max_open_uris: usize,
     uri_clock: AtomicU64,
     evicting_uris: AtomicBool,
@@ -423,7 +421,6 @@ impl CogStore {
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
             datasets_by_uri: DashMap::with_hasher(ahash::RandomState::new()),
             nodata_views: DashMap::with_hasher(ahash::RandomState::new()),
-            sparse_tiles: DashMap::with_hasher(ahash::RandomState::new()),
             max_open_uris: max_open_uris.max(1),
             uri_clock: AtomicU64::new(0),
             evicting_uris: AtomicBool::new(false),
@@ -628,13 +625,15 @@ impl CogStore {
         }
         if self.nodata_views.len() >= MAX_NODATA_VIEWS {
             self.nodata_views.clear();
-            self.sparse_tiles.clear();
         }
         // GDAL fills an unwritten tile with the file's nodata (0 with none); under the override
         // that is data unless it is NaN or the override itself. A mask or alpha band still
         // leaves such tiles transparent, so they are left as no data there.
         let fill = cog.index.nodata_f64.or(cog.index.nodata.map(f64::from)).unwrap_or(0.0);
-        let masked = cog.index.ifds.iter().any(|ifd| ifd.mask_ifd.is_some() || !ifd.extra_samples.is_empty());
+        let masked = cog.index.ifds.iter().any(|ifd| {
+            ifd.mask_ifd.is_some()
+                || cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples).is_some()
+        });
         let sparse_fill = (!fill.is_nan() && fill != f64::from(nd) && !masked).then_some(fill);
         let mut index = cog.index.clone();
         index.nodata = Some(nd);
@@ -652,13 +651,18 @@ impl CogStore {
     }
 
     /// The block of an unwritten tile of `cog`'s IFD `ifd_idx`: `None` (no data), or for a
-    /// `?nodata=` view with a [`OpenedCog::sparse_fill`], a tile of that value, made once per
-    /// view and IFD.
+    /// `?nodata=` view with a [`OpenedCog::sparse_fill`], a tile of that value. The fill is the
+    /// parent's, so one tile per parent and IFD serves every view of it; it is kept in the block
+    /// cache, under its byte budget, at a tile index no tile has.
     fn sparse_tile(&self, cog: &OpenedCog, ifd_idx: usize) -> Option<Arc<DecodedTile>> {
         let fill = cog.sparse_fill?;
-        let key = (cog.id, ifd_idx as u16);
-        if let Some(t) = self.sparse_tiles.get(&key) {
-            return Some(t.clone());
+        let key = BlockKey {
+            dataset_id: cog.source_id,
+            ifd_idx: ifd_idx as u16,
+            tile_idx: u32::MAX,
+        };
+        if let Some(t) = self.cache.try_get_fast(&key) {
+            return Some(t);
         }
         let ifd = &cog.index.ifds[ifd_idx];
         let bands = match ifd.planar_config {
@@ -690,7 +694,8 @@ impl CogStore {
             },
         };
         let tile = Arc::new(DecodedTile { bands: (0..bands).map(|_| band()).collect() });
-        Some(self.sparse_tiles.entry(key).or_insert(tile).clone())
+        self.cache.complete(key, tile.clone());
+        Some(tile)
     }
 
     pub fn get_registered(&self, name: &str) -> Option<Arc<OpenedCog>> {
@@ -723,7 +728,6 @@ impl CogStore {
         self.datasets_by_uri
             .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
         self.nodata_views.clear();
-        self.sparse_tiles.clear();
         self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(ref dc) = self.disk_cache {
             dc.clear();

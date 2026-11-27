@@ -111,3 +111,19 @@ async fn nodata_view_reads_unwritten_tiles_as_the_files_nodata() {
     assert_eq!(store.with_nodata(&cog, Some(f32::NAN)).sparse_fill, Some(0.0));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The fill tile of an unwritten tile is one per raster and IFD, shared by every view of it.
+#[tokio::test]
+async fn nodata_views_share_one_fill_tile() {
+    let dir = std::env::temp_dir().join(format!("cogzilla_sparse_share_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sparse_u16.tif");
+    write_sparse_u16(&path);
+    let store = CogStore::new(16 * 1024 * 1024);
+    let cog = store.register_local("sparse", &path).unwrap();
+    let a = store.get_blocks(&store.with_nodata(&cog, Some(7.0)), 0, &[Some(0)]).await.unwrap();
+    let b = store.get_blocks(&store.with_nodata(&cog, Some(5.0)), 0, &[Some(0)]).await.unwrap();
+    assert!(Arc::ptr_eq(a[0].as_ref().unwrap(), b[0].as_ref().unwrap()));
+    assert!(store.cache.current_bytes() >= 16 * 16 * 4, "held in the block cache, under its budget");
+    let _ = std::fs::remove_dir_all(&dir);
+}
