@@ -6604,26 +6604,19 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             let bounds = if given_epsg == drawn_epsg {
                 bbox
             } else {
-                let mut out = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-                const STEPS: usize = 8;
-                for i in 0..=STEPS {
-                    let f = i as f64 / STEPS as f64;
-                    let x = bbox[0] + f * (bbox[2] - bbox[0]);
-                    let y = bbox[1] + f * (bbox[3] - bbox[1]);
-                    for (px, py) in [(x, bbox[1]), (x, bbox[3]), (bbox[0], y), (bbox[2], y)] {
-                        let (lon, lat) = given_crs.to_lonlat_deg(px, py);
-                        let (dx, dy) = drawn_crs.from_lonlat_deg(lon, lat);
-                        if dx.is_finite() && dy.is_finite() {
-                            out[0] = out[0].min(dx);
-                            out[1] = out[1].min(dy);
-                            out[2] = out[2].max(dx);
-                            out[3] = out[3].max(dy);
-                        }
-                    }
+                let Ok(wgs_bbox) = super::bbox_to_wgs84(bbox, Some(&given_crs)) else {
+                    return resp;
+                };
+                if drawn_epsg == 4326 {
+                    wgs_bbox
+                } else {
+                    let Ok(reproj) = super::reproject_wgs84_bounds(wgs_bbox, &drawn_crs) else {
+                        return resp;
+                    };
+                    reproj
                 }
-                out
             };
-            if bounds.iter().any(|c| !c.is_finite()) {
+            if bounds.iter().any(|c| !c.is_finite()) || bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
                 return resp;
             }
             let spelled = asked("dst_crs").or_else(|| asked("coord_crs"));
@@ -8949,6 +8942,22 @@ mod tests {
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
+        // `respelled` preserves arbitrary EPSG codes from upstream Content-Crs headers.
+        let utm_tile = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-bbox", "500000,4800000,510000,4810000")
+            .header("content-crs", "<http://www.opengis.net/def/crs/EPSG/0/32631>")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let respelled_utm = item_placed(utm_tile, &["tiles", "UTM31N", "0", "0", "0.png"], "");
+        assert_eq!(
+            respelled_utm.headers().get("content-crs").unwrap().to_str().unwrap(),
+            crs(32631)
+        );
+        assert_eq!(
+            respelled_utm.headers().get("content-bbox").unwrap().to_str().unwrap(),
+            "500000.0,4800000.0,510000.0,4810000.0"
+        );
     }
 
     #[test]

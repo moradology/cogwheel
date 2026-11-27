@@ -6002,9 +6002,17 @@ where
         .headers()
         .get(hyper::header::ACCEPT)
         .and_then(|v| v.to_str().ok());
+    let raw_q = req.uri().query().unwrap_or("");
+    let colormap_prefers_image = {
+        let mut parts = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty());
+        matches!((parts.next(), parts.next(), parts.next()), (Some("colorMaps"), Some(_), None))
+            && html::explicit_format(raw_q).is_none()
+            && accept_hdr.and_then(html::negotiate_colormap_accept).is_some()
+    };
     let as_page = (offers_page
-        && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
-    .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
+        && !colormap_prefers_image
+        && html::wants_html(raw_q, accept_hdr))
+    .then(|| (req.uri().path().to_string(), raw_q.to_string()));
     // Prevent a cached JSON ETag in `If-None-Match` from short-circuiting an HTML page request to 304.
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
@@ -8042,23 +8050,10 @@ where
             )),
             ["colorMaps", id] => {
                 let negotiated_fmt: Option<&str> = pq.format_param.as_deref().or_else(|| {
-                    let accept = req
-                        .headers()
+                    req.headers()
                         .get(hyper::header::ACCEPT)
-                        .and_then(|v| v.to_str().ok())?
-                        .to_ascii_lowercase();
-                    if accept.contains("application/json") || accept.contains("text/html") || accept.contains("*/*") {
-                        return None;
-                    }
-                    if accept.contains("image/png") {
-                        Some("png")
-                    } else if accept.contains("image/jpeg") || accept.contains("image/jpg") {
-                        Some("jpg")
-                    } else if accept.contains("image/webp") {
-                        Some("webp")
-                    } else {
-                        None
-                    }
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(html::negotiate_colormap_accept)
                 });
                 match negotiated_fmt {
                     None | Some("json") | Some("html") => {

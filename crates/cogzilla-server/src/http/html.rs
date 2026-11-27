@@ -109,6 +109,110 @@ pub(crate) fn wants_html(query: &str, accept: Option<&str>) -> bool {
     }
 }
 
+/// RFC 9110 §12.5.1 content negotiation for `GET /colorMaps/{id}` when no explicit
+/// `?format=` / `?f=` query parameter is given. Returns `Some("png" | "jpg" | "webp")`
+/// only when an image representation strictly beats `application/json` and `text/html`
+/// by `(q, specificity, client_position)`; otherwise returns `None` (JSON or HTML).
+pub(crate) fn negotiate_colormap_accept(accept: &str) -> Option<&'static str> {
+    let mut best_json: Option<(f32, usize)> = None;
+    let mut best_html: Option<(f32, usize)> = None;
+    let mut best_png: Option<(f32, usize)> = None;
+    let mut best_jpg: Option<(f32, usize)> = None;
+    let mut best_webp: Option<(f32, usize)> = None;
+    let mut best_img_wild: Option<(f32, usize)> = None;
+    let mut best_app_wild: Option<(f32, usize)> = None;
+    let mut best_any_wild: Option<(f32, usize)> = None;
+
+    for (idx, item) in accept.split(',').enumerate() {
+        let mut parts = item.split(';');
+        let Some(media_type) = parts.next().map(str::trim) else {
+            continue;
+        };
+        let mut q = 1.0f32;
+        for param in parts {
+            if let Some((k, v)) = param.split_once('=')
+                && k.trim().eq_ignore_ascii_case("q")
+            {
+                if let Ok(parsed) = v.trim().parse::<f32>()
+                    && parsed.is_finite()
+                {
+                    q = parsed.clamp(0.0, 1.0);
+                } else {
+                    q = 0.0;
+                }
+            }
+        }
+        let slot = if media_type.eq_ignore_ascii_case("application/json") {
+            &mut best_json
+        } else if media_type.eq_ignore_ascii_case("text/html") {
+            &mut best_html
+        } else if media_type.eq_ignore_ascii_case("image/png") {
+            &mut best_png
+        } else if media_type.eq_ignore_ascii_case("image/jpeg")
+            || media_type.eq_ignore_ascii_case("image/jpg")
+        {
+            &mut best_jpg
+        } else if media_type.eq_ignore_ascii_case("image/webp") {
+            &mut best_webp
+        } else if media_type.eq_ignore_ascii_case("image/*") {
+            &mut best_img_wild
+        } else if media_type.eq_ignore_ascii_case("application/*") {
+            &mut best_app_wild
+        } else if media_type == "*/*" {
+            &mut best_any_wild
+        } else {
+            continue;
+        };
+        if slot.is_none_or(|(prev_q, _)| q > prev_q) {
+            *slot = Some((q, idx));
+        }
+    }
+
+    // Most-specific matching range determines each representation's effective (q, specificity, pos).
+    let eff = |exact: Option<(f32, usize)>,
+               type_wild: Option<(f32, usize)>,
+               any_wild: Option<(f32, usize)>|
+     -> Option<(f32, u8, usize)> {
+        let (q, spec, pos) = if let Some((q, pos)) = exact {
+            (q, 2u8, pos)
+        } else if let Some((q, pos)) = type_wild {
+            (q, 1u8, pos)
+        } else if let Some((q, pos)) = any_wild {
+            (q, 0u8, pos)
+        } else {
+            return None;
+        };
+        (q > 0.0).then_some((q, spec, pos))
+    };
+
+    let candidates: [(Option<&'static str>, Option<(f32, u8, usize)>); 5] = [
+        (None, eff(best_json, best_app_wild, best_any_wild)),
+        // Wildcards do not trigger HTML on their own (consistent with accepts_html).
+        (None, eff(best_html, None, None)),
+        // `image/*` prefers PNG, falling back to JPEG if PNG is explicitly excluded (`q=0`).
+        (Some("png"), eff(best_png, best_img_wild, None)),
+        (Some("jpg"), eff(best_jpg, best_img_wild, None)),
+        (Some("webp"), eff(best_webp, None, None)),
+    ];
+
+    let mut winner: Option<(Option<&'static str>, (f32, u8, usize))> = None;
+    for (fmt, score) in candidates {
+        let Some((q, spec, pos)) = score else {
+            continue;
+        };
+        let better = match winner {
+            None => true,
+            Some((_, (wq, wspec, wpos))) => {
+                q > wq || (q == wq && (spec > wspec || (spec == wspec && pos < wpos)))
+            }
+        };
+        if better {
+            winner = Some((fmt, (q, spec, pos)));
+        }
+    }
+    winner.and_then(|(fmt, _)| fmt)
+}
+
 /// Ensure `Vary` includes `Accept` without duplicating it or clobbering existing tokens.
 pub(crate) fn append_vary_accept(headers: &mut hyper::HeaderMap) {
     if let Some(existing) = headers
@@ -352,6 +456,35 @@ mod tests {
         assert!(!wants_html("", Some("text/html;q=0.8, */*;q=0.9")));
         assert!(!wants_html("", Some("text/html;q=0, */*;q=0.8")));
         assert!(wants_html("", Some("text/html;q=0.9, application/json;q=0.5")));
+    }
+
+    #[test]
+    fn colormap_accept_negotiation() {
+        assert_eq!(negotiate_colormap_accept("*/*"), None);
+        assert_eq!(negotiate_colormap_accept("application/json"), None);
+        assert_eq!(negotiate_colormap_accept("text/plain"), None);
+        assert_eq!(negotiate_colormap_accept("image/png"), Some("png"));
+        assert_eq!(negotiate_colormap_accept("image/jpeg"), Some("jpg"));
+        assert_eq!(negotiate_colormap_accept("image/webp"), Some("webp"));
+        assert_eq!(negotiate_colormap_accept("image/*"), Some("png"));
+        assert_eq!(negotiate_colormap_accept("image/png, */*;q=0.8"), Some("png"));
+        assert_eq!(negotiate_colormap_accept("image/png;q=0, */*"), None);
+        assert_eq!(negotiate_colormap_accept("image/png;q=0, image/*"), Some("jpg"));
+        assert_eq!(negotiate_colormap_accept("image/webp, image/png"), Some("webp"));
+        assert_eq!(negotiate_colormap_accept("image/png, text/html;q=0.5"), Some("png"));
+        assert_eq!(negotiate_colormap_accept("image/png;q=0.5, text/html;q=0.9"), None);
+        // Browser page navigation prefers text/html over image/webp.
+        assert_eq!(
+            negotiate_colormap_accept(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+            None
+        );
+        // Browser <img> request prefers image/webp (or image/* -> png) over */*;q=0.8.
+        assert_eq!(
+            negotiate_colormap_accept("image/avif,image/webp,image/apng,image/*,*/*;q=0.8"),
+            Some("webp")
+        );
     }
 
     #[test]
