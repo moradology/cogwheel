@@ -140,10 +140,8 @@ pub(crate) fn write_geotiff(
     spec: &GeoTiffSpec<'_>,
     write_pixels: impl FnOnce(&mut BytesMut),
 ) -> Bytes {
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(spec.epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
+    let is_geographic = cogzilla_proj::CrsModel::from_epsg(spec.epsg)
+        .is_ok_and(|c| c.is_geographic());
     let bbox = spec.bbox;
     // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
     let span_x = if is_geographic && bbox[2] < bbox[0] {
@@ -285,10 +283,8 @@ fn write_geotiff_placed(
         }
     }
 
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(spec.epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
+    let is_geographic = cogzilla_proj::CrsModel::from_epsg(spec.epsg)
+        .is_ok_and(|c| c.is_geographic());
     buf.put_f64_le(pixel_size[0]);
     buf.put_f64_le(pixel_size[1]);
     buf.put_f64_le(0.0);

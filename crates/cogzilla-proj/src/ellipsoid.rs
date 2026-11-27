@@ -1006,6 +1006,16 @@ impl EqualEarth {
 /// Solve `asinh(tan(lat)) - e * atanh(e * sin(lat)) = psi` for geodetic latitude `lat` (rad).
 #[inline(always)]
 fn inverse_isometric_lat(psi: f64, e: f64) -> f64 {
+    if !psi.is_finite() {
+        return if psi.is_nan() {
+            f64::NAN
+        } else {
+            psi.signum() * std::f64::consts::FRAC_PI_2
+        };
+    }
+    if psi.abs() > 35.0 {
+        return psi.signum() * std::f64::consts::FRAC_PI_2;
+    }
     let mut lat = psi.sinh().atan();
     if e == 0.0 {
         return lat;
@@ -1014,10 +1024,13 @@ fn inverse_isometric_lat(psi: f64, e: f64) -> f64 {
     for _ in 0..6 {
         let sin_lat = lat.sin();
         let cos_lat = lat.cos();
+        if cos_lat.abs() < 1e-15 {
+            break;
+        }
         let f = lat.tan().asinh() - e * (e * sin_lat).atanh() - psi;
         let df = (1.0 - e2) / (cos_lat * (1.0 - e2 * sin_lat * sin_lat));
         let step = f / df;
-        lat -= step;
+        lat = (lat - step).clamp(-std::f64::consts::FRAC_PI_2 + 1e-15, std::f64::consts::FRAC_PI_2 - 1e-15);
         if step.abs() < 1e-13 {
             break;
         }
@@ -1340,11 +1353,8 @@ impl SwissObliqueMercator {
         let l = self.alpha * wrap_dlon(lon - self.lon0);
         let (sin_l, cos_l) = l.sin_cos();
         let (sin_b, cos_b) = b.sin_cos();
-        let l_rot = sin_l.atan2(self.sin_b0 * (sin_b / cos_b) + self.cos_b0 * cos_l);
-        let b_rot = (self.cos_b0 * sin_b - self.sin_b0 * cos_b * cos_l)
-            .clamp(-1.0, 1.0)
-            .asin();
-        let sin_br = b_rot.sin();
+        let l_rot = (cos_b * sin_l).atan2(self.sin_b0 * sin_b + self.cos_b0 * cos_b * cos_l);
+        let sin_br = (self.cos_b0 * sin_b - self.sin_b0 * cos_b * cos_l).clamp(-1.0, 1.0);
         if (1.0 - sin_br.abs()) < 1e-12 {
             return (f64::NAN, f64::NAN);
         }
@@ -1357,6 +1367,9 @@ impl SwissObliqueMercator {
     #[inline(always)]
     pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
         let l_rot = (x - self.false_easting) * self.unit / self.r;
+        if l_rot.abs() > std::f64::consts::PI + 1e-9 {
+            return (f64::NAN, f64::NAN);
+        }
         let b_rot = 2.0 * (((y - self.false_northing) * self.unit / self.r).exp().atan()
             - std::f64::consts::FRAC_PI_4);
         let (sin_br, cos_br) = b_rot.sin_cos();
@@ -1364,7 +1377,7 @@ impl SwissObliqueMercator {
         let b = (self.cos_b0 * sin_br + self.sin_b0 * cos_br * cos_lr)
             .clamp(-1.0, 1.0)
             .asin();
-        let l = sin_lr.atan2(self.cos_b0 * cos_lr - self.sin_b0 * (sin_br / cos_br));
+        let l = (cos_br * sin_lr).atan2(self.cos_b0 * cos_br * cos_lr - self.sin_b0 * sin_br);
         let lon = self.lon0 + l / self.alpha;
         let iso = ((std::f64::consts::FRAC_PI_4 + 0.5 * b).tan().ln() - self.k) / self.alpha;
         let lat = inverse_isometric_lat(iso, self.e);
