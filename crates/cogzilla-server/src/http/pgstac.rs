@@ -5146,13 +5146,23 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
     if values.len() != descriptions.len() {
         return Ok(());
     }
-    let of = |name: &str, d: &str| {
-        d == name || d.strip_prefix(name).and_then(|r| r.strip_prefix("_b")).is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+    // `{asset}_b{k}`: the band of the asset a description names.
+    let band_of = |name: &str, d: &str| -> Option<usize> {
+        let k = d.strip_prefix(name)?.strip_prefix("_b")?;
+        (!k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())).then(|| k.parse().ok()).flatten()
     };
     let (mut out, mut described) = (Vec::new(), Vec::new());
     let mut at = 0;
     for spec in &specs {
-        let n = descriptions[at..].iter().take_while(|d| of(&spec.name, d)).count();
+        // An asset's run of values: the bands it chose, or all of its bands from the first,
+        // so that an asset asked for twice is read twice.
+        let n = match (&spec.expression, &spec.indexes) {
+            (None, Some(chosen)) => chosen.len(),
+            _ => descriptions[at..].iter().enumerate().take_while(|(i, d)| band_of(&spec.name, d) == Some(i + 1)).count(),
+        };
+        if n == 0 || at + n > values.len() || descriptions[at..at + n].iter().any(|d| band_of(&spec.name, d).is_none()) {
+            return Ok(());
+        }
         let bands = &values[at..at + n];
         at += n;
         if spec.expression.is_none() {
@@ -5177,6 +5187,21 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
     doc["band_names"] = json!((1..=out.len()).map(|i| format!("b{i}")).collect::<Vec<_>>());
     doc["band_descriptions"] = json!(described);
     Ok(())
+}
+
+/// What an item's point with an asset's own band math gives the `/stac` handler, which reads
+/// the bands for [`point_asset_math`] to work out: every band of such an asset, whatever
+/// band selection (`|bidx=`, `|indexes=`, `asset_bidx=`) or request `bidx` came with it, as
+/// titiler-pgstac reads it; and only the assets of `assets=`, as titiler-pgstac has no
+/// `asset_bidx` to add others with.
+pub(super) fn point_asset_math_reads(pq: &mut ParsedQuery, raw_query: &str) {
+    let Ok(specs) = parse_assets(&query_pairs(raw_query)) else { return };
+    let plain: Vec<&str> = specs.iter().filter(|s| s.expression.is_none()).map(|s| s.name.as_str()).collect();
+    pq.asset_bidx.retain(|(name, _)| plain.contains(&name.as_str()));
+    pq.assets.retain(|a| specs.iter().any(|s| s.name == a.split('|').next().unwrap_or(a)));
+    pq.bidx.clear();
+    pq.asset_exprs.clear();
+    pq.asset_as_band = false;
 }
 
 /// How many items of a point query are read at once.
@@ -7494,6 +7519,18 @@ mod tests {
         let mut doc = json!({ "values": [77.0, 81.0, 83.0, 750.0], "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "red_b1"] });
         let plain_many = "assets=visual&assets=red%7Cexpression%3Db1&asset_as_band=true";
         assert!(point_asset_math(&mut doc, &query_pairs(plain_many)).is_err(), "a plain asset of three bands is not one band");
+
+        // An asset asked for twice is read twice; a name that ends like a band is its own asset.
+        let mut doc = json!({ "values": [750.0, 750.0], "band_descriptions": ["red_b1", "red_b1"] });
+        point_asset_math(&mut doc, &query_pairs("assets=red%7Cexpression%3Db1*2&assets=red%7Cexpression%3Db1*3")).unwrap();
+        assert_eq!((&doc["values"], &doc["band_descriptions"]), (&json!([1500.0, 2250.0]), &json!(["red_b1*2", "red_b1*3"])));
+        let mut doc = json!({ "values": [10.0, 750.0], "band_descriptions": ["red_b1_b1", "red_b1"] });
+        point_asset_math(&mut doc, &query_pairs("assets=red_b1%7Cexpression%3Db1*2&assets=red")).unwrap();
+        assert_eq!((&doc["values"], &doc["band_descriptions"]), (&json!([20.0, 750.0]), &json!(["red_b1_b1*2", "red_b1"])));
+        // A plain asset's chosen bands are its run, in the order chosen.
+        let mut doc = json!({ "values": [83.0, 77.0, 750.0], "band_descriptions": ["visual_b3", "visual_b1", "red_b1"] });
+        point_asset_math(&mut doc, &query_pairs("assets=visual%7Cbidx%3D3,1&assets=red%7Cexpression%3Db1*2")).unwrap();
+        assert_eq!(doc["values"], json!([83.0, 77.0, 1500.0]));
     }
 
     #[test]

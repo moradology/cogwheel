@@ -6252,8 +6252,7 @@ where
                     // Each asset's band math on a point is applied by `pgstac::item_fixup` to
                     // every band of the asset, named as such; `asset_as_band` names them there.
                     if matches!(rest, ["point", _]) && !pq.asset_exprs.is_empty() {
-                        pq.asset_exprs.clear();
-                        pq.asset_as_band = false;
+                        pgstac::point_asset_math_reads(&mut pq, &raw_query);
                     }
                     if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
                         pq.bidx.clear();
@@ -8072,6 +8071,9 @@ where
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
+                // An item's band math is over `b1..bn` only, and may be one made of its assets'
+                // own (`pgstac::item_asset_math`): an asset named `b2` is not read for `b2`.
+                let rewritten_expr = if stac_prefix != "stac" { pq.expr_raw.clone() } else { rewritten_expr };
                 if item_asset_math {
                     pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
                 } else if stac_prefix != "stac"
