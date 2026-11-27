@@ -6,7 +6,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cogzilla_zarr::{ArrayMeta, DataType, Endianness, ZarrVersion};
+use cogzilla_zarr::{
+    ArrayMeta, DataType, Endianness, FsStore, OpenMode, ZarrHierarchy, ZarrStore, ZarrVersion,
+    decode_chunk_bytes,
+};
 
 fn fixtures_dir() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -112,5 +115,103 @@ fn zarr_fixtures_parse_with_array_meta() {
         "multiscale.zarr/1/elevation/zarr.json",
     ] {
         assert!(dir.join(expected).is_file(), "missing fixture {expected}");
+    }
+}
+
+#[tokio::test]
+async fn hierarchy_opens_generated_fixtures() {
+    let Some(dir) = fixtures_dir() else {
+        eprintln!("skipping: benches/fixtures/zarr not generated");
+        return;
+    };
+
+    // v2 consolidated vs unconsolidated
+    let v2c = ZarrHierarchy::open(&FsStore::new(dir.join("v2_consolidated.zarr")))
+        .await
+        .unwrap();
+    assert_eq!(v2c.open_mode, OpenMode::V2Consolidated);
+    assert_eq!(v2c.group(None).unwrap().data_variables(), vec!["temp"]);
+
+    let v2u = ZarrHierarchy::open(&FsStore::new(dir.join("v2_unconsolidated.zarr")))
+        .await
+        .unwrap();
+    assert_eq!(v2u.open_mode, OpenMode::V2Walked);
+    assert_eq!(v2u.group(None).unwrap().data_variables(), vec!["temp"]);
+
+    // v3 consolidated vs unconsolidated
+    let v3c = ZarrHierarchy::open(&FsStore::new(dir.join("v3_consolidated.zarr")))
+        .await
+        .unwrap();
+    assert_eq!(v3c.open_mode, OpenMode::V3Consolidated);
+    assert_eq!(v3c.group(None).unwrap().data_variables(), vec!["temp"]);
+
+    let v3u = ZarrHierarchy::open(&FsStore::new(dir.join("v3_unconsolidated.zarr")))
+        .await
+        .unwrap();
+    assert_eq!(v3u.open_mode, OpenMode::V3Walked);
+    assert_eq!(v3u.group(None).unwrap().data_variables(), vec!["temp"]);
+
+    // Multiscale nested groups
+    let ms = ZarrHierarchy::open(&FsStore::new(dir.join("multiscale.zarr")))
+        .await
+        .unwrap();
+    assert_eq!(ms.group(None).unwrap().subgroups(), vec!["0", "1"]);
+    assert_eq!(
+        ms.group(Some("0")).unwrap().array("elevation").unwrap().shape,
+        vec![256, 256]
+    );
+    assert_eq!(
+        ms.group(Some("1")).unwrap().array("elevation").unwrap().shape,
+        vec![128, 128]
+    );
+}
+
+#[tokio::test]
+async fn codec_chain_decodes_v2_v3_and_big_endian_fixtures_identically() {
+    let Some(dir) = fixtures_dir() else {
+        eprintln!("skipping: benches/fixtures/zarr not generated");
+        return;
+    };
+
+    // Reference: codecs_v3.zarr/uncompressed chunk (0, 0)
+    let v3_store = FsStore::new(dir.join("codecs_v3.zarr"));
+    let v3_h = ZarrHierarchy::open(&v3_store).await.unwrap();
+    let v3_root = v3_h.group(None).unwrap();
+    let ref_meta = v3_root.array("uncompressed").unwrap();
+    let ref_key = format!("uncompressed/{}", ref_meta.chunk_key(&[0, 0]));
+    let ref_raw = v3_store.get(&ref_key).await.unwrap().unwrap();
+    let expected = decode_chunk_bytes(ref_meta, &ref_raw, &ref_key).unwrap();
+    assert_eq!(expected.len(), 64 * 64 * 4);
+
+    // All v3 non-blosc codecs must match `expected` bit-for-bit
+    for name in ["gzip", "zstd", "transpose_f_order"] {
+        let meta = v3_root.array(name).unwrap();
+        let key = format!("{name}/{}", meta.chunk_key(&[0, 0]));
+        let raw = v3_store.get(&key).await.unwrap().unwrap();
+        let got = decode_chunk_bytes(meta, &raw, &key).unwrap();
+        assert_eq!(got, expected, "v3 codec {name} diverged from uncompressed");
+    }
+
+    // All v2 non-blosc codecs must match `expected` bit-for-bit
+    let v2_store = FsStore::new(dir.join("codecs_v2.zarr"));
+    let v2_h = ZarrHierarchy::open(&v2_store).await.unwrap();
+    let v2_root = v2_h.group(None).unwrap();
+    for name in ["uncompressed", "gzip", "zstd", "shuffle_zstd"] {
+        let meta = v2_root.array(name).unwrap();
+        let key = format!("{name}/{}", meta.chunk_key(&[0, 0]));
+        let raw = v2_store.get(&key).await.unwrap().unwrap();
+        let got = decode_chunk_bytes(meta, &raw, &key).unwrap();
+        assert_eq!(got, expected, "v2 codec {name} diverged from uncompressed");
+    }
+
+    // Big-endian v3 and v2 f32 arrays must also match `expected` bit-for-bit
+    for store_name in ["big_endian_v3.zarr", "big_endian_v2.zarr"] {
+        let store = FsStore::new(dir.join(store_name));
+        let h = ZarrHierarchy::open(&store).await.unwrap();
+        let meta = h.group(None).unwrap().array("f32_be").unwrap();
+        let key = format!("f32_be/{}", meta.chunk_key(&[0, 0]));
+        let raw = store.get(&key).await.unwrap().unwrap();
+        let got = decode_chunk_bytes(meta, &raw, &key).unwrap();
+        assert_eq!(got, expected, "{store_name}/f32_be diverged from LE reference");
     }
 }

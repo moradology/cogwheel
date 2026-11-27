@@ -30,11 +30,17 @@
 //! with the credential chain, concurrency limiting, caching and eviction. A Zarr chunk is one more
 //! object to ask it for.
 
+pub mod codecs;
+pub mod hierarchy;
+
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-/// Anything that can go wrong reading Zarr metadata.
+pub use codecs::{MAX_DECODED_CHUNK_BYTES, SUPPORTED_CODECS, decode_chunk_bytes};
+pub use hierarchy::{FsStore, GroupMeta, GroupView, MemoryStore, OpenMode, ZarrHierarchy, ZarrNode, ZarrStore};
+
+/// Anything that can go wrong reading Zarr metadata, navigating a store, or decoding chunks.
 #[derive(Debug, thiserror::Error)]
 pub enum ZarrError {
     #[error("metadata is not valid JSON: {0}")]
@@ -49,6 +55,30 @@ pub enum ZarrError {
     UnsupportedDataType(String),
     #[error("array has {0} dimensions; a 2D or 3D array is required")]
     UnsupportedRank(usize),
+    #[error("prefix is not a Zarr store (looked for {searched})")]
+    NotAZarrStore { searched: &'static str },
+    #[error("group {path:?} not found in Zarr store")]
+    GroupNotFound { path: String },
+    #[error("store I/O error on key {key:?}: {message}")]
+    Io { key: String, message: String },
+    #[error("unsupported codec {codec:?} on chunk {chunk_key:?} (supported: {supported})")]
+    UnsupportedCodec {
+        codec: String,
+        chunk_key: String,
+        supported: &'static str,
+    },
+    #[error("codec {codec:?} failed on chunk {chunk_key:?}: {detail}")]
+    Codec {
+        codec: String,
+        chunk_key: String,
+        detail: String,
+    },
+    #[error("chunk {chunk_key:?} decoded size {bytes} exceeds cap {cap} bytes")]
+    ChunkTooLarge {
+        chunk_key: String,
+        bytes: usize,
+        cap: usize,
+    },
 }
 
 /// Which revision of the Zarr specification a store was written to.
@@ -271,18 +301,29 @@ pub struct ArrayMeta {
     /// `.zattrs` in v2, the `attributes` object in v3. Carries the CF and GeoZarr georeferencing
     /// that the CRS work will read.
     pub attributes: BTreeMap<String, Value>,
+    /// True when a v2 array declares `"order": "F"` (Fortran / column-major memory order).
+    pub order_f: bool,
 }
 
 impl ArrayMeta {
     /// Parse a v2 array from its `.zarray`, with `.zattrs` if the store has one.
     pub fn from_v2(zarray: &[u8], zattrs: Option<&[u8]>) -> Result<Self, ZarrError> {
         let v: Value = serde_json::from_slice(zarray)?;
+        let attrs_val = match zattrs {
+            Some(bytes) => Some(serde_json::from_slice::<Value>(bytes)?),
+            None => None,
+        };
+        Self::from_v2_value(&v, attrs_val.as_ref())
+    }
+
+    /// Parse a v2 array from already-parsed JSON values (used by `.zmetadata` consolidation).
+    pub fn from_v2_value(v: &Value, zattrs: Option<&Value>) -> Result<Self, ZarrError> {
         match v.get("zarr_format").and_then(Value::as_u64) {
             Some(2) | None => {}
             Some(other) => return Err(ZarrError::UnsupportedVersion(other)),
         }
-        let shape = u64_vec(&v, "shape")?;
-        let chunk_shape = u64_vec(&v, "chunks")?;
+        let shape = u64_vec(v, "shape")?;
+        let chunk_shape = u64_vec(v, "chunks")?;
         let dtype_str = v
             .get("dtype")
             .and_then(Value::as_str)
@@ -307,15 +348,14 @@ impl ArrayMeta {
             .and_then(|s| s.chars().next())
             .unwrap_or('.');
 
-        let attributes = match zattrs {
-            Some(bytes) => object_map(&serde_json::from_slice::<Value>(bytes)?),
-            None => BTreeMap::new(),
-        };
+        let attributes = zattrs.map(object_map).unwrap_or_default();
         // xarray records dimension names in v2 stores under this attribute.
         let dimension_names = attributes.get("_ARRAY_DIMENSIONS").and_then(|v| {
             v.as_array()
                 .map(|a| a.iter().map(|n| n.as_str().map(str::to_string)).collect())
         });
+
+        let order_f = v.get("order").and_then(Value::as_str) == Some("F");
 
         Ok(ArrayMeta {
             version: ZarrVersion::V2,
@@ -328,17 +368,23 @@ impl ArrayMeta {
             chunk_key: ChunkKeyEncoding::V2 { separator },
             dimension_names,
             attributes,
+            order_f,
         })
     }
 
     /// Parse a v3 array from its `zarr.json`.
     pub fn from_v3(zarr_json: &[u8]) -> Result<Self, ZarrError> {
         let v: Value = serde_json::from_slice(zarr_json)?;
+        Self::from_v3_value(&v)
+    }
+
+    /// Parse a v3 array from an already-parsed JSON value (used by v3 consolidated metadata).
+    pub fn from_v3_value(v: &Value) -> Result<Self, ZarrError> {
         match v.get("zarr_format").and_then(Value::as_u64) {
             Some(3) | None => {}
             Some(other) => return Err(ZarrError::UnsupportedVersion(other)),
         }
-        let shape = u64_vec(&v, "shape")?;
+        let shape = u64_vec(v, "shape")?;
         let dtype = DataType::from_v3_name(
             v.get("data_type")
                 .and_then(Value::as_str)
@@ -413,6 +459,7 @@ impl ArrayMeta {
             chunk_key,
             dimension_names,
             attributes: v.get("attributes").map(object_map).unwrap_or_default(),
+            order_f: false,
         })
     }
 
