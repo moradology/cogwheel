@@ -1903,12 +1903,52 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
     Ok(Some((specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect(), own)))
 }
 
+/// The parameters the shared parser checks that FastAPI validates on titiler-pgstac's
+/// routes, where a value it cannot read is a 422.
+const CHECKED: [&str; 11] =
+    ["coord_crs", "dst_crs", "crs", "max_size", "width", "height", "nodata", "unscale", "return_mask", "buffer", "padding"];
+
+/// Whether an item's route reads `name`, one of [`CHECKED`], as titiler-pgstac's routes do
+/// (each asked with each, 2026-11-26): what a route reads FastAPI validates, a 422 when it
+/// cannot be read, before the item is looked for; what it does not read it passes over.
+fn item_route_reads(method: &Method, rest: &[&str], name: &str) -> bool {
+    const TILE: [&str; 5] = ["nodata", "unscale", "return_mask", "buffer", "padding"];
+    const PICTURE: [&str; 8] = ["coord_crs", "dst_crs", "max_size", "width", "height", "nodata", "unscale", "return_mask"];
+    let reads = |list: &[&str]| list.contains(&name);
+    // A size in the path is the size: `width` and `height` in the query are not read.
+    let sized = |list: &[&str]| reads(list) && !matches!(name, "width" | "height");
+    let named = |seg: &str, route: &str| seg == route || seg.strip_prefix(route).is_some_and(|ext| ext.starts_with('.'));
+    match rest {
+        ["tiles", _, _, _, _] | [_, "tilejson.json" | "map.html"] => reads(&TILE),
+        ["point", _] => matches!(name, "coord_crs" | "nodata" | "unscale"),
+        ["bbox", _, _] => sized(&PICTURE),
+        ["bbox", _] => reads(&PICTURE),
+        ["feature", _] => sized(&PICTURE),
+        [one] if named(one, "feature") => reads(&PICTURE),
+        // A preview is of the whole item, in no system but the one it is drawn in.
+        ["preview", _] => sized(&PICTURE[1..]),
+        [one] if named(one, "preview") => reads(&PICTURE[1..]),
+        ["statistics"] if *method == Method::POST => matches!(name, "coord_crs" | "dst_crs" | "max_size" | "width" | "height" | "nodata" | "unscale"),
+        ["statistics" | "asset_statistics"] => matches!(name, "max_size" | "width" | "height" | "nodata" | "unscale"),
+        _ => false,
+    }
+}
+
+/// Whether an item's route passes over the parameter `name`, one the shared parser checks
+/// but the route does not read: the request goes on without it, as in titiler-pgstac.
+pub(super) fn item_passes_over(method: &Method, rest: &[&str], name: &str) -> bool {
+    CHECKED.contains(&name) && !item_route_reads(method, rest, name)
+}
+
+/// Whether the shared parser's complaint `e` is about a parameter [`item_passes_over`].
+pub(super) fn item_passes_over_error(method: &Method, rest: &[&str], e: &str) -> bool {
+    error_parameter(e).is_some_and(|name| item_passes_over(method, rest, name))
+}
+
 /// The answer to a complaint of the shared parser. A value it could not read, of a
 /// parameter FastAPI checks in titiler-pgstac, is a 422 as there; anything else (what is
 /// not supported here, above all) stays the 400 it was.
 fn parse_error(e: &str) -> Resp {
-    const CHECKED: [&str; 11] =
-        ["coord_crs", "dst_crs", "crs", "max_size", "width", "height", "nodata", "unscale", "return_mask", "buffer", "padding"];
     match error_parameter(e) {
         Some(name) if e.starts_with("invalid ") && CHECKED.contains(&name) => {
             let msg = if name.ends_with("crs") { "Value error, invalid CRS format" } else { "Input should be a valid value" };
@@ -6726,6 +6766,15 @@ pub(super) async fn item_route(
         // What only a search reads means nothing to an item, and titiler-pgstac passes it
         // over there: the search routes are not shown it.
         let query = without_search_options(ctx.raw_query);
+        // Nor what the item's route passes over, which the search routes would check.
+        let query: String = query
+            .split('&')
+            .filter(|part| {
+                let name = part.split('=').next().unwrap_or(part);
+                !CHECKED.contains(&name) || item_route_reads(method, rest, name)
+            })
+            .collect::<Vec<_>>()
+            .join("&");
         let (own, pairs) = (super::parse_query((!query.is_empty()).then_some(query.as_str())), query_pairs(&query));
         return Done(mosaic_route(&ctx, pg, &base, &rec, rest, body.as_ref(), own, &pairs).await);
     }
@@ -6891,9 +6940,12 @@ fn item_path_error(method: &Method, rest: &[&str], pq: &ParsedQuery, pairs: &[(S
     // the 400 of a limit; `padding` and `buffer` are answered for where tiles are checked.
     of_path.or_else(|| {
         pq.errors.iter().find_map(|e| {
-            let name = error_parameter(e).filter(|name| matches!(*name, "max_size" | "width" | "height"))?;
-            let unread = pairs.iter().rev().find(|(k, _)| k == name).is_some_and(|(_, v)| !py_whole(v));
-            unread.then(|| invalid_param("query", name, "Input should be a valid value"))
+            let name = error_parameter(e).filter(|name| item_route_reads(method, rest, name))?;
+            if matches!(name, "max_size" | "width" | "height") {
+                let unread = pairs.iter().rev().find(|(k, _)| k == name).is_some_and(|(_, v)| !py_whole(v));
+                return unread.then(|| invalid_param("query", name, "Input should be a valid value"));
+            }
+            e.starts_with("invalid ").then(|| parse_error(e))
         })
     })
 }
