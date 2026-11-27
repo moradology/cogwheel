@@ -150,8 +150,37 @@ pub enum SourceFreshness {
     Cloud,
 }
 
+impl SourceFreshness {
+    /// Independent copy of these validators (fresh atomics and lock) for a derived view.
+    fn snapshot(&self) -> Self {
+        match self {
+            SourceFreshness::Local { path, len, mtime, inode } => SourceFreshness::Local {
+                path: path.clone(),
+                len: *len,
+                mtime: *mtime,
+                inode: *inode,
+            },
+            SourceFreshness::Remote { validator, opened_at, last_checked_ms, .. } => SourceFreshness::Remote {
+                validator: validator.clone(),
+                opened_at: *opened_at,
+                last_checked_ms: AtomicU64::new(last_checked_ms.load(Ordering::Relaxed)),
+                revalidate_lock: tokio::sync::Mutex::new(()),
+            },
+            SourceFreshness::Cloud => SourceFreshness::Cloud,
+        }
+    }
+}
+
 pub struct OpenedCog {
+    /// Identity of these decoded blocks in the block and GPU caches.
     pub id: u64,
+    /// `id` of the opened source the URI cache holds: `id` itself, but a `?nodata=` view's
+    /// parent's, so a source found changed through a view evicts the parent.
+    pub source_id: u64,
+    /// A `?nodata=` view's value for tiles the file leaves unwritten (`byte_count == 0`), when
+    /// that value is data under the view's nodata: GDAL reads such tiles as the file's own
+    /// nodata (or 0 with none), which the override makes valid. `None` keeps them no data.
+    pub sparse_fill: Option<f64>,
     pub uri: String,
     pub index: CogIndex,
     pub source: CogSource,
@@ -241,6 +270,8 @@ pub struct CogStore {
     next_id: AtomicU64,
     datasets_by_name: DashMap<String, Arc<OpenedCog>, ahash::RandomState>,
     datasets_by_uri: DashMap<String, OpenSlot, ahash::RandomState>,
+    /// `?nodata=` views keyed by `(parent OpenedCog::id, override bits)`; see [`CogStore::with_nodata`].
+    nodata_views: DashMap<(u64, u32), Arc<OpenedCog>, ahash::RandomState>,
     max_open_uris: usize,
     uri_clock: AtomicU64,
     evicting_uris: AtomicBool,
@@ -389,6 +420,7 @@ impl CogStore {
             next_id: AtomicU64::new(1),
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
             datasets_by_uri: DashMap::with_hasher(ahash::RandomState::new()),
+            nodata_views: DashMap::with_hasher(ahash::RandomState::new()),
             max_open_uris: max_open_uris.max(1),
             uri_clock: AtomicU64::new(0),
             evicting_uris: AtomicBool::new(false),
@@ -544,8 +576,11 @@ impl CogStore {
             CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
             _ => unreachable!(),
         };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cog = Arc::new(OpenedCog {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            id,
+            source_id: id,
+            sparse_fill: None,
             uri: uri.clone(),
             index,
             source,
@@ -565,6 +600,102 @@ impl CogStore {
             },
         );
         Ok(cog)
+    }
+
+    /// The COG as read with `nodata` in place of its own `GDAL_NODATA` (GDAL's nodata override,
+    /// which TiTiler's `?nodata=` is): pixels equal to `nodata` are masked and pixels equal to
+    /// the file's own nodata become valid data. Returns `cog` itself when there is no override or
+    /// it matches the file's nodata. The view has its own id, so its decoded blocks are cached
+    /// apart from the file's; views are kept per `(cog, nodata)` and dropped in bulk past a bound.
+    pub fn with_nodata(&self, cog: &Arc<OpenedCog>, nodata: Option<f32>) -> Arc<OpenedCog> {
+        const MAX_NODATA_VIEWS: usize = 256;
+        let Some(nd) = nodata else { return cog.clone() };
+        // NaN is no data whatever the file says, so a NaN override over no nodata is no change.
+        // The file's value is compared at full precision (`nodata` is its f32 rounding).
+        let same = match cog.index.nodata_f64.or(cog.index.nodata.map(f64::from)) {
+            Some(own) => own == f64::from(nd) || (own.is_nan() && nd.is_nan()),
+            None => nd.is_nan(),
+        };
+        if same {
+            return cog.clone();
+        }
+        let key = (cog.id, if nd.is_nan() { f32::NAN.to_bits() } else { nd.to_bits() });
+        if let Some(v) = self.nodata_views.get(&key) {
+            return v.clone();
+        }
+        if self.nodata_views.len() >= MAX_NODATA_VIEWS {
+            self.nodata_views.clear();
+        }
+        // GDAL fills an unwritten tile with the file's nodata (0 with none); under the override
+        // that is data unless it is NaN or the override itself. A mask or alpha band still
+        // leaves such tiles transparent, so they are left as no data there.
+        let fill = cog.index.nodata_f64.or(cog.index.nodata.map(f64::from)).unwrap_or(0.0);
+        let masked = cog.index.ifds.iter().any(|ifd| {
+            ifd.mask_ifd.is_some()
+                || cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples).is_some()
+        });
+        let sparse_fill = (!fill.is_nan() && fill != f64::from(nd) && !masked).then_some(fill);
+        let mut index = cog.index.clone();
+        index.nodata = Some(nd);
+        index.nodata_f64 = Some(f64::from(nd));
+        let view = Arc::new(OpenedCog {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            source_id: cog.source_id,
+            sparse_fill,
+            uri: cog.uri.clone(),
+            index,
+            source: cog.source.clone(),
+            freshness: cog.freshness.snapshot(),
+        });
+        self.nodata_views.entry(key).or_insert(view).clone()
+    }
+
+    /// The block of an unwritten tile of `cog`'s IFD `ifd_idx`: `None` (no data), or for a
+    /// `?nodata=` view with a [`OpenedCog::sparse_fill`], a tile of that value. The fill is the
+    /// parent's, so one tile per parent and IFD serves every view of it; it is kept in the block
+    /// cache, under its byte budget, at a tile index no tile has.
+    fn sparse_tile(&self, cog: &OpenedCog, ifd_idx: usize) -> Option<Arc<DecodedTile>> {
+        let fill = cog.sparse_fill?;
+        let key = BlockKey {
+            dataset_id: cog.source_id,
+            ifd_idx: ifd_idx as u16,
+            tile_idx: u32::MAX,
+        };
+        if let Some(t) = self.cache.try_get_fast(&key) {
+            return Some(t);
+        }
+        let ifd = &cog.index.ifds[ifd_idx];
+        let bands = match ifd.planar_config {
+            PlanarConfig::Chunky => ifd.samples_per_pixel.max(1) as usize,
+            _ => 1,
+        };
+        let px = (ifd.tile_width as usize) * (ifd.tile_height as usize);
+        let wide = matches!(
+            ifd.sample_type,
+            cogzilla_tiff::SampleType::Uint32
+                | cogzilla_tiff::SampleType::Int32
+                | cogzilla_tiff::SampleType::Uint64
+                | cogzilla_tiff::SampleType::Int64
+                | cogzilla_tiff::SampleType::Float64
+        );
+        let band = || cogzilla_codec::DecodedBand {
+            data: if wide {
+                BandData::F64(vec![fill; px].into_boxed_slice())
+            } else {
+                BandData::F32(cogzilla_codec::AlignedF32Slab::filled(px, fill as f32))
+            },
+            width: ifd.tile_width,
+            height: ifd.tile_height,
+            stats: cogzilla_codec::BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: fill as f32,
+                max: fill as f32,
+            },
+        };
+        let tile = Arc::new(DecodedTile { bands: (0..bands).map(|_| band()).collect() });
+        self.cache.complete(key, tile.clone());
+        Some(tile)
     }
 
     pub fn get_registered(&self, name: &str) -> Option<Arc<OpenedCog>> {
@@ -596,6 +727,7 @@ impl CogStore {
     pub fn clear_open_uris(&self) {
         self.datasets_by_uri
             .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
+        self.nodata_views.clear();
         self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(ref dc) = self.disk_cache {
             dc.clear();
@@ -945,8 +1077,11 @@ impl CogStore {
                     }
                 };
 
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 Ok(Arc::new(OpenedCog {
-                    id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                    id,
+                    source_id: id,
+                    sparse_fill: None,
                     uri: uri.to_string(),
                     index,
                     source,
@@ -1023,7 +1158,7 @@ impl CogStore {
                 .copied()
                 .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if count == 0 {
-                out.push(None);
+                out.push(self.sparse_tile(cog, ifd_idx));
                 continue;
             }
             let key = BlockKey {
@@ -1245,6 +1380,7 @@ impl CogStore {
                 .copied()
                 .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if count == 0 {
+                results[slot] = self.sparse_tile(cog, ifd_idx);
                 continue;
             }
             if seen_owned.contains_key(&tile_idx) {
@@ -1696,7 +1832,7 @@ impl CogStore {
                             Ok(resp) => Some((span, resp.bytes)),
                             Err(e) => {
                                 if matches!(e.root(), IoError::SourceChanged { .. }) {
-                                    self.invalidate_uri(&cog.uri, Some(cog.id));
+                                    self.invalidate_uri(&cog.uri, Some(cog.source_id));
                                 }
                                 fetch_err = Some(e);
                                 None
@@ -2183,7 +2319,7 @@ impl CogStore {
 
                     if let Some(e) = fetch_err {
                         if matches!(e.root(), IoError::SourceChanged { .. }) {
-                            self.invalidate_uri(&cog.uri, Some(cog.id));
+                            self.invalidate_uri(&cog.uri, Some(cog.source_id));
                         }
                         let shared = Arc::new(e);
                         // Broadcast the explicit upstream/decode error to all parked waiters for
@@ -2328,7 +2464,7 @@ impl CogStore {
         {
             Ok(resp) => resp.bytes,
             Err(e @ IoError::SourceChanged { .. }) => {
-                self.invalidate_uri(&cog.uri, Some(cog.id));
+                self.invalidate_uri(&cog.uri, Some(cog.source_id));
                 return Err(e);
             }
             Err(e) => return Err(e),

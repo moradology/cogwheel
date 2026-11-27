@@ -2810,7 +2810,9 @@ impl TileEngine {
     /// the raster's own, NaN where it has no data. An empty `bands_1based` asks for every
     /// band. `req` gives the tile, its size and `unscale`; `resampling` is used for a raster
     /// already in the tile's projection and `reproject` for one that has to be warped into
-    /// it. The raster's sample type comes back with the planes.
+    /// it. `nodata` (a request's `?nodata=`) stands in place of the raster's own. The raster's
+    /// sample type comes back with the planes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn raster_planes(
         &self,
         uri: &str,
@@ -2818,8 +2820,9 @@ impl TileEngine {
         req: &TileRequest,
         resampling: ResampleMode,
         reproject: ResampleMode,
+        nodata: Option<f32>,
     ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
-        let cog = self.store.open_uri(uri).await?;
+        let cog = self.store.with_nodata(&self.store.open_uri(uri).await?, nodata);
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
         let wanted = Self::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
@@ -3548,11 +3551,13 @@ mod tests {
             band_metadata: vec![Vec::new(); 3],
             band_descriptions: vec![String::new(); 3],
             color_map: None,
-            ifds: vec![ifd],
+            ifds: vec![ifd].into(),
         };
         let source = cogzilla_io::CogSource::open_local(&tmp_path).unwrap();
         let cog = OpenedCog {
             id: 999_999,
+            source_id: 999_999,
+            sparse_fill: None,
             uri: tmp_path.to_string_lossy().into_owned(),
             index,
             source,

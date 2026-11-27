@@ -6451,3 +6451,47 @@ async fn statistics_follow_the_resampling_of_the_preview() {
     }
     assert!(means[0] != means[1] && means[1] != means[2], "the resampling changes the numbers: {means:?}");
 }
+
+/// `?nodata=` replaces the raster's own nodata, as GDAL's override (and so TiTiler's) does:
+/// pixels equal to the file's nodata become data and pixels equal to the request's are masked.
+#[tokio::test]
+async fn nodata_query_replaces_the_rasters_own() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_nodata_override_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // GDAL_NODATA=0, the left half 0 and the right half 7 in both bands.
+    let path = tmp.join("u16_nodata0.tif");
+    write_synthetic_u16_2band_4326_geotiff(&path, 64, 64, [10.0, 40.0, 10.64, 40.64], 7, 7, Some("left"));
+    let url = path.to_string_lossy().to_string();
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let stats = |q: &'static str| {
+        let (client, base, url) = (client.clone(), base.clone(), url.clone());
+        async move {
+            let resp = client.get(format!("{base}/cog/statistics?url={url}{q}")).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{q}");
+            let v: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+            (v["b1"]["count"].as_f64().unwrap(), v["b1"]["min"].as_f64().unwrap(), v["b1"]["max"].as_f64().unwrap())
+        }
+    };
+    let half = (64 * 32) as f64;
+    assert_eq!(stats("").await, (half, 7.0, 7.0));
+    assert_eq!(stats("&nodata=0").await, (half, 7.0, 7.0), "the file's own value changes nothing");
+    assert_eq!(stats("&nodata=7").await, (half, 0.0, 0.0), "the file's 0 is data, the request's 7 is not");
+    assert_eq!(stats("&nodata=5").await, (2.0 * half, 0.0, 7.0), "nothing equals 5: every pixel is data");
+    // The preview's mask says the same, and the file's own read is not changed by the override's.
+    for (q, valid) in [("&nodata=7", half), ("", half), ("&nodata=5", 2.0 * half)] {
+        let npy = client.get(format!("{base}/cog/preview.npy?url={url}&bidx=1{q}")).send().await.unwrap().bytes().await.unwrap();
+        let values = decode_npy_f32(&npy);
+        let (data, mask) = values.split_at(values.len() / 2);
+        assert_eq!(mask.iter().filter(|m| **m > 0.0).count() as f64, valid, "{q}");
+        let want = if q == "&nodata=7" { 0.0 } else { 7.0 };
+        assert!(data.iter().zip(mask).any(|(v, m)| *m > 0.0 && *v == want), "{q}");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
