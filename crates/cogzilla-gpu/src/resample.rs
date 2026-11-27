@@ -57,6 +57,15 @@ impl GpuSlab {
             .checked_mul(stride as usize)
             .ok_or_else(|| GpuError::InvalidDimensions("slab size overflow".into()))?;
         let byte_size = (total_elems * std::mem::size_of::<f32>()) as u64;
+        let limits = device.limits();
+        let max_bytes = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size as u64);
+        if byte_size > max_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "slab buffer {byte_size} B exceeds adapter limit {max_bytes} B"
+            )));
+        }
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-slab"),
             size: byte_size,

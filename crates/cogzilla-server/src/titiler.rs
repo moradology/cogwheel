@@ -8160,6 +8160,7 @@ async fn render_bbox_core(
                             | BandRequest::Terrain { .. }
                             | BandRequest::CustomExprRgb { .. } => 3,
                             BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+                            BandRequest::CustomExprMulti { progs } => progs.len().max(1),
                             _ => 1,
                         };
                         return BboxRenderOutput::Bytes(
