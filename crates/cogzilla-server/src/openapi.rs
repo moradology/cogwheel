@@ -966,14 +966,23 @@ mod tests {
                 let resp = crate::http::handle_request(Arc::clone(&engine), req)
                     .await
                     .unwrap();
-                if resp.status() == StatusCode::NOT_FOUND {
-                    unrouted.push(format!("{} {} (via {})", method_str.to_uppercase(), path, concrete));
+                let status = resp.status();
+                if matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED)
+                    || status.is_server_error()
+                {
+                    unrouted.push(format!(
+                        "{} {} (via {}) -> {}",
+                        method_str.to_uppercase(),
+                        path,
+                        concrete,
+                        status.as_u16()
+                    ));
                 }
             }
         }
         assert!(
             unrouted.is_empty(),
-            "OpenAPI advertises unrouted paths returning 404:\n{}",
+            "OpenAPI advertises unrouted/disallowed/5xx paths:\n{}",
             unrouted.join("\n")
         );
     }

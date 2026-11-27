@@ -1315,7 +1315,7 @@ impl CogStore {
             cogzilla_tiff::PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
             cogzilla_tiff::PlanarConfig::Planar => 1,
         };
-        let bytes_per_sample = ifd.sample_type.bytes_per_sample();
+        let bytes_per_sample = cogzilla_codec::decoded_bytes_per_sample(ifd.sample_type);
         let per_block_bytes = (ifd.tile_width as usize)
             .saturating_mul(ifd.tile_height as usize)
             .saturating_mul(bands_per_block)
@@ -2802,8 +2802,8 @@ mod tests {
         let at_cap = vec![Some(0u32); 128];
         assert!(store.get_blocks(&f64_cog, 0, &at_cap).await.is_ok());
 
-        // Int8 (1 byte/sample), 512x512 tiles => 256 KiB per block.
-        // 300 blocks = 75 MiB <= 256 MiB cap => must succeed (previously over-counted as 300 MiB).
+        // Int8 decodes into BandData::F32 (4 bytes/sample), 512x512 tiles => 1 MiB per block.
+        // 257 blocks = 257 MiB > 256 MiB cap => must be refused; 256 blocks = 256 MiB => ok.
         let i8_path = dir.join("sparse_i8.tif");
         write_sparse_tiled_tiff(&i8_path, 512, 8, 2);
         let i8_cog = store
@@ -2814,8 +2814,45 @@ mod tests {
             i8_cog.index.ifds[0].sample_type,
             cogzilla_tiff::SampleType::Int8
         );
-        let i8_blocks = vec![Some(0u32); 300];
-        assert!(store.get_blocks(&i8_cog, 0, &i8_blocks).await.is_ok());
+        let i8_over = vec![Some(0u32); 257];
+        assert!(
+            store.get_blocks(&i8_cog, 0, &i8_over).await.is_err(),
+            "257 Int8 blocks decode to 257 MiB of BandData::F32 and must exceed the 256 MiB cap"
+        );
+        let i8_at = vec![Some(0u32); 256];
+        assert!(store.get_blocks(&i8_cog, 0, &i8_at).await.is_ok());
+
+        // Uint8 decodes into compact BandData::U8 (1 byte/sample), 512x512 tiles => 256 KiB/block.
+        // 300 blocks = 75 MiB <= 256 MiB cap => must succeed.
+        let u8_path = dir.join("sparse_u8.tif");
+        write_sparse_tiled_tiff(&u8_path, 512, 8, 1);
+        let u8_cog = store
+            .open_uri(&u8_path.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(
+            u8_cog.index.ifds[0].sample_type,
+            cogzilla_tiff::SampleType::Uint8
+        );
+        let u8_blocks = vec![Some(0u32); 300];
+        assert!(store.get_blocks(&u8_cog, 0, &u8_blocks).await.is_ok());
+
+        // Int32 decodes into BandData::F64 (8 bytes/sample), 512x512 tiles => 2 MiB/block.
+        // 129 blocks = 258 MiB > 256 MiB cap => must be refused.
+        let i32_path = dir.join("sparse_i32.tif");
+        write_sparse_tiled_tiff(&i32_path, 512, 32, 2);
+        let i32_cog = store
+            .open_uri(&i32_path.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(
+            i32_cog.index.ifds[0].sample_type,
+            cogzilla_tiff::SampleType::Int32
+        );
+        assert!(
+            store.get_blocks(&i32_cog, 0, &over_cap).await.is_err(),
+            "129 Int32 blocks decode to 258 MiB of BandData::F64 and must exceed the 256 MiB cap"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

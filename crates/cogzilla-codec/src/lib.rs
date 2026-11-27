@@ -404,6 +404,26 @@ pub fn zstd_to_vec(src: &[u8], expected: usize) -> Result<Vec<u8>, CodecError> {
 /// overflows and zip-bomb OOMs on hostile remote GeoTIFFs.
 const MAX_DECODED_TILE_BYTES: usize = 128 * 1024 * 1024;
 
+/// Resident in-memory bytes per sample of the [`BandData`] produced by [`decode_tile_rows`]
+/// for a given TIFF [`SampleType`].
+///
+/// Differs from [`SampleType::bytes_per_sample`] (on-disk width) because `Int8`/`Int16`
+/// reconstruct into `BandData::F32` (4 B) and `Uint32`/`Int32` reconstruct into
+/// `BandData::F64` (8 B) to preserve full 32-bit integer precision.
+#[inline(always)]
+pub const fn decoded_bytes_per_sample(st: SampleType) -> usize {
+    match st {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => 1,
+        SampleType::Uint16 => 2,
+        SampleType::Int8 | SampleType::Int16 | SampleType::Float32 => 4,
+        SampleType::Uint32
+        | SampleType::Int32
+        | SampleType::Uint64
+        | SampleType::Int64
+        | SampleType::Float64 => 8,
+    }
+}
+
 /// Decompress and reconstruct a single internal COG tile into planar 64-byte-aligned `f32` bands
 /// with precomputed `BlockStats`, reusing thread-local codec contexts and scratch memory.
 pub fn decode_tile(
