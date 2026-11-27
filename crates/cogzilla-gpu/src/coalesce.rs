@@ -2,7 +2,7 @@
 //!
 //! Coalesces arbitrary concurrent GPU jobs — across different COGs, slabs, colormaps,
 //! `CoordPlan`s (`Separable1D`, 17×17 `Grid2D`, `Exact2D`), output formats (`Rgba8`, `IndexedU8`,
-//! `RawF32`), and shader families (single-band colormap + DEM Horn 3×3 / Terrarium / TerrainRGB)
+//! `RawF32`), and shader families (single-band colormap + DEM numpy-gradient / Terrarium / TerrainRGB)
 //! — into **one `wgpu::CommandEncoder` → one `queue.submit()` → one `staging_buf.map_async()` →
 //! one `device.poll(Wait)`**.
 //!
@@ -51,8 +51,8 @@ struct TerrainParams {
     resample_mode: u32,
     alg_mode: u32,
     coord_mode: u32,
-    inv_8dx: f32,
-    inv_8dy: f32,
+    inv_dx: f32,
+    inv_dy: f32,
     z_factor: f32,
     sun_e: f32,
     sun_n: f32,
@@ -1108,8 +1108,8 @@ impl WorkerState {
                         resample_mode: mode.as_u32(),
                         alg_mode,
                         coord_mode,
-                        inv_8dx: 1.0 / (8.0 * pixel_size_x_m.max(1e-3)),
-                        inv_8dy: 1.0 / (8.0 * pixel_size_y_m.max(1e-3)),
+                        inv_dx: 1.0 / pixel_size_x_m.max(1e-9),
+                        inv_dy: 1.0 / pixel_size_y_m.max(1e-9),
                         z_factor,
                         sun_e,
                         sun_n,

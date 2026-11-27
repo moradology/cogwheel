@@ -6275,16 +6275,16 @@ pub fn render_terrain_tile<const N: usize>(
     }
 }
 
-/// On-the-fly 3×3 Horn DEM derivative algorithms (matching `gdaldem`).
+/// On-the-fly DEM derivative algorithms, from numpy's gradient as TiTiler takes it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DemAlgorithm {
-    /// Horn's 3×3 shaded relief in `[0.0, 255.0]`.
+    /// TiTiler's shaded relief in `[0.0, 255.0]`: lit from the gradient per pixel.
     Hillshade {
         azimuth_deg: f32,
         altitude_deg: f32,
         z_factor: f32,
     },
-    /// Terrain slope in degrees `[0.0, 90.0]`.
+    /// Terrain slope in degrees `[0.0, 90.0]`, over the grid's pixel size in its own units.
     Slope { z_factor: f32 },
     /// Compass aspect in degrees `[0.0, 360.0)` clockwise from North (`0=N, 90=E, 180=S, 270=W`).
     Aspect,
@@ -6305,61 +6305,41 @@ pub fn safe_rescale_denom(min: f32, max: f32) -> f32 {
     if d.abs() < 1e-12 { 1e-12 } else { d }
 }
 
-/// Evaluate a 3×3 Horn stencil centered at `(z_nw..z_se)` with isotropic ground spacing `1/(8*dx)`.
+/// numpy's gradient along one axis at a pixel `c` between `lo` and `hi`, in elevation per
+/// pixel: the centred difference over two pixels, or the one-sided difference over one where
+/// a neighbour is missing, as numpy takes it on an array's edge.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn eval_horn_3x3(
-    z_nw: f32,
-    z_n: f32,
-    z_ne: f32,
-    z_w: f32,
-    z_c: f32,
-    z_e: f32,
-    z_sw: f32,
-    z_s: f32,
-    z_se: f32,
-    inv_8dx: f32,
-    alg: DemAlgorithm,
-) -> f32 {
-    eval_horn_3x3_aniso(
-        z_nw, z_n, z_ne, z_w, z_c, z_e, z_sw, z_s, z_se, inv_8dx, inv_8dx, alg,
-    )
+pub fn dem_gradient(lo: f32, c: f32, hi: f32) -> f32 {
+    match (!lo.is_finite(), !hi.is_finite()) {
+        (false, false) => 0.5 * (hi - lo),
+        (true, false) => hi - c,
+        (false, true) => c - lo,
+        (true, true) => 0.0,
+    }
 }
 
-/// Evaluate a 3×3 Horn stencil with separate East-West (`inv_8dx`) and North-South (`inv_8dy`)
-/// inverse ground spacings (required for WGS84 / non-square bboxes where `dx_m != dy_m`).
+/// Evaluate a DEM algorithm at the pixel `z_c` from its four neighbours (North, West, East,
+/// South), with the inverse pixel sizes East-West (`inv_dx`) and North-South (`inv_dy`) in the
+/// grid's own units (TiTiler divides by the transform's pixel size). Hillshade, as TiTiler's,
+/// takes the gradient per pixel and does not use them.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn eval_horn_3x3_aniso(
-    z_nw: f32,
-    z_n: f32,
-    z_ne: f32,
-    z_w: f32,
+pub fn eval_dem_stencil(
+    n: f32,
+    w: f32,
     z_c: f32,
-    z_e: f32,
-    z_sw: f32,
-    z_s: f32,
-    z_se: f32,
-    inv_8dx: f32,
-    inv_8dy: f32,
+    e: f32,
+    s: f32,
+    inv_dx: f32,
+    inv_dy: f32,
     alg: DemAlgorithm,
 ) -> f32 {
-    if z_c.is_nan() {
+    if !z_c.is_finite() {
         return f32::NAN;
     }
-    // Fill any missing border neighbor with center elevation so coastal edges stay clean.
-    let nw = if z_nw.is_nan() { z_c } else { z_nw };
-    let n = if z_n.is_nan() { z_c } else { z_n };
-    let ne = if z_ne.is_nan() { z_c } else { z_ne };
-    let w = if z_w.is_nan() { z_c } else { z_w };
-    let e = if z_e.is_nan() { z_c } else { z_e };
-    let sw = if z_sw.is_nan() { z_c } else { z_sw };
-    let s = if z_s.is_nan() { z_c } else { z_s };
-    let se = if z_se.is_nan() { z_c } else { z_se };
-
-    // dz/dx (positive going East), dz/dy (positive going South)
-    let dz_dx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) * inv_8dx;
-    let dz_dy = ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne)) * inv_8dy;
+    // Per pixel, East-going and South-going.
+    let gx = dem_gradient(w, z_c, e);
+    let gy = dem_gradient(n, z_c, s);
 
     match alg {
         DemAlgorithm::Hillshade {
@@ -6367,6 +6347,9 @@ pub fn eval_horn_3x3_aniso(
             altitude_deg,
             z_factor,
         } => {
+            // TiTiler lights `sin(alt)·sin(slope) + cos(alt)·cos(slope)·cos(az - aspect)` and
+            // writes `255·(shaded + 1) / 2` as bytes (truncated, before any rescale); the dot
+            // product below is the same in closed form.
             let zenith = (90.0 - altitude_deg).to_radians();
             // Sun vector in East/North/Up coordinates:
             // azimuth_deg is clockwise from North (0=N, 90=E, 315=NW).
@@ -6374,18 +6357,21 @@ pub fn eval_horn_3x3_aniso(
             let sun_e = az.sin() * zenith.sin();
             let sun_n = az.cos() * zenith.sin();
             let sun_u = zenith.cos();
-            // Surface normal in (East, North, Up) = (-z*dz_dx, +z*dz_dy, 1) normalized
-            let nx = -z_factor * dz_dx;
-            let ny = z_factor * dz_dy;
-            let inv_len = 1.0 / (nx * nx + ny * ny + 1.0).sqrt();
-            let dot = (nx * sun_e + ny * sun_n + sun_u) * inv_len;
-            (dot.max(0.0) * 255.0).clamp(0.0, 255.0)
+            // Surface normal in (East, North, Up) = (-z*gx, +z*gy, 1) normalized
+            let nx = -z_factor * gx;
+            let ny = z_factor * gy;
+            let dot = (nx * sun_e + ny * sun_n + sun_u) / (nx * nx + ny * ny + 1.0).sqrt();
+            (dot * 127.5 + 127.5).clamp(0.0, 255.0).trunc()
         }
         DemAlgorithm::Slope { z_factor } => {
+            let dz_dx = gx * inv_dx;
+            let dz_dy = gy * inv_dy;
             let grad = (dz_dx * dz_dx + dz_dy * dz_dy).sqrt() * z_factor;
             grad.atan().to_degrees()
         }
         DemAlgorithm::Aspect => {
+            let dz_dx = gx * inv_dx;
+            let dz_dy = gy * inv_dy;
             if dz_dx.abs() < 1e-12 && dz_dy.abs() < 1e-12 {
                 return f32::NAN;
             }
@@ -6399,6 +6385,9 @@ pub fn eval_horn_3x3_aniso(
             minz,
             maxz,
         } => {
+            // A missing neighbour reads as the pixel itself, so no line is drawn toward it.
+            let fill = |v: f32| if v.is_nan() { z_c } else { v };
+            let (n, s, e, w) = (fill(n), fill(s), fill(e), fill(w));
             let inc = increment.max(1e-4);
             let in_range = z_c >= minz && z_c <= maxz;
             let level = (z_c / inc).floor();
@@ -6423,15 +6412,17 @@ pub fn eval_horn_3x3_aniso(
     }
 }
 
-/// SIMD Horn 3×3 hillshade row evaluator for clean (`no_nodata`) DEM tiles:
-/// processes 4 pixels/iter on ARM64 NEON or 8 pixels/iter on x86-64 AVX2 using pure contiguous
-/// vector loads from `row0`, `row1`, `row2` (`N + 2` floats each) and writes rescaled `u8` indices.
+/// SIMD hillshade row evaluator for clean (`no_nodata`) DEM tiles: TiTiler's shading from
+/// numpy's centred gradient per pixel, 4 pixels/iter on ARM64 NEON or 8 pixels/iter on x86-64
+/// AVX2, from contiguous loads of `row0`, `row1`, `row2` (`N + 2` floats each, the rows above,
+/// at and below), writing rescaled `u8` indices. Clean tiles hold no NaN (block statistics
+/// count NaN as nodata), so no neighbour is missing.
 #[inline(always)]
-fn eval_horn_hillshade_row_clean<const N: usize>(
+#[allow(clippy::too_many_arguments)]
+fn eval_hillshade_row_clean<const N: usize>(
     row0: &[f32],
     row1: &[f32],
     row2: &[f32],
-    inv_8dx: f32,
     azimuth_deg: f32,
     altitude_deg: f32,
     z_factor: f32,
@@ -6444,18 +6435,19 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
     let sun_e = az.sin() * zenith.sin();
     let sun_n = az.cos() * zenith.sin();
     let sun_u = zenith.cos();
-    let neg_z_scale = -z_factor * inv_8dx;
-    let pos_z_scale = z_factor * inv_8dx;
+    // The centred difference halves the step across two pixels.
+    let neg_z_scale = -0.5 * z_factor;
+    let pos_z_scale = 0.5 * z_factor;
     #[allow(unused_assignments, unused_mut)]
     let mut start_px = 0usize;
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
-        let v_two = vdupq_n_f32(2.0);
         let v_one = vdupq_n_f32(1.0);
         let v_zero = vdupq_n_f32(0.0);
         let v_255 = vdupq_n_f32(255.0);
+        let v_half_255 = vdupq_n_f32(127.5);
         let v_neg_zs = vdupq_n_f32(neg_z_scale);
         let v_pos_zs = vdupq_n_f32(pos_z_scale);
         let v_se = vdupq_n_f32(sun_e);
@@ -6470,27 +6462,18 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
         let out_ptr = out_idx.as_mut_ptr();
         let mut px = 0usize;
         while px + 4 <= N {
-            let nw = vld1q_f32(r0.add(px));
             let n = vld1q_f32(r0.add(px + 1));
-            let ne = vld1q_f32(r0.add(px + 2));
             let w = vld1q_f32(r1.add(px));
             let e = vld1q_f32(r1.add(px + 2));
-            let sw = vld1q_f32(r2.add(px));
             let s = vld1q_f32(r2.add(px + 1));
-            let se = vld1q_f32(r2.add(px + 2));
 
-            let east = vaddq_f32(vfmaq_f32(ne, v_two, e), se);
-            let west = vaddq_f32(vfmaq_f32(nw, v_two, w), sw);
-            let nx = vmulq_f32(vsubq_f32(east, west), v_neg_zs);
-
-            let south = vaddq_f32(vfmaq_f32(sw, v_two, s), se);
-            let north = vaddq_f32(vfmaq_f32(nw, v_two, n), ne);
-            let ny = vmulq_f32(vsubq_f32(south, north), v_pos_zs);
+            let nx = vmulq_f32(vsubq_f32(e, w), v_neg_zs);
+            let ny = vmulq_f32(vsubq_f32(s, n), v_pos_zs);
 
             let len_sq = vfmaq_f32(vfmaq_f32(v_one, nx, nx), ny, ny);
             let num = vfmaq_f32(vfmaq_f32(v_su, nx, v_se), ny, v_sn);
             let dot = vdivq_f32(num, vsqrtq_f32(len_sq));
-            let hs = vminq_f32(vmulq_f32(vmaxq_f32(dot, v_zero), v_255), v_255);
+            let hs = vrndq_f32(vminq_f32(vmaxq_f32(vfmaq_f32(v_half_255, dot, v_half_255), v_zero), v_255));
             let scaled = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(hs, v_min), v_inv_r), v_zero), v_255);
             // Narrow 4x u32 -> 4x u8 in registers and emit a single unaligned u32 store.
             let u32_v = vcvtq_u32_f32(scaled);
@@ -6507,7 +6490,7 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             unsafe {
-                eval_horn_hillshade_row_clean_avx2::<N>(
+                eval_hillshade_row_clean_avx2::<N>(
                     row0.as_ptr(),
                     row1.as_ptr(),
                     row2.as_ptr(),
@@ -6527,11 +6510,14 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
 
     for px in start_px..N {
         let c = px + 1;
-        let val = eval_horn_3x3(
-            row0[c - 1], row0[c], row0[c + 1],
-            row1[c - 1], row1[c], row1[c + 1],
-            row2[c - 1], row2[c], row2[c + 1],
-            inv_8dx,
+        let val = eval_dem_stencil(
+            row0[c],
+            row1[c - 1],
+            row1[c],
+            row1[c + 1],
+            row2[c],
+            1.0,
+            1.0,
             DemAlgorithm::Hillshade { azimuth_deg, altitude_deg, z_factor },
         );
         out_idx[px] = rescale_u8(val, inv_range, min_val);
@@ -6540,7 +6526,8 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
+#[allow(clippy::too_many_arguments)]
+unsafe fn eval_hillshade_row_clean_avx2<const N: usize>(
     r0: *const f32,
     r1: *const f32,
     r2: *const f32,
@@ -6554,12 +6541,10 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     out_idx: &mut [u8],
 ) {
     use std::arch::x86_64::*;
-    let v_two = _mm256_set1_ps(2.0);
     let v_one = _mm256_set1_ps(1.0);
     let v_zero = _mm256_setzero_ps();
     let v_255 = _mm256_set1_ps(255.0);
-    let v_half = _mm256_set1_ps(0.5);
-    let v_one_half = _mm256_set1_ps(1.5);
+    let v_half_255 = _mm256_set1_ps(127.5);
     let v_neg_zs = _mm256_set1_ps(neg_z_scale);
     let v_pos_zs = _mm256_set1_ps(pos_z_scale);
     let v_se = _mm256_set1_ps(sun_e);
@@ -6571,31 +6556,23 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     let out_ptr = out_idx.as_mut_ptr();
     let mut px = 0usize;
     while px + 8 <= N {
-        let nw = _mm256_loadu_ps(r0.add(px));
         let n = _mm256_loadu_ps(r0.add(px + 1));
-        let ne = _mm256_loadu_ps(r0.add(px + 2));
         let w = _mm256_loadu_ps(r1.add(px));
         let e = _mm256_loadu_ps(r1.add(px + 2));
-        let sw = _mm256_loadu_ps(r2.add(px));
         let s = _mm256_loadu_ps(r2.add(px + 1));
-        let se = _mm256_loadu_ps(r2.add(px + 2));
 
-        let east = _mm256_add_ps(_mm256_fmadd_ps(v_two, e, ne), se);
-        let west = _mm256_add_ps(_mm256_fmadd_ps(v_two, w, nw), sw);
-        let nx = _mm256_mul_ps(_mm256_sub_ps(east, west), v_neg_zs);
-
-        let south = _mm256_add_ps(_mm256_fmadd_ps(v_two, s, sw), se);
-        let north = _mm256_add_ps(_mm256_fmadd_ps(v_two, n, nw), ne);
-        let ny = _mm256_mul_ps(_mm256_sub_ps(south, north), v_pos_zs);
+        let nx = _mm256_mul_ps(_mm256_sub_ps(e, w), v_neg_zs);
+        let ny = _mm256_mul_ps(_mm256_sub_ps(s, n), v_pos_zs);
 
         let len_sq = _mm256_fmadd_ps(ny, ny, _mm256_fmadd_ps(nx, nx, v_one));
         let num = _mm256_fmadd_ps(ny, v_sn, _mm256_fmadd_ps(nx, v_se, v_su));
-        // Hardware reciprocal-sqrt + 1 Newton-Raphson step: r * (1.5 - 0.5 * len_sq * r * r)
-        let r = _mm256_rsqrt_ps(len_sq);
-        let r2 = _mm256_mul_ps(r, r);
-        let inv_len = _mm256_mul_ps(r, _mm256_fnmadd_ps(_mm256_mul_ps(v_half, len_sq), r2, v_one_half));
-        let dot = _mm256_mul_ps(num, inv_len);
-        let hs = _mm256_min_ps(_mm256_mul_ps(_mm256_max_ps(dot, v_zero), v_255), v_255);
+        // An exact square root and division, as the scalar path: levels are truncated, so
+        // an approximate reciprocal would move pixels across a level.
+        let dot = _mm256_div_ps(num, _mm256_sqrt_ps(len_sq));
+        let hs = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(_mm256_min_ps(
+            _mm256_max_ps(_mm256_fmadd_ps(dot, v_half_255, v_half_255), v_zero),
+            v_255,
+        ));
         let scaled = _mm256_min_ps(
             _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(hs, v_min), v_inv_r), v_zero),
             v_255,
@@ -6612,13 +6589,14 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     }
 }
 
-/// Render an on-the-fly DEM derivative tile (Hillshade, Slope, or Aspect) using Horn's 3×3
-/// stencil over a 1-pixel-padded resampled elevation buffer for seamless tile boundaries.
+/// Render an on-the-fly DEM derivative tile (Hillshade, Slope, or Aspect) from numpy's
+/// gradient over a 1-pixel-padded resampled elevation buffer for seamless tile boundaries.
+/// `pixel_size` is the tile's pixel size in its own system's units (Web Mercator metres).
 pub fn render_dem_algorithm<const N: usize>(
     plan: &CoordPlan<N>,
     src: &BandSource<'_>,
     alg: DemAlgorithm,
-    pixel_size_m: f32,
+    pixel_size: f32,
     style: &SingleBandStyle,
 ) -> Bytes {
     if src.all_nodata {
@@ -6755,44 +6733,31 @@ pub fn render_dem_algorithm<const N: usize>(
             (2.0 * v_row[N - 1] - v_prev[N - 1]) + (v_row[N - 1] - v_row[N - 2]),
         );
 
-        // When interior pixels are all valid (`clean == true`) but the tile abuts a DEM raster
-        // edge, `sample_border` writes `f32::NAN` into the 1-px extrapolated stencil ring.
-        // Clamp any NaN border cell to its adjacent interior pixel (matching `eval_horn_3x3`'s
-        // edge-fill) so the branchless SIMD hillshade path never turns raster-edge borders black.
-        if clean {
+        // The branchless SIMD hillshade path assumes every 4-neighbour (including the 1-px
+        // extrapolated halo) is finite so centred differences match `dem_gradient`. If a clean
+        // tile abuts a DEM raster edge, leave those border cells as NaN (do NOT clamp them,
+        // which would halve one-sided edge gradients) and fall back to scalar `eval_dem_stencil`.
+        let mut halo_clean = clean;
+        if halo_clean {
             for py in 0..N {
                 let row_off = (py + 1) * pad;
-                if elev[row_off].is_nan() {
-                    elev[row_off] = elev[row_off + 1];
-                }
-                if elev[row_off + N + 1].is_nan() {
-                    elev[row_off + N + 1] = elev[row_off + N];
+                if !elev[row_off].is_finite() || !elev[row_off + N + 1].is_finite() {
+                    halo_clean = false;
+                    break;
                 }
             }
+        }
+        if halo_clean {
             for px in 0..N {
                 let c = px + 1;
-                if elev[c].is_nan() {
-                    elev[c] = elev[pad + c];
+                if !elev[c].is_finite() || !elev[(N + 1) * pad + c].is_finite() {
+                    halo_clean = false;
+                    break;
                 }
-                if elev[(N + 1) * pad + c].is_nan() {
-                    elev[(N + 1) * pad + c] = elev[N * pad + c];
-                }
-            }
-            if elev[0].is_nan() {
-                elev[0] = elev[pad + 1];
-            }
-            if elev[pad - 1].is_nan() {
-                elev[pad - 1] = elev[pad + N];
-            }
-            if elev[(N + 1) * pad].is_nan() {
-                elev[(N + 1) * pad] = elev[N * pad + 1];
-            }
-            if elev[(N + 1) * pad + pad - 1].is_nan() {
-                elev[(N + 1) * pad + pad - 1] = elev[N * pad + N];
             }
         }
 
-        let inv_8dx = 1.0 / (8.0 * pixel_size_m.max(1e-3));
+        let inv_dx = 1.0 / pixel_size.max(1e-9);
         let inv_range = 255.0 / safe_rescale_denom(style.rescale_min, style.rescale_max);
         let min_val = style.rescale_min;
         let lut = style.colormap.lut();
@@ -6806,19 +6771,7 @@ pub fn render_dem_algorithm<const N: usize>(
                     let r2 = (py + 2) * pad;
                     for px in 0..N {
                         let c = px + 1;
-                        let val = eval_horn_3x3(
-                            elev[r0 + c - 1],
-                            elev[r0 + c],
-                            elev[r0 + c + 1],
-                            elev[r1 + c - 1],
-                            elev[r1 + c],
-                            elev[r1 + c + 1],
-                            elev[r2 + c - 1],
-                            elev[r2 + c],
-                            elev[r2 + c + 1],
-                            inv_8dx,
-                            alg,
-                        );
+                        let val = eval_dem_stencil(elev[r0 + c], elev[r1 + c - 1], elev[r1 + c], elev[r1 + c + 1], elev[r2 + c], inv_dx, inv_dx, alg);
                         out.put_slice(&val.to_le_bytes());
                     }
                 }
@@ -6834,7 +6787,7 @@ pub fn render_dem_algorithm<const N: usize>(
                     sc.row_buf.resize(N, 0);
                 }
                 let mut has_nodata = false;
-                if clean {
+                if halo_clean {
                     if let DemAlgorithm::Hillshade {
                         azimuth_deg,
                         altitude_deg,
@@ -6846,11 +6799,10 @@ pub fn render_dem_algorithm<const N: usize>(
                             let r1 = (py + 1) * pad;
                             let r2 = (py + 2) * pad;
                             let row_idx = &mut sc.row_buf[..N];
-                            eval_horn_hillshade_row_clean::<N>(
+                            eval_hillshade_row_clean::<N>(
                                 &elev[r0..r0 + pad],
                                 &elev[r1..r1 + pad],
                                 &elev[r2..r2 + pad],
-                                inv_8dx,
                                 azimuth_deg,
                                 altitude_deg,
                                 z_factor,
@@ -6891,19 +6843,7 @@ pub fn render_dem_algorithm<const N: usize>(
                         let r2 = (py + 2) * pad;
                         for px in 0..N {
                             let c = px + 1;
-                            let val = eval_horn_3x3(
-                                elev[r0 + c - 1],
-                                elev[r0 + c],
-                                elev[r0 + c + 1],
-                                elev[r1 + c - 1],
-                                elev[r1 + c],
-                                elev[r1 + c + 1],
-                                elev[r2 + c - 1],
-                                elev[r2 + c],
-                                elev[r2 + c + 1],
-                                inv_8dx,
-                                alg,
-                            );
+                            let val = eval_dem_stencil(elev[r0 + c], elev[r1 + c - 1], elev[r1 + c], elev[r1 + c + 1], elev[r2 + c], inv_dx, inv_dx, alg);
                             if val.is_nan() {
                                 row_ga[px * 2] = 0;
                                 row_ga[px * 2 + 1] = 0;
@@ -6924,19 +6864,7 @@ pub fn render_dem_algorithm<const N: usize>(
                     let row_idx = &mut sc.row_buf[..N];
                     for px in 0..N {
                         let c = px + 1;
-                        let val = eval_horn_3x3(
-                            elev[r0 + c - 1],
-                            elev[r0 + c],
-                            elev[r0 + c + 1],
-                            elev[r1 + c - 1],
-                            elev[r1 + c],
-                            elev[r1 + c + 1],
-                            elev[r2 + c - 1],
-                            elev[r2 + c],
-                            elev[r2 + c + 1],
-                            inv_8dx,
-                            alg,
-                        );
+                        let val = eval_dem_stencil(elev[r0 + c], elev[r1 + c - 1], elev[r1 + c], elev[r1 + c + 1], elev[r2 + c], inv_dx, inv_dx, alg);
                         if val.is_nan() {
                             has_nodata = true;
                             row_idx[px] = 0;
@@ -6972,19 +6900,7 @@ pub fn render_dem_algorithm<const N: usize>(
                             let r2 = (py + 2) * pad;
                             for px in 0..N {
                                 let c = px + 1;
-                                let val = eval_horn_3x3(
-                                    elev[r0 + c - 1],
-                                    elev[r0 + c],
-                                    elev[r0 + c + 1],
-                                    elev[r1 + c - 1],
-                                    elev[r1 + c],
-                                    elev[r1 + c + 1],
-                                    elev[r2 + c - 1],
-                                    elev[r2 + c],
-                                    elev[r2 + c + 1],
-                                    inv_8dx,
-                                    alg,
-                                );
+                                let val = eval_dem_stencil(elev[r0 + c], elev[r1 + c - 1], elev[r1 + c], elev[r1 + c + 1], elev[r2 + c], inv_dx, inv_dx, alg);
                                 if val.is_nan() {
                                     row_ga[px * 2] = 0;
                                     row_ga[px * 2 + 1] = 0;
@@ -7004,19 +6920,7 @@ pub fn render_dem_algorithm<const N: usize>(
                             let row_idx = &mut sc.row_buf[..N];
                             for px in 0..N {
                                 let c = px + 1;
-                                let val = eval_horn_3x3(
-                                    elev[r0 + c - 1],
-                                    elev[r0 + c],
-                                    elev[r0 + c + 1],
-                                    elev[r1 + c - 1],
-                                    elev[r1 + c],
-                                    elev[r1 + c + 1],
-                                    elev[r2 + c - 1],
-                                    elev[r2 + c],
-                                    elev[r2 + c + 1],
-                                    inv_8dx,
-                                    alg,
-                                );
+                                let val = eval_dem_stencil(elev[r0 + c], elev[r1 + c - 1], elev[r1 + c], elev[r1 + c + 1], elev[r2 + c], inv_dx, inv_dx, alg);
                                 row_idx[px] = if val.is_nan() {
                                     0
                                 } else {
@@ -7047,19 +6951,7 @@ pub fn render_dem_algorithm<const N: usize>(
                     let row_off = py * N * 4;
                     for px in 0..N {
                         let c = px + 1;
-                        let val = eval_horn_3x3(
-                            elev[r0 + c - 1],
-                            elev[r0 + c],
-                            elev[r0 + c + 1],
-                            elev[r1 + c - 1],
-                            elev[r1 + c],
-                            elev[r1 + c + 1],
-                            elev[r2 + c - 1],
-                            elev[r2 + c],
-                            elev[r2 + c + 1],
-                            inv_8dx,
-                            alg,
-                        );
+                        let val = eval_dem_stencil(elev[r0 + c], elev[r1 + c - 1], elev[r1 + c], elev[r1 + c + 1], elev[r2 + c], inv_dx, inv_dx, alg);
                         let off = row_off + px * 4;
                         if val.is_nan() {
                             all_opaque = false;
@@ -7288,48 +7180,61 @@ mod tests {
     }
 
     #[test]
-    fn dem_horn_3x3_matches_analytical_flat_and_45deg_east_ramp() {
-        let dx = 10.0f32;
-        let inv_8dx = 1.0 / (8.0 * dx);
+    fn dem_stencil_matches_analytical_flat_and_45deg_east_ramp() {
+        let inv_dx = 1.0 / 10.0f32;
 
-        // Flat plane z = 500m -> slope = 0 deg, hillshade(alt=45) = 255 * sin(45 deg) ~= 180.3
-        let flat_slope = eval_horn_3x3(
-            500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, inv_8dx,
-            DemAlgorithm::Slope { z_factor: 1.0 },
-        );
+        // Flat plane z = 500m -> slope = 0 deg, TiTiler's hillshade(alt=45) = 255 * (sin(45 deg) + 1) / 2 ~= 217.7, as a byte 217
+        let flat = |alg| eval_dem_stencil(500.0, 500.0, 500.0, 500.0, 500.0, inv_dx, inv_dx, alg);
+        let flat_slope = flat(DemAlgorithm::Slope { z_factor: 1.0 });
         assert!(flat_slope.abs() < 1e-4, "expected 0 deg slope, got {flat_slope}");
-
-        let flat_hs = eval_horn_3x3(
-            500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, inv_8dx,
-            DemAlgorithm::Hillshade {
-                azimuth_deg: 315.0,
-                altitude_deg: 45.0,
-                z_factor: 1.0,
-            },
-        );
-        assert!(
-            (flat_hs - 180.312).abs() < 0.1,
-            "expected ~180.3 flat hillshade, got {flat_hs}"
-        );
+        let flat_hs = flat(DemAlgorithm::Hillshade { azimuth_deg: 315.0, altitude_deg: 45.0, z_factor: 1.0 });
+        assert_eq!(flat_hs, 217.0, "expected 217.66 written as a byte");
 
         // 45-degree east-facing ramp: z drops by dx (=10m) each step East -> dz/dx = -1, dz/dy = 0
-        let ramp_slope = eval_horn_3x3(
-            110.0, 100.0, 90.0, 110.0, 100.0, 90.0, 110.0, 100.0, 90.0, inv_8dx,
-            DemAlgorithm::Slope { z_factor: 1.0 },
-        );
-        assert!(
-            (ramp_slope - 45.0).abs() < 1e-3,
-            "expected 45 deg slope, got {ramp_slope}"
-        );
+        let ramp = |alg| eval_dem_stencil(100.0, 110.0, 100.0, 90.0, 100.0, inv_dx, inv_dx, alg);
+        let ramp_slope = ramp(DemAlgorithm::Slope { z_factor: 1.0 });
+        assert!((ramp_slope - 45.0).abs() < 1e-3, "expected 45 deg slope, got {ramp_slope}");
+        let ramp_aspect = ramp(DemAlgorithm::Aspect);
+        assert!((ramp_aspect - 90.0).abs() < 1e-3, "expected 90 deg (East) aspect, got {ramp_aspect}");
+        // A missing neighbour is numpy's one-sided difference, over one pixel.
+        let edge = eval_dem_stencil(100.0, f32::NAN, 100.0, 90.0, 100.0, inv_dx, inv_dx, DemAlgorithm::Slope { z_factor: 1.0 });
+        assert!((edge - 45.0).abs() < 1e-3, "expected 45 deg slope from one side, got {edge}");
+    }
 
-        let ramp_aspect = eval_horn_3x3(
-            110.0, 100.0, 90.0, 110.0, 100.0, 90.0, 110.0, 100.0, 90.0, inv_8dx,
-            DemAlgorithm::Aspect,
-        );
-        assert!(
-            (ramp_aspect - 90.0).abs() < 1e-3,
-            "expected 90 deg (East) aspect, got {ramp_aspect}"
-        );
+    #[test]
+    fn hillshade_is_titilers() {
+        // titiler.core.algorithm.dem.HillShade, written out in double precision: numpy's
+        // gradient per pixel (axis 0 down, axis 1 across), its slope and aspect, its azimuth.
+        let titiler = |z: &[[f64; 3]; 3], azimuth: f64, altitude: f64, zx: f64| -> f64 {
+            let x = 0.5 * (z[2][1] - z[0][1]) * zx;
+            let y = 0.5 * (z[1][2] - z[1][0]) * zx;
+            let slope = std::f64::consts::FRAC_PI_2 - (x * x + y * y).sqrt().atan();
+            let aspect = (-x).atan2(y);
+            let az = (360.0 - azimuth).to_radians();
+            let alt = altitude.to_radians();
+            let shaded = alt.sin() * slope.sin() + alt.cos() * slope.cos() * (az - aspect).cos();
+            (255.0 * (shaded + 1.0) / 2.0).max(0.0)
+        };
+        let patches = [
+            [[100.0, 103.0, 109.0], [98.0, 101.0, 107.0], [91.0, 97.0, 104.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[500.0, 480.0, 470.0], [520.0, 505.0, 471.0], [560.0, 530.0, 500.0]],
+        ];
+        for z in &patches {
+            for (azimuth, altitude, zx) in [(45.0, 45.0, 1.0), (200.0, 20.0, 1.0), (0.0, 60.0, 3.0), (360.0, -30.0, 0.5)] {
+                let want = titiler(z, azimuth, altitude, zx);
+                // Compass degrees, as the query is converted: TiTiler's 45 is 315 (North-West).
+                let alg = DemAlgorithm::Hillshade {
+                    azimuth_deg: ((azimuth - 90.0) as f32).rem_euclid(360.0),
+                    altitude_deg: altitude as f32,
+                    z_factor: zx as f32,
+                };
+                let f = |r: usize, c: usize| z[r][c] as f32;
+                let got = eval_dem_stencil(f(0, 1), f(1, 0), f(1, 1), f(1, 2), f(2, 1), 1.0, 1.0, alg);
+                // Written as a byte, as TiTiler's `astype("uint8")`.
+                assert!(got == got.trunc() && (got as f64 - want.trunc()).abs() < 1e-9, "{z:?} {azimuth} {altitude} {zx}: {got} vs {want}");
+            }
+        }
     }
 
     #[test]
@@ -7420,7 +7325,7 @@ mod tests {
     }
 
     #[test]
-    fn simd_cubic_and_horn_hillshade_match_scalar() {
+    fn simd_cubic_and_hillshade_match_scalar() {
         let tw = 512u32;
         let th = 512u32;
         let len = (tw * th) as usize;
@@ -7470,7 +7375,7 @@ mod tests {
             );
         }
 
-        // 2. Verify SIMD Horn 3x3 hillshade row against scalar eval_horn_3x3
+        // 2. Verify the SIMD hillshade row against scalar eval_dem_stencil
         let mut r0 = [0.0f32; 258];
         let mut r1 = [0.0f32; 258];
         let mut r2 = [0.0f32; 258];
@@ -7480,17 +7385,15 @@ mod tests {
             r2[i] = src.sample_inbounds(i as u32 + 10, 12);
         }
         let mut simd_out = [0u8; 256];
-        let inv_8dx = 1.0 / (8.0 * 30.0);
-        eval_horn_hillshade_row_clean::<256>(
-            &r0, &r1, &r2, inv_8dx, 315.0, 45.0, 2.0, 1.0, 0.0, &mut simd_out,
+        eval_hillshade_row_clean::<256>(
+            &r0, &r1, &r2, 315.0, 45.0, 2.0, 1.0, 0.0, &mut simd_out,
         );
         for px in 0..256 {
             let c = px + 1;
-            let s = eval_horn_3x3(
-                r0[c - 1], r0[c], r0[c + 1],
-                r1[c - 1], r1[c], r1[c + 1],
-                r2[c - 1], r2[c], r2[c + 1],
-                inv_8dx,
+            let s = eval_dem_stencil(
+                r0[c], r1[c - 1], r1[c], r1[c + 1], r2[c],
+                1.0,
+                1.0,
                 DemAlgorithm::Hillshade {
                     azimuth_deg: 315.0,
                     altitude_deg: 45.0,
@@ -7499,7 +7402,7 @@ mod tests {
             );
             let scalar_u8 = rescale_u8(s, 1.0, 0.0);
             let diff = (simd_out[px] as i32 - scalar_u8 as i32).abs();
-            assert!(diff <= 1, "horn mismatch at px={px}: simd={} scalar={scalar_u8}", simd_out[px]);
+            assert!(diff <= 1, "hillshade mismatch at px={px}: simd={} scalar={scalar_u8}", simd_out[px]);
         }
 
         // 3. Time 100 iterations of 256x256 cubic hillshade PNG
@@ -7542,15 +7445,13 @@ mod tests {
     }
 
     #[test]
-    fn dem_horn_anisotropic_spacing_matches_exact_slope() {
-        // At 60°N in EPSG:4326, dx_m = 5.0 m and dy_m = 10.0 m.
+    fn dem_anisotropic_spacing_matches_exact_slope() {
+        // Pixels 5 units wide and 10 high.
         // A 45° East-facing ramp rises 5 m per East pixel (dz/dx = 1.0, dz/dy = 0.0).
-        let slope = eval_horn_3x3_aniso(
-            0.0, 5.0, 10.0,
-            0.0, 5.0, 10.0,
-            0.0, 5.0, 10.0,
-            1.0 / (8.0 * 5.0),
-            1.0 / (8.0 * 10.0),
+        let slope = eval_dem_stencil(
+            5.0, 0.0, 5.0, 10.0, 5.0,
+            1.0 / 5.0,
+            1.0 / 10.0,
             DemAlgorithm::Slope { z_factor: 1.0 },
         );
         assert!((slope - 45.0).abs() < 1e-4, "expected 45.0° slope, got {slope}");
@@ -8407,10 +8308,10 @@ mod npy_typed_tests {
         let r1 = [10.0f32; 7];
         let r2 = [10.0f32; 7];
         let mut hs = [0xEEu8; 5];
-        eval_horn_hillshade_row_clean::<5>(&r0, &r1, &r2, 1.0 / 80.0, 315.0, 45.0, 1.0, 1.0, 0.0, &mut hs);
+        eval_hillshade_row_clean::<5>(&r0, &r1, &r2, 315.0, 45.0, 1.0, 1.0, 0.0, &mut hs);
         assert!(
             hs.iter().all(|&b| b == hs[0] && b != 0xEE),
-            "tail pixel in eval_horn_hillshade_row_clean::<5> was not written: {hs:?}"
+            "tail pixel in eval_hillshade_row_clean::<5> was not written: {hs:?}"
         );
     }
 
@@ -8453,17 +8354,18 @@ mod npy_typed_tests {
 
     #[test]
     fn audit87_simd_scalar_rounding_parity_and_downscale_footprint_edge() {
-        // 1. Clean Horn hillshade: SIMD lanes (0..4) and scalar tail (4) must match exactly.
+        // 1. Clean hillshade: SIMD lanes (0..4) and scalar tail (4) must match exactly.
+        // Flat at 40°: TiTiler's 255 * (sin(40°) + 1) / 2 = 209.46, truncated.
         let r0 = [10.0f32; 7];
         let r1 = [10.0f32; 7];
         let r2 = [10.0f32; 7];
         let mut out = [0u8; 5];
-        eval_horn_hillshade_row_clean::<5>(&r0, &r1, &r2, 1.0, 315.0, 40.0, 1.0, 1.0, 0.0, &mut out);
+        eval_hillshade_row_clean::<5>(&r0, &r1, &r2, 315.0, 40.0, 1.0, 1.0, 0.0, &mut out);
         assert!(
             out.iter().all(|&v| v == out[0]),
             "hillshade SIMD lanes and scalar tail diverged: {out:?}"
         );
-        assert_eq!(out[0], 163);
+        assert_eq!(out[0], 209);
 
         // 2. Single-block RGB bilinear: SIMD lanes (0..4) and scalar tail (4) must match exactly.
         let r_blk: [u8; 16] = [

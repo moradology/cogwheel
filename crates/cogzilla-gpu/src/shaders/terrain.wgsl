@@ -10,8 +10,9 @@ struct TerrainParams {
     alg_mode: u32,
     /// Coordinate mode: 0 = Separable1D, 1 = Grid2D (17x17), 2 = Exact2D (dst_w * dst_h)
     coord_mode: u32,
-    inv_8dx: f32,
-    inv_8dy: f32,
+    /// Inverse pixel sizes in the grid's own units (slope and aspect).
+    inv_dx: f32,
+    inv_dy: f32,
     z_factor: f32,
     sun_e: f32,
     sun_n: f32,
@@ -79,7 +80,25 @@ fn eval_uv_extrap(ix: i32, iy: i32) -> vec2<f32> {
     return uv;
 }
 
-fn eval_horn_from_shared(lx: u32, ly: u32) -> f32 {
+// numpy's gradient, as TiTiler takes it: the centred difference over two pixels, or the
+// one-sided difference over one where a neighbour is missing (NaN or infinite).
+fn dem_gradient(lo: f32, c: f32, hi: f32) -> f32 {
+    // A neighbour that is NaN or infinite is missing.
+    let lo_nan = !is_finite_f32(lo);
+    let hi_nan = !is_finite_f32(hi);
+    if (!lo_nan && !hi_nan) {
+        return 0.5 * (hi - lo);
+    }
+    if (lo_nan && !hi_nan) {
+        return hi - c;
+    }
+    if (!lo_nan && hi_nan) {
+        return c - lo;
+    }
+    return 0.0;
+}
+
+fn eval_dem_from_shared(lx: u32, ly: u32) -> f32 {
     let cx = lx + 1u;
     let cy = ly + 1u;
     let z_c = shared_elev[cy * 18u + cx];
@@ -87,38 +106,24 @@ fn eval_horn_from_shared(lx: u32, ly: u32) -> f32 {
         return nan_f32();
     }
 
-    let r0 = (cy - 1u) * 18u;
-    let r1 = cy * 18u;
-    let r2 = (cy + 1u) * 18u;
+    let n = shared_elev[(cy - 1u) * 18u + cx];
+    let w = shared_elev[cy * 18u + cx - 1u];
+    let e = shared_elev[cy * 18u + cx + 1u];
+    let s = shared_elev[(cy + 1u) * 18u + cx];
 
-    let z_nw = shared_elev[r0 + cx - 1u];
-    let z_n  = shared_elev[r0 + cx];
-    let z_ne = shared_elev[r0 + cx + 1u];
-    let z_w  = shared_elev[r1 + cx - 1u];
-    let z_e  = shared_elev[r1 + cx + 1u];
-    let z_sw = shared_elev[r2 + cx - 1u];
-    let z_s  = shared_elev[r2 + cx];
-    let z_se = shared_elev[r2 + cx + 1u];
-
-    let nw = select(z_c, z_nw, is_finite_f32(z_nw));
-    let n  = select(z_c, z_n,  is_finite_f32(z_n));
-    let ne = select(z_c, z_ne, is_finite_f32(z_ne));
-    let w  = select(z_c, z_w,  is_finite_f32(z_w));
-    let e  = select(z_c, z_e,  is_finite_f32(z_e));
-    let sw = select(z_c, z_sw, is_finite_f32(z_sw));
-    let s  = select(z_c, z_s,  is_finite_f32(z_s));
-    let se = select(z_c, z_se, is_finite_f32(z_se));
-
-    let dz_dx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) * params.inv_8dx;
-    let dz_dy = ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne)) * params.inv_8dy;
+    // Per pixel, East-going and South-going.
+    let gx = dem_gradient(w, z_c, e);
+    let gy = dem_gradient(n, z_c, s);
+    let dz_dx = gx * params.inv_dx;
+    let dz_dy = gy * params.inv_dy;
 
     if (params.alg_mode == 0u) {
-        // Hillshade [0, 255]
-        let nx = -params.z_factor * dz_dx;
-        let ny = params.z_factor * dz_dy;
-        let inv_len = inverseSqrt(nx * nx + ny * ny + 1.0);
-        let dot = (nx * params.sun_e + ny * params.sun_n + params.sun_u) * inv_len;
-        return clamp(max(dot, 0.0) * 255.0, 0.0, 255.0);
+        // TiTiler's hillshade [0, 255]: lit from the gradient per pixel, written as
+        // 255 * (shaded + 1) / 2. An exact square root, since levels are truncated.
+        let nx = -params.z_factor * gx;
+        let ny = params.z_factor * gy;
+        let dot = (nx * params.sun_e + ny * params.sun_n + params.sun_u) / sqrt(nx * nx + ny * ny + 1.0);
+        return trunc(clamp(dot * 127.5 + 127.5, 0.0, 255.0));
     } else if (params.alg_mode == 1u) {
         // Slope in degrees [0, 90]
         let grad = sqrt(dz_dx * dz_dx + dz_dy * dz_dy) * params.z_factor;
@@ -171,7 +176,7 @@ fn dem_horn_rgba8(
         return;
     }
 
-    let val = eval_horn_from_shared(lid.x, lid.y);
+    let val = eval_dem_from_shared(lid.x, lid.y);
     if (!is_finite_f32(val)) {
         dst_words[py * params.dst_w + px] = 0u;
     } else {
@@ -195,7 +200,7 @@ fn dem_horn_f32(
         return;
     }
 
-    let val = eval_horn_from_shared(lid.x, lid.y);
+    let val = eval_dem_from_shared(lid.x, lid.y);
     dst_words[py * params.dst_w + px] = bitcast<u32>(val);
 }
 
@@ -212,7 +217,7 @@ fn dem_horn_indexed_u8(
     let py = gid.y;
     var q: u32 = 0u;
     if (px < params.dst_w && py < params.dst_h) {
-        let val = eval_horn_from_shared(lid.x, lid.y);
+        let val = eval_dem_from_shared(lid.x, lid.y);
         if (is_finite_f32(val)) {
             let scaled = clamp((val - params.rescale_min) * params.inv_range_254, 0.0, 254.0);
             q = 1u + u32(scaled);

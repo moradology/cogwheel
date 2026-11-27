@@ -11,7 +11,7 @@ use cogzilla_kernel::{
     render_rgb_bands, render_sar_rgb, render_single_band, render_terrain_tile,
 };
 use cogzilla_proj::{
-    CoordPlan, CrsModel, ProjError, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857,
+    CoordPlan, CrsModel, ProjError, TileCoord, tile_bounds_3857,
 };
 use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
 use dashmap::DashMap;
@@ -1208,11 +1208,10 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                // Ground pixel spacing in meters at the tile's center latitude (correcting WebMercator sec(lat)).
-                let (bx0, by0, bx1, by1) = tile_bounds_3857(req.tile);
-                let (_, lat_deg) = mercator_to_lonlat_deg((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
-                let pixel_size_m =
-                    (((bx1 - bx0) / N as f64) * lat_deg.to_radians().cos().max(0.05)) as f32;
+                let (bx0, _, bx1, _) = tile_bounds_3857(req.tile);
+                // The tile's pixel size in Web Mercator metres, as TiTiler's slope divides by the
+                // transform's pixel size.
+                let pixel_size_m = ((bx1 - bx0) / N as f64) as f32;
                 let style = SingleBandStyle {
                     rescale_min: rescale.0,
                     rescale_max: rescale.1,
@@ -2341,10 +2340,10 @@ impl TileEngine {
                 colormap,
             } => {
                 let src = make_src(*band_1based)?;
-                let (bx0, by0, bx1, by1) = tile_bounds_3857(req.tile);
-                let (_, lat_deg) = mercator_to_lonlat_deg((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
-                let pixel_size_m =
-                    (((bx1 - bx0) / N as f64) * lat_deg.to_radians().cos().max(0.05)) as f32;
+                let (bx0, _, bx1, _) = tile_bounds_3857(req.tile);
+                // The tile's pixel size in Web Mercator metres, as TiTiler's slope divides by the
+                // transform's pixel size.
+                let pixel_size_m = ((bx1 - bx0) / N as f64) as f32;
                 let style = SingleBandStyle {
                     rescale_min: rescale.0,
                     rescale_max: rescale.1,

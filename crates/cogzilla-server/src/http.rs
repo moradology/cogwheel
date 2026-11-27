@@ -564,7 +564,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                             pq.azimuth = (a as f32 - 90.0).rem_euclid(360.0);
                         }
                         if let Some(a) = number("angle_altitude").or_else(|| number("altitude")).or_else(|| number("angle")) {
-                            pq.altitude = (a as f32).clamp(0.0, 90.0);
+                            pq.altitude = (a as f32).clamp(-90.0, 90.0);
                         }
                         if let Some(z) = number("z_exaggeration").or_else(|| number("z_factor")).or_else(|| number("zfactor")) {
                             pq.z_factor = (z as f32).max(1e-4);
@@ -614,7 +614,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if let Ok(a) = v.parse::<f32>()
                     && a.is_finite()
                 {
-                    pq.altitude = a.clamp(0.0, 90.0);
+                    pq.altitude = a.clamp(-90.0, 90.0);
                 } else {
                     bad("expected a finite number");
                 }
@@ -996,22 +996,17 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     if pq.colormap_name_set {
         pq.custom_colormap_json = None;
     }
-    // TiTiler HillShade (default buffer 3) and Slope/Aspect (default buffer 0) crop
-    // `algorithm_params.buffer` back out of the buffered input tile; since cogzilla's Horn 3×3
-    // already fetches its own neighbor halo seamlessly, subtract that crop from `pq.buffer`
-    // so `?algorithm=hillshade&buffer=3` outputs 256×256 while `?algorithm=slope&buffer=3`
-    // keeps the requested 262×262 unless `algorithm_params.buffer` is explicitly set.
+    // TiTiler's HillShade and Slope (default buffer 3) crop `algorithm_params.buffer` back out
+    // of the buffered input tile; since cogzilla's stencil already fetches its own neighbour
+    // halo seamlessly, subtract that crop from `pq.buffer` so `?algorithm=hillshade&buffer=3`
+    // and `?algorithm=slope&buffer=3` are 256×256, as there. Aspect (cogzilla's own) crops none.
     if pq.buffer > 0.0
         && let Some(alg) = pq.algorithm.as_deref()
         && (alg.eq_ignore_ascii_case("hillshade")
             || alg.eq_ignore_ascii_case("slope")
             || alg.eq_ignore_ascii_case("aspect"))
     {
-        let default_crop = if alg.eq_ignore_ascii_case("hillshade") {
-            3.0
-        } else {
-            0.0
-        };
+        let default_crop = if alg.eq_ignore_ascii_case("aspect") { 0.0 } else { 3.0 };
         let crop = pq.alg_buffer.unwrap_or(default_crop).min(pq.buffer);
         pq.buffer = (pq.buffer - crop).max(0.0);
     }
