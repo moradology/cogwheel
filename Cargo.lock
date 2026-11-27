@@ -542,6 +542,7 @@ dependencies = [
  "cogzilla-pgstac",
  "cogzilla-proj",
  "cogzilla-tiff",
+ "cogzilla-zarr",
  "dashmap",
  "futures-util",
  "http-body-util",
@@ -564,6 +565,23 @@ name = "cogzilla-tiff"
 version = "0.8.0"
 dependencies = [
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cogzilla-zarr"
+version = "0.8.0"
+dependencies = [
+ "cogzilla-codec",
+ "cogzilla-kernel",
+ "cogzilla-proj",
+ "cogzilla-tiff",
+ "futures-util",
+ "libdeflater",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zstd-sys",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-proj = { path = "../cogzilla-proj" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
 cogzilla-io = { path = "../cogzilla-io" }
+cogzilla-zarr = { path = "../cogzilla-zarr" }
 cogzilla-pgstac = { path = "../cogzilla-pgstac" }
 cogzilla-gpu = { path = "../cogzilla-gpu", optional = true }
 thiserror.workspace = true

@@ -211,3 +211,39 @@ Or request tiles from any COG reachable over HTTP, S3 (`s3://`), GCS (`gs://`), 
 ```text
 GET http://localhost:8080/cog/tiles/WebMercatorQuad/{z}/{x}/{y}.png?url=s3://your-bucket/your.tif
 ```
+
+## Zarr (`/zarr/*`)
+
+Native Zarr v2 and v3 serving (consolidated `.zmetadata` / inline `consolidated_metadata`, v3 `sharding_indexed` ranged reads, pure-Rust Blosc 1.x + BloscLZ/lz4/zstd/zlib/gzip/shuffle/bitshuffle/transpose/big-endian, CF `grid_mapping` + `spatial_ref` WKT CRS, regular 1-D coordinate affine with `0..360` longitude normalization, CF time decoding, and GeoZarr/OME-Zarr `multiscales`).
+
+### Routes
+
+- **Metadata & introspection:**
+  - `GET /zarr/info`, `GET /zarr/info.geojson`, `GET /zarr/bounds`, `GET /zarr/validate`
+  - `GET /zarr/dataset/`, `GET /zarr/dataset/keys`, `GET /zarr/dataset/dict`, `GET /zarr/dataset/dimensions`, `GET /zarr/dataset/coordinates/{name}`
+- **Tiles, maps & point/bbox/preview:**
+  - `GET /zarr/tiles`, `GET /zarr/tiles/{tileMatrixSetId}`, `GET /zarr/tiles/{tileMatrixSetId}/{z}/{x}/{y}[@scale][.{format}]` (all 13 TileMatrixSets + implicit `WebMercatorQuad`)
+  - `GET /zarr/{tileMatrixSetId}/tilejson.json`, `GET /zarr/{tileMatrixSetId}/map.html`, `GET /zarr/{tileMatrixSetId}/WMTSCapabilities.xml`
+  - `GET /zarr/point/{lon},{lat}`, `GET /zarr/preview[/{w}x{h}][.{format}]`, `GET /zarr/bbox/{minx},{miny},{maxx},{maxy}[/{w}x{h}][.{format}]`
+- **Statistics & features:**
+  - `GET /zarr/statistics`, `POST /zarr/statistics` (exact analytical coverage-weighted & ellipsoidal area-weighted zonal stats), `POST /zarr/feature[/{w}x{h}][.{format}]`
+
+### Zarr-specific query parameters
+
+| Parameter | Purpose |
+| :--- | :--- |
+| `variable` | Select one 2-D or 3-D array in the store (auto-selected when the group has a single data variable). |
+| `variables` | Select multiple variables on multi-band routes. |
+| `group` | Scope to a nested subgroup path (e.g. `group=0`). |
+| `sel` | Repeatable xarray-style coordinate selector: `sel=time=2000-03-01` or `sel=time=nearest::2000-03-15` (`nearest`, `pad`/`ffill`, `backfill`/`bfill`). Out-of-range values return `400` with the available range. |
+| `decode_times` | Decode CF time coordinates (`<unit> since <epoch>`, supporting `standard`/`gregorian`/`proleptic_gregorian`/`noleap`/`365_day`/`all_leap`/`366_day`/`360_day`) to ISO-8601 (default `true`). |
+| `show_times` | Include decoded time coordinate values on `/zarr/info` (default `false`). |
+| `reproject` / `resampling` | Resampling kernel (`nearest`, `bilinear`, `cubic`, `cubic_spline`, `lanczos`, `average`, `mode`, `max`, `min`, `med`). |
+
+Example requests:
+
+```text
+GET http://localhost:8080/zarr/dataset/keys?url=/path/to/store.zarr
+GET http://localhost:8080/zarr/info?url=/path/to/store.zarr&variable=tas&show_times=true
+GET http://localhost:8080/zarr/tiles/WebMercatorQuad/9/81/197.png?url=/path/to/store.zarr&variable=tas&sel=time=nearest::2000-03-01&rescale=250,310&colormap_name=viridis
+```

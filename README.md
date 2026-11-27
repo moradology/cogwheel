@@ -8,7 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/moradology/cogzilla)](https://github.com/moradology/cogzilla/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A COG & STAC tile server that speaks TiTiler's API, without GDAL.** Written in Rust. Point your map client at a new base URL and keep everything else.
+**A COG, STAC, MosaicJSON & Zarr tile server that speaks TiTiler's API, without GDAL.** Written in Rust. Point your map client at a new base URL and keep everything else.
 
 | Against TiTiler | `cogzilla` | TiTiler | |
 | :--- | ---: | ---: | ---: |
@@ -56,7 +56,7 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda
 
 ## What it does
 
-- **TiTiler's routes**: `/cog`, `/stac`, `/mosaicjson`, `/algorithms`, `/colorMaps`, `/tileMatrixSets`, and optional [pgSTAC](docs/api.md#pgstac) (`/searches`, `/collections`), with tiles, TileJSON, WMTS, previews, crops, point queries, OGC Maps, and statistics.
+- **TiTiler's routes**: `/cog`, `/stac`, `/mosaicjson`, `/zarr` (Zarr v2 & v3, sharding, Blosc/zstd/gzip/zlib/lz4, CF `grid_mapping` & time `sel`, GeoZarr/OME-Zarr multiscales), `/algorithms`, `/colorMaps`, `/tileMatrixSets`, and optional [pgSTAC](docs/api.md#pgstac) (`/searches`, `/collections`), with tiles, TileJSON, WMTS, previews, crops, point queries, OGC Maps, and statistics.
 - **Any COG**: all eight numeric types, DEFLATE, ZSTD, LZW, LERC (`LERC`, `LERC_DEFLATE`, `LERC_ZSTD`), JPEG and WebP compression, and sources in 3,260+ EPSG coordinate systems (UTM, state plane, national Lambert and Albers grids, polar grids, LAEA Europe, World Mercator `3395`, EASE-Grid 2.0 Global `6933`, Equal Earth `8857`, and MODIS sinusoidal).
 - **Rendering per request**: rescaling, all 211 `rio-tiler` colormaps, all 15 GDAL resampling methods, band math (`expression=` or presets such as `ndvi`), multi-file composites and mosaics, plus automatic `wgpu` GPU acceleration (Metal/Vulkan) with silent CPU fallback.
 - **Terrain**: hillshade, slope, aspect, and contours, plus Terrarium and Terrain-RGB tiles for 3D maps.

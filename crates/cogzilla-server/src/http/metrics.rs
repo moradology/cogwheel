@@ -189,5 +189,6 @@ pub(super) fn render_prometheus_metrics(engine: &TileEngine) -> String {
         let _ = writeln!(out, "# TYPE cogzilla_pgstac_cache_entries gauge");
         let _ = writeln!(out, "cogzilla_pgstac_cache_entries {}", s.total_cache_entries());
     }
+    super::zarr::append_zarr_metrics(&mut out);
     out
 }

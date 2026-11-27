@@ -54,7 +54,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: benches/fixtures
-          key: fixtures-${{ hashFiles('benches/generate_fixtures.py', 'benches/generate_landsat_sar_fixtures.py') }}
+          key: fixtures-${{ hashFiles('benches/generate_fixtures.py', 'benches/generate_landsat_sar_fixtures.py', 'benches/generate_zarr_fixtures.py') }}
       - uses: astral-sh/setup-uv@v5
         if: steps.fixtures.outputs.cache-hit != 'true'
       - name: Generate fixtures
@@ -62,6 +62,7 @@ jobs:
         run: |
           uv run --no-project --python 3.12 --with rasterio --with numpy benches/generate_fixtures.py
           uv run --no-project --python 3.12 --with rasterio --with numpy benches/generate_landsat_sar_fixtures.py
+          uv run --no-project --python 3.12 --with "zarr>=3,<4" --with numcodecs --with numpy --with rasterio benches/generate_zarr_fixtures.py
 
       - run: cargo test --workspace --locked
         env:

@@ -934,17 +934,9 @@ impl CogStore {
             };
 
             let open_res: Result<Arc<OpenedCog>, IoError> = async {
-                let is_cloud_scheme = uri.starts_with("s3://")
-                    || uri.starts_with("/vsis3/")
-                    || uri.starts_with("gs://")
-                    || uri.starts_with("/vsigs/")
-                    || uri.starts_with("az://")
-                    || uri.starts_with("abfs://")
-                    || uri.starts_with("abfss://")
-                    || uri.starts_with("/vsiaz/");
                 let source = CogSource::open_remote_limited(
                     uri,
-                    if is_cloud_scheme {
+                    if is_cloud_scheme(uri) {
                         self.cloud_client.clone()
                     } else {
                         self.client.clone()
@@ -2611,6 +2603,12 @@ impl CogStore {
                 match crate::cloud::read_response_capped(resp, max_bytes).await {
                     Ok(data) => {
                         permit.on_success();
+                        self.metrics
+                            .remote_range_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .remote_bytes_fetched
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
                         return Ok(data);
                     }
                     Err(IoError::Http(e)) => {
@@ -2660,4 +2658,117 @@ impl CogStore {
         }
         Ok(bytes::Bytes::from(bytes))
     }
+
+    /// Fetch an exclusive byte range `[start, end)` from any URI supported by `cogzilla-io`
+    /// (`s3://`, `gs://`, `az://`, `abfs://`, `abfss://`, `http://`, `https://`, `/vsi*`,
+    /// `file://`, or local path), reusing the shared client pool, cloud credential chain,
+    /// allowlist, AIMD concurrency limiter, and `IoMetrics`.
+    pub async fn fetch_uri_range(
+        &self,
+        uri: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<bytes::Bytes, IoError> {
+        crate::allowlist::check_uri_allowed(uri)?;
+        let source = CogSource::open_remote_limited(
+            uri,
+            if is_cloud_scheme(uri) {
+                self.cloud_client.clone()
+            } else {
+                self.client.clone()
+            },
+            self.s3_cfg.clone(),
+            self.metrics.clone(),
+            self.upstream_limiter.clone(),
+        )?;
+        source.fetch_range(start, end).await
+    }
+
+    /// Cheaply probe an HTTP(S) URI via `HEAD` using the shared pooled client to extract a
+    /// freshness validator (`ETag` / `Last-Modified` / `Content-Length`). Returns `None` for
+    /// non-HTTP schemes or if the origin does not support `HEAD`.
+    pub async fn head_uri_validator(&self, uri: &str) -> Option<String> {
+        let http_uri = uri.strip_prefix("/vsicurl/").unwrap_or(uri);
+        if !http_uri.starts_with("http://") && !http_uri.starts_with("https://") {
+            return None;
+        }
+        if crate::allowlist::check_uri_allowed(uri).is_err() {
+            return None;
+        }
+        let resp = self.client.head(http_uri).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let et = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let lm = resp
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let cl = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        Some(format!("http:{et}:{lm}:{cl}"))
+    }
+
+    /// Return the total byte size of a URI using the shared pooled client (`HEAD` for HTTP(S),
+    /// `metadata` for local files), or `Ok(None)` on `404`.
+    pub async fn fetch_uri_size(&self, uri: &str) -> Result<Option<u64>, IoError> {
+        crate::allowlist::check_uri_allowed(uri)?;
+        let http_uri = uri.strip_prefix("/vsicurl/").unwrap_or(uri);
+        if http_uri.starts_with("http://") || http_uri.starts_with("https://") {
+            let permit = self.upstream_limiter.acquire().await;
+            let resp = self
+                .client
+                .head(http_uri)
+                .send()
+                .await
+                .map_err(crate::backend::io_error_from_reqwest)?;
+            let status = resp.status().as_u16();
+            if status == 404 {
+                permit.on_success();
+                return Ok(None);
+            }
+            if !resp.status().is_success() {
+                return Err(IoError::HttpStatus {
+                    status,
+                    url: crate::backend::redact_http_url(http_uri),
+                });
+            }
+            permit.on_success();
+            let len = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| IoError::HttpStatus {
+                    status: 502,
+                    url: crate::backend::redact_http_url(http_uri),
+                })?;
+            return Ok(Some(len));
+        }
+        let local = crate::backend::resolve_local_or_reject_scheme(uri)?;
+        match std::fs::metadata(local) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(IoError::Fs(e)),
+        }
+    }
+}
+
+fn is_cloud_scheme(uri: &str) -> bool {
+    uri.starts_with("s3://")
+        || uri.starts_with("/vsis3/")
+        || uri.starts_with("gs://")
+        || uri.starts_with("/vsigs/")
+        || uri.starts_with("az://")
+        || uri.starts_with("abfs://")
+        || uri.starts_with("abfss://")
+        || uri.starts_with("/vsiaz/")
 }

@@ -93,10 +93,10 @@
   <h2>Demos</h2>
   <div id="demos"></div>
 
-  <h2>Your own COG</h2>
+  <h2>Your own COG or Zarr</h2>
   <form id="custom">
-    <input type="text" id="custom-url" placeholder="https://… or s3://… .tif" aria-label="COG URL" />
-    <input type="text" id="custom-params" placeholder="optional: rescale=0,3000&amp;colormap_name=viridis" aria-label="Extra query parameters" />
+    <input type="text" id="custom-url" placeholder="https://… or s3://… .tif or .zarr" aria-label="COG or Zarr URL" />
+    <input type="text" id="custom-params" placeholder="optional: variable=t2m&amp;rescale=250,315&amp;colormap_name=viridis" aria-label="Extra query parameters" />
     <button class="go" type="submit">Open on map</button>
   </form>
   <p id="status" role="status"></p>
@@ -134,6 +134,7 @@ const BASE_PATH = {{BASE_PATH_JS}};
 const DEM = 'https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_W122_00_DEM/Copernicus_DSM_COG_10_N46_00_W122_00_DEM.tif';
 const S2 = 'https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/13/T/EE/2024/9/S2A_13TEE_20240929_0_L2A';
 const S2_STAC = S2 + '/S2A_13TEE_20240929_0_L2A.json';
+const ERA5_ZARR = 'https://storage.googleapis.com/gcp-public-data-arco-era5/ar/1959-2022-full_37-6h-0p25deg_derived.zarr';
 const RAINIER = { center: [-121.76, 46.853], zoom: 11 };
 const ELEV_ZONE_COLORS = [
   [35, 85, 130, 255],
@@ -175,6 +176,14 @@ const DEMOS = [
   { name: 'Multi-COG algebraic EVI', desc: '3-file expression VM: 2.5*(b1-b2)/(b1+6*b2-7.5*b3+10000)',
     urls: [S2 + '/B08.tif', S2 + '/B04.tif', S2 + '/B02.tif'],
     params: 'expression=2.5*(b1-b2)/(b1+6*b2-7.5*b3+10000)&rescale=-0.1,0.8&colormap_name=ylgn&reproject=bilinear' },
+  { name: 'Zarr: ERA5 2m temperature', desc: '/zarr global 0.25° Blosc-LZ4 on GCS, 2021-07-15 12Z',
+    kind: 'zarr', urls: [ERA5_ZARR],
+    params: 'variable=2m_temperature&sel=time=2021-07-15T12:00:00&rescale=250,315&colormap_name=rdylbu_r&reproject=bilinear',
+    view: { center: [-40, 28], zoom: 2.2 } },
+  { name: 'Zarr: ERA5 10m wind speed', desc: '/zarr 3D time-sliced wind speed, viridis colormap',
+    kind: 'zarr', urls: [ERA5_ZARR],
+    params: 'variable=10m_wind_speed&sel=time=2021-07-15T12:00:00&rescale=0,20&colormap_name=viridis&reproject=bilinear',
+    view: { center: [-35, 42], zoom: 2.6 } },
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -229,7 +238,7 @@ function query(urls, params) {
   return params ? q + '&' + params : q;
 }
 async function tilejson(urls, params, kind) {
-  const prefix = BASE_PATH + (kind === 'stac' ? '/stac' : '/cog');
+  const prefix = BASE_PATH + (kind === 'zarr' ? '/zarr' : kind === 'stac' ? '/stac' : '/cog');
   const r = await fetch(prefix + '/WebMercatorQuad/tilejson.json?' + query(urls, params));
   if (!r.ok) {
     const body = (await r.text()).slice(0, 200);
@@ -301,8 +310,10 @@ DEMOS.forEach((d, i) => {
 $('custom').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const url = $('custom-url').value.trim();
-  if (!url) return status('Enter the URL of a Cloud Optimized GeoTIFF.');
-  show({ urls: [url], params: $('custom-params').value.trim().replace(/^[?&]+/, '') }, null);
+  if (!url) return status('Enter the URL of a Cloud Optimized GeoTIFF or Zarr store.');
+  const params = $('custom-params').value.trim().replace(/^[?&]+/, '');
+  const isZarr = /\.zarr(?:\/|$|\?)/i.test(url) || /(?:^|&)variable=/.test(params);
+  show({ urls: [url], params, kind: isZarr ? 'zarr' : undefined }, null);
 });
 
 map.on('click', async (ev) => {
@@ -313,14 +324,24 @@ map.on('click', async (ev) => {
   const lat = ev.lngLat.lat.toFixed(5);
   const hud = $('point-hud');
   const isStac = layer.kind === 'stac';
-  const assets = layer.pointAssets || new URLSearchParams(layer.params).getAll('assets');
+  const isZarr = layer.kind === 'zarr';
+  const layerParams = new URLSearchParams(layer.params);
   const pointParams = new URLSearchParams();
-  assets.forEach(asset => pointParams.append('assets', asset));
+  if (isZarr) {
+    for (const k of ['variable', 'group', 'decode_times']) {
+      const v = layerParams.get(k);
+      if (v !== null) pointParams.set(k, v);
+    }
+    layerParams.getAll('sel').forEach((s) => pointParams.append('sel', s));
+  } else {
+    const assets = layer.pointAssets || layerParams.getAll('assets');
+    assets.forEach(asset => pointParams.append('assets', asset));
+  }
   const t0 = performance.now();
   hud.textContent = 'Sampling raw source bands…';
   try {
     const samples = await Promise.all(layer.urls.map(async (url) => {
-      const path = BASE_PATH + (isStac ? '/stac/point' : '/cog/point');
+      const path = BASE_PATH + (isZarr ? '/zarr/point' : isStac ? '/stac/point' : '/cog/point');
       const r = await fetch(`${path}/${lon},${lat}?${query([url], pointParams.toString())}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();

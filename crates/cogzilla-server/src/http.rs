@@ -29,6 +29,7 @@ pub(crate) mod pixel_selection;
 mod cql2_text;
 mod point_expr;
 mod server;
+mod zarr;
 mod zonal;
 
 pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
@@ -6567,6 +6568,7 @@ where
         engine.clear_gpu_caches();
         engine.stac_cache.clear();
         engine.mosaicjson_cache.clear();
+        zarr::clear_zarr_cache();
         if let Some(pg) = engine.pgstac() {
             pg.clear_caches();
         }
@@ -10269,6 +10271,32 @@ where
         if let Some((bbox, epsg, is_crs84)) = geo_meta {
             attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
         }
+        return Ok(resp);
+    }
+
+    // ------------------------------------------------------------------------
+    // Zarr API: /zarr/* (metadata, introspection, raster, and POST zonal routes)
+    // ------------------------------------------------------------------------
+    if segs.first() == Some(&"zarr") {
+        let sub = &segs[1..];
+        let body_bytes = if method == Method::POST {
+            match read_limited_body(req.into_body()).await {
+                Ok(b) => Some(b),
+                Err(e) => return Ok(error_to_http_response(&e)),
+            }
+        } else {
+            None
+        };
+        let resp = Box::pin(zarr::handle_zarr_request(
+            &engine,
+            method,
+            sub,
+            &raw_query,
+            &host,
+            if_none_match.as_deref(),
+            body_bytes,
+        ))
+        .await;
         return Ok(resp);
     }
 
