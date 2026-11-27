@@ -2195,7 +2195,7 @@ fn array_asked(pq: &ParsedQuery, last: Option<&&str>) -> Option<ArrayAsked> {
         return Some(ArrayAsked::Typed(rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask));
     }
     let npy = last.is_some_and(|last| last.ends_with(".npy")) || pq.format_param.as_deref() == Some("npy");
-    let shown = npy && array_type::shown(pq) && pq.algorithm.is_none();
+    let shown = npy && array_type::shown(pq);
     shown.then(|| ArrayAsked::Shown(Box::new(pq.clone())))
 }
 

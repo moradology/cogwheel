@@ -377,15 +377,15 @@ impl PixelAreaModel {
                 win_w,
                 win_h,
             } => {
-                let fx = if *nx <= 1 {
+                let fx = if *nx <= 1 || *win_w <= 1 {
                     0.0
                 } else {
-                    ((dx as f64 + 0.5) / (*win_w as f64)).clamp(0.0, 1.0) * ((*nx - 1) as f64)
+                    (dx as f64 / ((*win_w - 1) as f64)).clamp(0.0, 1.0) * ((*nx - 1) as f64)
                 };
-                let fy = if *ny <= 1 {
+                let fy = if *ny <= 1 || *win_h <= 1 {
                     0.0
                 } else {
-                    ((dy as f64 + 0.5) / (*win_h as f64)).clamp(0.0, 1.0) * ((*ny - 1) as f64)
+                    (dy as f64 / ((*win_h - 1) as f64)).clamp(0.0, 1.0) * ((*ny - 1) as f64)
                 };
                 let x0 = (fx.floor() as usize).min(nx.saturating_sub(1));
                 let x1 = (x0 + 1).min(nx.saturating_sub(1));
