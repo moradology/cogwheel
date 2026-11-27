@@ -5123,10 +5123,11 @@ async fn sweep31_gg1_mosaic_and_stac_exact_zonal_statistics() {
     );
 
     // C. Heterogeneous-grid POST /stac/statistics with expression keeps exact coverage & polygon valid_percent
+    // (the two-band assets are stacked band by band: `b3` is `lo`'s first band).
     let stac_u = stac_path.to_string_lossy();
     let r_stac = client
         .post(format!(
-            "{base}/stac/statistics?url={stac_u}&assets=hi&assets=lo&expression=b1%2Bb2"
+            "{base}/stac/statistics?url={stac_u}&assets=hi&assets=lo&expression=b1%2Bb3"
         ))
         .header("content-type", "application/json")
         .body(g_quad.to_string())
@@ -6744,6 +6745,62 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(past.status().as_u16(), 400);
     // An asset named like a band (`b2`) stays as written.
     assert_eq!(means("&assets=a&assets=b2&expression=b2%2B1").await[0].1, "b2+1");
+    // A point and the statistics of a posted feature read the same stack, and describe it so.
+    let point = |q: &str| {
+        let (client, base, url) = (client.clone(), base.clone(), url.clone());
+        let q = q.to_string();
+        async move {
+            let resp = client.get(format!("{base}/stac/point/10.3,40.3?url={url}{q}")).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{q}");
+            let doc: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+            let values = doc["values"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap());
+            let descs = doc["band_descriptions"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_string());
+            values.zip(descs).collect::<Vec<(f64, String)>>()
+        }
+    };
+    assert_eq!(point("&assets=a&assets=b&expression=b2;b3*2").await, described(&[(5.0, "a_b2"), (22.0, "b_b1*2")]));
+    assert_eq!(
+        point("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await,
+        described(&[(104.0, "a_b1+b2*b_b2")])
+    );
+    assert_eq!(point("&assets=a%7Cexpression%3Db1*2;b2&expression=b1%2Bb2").await, described(&[(11.0, "a_b1*2+a_b2")]));
+    assert_eq!(point("&assets=a%7Cbidx%3D2&expression=b1").await, described(&[(5.0, "a_b2")]));
+    let feature = serde_json::json!({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon",
+        "coordinates": [[[10.1, 40.1], [10.5, 40.1], [10.5, 40.5], [10.1, 40.5], [10.1, 40.1]]]}});
+    let posted = |q: &str| {
+        let (client, base, url, feature) = (client.clone(), base.clone(), url.clone(), feature.clone());
+        let q = q.to_string();
+        async move {
+            let resp = client
+                .post(format!("{base}/stac/statistics?url={url}&max_size=16{q}"))
+                .header("content-type", "application/json")
+                .body(feature.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{q}");
+            let doc: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+            let stats = &doc["properties"]["statistics"];
+            (1..=stats.as_object().unwrap().len())
+                .map(|k| {
+                    let band = &stats[format!("b{k}")];
+                    // Means weighted by each pixel's area, to a millionth.
+                    let mean = (band["mean"].as_f64().unwrap() * 1e6).round() / 1e6;
+                    (mean, band["description"].as_str().unwrap().to_string())
+                })
+                .collect::<Vec<(f64, String)>>()
+        }
+    };
+    assert_eq!(posted("&assets=a&assets=b&expression=b2;b3*2").await, described(&[(5.0, "a_b2"), (22.0, "b_b1*2")]));
+    assert_eq!(
+        posted("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await,
+        described(&[(104.0, "a_b1+b2*b_b2")])
+    );
+    // ... the same when an output size makes it a picture first.
+    assert_eq!(
+        posted("&assets=a&assets=b&expression=b2;b3*2&width=8&height=8").await,
+        described(&[(5.0, "a_b2"), (22.0, "b_b1*2")])
+    );
     // Sixteen bands are read for band math, but an answer of them all holds at most fifteen.
     let sixteen = "&assets=a".repeat(8);
     let too_many = client.get(format!("{base}/stac/preview.npy?url={url}{sixteen}")).send().await.unwrap();
