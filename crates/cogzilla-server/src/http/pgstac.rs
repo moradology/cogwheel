@@ -1160,6 +1160,9 @@ fn tileset(
     tms: &str,
     pairs: &[(String, String)],
 ) -> Resp {
+    let Some(tms_def) = crate::tms::lookup_tms(tms) else {
+        return invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet");
+    };
     let (minzoom, maxzoom, bounds) = match mosaic_extent(metadata, pairs) {
         Ok(e) => e,
         Err(r) => return r,
@@ -1167,15 +1170,38 @@ fn tileset(
     let host = ctx.host;
     let qs = encoded_query(pairs);
     let with_qs = |url: String| if qs.is_empty() { url } else { format!("{url}?{qs}") };
-    let limits: Vec<Value> = (minzoom.clamp(0, 30)..=maxzoom.clamp(0, 30))
-        .map(|z| tile_limits(z, bounds))
-        .collect();
+    let limits: Vec<Value> = if tms == "WebMercatorQuad" {
+        (minzoom.clamp(0, 30)..=maxzoom.clamp(0, 30))
+            .map(|z| tile_limits(z, bounds))
+            .collect()
+    } else {
+        let lo = minzoom.clamp(0, 30);
+        let hi = maxzoom.clamp(0, 30);
+        tms_def
+            .matrices
+            .iter()
+            .filter_map(|m| {
+                let z = m.id.parse::<i64>().ok()?;
+                if !(lo..=hi).contains(&z) {
+                    return None;
+                }
+                let (c0, c1, r0, r1) = tms_def.tile_limits_for_wgs84_bounds(m, bounds);
+                Some(json!({
+                    "tileMatrix": m.id,
+                    "minTileRow": r0,
+                    "maxTileRow": r1,
+                    "minTileCol": c0,
+                    "maxTileCol": c1,
+                }))
+            })
+            .collect()
+    };
     json_resp(
         StatusCode::OK,
         &json!({
             "title": format!("tileset tiled using {tms} TileMatrixSet"),
             "dataType": "map",
-            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857",
+            "crs": tms_def.crs_uri,
             "links": [
                 { "href": format!("{host}{base}/tiles/{tms}"), "rel": "self", "type": "application/json", "title": format!("Tileset tiled using {tms} TileMatrixSet") },
                 { "href": with_qs(format!("{host}{base}/tiles/{tms}/%7Bz%7D/%7Bx%7D/%7By%7D")), "rel": "tile", "templated": true, "title": "Templated link for retrieving Raster tiles" },
@@ -1189,8 +1215,7 @@ fn tileset(
     )
 }
 
-/// `GET {base}/tiles`: the tilesets on offer. TiTiler lists thirteen tile matrix sets;
-/// these routes serve Web Mercator only, so that is the one listed.
+/// `GET {base}/tiles`: all thirteen OGC tile matrix sets on offer (WebMercatorQuad first).
 fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, String)]) -> Resp {
     // The list has no zooms in it, and titiler-pgstac does not read the request's.
     let (_, _, bounds) = match mosaic_extent(metadata, &[]) {
@@ -1198,24 +1223,29 @@ fn tilesets(ctx: &Ctx<'_>, base: &str, metadata: &Value, pairs: &[(String, Strin
         Err(r) => return r,
     };
     let host = ctx.host;
-    let tms = "WebMercatorQuad";
     let qs = encoded_query(pairs);
     let with_qs = |url: String| if qs.is_empty() { url } else { format!("{url}?{qs}") };
-    json_resp(
-        StatusCode::OK,
-        &json!({ "tilesets": [{
-            "title": format!("tileset tiled using {tms} TileMatrixSet"),
-            "dataType": "map",
-            "crs": "http://www.opengis.net/def/crs/EPSG/0/3857",
-            "links": [
-                { "href": with_qs(format!("{host}{base}/tiles/{tms}")), "rel": "self", "type": "application/json", "title": format!("Tileset tiled using {tms} TileMatrixSet") },
-                { "href": with_qs(format!("{host}{base}/tiles/{tms}/%7Bz%7D/%7Bx%7D/%7By%7D")), "rel": "tile", "title": "Templated link for retrieving Raster tiles" },
-                { "href": format!("{host}/tileMatrixSets/{tms}"), "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme", "type": "application/json", "title": format!("Definition of '{tms}' tileMatrixSet") }
-            ],
-            "boundingBox": bounding_box(bounds),
-            "accessConstraints": "unclassified"
-        }]}),
-    )
+    let ordered = crate::tms::lookup_tms("WebMercatorQuad")
+        .into_iter()
+        .chain(crate::tms::ALL_TMS.iter().filter(|t| t.id != "WebMercatorQuad"));
+    let list: Vec<Value> = ordered
+        .map(|t| {
+            let tms = t.id;
+            json!({
+                "title": format!("tileset tiled using {tms} TileMatrixSet"),
+                "dataType": "map",
+                "crs": t.crs_uri,
+                "links": [
+                    { "href": with_qs(format!("{host}{base}/tiles/{tms}")), "rel": "self", "type": "application/json", "title": format!("Tileset tiled using {tms} TileMatrixSet") },
+                    { "href": with_qs(format!("{host}{base}/tiles/{tms}/%7Bz%7D/%7Bx%7D/%7By%7D")), "rel": "tile", "title": "Templated link for retrieving Raster tiles" },
+                    { "href": format!("{host}/tileMatrixSets/{tms}"), "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme", "type": "application/json", "title": format!("Definition of '{tms}' tileMatrixSet") }
+                ],
+                "boundingBox": bounding_box(bounds),
+                "accessConstraints": "unclassified"
+            })
+        })
+        .collect();
+    json_resp(StatusCode::OK, &json!({ "tilesets": list }))
 }
 
 /// What the WMTS document needs to know about the thing being tiled.
@@ -1488,17 +1518,11 @@ async fn listed_items(
     found.map_err(|e| db_error(&e))
 }
 
-/// Only Web Mercator tiles are served on the mosaic routes for now. A name TiTiler does
-/// not know is a validation error there; one it knows but this server cannot serve is
-/// refused with the reason.
+/// All thirteen built-in OGC TileMatrixSets are supported on pgSTAC mosaic routes.
+/// An unknown name returns TiTiler's `422` validation error.
 fn check_tms(tms: &str) -> Result<(), Resp> {
-    if tms == "WebMercatorQuad" {
+    if crate::tms::lookup_tms(tms).is_some() {
         Ok(())
-    } else if crate::tms::lookup_tms(tms).is_some() {
-        Err(detail(
-            StatusCode::BAD_REQUEST,
-            format!("tile matrix set '{tms}' is not supported on pgSTAC mosaic routes (use WebMercatorQuad)"),
-        ))
     } else {
         Err(invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet"))
     }
@@ -2926,15 +2950,90 @@ fn parse_zxy(zs: &str, xs: &str, y: u32) -> Result<Option<TileCoord>, Resp> {
     Ok(Some(TileCoord { z: z as u8, x, y }))
 }
 
-async fn tile_assets(pg: &PgStac, id: &str, tile: TileCoord, pairs: &[(String, String)]) -> Resp {
+fn parse_tms_zxy(
+    tms_def: &crate::tms::TmsDef,
+    zs: &str,
+    xs: &str,
+    y: u32,
+) -> Result<Option<TileCoord>, Resp> {
+    if tms_def.id == "WebMercatorQuad" {
+        return parse_zxy(zs, xs, y);
+    }
+    let bad = |name: &str| invalid_param("path", name, "Input should be a valid integer");
+    let z = zs.parse::<u32>().map_err(|_| bad("z"))?;
+    let x = xs.parse::<u32>().map_err(|_| bad("x"))?;
+    if z > u8::MAX as u32 {
+        return Ok(None);
+    }
+    let Some(m) = tms_def.matrix(z as u8) else {
+        return Ok(None);
+    };
+    if (x as u64) >= m.matrix_width || (y as u64) >= m.matrix_height {
+        return Ok(None);
+    }
+    Ok(Some(TileCoord { z: z as u8, x, y }))
+}
+
+/// WGS84 GeoJSON polygon covering a tile in any built-in TileMatrixSet.
+fn tms_tile_polygon(tms_def: &crate::tms::TmsDef, tile: TileCoord) -> Option<Value> {
+    if tms_def.id == "WebMercatorQuad" {
+        return Some(tile_polygon(tile));
+    }
+    let [min_x, min_y, max_x, max_y] = tms_def.tile_bounds(tile.z, tile.x, tile.y, 0.0, 256)?;
+    if tms_def.epsg == 4326 {
+        return Some(bbox_polygon([
+            min_x.clamp(-180.0, 180.0),
+            min_y.clamp(-90.0, 90.0),
+            max_x.clamp(-180.0, 180.0),
+            max_y.clamp(-90.0, 90.0),
+        ]));
+    }
+    let dst_crs = tms_def.crs_model().ok()?;
+    let (mut w, mut s, mut e, mut n) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    const STEPS: usize = 8;
+    for i in 0..=STEPS {
+        let f = i as f64 / STEPS as f64;
+        let x = min_x + f * (max_x - min_x);
+        let y = min_y + f * (max_y - min_y);
+        for (px, py) in [(x, min_y), (x, max_y), (min_x, y), (max_x, y)] {
+            let (lon, lat) = dst_crs.to_lonlat_deg(px, py);
+            if lon.is_finite() && lat.is_finite() {
+                w = w.min(lon);
+                e = e.max(lon);
+                s = s.min(lat);
+                n = n.max(lat);
+            }
+        }
+    }
+    if !w.is_finite() || !s.is_finite() || !e.is_finite() || !n.is_finite() {
+        return None;
+    }
+    Some(bbox_polygon([
+        w.clamp(-180.0, 180.0),
+        s.clamp(-90.0, 90.0),
+        e.clamp(-180.0, 180.0),
+        n.clamp(-90.0, 90.0),
+    ]))
+}
+
+async fn tile_assets(
+    pg: &PgStac,
+    id: &str,
+    tms_def: &crate::tms::TmsDef,
+    tile: TileCoord,
+    pairs: &[(String, String)],
+) -> Resp {
     let limits = match parse_limits(pairs) {
         Ok(l) => l,
         Err(r) => return r,
     };
+    let Some(geom) = tms_tile_polygon(tms_def, tile) else {
+        return json_resp(StatusCode::OK, &json!([]));
+    };
     // `tilesize` matters only to the lean lookup, which samples the tile as its picture would.
     let side = query_value(pairs, "tilesize").and_then(|v| v.parse::<u32>().ok()).unwrap_or(256);
-    let grid = SampleGrid::for_image(side, side, true);
-    match listed_items(pg, id, &tile_polygon(tile), limits, pairs, grid).await {
+    let grid = SampleGrid::for_image(side, side, tms_def.id == "WebMercatorQuad");
+    match listed_items(pg, id, &geom, limits, pairs, grid).await {
         Ok(items) => json_resp(
             StatusCode::OK,
             &Value::Array(items.iter().map(MosaicItem::to_json).collect()),
@@ -5177,16 +5276,281 @@ fn normalized_index_as_band_math(pq: &mut ParsedQuery, ext: Option<&str>) -> boo
     true
 }
 
-async fn tile(
+/// Render a mosaic tile in a non-WebMercator TileMatrixSet (geographic TMSs delegate to
+/// `part_image_of`; projected TMSs composite scenes via `render_crs_bbox`).
+#[allow(clippy::too_many_arguments)]
+async fn render_non_mercator_tms_tile(
     ctx: &Ctx<'_>,
     pg: &PgStac,
     id: &str,
+    tms_def: &'static crate::tms::TmsDef,
     tile: TileCoord,
     scale: Option<u32>,
     ext: &str,
     mut pq: ParsedQuery,
     pairs: &[(String, String)],
 ) -> Resp {
+    if scale.is_some_and(|s| !(1..=8).contains(&s)) {
+        return detail(StatusCode::BAD_REQUEST, "a tile's scale is from @1x to @8x");
+    }
+    if (pq.buffer * 2.0).fract() != 0.0 {
+        return detail(StatusCode::BAD_REQUEST, "`buffer` must be a multiple of `0.5`");
+    }
+    let side = scale.map_or(pq.tile_size, |s| s * 256);
+    let grown = (side as f32 + 2.0 * pq.buffer).round() as u32;
+    let Some(bbox) = tms_def.tile_bounds(tile.z, tile.x, tile.y, pq.buffer, side) else {
+        return no_content();
+    };
+    let Some(under) = tms_tile_polygon(tms_def, tile) else {
+        return no_content();
+    };
+    if tms_def.epsg == 4326 {
+        pq.buffer = 0.0;
+        pq.coord_crs_3857 = false;
+        const OF_A_BOX: [&str; 6] = ["buffer", "coord_crs", "dst_crs", "width", "height", "max_size"];
+        let filtered: Vec<(String, String)> = pairs
+            .iter()
+            .filter(|(k, _)| !OF_A_BOX.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        let ext_opt = (!ext.is_empty()).then_some(ext);
+        let resp = Box::pin(part_image_of(
+            ctx,
+            pg,
+            id,
+            &under,
+            Some(&under),
+            bbox,
+            None,
+            PartSize::Exact(grown, grown),
+            ext_opt,
+            pq,
+            &filtered,
+        ))
+        .await;
+        let spelled = if tms_def.id == "WorldCRS84Quad" { Some("crs84") } else { Some("epsg:4326") };
+        return placed_as(resp, bbox, 4326, spelled);
+    }
+
+    let dst_crs = match tms_def.crs_model() {
+        Ok(c) => c,
+        Err(e) => return engine_error(&e),
+    };
+    let ext_opt = (!ext.is_empty()).then_some(ext);
+    if let Some(resp) = format_error(ext_opt) {
+        return resp;
+    }
+    let _index = normalized_index_as_band_math(&mut pq, ext_opt);
+    let query = match check_mosaic_query(&pq, pairs) {
+        Ok(q) => q,
+        Err(r) => return r,
+    };
+    let names = match renderer_assets(&mut pq, &query) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let items = match pixel_items(ctx, pg, &under, id, query.limits, &names, None, query.lookup).await {
+        Ok(items) => items,
+        Err(e) => return db_error(&e),
+    };
+    if items.is_empty() {
+        return no_content();
+    }
+    let scenes: Result<Vec<Vec<String>>, Resp> = items
+        .iter()
+        .take(MAX_SCENES_PER_TILE)
+        .map(|item| asset_hrefs(item, names.iter().map(String::as_str)))
+        .collect();
+    let scenes = match scenes {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+
+    let explicit = ext_opt.map(str::to_string).or_else(|| pq.format_param.clone());
+    let tiff = matches!(explicit.as_deref(), Some("tif" | "tiff"));
+    let format = match explicit.as_deref() {
+        None => None,
+        Some(e) => match parse_ext_format(e, pq.webp_quality, pq.jpeg_quality) {
+            Ok(f) => Some(f),
+            Err(e) => return engine_error(&e),
+        },
+    };
+    let dim = grown as usize;
+    let engine = ctx.engine;
+    let rendered: Result<(Bytes, &'static str), EngineError> = async {
+        let formula = pq
+            .color_formula
+            .as_deref()
+            .map(cogzilla_kernel::ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)?;
+        let mut canvas = vec![0u8; dim * dim * 4];
+        let mut selecting: Option<(Fold, Paint)> = None;
+        let mut map_after: Option<MapAfterFormula> = None;
+        let mut one_grey = false;
+        for (n, scene) in scenes.iter().enumerate() {
+            let mut cogs = Vec::with_capacity(scene.len());
+            for href in scene {
+                cogs.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, pq.nodata))?);
+            }
+            let full = cogs[0].index.full_res();
+            let default_bands = if cogs.len() > 1 { cogs.len() as u16 } else { full.samples_per_pixel };
+            if pq.rescale.len() > 1 && pq.rescale.len() != 3 {
+                pq.rescale.truncate(1);
+            }
+            let mut bands = build_band_request(&pq, default_bands, full.sample_type)?;
+            let taken = match &formula {
+                Some(formula) if pq.colormap_explicit => MapAfterFormula::take(formula, &mut bands),
+                _ => None,
+            };
+            if n == 0 {
+                map_after = taken;
+                one_grey = !pq.colormap_explicit
+                    && (one_grey_band(&bands) || query.selection == Some(Selection::Count))
+                    && !super::has_embedded_palette(&pq, &cogs[0], &bands);
+            }
+            let exact = formula.is_some() && one_grey_band(&bands) && (map_after.is_some() || one_grey);
+            let resample = query.reproject;
+            if let Some(method) = query.selection.or(exact.then_some(Selection::First)) {
+                let count = TileEngine::value_bands(&bands);
+                if n == 0 {
+                    let paint = Paint::of(&bands).ok_or_else(|| {
+                        EngineError::BadRequest(
+                            "pixel_selection other than 'first' cannot be used with a terrain encoding".into(),
+                        )
+                    })?;
+                    let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
+                    selecting = Some((
+                        fold_within_limits(method, scenes.len(), count, dim * dim, integer, false)?,
+                        paint,
+                    ));
+                }
+                let values = render_crs_bbox(
+                    engine,
+                    &cogs,
+                    bbox,
+                    &dst_crs,
+                    grown,
+                    grown,
+                    None,
+                    &bands,
+                    resample,
+                    OutputFormat::RawF32,
+                    None,
+                    None,
+                    None,
+                    true,
+                    pq.unscale,
+                )
+                .await?;
+                if let Some((fold, _)) = &mut selecting
+                    && values.len() == count * dim * dim * 4
+                {
+                    fold.add_le_bytes(&values);
+                    if fold.is_done() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if pq.unscale {
+                apply_unscale_cogs(&mut bands, &cogs);
+            }
+            let rgba = render_crs_bbox(
+                engine,
+                &cogs,
+                bbox,
+                &dst_crs,
+                grown,
+                grown,
+                None,
+                &bands,
+                resample,
+                OutputFormat::RawRgba,
+                None,
+                None,
+                None,
+                true,
+                pq.unscale,
+            )
+            .await?;
+            if rgba.len() != canvas.len() {
+                return Err(EngineError::BadRequest("unexpected image size from the renderer".into()));
+            }
+            let mut empty = 0usize;
+            for (dst, src) in canvas.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+                if dst[3] == 0 {
+                    if src[3] != 0 {
+                        dst.copy_from_slice(src);
+                    } else {
+                        empty += 1;
+                    }
+                }
+            }
+            if empty == 0 {
+                break;
+            }
+        }
+        if let Some((fold, paint)) = selecting
+            && let Some(selected) = fold.finish()
+        {
+            if matches!(format, Some((OutputFormat::Npy, _))) || tiff {
+                let npy = cogzilla_kernel::encode_npy_typed(
+                    &selected.values,
+                    selected.bands,
+                    dim,
+                    dim,
+                    cogzilla_tiff::SampleType::Float32,
+                    None,
+                    pq.return_mask,
+                );
+                let made = (npy, "application/x-binary");
+                return Ok(as_geotiff(made, tiff, bbox, tms_def.epsg, pq.return_mask));
+            }
+            canvas = paint.rgba(&selected, dim * dim);
+        } else if matches!(format, Some((OutputFormat::Npy, _))) {
+            return Err(EngineError::BadRequest(
+                "`.npy` on projected non-WebMercator pgSTAC tiles requires `pixel_selection`".into(),
+            ));
+        }
+        if let Some(map_after) = &map_after {
+            map_after.colour(&mut canvas);
+        }
+        let asked = format.map(|(f, ct)| (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }));
+        let made = encode_picture(
+            canvas,
+            dim,
+            dim,
+            if map_after.is_some() { None } else { formula.as_ref() },
+            asked,
+            pq.jpeg_quality,
+            pq.return_mask,
+            one_grey,
+        )?;
+        Ok(as_geotiff(made, tiff, bbox, tms_def.epsg, pq.return_mask))
+    }
+    .await;
+    match rendered {
+        Ok(made) => placed(super::to_http_response(engine, Ok(made), ctx.if_none_match), bbox, tms_def.epsg),
+        Err(e) => engine_error(&e),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn tile(
+    ctx: &Ctx<'_>,
+    pg: &PgStac,
+    id: &str,
+    tms_def: &'static crate::tms::TmsDef,
+    tile: TileCoord,
+    scale: Option<u32>,
+    ext: &str,
+    mut pq: ParsedQuery,
+    pairs: &[(String, String)],
+) -> Resp {
+    if tms_def.id != "WebMercatorQuad" {
+        return render_non_mercator_tms_tile(ctx, pg, id, tms_def, tile, scale, ext, pq, pairs).await;
+    }
     // A tile with a `buffer` is the tile's box grown by that many pixels on every side,
     // at a size grown as much: to rio-tiler, and here, a box in Web Mercator like any other.
     // The renderer draws tiles of 256 and 512 pixels, and planes no algorithm: a tile of
@@ -7144,30 +7508,36 @@ async fn mosaic_route(
         ["tiles"] | ["tiles", _] if tileset_format_error(pairs).is_some() => tileset_format_error(pairs).unwrap_or_else(not_found),
         ["tiles"] => tilesets(ctx, base, &rec.metadata, pairs),
         ["tiles", tms] => tileset(ctx, base, &rec.metadata, tms, pairs),
-        ["tiles", _, zs, xs, ys, "assets"] => {
+        ["tiles", tms, zs, xs, ys, "assets"] => {
+            let Some(tms_def) = crate::tms::lookup_tms(tms) else {
+                return invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet");
+            };
             let coord = match ys.parse::<u32>() {
-                Ok(y) => parse_zxy(zs, xs, y),
+                Ok(y) => parse_tms_zxy(tms_def, zs, xs, y),
                 Err(_) => Err(detail(StatusCode::BAD_REQUEST, "invalid z/x/y tile coordinate")),
             };
             match coord {
                 Err(r) => r,
                 Ok(None) => json_resp(StatusCode::OK, &json!([])),
-                Ok(Some(t)) => tile_assets(pg, &rec.hash, t, pairs).await,
+                Ok(Some(t)) => tile_assets(pg, &rec.hash, tms_def, t, pairs).await,
             }
         }
         ["tiles", _, _, _, _] if tile_bounds_error(pairs).is_some() => tile_bounds_error(pairs).unwrap_or_else(not_found),
-        ["tiles", _, zs, xs, ys] => {
+        ["tiles", tms, zs, xs, ys] => {
+            let Some(tms_def) = crate::tms::lookup_tms(tms) else {
+                return invalid_param("path", "tileMatrixSetId", "Input should be a supported TileMatrixSet");
+            };
             let Some((y, scale, ext)) = parse_y_scale_ext(ys) else {
                 return invalid_param("path", "y", "Input should be a valid integer");
             };
             // Without an extension the format is chosen from the rendered pixels.
             let ext = if ys.contains('.') { ext.unwrap_or("") } else { "" };
-            match parse_zxy(zs, xs, y) {
+            match parse_tms_zxy(tms_def, zs, xs, y) {
                 Err(r) => r,
                 Ok(_) if format_error(Some(ext)).is_some() => format_error(Some(ext)).unwrap_or_else(not_found),
                 Ok(None) if pq.assets.is_empty() => missing_query_param("assets"),
                 Ok(None) => no_content(),
-                Ok(Some(coord)) => tile(ctx, pg, &rec.hash, coord, scale, ext, pq, pairs).await,
+                Ok(Some(coord)) => tile(ctx, pg, &rec.hash, tms_def, coord, scale, ext, pq, pairs).await,
             }
         }
         [first, ..] if *first == "feature" || first.starts_with("feature.") => {
