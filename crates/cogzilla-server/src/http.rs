@@ -41,13 +41,13 @@ use crate::stac::{
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, build_wmts_capabilities_multi,
-    compute_f32_band_stats,
+    compute_f32_band_stats, compute_f32_band_stats_with_engine,
     compute_statistics_with_options,
     encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
     get_algorithm_json,
     list_algorithms_json, native_bbox_dims_in_crs, query_point,
     render_crs_bbox, render_mercator_bbox, render_multi_asset_bbox, render_native_preview,
-    render_wgs84_bbox,
+    render_native_preview_stats, render_wgs84_bbox, render_wgs84_bbox_stats,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -3830,10 +3830,47 @@ async fn render_mosaic_tile_pixel_selection(
     {
         return Err(err);
     }
-    let selected = fold.and_then(Fold::finish).unwrap_or_else(|| {
-        let bands = default_raw_band_count(&treq.bands, method);
-        Selected { bands, values: vec![f32::NAN; bands * n_px] }
-    });
+    #[cfg(feature = "gpu")]
+    let gpu_selected: Option<Selected<f32>> = if let Some(ref gpu) = engine.gpu
+        && let Some(ref f) = fold
+        && let Some((nb, scenes)) = f.median_scenes()
+        && scenes.len() <= 32
+    {
+        let band_planes: Vec<Vec<&[f32]>> = (0..nb)
+            .map(|b| {
+                let b_off = b * n_px;
+                scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect()
+            })
+            .collect();
+        gpu.try_composite_mosaic_f32_bands(
+            out_dim,
+            out_dim,
+            &band_planes,
+            cogzilla_gpu::GpuPixelSelection::Median,
+        )
+        .map(|gpu_bands| {
+            engine
+                .stats
+                .gpu_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut values = Vec::with_capacity(nb * n_px);
+            for band_out in gpu_bands {
+                values.extend_from_slice(&band_out);
+            }
+            Selected { bands: nb, values }
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_selected: Option<Selected<f32>> = None;
+
+    let selected = gpu_selected
+        .or_else(|| fold.and_then(Fold::finish))
+        .unwrap_or_else(|| {
+            let bands = default_raw_band_count(&treq.bands, method);
+            Selected { bands, values: vec![f32::NAN; bands * n_px] }
+        });
 
     if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
         let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
@@ -3854,6 +3891,16 @@ async fn render_mosaic_tile_pixel_selection(
     }
 
     let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
+    #[cfg(feature = "gpu")]
+    if let Some(ref gpu) = engine.gpu {
+        return Ok(gpu.encode_rgba_output(
+            out_dim as usize,
+            out_dim as usize,
+            &rgba,
+            treq.format,
+            pq.return_mask,
+        ));
+    }
     Ok(encode_rgba_output(
         out_dim as usize,
         out_dim as usize,
@@ -4780,6 +4827,13 @@ async fn render_mosaic_bbox_composite(
         ));
     }
     let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
+    #[cfg(feature = "gpu")]
+    let data = if let Some(gpu) = engine.gpu.as_ref() {
+        gpu.encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
+    } else {
+        encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
+    };
+    #[cfg(not(feature = "gpu"))]
     let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask);
     Ok((
         wrap_geotiff_fmt(
@@ -5489,6 +5543,33 @@ where
     let is_post = *req.method() == Method::POST;
     let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
     let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics" | "/stats");
+    let bypass_aimd = is_health_or_metrics || *req.method() == Method::OPTIONS;
+    let mut aimd_permit = if bypass_aimd {
+        None
+    } else {
+        match engine.aimd.try_acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let body = if is_head {
+                    Bytes::new()
+                } else {
+                    Bytes::from_static(br#"{"detail":"server overloaded; retry shortly"}"#)
+                };
+                let mut resp = plain_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    body,
+                    "application/json",
+                );
+                resp.headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                if let Ok(hv) = HeaderValue::from_str(&engine.aimd.current_limit().to_string()) {
+                    resp.headers_mut()
+                        .insert(HeaderName::from_static("x-cogzilla-aimd-limit"), hv);
+                }
+                return Ok(resp);
+            }
+        }
+    };
     let accepts_gzip = req
         .headers()
         .get(hyper::header::ACCEPT_ENCODING)
@@ -5513,7 +5594,7 @@ where
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
     }
-    let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
+    let mut resp = Box::pin(handle_request_inner(engine.clone(), req, is_head)).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
     {
@@ -5522,9 +5603,17 @@ where
         *retry_req.method_mut() = m;
         *retry_req.uri_mut() = u;
         *retry_req.headers_mut() = h;
-        resp = handle_request_inner(engine, retry_req, is_head).await?;
+        resp = Box::pin(handle_request_inner(engine.clone(), retry_req, is_head)).await?;
         resp.headers_mut().remove("x-cogzilla-retry");
     }
+    if let Some(permit) = aimd_permit.as_mut()
+        && (resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status() == StatusCode::NOT_MODIFIED)
+    {
+        permit.ignore_rtt();
+    }
+    drop(aimd_permit);
     if let Some((path, query)) = as_page
         && resp.status() == StatusCode::OK
         && resp
@@ -7736,6 +7825,37 @@ where
                         apply_unscale_cogs(&mut bands, &cogs);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    if matches!(
+                        bands,
+                        BandRequest::Single { .. }
+                            | BandRequest::Dem { .. }
+                            | BandRequest::CustomExpr { .. }
+                            | BandRequest::Spectral1 { .. }
+                            | BandRequest::Spectral2 { .. }
+                            | BandRequest::Spectral3 { .. }
+                    ) {
+                        let stat = render_native_preview_stats(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            pq.nodata,
+                            pq.unscale,
+                            alg_name,
+                            &stats_opts,
+                        )
+                        .await?;
+                        let mut map = serde_json::Map::new();
+                        map.insert("b1".into(), stat);
+                        return Ok((
+                            Bytes::from(serde_json::Value::Object(map).to_string()),
+                            "application/json",
+                        ));
+                    }
                     let raw = render_native_preview(
                         &engine,
                         &cogs,
@@ -7774,7 +7894,7 @@ where
                         };
                         map.insert(
                             format!("b{}", b + 1),
-                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &plane, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
@@ -7833,7 +7953,7 @@ where
                         if pq.unscale {
                             apply_unscale_cogs(&mut bands, &cogs);
                         }
-                        let raw = render_native_preview(
+                        let stat = render_native_preview_stats(
                             &engine,
                             &cogs,
                             bbox,
@@ -7841,22 +7961,13 @@ where
                             out_h,
                             &bands,
                             pq.resample,
-                            OutputFormat::RawF32,
                             pq.nodata,
-                            None,
-                            None,
-                            true,
                             pq.unscale,
+                            &desc,
+                            &stats_opts,
                         )
                         .await?;
-                        let pixels: Vec<f32> = raw
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        map.insert(
-                            format!("b{}", idx + 1),
-                            compute_f32_band_stats(&pixels, &desc, &stats_opts),
-                        );
+                        map.insert(format!("b{}", idx + 1), stat);
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
                 }
@@ -8020,6 +8131,25 @@ where
                                 if unscale {
                                     apply_unscale_cogs(&mut bands, &cogs_c);
                                 }
+                                let alg_name = alg_c.as_deref().unwrap_or("algorithm");
+                                if matches!(
+                                    bands,
+                                    BandRequest::Single { .. }
+                                        | BandRequest::Dem { .. }
+                                        | BandRequest::CustomExpr { .. }
+                                        | BandRequest::Spectral1 { .. }
+                                        | BandRequest::Spectral2 { .. }
+                                        | BandRequest::Spectral3 { .. }
+                                ) {
+                                    let stat = render_wgs84_bbox_stats(
+                                        &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
+                                        resample, nodata, unscale, alg_name, &stats_opts,
+                                    )
+                                    .await?;
+                                    let mut map = serde_json::Map::new();
+                                    map.insert("b1".into(), stat);
+                                    return Ok::<_, EngineError>(serde_json::Value::Object(map));
+                                }
                                 let raw = render_wgs84_bbox(
                                     &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
                                     resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
@@ -8040,7 +8170,7 @@ where
                                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                         .collect();
                                     let desc = if nb == 1 { alg_name.to_string() } else { format!("{alg_name}_b{}", b + 1) };
-                                    map.insert(format!("b{}", b + 1), compute_f32_band_stats(&plane, &desc, &stats_opts));
+                                    map.insert(format!("b{}", b + 1), compute_f32_band_stats_with_engine(&eng, &plane, &desc, &stats_opts));
                                 }
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
@@ -9616,6 +9746,37 @@ where
                         apply_unscale_cogs(&mut bands, &cogs);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    if matches!(
+                        bands,
+                        BandRequest::Single { .. }
+                            | BandRequest::Dem { .. }
+                            | BandRequest::CustomExpr { .. }
+                            | BandRequest::Spectral1 { .. }
+                            | BandRequest::Spectral2 { .. }
+                            | BandRequest::Spectral3 { .. }
+                    ) {
+                        let stat = render_native_preview_stats(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            pq.nodata,
+                            pq.unscale,
+                            alg_name,
+                            &stats_opts,
+                        )
+                        .await?;
+                        let mut map = serde_json::Map::new();
+                        map.insert("b1".into(), stat);
+                        return Ok((
+                            Bytes::from(serde_json::Value::Object(map).to_string()),
+                            "application/json",
+                        ));
+                    }
                     let raw = render_native_preview(
                         &engine,
                         &cogs,
@@ -9654,7 +9815,7 @@ where
                         };
                         map.insert(
                             format!("b{}", b + 1),
-                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &plane, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
@@ -11198,6 +11359,17 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
     let _ = writeln!(out, "cogzilla_remote_range_requests_total {}", engine.store.metrics.remote_range_requests.load(Ordering::Relaxed));
     let _ = writeln!(out, "# TYPE cogzilla_remote_bytes_fetched_total counter");
     let _ = writeln!(out, "cogzilla_remote_bytes_fetched_total {}", engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed));
+
+    let aimd = engine.aimd.snapshot();
+    let _ = writeln!(out, "# HELP cogzilla_aimd_limit Current adaptive AIMD concurrency limit.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_limit gauge");
+    let _ = writeln!(out, "cogzilla_aimd_limit {}", aimd.limit);
+    let _ = writeln!(out, "# HELP cogzilla_aimd_in_flight Current in-flight HTTP requests admitted by AIMD.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_in_flight gauge");
+    let _ = writeln!(out, "cogzilla_aimd_in_flight {}", aimd.in_flight);
+    let _ = writeln!(out, "# HELP cogzilla_aimd_rejected_429_total Total HTTP requests shed with 429 Too Many Requests by AIMD.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_rejected_429_total counter");
+    let _ = writeln!(out, "cogzilla_aimd_rejected_429_total {}", aimd.rejected_429);
 
     if let Some(dc) = &engine.store.disk_cache {
         let s = dc.stats();

@@ -188,6 +188,25 @@ impl ColorFormula {
         Ok(Self { stages })
     }
 
+    /// Extract a single-pass GPU-compatible `(optional RGB LUT, optional LCH saturation)` when the
+    /// formula is representable as an optional fused LUT stage followed by an optional saturation
+    /// stage (e.g. `"Gamma RGB 1.5 Sigmoidal RGB 15 0.35 Saturation 1.2"`). Returns `None` for
+    /// multi-stage formulas with LUT ops *after* a Saturation stage.
+    #[allow(clippy::type_complexity)]
+    pub fn as_lut_then_saturation(
+        &self,
+    ) -> Option<(Option<(&[u8; 256], &[u8; 256], &[u8; 256])>, Option<f32>)> {
+        match self.stages.as_slice() {
+            [] => Some((None, None)),
+            [ColorStage::Lut { r, g, b }] => Some((Some((r, g, b)), None)),
+            [ColorStage::Saturation(s)] => Some((None, Some(*s as f32))),
+            [ColorStage::Lut { r, g, b }, ColorStage::Saturation(s)] => {
+                Some((Some((r, g, b)), Some(*s as f32)))
+            }
+            _ => None,
+        }
+    }
+
     #[inline(always)]
     pub fn apply_rgb(&self, mut r: u8, mut g: u8, mut b: u8) -> (u8, u8, u8) {
         for stage in &self.stages {
