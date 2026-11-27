@@ -9,6 +9,11 @@ pub enum Op {
     Mul,
     Div,
     Mod,
+    /// `% c` by a constant positive power of two `c`, the floored remainder worked as
+    /// `a - c * floor(a / c)`: exact for such `c`, and free of a `fmod` call per pixel. Only
+    /// `c` is held, not its reciprocal too, so that an op stays eight bytes (see the test):
+    /// `a / c` and `a * (1 / c)` are the same number when `c` is a power of two.
+    ModPow2(f32),
     Pow,
     BitAnd,
     BitOr,
@@ -47,6 +52,7 @@ pub enum Op {
     Ceil,
     Floor,
     Round,
+    Trunc,
     Median(u8),
     Std(u8),
     Var(u8),
@@ -185,6 +191,10 @@ impl ExprProgram {
                     } else {
                         stack[sp - 1] / d
                     };
+                }
+                Op::ModPow2(c) => {
+                    let a = stack[sp - 1];
+                    stack[sp - 1] = a - c * (a / c).floor();
                 }
                 Op::Mod => {
                     sp -= 1;
@@ -409,6 +419,9 @@ impl ExprProgram {
                 Op::Round => {
                     stack[sp - 1] = stack[sp - 1].round();
                 }
+                Op::Trunc => {
+                    stack[sp - 1] = stack[sp - 1].trunc();
+                }
                 Op::Median(n) => {
                     let k = n as usize;
                     let base = sp - k;
@@ -584,6 +597,13 @@ impl ExprProgram {
                     for i in 0..N {
                         let d = rhs[i];
                         lhs[i] = if d.abs() < 1e-12 { f32::NAN } else { lhs[i] / d };
+                    }
+                }
+                Op::ModPow2(c) => {
+                    let s = &mut stack[sp - 1];
+                    let r = c.recip();
+                    for v in s.iter_mut() {
+                        *v -= c * (*v * r).floor();
                     }
                 }
                 Op::Mod => {
@@ -904,6 +924,12 @@ impl ExprProgram {
                     let s = &mut stack[sp - 1];
                     for i in 0..N {
                         s[i] = s[i].round();
+                    }
+                }
+                Op::Trunc => {
+                    let s = &mut stack[sp - 1];
+                    for i in 0..N {
+                        s[i] = s[i].trunc();
                     }
                 }
                 Op::Median(n) => {
@@ -1247,7 +1273,13 @@ impl<'a> Parser<'a> {
                 Tok::Percent => {
                     self.pos += 1;
                     self.parse_unary()?;
-                    self.ops.push(Op::Mod);
+                    match self.ops.last() {
+                        Some(&Op::PushConst(c)) if c > 0.0 && c.is_normal() && c.to_bits() & 0x007f_ffff == 0 => {
+                            self.ops.pop();
+                            self.ops.push(Op::ModPow2(c));
+                        }
+                        _ => self.ops.push(Op::Mod),
+                    }
                 }
                 _ => break,
             }
@@ -1356,6 +1388,7 @@ impl<'a> Parser<'a> {
                         ("ceil", 1) => Op::Ceil,
                         ("floor", 1) => Op::Floor,
                         ("round", 1) => Op::Round,
+                        ("trunc", 1) => Op::Trunc,
                         ("min" | "minimum", 2) => Op::Min,
                         ("max" | "maximum", 2) => Op::Max,
                         ("clip", 3) => Op::Clip,
@@ -1454,6 +1487,31 @@ mod tests {
     }
 
     #[test]
+    fn an_op_is_eight_bytes() {
+        // The VM walks its ops for every pixel; a wider one makes all band math slower.
+        assert_eq!(std::mem::size_of::<Op>(), 8);
+    }
+
+    #[test]
+    fn remainder_by_a_power_of_two_is_the_floored_remainder() {
+        let fast = ExprProgram::compile("b1 % 256").unwrap();
+        assert_eq!(fast.ops.last(), Some(&Op::ModPow2(256.0)));
+        let general = ExprProgram::compile("b1 % (b2 + 256)").unwrap();
+        assert_eq!(ExprProgram::compile("b1 % 7").unwrap().ops.last(), Some(&Op::Mod));
+        let values = [0.0, 300.0, -1.0, -300.7, 255.9, 256.0, -256.0, 70_000.5, 1e10, -1e10, 16_777_215.0, -0.5];
+        let mut row = [0.0f32; 12];
+        fast.eval_row::<12>(&[values], &mut row);
+        for (i, v) in values.into_iter().enumerate() {
+            let want = general.eval(&[v, 0.0]);
+            assert_eq!(fast.eval(&[v]), want, "{v} % 256");
+            assert_eq!(row[i], want, "{v} % 256 over a row");
+        }
+        assert!(fast.eval(&[f32::NAN]).is_nan());
+        assert!(fast.eval(&[f32::INFINITY]).is_nan());
+        assert_eq!(ExprProgram::compile("b1 % 0.25").unwrap().eval(&[1.3]), 1.3 - 1.25);
+    }
+
+    #[test]
     fn eval_row_matches_scalar_eval_across_all_ops() {
         let exprs = [
             "(b1 - b2) / (b1 + b2)",
@@ -1469,6 +1527,9 @@ mod tests {
             "arctan2(b1, b2) + sinh(b1) + cosh(b2) + tanh(b3)",
             "log1p(b1) + expm1(b2) + sign(b1 - b2)",
             "(b1 * 100) % 7",
+            "(b1 * 1000 - 300) % 256",
+            "(b2 * 100) % 0.25 + b3 % 1",
+            "trunc(b1 * 100 - 50) + trunc(-b2 * 7)",
             "where((b1 > 0.5) & (b2 < 1.0), 1, ~(b3 == 0) | 0)",
         ];
         // Verify exact 4-band median (differs from mean!) and 1-band std NaN masking

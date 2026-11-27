@@ -21,6 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+mod algorithm_math;
 mod pgstac;
 mod array_type;
 #[cfg(test)]
@@ -2059,6 +2060,7 @@ fn wants_f32_geotiff(
         }
         BandRequest::CustomExpr { .. }
         | BandRequest::CustomExprRgb { .. }
+        | BandRequest::CustomExprMulti { .. }
         | BandRequest::MultiBand { .. }
         | BandRequest::Spectral1 { .. }
         | BandRequest::Spectral2 { .. }
@@ -2151,11 +2153,30 @@ fn may_be_f32_array(data: &[u8]) -> bool {
 /// the type TiTiler writes it in ([`array_type`]); with `mask`, its last band is the mask.
 /// Left as it is without a type, or when it is not a float32 array of the bands it says.
 fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
+    array_in_its_type_rounded(data, kind, mask, None)
+}
+
+/// [`array_in_its_type`], each value first rounded by `rounding` and put in `kind` as
+/// numpy's `astype` puts it ([`array_type::astype`]): what `cast`, `ceil` and `floor` do.
+fn array_in_its_type_rounded(
+    data: Bytes,
+    kind: Option<cogzilla_tiff::SampleType>,
+    mask: bool,
+    rounding: Option<fn(f64) -> f64>,
+) -> Bytes {
     let Some(kind) = kind else { return data };
-    let typed = if data.starts_with(b"II*\0") {
-        crate::geotiff::retype_f32_geotiff(&data, kind, mask)
-    } else {
-        cogzilla_kernel::retype_f32_npy(&data, kind, mask)
+    let tif = data.starts_with(b"II*\0");
+    let typed = match rounding {
+        None if tif => crate::geotiff::retype_f32_geotiff(&data, kind, mask),
+        None => cogzilla_kernel::retype_f32_npy(&data, kind, mask),
+        Some(round) => {
+            let prepare = |v: f64| array_type::astype(kind, round(v));
+            if tif {
+                crate::geotiff::retype_f32_geotiff_with(&data, kind, mask, prepare)
+            } else {
+                cogzilla_kernel::retype_f32_npy_with(&data, kind, mask, prepare)
+            }
+        }
     };
     typed.unwrap_or(data)
 }
@@ -2293,7 +2314,9 @@ fn apply_array_asked(
         ArrayAsked::Typed(rule, _, expression, mask) => {
             let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
             let expr = expression_override.or(expression.as_deref());
-            array_in_its_type(data, rule.kind(&reads, expr), mask)
+            let kind = rule.kind(&reads, expr);
+            let rounding = kind.and_then(|kind| rule.rounding(kind));
+            array_in_its_type_rounded(data, kind, mask, rounding)
         }
         ArrayAsked::Shown(pq) => {
             shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data)
@@ -2680,161 +2703,34 @@ fn build_band_request(
                 } else {
                     (1..=default_bands.clamp(1, 16)).collect()
                 };
-                let (expr_str, default_rescale) = match alg {
-                    "normalizedindex" => {
-                        if bands.len() < 2 {
-                            return Err(EngineError::BadRequest(
-                                "algorithm 'normalizedIndex' requires at least 2 bands".into(),
-                            ));
-                        }
-                        // Match TiTiler's NormalizedIndex: (b2 - b1) / (b2 + b1)
-                        (
-                            format!(
-                                "(b{} - b{}) / (b{} + b{})",
-                                bands[1], bands[0], bands[1], bands[0]
-                            ),
-                            (-1.0, 1.0),
-                        )
+                let whole = algorithm_math::whole_numbers(sample_type, pq.unscale);
+                let source_range = default_rescale_for_dtype(sample_type, true);
+                if matches!(alg, "cast" | "ceil" | "floor") && bands.len() >= 3 {
+                    // Each of the first three bands, as an RGB picture.
+                    let one = |b: u16| -> Result<(ExprProgram, (f32, f32)), EngineError> {
+                        let (expr, range) = algorithm_math::integer_band(alg, b, whole, pq.cast_dtype.as_deref());
+                        Ok((ExprProgram::compile(&expr).map_err(EngineError::BadRequest)?, range.unwrap_or(source_range)))
+                    };
+                    let ((p0, dr), (p1, _), (p2, _)) = (one(bands[0])?, one(bands[1])?, one(bands[2])?);
+                    let r0 = pq.rescale.first().copied().unwrap_or(dr);
+                    let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
+                    let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
+                    return Ok(BandRequest::CustomExprRgb {
+                        progs: [p0, p1, p2],
+                        rescale_min: [r0.0, r1.0, r2.0],
+                        rescale_max: [r0.1, r1.1, r2.1],
+                    });
+                }
+                let expr_str = algorithm_math::band_math(alg, &bands, whole, pq.cast_dtype.as_deref(), pq.threshold)
+                    .map_err(EngineError::BadRequest)?;
+                let default_rescale = match alg {
+                    "normalizedindex" => (-1.0, 1.0),
+                    "cast" | "ceil" | "floor" => {
+                        algorithm_math::integer_band(alg, bands[0], whole, pq.cast_dtype.as_deref()).1.unwrap_or(source_range)
                     }
-                    "cast" => {
-                        let cast_one = |b: u16| -> (String, (f32, f32)) {
-                            match pq.cast_dtype.as_deref() {
-                                None | Some("uint8") => {
-                                    (format!("clip(floor(b{b}), 0, 255)"), (0.0, 255.0))
-                                }
-                                Some("int8") => {
-                                    (format!("clip(floor(b{b}), -128, 127)"), (-128.0, 127.0))
-                                }
-                                Some("uint16") => {
-                                    (format!("clip(floor(b{b}), 0, 65535)"), (0.0, 65535.0))
-                                }
-                                Some("int16") => {
-                                    (format!("clip(floor(b{b}), -32768, 32767)"), (-32768.0, 32767.0))
-                                }
-                                Some("uint32") => {
-                                    (format!("max(floor(b{b}), 0)"), (0.0, 4_294_967_295.0))
-                                }
-                                Some("int32") => {
-                                    (format!("floor(b{b})"), (-2_147_483_648.0, 2_147_483_647.0))
-                                }
-                                _ => (format!("b{b}"), default_rescale_for_dtype(sample_type, true)),
-                            }
-                        };
-                        if bands.len() >= 3 {
-                            let (e0, dr) = cast_one(bands[0]);
-                            let (e1, _) = cast_one(bands[1]);
-                            let (e2, _) = cast_one(bands[2]);
-                            let progs = [
-                                ExprProgram::compile(&e0).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&e1).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&e2).map_err(EngineError::BadRequest)?,
-                            ];
-                            let r0 = pq.rescale.first().copied().unwrap_or(dr);
-                            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
-                            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
-                            return Ok(BandRequest::CustomExprRgb {
-                                progs,
-                                rescale_min: [r0.0, r1.0, r2.0],
-                                rescale_max: [r0.1, r1.1, r2.1],
-                            });
-                        }
-                        cast_one(bands[0])
-                    }
-                    "ceil" | "floor" => {
-                        let dr = (0.0, 255.0);
-                        if bands.len() >= 3 {
-                            let progs = [
-                                ExprProgram::compile(&format!("{alg}(b{})", bands[0])).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&format!("{alg}(b{})", bands[1])).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&format!("{alg}(b{})", bands[2])).map_err(EngineError::BadRequest)?,
-                            ];
-                            let r0 = pq.rescale.first().copied().unwrap_or(dr);
-                            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
-                            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
-                            return Ok(BandRequest::CustomExprRgb {
-                                progs,
-                                rescale_min: [r0.0, r1.0, r2.0],
-                                rescale_max: [r0.1, r1.1, r2.1],
-                            });
-                        }
-                        (format!("{alg}(b{})", bands[0]), dr)
-                    }
-                    "min" => {
-                        let mut acc = format!("b{}", bands[0]);
-                        for &b in &bands[1..] {
-                            acc = format!("min({acc}, b{b})");
-                        }
-                        (acc, default_rescale_for_dtype(sample_type, true))
-                    }
-                    "max" => {
-                        let mut acc = format!("b{}", bands[0]);
-                        for &b in &bands[1..] {
-                            acc = format!("max({acc}, b{b})");
-                        }
-                        (acc, default_rescale_for_dtype(sample_type, true))
-                    }
-                    "sum" => {
-                        let sum_s = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(" + ");
-                        let (lo, hi) = default_rescale_for_dtype(sample_type, true);
-                        (sum_s, (lo, hi * bands.len() as f32))
-                    }
-                    "mean" => {
-                        let sum_s = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(" + ");
-                        (
-                            format!("({sum_s}) / {}", bands.len()),
-                            default_rescale_for_dtype(sample_type, true),
-                        )
-                    }
-                    "var" | "std" => {
-                        let args = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("{alg}({args})"), default_rescale_for_dtype(sample_type, true))
-                    }
-                    "median" => {
-                        let args = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("median({args})"), default_rescale_for_dtype(sample_type, true))
-                    }
-                    "grayscale" => {
-                        let expr = if bands.len() >= 3 {
-                            format!(
-                                "0.299 * b{} + 0.587 * b{} + 0.114 * b{}",
-                                bands[0], bands[1], bands[2]
-                            )
-                        } else {
-                            format!("b{}", bands[0])
-                        };
-                        (expr, default_rescale_for_dtype(sample_type, true))
-                    }
-                    "bitonal" => {
-                        let src_expr = if bands.len() >= 3 {
-                            format!(
-                                "(0.299 * b{} + 0.587 * b{} + 0.114 * b{})",
-                                bands[0], bands[1], bands[2]
-                            )
-                        } else {
-                            format!("b{}", bands[0])
-                        };
-                        (
-                            format!("where({src_expr} > {}, 255, 0)", pq.threshold),
-                            (0.0, 255.0),
-                        )
-                    }
-                    _ => unreachable!(),
+                    "bitonal" => (0.0, 255.0),
+                    "sum" => (source_range.0, source_range.1 * bands.len() as f32),
+                    _ => source_range,
                 };
                 let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
                 let rescale = pq.rescale.first().copied().unwrap_or(default_rescale);
@@ -2954,10 +2850,22 @@ fn build_band_request(
                 rescale_max: rmax,
             });
         } else if parts.len() != 1 {
-            return Err(EngineError::BadRequest(format!(
-                "multi-band tile expression must have 1 or 3 semicolon-separated expressions (got {})",
-                parts.len()
-            )));
+            if parts.len() > 15 {
+                return Err(EngineError::BadRequest(format!(
+                    "multi-band tile expression count ({}) exceeds maximum of 15",
+                    parts.len()
+                )));
+            }
+            if pq.colormap_explicit || pq.custom_colormap_json.is_some() {
+                return Err(EngineError::BadRequest(
+                    "colormap cannot be applied to multi-band expression output".into(),
+                ));
+            }
+            let mut progs = Vec::with_capacity(parts.len());
+            for p in &parts {
+                progs.push(ExprProgram::compile(p).map_err(EngineError::BadRequest)?);
+            }
+            return Ok(BandRequest::CustomExprMulti { progs });
         }
         if pq.rescale.len() > 1 {
             return Err(EngineError::BadRequest(format!(
@@ -3396,6 +3304,33 @@ fn maybe_upgrade_multiband_default(
     bands
 }
 
+/// TiTiler's `cast`, `ceil` and `floor` keep every band. An array of other than one or
+/// three bands (which are band math), on a route that writes arrays in their type
+/// (`apply_array_asked`), reads them as they are, and each value is rounded and wrapped as
+/// it is typed (`ArrayRule::rounding`).
+fn keep_algorithm_bands(
+    bands: BandRequest,
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    default_bands: u16,
+) -> BandRequest {
+    let array = fmt == OutputFormat::Npy || ct == GEOTIFF_CONTENT_TYPE;
+    let asked = if pq.bidx.is_empty() { usize::from(default_bands) } else { pq.bidx.len() };
+    if matches!(pq.algorithm.as_deref(), Some("cast" | "ceil" | "floor"))
+        && array
+        && !array_type::shown(pq)
+        && pq.asset_exprs.is_empty()
+        && (asked == 2 || (4..=15).contains(&asked))
+    {
+        let bands_1based = if pq.bidx.is_empty() { (1..=default_bands).collect() } else { pq.bidx.clone() };
+        return BandRequest::MultiBand { bands_1based };
+    }
+    bands
+}
+
+/// The bands of a request on a route that writes arrays in their type (`/cog`, `/stac`,
+/// `/mosaicjson`).
 fn build_band_request_for_output(
     pq: &ParsedQuery,
     default_bands: u16,
@@ -3404,13 +3339,8 @@ fn build_band_request_for_output(
     ct: &str,
 ) -> Result<BandRequest, EngineError> {
     let bands = build_band_request(pq, default_bands, sample_type)?;
-    Ok(maybe_upgrade_multiband_default(
-        bands,
-        fmt,
-        ct,
-        pq,
-        default_bands,
-    ))
+    let bands = maybe_upgrade_multiband_default(bands, fmt, ct, pq, default_bands);
+    Ok(keep_algorithm_bands(bands, fmt, ct, pq, default_bands))
 }
 
 fn build_tile_request(
@@ -3439,9 +3369,12 @@ fn build_tile_request(
         sample_type,
         tms_id,
         source_cog,
+        false,
     )
 }
 
+/// A tile request; `typed_arrays` when the route writes its arrays in their type
+/// (`apply_array_asked`), which some algorithms' bands rely on ([`keep_algorithm_bands`]).
 #[allow(clippy::too_many_arguments)]
 fn build_tile_request_for_tms(
     engine: Option<&TileEngine>,
@@ -3453,6 +3386,7 @@ fn build_tile_request_for_tms(
     sample_type: cogzilla_tiff::SampleType,
     tms_id: &str,
     source_cog: Option<&cogzilla_io::OpenedCog>,
+    typed_arrays: bool,
 ) -> Result<(TileRequest, &'static str), EngineError> {
     let (cols, rows, target_epsg, base_tile_size) =
         if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
@@ -3487,7 +3421,12 @@ fn build_tile_request_for_tms(
         }
         _ => default_bands,
     };
-    let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
+    let bands = if typed_arrays {
+        build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?
+    } else {
+        let bands = build_band_request(pq, eff_default_bands, sample_type)?;
+        maybe_upgrade_multiband_default(bands, format, content_type, pq, eff_default_bands)
+    };
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
     if let BandRequest::MultiBand { ref bands_1based } = bands
         && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
@@ -3599,54 +3538,12 @@ fn build_stats_options_with_bands(
             (1..=default_bands.clamp(1, 16)).collect()
         };
         let alg = alg_raw.to_ascii_lowercase();
-        let expr_str = match alg.as_str() {
-            "normalizedindex" => {
-                if bands.len() < 2 {
-                    return Err(EngineError::BadRequest(
-                        "algorithm 'normalizedIndex' requires at least 2 bands".into(),
-                    ));
-                }
-                format!("(b{} - b{}) / (b{} + b{})", bands[1], bands[0], bands[1], bands[0])
-            }
-            "min" | "max" => {
-                let mut acc = format!("b{}", bands[0]);
-                for &b in &bands[1..] {
-                    acc = format!("{alg}({acc}, b{b})");
-                }
-                acc
-            }
-            "sum" => bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(" + "),
-            "mean" => {
-                let s = bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(" + ");
-                format!("({s}) / {}", bands.len())
-            }
-            "var" | "std" | "median" => {
-                let args = bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(", ");
-                format!("{alg}({args})")
-            }
-            "grayscale" => {
-                if bands.len() >= 3 {
-                    format!("0.299 * b{} + 0.587 * b{} + 0.114 * b{}", bands[0], bands[1], bands[2])
-                } else {
-                    format!("b{}", bands[0])
-                }
-            }
-            "bitonal" => {
-                let src = if bands.len() >= 3 {
-                    format!("(0.299 * b{} + 0.587 * b{} + 0.114 * b{})", bands[0], bands[1], bands[2])
-                } else {
-                    format!("b{}", bands[0])
-                };
-                format!("where({src} > {}, 255, 0)", pq.threshold)
-            }
-            "cast" => format!("clip(floor(b{}), 0, 255)", bands[0]),
-            "ceil" | "floor" => format!("{alg}(b{})", bands[0]),
-            _ => {
-                return Err(EngineError::BadRequest(format!(
-                    "algorithm '{alg_raw}' is not supported on statistics routes"
-                )));
-            }
-        };
+        // The bands' type is not known here: they are taken as possibly fractional.
+        let expr_str = algorithm_math::band_math(&alg, &bands, None, pq.cast_dtype.as_deref(), pq.threshold)
+            .map_err(|e| match alg.as_str() {
+                "normalizedindex" => EngineError::BadRequest(e),
+                _ => EngineError::BadRequest(format!("algorithm '{alg_raw}' is not supported on statistics routes")),
+            })?;
         let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
         opts.expressions = Some(vec![(alg_raw.to_string(), prog)]);
     }
@@ -3765,6 +3662,7 @@ fn default_raw_band_count(bands: &BandRequest, pixel_selection: Selection) -> us
         | BandRequest::Terrain { .. }
         | BandRequest::CustomExprRgb { .. } => 3,
         BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+        BandRequest::CustomExprMulti { progs } => progs.len().max(1),
         _ => 1,
     };
     if pixel_selection.by_last_band() {
@@ -4049,7 +3947,12 @@ async fn render_mosaic_tile_styled(
                     | BandRequest::CustomExprRgb { .. }
                     | BandRequest::Terrain { .. }
             ))
-        || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+        || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
         || (treq.tile_size != 256 && treq.tile_size != 512);
     if !needs_bbox_mosaic
         && !pq.colormap_explicit
@@ -4329,6 +4232,29 @@ fn stac_asset_expr<'a>(pq: &'a ParsedQuery, asset_name: &str) -> Option<&'a str>
         .map(|(_, e)| e.as_str())
 }
 
+fn replace_band1_token(expr: &str, slot: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] == b'b' || bytes[i] == b'B')
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'1'
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && (i + 2 == bytes.len()
+                || !(bytes[i + 2].is_ascii_alphanumeric() || bytes[i + 2] == b'_'))
+        {
+            out.push_str(slot);
+            i += 2;
+        } else {
+            let ch = expr[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 fn expand_stac_asset_bidx(
     pq: &mut ParsedQuery,
     names: &[String],
@@ -4339,7 +4265,7 @@ fn expand_stac_asset_bidx(
             if let Some(expr) = stac_asset_expr(pq, &names[0]) {
                 pq.expr_raw = Some(expr.to_string());
             }
-        } else if names.len() == 3
+        } else if names.len() >= 2
             && names.iter().any(|n| stac_asset_expr(pq, n).is_some())
         {
             let parts: Vec<String> = names
@@ -4348,7 +4274,7 @@ fn expand_stac_asset_bidx(
                 .map(|(i, n)| {
                     let slot = format!("b{}", i + 1);
                     match stac_asset_expr(pq, n) {
-                        Some(expr) => expr.replace("b1", &slot),
+                        Some(expr) => replace_band1_token(expr, &slot),
                         None => slot,
                     }
                 })
@@ -5526,7 +5452,7 @@ fn is_compressible_content_type(ct: &str) -> bool {
 
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
-    req: Request<B>,
+    mut req: Request<B>,
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     B: hyper::body::Body,
@@ -5557,6 +5483,10 @@ where
     let as_page = (offers_page
         && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
     .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
+    // Prevent a cached JSON ETag in `If-None-Match` from short-circuiting an HTML page request to 304.
+    if as_page.is_some() {
+        req.headers_mut().remove(IF_NONE_MATCH);
+    }
     let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
@@ -5590,7 +5520,7 @@ where
             Err(_) => Response::from_parts(parts, Full::new(raw)),
         };
     }
-    if offers_page && resp.status().is_success() {
+    if offers_page && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED) {
         html::append_vary_accept(resp.headers_mut());
     }
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -6977,6 +6907,7 @@ where
                                 cogzilla_tiff::SampleType::Uint8,
                                 tms,
                                 None,
+                                true,
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
@@ -7468,7 +7399,8 @@ where
                             let needs_general_path = pq.nodata.is_some()
                                 || pq.custom_colormap_json.is_some()
                                 || pq.buffer > 0.0
-                                || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
+                                || (!pq.return_mask
+                                && matches!(treq.format, OutputFormat::Npy | OutputFormat::NpyF64))
                                 || (pq.color_formula.is_some()
                                     && !matches!(
                                         treq.bands,
@@ -7478,7 +7410,12 @@ where
                                             | BandRequest::Terrain { .. }
                                     ))
                                 || (treq.tile_size != 256 && treq.tile_size != 512)
-                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                                || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
                                 || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                                 || !crate::engine::cogs_share_base_grid(&cogs);
                             if needs_general_path {
@@ -7961,7 +7898,7 @@ where
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
-                        cogs[0].index.full_res().samples_per_pixel
+                        data_band_count(cogs[0].index.full_res())
                     };
                     expr_progs = build_stats_options_with_bands(&pq, true, db)?.expressions;
                 }
@@ -8045,13 +7982,17 @@ where
                 for (name, slot) in names.iter().zip(ordered.into_iter()) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
-                        let bands_iter: Vec<usize> = match stac_asset_selected_bands(&pq, name) {
-                            Some(sel) => sel.iter().map(|&b| b as usize).collect(),
-                            None if pq.asset_as_band => vec![1],
-                            None if !pq.bidx.is_empty() => {
-                                pq.bidx.iter().map(|&b| b as usize).collect()
+                        let bands_iter: Vec<usize> = if stac_asset_expr(&pq, name).is_some() {
+                            vec![1]
+                        } else {
+                            match stac_asset_selected_bands(&pq, name) {
+                                Some(sel) => sel.iter().map(|&b| b as usize).collect(),
+                                None if pq.asset_as_band => vec![1],
+                                None if !pq.bidx.is_empty() => {
+                                    pq.bidx.iter().map(|&b| b as usize).collect()
+                                }
+                                None => (1..=nb).collect(),
                             }
-                            None => (1..=nb).collect(),
                         };
                         for i in bands_iter {
                             if let Some(v) = obj.get(&format!("b{i}")) {
@@ -8107,7 +8048,7 @@ where
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
-                        cogs[0].index.full_res().samples_per_pixel
+                        data_band_count(cogs[0].index.full_res())
                     };
                     build_stats_options_with_bands(&pq, true, db)?.expressions
                 } else {
@@ -8138,7 +8079,7 @@ where
                         if is_dem_alg || expr_progs_c.is_some() {
                             if is_dem_alg {
                                 let full = cogs_c[0].index.full_res();
-                                let db = if cogs_c.len() > 1 { cogs_c.len() as u16 } else { full.samples_per_pixel };
+                                let db = if cogs_c.len() > 1 { cogs_c.len() as u16 } else { data_band_count(full) };
                                 let mut bands = build_band_request(&pq_clone, db, full.sample_type)?;
                                 if mask.is_empty() {
                                     let alg_name = alg_c.as_deref().unwrap_or("algorithm");
@@ -8780,6 +8721,7 @@ where
                             st,
                             tms,
                             Some(&cogs[0]),
+                            true,
                         )?;
                         // titiler-pgstac's item routes name the media type after the extension
                         // and, without one, choose the format from the pixels.
@@ -8834,7 +8776,8 @@ where
                             || pq_stac.buffer > 0.0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some()
-                            || (!pq_stac.return_mask && matches!(treq.format, OutputFormat::Npy))
+                            || (!pq_stac.return_mask
+                                && matches!(treq.format, OutputFormat::Npy | OutputFormat::NpyF64))
                             || (pq_stac.color_formula.is_some()
                                 && !matches!(
                                     treq.bands,
@@ -8843,7 +8786,12 @@ where
                                         | BandRequest::CustomExprRgb { .. }
                                         | BandRequest::Terrain { .. }
                                 ))
-                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                            || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);
@@ -9312,7 +9260,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let (fmt, ct) = parse_ext_format(
                     ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
                     pq_stac.webp_quality,
@@ -9413,7 +9361,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
@@ -9502,7 +9450,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
@@ -9567,7 +9515,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
@@ -10127,6 +10075,7 @@ where
                             st,
                             tms,
                             Some(&cogs[0]),
+                            true,
                         )?;
                         if pq.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -10174,7 +10123,8 @@ where
                             || pq.buffer > 0.0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some()
-                            || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
+                            || (!pq.return_mask
+                                && matches!(treq.format, OutputFormat::Npy | OutputFormat::NpyF64))
                             || (pq.color_formula.is_some()
                                 && !matches!(
                                     treq.bands,
@@ -10183,7 +10133,12 @@ where
                                         | BandRequest::CustomExprRgb { .. }
                                         | BandRequest::Terrain { .. }
                                 ))
-                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                            || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);
@@ -10384,9 +10339,18 @@ where
                                 }
                             }
                             "datetime" if !dec.is_empty() => q_datetime = Some(dec),
-                            "with_proj" => with_proj = !dec.eq_ignore_ascii_case("false") && dec != "0",
-                            "with_raster" => with_raster = !dec.eq_ignore_ascii_case("false") && dec != "0",
-                            "with_eo" => with_eo = !dec.eq_ignore_ascii_case("false") && dec != "0",
+                            "with_proj" => match parse_bool_param(v) {
+                                Some(b) => with_proj = b,
+                                None => return Err(EngineError::BadRequest(format!("invalid with_proj={dec}: expected boolean"))),
+                            },
+                            "with_raster" => match parse_bool_param(v) {
+                                Some(b) => with_raster = b,
+                                None => return Err(EngineError::BadRequest(format!("invalid with_raster={dec}: expected boolean"))),
+                            },
+                            "with_eo" => match parse_bool_param(v) {
+                                Some(b) => with_eo = b,
+                                None => return Err(EngineError::BadRequest(format!("invalid with_eo={dec}: expected boolean"))),
+                            },
                             _ => {}
                         }
                     }
@@ -12346,6 +12310,7 @@ mod tests {
             cogzilla_tiff::SampleType::Uint8,
             "CDB1GlobalGrid",
             None,
+            true,
         )
         .is_err());
 

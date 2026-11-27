@@ -137,17 +137,18 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
             });
         }
     }
-    if let Ok(conn) = std::env::var("AZURE_STORAGE_CONNECTION_STRING")
-        && let Some(acct) = parse_azure_connection_string(&conn).account_name
-    {
-        if !is_valid_azure_account(&acct) || !is_valid_azure_container(first) {
-            return None;
+    if let Ok(conn) = std::env::var("AZURE_STORAGE_CONNECTION_STRING") {
+        let parsed = parse_azure_connection_string(&conn);
+        if let Some(acct) = parsed.inferred_account_name() {
+            if !is_valid_azure_account(&acct) || !is_valid_azure_container(first) {
+                return None;
+            }
+            return Some(AzureTarget {
+                account: acct,
+                container: first.to_string(),
+                blob: tail.to_string(),
+            });
         }
-        return Some(AzureTarget {
-            account: acct,
-            container: first.to_string(),
-            blob: tail.to_string(),
-        });
     }
     // Fallback: az://account/container/blob
     let (container, blob) = tail.split_once('/')?;
@@ -206,6 +207,22 @@ pub fn parse_azure_connection_string(raw: &str) -> AzureConnectionString {
 }
 
 impl AzureConnectionString {
+    pub fn inferred_account_name(&self) -> Option<String> {
+        if let Some(acct) = &self.account_name {
+            return Some(acct.clone());
+        }
+        let ep = self.blob_endpoint.as_deref()?;
+        let after_scheme = ep.split_once("://").map(|(_, r)| r).unwrap_or(ep);
+        let host = after_scheme.split('/').next()?;
+        let host_no_port = host.split(':').next()?;
+        let first_label = host_no_port.split('.').next()?;
+        if is_valid_azure_account(first_label) {
+            Some(first_label.to_string())
+        } else {
+            None
+        }
+    }
+
     pub fn resolved_endpoint(&self) -> Option<String> {
         if let Some(ep) = &self.blob_endpoint {
             return Some(ep.clone());
@@ -449,15 +466,38 @@ pub async fn fetch_azure_imds_token_from(
     secret_header: Option<(&str, &str)>,
     client_id: Option<&str>,
 ) -> Option<(String, u64)> {
+    fetch_azure_token_with_params(
+        client,
+        endpoint,
+        "2018-02-01",
+        "client_id",
+        secret_header,
+        client_id,
+        Duration::from_millis(500),
+    )
+    .await
+}
+
+async fn fetch_azure_token_with_params(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_version: &str,
+    client_id_param: &str,
+    secret_header: Option<(&str, &str)>,
+    client_id: Option<&str>,
+    timeout: Duration,
+) -> Option<(String, u64)> {
     let sep = if endpoint.contains('?') { '&' } else { '?' };
     let mut url = format!(
-        "{endpoint}{sep}api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F"
+        "{endpoint}{sep}api-version={api_version}&resource=https%3A%2F%2Fstorage.azure.com%2F"
     );
     if let Some(cid) = client_id.map(str::trim).filter(|s| !s.is_empty()) {
-        url.push_str("&client_id=");
-        url.push_str(cid);
+        url.push('&');
+        url.push_str(client_id_param);
+        url.push('=');
+        url.push_str(&encode_query_value(cid));
     }
-    let mut req = client.get(&url).timeout(Duration::from_millis(500));
+    let mut req = client.get(&url).timeout(timeout);
     if let Some((hk, hv)) = secret_header {
         req = req.header(hk, hv);
     } else {
@@ -470,6 +510,10 @@ pub async fn fetch_azure_imds_token_from(
     let text = resp.text().await.ok()?;
     let tok = extract_json_str(&text, "access_token").filter(|s| !s.is_empty())?;
     let ttl = extract_json_u64(&text, "expires_on")
+        .or_else(|| {
+            extract_json_str(&text, "expires_on")
+                .and_then(|s| crate::s3::parse_iso8601_utc_epoch(&s))
+        })
         .and_then(|exp_epoch| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -531,11 +575,14 @@ impl AzureTokenCache {
         ) && !ep.trim().is_empty()
             && !hdr.trim().is_empty()
         {
-            fetch_azure_imds_token_from(
+            fetch_azure_token_with_params(
                 client,
                 ep.trim(),
+                "2019-08-01",
+                "client_id",
                 Some(("X-IDENTITY-HEADER", hdr.trim())),
                 client_id.as_deref(),
+                Duration::from_secs(5),
             )
             .await
         } else if let (Ok(ep), Ok(sec)) = (
@@ -544,11 +591,14 @@ impl AzureTokenCache {
         ) && !ep.trim().is_empty()
             && !sec.trim().is_empty()
         {
-            fetch_azure_imds_token_from(
+            fetch_azure_token_with_params(
                 client,
                 ep.trim(),
+                "2017-09-01",
+                "clientid",
                 Some(("Secret", sec.trim())),
                 client_id.as_deref(),
+                Duration::from_secs(5),
             )
             .await
         } else {
@@ -815,18 +865,30 @@ async fn fetch_gcs_inner(
         if let Some(tok) = &bearer {
             req = req.header("Authorization", format!("Bearer {tok}"));
         } else if let Some((ak, sk)) = hmac_pair {
-            let host = cfg
+            let (scheme, after_scheme) = cfg
                 .endpoint
                 .split_once("://")
-                .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
-                .unwrap_or("storage.googleapis.com");
+                .unwrap_or(("https", cfg.endpoint.as_str()));
+            let (raw_host, ep_path) = match after_scheme.find('/') {
+                Some(i) => (&after_scheme[..i], after_scheme[i..].trim_end_matches('/')),
+                None => (after_scheme, ""),
+            };
+            let host_lower = raw_host.to_ascii_lowercase();
+            let norm_host = if (scheme.eq_ignore_ascii_case("https") && host_lower.ends_with(":443"))
+                || (scheme.eq_ignore_ascii_case("http") && host_lower.ends_with(":80"))
+            {
+                host_lower.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_lower)
+            } else {
+                host_lower.as_str()
+            };
+            let full_canonical = format!("{ep_path}{canonical_uri}");
             let sig_headers = crate::s3::sign_s3_get(
                 ak,
                 sk,
                 None,
                 "auto",
-                host,
-                &canonical_uri,
+                norm_host,
+                &full_canonical,
                 range_hdr.as_deref(),
                 false,
             );
@@ -834,7 +896,10 @@ async fn fetch_gcs_inner(
                 req = req.header(k, v);
             }
         }
-        if let Some(proj) = &cfg.user_project {
+        // GCS XML API forbids mixing `x-amz-*` (HMAC SigV4) with `x-goog-*` headers.
+        if hmac_pair.is_none()
+            && let Some(proj) = &cfg.user_project
+        {
             req = req.header("x-goog-user-project", proj);
         }
 
@@ -1189,15 +1254,44 @@ fn extract_json_str(json: &str, key: &str) -> Option<String> {
     None
 }
 
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\"");
     let pos = json.find(&needle)?;
     let rest = &json[pos + needle.len()..];
     let colon = rest.find(':')?;
     let after = rest[colon + 1..].trim_start();
-    let after = after.strip_prefix('"').unwrap_or(after);
-    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
+    let (quoted, after) = match after.strip_prefix('"') {
+        Some(s) => (true, s),
+        None => (false, after),
+    };
+    let digits_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+    let tail = &after[digits_len..];
+    if quoted {
+        // Reject date strings like "2026-11-27T02:00:00Z" or "11/27/2026 ..."
+        if !tail.starts_with('"') {
+            return None;
+        }
+    } else if let Some(next) = tail.bytes().next()
+        && !matches!(next, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+    {
+        return None;
+    }
+    after[..digits_len].parse().ok()
 }
 
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1479,6 +1573,17 @@ mod tests {
             Some("http://127.0.0.1:10000/devstoreaccount1")
         );
         assert_eq!(cs_sas.sas_token.as_deref(), Some("sv=2020-10-02&sig=xyz%3D"));
+
+        // SAS-only connection string infers AccountName from BlobEndpoint host.
+        let cs_sas_cloud = parse_azure_connection_string(
+            "BlobEndpoint=https://myacct.blob.core.windows.net;SharedAccessSignature=sv=2020-10-02&sig=abc",
+        );
+        assert_eq!(cs_sas_cloud.inferred_account_name().as_deref(), Some("myacct"));
+
+        // Non-epoch date string in expires_on must NOT parse as Unix epoch 2026 or 11.
+        assert_eq!(extract_json_u64(r#"{"expires_on":"2026-11-27T02:00:00Z"}"#, "expires_on"), None);
+        assert_eq!(extract_json_u64(r#"{"expires_on":"11/27/2026 02:00:00 +00:00"}"#, "expires_on"), None);
+        assert_eq!(extract_json_u64(r#"{"expires_on":"4102444800"}"#, "expires_on"), Some(4102444800));
     }
 
     #[tokio::test]

@@ -2646,7 +2646,7 @@ impl MosaicColormap {
                     _ => extra.get(&key).copied().unwrap_or(NOTHING),
                 }
             }
-            cogzilla_kernel::CustomColormap::Intervals(spans) => {
+            cogzilla_kernel::CustomColormap::Intervals { intervals: spans, .. } => {
                 let x = scaled.map_or(v, |(min, max)| f32::from(rescale_byte(v, min, max)));
                 // Where intervals overlap, the one given last is the one that shows.
                 spans.iter().rev().find(|(low, high, _)| x >= *low && x < *high).map_or(NOTHING, |span| span.2)
