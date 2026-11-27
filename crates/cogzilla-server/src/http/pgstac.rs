@@ -1961,7 +1961,7 @@ pub(super) fn asset_entry_names(raw_query: &str) -> Option<Vec<String>> {
 /// Whether an `assets` option may be band math (`red|expression=b1*2`): a look at the
 /// decoded values that spares the requests without it a parse of their assets.
 pub(super) fn asset_math_asked(pairs: &[(String, String)]) -> bool {
-    pairs.iter().any(|(k, v)| k == "assets" && v.contains("expression="))
+    pairs.iter().any(|(k, v)| k == "assets" && v.split('|').skip(1).any(|option| option.starts_with("expression=")))
 }
 
 /// The item routes whose `/stac` handler reads an asset's band math as one expression over
@@ -2064,21 +2064,18 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
     }
 }
 
-/// The two steps an array of [`item_asset_math`] is typed by, as numpy types them: the
-/// assets' results stacked (each over the asset's own bands, which is the same type as over
-/// the stack's), then the request expression over that stack. `None` without a request
-/// expression, when the results are the answer.
-pub(super) fn item_asset_math_stages(rest: &[&str], pairs: &[(String, String)]) -> Option<(String, String)> {
-    let request = request_expression(pairs)?;
+/// The two steps an array of [`item_asset_math`] is typed by, as numpy types them: each
+/// `assets` entry's band math over its own raster (`None` for a plain asset, which is its
+/// raster's type), the results stacked at the widest of their types, then the request
+/// expression over that stack, which is empty without one: the results are then the answer.
+pub(super) fn item_asset_math_stages(rest: &[&str], pairs: &[(String, String)]) -> Option<(Vec<Option<String>>, String)> {
+    let request = request_expression(pairs).unwrap_or_default();
     let specs = parse_assets(pairs).ok()?;
-    let results: Vec<String> = specs
-        .iter()
-        .flat_map(|spec| match &spec.expression {
-            Some(own) => own.split(';').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect(),
-            None => vec!["b1".to_string()],
-        })
-        .collect();
-    item_asset_math_route(rest).then(|| (results.join(";"), request.to_string()))
+    if specs.iter().all(|s| s.expression.is_none()) {
+        return None;
+    }
+    let own: Vec<Option<String>> = specs.into_iter().map(|spec| spec.expression).collect();
+    item_asset_math_route(rest).then(|| (own, request.to_string()))
 }
 
 /// [`item_asset_math`] over several assets reads each asset's first band, which is the
@@ -8129,9 +8126,19 @@ mod tests {
     #[test]
     fn asset_math_is_typed_from_its_stacked_results() {
         let stages = |q: &str| item_asset_math_stages(&["preview.npy"], &query_pairs(q));
-        assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some(("b1/2;b1".into(), "b2".into())));
-        assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some(("b1*2;b1".into(), "b1-b2".into())));
-        assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), None, "the results are the answer");
+        assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some((vec![Some("b1/2;b1".into())], "b2".into())));
+        assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some((vec![Some("b1*2".into()), None], "b1-b2".into())));
+        assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), Some((vec![Some("b1*2".into())], String::new())), "the results are the answer");
+        assert_eq!(stages("assets=red&expression=b1*2"), None, "no asset's own band math");
+    }
+
+    /// Band math is an `|expression=` option of an asset, not an option whose name ends so.
+    #[test]
+    fn asset_math_is_an_expression_option() {
+        assert!(asset_math_asked(&query_pairs("assets=red%7Cexpression%3Db1*2")));
+        assert!(asset_math_asked(&query_pairs("assets=visual%7Cbidx%3D1%7Cexpression%3Db1")));
+        assert!(!asset_math_asked(&query_pairs("assets=visual%7Ccustom_expression%3Db1*2%7Cbidx%3D3")));
+        assert!(!asset_math_asked(&query_pairs("assets=red&expression=b1*2")));
     }
 
     /// An item's point is read band by band and each asset's band math applied afterwards.

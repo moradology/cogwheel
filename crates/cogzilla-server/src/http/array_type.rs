@@ -201,6 +201,13 @@ impl ArrayRule {
         })
     }
 
+    /// Whether the rule reads the bands with their scale and offset applied.
+    pub(super) fn unscales(&self) -> bool {
+        match self {
+            Self::Data { unscale, .. } | Self::Math { unscale } | Self::Algorithm { unscale, .. } => *unscale,
+        }
+    }
+
     /// The type for bands read as `reads`, with `expression` the band math as worked on
     /// (`b1`, `b2`, ... after any asset names are rewritten), several separated by `;`.
     pub(super) fn kind(&self, reads: &[SampleType], expression: Option<&str>) -> Option<SampleType> {
@@ -219,6 +226,45 @@ impl ArrayRule {
         }
         let expressions: Vec<String> = expression?.split(';').map(str::to_string).collect();
         Some(band_math_type(expressions.iter(), read))
+    }
+
+    /// Staged typing for per-asset band math (`own` per asset in `reads`), stacked via numpy
+    /// promotion, optionally followed by a request-level `expression`, and finally any `Algorithm`.
+    pub(super) fn staged_kind(
+        &self,
+        reads: &[SampleType],
+        own: &[Option<String>],
+        request: &str,
+    ) -> Option<SampleType> {
+        if own.len() != reads.len() {
+            return None;
+        }
+        let unscale = self.unscales();
+        let stacked = own
+            .iter()
+            .zip(reads)
+            .map(|(own, read)| match own {
+                Some(expr) => Self::Math { unscale }.kind(&[*read], Some(expr)),
+                None => Self::Data { unscale, resampled: false }.kind(&[*read], None),
+            })
+            .reduce(|a, b| Some(wider_type(a?, b?)))
+            .flatten()?;
+        let after_math = if request.is_empty() {
+            stacked
+        } else {
+            let parts: Vec<String> = request.split(';').map(str::to_string).collect();
+            let whole = band_math_type(parts.iter(), SampleType::Uint16) == SampleType::Int32;
+            if stacked == SampleType::Int32 && whole {
+                SampleType::Int32
+            } else {
+                band_math_type(parts.iter(), stacked)
+            }
+        };
+        if let Self::Algorithm { name, cast, .. } = self {
+            algorithm_type(name, *cast, after_math)
+        } else {
+            Some(after_math)
+        }
     }
 
     /// How each number is rounded before it is put in `kind`: TiTiler's `cast` truncates
@@ -360,5 +406,43 @@ mod tests {
         assert_eq!(ArrayRule::Data { unscale: false, resampled: true }.rounding(T::Uint8).unwrap()(255.7), 255.0);
         assert!(rule("mean").rounding(T::Uint8).is_none());
         assert!(rule("cast").rounding(T::Float32).is_none());
+    }
+
+    #[test]
+    fn staged_kind_handles_mixed_types_unscale_and_algorithms() {
+        use SampleType as T;
+        let math = ArrayRule::Math { unscale: false };
+        // Uint16 whole math (Int32) stacked with plain Float32 -> Float64.
+        assert_eq!(
+            math.staged_kind(&[T::Uint16, T::Float32], &[Some("b1*2".into()), None], ""),
+            Some(T::Float64)
+        );
+        // Uint16 whole math (Int32) + plain Uint16 -> Int32, preserved under whole request math.
+        assert_eq!(
+            math.staged_kind(&[T::Uint16, T::Uint16], &[Some("b1*2".into()), None], "b1+b2"),
+            Some(T::Int32)
+        );
+        // Fixed-dtype algorithm applies AFTER per-asset & request math.
+        let floor = ArrayRule::Algorithm { name: "floor".into(), cast: None, unscale: false, resampled: false };
+        assert_eq!(
+            floor.staged_kind(&[T::Uint16, T::Uint16], &[Some("b1*2".into()), None], ""),
+            Some(T::Uint8)
+        );
+        assert_eq!(
+            floor.staged_kind(&[T::Uint16], &[Some("b1*2".into())], "b1+1"),
+            Some(T::Uint8)
+        );
+        // Input-dependent algorithm (`max`) sees the Float64 from `b1/2`.
+        let max_alg = ArrayRule::Algorithm { name: "max".into(), cast: None, unscale: false, resampled: false };
+        assert_eq!(
+            max_alg.staged_kind(&[T::Uint16], &[Some("b1/2".into())], ""),
+            Some(T::Float64)
+        );
+        // Unscaled math reads bands as Float32.
+        let math_unscale = ArrayRule::Math { unscale: true };
+        assert_eq!(
+            math_unscale.staged_kind(&[T::Uint16, T::Uint16], &[Some("b1*2".into()), None], ""),
+            Some(T::Float32)
+        );
     }
 }

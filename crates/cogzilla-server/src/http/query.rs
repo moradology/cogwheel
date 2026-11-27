@@ -34,9 +34,10 @@ pub(super) struct ParsedQuery {
     pub(super) asset_bidx: Vec<(String, Vec<u16>)>,
     pub(super) asset_exprs: Vec<(String, String)>,
     /// The assets' own band math as it was folded into `expr_raw`, for typing an array as
-    /// numpy types it: the results of the assets stacked, `;` apart, and the request
-    /// expression over them. `None` when nothing was folded.
-    pub(super) asset_math_stages: Option<(String, String)>,
+    /// numpy types it: each `assets` entry's band math (`None` for a plain asset), one per
+    /// raster read, and the request expression over their results. `None` when nothing was
+    /// folded.
+    pub(super) asset_math_stages: Option<(Vec<Option<String>>, String)>,
     pub(super) asset_as_band: bool,
     pub(super) bidx: Vec<u16>,
     pub(super) rescale: Vec<(f32, f32)>,
