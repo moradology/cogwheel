@@ -198,111 +198,31 @@ fn convert_endian_to_native(buf: &mut [u8], elem_size: usize, stored: Endianness
 }
 
 fn decompress_gzip(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
-    if src.len() < 18 || src[0] != 0x1f || src[1] != 0x8b {
-        return Err(ZarrError::Codec {
+    cogzilla_codec::inflate_to_vec(src, expected, cogzilla_codec::DeflateWrapper::Gzip).map_err(
+        |e| ZarrError::Codec {
             codec: "gzip".into(),
             chunk_key: chunk_key.into(),
-            detail: "invalid or truncated gzip header".into(),
-        });
-    }
-    let mut out = vec![0u8; expected];
-    let mut dec = libdeflater::Decompressor::new();
-    let n = dec
-        .gzip_decompress(src, &mut out)
-        .map_err(|e| ZarrError::Codec {
-            codec: "gzip".into(),
-            chunk_key: chunk_key.into(),
-            detail: format!("libdeflater gzip error: {e:?}"),
-        })?;
-    out.truncate(n);
-    Ok(out)
-}
-
-pub(crate) fn decompress_zlib_raw(
-    src: &[u8],
-    expected: usize,
-    chunk_key: &str,
-) -> Result<Vec<u8>, ZarrError> {
-    decompress_zlib(src, expected, chunk_key)
-}
-
-pub(crate) fn decompress_zstd_raw(
-    src: &[u8],
-    expected: usize,
-    chunk_key: &str,
-) -> Result<Vec<u8>, ZarrError> {
-    decompress_zstd(src, expected, chunk_key)
+            detail: e.to_string(),
+        },
+    )
 }
 
 fn decompress_zlib(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
-    if src.len() < 6 {
-        return Err(ZarrError::Codec {
+    cogzilla_codec::inflate_to_vec(src, expected, cogzilla_codec::DeflateWrapper::Zlib).map_err(
+        |e| ZarrError::Codec {
             codec: "zlib".into(),
             chunk_key: chunk_key.into(),
-            detail: "truncated zlib stream".into(),
-        });
-    }
-    let mut out = vec![0u8; expected];
-    let mut dec = libdeflater::Decompressor::new();
-    let n = dec
-        .zlib_decompress(src, &mut out)
-        .map_err(|e| ZarrError::Codec {
-            codec: "zlib".into(),
-            chunk_key: chunk_key.into(),
-            detail: format!("libdeflater zlib error: {e:?}"),
-        })?;
-    out.truncate(n);
-    Ok(out)
+            detail: e.to_string(),
+        },
+    )
 }
 
 fn decompress_zstd(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
-    if src.len() < 4 {
-        return Err(ZarrError::Codec {
-            codec: "zstd".into(),
-            chunk_key: chunk_key.into(),
-            detail: "truncated zstd frame".into(),
-        });
-    }
-    // Check declared frame content size when available so hostile headers fail immediately.
-    // SAFETY: `src.as_ptr()` is valid for `src.len()` readable bytes.
-    let content_size = unsafe { zstd_sys::ZSTD_getFrameContentSize(src.as_ptr().cast(), src.len()) };
-    if content_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
-        return Err(ZarrError::Codec {
-            codec: "zstd".into(),
-            chunk_key: chunk_key.into(),
-            detail: "corrupt zstd frame header".into(),
-        });
-    }
-    if content_size != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64 && content_size > expected as u64 {
-        return Err(ZarrError::Codec {
-            codec: "zstd".into(),
-            chunk_key: chunk_key.into(),
-            detail: format!("zstd frame declares {content_size} bytes, exceeding chunk size {expected}"),
-        });
-    }
-
-    let mut out = vec![0u8; expected];
-    // SAFETY: `out` is a freshly allocated writable buffer of `out.len()` bytes and
-    // `src` is a valid non-overlapping readable slice of `src.len()` bytes.
-    let rc = unsafe {
-        zstd_sys::ZSTD_decompress(
-            out.as_mut_ptr().cast(),
-            out.len(),
-            src.as_ptr().cast(),
-            src.len(),
-        )
-    };
-    // SAFETY: `ZSTD_isError` is a pure inspection of the return code `rc`.
-    let is_err = unsafe { zstd_sys::ZSTD_isError(rc) } != 0;
-    if is_err {
-        return Err(ZarrError::Codec {
-            codec: "zstd".into(),
-            chunk_key: chunk_key.into(),
-            detail: format!("zstd error code {rc}"),
-        });
-    }
-    out.truncate(rc);
-    Ok(out)
+    cogzilla_codec::zstd_to_vec(src, expected).map_err(|e| ZarrError::Codec {
+        codec: "zstd".into(),
+        chunk_key: chunk_key.into(),
+        detail: e.to_string(),
+    })
 }
 
 /// Decompress LZ4: supports both standard LZ4 frames (magic `0x184D2204`) and numcodecs's
@@ -804,20 +724,7 @@ mod tests {
     }
 
     fn compress_zstd(src: &[u8]) -> Vec<u8> {
-        let bound = unsafe { zstd_sys::ZSTD_compressBound(src.len()) };
-        let mut out = vec![0u8; bound];
-        let rc = unsafe {
-            zstd_sys::ZSTD_compress(
-                out.as_mut_ptr().cast(),
-                out.len(),
-                src.as_ptr().cast(),
-                src.len(),
-                3,
-            )
-        };
-        assert_eq!(unsafe { zstd_sys::ZSTD_isError(rc) }, 0);
-        out.truncate(rc);
-        out
+        cogzilla_codec::compress_zstd(src, 3).unwrap()
     }
 
     #[test]
@@ -864,10 +771,7 @@ mod tests {
         let payload: Vec<u8> = (0..256u32).flat_map(|v| v.to_le_bytes()).collect();
 
         // zlib round-trip
-        let mut comp = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
-        let mut zbuf = vec![0u8; comp.zlib_compress_bound(payload.len())];
-        let zn = comp.zlib_compress(&payload, &mut zbuf).unwrap();
-        zbuf.truncate(zn);
+        let zbuf = cogzilla_codec::compress_zlib(&payload).unwrap();
         let meta_z = make_meta(
             vec![16, 16],
             DataType::UInt32,
