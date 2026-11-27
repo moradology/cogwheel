@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod batch;
 pub mod cache;
 pub mod coalesce;

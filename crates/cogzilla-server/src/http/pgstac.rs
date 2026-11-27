@@ -2153,7 +2153,7 @@ pub(super) fn check_item_asset_math(
         let plain_unselected = specs.iter().enumerate().any(|(slot, s)| {
             &s.name == name
                 && s.expression.is_none()
-                && !chosen.get(slot).is_some_and(|c| c.as_ref().is_some_and(|c| c.as_slice() == [1]))
+                && chosen.get(slot).is_none_or(|c| c.as_ref().is_none_or(|c| c.as_slice() != [1]))
         });
         if plain_unselected && bands > 1 {
             return Err(EngineError::BadRequest(format!(

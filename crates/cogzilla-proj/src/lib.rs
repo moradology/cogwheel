@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod crs;
 pub mod ellipsoid;
 pub mod epsg;
