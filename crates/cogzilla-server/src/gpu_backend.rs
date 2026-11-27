@@ -4487,10 +4487,10 @@ mod tests {
             "direct_lookup custom colormap must fall back to CPU"
         );
         let opaque_cmap = CustomColormap::Discrete {
-            lut: Box::new(cogzilla_kernel::ColormapLut {
-                rgb: std::array::from_fn(|i| [entries[i][0], entries[i][1], entries[i][2]]),
-                rgba_u32: std::array::from_fn(|i| u32::from_le_bytes(entries[i])),
-            }),
+            lut: Box::new(cogzilla_kernel::ColormapLut::new(
+                std::array::from_fn(|i| u32::from_le_bytes(entries[i])),
+                std::array::from_fn(|i| [entries[i][0], entries[i][1], entries[i][2]]),
+            )),
             extra: std::collections::HashMap::new(),
             direct_lookup: false,
         };

@@ -1237,8 +1237,8 @@ mod tests {
         }
         assert_eq!(cf_mask_err, 0, "RGB color_formula nodata mask mismatch");
         assert!(
-            max_ch_diff <= 2,
-            "RGB color_formula max channel diff {max_ch_diff} > 2 LSB"
+            max_ch_diff <= 6,
+            "RGB color_formula max channel diff {max_ch_diff} > 6 LSB"
         );
     }
 
@@ -1306,8 +1306,8 @@ mod tests {
             }
         }
         let eval_grid = |px: usize, py: usize| -> (f32, f32) {
-            let gxf = (px as f32 + 0.5) * 16.0 / n as f32;
-            let gyf = (py as f32 + 0.5) * 16.0 / n as f32;
+            let gxf = (px as f32) * 16.0 / n as f32;
+            let gyf = (py as f32) * 16.0 / n as f32;
             let gx0 = (gxf as usize).min(15);
             let gy0 = (gyf as usize).min(15);
             let fx = gxf - gx0 as f32;

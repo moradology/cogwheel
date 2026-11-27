@@ -489,7 +489,7 @@ impl TileEngine {
             if let Some(b1) = bands_1based {
                 let kind = cog.index.full_res().sample_type;
                 let (minx, miny, maxx, maxy) = cogzilla_proj::tile_bounds_3857(req.tile);
-                return crate::titiler::render_exact_f64_array(
+                return Box::pin(crate::titiler::render_exact_f64_array(
                     self,
                     cog,
                     [minx, miny, maxx, maxy],
@@ -506,7 +506,7 @@ impl TileEngine {
                     true,
                     matches!(req.format, OutputFormat::RawF64),
                     true,
-                )
+                ))
                 .await;
             }
         }
@@ -514,8 +514,8 @@ impl TileEngine {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
             let raw = match raw_req.tile_size {
-                256 => self.render_tile_sized::<256>(cog, &raw_req).await?,
-                512 => self.render_tile_sized::<512>(cog, &raw_req).await?,
+                256 => Box::pin(self.render_tile_sized::<256>(cog, &raw_req)).await?,
+                512 => Box::pin(self.render_tile_sized::<512>(cog, &raw_req)).await?,
                 other => {
                     return Err(EngineError::BadRequest(format!(
                         "unsupported tile_size={other}, expected 256 or 512"
@@ -539,8 +539,8 @@ impl TileEngine {
             ));
         }
         match req.tile_size {
-            256 => self.render_tile_sized::<256>(cog, req).await,
-            512 => self.render_tile_sized::<512>(cog, req).await,
+            256 => Box::pin(self.render_tile_sized::<256>(cog, req)).await,
+            512 => Box::pin(self.render_tile_sized::<512>(cog, req)).await,
             other => Err(EngineError::BadRequest(format!(
                 "unsupported tile_size={other}, expected 256 or 512"
             ))),

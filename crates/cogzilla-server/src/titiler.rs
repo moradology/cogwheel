@@ -6204,7 +6204,7 @@ pub async fn render_native_preview_stats(
     stats_opts: &StatsOptions,
 ) -> Result<serde_json::Value, EngineError> {
     let n_px = (width.clamp(1, 4096) as usize) * (height.clamp(1, 4096) as usize);
-    match render_bbox_core(
+    match Box::pin(render_bbox_core(
         engine,
         cogs,
         bbox,
@@ -6222,7 +6222,7 @@ pub async fn render_native_preview_stats(
         true,
         unscale,
         Some((stats_opts, description)),
-    )
+    ))
     .await?
     {
         #[cfg(feature = "gpu")]
@@ -6260,7 +6260,7 @@ pub async fn render_wgs84_bbox_stats(
     stats_opts: &StatsOptions,
 ) -> Result<serde_json::Value, EngineError> {
     let n_px = (width.clamp(1, 4096) as usize) * (height.clamp(1, 4096) as usize);
-    match render_bbox_core(
+    match Box::pin(render_bbox_core(
         engine,
         cogs,
         bbox,
@@ -6278,7 +6278,7 @@ pub async fn render_wgs84_bbox_stats(
         true,
         unscale,
         Some((stats_opts, description)),
-    )
+    ))
     .await?
     {
         #[cfg(feature = "gpu")]
@@ -6366,7 +6366,7 @@ async fn render_bbox_impl(
     return_mask: bool,
     unscale: bool,
 ) -> Result<Bytes, EngineError> {
-    match render_bbox_core(
+    match Box::pin(render_bbox_core(
         engine,
         cogs,
         bbox,
@@ -6384,7 +6384,7 @@ async fn render_bbox_impl(
         return_mask,
         unscale,
         None,
-    )
+    ))
     .await?
     {
         BboxRenderOutput::Bytes(b) => Ok(b),

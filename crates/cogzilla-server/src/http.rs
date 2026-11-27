@@ -5478,7 +5478,7 @@ where
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
     }
-    let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
+    let mut resp = Box::pin(handle_request_inner(engine.clone(), req, is_head)).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
     {
@@ -5487,7 +5487,7 @@ where
         *retry_req.method_mut() = m;
         *retry_req.uri_mut() = u;
         *retry_req.headers_mut() = h;
-        resp = handle_request_inner(engine.clone(), retry_req, is_head).await?;
+        resp = Box::pin(handle_request_inner(engine.clone(), retry_req, is_head)).await?;
         resp.headers_mut().remove("x-cogzilla-retry");
     }
     if let Some(permit) = aimd_permit.as_mut()
