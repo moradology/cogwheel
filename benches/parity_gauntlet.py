@@ -38,6 +38,9 @@ import rasterio
 import rasterio.shutil as rio_shutil
 from rasterio.crs import CRS
 from rasterio.enums import Resampling as RioResampling
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle_lib import wait_ready
 from rasterio.transform import from_bounds
 from rasterio.warp import transform_bounds
 
@@ -355,19 +358,6 @@ def build_corpus() -> list[CorpusCase]:
     cases.append(CorpusCase("resample_cubic_rgb_u8", "resampling", CORPUS_DIR / "layout_rgb_pixel_u8.tif", "bidx=1&bidx=2&bidx=3&resampling=cubic", check_stats=False, check_point=False))
 
     return cases
-
-
-def wait_ready(url: str, timeout_s: float = 10.0):
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        try:
-            r = httpx.get(url, timeout=0.5)
-            if r.status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(0.1)
-    raise RuntimeError(f"Server at {url} not ready in {timeout_s}s")
 
 
 def lonlat_to_tile(lon: float, lat: float, z: int) -> tuple[int, int]:

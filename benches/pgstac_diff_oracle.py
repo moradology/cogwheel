@@ -44,8 +44,19 @@ import xml.etree.ElementTree as ET
 import httpx
 import psycopg
 import mercantile
-import numpy as np
-from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle_lib import (
+    DEFAULT_VOLATILE_KEYS as VOLATILE,
+    compare_response,
+    compare_wmts_xml,
+    first_json_diff as first_diff,
+    normalize_json as normalize,
+    same_place,
+    stats_diff,
+    wait_ready,
+    zonal_diff,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "benches" / "results" / "pgstac"
@@ -55,7 +66,6 @@ COGZILLA_BIN = ROOT / "target" / "release" / "cogzilla-server"
 PORT_COGZILLA = 18823
 TITILER = f"http://127.0.0.1:{os.environ.get('TITILER_PGSTAC_PORT', '18821')}"
 COGZILLA = f"http://127.0.0.1:{PORT_COGZILLA}"
-VOLATILE = {"lastused", "usecount"}
 
 
 def dsn_from_env() -> str:
@@ -68,232 +78,6 @@ def dsn_from_env() -> str:
     port = os.environ.get("PGPORT", os.environ.get("PGSTAC_PORT", "5439"))
     db = os.environ.get("PGDATABASE", "postgis")
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
-
-
-def wait_ready(url: str, timeout_s: float = 20.0) -> None:
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        try:
-            if httpx.get(url, timeout=1.0).status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.1)
-    raise RuntimeError(f"{url} did not become ready in {timeout_s}s")
-
-
-def normalize(value, base: str):
-    """Strip what legitimately differs between the two servers."""
-    if isinstance(value, dict):
-        return {k: normalize(v, base) for k, v in value.items() if k not in VOLATILE}
-    if isinstance(value, list):
-        return [normalize(v, base) for v in value]
-    if isinstance(value, str):
-        return value.replace(base, "{base}")
-    return value
-
-
-def first_diff(a, b, path="$"):
-    if type(a) is not type(b) and not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
-        return f"{path}: {type(a).__name__} vs {type(b).__name__}"
-    if isinstance(a, dict):
-        for k in sorted(set(a) | set(b)):
-            if k not in a:
-                return f"{path}.{k}: missing in cogzilla"
-            if k not in b:
-                return f"{path}.{k}: only in cogzilla"
-            d = first_diff(a[k], b[k], f"{path}.{k}")
-            if d:
-                return d
-        return None
-    if isinstance(a, list):
-        if len(a) != len(b):
-            return f"{path}: {len(a)} vs {len(b)} entries"
-        for i, (x, y) in enumerate(zip(a, b)):
-            d = first_diff(x, y, f"{path}[{i}]")
-            if d:
-                return d
-        return None
-    if isinstance(a, float) or isinstance(b, float):
-        return None if math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9) else f"{path}: {a} vs {b}"
-    return None if a == b else f"{path}: {str(a)[:60]!r} vs {str(b)[:60]!r}"
-
-
-def geotiff_array(body: bytes) -> tuple[bytes, str]:
-    """A GeoTIFF as the NumPy array it holds, and what it says of itself."""
-    import warnings
-
-    from rasterio.io import MemoryFile
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        with MemoryFile(body) as memory, memory.open() as ds:
-            said = (f"{ds.dtypes[0]} x{ds.count} {[c.name for c in ds.colorinterp]} "
-                    f"epsg {ds.crs.to_epsg() if ds.crs else None} {[round(v, 6) for v in ds.bounds]}")
-            out = io.BytesIO()
-            np.save(out, ds.read())
-            return out.getvalue(), said
-
-
-def compare_geotiffs(cz: bytes, tt: bytes, smooth: bool) -> tuple[bool, str]:
-    try:
-        (a, said_a), (b, said_b) = geotiff_array(cz), geotiff_array(tt)
-    except Exception as e:  # noqa: BLE001 - an unreadable GeoTIFF is a failed check
-        return False, f"unreadable GeoTIFF: {e}"
-    if said_a != said_b:
-        return False, f"{said_a} vs {said_b}"
-    ok, note = compare_arrays(a, b, smooth)
-    return ok, f"GeoTIFF, {note}"
-
-
-def same_place(cz, tt) -> tuple[bool, str]:
-    """`Content-Crs` equal, and `Content-Bbox` equal to a millionth of a unit (the last
-    digits of a float worked out another way)."""
-    crs_cz, crs_tt = cz.headers.get("content-crs"), tt.headers.get("content-crs")
-    if crs_cz != crs_tt:
-        return False, f"content-crs {crs_cz} vs {crs_tt}"
-    box_cz, box_tt = cz.headers.get("content-bbox"), tt.headers.get("content-bbox")
-    if (box_cz is None) != (box_tt is None):
-        return False, f"content-bbox {box_cz} vs {box_tt}"
-    if box_cz is None:
-        return True, "neither placed"
-    a, b = [float(v) for v in box_cz.split(",")], [float(v) for v in box_tt.split(",")]
-    if len(a) != 4 or any(abs(x - y) > 1e-6 * max(1.0, abs(y)) for x, y in zip(a, b)):
-        return False, f"content-bbox {box_cz} vs {box_tt}"
-    return True, f"{crs_cz.rsplit('/', 1)[-1]} {box_cz}"
-
-
-def compare_images(cz: bytes, tt: bytes) -> tuple[bool, str]:
-    try:
-        a = np.array(Image.open(io.BytesIO(cz)).convert("RGBA"), dtype=np.float32)
-        b = np.array(Image.open(io.BytesIO(tt)).convert("RGBA"), dtype=np.float32)
-    except Exception as e:  # noqa: BLE001 - an undecodable image is a failed check
-        return False, f"undecodable image: {e}"
-    if a.shape != b.shape:
-        return False, f"size {a.shape[1]}x{a.shape[0]} vs {b.shape[1]}x{b.shape[0]}"
-    ma, mb = a[:, :, 3] > 0, b[:, :, 3] > 0
-    mask = float((ma == mb).mean()) * 100
-    both = ma & mb
-    if both.any():
-        d = a[:, :, :3][both] - b[:, :, :3][both]
-        mse = float((d * d).mean())
-        psnr = 99.0 if mse < 1e-9 else 20 * math.log10(255 / math.sqrt(mse))
-    else:
-        psnr = 99.0
-    return mask >= 99.0 and psnr >= 25.0, f"mask {mask:.2f}%, PSNR {psnr:.1f} dB"
-
-
-def compare_arrays(cz: bytes, tt: bytes, smooth: bool = False, masked: bool = True) -> tuple[bool, str]:
-    """NumPy arrays: the same type and shape, the same mask band, and values as close as
-    two pictures of them would be (most equal; the rest from the pixel next door).
-    Without a mask band (`return_mask=false`) a pixel counts as there where any band of
-    the reference's is not zero."""
-    try:
-        a, b = np.load(io.BytesIO(cz)), np.load(io.BytesIO(tt))
-    except Exception as e:  # noqa: BLE001 - an unreadable array is a failed check
-        return False, f"unreadable array: {e}"
-    if a.dtype != b.dtype or a.shape != b.shape:
-        return False, f"{a.dtype} {a.shape} vs {b.dtype} {b.shape}"
-    if not masked:
-        there = (b != 0).any(axis=0)
-        top = np.iinfo(a.dtype).max if a.dtype.kind in "ui" else 1
-        a = np.concatenate([a, (there * top).astype(a.dtype)[None]])
-        b = np.concatenate([b, (there * top).astype(b.dtype)[None]])
-    ma, mb = a[-1] != 0, b[-1] != 0
-    mask = float((ma == mb).mean()) * 100
-    tops = set(np.unique(a[-1][ma]).tolist()) == set(np.unique(b[-1][mb]).tolist())
-    both = ma & mb
-    if not both.any():
-        return mask >= 99.0 and tops, f"{a.dtype} {a.shape}, mask {mask:.2f}%"
-    va, vb = a[:-1][:, both].astype(np.float64), b[:-1][:, both].astype(np.float64)
-    if a.dtype.kind == "f":
-        # Fractions are not equal from one pixel to its neighbour: the means are compared.
-        # Halved first: the largest double, which a division by zero is written as, has no sum.
-        ha, hb = (va / 2).mean(), (vb / 2).mean()
-        close = ha == hb or abs(ha - hb) <= 0.02 * abs(hb) + 1e-9
-        return mask >= 99.0 and tops and close, f"{a.dtype} {a.shape}, mask {mask:.2f}%, mean {va.mean():.5g} vs {vb.mean():.5g}"
-    # Band by band: one band that is wrong is not hidden by the others that are right.
-    same = min(float((va[i] == vb[i]).mean()) * 100 for i in range(va.shape[0]))
-    if smooth:
-        # Between pixels two readers do not land on the same number: the worst band's
-        # mean difference is held to a tenth of its mean value.
-        off = max(float(np.abs(va[i] - vb[i]).mean() / (np.abs(vb[i]).mean() + 1e-9)) for i in range(va.shape[0])) * 100
-        return mask >= 99.0 and tops and off <= 10.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, values {off:.1f}% apart in the worst band"
-    return mask >= 99.0 and tops and same >= 75.0, f"{a.dtype} {a.shape}, mask {mask:.2f}%, {same:.1f}% of values equal in the worst band"
-
-
-def wmts_view(text: str, base: str):
-    """A WMTS capabilities document as plain lists, keeping only what concerns WebMercatorQuad:
-    cogzilla serves these routes in that one tile matrix set, TiTiler lists thirteen."""
-    wm = "{http://www.opengis.net/wmts/1.0}"
-    ows = "{http://www.opengis.net/ows/1.1}"
-
-    def plain(el):
-        attrs = {k: v.replace(base, "{base}") for k, v in sorted(el.attrib.items())}
-        text = (el.text or "").strip().replace(base, "{base}")
-        if el.tag.endswith("Corner"):
-            # Coordinates are compared as numbers: the two servers project with different code.
-            text = [float(v) for v in text.split()]
-        return [el.tag, attrs, text, [plain(c) for c in el]]
-
-    root = ET.fromstring(text)
-    contents = root.find(f"{wm}Contents")
-    layers = [l for l in contents.findall(f"{wm}Layer")
-              if l.find(f"{wm}TileMatrixSetLink/{wm}TileMatrixSet").text == "WebMercatorQuad"]
-    matrix_sets = [t for t in contents.findall(f"{wm}TileMatrixSet")
-                   if t.find(f"{ows}Identifier").text == "WebMercatorQuad"]
-    rest = [plain(c) for c in root if c.tag != f"{wm}Contents"]
-    return {"root": [root.tag, dict(sorted(root.attrib.items()))], "outside_contents": rest,
-            "layers": [plain(l) for l in layers], "tile_matrix_sets": [plain(t) for t in matrix_sets]}
-
-
-def stats_diff(a, b, path="$"):
-    """Statistics come from differently resampled pixels: compare structure exactly and the
-    summary numbers loosely (5% of the reference, or 2 units)."""
-    if isinstance(b, dict):
-        if not isinstance(a, dict) or set(a) != set(b):
-            return f"{path}: keys differ: {sorted(set(a) ^ set(b)) if isinstance(a, dict) else type(a).__name__}"
-        for k in b:
-            if k in ("histogram", "majority", "minority", "unique", "count", "sum",
-                     "masked_pixels", "valid_pixels", "valid_percent"):
-                continue
-            d = stats_diff(a[k], b[k], f"{path}.{k}")
-            if d:
-                return d
-        return None
-    if isinstance(b, (int, float)) and not isinstance(b, bool):
-        if not isinstance(a, (int, float)) or abs(a - b) > max(2.0, 0.05 * abs(b)):
-            return f"{path}: {a} vs {b}"
-        return None
-    return None if a == b else f"{path}: {a!r} vs {b!r}"
-
-
-def zonal_diff(a, b, path="$", key=""):
-    """Mosaic statistics are read from the same pixels on both sides, so everything has to
-    be equal. TiTiler sums coverage-weighted values in single precision: `mean`, `count`,
-    `sum` and `std` are compared to one part in a million, other numbers to one in 1e9."""
-    if isinstance(b, dict):
-        if not isinstance(a, dict) or set(a) != set(b):
-            return f"{path}: keys differ: {sorted(set(a) ^ set(b)) if isinstance(a, dict) else type(a).__name__}"
-        for k in b:
-            d = zonal_diff(a[k], b[k], f"{path}.{k}", k)
-            if d:
-                return d
-        return None
-    if isinstance(b, list):
-        if not isinstance(a, list) or len(a) != len(b):
-            return f"{path}: lists differ"
-        for i, (x, y) in enumerate(zip(a, b)):
-            d = zonal_diff(x, y, f"{path}[{i}]", key)
-            if d:
-                return d
-        return None
-    if isinstance(b, (int, float)) and not isinstance(b, bool):
-        tol = 1e-6 if key in ("mean", "count", "sum", "std") else 1e-9
-        if not isinstance(a, (int, float)) or abs(a - b) > tol * max(1.0, abs(b)):
-            return f"{path}: {a!r} vs {b!r}"
-        return None
-    return None if a == b else f"{path}: {a!r} vs {b!r}"
 
 
 class Oracle:
@@ -353,9 +137,7 @@ class Oracle:
             elif cz.headers.get("content-type") != tt.headers.get("content-type"):
                 ok, note = False, f"content type {cz.headers.get('content-type')} vs {tt.headers.get('content-type')}"
             else:
-                a, b = wmts_view(cz.text, COGZILLA), wmts_view(tt.text, TITILER)
-                diff = first_diff(a, b)
-                ok, note = diff is None, diff or f"{len(a['layers'])} layer(s), WebMercatorQuad parts equal"
+                ok, note = compare_wmts_xml(cz.text, tt.text, base_a=COGZILLA, base_b=TITILER)
         elif kind == "stats":
             diff = stats_diff(cz.json(), tt.json())
             ok, note = diff is None, diff or "same bands and fields, numbers within tolerance"
@@ -394,13 +176,15 @@ class Oracle:
                 note = f"{cz.status_code}"
             elif ct_cz != ct_tt:
                 ok, note = False, f"content type {ct_cz} vs {ct_tt}"
-            elif cz.content[:6] == b"\x93NUMPY":
-                ok, note = compare_arrays(cz.content, tt.content, smooth="resampling=" in path, masked="return_mask=false" not in path)
-            elif cz.content[:4] == b"II*\x00":
-                ok, note = compare_geotiffs(cz.content, tt.content, "resampling=" in path)
             else:
-                ok, note = compare_images(cz.content, tt.content)
-                note = f"{ct_cz}, {note}"
+                ok, note = compare_response(
+                    ct_cz,
+                    cz.content,
+                    tt.content,
+                    compare_pixels=True,
+                    smooth="resampling=" in path,
+                    masked="return_mask=false" not in path,
+                )
         status = "PASS" if ok else "FAIL"
         if known:
             status, note = ("KNOWN", f"{note} [{known}]") if not ok else ("FAIL", f"agrees now, drop the note [{known}]")
