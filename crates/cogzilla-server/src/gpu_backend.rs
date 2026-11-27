@@ -19,7 +19,8 @@ use cogzilla_gpu::{
     GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuJpegEncoder,
     GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuSlab,
     GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedStatsReducer,
-    MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, pack_rgb_lut,
+    MosaicCompositeResult as GpuMosaicResult, MosaicOutput, MosaicUpload, MultiBandSlabKey,
+    OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, pack_rgb_lut,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{
@@ -2581,27 +2582,42 @@ impl GpuBackend {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard(&self.in_flight);
 
-        // 2. Dispatch to the specialized fused GPU kernel for each filled cell.
+        // 2. Dispatch through the single `GpuMosaicCompositor::composite` entry point.
         match (&req.input, &req.output) {
             (MosaicCompositeInput::Single(planes), MosaicCompositeOutput::F32) => {
                 let mut mosaic_guard = self.mosaic.lock().ok()?;
-                mosaic_guard
-                    .composite_f32_direct(planes, width, height, method)
-                    .ok()
-                    .map(MosaicCompositeResult::F32)
+                match mosaic_guard
+                    .composite(
+                        MosaicUpload::Direct {
+                            planes,
+                            width,
+                            height,
+                        },
+                        method,
+                        MosaicOutput::F32,
+                    )
+                    .ok()?
+                {
+                    GpuMosaicResult::F32(v) => Some(MosaicCompositeResult::F32(v)),
+                    _ => None,
+                }
             }
             (MosaicCompositeInput::Bands(band_planes), MosaicCompositeOutput::F32) => {
                 let mut mosaic_guard = self.mosaic.lock().ok()?;
-                if band_planes.len() == 1 {
-                    mosaic_guard
-                        .composite_f32_direct(&band_planes[0], width, height, method)
-                        .ok()
-                        .map(|v| MosaicCompositeResult::F32Bands(vec![v]))
-                } else {
-                    mosaic_guard
-                        .composite_f32_bands_direct(band_planes, width, height, method)
-                        .ok()
-                        .map(MosaicCompositeResult::F32Bands)
+                match mosaic_guard
+                    .composite(
+                        MosaicUpload::DirectBands {
+                            bands: band_planes,
+                            width,
+                            height,
+                        },
+                        method,
+                        MosaicOutput::F32Bands,
+                    )
+                    .ok()?
+                {
+                    GpuMosaicResult::F32Bands(v) => Some(MosaicCompositeResult::F32Bands(v)),
+                    _ => None,
                 }
             }
             (
@@ -2620,33 +2636,42 @@ impl GpuBackend {
 
                 if let OutputFormat::Jpeg { quality } = *format
                     && let Ok(mut jpeg_guard) = self.jpeg.lock()
-                    && let Ok(jpg) = mosaic_guard.composite_styled_jpeg_direct(
-                        planes,
-                        width,
-                        height,
+                    && let Ok(GpuMosaicResult::Bytes(jpg)) = mosaic_guard.composite(
+                        MosaicUpload::Direct {
+                            planes,
+                            width,
+                            height,
+                        },
                         method,
-                        rescale.0,
-                        rescale.1,
-                        &lut_u32,
-                        &mut jpeg_guard,
-                        quality,
+                        MosaicOutput::StyledJpeg {
+                            lut: &lut_u32,
+                            jpeg: &mut jpeg_guard,
+                            quality,
+                            rescale: *rescale,
+                        },
                     )
                 {
                     return Some(MosaicCompositeResult::Bytes(Bytes::from(jpg)));
                 }
 
-                let raw = mosaic_guard
-                    .composite_styled_direct(
-                        planes,
-                        width,
-                        height,
+                let GpuMosaicResult::Bytes(raw) = mosaic_guard
+                    .composite(
+                        MosaicUpload::Direct {
+                            planes,
+                            width,
+                            height,
+                        },
                         method,
-                        rescale.0,
-                        rescale.1,
-                        &lut_u32,
-                        out_kind,
+                        MosaicOutput::Styled {
+                            lut: &lut_u32,
+                            out: out_kind,
+                            rescale: *rescale,
+                        },
                     )
-                    .ok()?;
+                    .ok()?
+                else {
+                    return None;
+                };
                 drop(mosaic_guard);
 
                 let bytes = match out_kind {
@@ -2681,29 +2706,40 @@ impl GpuBackend {
                 let mut mosaic_guard = self.mosaic.lock().ok()?;
                 if let OutputFormat::Jpeg { quality } = *format
                     && let Ok(mut jpeg_guard) = self.jpeg.lock()
-                    && let Ok(jpg) = mosaic_guard.composite_rgb_styled_jpeg_direct(
-                        rgb_planes,
-                        width,
-                        height,
+                    && let Ok(GpuMosaicResult::Bytes(jpg)) = mosaic_guard.composite(
+                        MosaicUpload::DirectRgb {
+                            planes: rgb_planes,
+                            width,
+                            height,
+                        },
                         method,
-                        *rescale_min,
-                        *rescale_max,
-                        &mut jpeg_guard,
-                        quality,
+                        MosaicOutput::RgbStyledJpeg {
+                            jpeg: &mut jpeg_guard,
+                            quality,
+                            rescale_min: *rescale_min,
+                            rescale_max: *rescale_max,
+                        },
                     )
                 {
                     return Some(MosaicCompositeResult::Bytes(Bytes::from(jpg)));
                 }
-                let rgba = mosaic_guard
-                    .composite_rgb_styled_direct(
-                        rgb_planes,
-                        width,
-                        height,
+                let GpuMosaicResult::Bytes(rgba) = mosaic_guard
+                    .composite(
+                        MosaicUpload::DirectRgb {
+                            planes: rgb_planes,
+                            width,
+                            height,
+                        },
                         method,
-                        *rescale_min,
-                        *rescale_max,
+                        MosaicOutput::RgbStyled {
+                            rescale_min: *rescale_min,
+                            rescale_max: *rescale_max,
+                        },
                     )
-                    .ok()?;
+                    .ok()?
+                else {
+                    return None;
+                };
                 drop(mosaic_guard);
 
                 let bytes = if *format == OutputFormat::RawRgba {

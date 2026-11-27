@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use cogzilla_gpu::{
-    DispatchPolicy, GpuContext, GpuMosaicCompositor, GpuPixelOutput, pack_rgb_lut,
-    GpuPixelSelection,
+    DispatchPolicy, GpuContext, GpuMosaicCompositor, GpuPixelOutput, GpuPixelSelection,
+    MosaicCompositeResult, MosaicOutput, MosaicUpload, pack_rgb_lut,
 };
 use cogzilla_kernel::ColormapName;
 
@@ -139,14 +139,33 @@ fn main() {
 
                 // Warmup
                 let _ = comp
-                    .composite_styled(&stack, method, 100.0, 1200.0, &lut_u32, GpuPixelOutput::IndexedU8)
+                    .composite(
+                        MosaicUpload::Staged(&stack),
+                        method,
+                        MosaicOutput::Styled {
+                            lut: &lut_u32,
+                            out: GpuPixelOutput::IndexedU8,
+                            rescale: (100.0, 1200.0),
+                        },
+                    )
                     .unwrap();
                 let mut g_times = Vec::with_capacity(iters);
                 for _ in 0..iters {
                     let t0 = Instant::now();
-                    let out = comp
-                        .composite_styled(&stack, method, 100.0, 1200.0, &lut_u32, GpuPixelOutput::IndexedU8)
-                        .unwrap();
+                    let MosaicCompositeResult::Bytes(out) = comp
+                        .composite(
+                            MosaicUpload::Staged(&stack),
+                            method,
+                            MosaicOutput::Styled {
+                                lut: &lut_u32,
+                                out: GpuPixelOutput::IndexedU8,
+                                rescale: (100.0, 1200.0),
+                            },
+                        )
+                        .unwrap()
+                    else {
+                        unreachable!();
+                    };
                     std::hint::black_box(out[0]);
                     g_times.push(t0.elapsed());
                 }
