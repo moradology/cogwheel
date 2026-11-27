@@ -128,7 +128,7 @@ impl S3Config {
         let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
             .or_else(|_| std::env::var("AWS_MAX_ATTEMPTS"))
             .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(3)
             .min(10);
 
@@ -1159,7 +1159,7 @@ async fn fetch_s3_inner(
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+                .and_then(|s| s.trim().parse::<u64>().ok());
             if let Some(p) = permit {
                 p.on_throttle();
             }

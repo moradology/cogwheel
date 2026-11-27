@@ -55,9 +55,6 @@ pub(crate) struct FetchSpec<'a> {
     pub validator: Option<&'a RemoteValidator>,
     /// Retry limit.
     pub max_retries: u32,
-    /// When true, strip the URL from `reqwest::Error` (used by cloud backends with signed URLs);
-    /// when false, preserve redirect-allowlist `IoError::Forbidden` via `io_error_from_reqwest`.
-    pub strip_url_on_http_err: bool,
 }
 
 /// Execute an HTTP GET (ranged or whole-object) through the single shared retry, AIMD concurrency
@@ -71,22 +68,16 @@ pub(crate) async fn execute_get_with_retry<F>(
 where
     F: FnMut() -> Result<(reqwest::RequestBuilder, String), IoError>,
 {
-    let map_http_err = |e: reqwest::Error| -> IoError {
-        if spec.strip_url_on_http_err {
-            IoError::Http(e.without_url())
-        } else {
-            io_error_from_reqwest(e)
-        }
-    };
-
     let eff_cap = spec.max_bytes.or_else(|| {
         spec.range
             .map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
     });
 
     for attempt in 0..=spec.max_retries {
-        let (req, redacted_url) = build_req()?;
+        // Acquire AIMD concurrency permit before building/signing the request so queued tasks
+        // do not hold stale SigV4 / SharedKey timestamps under congestion.
         let permit = limiter.acquire().await;
+        let (req, redacted_url) = build_req()?;
         metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
 
         let resp = match req.send().await {
@@ -99,7 +90,7 @@ where
                         continue;
                     }
                 }
-                return Err(map_http_err(e));
+                return Err(io_error_from_reqwest(e));
             }
         };
 
@@ -207,7 +198,7 @@ where
                         continue;
                     }
                 }
-                return Err(map_http_err(e));
+                return Err(io_error_from_reqwest(e));
             }
             Err(e) => return Err(e),
         }

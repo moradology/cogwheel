@@ -319,11 +319,7 @@ impl CogSource {
                 (uri.starts_with("http://") || uri.starts_with("https://")).then_some(uri)
             })
         {
-            let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(3)
-                .min(10);
+            let max_retries = crate::retry::RetryPolicy::from_env().max_retries;
             Ok(Self::RemoteHttp {
                 url: http_url.to_string(),
                 client,
@@ -424,7 +420,6 @@ impl CogSource {
                         max_bytes: None,
                         validator,
                         max_retries: *max_retries,
-                        strip_url_on_http_err: false,
                     },
                     limiter,
                     metrics,

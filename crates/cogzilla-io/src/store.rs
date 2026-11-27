@@ -2558,7 +2558,6 @@ impl CogStore {
                     max_bytes: Some(max_bytes),
                     validator: None,
                     max_retries,
-                    strip_url_on_http_err: false,
                 },
                 &self.upstream_limiter,
                 &self.metrics,
