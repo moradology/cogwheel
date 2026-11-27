@@ -21,7 +21,7 @@ use crate::colormap::{GpuColormapMode, GpuPixelOutput};
 use crate::context::{GpuContext, GpuError};
 use crate::expr::{GpuColorFormula, GpuInstr, GpuMultiBandSlab};
 use crate::resample::GpuSlab;
-use crate::terrain::GpuDemAlgorithm;
+use cogzilla_raster::DemAlgorithm;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -233,7 +233,7 @@ pub enum CoalescedJob {
         slab: Arc<GpuSlab>,
         plan: OwnedCoordPlan,
         mode: GpuColormapMode,
-        alg: GpuDemAlgorithm,
+        alg: DemAlgorithm,
         pixel_size_x_m: f32,
         pixel_size_y_m: f32,
         rescale_min: f32,
@@ -1078,8 +1078,14 @@ impl WorkerState {
                         )));
                         continue;
                     }
-                    let (alg_mode, sun_e, sun_n, sun_u, z_factor, is_terrain_rgb) = match alg {
-                        GpuDemAlgorithm::Hillshade {
+                    let Some(alg_mode) = alg.gpu_mode() else {
+                        reply(Err(GpuError::InvalidDimensions(
+                            "unsupported GPU DEM algorithm".into(),
+                        )));
+                        continue;
+                    };
+                    let (sun_e, sun_n, sun_u, z_factor) = match alg {
+                        DemAlgorithm::Hillshade {
                             azimuth_deg,
                             altitude_deg,
                             z_factor,
@@ -1087,19 +1093,19 @@ impl WorkerState {
                             let az = azimuth_deg.to_radians();
                             let alt = altitude_deg.to_radians();
                             (
-                                0u32,
                                 alt.cos() * az.sin(),
                                 alt.cos() * az.cos(),
                                 alt.sin(),
                                 z_factor,
-                                false,
                             )
                         }
-                        GpuDemAlgorithm::Slope { z_factor } => (1u32, 0.0, 0.0, 1.0, z_factor, false),
-                        GpuDemAlgorithm::Aspect => (2u32, 0.0, 0.0, 1.0, 1.0, false),
-                        GpuDemAlgorithm::Terrarium => (3u32, 0.0, 0.0, 1.0, 1.0, true),
-                        GpuDemAlgorithm::TerrainRgb => (4u32, 0.0, 0.0, 1.0, 1.0, true),
+                        DemAlgorithm::Slope { z_factor } => (0.0, 0.0, 1.0, z_factor),
+                        DemAlgorithm::Aspect
+                        | DemAlgorithm::Terrarium
+                        | DemAlgorithm::TerrainRgb
+                        | DemAlgorithm::Contours { .. } => (0.0, 0.0, 1.0, 1.0),
                     };
+                    let is_terrain_rgb = alg.is_terrain_rgb_encoding();
                     let eff_output = if is_terrain_rgb {
                         CoalescedOutput::Rgba8
                     } else {
@@ -2670,7 +2676,7 @@ mod tests {
                     v: v.clone(),
                 },
                 mode: GpuColormapMode::Lanczos3,
-                alg: GpuDemAlgorithm::Hillshade {
+                alg: DemAlgorithm::Hillshade {
                     azimuth_deg: 315.0,
                     altitude_deg: 45.0,
                     z_factor: 1.0,
@@ -2719,7 +2725,7 @@ mod tests {
                         slab: sa,
                         plan: OwnedCoordPlan::Separable1D { u: uu, v: vv },
                         mode: GpuColormapMode::Lanczos3,
-                        alg: GpuDemAlgorithm::Hillshade {
+                        alg: DemAlgorithm::Hillshade {
                             azimuth_deg: 315.0,
                             altitude_deg: 45.0,
                             z_factor: 1.0,
@@ -2829,7 +2835,7 @@ mod tests {
                 slab: Arc::clone(&single_slab),
                 plan: plan_ref(),
                 mode: GpuColormapMode::Cubic,
-                alg: GpuDemAlgorithm::Hillshade {
+                alg: DemAlgorithm::Hillshade {
                     azimuth_deg: 315.0,
                     altitude_deg: 45.0,
                     z_factor: 1.0,
@@ -2905,7 +2911,7 @@ mod tests {
                         slab: s1,
                         plan,
                         mode: GpuColormapMode::Cubic,
-                        alg: GpuDemAlgorithm::Hillshade {
+                        alg: DemAlgorithm::Hillshade {
                             azimuth_deg: 315.0,
                             altitude_deg: 45.0,
                             z_factor: 1.0,
@@ -2963,6 +2969,54 @@ mod tests {
         assert!(
             st.batches_submitted < 15 && st.max_batch_seen >= 3,
             "expected multi-family coalescing across 15 threads, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn dem_algorithm_gpu_modes_match_terrain_wgsl() {
+        let wgsl = include_str!("shaders/terrain.wgsl");
+        let mut shader_modes = std::collections::BTreeSet::new();
+        for part in wgsl.split("params.alg_mode == ").skip(1) {
+            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(m) = digits.parse::<u32>() {
+                shader_modes.insert(m);
+            }
+        }
+        let rust_cases: &[(&str, DemAlgorithm, Option<u32>)] = &[
+            (
+                "Hillshade",
+                DemAlgorithm::Hillshade {
+                    azimuth_deg: 315.0,
+                    altitude_deg: 45.0,
+                    z_factor: 1.0,
+                },
+                Some(0),
+            ),
+            ("Slope", DemAlgorithm::Slope { z_factor: 1.0 }, Some(1)),
+            ("Aspect", DemAlgorithm::Aspect, Some(2)),
+            ("Terrarium", DemAlgorithm::Terrarium, Some(3)),
+            ("TerrainRgb", DemAlgorithm::TerrainRgb, Some(4)),
+            (
+                "Contours",
+                DemAlgorithm::Contours {
+                    increment: 100.0,
+                    thickness: 1,
+                    minz: 0.0,
+                    maxz: 1000.0,
+                },
+                None,
+            ),
+        ];
+        let mut rust_modes = std::collections::BTreeSet::new();
+        for &(name, alg, expected) in rust_cases {
+            assert_eq!(alg.gpu_mode(), expected, "{name} gpu_mode mismatch");
+            if let Some(m) = alg.gpu_mode() {
+                rust_modes.insert(m);
+            }
+        }
+        assert_eq!(
+            shader_modes, rust_modes,
+            "terrain.wgsl alg_mode literals must match DemAlgorithm::gpu_mode()"
         );
     }
 }

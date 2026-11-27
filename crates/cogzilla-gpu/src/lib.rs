@@ -12,7 +12,6 @@ pub mod policy;
 pub mod resample;
 pub(crate) mod shaders;
 pub mod stats;
-pub mod terrain;
 pub mod weighted_stats;
 pub(crate) mod wgpu_util;
 
@@ -30,6 +29,6 @@ pub use policy::{
 };
 pub use resample::GpuSlab;
 pub use stats::{GpuBandStats, GpuStatsReducer, decode_stats_readback};
-pub use terrain::GpuDemAlgorithm;
+pub use cogzilla_raster::DemAlgorithm;
 pub use weighted_stats::{GpuWeightedBandStats, GpuWeightedStatsReducer};
 pub use wgpu;

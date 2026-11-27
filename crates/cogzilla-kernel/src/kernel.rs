@@ -22,9 +22,9 @@ mod rgb;
 mod widened;
 
 pub use self::dem::{
-    DemAlgorithm, TerrainEncoding, dem_gradient, encode_contours_rgb, encode_terrain_rgb,
-    encode_terrarium_rgb, eval_dem_stencil, render_dem_algorithm, render_terrain_tile,
-    safe_rescale_denom,
+    DemAlgorithm, TerrainEncoding, dem_gradient, encode_contours_rgb, encode_terrain_pixel,
+    encode_terrain_rgb, encode_terrarium_rgb, eval_dem_stencil, render_dem_algorithm,
+    render_terrain_tile, safe_rescale_denom,
 };
 pub use self::npy::{
     encode_npy_f32_header, encode_npy_header, encode_npy_typed, encode_npy_typed_f64,

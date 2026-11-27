@@ -114,7 +114,7 @@ fn eval_dem_from_shared(lx: u32, ly: u32) -> f32 {
         // Slope in degrees [0, 90]
         let grad = sqrt(dz_dx * dz_dx + dz_dy * dz_dy) * params.z_factor;
         return atan(grad) * RAD_TO_DEG;
-    } else {
+    } else if (params.alg_mode == 2u) {
         // Aspect in degrees [0, 360) clockwise from North
         if (abs(dz_dx) < 1e-12 && abs(dz_dy) < 1e-12) {
             return nan_f32();
@@ -124,6 +124,8 @@ fn eval_dem_from_shared(lx: u32, ly: u32) -> f32 {
             bearing += 360.0;
         }
         return bearing;
+    } else {
+        return nan_f32();
     }
 }
 
@@ -253,12 +255,14 @@ fn dem_terrain_rgb(@builtin(global_invocation_id) gid: vec3<u32>) {
         let g = u32(vf) & 0xffu;
         let b = u32(clamp(floor((v - vf) * 256.0), 0.0, 255.0)) & 0xffu;
         dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
-    } else {
+    } else if (params.alg_mode == 4u) {
         // Mapbox Terrain-RGB: enc = round((elev + 10000.0) * 10.0)
         let enc = u32(clamp(round((elev + 10000.0) * 10.0), 0.0, 16777215.0));
         let r = (enc >> 16u) & 0xffu;
         let g = (enc >> 8u) & 0xffu;
         let b = enc & 0xffu;
         dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+    } else {
+        dst_words[out_idx] = 0u;
     }
 }
