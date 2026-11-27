@@ -1499,6 +1499,8 @@ def main() -> int:
         o.check("item point, band math on each of two assets", "json",
                 f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual%7Cexpression=b1%2Bb2;b3&assets=red%7Cexpression=b1*2&expression=b1/b3")
         o.check("item statistics, band math on one asset's own bands", "stats", f"{it}/statistics?assets=visual%7Cexpression=b1%2Bb2;b3&max_size=64")
+        o.check("item statistics, grayscale over an asset's fractional band math", "stats",
+                f"{it}/statistics?assets=visual%7Cexpression=b1/2;b1;b2;b3&expression=b2;b3;b4&algorithm=grayscale&max_size=64")
         o.check("item preview, an algorithm over band math", "image", f"{it}/preview.npy?assets=red&expression=b1/2&algorithm=floor&max_size=64")
         o.check("item statistics, normalizedIndex over band math", "stats",
                 f"{it}/statistics?assets=red&assets=nir&expression=b1;b2&algorithm=normalizedIndex&max_size=64")

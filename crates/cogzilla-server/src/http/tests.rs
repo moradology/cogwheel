@@ -1293,3 +1293,16 @@ async fn x_request_id_echoes_valid_generates_when_absent_or_invalid_and_on_429()
         "shed-req-42"
     );
 }
+
+#[test]
+fn a_cast_to_float_over_band_math_keeps_the_band_math_s_range() {
+    use cogzilla_tiff::SampleType as T;
+    // No integer range to cast into: the picture spans what the band math gives, as
+    // without the expression.
+    let pq = parse_query(Some("expression=b1&algorithm=cast&algorithm_params=%7B%22dtype%22%3A%22float32%22%7D"));
+    let composed = algorithm_over_expression(&pq, Some(T::Float32)).unwrap().expect("composed");
+    assert_eq!(composed.rescale, [default_rescale_for_dtype(T::Float32, true)]);
+    let pq = parse_query(Some("expression=b1&algorithm=cast&algorithm_params=%7B%22dtype%22%3A%22int16%22%7D"));
+    let composed = algorithm_over_expression(&pq, Some(T::Float32)).unwrap().expect("composed");
+    assert_eq!(composed.rescale, [(-32768.0, 32767.0)]);
+}

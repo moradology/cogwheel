@@ -1341,7 +1341,8 @@ fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::Sampl
     let lower = alg.to_ascii_lowercase();
     let source = default_rescale_for_dtype(typed.unwrap_or(cogzilla_tiff::SampleType::Float32), true);
     let range = match lower.as_str() {
-        "cast" | "ceil" | "floor" => algorithm_math::integer_band(&lower, 1, None, pq.cast_dtype.as_deref()).1,
+        // A cast to a float has no integer range: the values keep the band math's own.
+        "cast" | "ceil" | "floor" => algorithm_math::integer_band(&lower, 1, None, pq.cast_dtype.as_deref()).1.or(Some(source)),
         "normalizedindex" => Some((-1.0, 1.0)),
         "bitonal" => Some((0.0, 255.0)),
         "sum" => Some((source.0, source.1 * parts.len() as f32)),
@@ -7224,7 +7225,22 @@ where
                         .enumerate()
                         .map(|(idx, part)| (raw_parts.get(idx).copied().unwrap_or(part).to_string(), part.to_string()))
                         .collect();
-                    let (compiled, hist) = compile_stats_parts(&pq, described, Some(reads_type(&cogs)))?;
+                    // An item's assets' own band math, folded into this expression, types the
+                    // results stage by stage (what an algorithm over them is given).
+                    let staged;
+                    let typed_pq = match pq.asset_math_stages.as_ref() {
+                        Some((own, request)) if pq.band_math_type.is_none() => {
+                            let reads: Vec<cogzilla_tiff::SampleType> =
+                                cogs.iter().map(|c| c.index.full_res().sample_type).collect();
+                            let mut typed = pq.clone();
+                            typed.band_math_type =
+                                array_type::ArrayRule::Math { unscale: pq.unscale }.staged_kind(&reads, own, request);
+                            staged = typed;
+                            &staged
+                        }
+                        _ => &pq,
+                    };
+                    let (compiled, hist) = compile_stats_parts(typed_pq, described, Some(reads_type(&cogs)))?;
                     expr_progs = Some(compiled);
                     expr_hist = hist;
                 } else if pq.algorithm.is_some() {
