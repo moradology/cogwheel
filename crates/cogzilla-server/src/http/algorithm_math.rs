@@ -143,6 +143,10 @@ pub(super) fn over_results(
     if !one_output && !matches!(alg.as_str(), "cast" | "ceil" | "floor") {
         return Ok(None);
     }
+    // As many outputs as band math may have, before any are folded into one.
+    if parts.len() > 16 {
+        return Err(super::EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
+    }
     let mut ops = 0usize;
     for (_, text) in parts {
         ops += cogzilla_kernel::ExprProgram::compile(text).map_err(super::EngineError::BadRequest)?.ops.len();
@@ -219,6 +223,10 @@ mod tests {
         let ndi = over_results("normalizedIndex", None, None, 127.0, &parts(&[&long, &long2])).unwrap().unwrap();
         let program = ExprProgram::compile_with_limit(&ndi.outputs[0].1, ndi.max_ops).unwrap();
         assert!(program.ops.len() > ExprProgram::MAX_OPS);
+        // No more parts than band math may have outputs, even where they fold into one.
+        let many = vec!["b1"; 17];
+        assert!(over_results("sum", None, None, 127.0, &parts(&many)).is_err());
+        assert!(over_results("sum", None, None, 127.0, &parts(&many[..16])).unwrap().is_some());
     }
 
     #[test]
