@@ -7,8 +7,12 @@ edition.workspace = true
 cogzilla-tiff = { path = "../cogzilla-tiff" }
 thiserror.workspace = true
 libdeflater.workspace = true
+brotli.workspace = true
 zstd-sys.workspace = true
 libwebp-sys.workspace = true
 zune-jpeg.workspace = true
 lerc-core.workspace = true
 lerc-reader.workspace = true
+
+[lints]
+workspace = true

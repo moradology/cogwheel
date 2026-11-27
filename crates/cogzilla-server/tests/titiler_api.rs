@@ -61,7 +61,7 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
         ("unknown tms tilejson", format!("{base}/cog/FakeQuad/tilejson.json?url={sat_url}")),
         ("non-stats percentiles", format!("{base}/cog/info?url={sat_url}&p=5")),
         ("point algorithm", format!("{base}/cog/point/-122.6,37.7?url={sat_url}&algorithm=hillshade")),
-        ("point unsupported coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:4267")),
+        ("point unsupported coord_crs", format!("{base}/cog/point/1,1?url={sat_url}&coord_crs=epsg:4275")),
         ("preview explicit dims width", format!("{base}/cog/preview/256x256.png?url={sat_url}&width=300")),
         ("bbox explicit dims width", format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.8/256x256.png?url={sat_url}&width=300")),
         ("non-colormap orientation", format!("{base}/cog/info?url={sat_url}&orientation=vertical")),
@@ -6054,8 +6054,8 @@ async fn parity_nn1_r2_raster_layers_and_f2_sample_types() {
     let u64_path = tmp.join("u64.tif");
     write_test_geotiff(&u1_path, 1, 1, &[0xAAu8; 32], false);
     write_test_geotiff(&u4_path, 4, 1, &[0x3Cu8; 128], false);
-    let i64_bytes: Vec<u8> = std::iter::repeat((-500i64).to_le_bytes()).take(256).flatten().collect();
-    let u64_bytes: Vec<u8> = std::iter::repeat(900u64.to_le_bytes()).take(256).flatten().collect();
+    let i64_bytes: Vec<u8> = std::iter::repeat_n((-500i64).to_le_bytes(), 256).flatten().collect();
+    let u64_bytes: Vec<u8> = std::iter::repeat_n(900u64.to_le_bytes(), 256).flatten().collect();
     write_test_geotiff(&i64_path, 64, 2, &i64_bytes, false);
     write_test_geotiff(&u64_path, 64, 1, &u64_bytes, false);
 
@@ -6538,6 +6538,80 @@ async fn encoded_query_keys_and_grey_mosaic_tiles() {
     assert!(matches!(mapped[25], 2 | 3 | 6), "a colour map is colour: {}", mapped[25]);
     let jpg = get(tile("").replace(".png", ".jpg")).await;
     // The frame header's component count: one for grey.
-    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0 | 0xC1 | 0xC2)).unwrap();
+    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0..=0xC2)).unwrap();
     assert_eq!(jpg[sof + 9], 1, "a grey JPEG");
+}
+
+#[tokio::test]
+async fn ogc_wms_getcapabilities_and_getmap_end_to_end() {
+    let sat = fixture("satellite_utm10n_rgb_zstd_p3.tif");
+    if !sat.exists() {
+        eprintln!("fixtures not generated; skipping");
+        return;
+    }
+    let sat = sat.canonicalize().unwrap();
+    let sat_url = sat.to_string_lossy();
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. GetCapabilities XML (uppercase WMS keys)
+    let cap_resp = client
+        .get(format!("{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cap_resp.status().as_u16(), 200);
+    let cap_xml = cap_resp.text().await.unwrap();
+    assert!(cap_xml.contains("<WMS_Capabilities version=\"1.3.0\""));
+    assert!(!cap_xml.contains("REQUEST=GetCapabilities"));
+
+    // 2. GetMap WMS 1.3.0 with uppercase keys & EPSG:4326 (lat,lon axis order) vs CRS:84 (lon,lat)
+    let png_4326 = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=EPSG:4326&BBOX=37.6,-122.8,37.8,-122.5&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(png_4326.status().as_u16(), 200);
+    let b_4326 = png_4326.bytes().await.unwrap();
+    assert_eq!(&b_4326[0..8], b"\x89PNG\r\n\x1a\n");
+
+    let png_crs84 = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=CRS:84&BBOX=-122.8,37.6,-122.5,37.8&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(png_crs84.status().as_u16(), 200);
+    let b_crs84 = png_crs84.bytes().await.unwrap();
+    assert_eq!(b_4326, b_crs84, "WMS 1.3.0 EPSG:4326 (lat,lon) and CRS:84 (lon,lat) must produce identical PNGs");
+
+    // 3. GetMap WMS 1.1.1 SRS=EPSG:4326 (lon,lat)
+    let png_111 = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetMap&VERSION=1.1.1&SRS=EPSG:4326&BBOX=-122.8,37.6,-122.5,37.8&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(png_111.status().as_u16(), 200);
+    assert_eq!(png_111.bytes().await.unwrap(), b_crs84, "WMS 1.1.1 SRS=EPSG:4326 must match CRS:84");
+
+    // 4. Invalid TRANSPARENT & missing BBOX return 400
+    let bad_t = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&REQUEST=GetMap&CRS=CRS:84&BBOX=-122.8,37.6,-122.5,37.8&WIDTH=64&HEIGHT=64&TRANSPARENT=maybe"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_t.status().as_u16(), 400);
 }

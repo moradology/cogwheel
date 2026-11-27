@@ -682,14 +682,14 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     };
                 }
                 TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
-                TAG_COLOR_MAP => {
+                TAG_COLOR_MAP
                     if ifds.is_empty()
                         && color_map.is_none()
                         && ifd_color_map.is_none()
                         && entry.count > 0
                         && entry.count % 3 == 0
                         && entry.count <= 3 * 65_536
-                    {
+                    => {
                         charge_tag(entry.count, 2)?;
                         let vals = entry.read_u16_vec(&r)?;
                         let n = vals.len() / 3;
@@ -704,7 +704,6 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                             ifd_color_map = Some(lut);
                         }
                     }
-                }
                 TAG_STRIP_OFFSETS => {
                     charge_tag(entry.count, 8)?;
                     strip_offsets = Some(entry.read_u64_vec(&r)?);
@@ -760,8 +759,8 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     charge_tag(entry.count, 1)?;
                     jpeg_tables = Some(entry.read_bytes(&r)?);
                 }
-                TAG_LERC_PARAMETERS => {
-                    if entry.count >= 2 && entry.count <= 16 {
+                TAG_LERC_PARAMETERS
+                    if entry.count >= 2 && entry.count <= 16 => {
                         charge_tag(entry.count, 8)?;
                         match entry.read_u64_vec(&r) {
                             Ok(vals) => {
@@ -776,7 +775,6 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                             Err(_) => {}
                         }
                     }
-                }
                 TAG_RPC_COEFFICIENT if ifds.is_empty() => {
                     has_rpc = true;
                 }
@@ -1031,11 +1029,10 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             (c, _) => c,
         };
         let jpeg_tables = if compression == Compression::Jpeg {
-            if let Some(ref jt) = jpeg_tables {
-                if jt.len() > MAX_JPEG_TABLES_BYTES {
+            if let Some(ref jt) = jpeg_tables
+                && jt.len() > MAX_JPEG_TABLES_BYTES {
                     return Err(TiffError::Corrupt("JPEGTables exceeds 64 KiB limit"));
                 }
-            }
             jpeg_tables
         } else {
             None

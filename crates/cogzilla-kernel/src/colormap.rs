@@ -15,8 +15,8 @@ fn parse_json_rgba(v: &serde_json::Value) -> Option<[u8; 4]> {
         }
     } else if let Some(s) = v.as_str() {
         let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
-        if (hex.len() == 6 || hex.len() == 8) && hex.is_ascii() {
-            if let (Ok(r), Ok(g), Ok(b)) = (
+        if (hex.len() == 6 || hex.len() == 8) && hex.is_ascii()
+            && let (Ok(r), Ok(g), Ok(b)) = (
                 u8::from_str_radix(&hex[0..2], 16),
                 u8::from_str_radix(&hex[2..4], 16),
                 u8::from_str_radix(&hex[4..6], 16),
@@ -28,7 +28,6 @@ fn parse_json_rgba(v: &serde_json::Value) -> Option<[u8; 4]> {
                 };
                 return Some([r, g, b, a]);
             }
-        }
     }
     None
 }
@@ -344,8 +343,8 @@ impl ColormapLut {
                 }
             } else if let Some(s) = v.as_str() {
                 let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
-                if (hex.len() == 6 || hex.len() == 8) && hex.is_ascii() {
-                    if let (Ok(r), Ok(g), Ok(b)) = (
+                if (hex.len() == 6 || hex.len() == 8) && hex.is_ascii()
+                    && let (Ok(r), Ok(g), Ok(b)) = (
                         u8::from_str_radix(&hex[0..2], 16),
                         u8::from_str_radix(&hex[2..4], 16),
                         u8::from_str_radix(&hex[4..6], 16),
@@ -358,7 +357,6 @@ impl ColormapLut {
                         rgb[idx] = [r, g, b];
                         rgba_u32[idx] = u32::from_le_bytes([r, g, b, a]);
                     }
-                }
             }
         }
         Ok(Self::new(rgba_u32, rgb))

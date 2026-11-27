@@ -362,7 +362,8 @@ fn sort_by_value(pairs: &mut Vec<(f64, f32)>) {
         // -0 comes before 0 in a sort, but is the same number to a count.
         whole &= v.fract() == 0.0 && v.to_bits() != (-0.0f64).to_bits();
     }
-    if !whole || pairs.len() < 1024 || !(hi - lo < MAX_COUNTED_RANGE) {
+    let range = hi - lo;
+    if !whole || pairs.len() < 1024 || range >= MAX_COUNTED_RANGE || range.is_nan() {
         pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
         return;
     }

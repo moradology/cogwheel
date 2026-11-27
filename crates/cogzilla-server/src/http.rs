@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -15,11 +14,7 @@ use hyper::header::{
     ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderName, HeaderValue,
     IF_NONE_MATCH,
 };
-use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ServerBuilder;
-use tokio::net::TcpListener;
 
 mod algorithm_math;
 mod algorithm_params;
@@ -27,12 +22,16 @@ mod pgstac;
 mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
+mod metrics;
 mod paint;
 mod html;
 pub(crate) mod pixel_selection;
 mod cql2_text;
 mod point_expr;
+mod server;
 mod zonal;
+
+pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
@@ -230,8 +229,8 @@ fn resolve_input_bbox(
     if is_geo {
         // Symmetric ±2-turn longitude normalisation (matching point routes) before RFC 7946 §5.2
         // antimeridian unwrap: shift both bounds by the same whole multiple of 360° if needed.
-        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0) {
-            if let (Some(n0), Some(n2)) = (
+        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0)
+            && let (Some(n0), Some(n2)) = (
                 cogzilla_proj::normalize_geographic_lon(bbox[0]),
                 cogzilla_proj::normalize_geographic_lon(bbox[2]),
             ) {
@@ -241,7 +240,6 @@ fn resolve_input_bbox(
                     bbox[2] += shift;
                 }
             }
-        }
     }
     if bbox[0] > bbox[2] {
         if is_geo && bbox[0] >= -180.0 && bbox[0] <= 180.0 && bbox[2] >= -180.0 && bbox[2] <= 180.0
@@ -792,8 +790,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected a number");
                 }
             }
-            "quality" => {
-                if v != "lossless" {
+            "quality"
+                if v != "lossless" => {
                     if let Ok(qual) = v.parse::<f32>()
                         && qual.is_finite()
                     {
@@ -803,7 +801,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                         bad("expected a finite quality in 1..=100 or 'lossless'");
                     }
                 }
-            }
             "expr" | "expression" | "index" => {
                 // Standard HTTP clients (httpx, requests, URLSearchParams) form-encode spaces as `+`
                 // and literal plus as `%2B`, while raw CLI/browser URLs often write `(b1+b2)` directly.
@@ -1098,13 +1095,12 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     if let Some(e) = pq.errors.first() {
         return Err(e.clone());
     }
-    if let Some(alg) = pq.algorithm.as_deref() {
-        if !crate::titiler::is_supported_algorithm(alg) {
+    if let Some(alg) = pq.algorithm.as_deref()
+        && !crate::titiler::is_supported_algorithm(alg) {
             return Err(format!(
                 "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
             ));
         }
-    }
 
     // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html,
     // {family}/{tms}/WMTSCapabilities.xml
@@ -1129,13 +1125,12 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
                 _ => None,
             }
         };
-        if let Some(tms) = tms {
-            if crate::tms::lookup_tms(tms).is_none() {
+        if let Some(tms) = tms
+            && crate::tms::lookup_tms(tms).is_none() {
                 return Err(format!(
                     "tile matrix set '{tms}' is not supported (see /tileMatrixSets)"
                 ));
             }
-        }
     }
 
     let has = |names: &[&str]| pq.keys.iter().find(|k| names.contains(&k.as_str())).cloned();
@@ -1152,47 +1147,41 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     let is_tileset_meta = matches!(segs[0], "cog" | "stac" | "mosaicjson")
         && segs.get(1) == Some(&"tiles")
         && segs.len() <= 3;
-    if family != "colorMaps" {
-        if let Some(k) = has(&["orientation"]) {
+    if family != "colorMaps"
+        && let Some(k) = has(&["orientation"]) {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
-    }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics") || family == "colorMaps") {
-        if let Some(k) = has(&["width", "height"]) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics") || family == "colorMaps")
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on preview, bbox, feature, map, statistics, and colorMaps routes"
+                "parameter '{k}' is only supported on preview, bbox, feature, map, wms, statistics, and colorMaps routes"
             ));
         }
-    }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics")) {
-        if let Some(k) = has(&["dst_crs"]) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics"))
+        && let Some(k) = has(&["dst_crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, map, and statistics routes"
             ));
         }
-    }
-    if !(route("bounds") || route("info") || is_ogc_map || is_tileset_meta) {
-        if let Some(k) = has(&["crs"]) {
+    if !(route("bounds") || route("info") || is_ogc_map || route("wms") || is_tileset_meta)
+        && let Some(k) = has(&["crs"]) {
             return Err(format!(
-                "parameter '{k}' is only supported on bounds, info, tiles, and map routes"
+                "parameter '{k}' is only supported on bounds, info, tiles, map, and wms routes"
             ));
         }
-    }
     if route("statistics") || route("asset_statistics") {
-        if let Some(k) = has(&["algorithm"]) {
-            if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
+        if let Some(k) = has(&["algorithm"])
+            && !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
                 return Err(format!(
                     "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
-        }
-        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
-            if let Some(k) = has(&["expression", "expr", "index"]) {
+        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics")))
+            && let Some(k) = has(&["expression", "expr", "index"]) {
                 return Err(format!(
                     "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
-        }
     } else if let Some(k) = has(&["p", "histogram_bins", "histogram_range", "categorical", "c"]) {
         return Err(format!("parameter '{k}' is only supported on statistics routes"));
     }
@@ -1200,21 +1189,18 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         if let Some(k) = has(&["algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on point routes"));
         }
-    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets"))) {
-        if let Some(k) = has(&["coord_crs"]) {
+    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets")))
+        && let Some(k) = has(&["coord_crs"]) {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
-    }
-    if route("bbox") && segs.len() >= 4 {
-        if let Some(k) = has(&["width", "height"]) {
+    if route("bbox") && segs.len() >= 4
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
-    }
-    if (route("preview") || route("feature")) && segs.len() >= 3 {
-        if let Some(k) = has(&["width", "height"]) {
+    if (route("preview") || route("feature")) && segs.len() >= 3
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
-    }
     let last_seg = segs.last().copied().unwrap_or("");
     if !matches!(last_seg, "tilejson.json" | "map.html" | "WMTSCapabilities.xml") && !is_tileset_meta {
         if let Some(k) = has(&["minzoom", "maxzoom", "tile_format", "tile_scale"]) {
@@ -1349,6 +1335,283 @@ fn apply_info_bounds_crs(
 
 const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
 
+/// Strip WMS protocol parameters (case-insensitively) from a query string so `OnlineResource`
+/// in `GetCapabilities` retains only dataset/rendering parameters (e.g. `url`, `bidx`, `rescale`)
+/// and ends with `?` or `&` per OGC WMS 1.3.0 §6.3.3.
+fn wms_online_resource(host: &str, raw_query: &str) -> String {
+    const WMS_STRIP: &[&str] = &[
+        "service", "request", "version", "wmtver", "layers", "styles", "crs", "srs", "bbox",
+        "width", "height", "format", "transparent", "bgcolor", "exceptions", "time", "elevation",
+        "updatesequence", "minzoom", "maxzoom", "tile_format", "tile_scale", "use_epsg", "zooms",
+    ];
+    let base_url = format!("{}/cog/wms", host.trim_end_matches('/'));
+    let kept: Vec<&str> = raw_query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let k = pair.split_once('=').map_or(*pair, |(k, _)| k);
+            let kl = query_key(k).to_ascii_lowercase();
+            !WMS_STRIP.contains(&kl.as_str())
+        })
+        .collect();
+    if kept.is_empty() {
+        format!("{base_url}?")
+    } else {
+        format!("{base_url}?{}&", kept.join("&"))
+    }
+}
+
+/// Build an OGC WMS 1.3.0 `WMS_Capabilities` XML document for a COG dataset.
+fn build_wms_capabilities(
+    host: &str,
+    raw_query: &str,
+    bounds: [f64; 4],
+    native_epsg: Option<u16>,
+) -> String {
+    let bounds = if bounds.iter().all(|v| v.is_finite()) {
+        bounds
+    } else {
+        [-180.0, -90.0, 180.0, 90.0]
+    };
+    let online_href = wms_online_resource(host, raw_query);
+    let href_esc = crate::titiler::xml_escape(&online_href);
+    let [w, s, e, n] = bounds;
+    let [mw, ms, me, mn] = crate::catalog::wgs84_bbox_to_3857(bounds);
+    let extra_crs = match native_epsg {
+        Some(code) if code != 4326 && code != 3857 => {
+            format!("      <CRS>EPSG:{code}</CRS>\n")
+        }
+        _ => String::new(),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <Service>
+    <Name>WMS</Name>
+    <Title>cogzilla COG WMS</Title>
+    <OnlineResource xlink:type="simple" xlink:href="{href_esc}"/>
+    <MaxWidth>4096</MaxWidth>
+    <MaxHeight>4096</MaxHeight>
+  </Service>
+  <Capability>
+    <Request>
+      <GetCapabilities>
+        <Format>text/xml</Format>
+        <Format>application/xml</Format>
+        <DCPType><HTTP><Get><OnlineResource xlink:type="simple" xlink:href="{href_esc}"/></Get></HTTP></DCPType>
+      </GetCapabilities>
+      <GetMap>
+        <Format>image/png</Format>
+        <Format>image/jpeg</Format>
+        <Format>image/webp</Format>
+        <Format>image/tiff</Format>
+        <DCPType><HTTP><Get><OnlineResource xlink:type="simple" xlink:href="{href_esc}"/></Get></HTTP></DCPType>
+      </GetMap>
+    </Request>
+    <Exception>
+      <Format>XML</Format>
+    </Exception>
+    <Layer queryable="0">
+      <Name>cog</Name>
+      <Title>Cloud Optimized GeoTIFF</Title>
+      <CRS>CRS:84</CRS>
+      <CRS>EPSG:4326</CRS>
+      <CRS>EPSG:3857</CRS>
+{extra_crs}      <EX_GeographicBoundingBox>
+        <westBoundLongitude>{w}</westBoundLongitude>
+        <eastBoundLongitude>{e}</eastBoundLongitude>
+        <southBoundLatitude>{s}</southBoundLatitude>
+        <northBoundLatitude>{n}</northBoundLatitude>
+      </EX_GeographicBoundingBox>
+      <BoundingBox CRS="CRS:84" minx="{w}" miny="{s}" maxx="{e}" maxy="{n}"/>
+      <BoundingBox CRS="EPSG:4326" minx="{s}" miny="{w}" maxx="{n}" maxy="{e}"/>
+      <BoundingBox CRS="EPSG:3857" minx="{mw}" miny="{ms}" maxx="{me}" maxy="{mn}"/>
+    </Layer>
+  </Capability>
+</WMS_Capabilities>"#
+    )
+}
+
+/// Parse an OGC WMS `FORMAT` parameter (`image/png`, `image/jpeg`, `image/webp`, `image/tiff`,
+/// or short extensions) into `(OutputFormat, content_type)`.
+fn parse_wms_format(
+    raw: Option<&str>,
+    webp_quality: Option<f32>,
+    jpeg_quality: u8,
+) -> Result<(OutputFormat, &'static str), EngineError> {
+    let norm = raw.map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
+    let ext = match norm.as_deref() {
+        None | Some("") | Some("image/png") | Some("png") => "png",
+        Some("image/jpeg") | Some("image/jpg") | Some("jpeg") | Some("jpg") => "jpg",
+        Some("image/webp") | Some("webp") => "webp",
+        Some("image/tiff") | Some("image/geotiff") | Some("tif") | Some("tiff") => "tif",
+        Some(other) => {
+            return Err(EngineError::BadRequest(format!(
+                "unsupported WMS FORMAT '{other}' (use image/png, image/jpeg, image/webp, or image/tiff)"
+            )));
+        }
+    };
+    parse_ext_format(ext, webp_quality, jpeg_quality)
+}
+
+/// Handle OGC WMS 1.1.1 / 1.3.0 (`GET /cog/wms`) `GetCapabilities` and `GetMap` requests.
+async fn handle_cog_wms(
+    engine: &TileEngine,
+    host: &str,
+    raw_query: &str,
+    pq: &ParsedQuery,
+    geo_meta: &mut Option<([f64; 4], Option<u16>, bool)>,
+) -> Result<(Bytes, &'static str), EngineError> {
+    let mut wms_request: Option<String> = None;
+    let mut wms_version: Option<String> = None;
+    let mut wms_srs: Option<String> = None;
+    let mut wms_crs_raw: Option<String> = None;
+    let mut wms_bbox_raw: Option<String> = None;
+    let mut wms_width_raw: Option<String> = None;
+    let mut wms_height_raw: Option<String> = None;
+    let mut wms_format_raw: Option<String> = None;
+    let mut wms_transparent: Option<bool> = None;
+    for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match query_key(k).to_ascii_lowercase().as_str() {
+            "request" => wms_request = Some(percent_decode(v).trim().to_ascii_lowercase()),
+            "version" => wms_version = Some(percent_decode(v).trim().to_string()),
+            "srs" => wms_srs = Some(percent_decode(v)),
+            "crs" => wms_crs_raw = Some(percent_decode(v)),
+            "bbox" => wms_bbox_raw = Some(percent_decode(v)),
+            "width" => wms_width_raw = Some(percent_decode(v)),
+            "height" => wms_height_raw = Some(percent_decode(v)),
+            "format" | "f" => wms_format_raw = Some(percent_decode(v)),
+            "transparent" => {
+                let dec = percent_decode(v);
+                match parse_bool_param(dec.trim()) {
+                    Some(b) => wms_transparent = Some(b),
+                    None => {
+                        return Err(EngineError::BadRequest(format!(
+                            "invalid WMS TRANSPARENT '{dec}' (expected TRUE or FALSE)"
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match wms_request.as_deref() {
+        Some("getcapabilities") => {
+            let cogs = open_query_urls(engine, &pq.urls, None).await?;
+            let crs = engine.get_or_build_crs(&cogs[0])?;
+            let full = cogs[0].index.full_res();
+            let bounds = crs.wgs84_bounds_with_gcp(
+                &full.pixel_to_crs,
+                full.gcp_poly.as_deref(),
+                full.width,
+                full.height,
+            );
+            let native_epsg = cogs[0]
+                .index
+                .geo_keys
+                .projected_cs_type
+                .or(cogs[0].index.geo_keys.geographic_type)
+                .filter(|&c| c != 32767);
+            let xml = build_wms_capabilities(host, raw_query, bounds, native_epsg);
+            Ok((Bytes::from(xml), "application/xml"))
+        }
+        Some("getmap") => {
+            let bbox_str = wms_bbox_raw
+                .as_deref()
+                .ok_or_else(|| EngineError::BadRequest("WMS GetMap requires BBOX=minx,miny,maxx,maxy".into()))?;
+            let (mut bbox, None) = parse_bbox4(bbox_str)
+                .ok_or_else(|| EngineError::BadRequest(format!("invalid WMS BBOX '{bbox_str}'")))?
+            else {
+                return Err(EngineError::BadRequest(format!("invalid WMS BBOX '{bbox_str}'")));
+            };
+            let parse_dim = |raw: Option<&str>, name: &str| -> Result<u32, EngineError> {
+                let s = raw.ok_or_else(|| EngineError::BadRequest(format!("WMS GetMap requires {name}")))?;
+                let n = s
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| EngineError::BadRequest(format!("invalid WMS {name} '{s}'")))?;
+                if !(1..=4096).contains(&n) {
+                    return Err(EngineError::BadRequest(format!(
+                        "WMS {name} must be between 1 and 4096 (got {n})"
+                    )));
+                }
+                Ok(n)
+            };
+            let out_w = parse_dim(wms_width_raw.as_deref(), "WIDTH")?;
+            let out_h = parse_dim(wms_height_raw.as_deref(), "HEIGHT")?;
+            let crs_str = wms_crs_raw
+                .as_deref()
+                .or(wms_srs.as_deref())
+                .unwrap_or("EPSG:3857");
+            let (dst_crs, dst_epsg) =
+                parse_coord_crs_with_epsg(crs_str).map_err(EngineError::BadRequest)?;
+            // Default to WMS 1.3.0 unless VERSION explicitly says 1.1.x or client sent WMS 1.1.1 SRS= without CRS=.
+            let is_wms_130 = match wms_version.as_deref() {
+                Some(v) => v.starts_with("1.3"),
+                None => !(wms_crs_raw.is_none() && wms_srs.is_some()),
+            };
+            let crs_lower = crs_str.trim().to_ascii_lowercase();
+            let is_crs84 = crs_lower == "crs:84"
+                || crs_lower == "crs84"
+                || crs_lower.ends_with(":crs84")
+                || crs_lower.ends_with("/crs84");
+            // OGC WMS 1.3.0 specifies (lat, lon) axis order for geographic EPSG CRSes (unlike CRS:84 and WMS 1.1.1).
+            if is_wms_130 && dst_crs.is_geographic() && !is_crs84 {
+                bbox = [bbox[1], bbox[0], bbox[3], bbox[2]];
+            }
+            let bbox = resolve_input_bbox(bbox, Some(&dst_crs))?;
+            let (fmt, ct) = parse_wms_format(
+                wms_format_raw.as_deref(),
+                pq.webp_quality,
+                pq.jpeg_quality,
+            )?;
+            // Default transparent nodata mask for COG overlays unless TRANSPARENT=FALSE is passed.
+            let return_mask = wms_transparent.unwrap_or(pq.return_mask);
+            let cogs = open_query_urls(engine, &pq.urls, pq.nodata).await?;
+            let full = cogs[0].index.full_res();
+            let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
+            let st = widest_sample_type(&cogs);
+            let mut bands = build_band_request_for_output(pq, db, st, fmt, ct)?;
+            let fmt = geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+            if pq.unscale {
+                apply_unscale_cogs(&mut bands, &cogs);
+            }
+            let custom_lut = resolve_custom_lut(pq, &cogs[0], &bands)?;
+            let cf = pq.parse_color_formula()?;
+            let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), dst_epsg);
+            let data = render_crs_bbox(
+                engine,
+                &cogs,
+                bbox,
+                &dst_crs,
+                out_w,
+                out_h,
+                None,
+                &bands,
+                resample,
+                fmt,
+                pq.nodata,
+                custom_lut.as_ref(),
+                cf.as_ref(),
+                return_mask,
+                pq.unscale,
+            )
+            .await?;
+            let data = wrap_geotiff_fmt(data, ct, fmt, out_w, out_h, bbox, dst_epsg, return_mask);
+            *geo_meta = Some((bbox, Some(dst_epsg), is_crs84));
+            Ok((data, ct))
+        }
+        Some(other) => Err(EngineError::BadRequest(format!(
+            "unsupported WMS REQUEST '{other}' (use GetCapabilities or GetMap)"
+        ))),
+        None => Err(EngineError::BadRequest(
+            "WMS requires REQUEST=GetCapabilities or REQUEST=GetMap".into(),
+        )),
+    }
+}
+
 /// Parse a TiTiler CRS string (`EPSG:32610`, `EPSG:900913`, `CRS84`, `http://.../EPSG/0/32610`,
 /// `urn:ogc:def:crs:EPSG::32610`, etc.) into `(CrsModel, epsg_code)` using our 3,260+ EPSG table.
 pub(crate) fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::CrsModel, u16), String> {
@@ -1359,7 +1622,11 @@ pub(crate) fn parse_coord_crs_with_epsg(raw: &str) -> Result<(cogzilla_proj::Crs
         .unwrap_or(raw_trimmed)
         .trim();
     let lower = trimmed.to_ascii_lowercase();
-    if lower == "crs84" || lower.ends_with(":crs84") || lower.ends_with("/crs84") {
+    if lower == "crs84"
+        || lower == "crs:84"
+        || lower.ends_with(":crs84")
+        || lower.ends_with("/crs84")
+    {
         return Ok((cogzilla_proj::CrsModel::Geographic, 4326));
     }
     if lower == "esri:102100" || lower == "esri:102113" {
@@ -2042,7 +2309,7 @@ fn wants_f32_geotiff(
         ),
         BandRequest::Single { .. } => {
             pq.unscale
-                || (!source_cog.is_some_and(|c| c.index.color_map.is_some())
+                || (source_cog.is_none_or(|c| c.index.color_map.is_none())
                     && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8))
         }
         BandRequest::Rgb { .. } => {
@@ -2094,6 +2361,50 @@ fn geotiff_render_format(
     }
 }
 
+/// Return true when an unrescaled `Uint16` `.png` request should emit a 16-bit PNG
+/// matching TiTiler / GDAL's PNG driver instead of downscaling to 8-bit.
+fn wants_u16_png(
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    bands: &BandRequest,
+    sample_type: cogzilla_tiff::SampleType,
+) -> bool {
+    fmt == OutputFormat::Png
+        && ct == "image/png"
+        && sample_type == cogzilla_tiff::SampleType::Uint16
+        && !pq.unscale
+        && pq.rescale.is_empty()
+        && !pq.colormap_explicit
+        && pq.custom_colormap_json.is_none()
+        && pq.color_formula.is_none()
+        && pq.algorithm.is_none()
+        && pq.expr_raw.is_none()
+        && !source_cog.is_some_and(|c| has_embedded_palette(pq, c, bands))
+        && matches!(
+            bands,
+            BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
+        )
+        && (TileEngine::value_bands(bands) + usize::from(pq.return_mask)) <= 4
+}
+
+fn render_output_format(
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    bands: &BandRequest,
+    sample_type: cogzilla_tiff::SampleType,
+    allow_f64: bool,
+) -> OutputFormat {
+    if wants_u16_png(fmt, ct, pq, source_cog, bands, sample_type) {
+        OutputFormat::RawF32
+    } else {
+        geotiff_render_format(fmt, ct, pq, source_cog, bands, sample_type, allow_f64)
+    }
+}
+
 fn wrap_geotiff_fmt(
     data: Bytes,
     ct: &'static str,
@@ -2127,6 +2438,30 @@ fn wrap_geotiff_fmt(
         } else {
             encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
         }
+    } else if ct == "image/png" && matches!(fmt, OutputFormat::RawF32) {
+        if let Some(n_px) = (w as usize).checked_mul(h as usize).filter(|&n| n > 0)
+            && let Some(row_bytes) = n_px.checked_mul(4)
+        {
+            let n_bands = data.len() / row_bytes;
+            if n_bands >= 1
+                && data.len() == n_bands * row_bytes
+                && (n_bands + usize::from(return_mask)) <= 4
+            {
+                let vals: Vec<f32> = data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                return pgstac::png_of_16_bits(&vals, n_bands, w as usize, h as usize, return_mask);
+            }
+        }
+        debug_assert!(
+            false,
+            "wrap_geotiff_fmt: unexpected RawF32 buffer length {} for {}x{} 16-bit PNG",
+            data.len(),
+            w,
+            h
+        );
+        pgstac::png_of_16_bits(&[], 1, w.max(1) as usize, h.max(1) as usize, return_mask)
     } else {
         data
     }
@@ -3421,10 +3756,13 @@ fn build_tile_request_for_tms(
         maybe_upgrade_multiband_default(bands, format, content_type, pq, eff_default_bands)
     };
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
+    let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
+    let u16_png = !auto_fmt && wants_u16_png(format, content_type, pq, source_cog, &bands, sample_type);
     if !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64) {
         match bands {
             BandRequest::MultiBand { ref bands_1based }
-                if !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
+                if !u16_png
+                    && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
             {
                 return Err(EngineError::BadRequest(
                     "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
@@ -4351,7 +4689,7 @@ fn expand_stac_asset_bidx(
         if needs_per_asset {
             let mut expanded_cogs = Vec::new();
             let mut slot_bands = Vec::new();
-            for (name, cog) in names.iter().zip(cogs.into_iter()) {
+            for (name, cog) in names.iter().zip(cogs) {
                 let nb = cog.index.full_res().samples_per_pixel;
                 let sel: &[u16] = stac_asset_selected_bands(pq, name).unwrap_or(&[1]);
                 for &b in sel {
@@ -5574,41 +5912,75 @@ pub async fn handle_bytes_request(
     Response::from_parts(rparts, bytes)
 }
 
-fn header_accepts_gzip(val: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferredEncoding {
+    None,
+    Gzip,
+    Brotli,
+}
+
+/// Negotiate `Accept-Encoding` across all header lines per RFC 9110 §5.3 & §12.5.3,
+/// supporting `br`, `gzip`/`x-gzip`, `identity`, and `*`. Prefers `br` over `gzip` when both
+/// have equal explicit positive q-values, and falls back to `gzip` for bare `*`.
+fn negotiate_encoding<'a>(vals: impl IntoIterator<Item = &'a str>) -> PreferredEncoding {
+    let mut br_q: Option<f32> = None;
     let mut gzip_q: Option<f32> = None;
+    let mut identity_q: Option<f32> = None;
     let mut star_q: Option<f32> = None;
-    for part in val.split(',') {
-        let mut iter = part.split(';');
-        let enc = iter.next().unwrap_or("").trim();
-        let is_gzip = enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip");
-        let is_star = enc == "*";
-        if !is_gzip && !is_star {
-            continue;
-        }
-        let mut q_val = 1.0f32;
-        let mut valid = true;
-        for param in iter {
-            let p = param.trim();
-            if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                match qv.trim().parse::<f32>() {
-                    Ok(q) if q.is_finite() && (0.0..=1.0).contains(&q) => q_val = q,
-                    _ => {
-                        valid = false;
-                        break;
+    for val in vals {
+        for part in val.split(',') {
+            let mut iter = part.split(';');
+            let enc = iter.next().unwrap_or("").trim();
+            let is_br = enc.eq_ignore_ascii_case("br");
+            let is_gzip = enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip");
+            let is_identity = enc.eq_ignore_ascii_case("identity");
+            let is_star = enc == "*";
+            if !is_br && !is_gzip && !is_identity && !is_star {
+                continue;
+            }
+            let mut q_val = 1.0f32;
+            let mut valid = true;
+            for param in iter {
+                let p = param.trim();
+                if let Some(qv) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                    match qv.trim().parse::<f32>() {
+                        Ok(q) if q.is_finite() && (0.0..=1.0).contains(&q) => q_val = q,
+                        _ => {
+                            valid = false;
+                            break;
+                        }
                     }
                 }
             }
-        }
-        if !valid {
-            continue;
-        }
-        if is_gzip {
-            gzip_q = Some(gzip_q.map_or(q_val, |prev| prev.max(q_val)));
-        } else {
-            star_q = Some(star_q.map_or(q_val, |prev| prev.max(q_val)));
+            if !valid {
+                continue;
+            }
+            if is_br {
+                br_q = Some(br_q.map_or(q_val, |prev| prev.max(q_val)));
+            } else if is_gzip {
+                gzip_q = Some(gzip_q.map_or(q_val, |prev| prev.max(q_val)));
+            } else if is_identity {
+                identity_q = Some(identity_q.map_or(q_val, |prev| prev.max(q_val)));
+            } else {
+                star_q = Some(star_q.map_or(q_val, |prev| prev.max(q_val)));
+            }
         }
     }
-    gzip_q.or(star_q).is_some_and(|q| q > 0.0)
+    let eff_br = br_q.or(star_q).unwrap_or(0.0);
+    let eff_gzip = gzip_q.or(star_q).unwrap_or(0.0);
+    let best_compressed = eff_br.max(eff_gzip);
+    if best_compressed <= 0.0 || identity_q.is_some_and(|iq| iq > best_compressed) {
+        return PreferredEncoding::None;
+    }
+    if eff_br > eff_gzip {
+        PreferredEncoding::Brotli
+    } else if eff_gzip > eff_br {
+        PreferredEncoding::Gzip
+    } else if br_q.is_some() {
+        PreferredEncoding::Brotli
+    } else {
+        PreferredEncoding::Gzip
+    }
 }
 
 fn is_compressible_content_type(ct: &str) -> bool {
@@ -5624,6 +5996,43 @@ fn is_compressible_content_type(ct: &str) -> bool {
         || media.starts_with("text/")
 }
 
+const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Extract a valid caller-supplied `X-Request-Id` header (1..=128 printable non-whitespace ASCII
+/// bytes) or generate a compact lock-free hex ID (`<8-hex-process-seed>-<12-hex-seq>`).
+fn resolve_request_id(headers: &hyper::HeaderMap) -> HeaderValue {
+    if let Some(hv) = headers.get(&X_REQUEST_ID) {
+        let bytes = hv.as_bytes();
+        if !bytes.is_empty()
+            && bytes.len() <= 128
+            && bytes.iter().all(|&b| (0x21..=0x7E).contains(&b))
+        {
+            return hv.clone();
+        }
+    }
+    static SEED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seed = *SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        (nanos ^ (nanos >> 32) ^ (pid.wrapping_mul(0x9E37_79B9))) as u32
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) & 0x0000_FFFF_FFFF_FFFF;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 21];
+    for i in 0..8 {
+        buf[7 - i] = HEX[((seed >> (i * 4)) & 0xF) as usize];
+    }
+    buf[8] = b'-';
+    for i in 0..12 {
+        buf[20 - i] = HEX[((seq >> (i * 4)) & 0xF) as usize];
+    }
+    HeaderValue::from_bytes(&buf).expect("ASCII hex request id")
+}
+
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
     mut req: Request<B>,
@@ -5633,17 +6042,21 @@ where
     B::Error: std::fmt::Display,
 {
     let t0 = std::time::Instant::now();
-    let is_head = *req.method() == Method::HEAD;
-    let is_post = *req.method() == Method::POST;
-    let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
+    let req_id = resolve_request_id(req.headers());
+    let req_method = req.method().clone();
+    // O(1) `Bytes`-backed URI clone (zero heap allocation) for structured access logging.
+    let req_uri = req.uri().clone();
+    let is_head = req_method == Method::HEAD;
+    let is_post = req_method == Method::POST;
+    let is_get_or_head = matches!(req_method, Method::GET | Method::HEAD);
     let is_health_or_metrics =
-        matches!(req.uri().path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
+        matches!(req_uri.path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
     let is_control_plane = is_health_or_metrics
         || matches!(
-            req.uri().path(),
+            req_uri.path(),
             "/admin/clear-cache" | "/searches" | "/searches/list" | "/searches/register"
         );
-    let bypass_aimd = is_control_plane || *req.method() == Method::OPTIONS;
+    let bypass_aimd = is_control_plane || req_method == Method::OPTIONS;
     let mut aimd_permit = if bypass_aimd {
         None
     } else {
@@ -5666,15 +6079,32 @@ where
                     resp.headers_mut()
                         .insert(HeaderName::from_static("x-cogzilla-aimd-limit"), hv);
                 }
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    tracing::debug!(
+                        request_id = req_id.to_str().unwrap_or(""),
+                        method = %req_method,
+                        path = %req_uri.path(),
+                        status = 429u16,
+                        dur_ms = format_args!("{dur_ms:.2}"),
+                        "http request"
+                    );
+                }
+                resp.headers_mut().insert(X_REQUEST_ID, req_id);
+                resp.headers_mut().insert(
+                    hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static("X-Request-Id"),
+                );
                 return Ok(resp);
             }
         }
     };
-    let accepts_gzip = req
-        .headers()
-        .get(hyper::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(header_accepts_gzip);
+    let preferred_enc = negotiate_encoding(
+        req.headers()
+            .get_all(hyper::header::ACCEPT_ENCODING)
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     engine.sync_tile_cache_epoch();
     let retry_head = if is_get_or_head {
         Some((req.method().clone(), req.uri().clone(), req.headers().clone()))
@@ -5687,9 +6117,17 @@ where
         .headers()
         .get(hyper::header::ACCEPT)
         .and_then(|v| v.to_str().ok());
+    let raw_q = req.uri().query().unwrap_or("");
+    let colormap_prefers_image = {
+        let mut parts = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty());
+        matches!((parts.next(), parts.next(), parts.next()), (Some("colorMaps"), Some(_), None))
+            && html::explicit_format(raw_q).is_none()
+            && accept_hdr.and_then(html::negotiate_colormap_accept).is_some()
+    };
     let as_page = (offers_page
-        && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
-    .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
+        && !colormap_prefers_image
+        && html::wants_html(raw_q, accept_hdr))
+    .then(|| (req.uri().path().to_string(), raw_q.to_string()));
     // Prevent a cached JSON ETag in `If-None-Match` from short-circuiting an HTML page request to 304.
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
@@ -5746,6 +6184,36 @@ where
             hv,
         );
     }
+    let status = resp.status();
+    if status.is_server_error() {
+        tracing::warn!(
+            request_id = req_id.to_str().unwrap_or(""),
+            method = %req_method,
+            path = %req_uri.path(),
+            status = status.as_u16(),
+            dur_ms = format_args!("{dur_ms:.2}"),
+            "http request failed"
+        );
+    } else if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            request_id = req_id.to_str().unwrap_or(""),
+            method = %req_method,
+            path = %req_uri.path(),
+            status = status.as_u16(),
+            dur_ms = format_args!("{dur_ms:.2}"),
+            "http request"
+        );
+    }
+    resp.headers_mut().insert(X_REQUEST_ID, req_id);
+    if !resp
+        .headers()
+        .contains_key(hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+    {
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("X-Request-Id"),
+        );
+    }
     if is_post {
         // RFC 9110: POST responses depend on the request body and must not carry public Cache-Control/ETag.
         resp.headers_mut().remove(CACHE_CONTROL);
@@ -5767,16 +6235,15 @@ where
             .is_some_and(is_compressible_content_type);
     if compressible {
         if let Some(existing) = resp.headers().get(hyper::header::VARY).and_then(|v| v.to_str().ok()) {
-            if !existing.to_ascii_lowercase().contains("accept-encoding") {
-                if let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
+            if !existing.to_ascii_lowercase().contains("accept-encoding")
+                && let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
                     resp.headers_mut().insert(hyper::header::VARY, hv);
                 }
-            }
         } else {
             resp.headers_mut()
                 .insert(hyper::header::VARY, HeaderValue::from_static("Accept-Encoding"));
         }
-        if accepts_gzip
+        if preferred_enc != PreferredEncoding::None
             && !is_head
             && !resp.headers().contains_key(hyper::header::CONTENT_ENCODING)
         {
@@ -5786,18 +6253,30 @@ where
                 .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            if raw.len() >= 500
-                && let Ok(gz) = cogzilla_codec::compress_gzip(&raw)
-                && gz.len() < raw.len()
+            let compressed = if raw.len() >= 500 {
+                match preferred_enc {
+                    PreferredEncoding::Brotli => {
+                        cogzilla_codec::compress_brotli(&raw).ok().map(|b| (b, "br"))
+                    }
+                    PreferredEncoding::Gzip => {
+                        cogzilla_codec::compress_gzip(&raw).ok().map(|b| (b, "gzip"))
+                    }
+                    PreferredEncoding::None => None,
+                }
+            } else {
+                None
+            };
+            if let Some((enc_bytes, enc_name)) = compressed
+                && enc_bytes.len() < raw.len()
             {
                 parts.headers.insert(
                     hyper::header::CONTENT_ENCODING,
-                    HeaderValue::from_static("gzip"),
+                    HeaderValue::from_static(enc_name),
                 );
-                if let Ok(hv) = HeaderValue::from_str(&gz.len().to_string()) {
+                if let Ok(hv) = HeaderValue::from_str(&enc_bytes.len().to_string()) {
                     parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
                 }
-                resp = Response::from_parts(parts, Full::new(Bytes::from(gz)));
+                resp = Response::from_parts(parts, Full::new(Bytes::from(enc_bytes)));
             } else {
                 resp = Response::from_parts(parts, Full::new(raw));
             }
@@ -5806,13 +6285,11 @@ where
 
     if is_head {
         let (mut parts, body) = resp.into_parts();
-        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT {
-            if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
-                if let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
+        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT
+            && let Some(len) = hyper::body::Body::size_hint(&body).exact()
+                && let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
                     parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
                 }
-            }
-        }
         return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
     }
     Ok(resp)
@@ -5907,7 +6384,7 @@ where
         );
         resp.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("Content-Type, If-None-Match, Authorization"),
+            HeaderValue::from_static("Content-Type, If-None-Match, Authorization, X-Request-Id"),
         );
         return Ok(resp);
     }
@@ -6070,82 +6547,12 @@ where
     }
 
     if method == Method::GET && path == "/stats" {
-        let disk = engine.store.disk_cache.as_ref().map(|dc| {
-            let s = dc.stats();
-            serde_json::json!({
-                "hits": s.hits,
-                "misses": s.misses,
-                "bytes_used": s.bytes_used,
-                "max_bytes": s.max_bytes,
-                "evictions": s.evictions,
-                "write_errors": s.write_errors,
-                "read_errors": s.read_errors,
-            })
-        });
-        #[cfg(feature = "gpu")]
-        let gpu_stats = engine.gpu.as_ref().map(|gpu| {
-            let s = gpu.slab_cache.stats();
-            let ms = gpu.multi_slab_cache.stats();
-            serde_json::json!({
-                "dispatches": engine.stats.gpu_dispatches.load(Ordering::Relaxed),
-                "in_flight": gpu.in_flight(),
-                "slab_cache": {
-                    "hits": s.hits,
-                    "misses": s.misses,
-                    "bytes_used": s.used_bytes,
-                    "max_bytes": s.max_bytes,
-                },
-                "multi_slab_cache": {
-                    "hits": ms.hits,
-                    "misses": ms.misses,
-                    "bytes_used": ms.used_bytes,
-                    "max_bytes": ms.max_bytes,
-                },
-            })
-        });
-        #[cfg(not(feature = "gpu"))]
-        let gpu_stats: Option<serde_json::Value> = None;
-        let pgstac_stats = engine.pgstac().map(|pg| {
-            let s = pg.stats();
-            serde_json::json!({
-                "pool_size": s.pool_size,
-                "pool_available": s.pool_available,
-                "pool_waiting": s.pool_waiting,
-                "cache_items": s.cache_items,
-                "cache_searches": s.cache_searches,
-                "cache_collections": s.cache_collections,
-                "cache_item_docs": s.cache_item_docs,
-                "cache_plans": s.cache_plans,
-            })
-        });
-        let body = serde_json::json!({
-            "tiles_served": engine.stats.tiles_served.load(Ordering::Relaxed),
-            "empty_short_circuits": engine.stats.empty_short_circuits.load(Ordering::Relaxed),
-            "passthrough_hits": engine.stats.passthrough_hits.load(Ordering::Relaxed),
-            "http_304_not_modified": engine.stats.http_304_not_modified.load(Ordering::Relaxed),
-            "cache_hits": engine.store.cache.hits.load(Ordering::Relaxed),
-            "cache_misses": engine.store.cache.misses.load(Ordering::Relaxed),
-            "singleflight_coalesced": engine.store.cache.coalesced_waiters.load(Ordering::Relaxed),
-            "cache_bytes": engine.store.cache.current_bytes(),
-            "tile_cache_hits": engine.tile_cache.hits.load(Ordering::Relaxed),
-            "tile_cache_misses": engine.tile_cache.misses.load(Ordering::Relaxed),
-            "tile_cache_coalesced": engine.tile_cache.coalesced.load(Ordering::Relaxed),
-            "tile_cache_bytes": engine.tile_cache.current_bytes(),
-            "upstream_limit": engine.store.upstream_limiter.current_limit(),
-            "upstream_in_flight": engine.store.upstream_limiter.in_flight(),
-            "upstream_throttles": engine.store.upstream_limiter.throttle_events(),
-            "remote_range_requests": engine.store.metrics.remote_range_requests.load(Ordering::Relaxed),
-            "remote_bytes_fetched": engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed),
-            "disk_cache": disk,
-            "gpu": gpu_stats,
-            "pgstac": pgstac_stats,
-        })
-        .to_string();
+        let body = metrics::render_stats_json(&engine);
         return Ok(plain_resp(StatusCode::OK, Bytes::from(body), "application/json"));
     }
 
     if method == Method::GET && path == "/metrics" {
-        let prom = render_prometheus_metrics(&engine);
+        let prom = metrics::render_prometheus_metrics(&engine);
         return Ok(plain_resp(
             StatusCode::OK,
             Bytes::from(prom),
@@ -6746,7 +7153,7 @@ where
                 let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or({
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -6801,7 +7208,7 @@ where
                 let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or({
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -7808,46 +8215,54 @@ where
                 Bytes::from(list_colormaps_json(&host).to_string()),
                 "application/json",
             )),
-            ["colorMaps", id] => match pq.format_param.as_deref() {
-                None | Some("json") | Some("html") => {
-                    get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+            ["colorMaps", id] => {
+                let negotiated_fmt: Option<&str> = pq.format_param.as_deref().or_else(|| {
+                    req.headers()
+                        .get(hyper::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(html::negotiate_colormap_accept)
+                });
+                match negotiated_fmt {
+                    None | Some("json") | Some("html") => {
+                        get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+                    }
+                    Some("npy") => get_colormap_image(
+                        id,
+                        OutputFormat::Npy,
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "application/x-binary")),
+                    Some("png") => get_colormap_image(
+                        id,
+                        OutputFormat::Png,
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/png")),
+                    Some("jpg" | "jpeg") => get_colormap_image(
+                        id,
+                        OutputFormat::Jpeg { quality: pq.jpeg_quality },
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/jpeg")),
+                    Some("webp") => get_colormap_image(
+                        id,
+                        OutputFormat::Webp { quality: pq.webp_quality },
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/webp")),
+                    Some(other) => Err(EngineError::BadRequest(format!(
+                        "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
+                    ))),
                 }
-                Some("npy") => get_colormap_image(
-                    id,
-                    OutputFormat::Npy,
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "application/x-binary")),
-                Some("png") => get_colormap_image(
-                    id,
-                    OutputFormat::Png,
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/png")),
-                Some("jpg" | "jpeg") => get_colormap_image(
-                    id,
-                    OutputFormat::Jpeg { quality: pq.jpeg_quality },
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/jpeg")),
-                Some("webp") => get_colormap_image(
-                    id,
-                    OutputFormat::Webp { quality: pq.webp_quality },
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/webp")),
-                Some(other) => Err(EngineError::BadRequest(format!(
-                    "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
-                ))),
-            },
+            }
             _ => Err(EngineError::NotFound(path.clone())),
         };
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
@@ -7969,7 +8384,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut map = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
+                for (name, cog) in names.into_iter().zip(cogs) {
                     let mut info = build_cog_info(&engine, &cog)?;
                     if pq.bounds_crs.is_some() {
                         let crs = engine.get_or_build_crs(&cog)?;
@@ -7989,7 +8404,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut props = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
+                for (name, cog) in names.into_iter().zip(cogs) {
                     let mut info = build_cog_info(&engine, &cog)?;
                     if pq.bounds_crs.is_some() {
                         let crs = engine.get_or_build_crs(&cog)?;
@@ -8049,10 +8464,10 @@ where
                     ordered[idx] = Some(st);
                 }
                 let mut map = serde_json::Map::new();
-                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
+                for (name, st) in names.into_iter().zip(ordered) {
                     if let Some(mut st) = st {
-                        if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
-                            if let Some(obj) = st.as_object() {
+                        if let Some(sel) = stac_asset_selected_bands(&pq, &name)
+                            && let Some(obj) = st.as_object() {
                                 let mut filtered = serde_json::Map::new();
                                 for &b in sel {
                                     let k = format!("b{b}");
@@ -8062,7 +8477,6 @@ where
                                 }
                                 st = serde_json::Value::Object(filtered);
                             }
-                        }
                         map.insert(name, st);
                     }
                 }
@@ -8283,7 +8697,7 @@ where
                 }
                 let mut map = serde_json::Map::new();
                 let mut band_idx = 1usize;
-                for (name, slot) in names.iter().zip(ordered.into_iter()) {
+                for (name, slot) in names.iter().zip(ordered) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
                         let bands_iter: Vec<usize> = if stac_asset_expr(&pq, name).is_some() {
@@ -8586,7 +9000,7 @@ where
                         // Merge bands in numeric order 1..=nb across assets to match TiTiler's POST /stac/statistics.
                         let mut merged = serde_json::Map::new();
                         let mut b_counter = 1usize;
-                        for (name, slot) in names_c.iter().zip(ordered.into_iter()) {
+                        for (name, slot) in names_c.iter().zip(ordered) {
                             let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
                                 let bands_iter: Vec<usize> =
@@ -8839,7 +9253,7 @@ where
                 let st = widest_sample_type(&cogs);
                 let mut bands =
                     build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -9079,6 +9493,8 @@ where
                         let auto_fmt = ext.is_none() && pq_stac.format_param.is_none();
                         if auto_fmt {
                             treq.format = OutputFormat::RawRgba;
+                        } else if wants_u16_png(treq.format, ct, &pq_stac, Some(&cogs[0]), &treq.bands, st) {
+                            treq.format = OutputFormat::RawF32;
                         }
                         if let Some(ref cf_str) = pq_stac.color_formula {
                             ColorFormula::parse(cf_str).map_err(EngineError::BadRequest)?;
@@ -9248,7 +9664,7 @@ where
                 let single_asset_expr = names.len() == 1 && rewritten_expr.is_some();
                 let single_band_per_asset = (names.len() > 1 && rewritten_expr.is_some()) || pq.asset_as_band;
                 let mut used_asset_bidx = false;
-                for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
+                for (name, pt) in names.into_iter().zip(ordered) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         if !single_asset_expr
                             && let Some(expr_str) = stac_asset_expr(&pq, &name)
@@ -9369,7 +9785,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(
+                    render_output_format(
                         fmt,
                         ct,
                         &pq_stac,
@@ -9460,7 +9876,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -9546,7 +9962,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(
+                    render_output_format(
                         fmt,
                         ct,
                         &pq_stac,
@@ -9636,7 +10052,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -9720,7 +10136,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -9783,7 +10199,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(
+                    render_output_format(
                         fmt,
                         ct,
                         &pq_stac,
@@ -10377,6 +10793,8 @@ where
                         let auto_fmt = ext.is_none() && pq.format_param.is_none();
                         if auto_fmt {
                             treq.format = OutputFormat::RawRgba;
+                        } else if wants_u16_png(treq.format, ct, &pq, Some(&cogs[0]), &treq.bands, st) {
+                            treq.format = OutputFormat::RawF32;
                         }
                         if let Some(ref cf_str) = pq.color_formula {
                             ColorFormula::parse(cf_str).map_err(EngineError::BadRequest)?;
@@ -10837,7 +11255,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -10863,6 +11281,9 @@ where
                 Ok((data, ct))
             }
             .await,
+            (Method::GET, ["wms"]) => {
+                handle_cog_wms(&engine, &host, &raw_query, &pq, &mut geo_meta).await
+            }
             (Method::GET, [_, "WMTSCapabilities.xml"]) | (Method::GET, ["WMTSCapabilities.xml"]) => {
                 async {
                     let explicit_tms = (sub.len() == 2).then_some(sub[0]);
@@ -10991,7 +11412,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
+                    render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11090,7 +11511,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -11178,7 +11599,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
+                    render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11256,7 +11677,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -11334,7 +11755,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
+                    render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11390,7 +11811,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -11433,7 +11854,7 @@ where
                 Err(EngineError::MethodNotAllowed("POST"))
             }
             (_, ["feature", _]) => Err(EngineError::MethodNotAllowed("POST")),
-            (_, ["info"] | ["info.geojson"] | ["bounds"] | ["validate"] | ["stac"] | ["tiles"] | ["tiles", ..] | ["point", _] | ["preview", ..] | ["bbox", ..] | ["map"] | ["viewer"] | ["tilejson.json"] | [_, "tilejson.json"] | ["map.html"] | [_, "map.html"] | ["WMTSCapabilities.xml"] | [_, "WMTSCapabilities.xml"]) => {
+            (_, ["info"] | ["info.geojson"] | ["bounds"] | ["validate"] | ["stac"] | ["tiles"] | ["tiles", ..] | ["point", _] | ["preview", ..] | ["bbox", ..] | ["map"] | ["wms"] | ["viewer"] | ["tilejson.json"] | [_, "tilejson.json"] | ["map.html"] | [_, "map.html"] | ["WMTSCapabilities.xml"] | [_, "WMTSCapabilities.xml"]) => {
                 Err(EngineError::MethodNotAllowed("GET, HEAD"))
             }
 
@@ -11517,118 +11938,6 @@ fn etag_matches(if_none_match: &str, etag: &str) -> bool {
         }
     }
     false
-}
-
-fn render_prometheus_metrics(engine: &TileEngine) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(2048);
-    let _ = writeln!(out, "# HELP cogzilla_tiles_served_total Total tiles rendered or served.");
-    let _ = writeln!(out, "# TYPE cogzilla_tiles_served_total counter");
-    let _ = writeln!(out, "cogzilla_tiles_served_total {}", engine.stats.tiles_served.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# HELP cogzilla_empty_short_circuits_total Empty/nodata tiles short-circuited.");
-    let _ = writeln!(out, "# TYPE cogzilla_empty_short_circuits_total counter");
-    let _ = writeln!(out, "cogzilla_empty_short_circuits_total {}", engine.stats.empty_short_circuits.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# HELP cogzilla_passthrough_hits_total Zero-decode JPEG/WebP pass-through tiles.");
-    let _ = writeln!(out, "# TYPE cogzilla_passthrough_hits_total counter");
-    let _ = writeln!(out, "cogzilla_passthrough_hits_total {}", engine.stats.passthrough_hits.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# HELP cogzilla_http_304_not_modified_total Conditional GET 304 Not Modified responses.");
-    let _ = writeln!(out, "# TYPE cogzilla_http_304_not_modified_total counter");
-    let _ = writeln!(out, "cogzilla_http_304_not_modified_total {}", engine.stats.http_304_not_modified.load(Ordering::Relaxed));
-
-    let _ = writeln!(out, "# TYPE cogzilla_block_cache_hits_total counter");
-    let _ = writeln!(out, "cogzilla_block_cache_hits_total {}", engine.store.cache.hits.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_block_cache_misses_total counter");
-    let _ = writeln!(out, "cogzilla_block_cache_misses_total {}", engine.store.cache.misses.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_block_cache_coalesced_total counter");
-    let _ = writeln!(out, "cogzilla_block_cache_coalesced_total {}", engine.store.cache.coalesced_waiters.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_block_cache_bytes gauge");
-    let _ = writeln!(out, "cogzilla_block_cache_bytes {}", engine.store.cache.current_bytes());
-
-    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_hits_total counter");
-    let _ = writeln!(out, "cogzilla_tile_cache_hits_total {}", engine.tile_cache.hits.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_misses_total counter");
-    let _ = writeln!(out, "cogzilla_tile_cache_misses_total {}", engine.tile_cache.misses.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_coalesced_total counter");
-    let _ = writeln!(out, "cogzilla_tile_cache_coalesced_total {}", engine.tile_cache.coalesced.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_tile_cache_bytes gauge");
-    let _ = writeln!(out, "cogzilla_tile_cache_bytes {}", engine.tile_cache.current_bytes());
-
-    let _ = writeln!(out, "# TYPE cogzilla_upstream_limit gauge");
-    let _ = writeln!(out, "cogzilla_upstream_limit {}", engine.store.upstream_limiter.current_limit());
-    let _ = writeln!(out, "# TYPE cogzilla_upstream_in_flight gauge");
-    let _ = writeln!(out, "cogzilla_upstream_in_flight {}", engine.store.upstream_limiter.in_flight());
-    let _ = writeln!(out, "# TYPE cogzilla_upstream_throttles_total counter");
-    let _ = writeln!(out, "cogzilla_upstream_throttles_total {}", engine.store.upstream_limiter.throttle_events());
-    let _ = writeln!(out, "# TYPE cogzilla_remote_range_requests_total counter");
-    let _ = writeln!(out, "cogzilla_remote_range_requests_total {}", engine.store.metrics.remote_range_requests.load(Ordering::Relaxed));
-    let _ = writeln!(out, "# TYPE cogzilla_remote_bytes_fetched_total counter");
-    let _ = writeln!(out, "cogzilla_remote_bytes_fetched_total {}", engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed));
-
-    let aimd = engine.aimd.snapshot();
-    let _ = writeln!(out, "# HELP cogzilla_aimd_limit Current adaptive AIMD concurrency limit.");
-    let _ = writeln!(out, "# TYPE cogzilla_aimd_limit gauge");
-    let _ = writeln!(out, "cogzilla_aimd_limit {}", aimd.limit);
-    let _ = writeln!(out, "# HELP cogzilla_aimd_in_flight Current in-flight HTTP requests admitted by AIMD.");
-    let _ = writeln!(out, "# TYPE cogzilla_aimd_in_flight gauge");
-    let _ = writeln!(out, "cogzilla_aimd_in_flight {}", aimd.in_flight);
-    let _ = writeln!(out, "# HELP cogzilla_aimd_rejected_429_total Total HTTP requests shed with 429 Too Many Requests by AIMD.");
-    let _ = writeln!(out, "# TYPE cogzilla_aimd_rejected_429_total counter");
-    let _ = writeln!(out, "cogzilla_aimd_rejected_429_total {}", aimd.rejected_429);
-
-    if let Some(dc) = &engine.store.disk_cache {
-        let s = dc.stats();
-        let _ = writeln!(out, "# TYPE cogzilla_disk_cache_hits_total counter");
-        let _ = writeln!(out, "cogzilla_disk_cache_hits_total {}", s.hits);
-        let _ = writeln!(out, "# TYPE cogzilla_disk_cache_misses_total counter");
-        let _ = writeln!(out, "cogzilla_disk_cache_misses_total {}", s.misses);
-        let _ = writeln!(out, "# TYPE cogzilla_disk_cache_bytes gauge");
-        let _ = writeln!(out, "cogzilla_disk_cache_bytes {}", s.bytes_used);
-    }
-
-    #[cfg(feature = "gpu")]
-    if let Some(gpu) = &engine.gpu {
-        let s = gpu.slab_cache.stats();
-        let ms = gpu.multi_slab_cache.stats();
-        let _ = writeln!(out, "# HELP cogzilla_gpu_dispatches_total Total GPU compute dispatches.");
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_dispatches_total counter");
-        let _ = writeln!(
-            out,
-            "cogzilla_gpu_dispatches_total {}",
-            engine.stats.gpu_dispatches.load(Ordering::Relaxed)
-        );
-        let _ = writeln!(out, "# HELP cogzilla_gpu_in_flight Current in-flight GPU operations.");
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_in_flight gauge");
-        let _ = writeln!(out, "cogzilla_gpu_in_flight {}", gpu.in_flight());
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_hits_total counter");
-        let _ = writeln!(out, "cogzilla_gpu_slab_cache_hits_total {}", s.hits);
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_misses_total counter");
-        let _ = writeln!(out, "cogzilla_gpu_slab_cache_misses_total {}", s.misses);
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_bytes gauge");
-        let _ = writeln!(out, "cogzilla_gpu_slab_cache_bytes {}", s.used_bytes);
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_hits_total counter");
-        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_hits_total {}", ms.hits);
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_misses_total counter");
-        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_misses_total {}", ms.misses);
-        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_bytes gauge");
-        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_bytes {}", ms.used_bytes);
-    }
-
-    if let Some(pg) = engine.pgstac() {
-        let s = pg.stats();
-        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_size Current pgSTAC connection pool size.");
-        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_size gauge");
-        let _ = writeln!(out, "cogzilla_pgstac_pool_size {}", s.pool_size);
-        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_available Available idle pgSTAC connections.");
-        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_available gauge");
-        let _ = writeln!(out, "cogzilla_pgstac_pool_available {}", s.pool_available);
-        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_waiting Tasks waiting for a pgSTAC connection.");
-        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_waiting gauge");
-        let _ = writeln!(out, "cogzilla_pgstac_pool_waiting {}", s.pool_waiting);
-        let _ = writeln!(out, "# HELP cogzilla_pgstac_cache_entries Total entries across pgSTAC TTL caches.");
-        let _ = writeln!(out, "# TYPE cogzilla_pgstac_cache_entries gauge");
-        let _ = writeln!(out, "cogzilla_pgstac_cache_entries {}", s.total_cache_entries());
-    }
-    out
 }
 
 fn attach_geo_headers(
@@ -11732,7 +12041,7 @@ fn attach_tile_geo_headers_opts(
             .map(|sc| sc.saturating_mul(base_ts))
             .unwrap_or(if opts.has_explicit_ts { opts.tile_size } else { base_ts });
         if let Some(bbox) = tms_def.tile_bounds(z, x, y, opts.buffer, ts) {
-            let is_crs84 = matches!(tms, "WorldCRS84Quad" | "GNOSISGlobalGrid" | "WGS1984Quad");
+            let is_crs84 = tms == "WorldCRS84Quad";
             attach_geo_headers(resp, bbox, Some(tms_def.epsg), is_crs84);
         }
     }
@@ -11778,9 +12087,9 @@ fn binary_or_plain_response(
     if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
     if let Some(etag_hv) = etag {
-        if let Some(inm) = if_none_match {
-            if let Ok(etag_str) = etag_hv.to_str() {
-                if etag_matches(inm, etag_str) {
+        if let Some(inm) = if_none_match
+            && let Ok(etag_str) = etag_hv.to_str()
+                && etag_matches(inm, etag_str) {
                     engine
                         .stats
                         .http_304_not_modified
@@ -11794,8 +12103,6 @@ fn binary_or_plain_response(
                         .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
                     return resp;
                 }
-            }
-        }
         let mut resp = plain_resp(StatusCode::OK, bytes, content_type);
         resp.headers_mut().insert(ETAG, etag_hv);
         resp.headers_mut()
@@ -11902,103 +12209,10 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
     }
 }
 
-/// Bind and serve HTTP/1.1 + HTTP/2 requests until shutdown.
-pub async fn serve(engine: Arc<TileEngine>, addr: SocketAddr) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    serve_listener(engine, listener).await
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        if let Ok(mut sig) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            sig.recv().await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
-}
-
-pub async fn serve_listener(engine: Arc<TileEngine>, listener: TcpListener) -> std::io::Result<()> {
-    serve_listener_with_shutdown(engine, listener, shutdown_signal()).await
-}
-
-pub async fn serve_listener_with_shutdown<F>(
-    engine: Arc<TileEngine>,
-    listener: TcpListener,
-    shutdown: F,
-) -> std::io::Result<()>
-where
-    F: std::future::Future<Output = ()>,
-{
-    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    tokio::pin!(shutdown);
-    loop {
-        let (stream, _) = tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("shutdown signal received; draining in-flight connections");
-                break;
-            }
-            accept_res = listener.accept() => match accept_res {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // Transient socket errors (EMFILE/ENFILE/ECONNABORTED) must never crash the server.
-                    tracing::warn!(error = %e, "TCP accept error; backing off briefly");
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    continue;
-                }
-            }
-        };
-        let _ = stream.set_nodelay(true);
-        let io = TokioIo::new(stream);
-        let eng = engine.clone();
-        let svc = service_fn(move |req| handle_request(eng.clone(), req));
-        let mut builder = ServerBuilder::new(TokioExecutor::new());
-        builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(std::time::Duration::from_secs(15));
-        let conn = builder.serve_connection(io, svc).into_owned();
-        let fut = graceful.watch(conn);
-        tokio::spawn(async move {
-            let _ = fut.await;
-        });
-    }
-    // Close the listening socket immediately so load balancers get ECONNREFUSED instead of
-    // queueing new handshakes in the kernel backlog while in-flight connections drain.
-    drop(listener);
-    let drain_secs = std::env::var("COGZILLA_SHUTDOWN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(15);
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(drain_secs),
-        graceful.shutdown(),
-    )
-    .await
-    {
-        Ok(()) => tracing::info!("all in-flight connections drained"),
-        Err(_) => {
-            tracing::warn!(timeout_secs = drain_secs, "graceful shutdown timed out; forcing exit");
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     fn single(rescale: (f32, f32), colormap: ColormapName) -> BandRequest {
         BandRequest::Single { band_1based: 1, rescale, colormap }
@@ -12191,6 +12405,69 @@ mod tests {
         assert_ne!(unmasked, png, "return_mask=false leaves the mask out");
         let jpeg = encode_rgba_output(2, 2, &rgba, OutputFormat::Jpeg { quality: 75 }, true);
         assert_eq!(jpeg[..2], [0xff, 0xd8]);
+    }
+
+    #[test]
+    fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
+        let pq_plain = parse_query(None);
+        let pq_rescaled = parse_query(Some("rescale=0,1000"));
+        let pq_cmap = parse_query(Some("colormap_name=viridis"));
+        let single = BandRequest::Single { band_1based: 1, rescale: (0.0, 65535.0), colormap: ColormapName::Grayscale };
+        assert!(wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_tiff::SampleType::Uint16));
+        assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_tiff::SampleType::Uint8));
+        assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_rescaled, None, &single, cogzilla_tiff::SampleType::Uint16));
+        assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_cmap, None, &single, cogzilla_tiff::SampleType::Uint16));
+
+        // 4x1 single-band f32 buffer testing clamp (-1.0 -> 0, 70000.0 -> 65535),
+        // rounding (123.6 -> 124), and NaN (0, alpha=0) in 16-bit Grey+Alpha PNG.
+        let mut raw = Vec::new();
+        for v in [-1.0f32, 123.6, 70000.0, f32::NAN] {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let png = wrap_geotiff_fmt(Bytes::from(raw), "image/png", OutputFormat::RawF32, 4, 1, [0.0; 4], 4326, true);
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        // IHDR: byte 24 is bit depth (16), byte 25 is colour type (4 = Greyscale+Alpha).
+        assert_eq!(png[24], 16, "expected 16-bit PNG");
+        assert_eq!(png[25], 4, "expected Greyscale+Alpha colour type");
+        // Extract and inflate IDAT payload to verify decoded 16-bit BE samples & alpha.
+        let mut idat = Vec::new();
+        let mut pos = 8usize;
+        while pos + 12 <= png.len() {
+            let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
+            let chunk_type = &png[pos + 4..pos + 8];
+            if chunk_type == b"IDAT" {
+                idat.extend_from_slice(&png[pos + 8..pos + 8 + len]);
+            }
+            pos += 12 + len;
+        }
+        let mut scanline = vec![0u8; 17];
+        let n = libdeflater::Decompressor::new()
+            .zlib_decompress(&idat, &mut scanline)
+            .expect("valid zlib IDAT");
+        // Filter byte (0) + 4 pixels * (u16 value + u16 alpha) = 1 + 16 = 17 bytes.
+        assert_eq!(n, 17);
+        assert_eq!(scanline[0], 0);
+        let decoded: Vec<(u16, u16)> = scanline[1..]
+            .chunks_exact(4)
+            .map(|c| (u16::from_be_bytes([c[0], c[1]]), u16::from_be_bytes([c[2], c[3]])))
+            .collect();
+        assert_eq!(decoded, vec![(0, 65535), (124, 65535), (65535, 65535), (0, 0)]);
+
+        // 2-band Uint16 `.png` tile request is accepted by build_tile_request_for_tms.
+        let pq_2b = parse_query(Some("bidx=1&bidx=2"));
+        let res = build_tile_request_for_tms(
+            None,
+            TileCoord { z: 0, x: 0, y: 0 },
+            None,
+            Some("png"),
+            &pq_2b,
+            2,
+            cogzilla_tiff::SampleType::Uint16,
+            "WebMercatorQuad",
+            None,
+            false,
+        );
+        assert!(res.is_ok(), "2-band Uint16 .png tile should be accepted: {:?}", res.err());
     }
 
     #[test]
@@ -12443,6 +12720,20 @@ mod tests {
 
         let pq_wmts = parse_query(Some("url=a.tif&minzoom=4&maxzoom=12&tile_format=png&tile_scale=2"));
         assert!(validate_query(&["cog", "WebMercatorQuad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
+        let pq_wms = parse_query(Some("url=https://example.com/a.tif&SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=CRS:84&BBOX=-123,37,-122,38&WIDTH=256&HEIGHT=256&FORMAT=image/png"));
+        assert!(pq_wms.errors.is_empty(), "wms errors: {:?}", pq_wms.errors);
+        assert!(validate_query(&["cog", "wms"], &pq_wms).is_ok());
+        assert_eq!(parse_coord_crs_with_epsg("CRS:84").unwrap().1, 4326);
+        assert!(parse_wms_format(Some("image/png"), None, 85).is_ok());
+        assert!(parse_wms_format(Some("image/tiff"), None, 85).is_ok());
+        assert!(parse_wms_format(Some("image/gif"), None, 85).is_err());
+        let cap = build_wms_capabilities("https://example.com", "url=https://example.com/a.tif&SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0", [-123.0, 37.0, -122.0, 38.0], Some(32610));
+        assert!(cap.contains("<WMS_Capabilities version=\"1.3.0\""));
+        assert!(cap.contains("<CRS>EPSG:32610</CRS>"));
+        assert!(cap.contains("<BoundingBox CRS=\"EPSG:4326\" minx=\"37\" miny=\"-123\" maxx=\"38\" maxy=\"-122\"/>"));
+        assert!(cap.contains("xlink:href=\"https://example.com/cog/wms?url=https://example.com/a.tif&amp;\""), "OnlineResource should strip WMS protocol params and end with &: {cap}");
+        assert!(!cap.contains("REQUEST=GetCapabilities"));
+        assert!(parse_wms_format(Some("IMAGE/PNG"), None, 85).is_ok());
         assert!(validate_query(&["mosaicjson", "WorldCRS84Quad", "WMTSCapabilities.xml"], &pq_wmts).is_ok());
         assert!(validate_query(&["mosaicjson", "NotATms", "WMTSCapabilities.xml"], &pq_wmts).is_err());
     }
@@ -12477,10 +12768,12 @@ mod tests {
         );
 
         // 2. cog_standard_epsg returns None for user-defined projected CRS (32767) even with geographic_type=4326
-        let mut gk = cogzilla_tiff::GeoKeys::default();
-        gk.model_type = Some(1);
-        gk.projected_cs_type = Some(32767);
-        gk.geographic_type = Some(4326);
+        let mut gk = cogzilla_tiff::GeoKeys {
+            model_type: Some(1),
+            projected_cs_type: Some(32767),
+            geographic_type: Some(4326),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         assert_eq!(cog_standard_epsg(&gk), None);
 
         // Standard projected EPSG returns Some(32610)
@@ -12488,9 +12781,11 @@ mod tests {
         assert_eq!(cog_standard_epsg(&gk), Some(32610));
 
         // Pure geographic returns Some(4326)
-        let mut gk_geo = cogzilla_tiff::GeoKeys::default();
-        gk_geo.model_type = Some(2);
-        gk_geo.geographic_type = Some(4326);
+        let gk_geo = cogzilla_tiff::GeoKeys {
+            model_type: Some(2),
+            geographic_type: Some(4326),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         assert_eq!(cog_standard_epsg(&gk_geo), Some(4326));
 
         // 3. GEOTIFF_CONTENT_TYPE matches parse_ext_format("tif", ...)
@@ -12780,16 +13075,16 @@ mod tests {
 
     #[test]
     fn audit87_header_accepts_gzip_rfc9110_precedence_and_nan() {
-        assert!(!header_accepts_gzip("gzip;q=0, *"));
-        assert!(!header_accepts_gzip("*, gzip;q=0"));
-        assert!(!header_accepts_gzip("x-gzip;q=0, *;q=1"));
-        assert!(!header_accepts_gzip("gzip;q=NaN"));
-        assert!(!header_accepts_gzip("gzip;q=inf"));
-        assert!(!header_accepts_gzip("gzip;q=-0.5"));
-        assert!(!header_accepts_gzip("br, deflate"));
-        assert!(header_accepts_gzip("br, *;q=0.5"));
-        assert!(header_accepts_gzip("x-gzip;q=0.1"));
-        assert!(header_accepts_gzip("gzip, deflate"));
+        assert_eq!(negotiate_encoding(["gzip;q=0, *"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["*, gzip;q=0"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["x-gzip;q=0, *;q=1"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip;q=NaN"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["gzip;q=inf"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["gzip;q=-0.5"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["br, deflate"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["br, *;q=0.5"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["x-gzip;q=0.1"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip, deflate"]), PreferredEncoding::Gzip);
     }
 
     #[test]
@@ -13087,5 +13382,128 @@ mod tests {
             .await
             .expect("server should drain and exit promptly")
             .unwrap();
+    }
+
+    #[test]
+    fn negotiate_encoding_prefers_brotli_and_honours_rfc9110_q_values() {
+        assert_eq!(negotiate_encoding(["gzip, deflate, br"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["br"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip, deflate"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["br;q=0, gzip"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip;q=1.0, br;q=0.5"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip;q=0.5, br;q=0.8"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip;q=0.5, *"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["br;q=0.5, *"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["*"]), PreferredEncoding::Gzip);
+        assert_eq!(negotiate_encoding(["gzip;q=0, *"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["gzip;q=0, br;q=0, *"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["identity;q=1.0, br;q=0.5"]), PreferredEncoding::None);
+        assert_eq!(negotiate_encoding(["br;q=NaN"]), PreferredEncoding::None);
+        // Multi-header HTTP/1.1 & HTTP/2 Accept-Encoding lines
+        assert_eq!(negotiate_encoding(["gzip", "br"]), PreferredEncoding::Brotli);
+        assert_eq!(negotiate_encoding(["*", "gzip;q=0", "br;q=0"]), PreferredEncoding::None);
+    }
+
+    #[tokio::test]
+    async fn x_request_id_echoes_valid_generates_when_absent_or_invalid_and_on_429() {
+        let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+
+        // Absent -> generated 21-byte <8-hex>-<12-hex>, unique across calls.
+        let r1 = handle_request(
+            engine.clone(),
+            Request::builder().uri("/healthz").body(Full::new(Bytes::new())).unwrap(),
+        )
+        .await
+        .unwrap();
+        let r2 = handle_request(
+            engine.clone(),
+            Request::builder().uri("/healthz").body(Full::new(Bytes::new())).unwrap(),
+        )
+        .await
+        .unwrap();
+        let id1 = r1.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id2 = r2.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+        assert_eq!(id1.len(), 21);
+        assert_eq!(id1.as_bytes()[8], b'-');
+        assert!(id1[..8].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(id1[9..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_ne!(id1, id2);
+        assert_eq!(
+            r1.headers()
+                .get(hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|v| v.to_str().ok()),
+            Some("X-Request-Id")
+        );
+
+        // Valid caller-supplied X-Request-Id (including exact 128-byte boundary) is echoed verbatim.
+        let exact_128 = "a".repeat(128);
+        for valid in ["trace-abc-123_XYZ", exact_128.as_str()] {
+            let r_echo = handle_request(
+                engine.clone(),
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", valid)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                r_echo.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap(),
+                valid
+            );
+        }
+
+        // Invalid (empty, contains whitespace/tab, or >128 bytes) -> replaced with fresh generated ID.
+        for invalid in ["", "bad id with spaces", "bad\tid"] {
+            let r_bad = handle_request(
+                engine.clone(),
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", invalid)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let bad_out = r_bad.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+            assert_ne!(bad_out, invalid);
+            assert_eq!(bad_out.len(), 21);
+        }
+
+        let too_long = "a".repeat(129);
+        let r_long = handle_request(
+            engine.clone(),
+            Request::builder()
+                .uri("/healthz")
+                .header("x-request-id", &too_long)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_long.headers().get(&X_REQUEST_ID).unwrap().len(), 21);
+
+        // AIMD 429 shedding still carries X-Request-Id.
+        let tight = Arc::new(
+            TileEngine::new(8 * 1024 * 1024)
+                .with_aimd(crate::aimd::AimdLimiter::new(true, 1, 1, 1, 150)),
+        );
+        let _held = tight.aimd.try_acquire().unwrap();
+        let r_429 = handle_request(
+            tight.clone(),
+            Request::builder()
+                .uri("/cog/info")
+                .header("x-request-id", "shed-req-42")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_429.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            r_429.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap(),
+            "shed-req-42"
+        );
     }
 }

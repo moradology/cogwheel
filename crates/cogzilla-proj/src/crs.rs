@@ -2,8 +2,9 @@ use cogzilla_tiff::{Affine2D, GeoKeys};
 use thiserror::Error;
 
 use crate::ellipsoid::{
-    AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, LambertAzimuthalEqualArea,
-    LambertConformalConic, PolarStereographic, Sinusoidal, TransverseMercator,
+    AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, Equirectangular,
+    HelmertTransform, LambertAzimuthalEqualArea, LambertConformalConic, Mercator,
+    ObliqueStereographic, PolarStereographic, Sinusoidal, SwissObliqueMercator, TransverseMercator,
 };
 use crate::mercator::{
     ORIGIN_SHIFT, TileCoord, lonlat_deg_to_mercator, mercator_to_lonlat_deg,
@@ -36,13 +37,157 @@ pub enum CrsModel {
     Sinusoidal(Sinusoidal),
     CylindricalEqualArea(CylindricalEqualArea),
     EqualEarth(EqualEarth),
+    Equirectangular(Equirectangular),
+    Mercator(Mercator),
+    ObliqueStereographic(ObliqueStereographic),
+    SwissObliqueMercator(SwissObliqueMercator),
+    /// Any CRS defined on a non-WGS84 datum, bridged to WGS84 via a 7-parameter Helmert shift.
+    DatumShifted {
+        inner: Box<CrsModel>,
+        helmert: HelmertTransform,
+    },
+}
+
+/// Well-known projected EPSG codes outside the WGS84-like table:
+/// Equirectangular, Mercator variants, Oblique Stereographic (Dutch RD New),
+/// Swiss Oblique Mercator (LV95/LV03), British National Grid (OSGB36), and NAD27 UTM.
+fn well_known_special_projected_epsg(code: u16) -> Option<CrsModel> {
+    match code {
+        // Equirectangular / Plate Carrée (WGS84)
+        32662 | 32663 | 4087 => Some(CrsModel::Equirectangular(Equirectangular::new(
+            Ellipsoid::WGS84,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ))),
+        // WGS84 / PDC Mercator (lon0 = 150°E)
+        3832 => Some(CrsModel::Mercator(Mercator::new_1sp(
+            Ellipsoid::WGS84,
+            150.0,
+            1.0,
+            0.0,
+            0.0,
+        ))),
+        // WGS84 / Mercator 41 (lat_ts = -41°, lon0 = 100°E)
+        3994 => Some(CrsModel::Mercator(Mercator::new_2sp(
+            Ellipsoid::WGS84,
+            -41.0,
+            100.0,
+            0.0,
+            0.0,
+        ))),
+        // OSGB36 / British National Grid (Airy 1830 TM + EPSG:1314 Helmert)
+        27700 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::TransverseMercator(TransverseMercator::new(
+                Ellipsoid::AIRY_1830,
+                -2.0,
+                49.0,
+                0.999_601_271_7,
+                400_000.0,
+                -100_000.0,
+            ))),
+            helmert: HelmertTransform::OSGB36_TO_WGS84,
+        }),
+        // Amersfoort / RD New (Dutch Oblique Stereographic + EPSG:15934 Helmert)
+        28992 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::ObliqueStereographic(ObliqueStereographic::new(
+                Ellipsoid::BESSEL_1841,
+                52.156_160_555_555_55,
+                5.387_638_888_888_89,
+                0.999_907_9,
+                155_000.0,
+                463_000.0,
+            ))),
+            helmert: HelmertTransform::AMERSFOORT_TO_WGS84,
+        }),
+        // CH1903+ / LV95 (Swiss Oblique Mercator + EPSG:1676 Helmert)
+        2056 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::SwissObliqueMercator(SwissObliqueMercator::new(
+                Ellipsoid::BESSEL_1841,
+                46.952_405_555_555_56,
+                7.439_583_333_333_333,
+                2_600_000.0,
+                1_200_000.0,
+            ))),
+            helmert: HelmertTransform::CH1903_TO_WGS84,
+        }),
+        // CH1903 / LV03 (Swiss Oblique Mercator + EPSG:1676 Helmert)
+        21781 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::SwissObliqueMercator(SwissObliqueMercator::new(
+                Ellipsoid::BESSEL_1841,
+                46.952_405_555_555_56,
+                7.439_583_333_333_333,
+                600_000.0,
+                200_000.0,
+            ))),
+            helmert: HelmertTransform::CH1903_TO_WGS84,
+        }),
+        // NAD27 / UTM zones 1N–23N
+        26701..=26723 => {
+            let zone = (code - 26700) as u8;
+            Some(CrsModel::DatumShifted {
+                inner: Box::new(CrsModel::TransverseMercator(TransverseMercator::utm(
+                    Ellipsoid::CLARKE_1866,
+                    zone,
+                    false,
+                ))),
+                helmert: HelmertTransform::NAD27_TO_WGS84,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Well-known geographic (degree-based) EPSG codes on non-WGS84 datums supported via Helmert shifts.
+fn well_known_special_geographic_epsg(code: u16) -> Option<CrsModel> {
+    match code {
+        // OSGB36 Geographic
+        4277 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::Geographic),
+            helmert: HelmertTransform::OSGB36_TO_WGS84,
+        }),
+        // Amersfoort Geographic
+        4289 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::Geographic),
+            helmert: HelmertTransform::AMERSFOORT_TO_WGS84,
+        }),
+        // CH1903 / CH1903+ Geographic
+        4149 | 4150 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::Geographic),
+            helmert: HelmertTransform::CH1903_TO_WGS84,
+        }),
+        // NAD27 Geographic (Clarke 1866 + EPSG:1173 CONUS Helmert)
+        4267 => Some(CrsModel::DatumShifted {
+            inner: Box::new(CrsModel::Geographic),
+            helmert: HelmertTransform::NAD27_TO_WGS84,
+        }),
+        _ => None,
+    }
 }
 
 impl CrsModel {
-    /// Construct a `CrsModel` from parsed GeoTIFF `GeoKeys`.
-    ///
+    /// Returns `true` for geographic (degree-based) CRSes, including datum-shifted geographic
+    /// CRSes such as NAD27 (`EPSG:4267`), OSGB36 (`EPSG:4277`), Amersfoort (`EPSG:4289`), and
+    /// CH1903 (`EPSG:4149`/`4150`).
+    #[inline]
+    pub fn is_geographic(&self) -> bool {
+        matches!(self.unshifted(), Self::Geographic)
+    }
+
+    /// Unwrap any outer `DatumShifted` wrapper to inspect the underlying projection model.
+    #[inline]
+    fn unshifted(&self) -> &Self {
+        match self {
+            Self::DatumShifted { inner, .. } => inner.unshifted(),
+            other => other,
+        }
+    }
+
     /// Construct a `CrsModel` directly from an EPSG code (supporting `4326`, `3857`, all 270+
-    /// WGS84-compatible geographic codes, and all 3,260+ supported projected EPSG codes).
+    /// WGS84-compatible geographic codes, 3,260+ projected EPSG codes, plus Equirectangular,
+    /// Mercator variants, Oblique Stereographic, Swiss LV95/LV03, OSGB36 BNG, and NAD27).
     pub fn from_epsg(code: u16) -> Result<Self, ProjError> {
         if code == 4326 || crate::epsg_table::WGS84_LIKE_GCS.binary_search(&code).is_ok() {
             return Ok(Self::Geographic);
@@ -52,6 +197,11 @@ impl CrsModel {
         }
         if code == 3395 {
             return Ok(Self::WorldMercator);
+        }
+        if let Some(model) = well_known_special_projected_epsg(code)
+            .or_else(|| well_known_special_geographic_epsg(code))
+        {
+            return Ok(model);
         }
         if let Some(def) = crate::epsg::lookup(code) {
             return Ok(def.to_model());
@@ -77,6 +227,11 @@ impl CrsModel {
             Self::Sinusoidal(p) => p.unit,
             Self::CylindricalEqualArea(p) => p.unit,
             Self::EqualEarth(p) => p.unit,
+            Self::Equirectangular(p) => p.unit,
+            Self::Mercator(p) => p.unit,
+            Self::ObliqueStereographic(p) => p.unit,
+            Self::SwissObliqueMercator(p) => p.unit,
+            Self::DatumShifted { inner, .. } => inner.linear_unit_metres(),
             Self::Epsg3857 | Self::WorldMercator | Self::Geographic => 1.0,
         }
     }
@@ -122,6 +277,14 @@ impl CrsModel {
             // User-defined: described by the parameter keys below.
             Some(32767) | None => {}
             Some(code) => {
+                if let Some(model) = well_known_special_projected_epsg(code) {
+                    if matches!(gk.proj_linear_units, Some(u) if u != 9001 && u != 32767) {
+                        return Err(unsupported(
+                            "projected CRS linear units override conflicts with EPSG definition",
+                        ));
+                    }
+                    return Ok(model);
+                }
                 return match crate::epsg::lookup(code) {
                     Some(def) => {
                         let expected_unit = match def.unit {
@@ -144,7 +307,16 @@ impl CrsModel {
             }
         }
 
-        let sphere_ok = matches!(gk.proj_coord_trans, Some(10 | 24 | 28));
+        // Geographic CRS on a supported shifted datum (e.g. NAD27 4267, OSGB36 4277, Amersfoort 4289, CH1903 4149/4150).
+        if gk.proj_coord_trans.is_none()
+            && (gk.model_type == Some(2) || (gk.model_type.is_none() && gk.geographic_type.is_some()))
+            && let Some(gcs) = gk.geographic_type
+                && let Some(model) = well_known_special_geographic_epsg(gcs)
+            {
+                return Ok(model);
+            }
+
+        let sphere_ok = matches!(gk.proj_coord_trans, Some(7 | 10 | 17 | 24 | 28));
         let ellip = Self::wgs84_compatible_ellipsoid(gk, sphere_ok).map_err(unsupported)?;
 
         // 2. User-defined projection parameters via ProjCoordTransGeoKey.
@@ -372,6 +544,51 @@ impl CrsModel {
                     p.unit = unit;
                     Ok(Self::CylindricalEqualArea(p))
                 }
+                // CT_Mercator (1SP / 2SP)
+                7 => {
+                    let lon0 = require_finite(lon0.unwrap_or(0.0), "central meridian")?;
+                    let lat_ts_opt = gk.std_parallel_1.or_else(|| {
+                        gk.nat_origin_lat.filter(|v| v.abs() > 1e-9)
+                    });
+                    let mut p = if let Some(lat_ts_raw) = lat_ts_opt {
+                        let lat_ts = require_lat(lat_ts_raw, true, "standard parallel")?;
+                        Mercator::new_2sp(ellip, lat_ts, lon0, fe, fn_m)
+                    } else {
+                        let k0 = require_scale(gk.scale_at_nat_origin.unwrap_or(1.0))?;
+                        Mercator::new_1sp(ellip, lon0, k0, fe, fn_m)
+                    };
+                    p.unit = unit;
+                    Ok(Self::Mercator(p))
+                }
+                // CT_ObliqueStereographic
+                16 => {
+                    let lat0 = require_lat(
+                        lat0.ok_or_else(|| missing("latitude of origin"))?,
+                        true,
+                        "latitude of origin",
+                    )?;
+                    let lon0 = require_finite(
+                        lon0.ok_or_else(|| missing("central meridian"))?,
+                        "central meridian",
+                    )?;
+                    let k0 = require_scale(gk.scale_at_nat_origin.unwrap_or(1.0))?;
+                    let mut p = ObliqueStereographic::new(ellip, lat0, lon0, k0, fe, fn_m);
+                    p.unit = unit;
+                    Ok(Self::ObliqueStereographic(p))
+                }
+                // CT_Equirectangular
+                17 => {
+                    let lat_ts = require_lat(
+                        gk.std_parallel_1.unwrap_or(0.0),
+                        true,
+                        "standard parallel",
+                    )?;
+                    let lat0 = require_lat(lat0.unwrap_or(0.0), false, "latitude of origin")?;
+                    let lon0 = require_finite(lon0.unwrap_or(0.0), "central meridian")?;
+                    let mut p = Equirectangular::new(ellip, lat_ts, lat0, lon0, fe, fn_m);
+                    p.unit = unit;
+                    Ok(Self::Equirectangular(p))
+                }
                 _ => Err(unsupported("projection method is not implemented")),
             };
         }
@@ -475,6 +692,27 @@ impl CrsModel {
                 let (lon, lat) = mercator_to_lonlat_rad(mx, my);
                 p.forward(lon, lat)
             }
+            Self::Equirectangular(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
+            Self::Mercator(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
+            Self::ObliqueStereographic(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
+            Self::SwissObliqueMercator(p) => {
+                let (lon, lat) = mercator_to_lonlat_rad(mx, my);
+                p.forward(lon, lat)
+            }
+            Self::DatumShifted { inner, helmert } => {
+                let (lon, lat) = mercator_to_lonlat_deg(mx, my);
+                let (dlon, dlat) = helmert.wgs84_to_datum_deg(lon, lat);
+                inner.from_lonlat_deg(dlon, dlat)
+            }
         }
     }
 
@@ -529,6 +767,14 @@ impl CrsModel {
                 p.forward(lon_deg.to_radians(), lat_deg.to_radians())
             }
             Self::EqualEarth(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::Equirectangular(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::Mercator(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::ObliqueStereographic(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::SwissObliqueMercator(p) => p.forward(lon_deg.to_radians(), lat_deg.to_radians()),
+            Self::DatumShifted { inner, helmert } => {
+                let (dlon, dlat) = helmert.wgs84_to_datum_deg(lon_deg, lat_deg);
+                inner.from_lonlat_deg(dlon, dlat)
+            }
         }
     }
 
@@ -571,8 +817,28 @@ impl CrsModel {
                 let (lon, lat) = p.inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
+            Self::Equirectangular(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::Mercator(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::ObliqueStereographic(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::SwissObliqueMercator(p) => {
+                let (lon, lat) = p.inverse(x, y);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Self::DatumShifted { inner, helmert } => {
+                let (dlon, dlat) = inner.to_lonlat_deg(x, y);
+                helmert.datum_to_wgs84_deg(dlon, dlat)
+            }
         };
-        let norm_lon = if lon.is_finite() && (lon < -180.0 || lon > 180.0) {
+        let norm_lon = if lon.is_finite() && !(-180.0..=180.0).contains(&lon) {
             ((lon + 180.0).rem_euclid(360.0)) - 180.0
         } else {
             lon
@@ -706,11 +972,10 @@ impl CrsModel {
             let mut prev_lon: Option<f64> = None;
             for &(col, row) in pts {
                 if let Some((lon, lat)) = sample_pt(col, row) {
-                    if let Some(pl) = prev_lon {
-                        if (lon - pl).abs() > 180.0 {
+                    if let Some(pl) = prev_lon
+                        && (lon - pl).abs() > 180.0 {
                             crosses_antimeridian = true;
                         }
-                    }
                     prev_lon = Some(lon);
                     min_lon = min_lon.min(lon);
                     max_lon = max_lon.max(lon);
@@ -738,8 +1003,11 @@ impl CrsModel {
         // For polar/azimuthal projections, enclosing a pole means the raster spans all longitudes
         // [-180, 180]; for cylindrical/pseudocylindrical projections (CEA, EqualEarth), poles are
         // horizontal lines, so only extend min_lat / max_lat without expanding longitude.
-        if !matches!(self, Self::Epsg3857 | Self::Geographic | Self::WorldMercator) {
-            let is_line_pole = matches!(self, Self::CylindricalEqualArea(_) | Self::EqualEarth(_));
+        if !matches!(self.unshifted(), Self::Epsg3857 | Self::Geographic | Self::WorldMercator | Self::Mercator(_)) {
+            let is_line_pole = matches!(
+                self.unshifted(),
+                Self::CylindricalEqualArea(_) | Self::EqualEarth(_) | Self::Equirectangular(_)
+            );
             if let Some(crs_to_pixel) = pixel_to_crs.invert() {
                 for &pole_lat in &[90.0_f64, -90.0_f64] {
                     let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
@@ -851,11 +1119,10 @@ impl CrsModel {
                         _ => (wf, t * hf),
                     };
                     if let Some((mx, my)) = to_merc(col, row) {
-                        if let Some(px) = prev_x {
-                            if (mx - px).abs() > ORIGIN_SHIFT {
+                        if let Some(px) = prev_x
+                            && (mx - px).abs() > ORIGIN_SHIFT {
                                 crosses_antimeridian = true;
                             }
-                        }
                         prev_x = Some(mx);
                         min_x = min_x.min(mx);
                         max_x = max_x.max(mx);
@@ -888,14 +1155,16 @@ impl CrsModel {
                 // across a few pixels; instead match GDAL's warped-extent diagonal resolution.
                 let mut pole_inside = false;
                 if !matches!(
-                    self,
+                    self.unshifted(),
                     Self::Epsg3857
                         | Self::Geographic
                         | Self::WorldMercator
                         | Self::CylindricalEqualArea(_)
                         | Self::EqualEarth(_)
-                ) {
-                    if let Some(crs_to_pixel) = pixel_to_crs.invert() {
+                        | Self::Equirectangular(_)
+                        | Self::Mercator(_)
+                )
+                    && let Some(crs_to_pixel) = pixel_to_crs.invert() {
                         for &pole_lat in &[90.0_f64, -90.0_f64] {
                             let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
                             if px_crs.is_finite() && py_crs.is_finite() {
@@ -913,7 +1182,6 @@ impl CrsModel {
                             }
                         }
                     }
-                }
                 if pole_inside
                     && min_x.is_finite()
                     && max_x.is_finite()
@@ -1025,11 +1293,10 @@ impl CrsModel {
                         _ => (wf, t * hf),
                     };
                     if let Some((lon, lat)) = to_ll(col, row) {
-                        if let Some(pl) = prev_lon {
-                            if (lon - pl).abs() > 180.0 {
+                        if let Some(pl) = prev_lon
+                            && (lon - pl).abs() > 180.0 {
                                 crosses_antimeridian = true;
                             }
-                        }
                         prev_lon = Some(lon);
                         max_abs_lat = max_abs_lat.max(lat.abs());
                         min_x = min_x.min(lon);
@@ -1143,6 +1410,7 @@ pub const GRID_DIM: usize = 17;
 
 /// Precomputed coordinate mapping from output XYZ tile pixels -> source IFD pixel-center space
 /// `(u = col - 0.5, v = row - 0.5)` so `(0.0, 0.0)` samples 100% of source pixel `(0, 0)`.
+#[allow(clippy::large_enum_variant)] // Grid2D keeps 17x17 f32 control grids stack-inline on the tile hot path
 pub enum CoordPlan<const N: usize> {
     /// Separable 1D mapping (`EPSG:3857` and `EPSG:4326` with axis-aligned GeoTransform).
     /// Vertical weight and source row pointers are invariant across every output scanline!
@@ -1260,13 +1528,35 @@ impl<const N: usize> CoordPlan<N> {
         let step_x = (max_x - min_x) / (N as f64);
         let step_y = (max_y - min_y) / (N as f64);
 
+        let branch_lon0: Option<f64> = match crs.unshifted() {
+            CrsModel::Sinusoidal(p) => Some(p.lon0),
+            CrsModel::EqualEarth(p) => Some(p.lon0),
+            CrsModel::Albers(p) => Some(p.lon0),
+            CrsModel::LambertConformalConic(p) => Some(p.lon0),
+            CrsModel::CylindricalEqualArea(p) => Some(p.lon0),
+            CrsModel::Equirectangular(p) => Some(p.lon0),
+            CrsModel::Mercator(p) => Some(p.lon0),
+            _ => None,
+        };
+        let straddles_branch_cut = branch_lon0.is_some_and(|lon0| {
+            let (lon_w, _) = mercator_to_lonlat_rad(min_x + 0.5 * step_x, max_y);
+            let (lon_e, _) = mercator_to_lonlat_rad(max_x - 0.5 * step_x, max_y);
+            let wrap = |d: f64| {
+                (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+            };
+            wrap(lon_w - lon0) > 0.0 && wrap(lon_e - lon0) < 0.0
+        });
+
         if crs_to_pixel.is_axis_aligned()
+            && !straddles_branch_cut
             && matches!(
                 crs,
                 CrsModel::Epsg3857
                     | CrsModel::WorldMercator
                     | CrsModel::Geographic
                     | CrsModel::CylindricalEqualArea(_)
+                    | CrsModel::Equirectangular(_)
+                    | CrsModel::Mercator(_)
             )
         {
             let mut u = Box::new([0.0f32; N]);
@@ -1371,6 +1661,46 @@ impl<const N: usize> CoordPlan<N> {
                         max_v = max_v.max(vv);
                     }
                 }
+                CrsModel::Equirectangular(eqc) => {
+                    for px in 0..N {
+                        let mx = min_x + (px as f64 + 0.5) * step_x;
+                        let (lon, _) = mercator_to_lonlat_rad(mx, 0.0);
+                        let sx = eqc.forward_x(lon);
+                        let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
+                        u[px] = uu;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                    }
+                    for py in 0..N {
+                        let my = max_y - (py as f64 + 0.5) * step_y;
+                        let (_, lat) = mercator_to_lonlat_rad(0.0, my);
+                        let sy = eqc.forward_y(lat);
+                        let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
+                        v[py] = vv;
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
+                CrsModel::Mercator(merc) => {
+                    for px in 0..N {
+                        let mx = min_x + (px as f64 + 0.5) * step_x;
+                        let (lon, _) = mercator_to_lonlat_rad(mx, 0.0);
+                        let sx = merc.forward_x(lon);
+                        let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
+                        u[px] = uu;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                    }
+                    for py in 0..N {
+                        let my = max_y - (py as f64 + 0.5) * step_y;
+                        let (_, lat) = mercator_to_lonlat_rad(0.0, my);
+                        let sy = merc.forward_y(lat);
+                        let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
+                        v[py] = vv;
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
                 _ => unreachable!(),
             }
 
@@ -1409,31 +1739,34 @@ impl<const N: usize> CoordPlan<N> {
             // If all 289 control points are finite, return `Grid2D` (or `None` if strictly outside
             // the raster); if any control point hits a projection domain boundary, fall through
             // to adaptive `Exact2D` so boundary 16x16 blocks are never dropped or smeared.
-            let branch_lon0: Option<f64> = match crs {
-                CrsModel::Sinusoidal(p) => Some(p.lon0),
-                CrsModel::EqualEarth(p) => Some(p.lon0),
-                CrsModel::Albers(p) => Some(p.lon0),
-                CrsModel::LambertConformalConic(p) => Some(p.lon0),
-                CrsModel::CylindricalEqualArea(p) => Some(p.lon0),
-                _ => None,
+            let near_singularity = match crs.unshifted() {
+                CrsModel::Laea(p) if p.pole == 0 => {
+                    let (lon_c, lat_c) =
+                        mercator_to_lonlat_rad(0.5 * (min_x + max_x), 0.5 * (min_y + max_y));
+                    let cos_dist = p.lat0.sin() * lat_c.sin()
+                        + p.lat0.cos() * lat_c.cos() * (lon_c - p.lon0).cos();
+                    1.0 + cos_dist < 0.02
+                }
+                CrsModel::ObliqueStereographic(p) => {
+                    let (lon_c, lat_c) =
+                        mercator_to_lonlat_rad(0.5 * (min_x + max_x), 0.5 * (min_y + max_y));
+                    let cos_dist = p.sin_chi0 * lat_c.sin()
+                        + p.cos_chi0 * lat_c.cos() * (lon_c - p.lon0).cos();
+                    1.0 + cos_dist < 0.05
+                }
+                CrsModel::SwissObliqueMercator(p) => {
+                    let (lon_c, lat_c) =
+                        mercator_to_lonlat_rad(0.5 * (min_x + max_x), 0.5 * (min_y + max_y));
+                    let sin_br = p.cos_b0 * lat_c.sin()
+                        - p.sin_b0 * lat_c.cos() * (lon_c - p.lon0).cos();
+                    sin_br.abs() > 0.98
+                }
+                _ => false,
             };
-            let straddles_branch_cut = branch_lon0.is_some_and(|lon0| {
-                let (lon_w, _) = mercator_to_lonlat_rad(min_x + 0.5 * step_x, max_y);
-                let (lon_e, _) = mercator_to_lonlat_rad(max_x + 0.5 * step_x, max_y);
-                let wrap = |d: f64| (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
-                wrap(lon_w - lon0) > 0.0 && wrap(lon_e - lon0) < 0.0
-            });
-            let near_laea_antipode = matches!(crs, CrsModel::Laea(p) if p.pole == 0 && {
-                let (lon_c, lat_c) =
-                    mercator_to_lonlat_rad(0.5 * (min_x + max_x), 0.5 * (min_y + max_y));
-                let cos_dist = p.lat0.sin() * lat_c.sin()
-                    + p.lat0.cos() * lat_c.cos() * (lon_c - p.lon0).cos();
-                1.0 + cos_dist < 0.02
-            });
             let try_grid_2d = tile.z > 8
                 && ((tile.x as u64) + 1 < (1u64 << tile.z.min(30)))
                 && !straddles_branch_cut
-                && !near_laea_antipode;
+                && !near_singularity;
             if try_grid_2d {
                 let mut grid_u = [0.0f32; GRID_DIM * GRID_DIM];
                 let mut grid_v = [0.0f32; GRID_DIM * GRID_DIM];
@@ -1732,7 +2065,7 @@ impl<const N: usize> CoordPlan<N> {
                     min_u, max_u, min_v, max_v,
                 );
 
-                if xm + 1 <= x1 {
+                if xm < x1 {
                     let q10_00 = project_px(xm + 1, y0);
                     let q10_01 = project_px(xm + 1, ym);
                     let q10_11 = project_px(x1, ym);
@@ -1742,7 +2075,7 @@ impl<const N: usize> CoordPlan<N> {
                     );
                 }
 
-                if ym + 1 <= y1 {
+                if ym < y1 {
                     let q01_00 = project_px(x0, ym + 1);
                     let q01_10 = project_px(xm, ym + 1);
                     let q01_11 = project_px(xm, y1);
@@ -1752,7 +2085,7 @@ impl<const N: usize> CoordPlan<N> {
                     );
                 }
 
-                if xm + 1 <= x1 && ym + 1 <= y1 {
+                if xm < x1 && ym < y1 {
                     let q11_00 = project_px(xm + 1, ym + 1);
                     let q11_10 = project_px(x1, ym + 1);
                     let q11_01 = project_px(xm + 1, y1);
@@ -1998,23 +2331,21 @@ mod tests {
     #[test]
     fn refuses_what_it_cannot_place() {
         let refused: Vec<(&str, GeoKeys)> = vec![
-            ("an EPSG code outside the list", keys(|k| k.projected_cs_type = Some(27700))),
-            ("NAD27 UTM", keys(|k| k.projected_cs_type = Some(26710))),
-            ("NAD27 CONUS Albers", keys(|k| k.projected_cs_type = Some(5069))),
-            ("Swiss LV95 (oblique Mercator)", keys(|k| k.projected_cs_type = Some(2056))),
+            ("an EPSG code outside the list", keys(|k| k.projected_cs_type = Some(29999))),
+            ("NAD27 CONUS Albers (not in table)", keys(|k| k.projected_cs_type = Some(5069))),
             (
                 "an unknown code even with parameter keys beside it",
                 keys(|k| {
-                    k.projected_cs_type = Some(26710);
+                    k.projected_cs_type = Some(29999);
                     k.proj_coord_trans = Some(1);
                     k.nat_origin_long = Some(-123.0);
                 }),
             ),
             (
-                "NAD27 geographic",
+                "unsupported non-WGS84 geographic datum (NTF Paris)",
                 keys(|k| {
                     k.model_type = Some(2);
-                    k.geographic_type = Some(4267);
+                    k.geographic_type = Some(4275);
                 }),
             ),
             (
@@ -2022,7 +2353,7 @@ mod tests {
                 keys(|k| {
                     k.model_type = Some(1);
                     k.projected_cs_type = Some(32767);
-                    k.proj_coord_trans = Some(7); // Mercator
+                    k.proj_coord_trans = Some(22); // Polyconic
                     k.geographic_type = Some(4326);
                 }),
             ),

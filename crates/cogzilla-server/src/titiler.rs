@@ -1130,11 +1130,10 @@ pub async fn query_point(
     let pidx = (ly as usize) * (ifd.tile_width as usize) + (lx as usize);
 
     let maybe_unscale = |b: usize, v: f64| -> f64 {
-        if let Some(nd) = nodata_override {
-            if !nd.is_nan() && v == nd as f64 {
+        if let Some(nd) = nodata_override
+            && !nd.is_nan() && v == nd as f64 {
                 return f64::NAN;
             }
-        }
         if unscale && !v.is_nan() {
             let sc = cog.index.scales_f64.get(b).copied().unwrap_or(1.0);
             let off = cog.index.offsets_f64.get(b).copied().unwrap_or(0.0);
@@ -1198,7 +1197,8 @@ pub async fn query_point(
 }
 
 /// Per-band statistics accumulator: uses exact O(1)-memory counting histograms for `U8`/`U16`
-/// bands (zero sort, zero per-pixel enum dispatch) and O(N) Quickselect for `F32` bands.
+/// bands (zero sort, zero per-pixel enum dispatch) and O(N) radix sort for `F32` bands.
+#[allow(clippy::large_enum_variant)] // Inline 2 KiB U8 histogram avoids a heap alloc per band
 enum BandStatsAcc {
     HistU8([u64; 256]),
     HistU16(Vec<u64>),
@@ -2031,7 +2031,7 @@ impl BandStatsAcc {
         description: &str,
         opts: &StatsOptions,
         dtype: HistDtype,
-        cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+        sort_vals: impl FnOnce(&mut [T]),
     ) -> serde_json::Value
     where
         T: Copy + PartialEq + Into<f64> + serde::Serialize,
@@ -2046,7 +2046,7 @@ impl BandStatsAcc {
         if valid_px == 0 {
             return empty_band_stats_json(masked_px, description, opts, dtype);
         }
-        vals.sort_unstable_by(cmp);
+        sort_vals(&mut vals);
         let min = vals[0];
         let max = vals[valid_px - 1];
         let mut sum = 0.0f64;
@@ -2176,11 +2176,10 @@ impl BandStatsAcc {
     ) -> serde_json::Value {
         match self {
             Self::HistU8(mut hist) => {
-                if let Some(nd) = nodata_override {
-                    if nd.is_finite() && nd >= 0.0 && nd <= 255.0 && nd.fract() == 0.0 {
+                if let Some(nd) = nodata_override
+                    && nd.is_finite() && (0.0..=255.0).contains(&nd) && nd.fract() == 0.0 {
                         hist[nd as usize] = 0;
                     }
-                }
                 Self::finalize_hist_with_opts(
                     &hist,
                     denom_pixels,
@@ -2193,11 +2192,10 @@ impl BandStatsAcc {
                 )
             }
             Self::HistU16(mut hist) => {
-                if let Some(nd) = nodata_override {
-                    if nd.is_finite() && nd >= 0.0 && nd <= 65535.0 && nd.fract() == 0.0 {
+                if let Some(nd) = nodata_override
+                    && nd.is_finite() && (0.0..=65535.0).contains(&nd) && nd.fract() == 0.0 {
                         hist[nd as usize] = 0;
                     }
-                }
                 Self::finalize_hist_with_opts(
                     &hist,
                     denom_pixels,
@@ -2215,7 +2213,14 @@ impl BandStatsAcc {
                 } else {
                     dtype.unwrap_or_else(|| HistDtype::infer(vals.iter().copied()))
                 };
-                Self::finalize_sorted(vals, denom_pixels, description, opts, eff_dtype, f32::total_cmp)
+                Self::finalize_sorted(
+                    vals,
+                    denom_pixels,
+                    description,
+                    opts,
+                    eff_dtype,
+                    crate::zonal::sort_f32_radix,
+                )
             }
             Self::Floats64(vals) => Self::finalize_sorted(
                 vals,
@@ -2223,7 +2228,7 @@ impl BandStatsAcc {
                 description,
                 opts,
                 dtype.unwrap_or(HistDtype::Float64),
-                f64::total_cmp,
+                |s| s.sort_unstable_by(f64::total_cmp),
             ),
         }
     }
@@ -3093,11 +3098,11 @@ fn build_stats_separable_coords(
 }
 
 #[cfg(feature = "gpu")]
-fn stats_band_blocks<'a>(
-    fetched: &'a StatsTiles,
+fn stats_band_blocks(
+    fetched: &StatsTiles,
     n_tiles: usize,
     bi: usize,
-) -> Vec<Option<&'a cogzilla_codec::DecodedBand>> {
+) -> Vec<Option<&cogzilla_codec::DecodedBand>> {
     match fetched {
         StatsTiles::Chunky { tiles, .. } => tiles
             .iter()
@@ -3434,7 +3439,7 @@ fn compute_expression_statistics_cpu(
     }
 
     let mut out = serde_json::Map::new();
-    for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs.into_iter()).enumerate() {
+    for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs).enumerate() {
         #[cfg(feature = "gpu")]
         if !opts.categorical
             && opts.histogram_edges.is_none()
@@ -3814,13 +3819,7 @@ pub fn native_bbox_dims_in_crs(
     if dx > 1e-12 && dy > 1e-12 && ifd.width > 0 && ifd.height > 0 && ifd.gcp_poly.is_none() {
         let (sx0, sy0) = ifd.pixel_to_crs.forward(0.0, 0.0);
         let (sx1, sy1) = ifd.pixel_to_crs.forward(ifd.width as f64, ifd.height as f64);
-        let both_geographic = matches!(
-            (src_crs, dst_crs),
-            (
-                cogzilla_proj::CrsModel::Geographic,
-                cogzilla_proj::CrsModel::Geographic
-            )
-        );
+        let both_geographic = src_crs.is_geographic() && dst_crs.is_geographic();
         if both_geographic {
             let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
             let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
@@ -3862,7 +3861,7 @@ pub fn native_bbox_dims_in_crs(
             } else {
                 dx1 - dx0
             };
-            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && ddx.abs() > 180.0 {
+            if dst_crs.is_geographic() && ddx.abs() > 180.0 {
                 let (lon_mid, _) = src_crs.to_lonlat_deg(0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1));
                 // Wrap only when the midpoint lies on the opposite hemisphere from the arithmetic
                 // mean of endpoints (antimeridian-crossing scene), NOT on wide/global scenes
@@ -4529,12 +4528,11 @@ pub async fn compute_statistics_with_options(
                         indices.push(None);
                         continue;
                     }
-                    if let Some(ref masks) = tile_masks {
-                        if masks[ti].is_none() {
+                    if let Some(ref masks) = tile_masks
+                        && masks[ti].is_none() {
                             indices.push(None);
                             continue;
                         }
-                    }
                     active_blocks += 1;
                     if active_blocks > MAX_STATS_BLOCKS {
                         return Err(EngineError::BadRequest(format!(
@@ -4599,12 +4597,11 @@ pub async fn compute_statistics_with_options(
                             all_indices.push(None);
                             continue;
                         }
-                        if let Some(ref masks) = tile_masks {
-                            if masks[ti].is_none() {
+                        if let Some(ref masks) = tile_masks
+                            && masks[ti].is_none() {
                                 all_indices.push(None);
                                 continue;
                             }
-                        }
                         active_blocks += 1;
                         if active_blocks > MAX_STATS_BLOCKS {
                             return Err(EngineError::BadRequest(format!(
@@ -4762,9 +4759,7 @@ pub fn extract_geojson_crs(
             .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON crs: {e}")))?;
         return Ok(Some(model));
     }
-    Err(EngineError::BadRequest(format!(
-        "unsupported GeoJSON crs member (expected type 'name' or 'EPSG'; pass ?coord_crs=EPSG:<code>)"
-    )))
+    Err(EngineError::BadRequest("unsupported GeoJSON crs member (expected type 'name' or 'EPSG'; pass ?coord_crs=EPSG:<code>)".to_string()))
 }
 
 impl PolygonMask {
@@ -5090,7 +5085,7 @@ impl PolygonMask {
             bbox
         };
         let coord_crs_projected =
-            effective_crs.is_some_and(|c| !matches!(c, cogzilla_proj::CrsModel::Geographic));
+            effective_crs.is_some_and(|c| !c.is_geographic());
         Ok((Self { polygons, lines, points, bbox, raw_bbox, coord_crs_projected }, bbox))
     }
 
@@ -5180,14 +5175,13 @@ impl PolygonMask {
             return false;
         }
         for poly in &self.polygons {
-            if let Some(outer) = poly.first() {
-                if Self::ring_contains(outer, lon, lat) {
+            if let Some(outer) = poly.first()
+                && Self::ring_contains(outer, lon, lat) {
                     let in_hole = poly[1..].iter().any(|h| Self::ring_contains(h, lon, lat));
                     if !in_hole {
                         return true;
                     }
                 }
-            }
         }
         false
     }
@@ -5262,7 +5256,6 @@ impl PolygonMask {
                                         push_densified(a, pa, mid, pm, depth + 1, project, out);
                                         out.push(pm);
                                         push_densified(mid, pm, b, pb, depth + 1, project, out);
-                                        return;
                                     }
                                 }
                             }
@@ -5703,7 +5696,7 @@ pub async fn render_exact_f64_array(
                 bbox[0], bbox[1], bbox[2], bbox[3]
             )));
         }
-        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+        if dst_crs.is_geographic() && bbox[0] > bbox[2] {
             bbox[2] += 360.0;
         }
         if bbox[0] >= bbox[2] {
@@ -6642,7 +6635,7 @@ async fn render_bbox_core(
         }
         // RFC 7946 antimeridian-crossing geographic bboxes use w > e (e.g. [177, -20, -178, -16]);
         // unwrap e into (180, 540] so dlx > 0 and clamp() never sees min > max.
-        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+        if dst_crs.is_geographic() && bbox[0] > bbox[2] {
             bbox[2] += 360.0;
         }
         if bbox[0] >= bbox[2] {
@@ -7426,11 +7419,10 @@ async fn render_bbox_core(
                         } else {
                             for px in x0..x1 {
                                 let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                                if let Some(ref tm) = touched_mask {
-                                    if !tm[row_off + px] {
+                                if let Some(ref tm) = touched_mask
+                                    && !tm[row_off + px] {
                                         continue;
                                     }
-                                }
                                 let (sx, sy) = to_src_crs(lon, lat);
                                 if !sx.is_finite() || !sy.is_finite() {
                                     continue;
@@ -7765,21 +7757,48 @@ async fn render_bbox_core(
         let _ = fused_stats;
         let ifd_w_i = ifd_width as i32;
         let ifd_h_i = ifd_height as i32;
-        // Same-CRS boxes and previews have separable maps: the widened sampler then filters each
-        // band's whole plane in two passes (`plane_of`), read directly by the common outputs.
-        let wide = widen_kernel.then(|| {
-            match &coord_map {
-                BboxCoordMap::Separable { u_cols, v_rows } => cogzilla_kernel::WidenedSampler::with_grid(
-                    resample,
-                    footprint_sx,
-                    footprint_sy,
-                    u_cols.clone(),
-                    v_rows.clone(),
-                ),
-                _ => None,
-            }
-            .unwrap_or_else(|| cogzilla_kernel::WidenedSampler::new_uncached(resample, footprint_sx, footprint_sy))
-        });
+        // Same-CRS boxes and previews have separable maps: lazily initialize the 2-pass separable
+        // convolution sampler only when CPU rendering actually runs (zero allocation on GPU hits).
+        // For `CubicSpline` and `Lanczos` at `scale <= 1.0` (`!widen_kernel`), `with_grid` turns
+        // per-pixel 2D 4x4/6x6 sampling into two 1D passes (~8x faster on 1024x1024 Lanczos).
+        // If `with_grid` declines (`> WIDE_GRID_MAX_PIXELS`) when `!widen_kernel`, return `None`
+        // rather than falling back to `new_uncached`.
+        let use_separable_conv = matches!(coord_map, BboxCoordMap::Separable { .. })
+            && matches!(resample, ResampleMode::CubicSpline | ResampleMode::Lanczos);
+        let wide_cell: std::cell::OnceCell<Option<cogzilla_kernel::WidenedSampler>> =
+            std::cell::OnceCell::new();
+        let get_wide = || -> Option<&cogzilla_kernel::WidenedSampler> {
+            wide_cell
+                .get_or_init(|| {
+                    if !widen_kernel && !use_separable_conv {
+                        return None;
+                    }
+                    let grid = match &coord_map {
+                        BboxCoordMap::Separable { u_cols, v_rows } => {
+                            cogzilla_kernel::WidenedSampler::with_grid(
+                                resample,
+                                footprint_sx,
+                                footprint_sy,
+                                u_cols.clone(),
+                                v_rows.clone(),
+                            )
+                        }
+                        _ => None,
+                    };
+                    if grid.is_some() {
+                        grid
+                    } else if widen_kernel {
+                        Some(cogzilla_kernel::WidenedSampler::new_uncached(
+                            resample,
+                            footprint_sx,
+                            footprint_sy,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .as_ref()
+        };
         let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
             if !u.is_finite() || !v.is_finite() {
                 return f32::NAN;
@@ -7803,9 +7822,9 @@ async fn render_bbox_core(
                 | ResampleMode::Cubic
                 | ResampleMode::CubicSpline
                 | ResampleMode::Lanczos
-                    if widen_kernel =>
+                    if get_wide().is_some() =>
                 {
-                    wide.as_ref().map_or(f32::NAN, |w| w.sample(src, u, v))
+                    get_wide().map_or(f32::NAN, |w| w.sample(src, u, v))
                 }
                 ResampleMode::Cubic => cogzilla_kernel::sample_cubic(src, u, v),
                 ResampleMode::Bilinear => {
@@ -7863,7 +7882,7 @@ async fn render_bbox_core(
             }
         };
         // The widened plane of a band on separable maps (`None` otherwise: sample per pixel).
-        let plane_of = |src: &BandSource<'_>| wide.as_ref().and_then(|wd| wd.grid_plane(src));
+        let plane_of = |src: &BandSource<'_>| get_wide().and_then(|wd| wd.grid_plane(src));
 
         let apply_source_unscale = unscale
             && (crate::engine::needs_source_unscale(bands, format)

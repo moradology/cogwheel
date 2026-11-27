@@ -409,13 +409,28 @@ impl TmsDef {
 
     pub fn matrix(&self, z: u8) -> Option<&'static TileMatrixDef> {
         let zs = z.to_string();
-        self.matrices.iter().find(|m| m.id == zs)
+        self.matrix_by_id(&zs)
+    }
+
+    pub fn matrix_by_id(&self, id: &str) -> Option<&'static TileMatrixDef> {
+        self.matrices.iter().find(|m| m.id == id)
     }
 
     /// Return `[min_x, min_y, max_x, max_y]` in the TMS's native `(easting/lon, northing/lat)` CRS,
     /// expanded by `buffer` pixels on all 4 sides.
     pub fn tile_bounds(&self, z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> Option<[f64; 4]> {
         let m = self.matrix(z)?;
+        self.tile_bounds_for_matrix(m, x, y, buffer, tile_size)
+    }
+
+    pub fn tile_bounds_for_matrix(
+        &self,
+        m: &TileMatrixDef,
+        x: u32,
+        y: u32,
+        buffer: f32,
+        tile_size: u32,
+    ) -> Option<[f64; 4]> {
         if (x as u64) >= m.matrix_width || (y as u64) >= m.matrix_height {
             return None;
         }
@@ -584,11 +599,10 @@ impl TmsDef {
         let min_res = res * ov_factor.max(1.0);
         let mut min_z = first_z;
         for m in self.matrices {
-            if let Ok(z) = m.id.parse::<u8>() {
-                if m.cell_size >= min_res {
+            if let Ok(z) = m.id.parse::<u8>()
+                && m.cell_size >= min_res {
                     min_z = z;
                 }
-            }
         }
         (min_z.clamp(first_z, max_z), max_z)
     }
@@ -672,10 +686,10 @@ mod tests {
         let tms = lookup_tms("WorldCRS84Quad").unwrap();
         let m1 = tms.matrix(1).unwrap();
         // RFC 7946 w > e crossing antimeridian
-        let (c0, c1, _, _) = tms.tile_limits_for_wgs84_bounds(&m1, [170.0, -10.0, -170.0, 10.0]);
+        let (c0, c1, _, _) = tms.tile_limits_for_wgs84_bounds(m1, [170.0, -10.0, -170.0, 10.0]);
         assert_eq!((c0, c1), (0, m1.matrix_width - 1));
         // Unwrapped e > 180 crossing antimeridian
-        let (c0b, c1b, _, _) = tms.tile_limits_for_wgs84_bounds(&m1, [170.0, -20.0, 190.0, 0.0]);
+        let (c0b, c1b, _, _) = tms.tile_limits_for_wgs84_bounds(m1, [170.0, -20.0, 190.0, 0.0]);
         assert_eq!((c0b, c1b), (0, m1.matrix_width - 1));
     }
 }

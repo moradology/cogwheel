@@ -637,7 +637,7 @@ impl GpuBackend {
             return 0;
         }
         if let Some((slice, _, _, _)) = src.single_block_flat() {
-            return slice.len() * std::mem::size_of::<f32>();
+            return std::mem::size_of_val(slice);
         }
         let w = (src.grid_w * src.tile_w) as usize;
         let h = (src.grid_h * src.tile_h) as usize;
@@ -880,13 +880,11 @@ impl GpuBackend {
             } else {
                 512 * 512
             };
-            if dst_w.saturating_mul(dst_h) >= min_px {
-                if let Ok(mut enc) = self.jpeg.lock() {
-                    if let Ok(jpg) = enc.encode_rgba8(rgba, dst_w as u32, dst_h as u32, quality) {
+            if dst_w.saturating_mul(dst_h) >= min_px
+                && let Ok(mut enc) = self.jpeg.lock()
+                    && let Ok(jpg) = enc.encode_rgba8(rgba, dst_w as u32, dst_h as u32, quality) {
                         return Bytes::from(jpg);
                     }
-                }
-            }
         }
         crate::titiler::encode_rgba_output(dst_w, dst_h, rgba, format, return_mask)
     }
@@ -2013,9 +2011,9 @@ impl GpuBackend {
 
         // 1-pass fused Mosaic -> GPU JPEG FDCT: zero per-call VRAM alloc, zero RGBA8 readback,
         // zero CPU JPEG encode.
-        if let OutputFormat::Jpeg { quality } = format {
-            if let Ok(mut jpeg_guard) = self.jpeg.lock() {
-                if let Ok(jpg) = mosaic_guard.composite_styled_jpeg_direct(
+        if let OutputFormat::Jpeg { quality } = format
+            && let Ok(mut jpeg_guard) = self.jpeg.lock()
+                && let Ok(jpg) = mosaic_guard.composite_styled_jpeg_direct(
                     planes,
                     width,
                     height,
@@ -2028,8 +2026,6 @@ impl GpuBackend {
                 ) {
                     return Some(Bytes::from(jpg));
                 }
-            }
-        }
 
         let raw = mosaic_guard
             .composite_styled_direct(
@@ -2125,9 +2121,9 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
 
         let mut mosaic_guard = self.mosaic.lock().ok()?;
-        if let OutputFormat::Jpeg { quality } = format {
-            if let Ok(mut jpeg_guard) = self.jpeg.lock() {
-                if let Ok(jpg) = mosaic_guard.composite_rgb_styled_jpeg_direct(
+        if let OutputFormat::Jpeg { quality } = format
+            && let Ok(mut jpeg_guard) = self.jpeg.lock()
+                && let Ok(jpg) = mosaic_guard.composite_rgb_styled_jpeg_direct(
                     rgb_planes,
                     width,
                     height,
@@ -2139,8 +2135,6 @@ impl GpuBackend {
                 ) {
                     return Some(Bytes::from(jpg));
                 }
-            }
-        }
         let rgba = mosaic_guard
             .composite_rgb_styled_direct(
                 rgb_planes,

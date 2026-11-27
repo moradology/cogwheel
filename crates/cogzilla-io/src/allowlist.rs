@@ -18,6 +18,7 @@ pub const ALLOWLIST_RESOLVE_SYMLINKS_ENV: &str = "COGZILLA_ALLOWLIST_RESOLVE_SYM
 /// Normalize `file:///path` and `file://localhost/path` to `/path` (rejecting non-local hosts
 /// like `file://evil/share`). Returns `Ok(Some(path))` if `uri` is a local `file://` URI,
 /// `Ok(None)` if `uri` does not start with `file://`, or `Err(())` for a non-localhost `file://` host.
+#[allow(clippy::result_unit_err)]
 pub fn strip_file_uri_prefix(uri: &str) -> Result<Option<&str>, ()> {
     let Some(rest) = uri.strip_prefix("file://") else {
         return Ok(None);
@@ -81,8 +82,8 @@ fn decode_percent_once(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h1), Some(h2)) = (
+        if b[i] == b'%' && i + 2 < b.len()
+            && let (Some(h1), Some(h2)) = (
                 (b[i + 1] as char).to_digit(16),
                 (b[i + 2] as char).to_digit(16),
             ) {
@@ -93,7 +94,6 @@ fn decode_percent_once(s: &str) -> String {
                     continue;
                 }
             }
-        }
         out.push(b[i] as char);
         i += 1;
     }
@@ -210,11 +210,10 @@ pub fn matches_any_prefix_with_opts(
             // Canonicalize HTTP(S) prefixes (lowercasing host and stripping default ports
             // `:80`/`:443`) so prefixes like `https://Bucket.Example.com:443/` still match
             // WHATWG-normalized URLs without relaxing path-boundary or scheme checks.
-            if cand_http && (p.starts_with("http://") || p.starts_with("https://")) {
-                if let Ok(parsed_p) = reqwest::Url::parse(p) {
+            if cand_http && (p.starts_with("http://") || p.starts_with("https://"))
+                && let Ok(parsed_p) = reqwest::Url::parse(p) {
                     return matches_prefix(parsed_p.as_str());
                 }
-            }
             false
         })
     };

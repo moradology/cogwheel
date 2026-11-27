@@ -1250,7 +1250,7 @@ mod tests {
                 .map(|s| {
                     (0..n)
                         .map(|i| {
-                            if (i + s * 31 + seed * 17) % 9 == 0 {
+                            if (i + s * 31 + seed * 17).is_multiple_of(9) {
                                 f32::NAN
                             } else {
                                 40.0 + ((i * 7 + s * 53 + seed * 29) % 200) as f32
@@ -1349,7 +1349,7 @@ mod tests {
                     (0..n)
                         .map(|i| {
                             // Force some all-NaN pixels in band 0, 1, or 2 to test any-band-NaN masking
-                            if i == 17 + seed || (i + s * 41 + seed * 19) % 7 == 0 {
+                            if i == 17 + seed || (i + s * 41 + seed * 19).is_multiple_of(7) {
                                 f32::NAN
                             } else {
                                 10.0 * (seed as f32) + ((i * 11 + s * 59 + seed * 37) % 300) as f32

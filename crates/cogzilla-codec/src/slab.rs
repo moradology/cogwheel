@@ -84,16 +84,14 @@ impl AlignedF32Slab {
                 len: 0,
             };
         }
-        if let Some((pool, _)) = pool_for_len(len) {
-            if let Ok(mut guard) = pool.lock() {
-                if let Some(SendF32Ptr(raw)) = guard.pop() {
+        if let Some((pool, _)) = pool_for_len(len)
+            && let Ok(mut guard) = pool.lock()
+                && let Some(SendF32Ptr(raw)) = guard.pop() {
                     return Self {
                         ptr: unsafe { NonNull::new_unchecked(raw) },
                         len,
                     };
                 }
-            }
-        }
         let layout = slab_layout(len);
         // SAFETY: layout size > 0 and align is power of two; zero-initializing ensures
         // subsequent `&[f32]`/`&mut [f32]` slice views are always valid initialized memory.
@@ -174,14 +172,12 @@ impl DerefMut for AlignedF32Slab {
 impl Drop for AlignedF32Slab {
     fn drop(&mut self) {
         if self.len > 0 {
-            if let Some((pool, cap)) = pool_for_len(self.len) {
-                if let Ok(mut guard) = pool.lock() {
-                    if guard.len() < cap {
+            if let Some((pool, cap)) = pool_for_len(self.len)
+                && let Ok(mut guard) = pool.lock()
+                    && guard.len() < cap {
                         guard.push(SendF32Ptr(self.ptr.as_ptr()));
                         return;
                     }
-                }
-            }
             let layout = slab_layout(self.len);
             unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
         }

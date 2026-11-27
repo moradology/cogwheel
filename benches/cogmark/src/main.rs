@@ -119,8 +119,8 @@ async fn start_delayed_range_server(
                             .get("range")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.strip_prefix("bytes="));
-                        if let Some(r) = range {
-                            if let Some((a, b)) = r.split_once('-') {
+                        if let Some(r) = range
+                            && let Some((a, b)) = r.split_once('-') {
                                 let start: usize = a.parse().unwrap_or(0);
                                 let end_incl: usize =
                                     b.parse().unwrap_or(total - 1).min(total - 1);
@@ -147,7 +147,6 @@ async fn start_delayed_range_server(
                                 );
                                 return Ok::<_, Infallible>(resp);
                             }
-                        }
                         bs.fetch_add(total as u64, Ordering::Relaxed);
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
                     }

@@ -404,10 +404,12 @@ async fn run_mixed_contention_soak(
             let mut iter = worker;
             let cogs = [Arc::clone(&cog)];
             let sub_bbox = [-9.7, 35.3, -8.3, 36.7];
-            let mut stats_opts = StatsOptions::default();
-            stats_opts.percentiles = vec![2.0, 98.0];
-            stats_opts.histogram_bins = 10;
-            stats_opts.area_weighted = true;
+            let stats_opts = StatsOptions {
+                percentiles: vec![2.0, 98.0],
+                histogram_bins: 10,
+                area_weighted: true,
+                ..StatsOptions::default()
+            };
             while Instant::now() < deadline {
                 let t0 = Instant::now();
                 match iter % 3 {

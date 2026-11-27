@@ -1094,6 +1094,13 @@ fn radix_sort_u32(data: &mut [u32]) {
     radix_sort_by_u32(data, |&k| k);
 }
 
+/// Sort finite `f32` slices in ascending numerical order using 4-pass 8-bit LSD radix sort
+/// (`O(N)`, skipping uniform byte passes). For slices shorter than 1,024 elements, falls back
+/// to `sort_unstable_by_key`.
+pub(crate) fn sort_f32_radix(data: &mut [f32]) {
+    radix_sort_by_u32(data, |&v| f32_to_sortable_u32(v));
+}
+
 fn radix_sort_u32_f64(data: &mut [(u32, f64)]) {
     radix_sort_by_u32(data, |&(k, _)| k);
 }
@@ -1121,7 +1128,7 @@ pub fn compute_weighted_band_stats_with_geom(
         && !area_model.is_constant();
     let const_poly_area = (geom_kind == ZonalGeomKind::Polygon && area_model.is_constant())
         .then(|| area_model.area_at(0, 0));
-    let w_eq_c = !use_area_w && !(geom_kind == ZonalGeomKind::Line && area_weighted && line_len_m.is_some());
+    let w_eq_c = !(use_area_w || geom_kind == ZonalGeomKind::Line && area_weighted && line_len_m.is_some());
     let is_categorical =
         opts.categorical || opts.categories.as_ref().is_some_and(|c| !c.is_empty());
 
@@ -2413,7 +2420,7 @@ pub async fn compute_native_exact_polygon_stats(
             let per_band = blocks_x * blocks_y;
             let mut indices = Vec::with_capacity(per_band * sel_bands.len());
             for &b1 in &sel_bands {
-                let b0 = (b1 - 1) as u16;
+                let b0 = b1 - 1;
                 for ty in ty0..=ty1 {
                     for tx in tx0..=tx1 {
                         indices.push(Some(ifd.tile_index(tx as u32, ty as u32, b0) as u32));
@@ -2758,7 +2765,7 @@ pub async fn compute_native_exact_polygon_stats(
                     gpu_stats_counter
                         .gpu_dispatches
                         .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    for ((b1, _), val) in band_bufs.iter().zip(vals.into_iter()) {
+                    for ((b1, _), val) in band_bufs.iter().zip(vals) {
                         out.insert(format!("b{b1}"), val);
                     }
                     return serde_json::Value::Object(out);
@@ -2777,7 +2784,7 @@ pub async fn compute_native_exact_polygon_stats(
                         geom_kind,
                         line_len_m.as_deref(),
                         total_poly_area_px,
-                        &desc,
+                        desc,
                         &opts_owned,
                     ),
                 );
@@ -3941,11 +3948,11 @@ mod tests {
         let eq_km2 = wgs84_geographic_cell_area_m2(0.0, 1.0, 0.0, 1.0) / 1e6;
         let hi_km2 = wgs84_geographic_cell_area_m2(0.0, 1.0, 59.5, 60.5) / 1e6;
         assert!(
-            (eq_km2 - 12_308.4639).abs() < 1e-3,
+            (eq_km2 - 12_308.463_9).abs() < 1e-3,
             "equator 1x1 deg area expected 12308.4639 km2, got {eq_km2}"
         );
         assert!(
-            (hi_km2 - 6_216.7227).abs() < 1e-3,
+            (hi_km2 - 6_216.722_7).abs() < 1e-3,
             "60N 1x1 deg area expected 6216.7227 km2, got {hi_km2}"
         );
 
@@ -4119,7 +4126,7 @@ mod tests {
         };
         let pt_cov = rasterize_exact_coverage(&[], &[], &[(2.5, 2.5)], 0, 0, 5, 5);
         let st_pt = compute_weighted_band_stats_with_geom(
-            &vec![42.0f32; 25],
+            &[42.0f32; 25],
             &pt_cov,
             5,
             5,
@@ -4135,7 +4142,8 @@ mod tests {
         assert!(st_pt["area"].is_null(), "Point must have area=null, got {:?}", st_pt["area"]);
 
         let diag = vec![(0.0, 0.0), (100.0, 100.0)];
-        let line_cov = rasterize_exact_coverage(&[], &[diag.clone()], &[], 0, 0, 100, 100);
+        let line_cov =
+            rasterize_exact_coverage(&[], std::slice::from_ref(&diag), &[], 0, 0, 100, 100);
         let line_len_m = rasterize_line_geodesic_lengths_m(&[diag], &utm, &p2c, 0, 0, 100, 100);
         let st_line = compute_weighted_band_stats_with_geom(
             &vec![5.0f32; 10_000],
@@ -4262,9 +4270,11 @@ mod tests {
         assert_eq!(st_cov["histogram"], st_cov_gen["histogram"]);
 
         // Verify histogram upper edge pinning never drops max_v due to float rounding (Fix #5)
-        let mut opts_h = StatsOptions::default();
-        opts_h.histogram_bins = 3;
-        opts_h.histogram_range = Some((0.3, 1.0));
+        let opts_h = StatsOptions {
+            histogram_bins: 3,
+            histogram_range: Some((0.3, 1.0)),
+            ..StatsOptions::default()
+        };
         let st_h1 = compute_weighted_band_stats(
             &[0.3f32, 0.5, 1.0, 1.0],
             &[1.0; 4],

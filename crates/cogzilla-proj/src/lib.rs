@@ -7,8 +7,9 @@ pub mod mercator;
 pub use crs::{CoordPlan, CrsModel, GRID_DIM, ProjError};
 pub use epsg::{EpsgDef, lookup as lookup_epsg};
 pub use ellipsoid::{
-    AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, LambertAzimuthalEqualArea,
-    LambertConformalConic, PolarStereographic, Sinusoidal, TransverseMercator,
+    AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, Equirectangular,
+    HelmertTransform, LambertAzimuthalEqualArea, LambertConformalConic, Mercator,
+    ObliqueStereographic, PolarStereographic, Sinusoidal, SwissObliqueMercator, TransverseMercator,
 };
 pub use mercator::{ORIGIN_SHIFT, TileCoord, WEB_MERCATOR_R, mercator_to_lonlat_deg, tile_bounds_3857};
 

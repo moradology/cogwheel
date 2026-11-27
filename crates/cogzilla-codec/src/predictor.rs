@@ -604,8 +604,10 @@ unsafe fn reconstruct_predictor2_le_neon(
 // x86_64 AVX2 Kernels (AMD EPYC / Intel Xeon Cloud Servers)
 // ============================================================================
 
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within `row.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = row.len();
@@ -636,8 +638,10 @@ unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
 
 /// 12-byte (4-triplet) AVX2/SSSE3 Kogge-Stone prefix sum for stride-3 interleaved byte streams
 /// (3-band chunky float32 Predictor 3 rows on x86_64 cloud servers).
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within `row.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn prefix_sum_stride3_avx2(row: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = row.len();
@@ -671,8 +675,10 @@ unsafe fn prefix_sum_stride3_avx2(row: &mut [u8]) {
 }
 
 /// Single-pass AVX2 3-band chunky `uint8` horizontal differencing (optional) + min/max/nodata stats.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loops stay within input/output slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn reconstruct_u8_rgb3_avx2(
     slice: &mut [u8],
     w: usize,
@@ -788,8 +794,10 @@ unsafe fn reconstruct_u8_rgb3_avx2(
     }
 }
 
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within row/out slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn unshuffle_row_stride1_avx2(
     p0: &[u8],
     p1: &[u8],
@@ -908,8 +916,10 @@ unsafe fn unshuffle_row_stride1_avx2(
     }
 }
 
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within input/output slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn reconstruct_predictor1_le_avx2(
     raw: &[u8],
     dst: &mut [f32],
@@ -1011,8 +1021,10 @@ unsafe fn reconstruct_predictor1_le_avx2(
 }
 
 /// SIMD 8-lane `u32` horizontal prefix-sum -> `f32` + nodata/stats on x86_64 AVX2 (Predictor 2).
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within input/output slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn reconstruct_predictor2_le_avx2(
     raw: &[u8],
     tile_w: u32,
@@ -1119,8 +1131,10 @@ unsafe fn reconstruct_predictor2_le_avx2(
 }
 
 /// SIMD 8-lane `u16` horizontal prefix-sum directly into compact `u16` + nodata/stats on x86_64 AVX2.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within input/output slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn u16_pred2_row_avx2(
     src_u16: &[u8],
     dst_u16: &mut [u16],
@@ -1215,8 +1229,10 @@ unsafe fn u16_pred2_row_avx2(
 
 /// Hardware-accelerated 3-band chunky Predictor-3 unshuffle + planar deinterleave on x86_64 AVX2
 /// using `pshufb` 3-way deinterleave (16 RGB pixels / 48 floats / 192 bytes per iteration).
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within row/out slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn unshuffle_row_stride3_avx2(
     p0: &[u8],
     p1: &[u8],
