@@ -353,6 +353,17 @@ pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
 /// `cogzilla_kernel::retype_f32_npy` casts them; with `mask`, the last band is the mask,
 /// written as the type's largest number where it is not zero and its smallest where it is.
 pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, mask: bool) -> Option<Bytes> {
+    retype_f32_geotiff_with(tif, kind, mask, |v| v)
+}
+
+/// [`retype_f32_geotiff`], each sample (not the mask) passed through `prepare` before it is
+/// cast, as `cogzilla_kernel::retype_f32_npy_with` does.
+pub(crate) fn retype_f32_geotiff_with(
+    tif: &[u8],
+    kind: cogzilla_tiff::SampleType,
+    mask: bool,
+    prepare: impl Fn(f64) -> f64,
+) -> Option<Bytes> {
     let u16_at = |at: usize| tif.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |at: usize| tif.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let f64_at = |at: usize| tif.get(at..at + 8).map(|b| f64::from_le_bytes(b.try_into().unwrap()));
@@ -453,7 +464,7 @@ pub(crate) fn retype_f32_geotiff(tif: &[u8], kind: cogzilla_tiff::SampleType, ma
                 for i in 0..total_samples {
                     let v = read_sample(i);
                     let x: $t = if !is_mask(i) {
-                        cast(v)
+                        cast(prepare(v))
                     } else if v.is_finite() && v > 0.0 {
                         <$t>::MAX
                     } else {

@@ -21,6 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
+mod algorithm_math;
 mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
@@ -2148,11 +2149,30 @@ fn may_be_f32_array(data: &[u8]) -> bool {
 /// the type TiTiler writes it in ([`array_type`]); with `mask`, its last band is the mask.
 /// Left as it is without a type, or when it is not a float32 array of the bands it says.
 fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
+    array_in_its_type_rounded(data, kind, mask, None)
+}
+
+/// [`array_in_its_type`], each value first rounded by `rounding` and put in `kind` as
+/// numpy's `astype` puts it ([`array_type::astype`]): what `cast`, `ceil` and `floor` do.
+fn array_in_its_type_rounded(
+    data: Bytes,
+    kind: Option<cogzilla_tiff::SampleType>,
+    mask: bool,
+    rounding: Option<fn(f64) -> f64>,
+) -> Bytes {
     let Some(kind) = kind else { return data };
-    let typed = if data.starts_with(b"II*\0") {
-        crate::geotiff::retype_f32_geotiff(&data, kind, mask)
-    } else {
-        cogzilla_kernel::retype_f32_npy(&data, kind, mask)
+    let tif = data.starts_with(b"II*\0");
+    let typed = match rounding {
+        None if tif => crate::geotiff::retype_f32_geotiff(&data, kind, mask),
+        None => cogzilla_kernel::retype_f32_npy(&data, kind, mask),
+        Some(round) => {
+            let prepare = |v: f64| array_type::astype(kind, round(v));
+            if tif {
+                crate::geotiff::retype_f32_geotiff_with(&data, kind, mask, prepare)
+            } else {
+                cogzilla_kernel::retype_f32_npy_with(&data, kind, mask, prepare)
+            }
+        }
     };
     typed.unwrap_or(data)
 }
@@ -2290,7 +2310,9 @@ fn apply_array_asked(
         ArrayAsked::Typed(rule, _, expression, mask) => {
             let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
             let expr = expression_override.or(expression.as_deref());
-            array_in_its_type(data, rule.kind(&reads, expr), mask)
+            let kind = rule.kind(&reads, expr);
+            let rounding = kind.and_then(|kind| rule.rounding(kind));
+            array_in_its_type_rounded(data, kind, mask, rounding)
         }
         ArrayAsked::Shown(pq) => {
             shown_array(&pq, cogs.first().map(|cog| &**cog), &data).unwrap_or(data)
@@ -2674,161 +2696,34 @@ fn build_band_request(
                 } else {
                     (1..=default_bands.clamp(1, 16)).collect()
                 };
-                let (expr_str, default_rescale) = match alg {
-                    "normalizedindex" => {
-                        if bands.len() < 2 {
-                            return Err(EngineError::BadRequest(
-                                "algorithm 'normalizedIndex' requires at least 2 bands".into(),
-                            ));
-                        }
-                        // Match TiTiler's NormalizedIndex: (b2 - b1) / (b2 + b1)
-                        (
-                            format!(
-                                "(b{} - b{}) / (b{} + b{})",
-                                bands[1], bands[0], bands[1], bands[0]
-                            ),
-                            (-1.0, 1.0),
-                        )
+                let whole = algorithm_math::whole_numbers(sample_type, pq.unscale);
+                let source_range = default_rescale_for_dtype(sample_type, true);
+                if matches!(alg, "cast" | "ceil" | "floor") && bands.len() >= 3 {
+                    // Each of the first three bands, as an RGB picture.
+                    let one = |b: u16| -> Result<(ExprProgram, (f32, f32)), EngineError> {
+                        let (expr, range) = algorithm_math::integer_band(alg, b, whole, pq.cast_dtype.as_deref());
+                        Ok((ExprProgram::compile(&expr).map_err(EngineError::BadRequest)?, range.unwrap_or(source_range)))
+                    };
+                    let ((p0, dr), (p1, _), (p2, _)) = (one(bands[0])?, one(bands[1])?, one(bands[2])?);
+                    let r0 = pq.rescale.first().copied().unwrap_or(dr);
+                    let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
+                    let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
+                    return Ok(BandRequest::CustomExprRgb {
+                        progs: [p0, p1, p2],
+                        rescale_min: [r0.0, r1.0, r2.0],
+                        rescale_max: [r0.1, r1.1, r2.1],
+                    });
+                }
+                let expr_str = algorithm_math::band_math(alg, &bands, whole, pq.cast_dtype.as_deref(), pq.threshold)
+                    .map_err(EngineError::BadRequest)?;
+                let default_rescale = match alg {
+                    "normalizedindex" => (-1.0, 1.0),
+                    "cast" | "ceil" | "floor" => {
+                        algorithm_math::integer_band(alg, bands[0], whole, pq.cast_dtype.as_deref()).1.unwrap_or(source_range)
                     }
-                    "cast" => {
-                        let cast_one = |b: u16| -> (String, (f32, f32)) {
-                            match pq.cast_dtype.as_deref() {
-                                None | Some("uint8") => {
-                                    (format!("clip(floor(b{b}), 0, 255)"), (0.0, 255.0))
-                                }
-                                Some("int8") => {
-                                    (format!("clip(floor(b{b}), -128, 127)"), (-128.0, 127.0))
-                                }
-                                Some("uint16") => {
-                                    (format!("clip(floor(b{b}), 0, 65535)"), (0.0, 65535.0))
-                                }
-                                Some("int16") => {
-                                    (format!("clip(floor(b{b}), -32768, 32767)"), (-32768.0, 32767.0))
-                                }
-                                Some("uint32") => {
-                                    (format!("max(floor(b{b}), 0)"), (0.0, 4_294_967_295.0))
-                                }
-                                Some("int32") => {
-                                    (format!("floor(b{b})"), (-2_147_483_648.0, 2_147_483_647.0))
-                                }
-                                _ => (format!("b{b}"), default_rescale_for_dtype(sample_type, true)),
-                            }
-                        };
-                        if bands.len() >= 3 {
-                            let (e0, dr) = cast_one(bands[0]);
-                            let (e1, _) = cast_one(bands[1]);
-                            let (e2, _) = cast_one(bands[2]);
-                            let progs = [
-                                ExprProgram::compile(&e0).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&e1).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&e2).map_err(EngineError::BadRequest)?,
-                            ];
-                            let r0 = pq.rescale.first().copied().unwrap_or(dr);
-                            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
-                            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
-                            return Ok(BandRequest::CustomExprRgb {
-                                progs,
-                                rescale_min: [r0.0, r1.0, r2.0],
-                                rescale_max: [r0.1, r1.1, r2.1],
-                            });
-                        }
-                        cast_one(bands[0])
-                    }
-                    "ceil" | "floor" => {
-                        let dr = (0.0, 255.0);
-                        if bands.len() >= 3 {
-                            let progs = [
-                                ExprProgram::compile(&format!("{alg}(b{})", bands[0])).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&format!("{alg}(b{})", bands[1])).map_err(EngineError::BadRequest)?,
-                                ExprProgram::compile(&format!("{alg}(b{})", bands[2])).map_err(EngineError::BadRequest)?,
-                            ];
-                            let r0 = pq.rescale.first().copied().unwrap_or(dr);
-                            let r1 = pq.rescale.get(1).copied().unwrap_or(r0);
-                            let r2 = pq.rescale.get(2).copied().unwrap_or(r0);
-                            return Ok(BandRequest::CustomExprRgb {
-                                progs,
-                                rescale_min: [r0.0, r1.0, r2.0],
-                                rescale_max: [r0.1, r1.1, r2.1],
-                            });
-                        }
-                        (format!("{alg}(b{})", bands[0]), dr)
-                    }
-                    "min" => {
-                        let mut acc = format!("b{}", bands[0]);
-                        for &b in &bands[1..] {
-                            acc = format!("min({acc}, b{b})");
-                        }
-                        (acc, default_rescale_for_dtype(sample_type, true))
-                    }
-                    "max" => {
-                        let mut acc = format!("b{}", bands[0]);
-                        for &b in &bands[1..] {
-                            acc = format!("max({acc}, b{b})");
-                        }
-                        (acc, default_rescale_for_dtype(sample_type, true))
-                    }
-                    "sum" => {
-                        let sum_s = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(" + ");
-                        let (lo, hi) = default_rescale_for_dtype(sample_type, true);
-                        (sum_s, (lo, hi * bands.len() as f32))
-                    }
-                    "mean" => {
-                        let sum_s = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(" + ");
-                        (
-                            format!("({sum_s}) / {}", bands.len()),
-                            default_rescale_for_dtype(sample_type, true),
-                        )
-                    }
-                    "var" | "std" => {
-                        let args = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("{alg}({args})"), default_rescale_for_dtype(sample_type, true))
-                    }
-                    "median" => {
-                        let args = bands
-                            .iter()
-                            .map(|b| format!("b{b}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("median({args})"), default_rescale_for_dtype(sample_type, true))
-                    }
-                    "grayscale" => {
-                        let expr = if bands.len() >= 3 {
-                            format!(
-                                "0.299 * b{} + 0.587 * b{} + 0.114 * b{}",
-                                bands[0], bands[1], bands[2]
-                            )
-                        } else {
-                            format!("b{}", bands[0])
-                        };
-                        (expr, default_rescale_for_dtype(sample_type, true))
-                    }
-                    "bitonal" => {
-                        let src_expr = if bands.len() >= 3 {
-                            format!(
-                                "(0.299 * b{} + 0.587 * b{} + 0.114 * b{})",
-                                bands[0], bands[1], bands[2]
-                            )
-                        } else {
-                            format!("b{}", bands[0])
-                        };
-                        (
-                            format!("where({src_expr} > {}, 255, 0)", pq.threshold),
-                            (0.0, 255.0),
-                        )
-                    }
-                    _ => unreachable!(),
+                    "bitonal" => (0.0, 255.0),
+                    "sum" => (source_range.0, source_range.1 * bands.len() as f32),
+                    _ => source_range,
                 };
                 let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
                 let rescale = pq.rescale.first().copied().unwrap_or(default_rescale);
@@ -3390,6 +3285,33 @@ fn maybe_upgrade_multiband_default(
     bands
 }
 
+/// TiTiler's `cast`, `ceil` and `floor` keep every band. An array of other than one or
+/// three bands (which are band math), on a route that writes arrays in their type
+/// (`apply_array_asked`), reads them as they are, and each value is rounded and wrapped as
+/// it is typed (`ArrayRule::rounding`).
+fn keep_algorithm_bands(
+    bands: BandRequest,
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    default_bands: u16,
+) -> BandRequest {
+    let array = fmt == OutputFormat::Npy || ct == GEOTIFF_CONTENT_TYPE;
+    let asked = if pq.bidx.is_empty() { usize::from(default_bands) } else { pq.bidx.len() };
+    if matches!(pq.algorithm.as_deref(), Some("cast" | "ceil" | "floor"))
+        && array
+        && !array_type::shown(pq)
+        && pq.asset_exprs.is_empty()
+        && (asked == 2 || (4..=15).contains(&asked))
+    {
+        let bands_1based = if pq.bidx.is_empty() { (1..=default_bands).collect() } else { pq.bidx.clone() };
+        return BandRequest::MultiBand { bands_1based };
+    }
+    bands
+}
+
+/// The bands of a request on a route that writes arrays in their type (`/cog`, `/stac`,
+/// `/mosaicjson`).
 fn build_band_request_for_output(
     pq: &ParsedQuery,
     default_bands: u16,
@@ -3398,13 +3320,8 @@ fn build_band_request_for_output(
     ct: &str,
 ) -> Result<BandRequest, EngineError> {
     let bands = build_band_request(pq, default_bands, sample_type)?;
-    Ok(maybe_upgrade_multiband_default(
-        bands,
-        fmt,
-        ct,
-        pq,
-        default_bands,
-    ))
+    let bands = maybe_upgrade_multiband_default(bands, fmt, ct, pq, default_bands);
+    Ok(keep_algorithm_bands(bands, fmt, ct, pq, default_bands))
 }
 
 fn build_tile_request(
@@ -3433,9 +3350,12 @@ fn build_tile_request(
         sample_type,
         tms_id,
         source_cog,
+        false,
     )
 }
 
+/// A tile request; `typed_arrays` when the route writes its arrays in their type
+/// (`apply_array_asked`), which some algorithms' bands rely on ([`keep_algorithm_bands`]).
 #[allow(clippy::too_many_arguments)]
 fn build_tile_request_for_tms(
     engine: Option<&TileEngine>,
@@ -3447,6 +3367,7 @@ fn build_tile_request_for_tms(
     sample_type: cogzilla_tiff::SampleType,
     tms_id: &str,
     source_cog: Option<&cogzilla_io::OpenedCog>,
+    typed_arrays: bool,
 ) -> Result<(TileRequest, &'static str), EngineError> {
     let (cols, rows, target_epsg, base_tile_size) =
         if let Some(tms_def) = crate::tms::lookup_tms(tms_id) {
@@ -3481,7 +3402,12 @@ fn build_tile_request_for_tms(
         }
         _ => default_bands,
     };
-    let bands = build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?;
+    let bands = if typed_arrays {
+        build_band_request_for_output(pq, eff_default_bands, sample_type, format, content_type)?
+    } else {
+        let bands = build_band_request(pq, eff_default_bands, sample_type)?;
+        maybe_upgrade_multiband_default(bands, format, content_type, pq, eff_default_bands)
+    };
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
     if let BandRequest::MultiBand { ref bands_1based } = bands
         && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
@@ -3593,54 +3519,12 @@ fn build_stats_options_with_bands(
             (1..=default_bands.clamp(1, 16)).collect()
         };
         let alg = alg_raw.to_ascii_lowercase();
-        let expr_str = match alg.as_str() {
-            "normalizedindex" => {
-                if bands.len() < 2 {
-                    return Err(EngineError::BadRequest(
-                        "algorithm 'normalizedIndex' requires at least 2 bands".into(),
-                    ));
-                }
-                format!("(b{} - b{}) / (b{} + b{})", bands[1], bands[0], bands[1], bands[0])
-            }
-            "min" | "max" => {
-                let mut acc = format!("b{}", bands[0]);
-                for &b in &bands[1..] {
-                    acc = format!("{alg}({acc}, b{b})");
-                }
-                acc
-            }
-            "sum" => bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(" + "),
-            "mean" => {
-                let s = bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(" + ");
-                format!("({s}) / {}", bands.len())
-            }
-            "var" | "std" | "median" => {
-                let args = bands.iter().map(|b| format!("b{b}")).collect::<Vec<_>>().join(", ");
-                format!("{alg}({args})")
-            }
-            "grayscale" => {
-                if bands.len() >= 3 {
-                    format!("0.299 * b{} + 0.587 * b{} + 0.114 * b{}", bands[0], bands[1], bands[2])
-                } else {
-                    format!("b{}", bands[0])
-                }
-            }
-            "bitonal" => {
-                let src = if bands.len() >= 3 {
-                    format!("(0.299 * b{} + 0.587 * b{} + 0.114 * b{})", bands[0], bands[1], bands[2])
-                } else {
-                    format!("b{}", bands[0])
-                };
-                format!("where({src} > {}, 255, 0)", pq.threshold)
-            }
-            "cast" => format!("clip(floor(b{}), 0, 255)", bands[0]),
-            "ceil" | "floor" => format!("{alg}(b{})", bands[0]),
-            _ => {
-                return Err(EngineError::BadRequest(format!(
-                    "algorithm '{alg_raw}' is not supported on statistics routes"
-                )));
-            }
-        };
+        // The bands' type is not known here: they are taken as possibly fractional.
+        let expr_str = algorithm_math::band_math(&alg, &bands, None, pq.cast_dtype.as_deref(), pq.threshold)
+            .map_err(|e| match alg.as_str() {
+                "normalizedindex" => EngineError::BadRequest(e),
+                _ => EngineError::BadRequest(format!("algorithm '{alg_raw}' is not supported on statistics routes")),
+            })?;
         let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
         opts.expressions = Some(vec![(alg_raw.to_string(), prog)]);
     }
@@ -6870,6 +6754,7 @@ where
                                 cogzilla_tiff::SampleType::Uint8,
                                 tms,
                                 None,
+                                true,
                             )?;
                             validate_mosaic_tile_params(&pq, treq.tile_size)?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
@@ -8659,6 +8544,7 @@ where
                             st,
                             tms,
                             Some(&cogs[0]),
+                            true,
                         )?;
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -9958,6 +9844,7 @@ where
                             st,
                             tms,
                             Some(&cogs[0]),
+                            true,
                         )?;
                         if pq.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
@@ -12176,6 +12063,7 @@ mod tests {
             cogzilla_tiff::SampleType::Uint8,
             "CDB1GlobalGrid",
             None,
+            true,
         )
         .is_err());
 
