@@ -2813,6 +2813,9 @@ fn build_band_request(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
+        if parts.is_empty() {
+            return Err(EngineError::BadRequest("empty expression".into()));
+        }
         if parts.len() == 3 {
             if pq.colormap_explicit || pq.custom_colormap_json.is_some() {
                 return Err(EngineError::BadRequest(
@@ -3422,14 +3425,26 @@ fn build_tile_request_for_tms(
         maybe_upgrade_multiband_default(bands, format, content_type, pq, eff_default_bands)
     };
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
-    if let BandRequest::MultiBand { ref bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
-        && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4))
-    {
-        return Err(EngineError::BadRequest(
-            "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
-                .into(),
-        ));
+    if !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64) {
+        match bands {
+            BandRequest::MultiBand { ref bands_1based }
+                if !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
+            {
+                return Err(EngineError::BadRequest(
+                    "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
+                        .into(),
+                ));
+            }
+            BandRequest::CustomExprMulti { ref progs }
+                if !(pq.pixel_selection.by_last_band() && matches!(progs.len(), 2 | 4)) =>
+            {
+                return Err(EngineError::BadRequest(format!(
+                    "unsupported expression count {} for visual image output (expected 1 or 3; use .tif, .npy, or .f32)",
+                    progs.len()
+                )));
+            }
+            _ => {}
+        }
     }
     let has_explicit_tile_size = pq
         .keys
@@ -4262,17 +4277,22 @@ fn expand_stac_asset_bidx(
         } else if names.len() >= 2
             && names.iter().any(|n| stac_asset_expr(pq, n).is_some())
         {
-            let parts: Vec<String> = names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| {
-                    let slot = format!("b{}", i + 1);
-                    match stac_asset_expr(pq, n) {
-                        Some(expr) => replace_band1_token(expr, &slot),
-                        None => slot,
+            let mut parts: Vec<String> = Vec::with_capacity(names.len());
+            let mut slot_offset = 1usize;
+            for n in names {
+                let sel_len = stac_asset_selected_bands(pq, n)
+                    .map(|s| s.len().max(1))
+                    .unwrap_or(1);
+                if let Some(expr) = stac_asset_expr(pq, n) {
+                    let slot = format!("b{slot_offset}");
+                    parts.push(replace_band1_token(expr, &slot));
+                } else {
+                    for k in 0..sel_len {
+                        parts.push(format!("b{}", slot_offset + k));
                     }
-                })
-                .collect();
+                }
+                slot_offset += sel_len;
+            }
             pq.expr_raw = Some(parts.join(";"));
         }
     }
@@ -4471,14 +4491,26 @@ async fn render_mosaic_bbox_composite(
             geotiff_render_format(fmt, ct, pq, Some(&cogs[0]), &bands, full.sample_type, false)
         });
         let is_f32_out = matches!(scene_fmt, OutputFormat::RawF32 | OutputFormat::Npy);
-        if let BandRequest::MultiBand { ref bands_1based } = bands
-            && !is_f32_out
-            && !(method.by_last_band() && matches!(bands_1based.len(), 2 | 4))
-        {
-            return Err(EngineError::BadRequest(
-                "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
-                    .into(),
-            ));
+        if !is_f32_out {
+            match bands {
+                BandRequest::MultiBand { ref bands_1based }
+                    if !(method.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
+                {
+                    return Err(EngineError::BadRequest(
+                        "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
+                            .into(),
+                    ));
+                }
+                BandRequest::CustomExprMulti { ref progs }
+                    if !(method.by_last_band() && matches!(progs.len(), 2 | 4)) =>
+                {
+                    return Err(EngineError::BadRequest(format!(
+                        "unsupported expression count {} for visual image output (expected 1 or 3; use .tif, .npy, or .f32)",
+                        progs.len()
+                    )));
+                }
+                _ => {}
+            }
         }
         if first_bands.is_none() {
             first_bands = Some(bands.clone());
@@ -8110,7 +8142,11 @@ where
                             let eng_c = eng.clone();
                             let mask_c = mask.clone();
                             let mut opts_c = stats_opts.clone();
-                            if let Some((_, sel)) =
+                            if let Some(expr_str) = stac_asset_expr(&pq_clone, &names_c[idx]) {
+                                let prog = ExprProgram::compile(expr_str)
+                                    .map_err(EngineError::BadRequest)?;
+                                opts_c.expressions = Some(vec![(expr_str.to_string(), prog)]);
+                            } else if let Some((_, sel)) =
                                 asset_bidx_c.iter().find(|(n, _)| n == &names_c[idx])
                             {
                                 opts_c.bidx = Some(sel.to_vec());
@@ -8142,17 +8178,21 @@ where
                         for (name, slot) in names_c.iter().zip(ordered.into_iter()) {
                             let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
-                                let bands_iter: Vec<usize> = match asset_bidx_c
-                                    .iter()
-                                    .find(|(n, _)| n == name)
-                                {
-                                    Some((_, sel)) => sel.iter().map(|&b| b as usize).collect(),
-                                    None if asset_as_band => vec![1],
-                                    None if !pq_bidx_c.is_empty() => {
-                                        pq_bidx_c.iter().map(|&b| b as usize).collect()
-                                    }
-                                    None => (1..=nb).collect(),
-                                };
+                                let bands_iter: Vec<usize> =
+                                    if stac_asset_expr(&pq_clone, name).is_some() {
+                                        vec![1]
+                                    } else {
+                                        match asset_bidx_c.iter().find(|(n, _)| n == name) {
+                                            Some((_, sel)) => {
+                                                sel.iter().map(|&b| b as usize).collect()
+                                            }
+                                            None if asset_as_band => vec![1],
+                                            None if !pq_bidx_c.is_empty() => {
+                                                pq_bidx_c.iter().map(|&b| b as usize).collect()
+                                            }
+                                            None => (1..=nb).collect(),
+                                        }
+                                    };
                                 for b in bands_iter {
                                     if let Some(v) = obj.get(&format!("b{b}")) {
                                         let mut band_val = v.clone();
@@ -9557,7 +9597,7 @@ where
             (Method::GET, ["statistics"]) => async {
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
                 let full = cogs[0].index.full_res();
-                let db = full.samples_per_pixel;
+                let db = data_band_count(full);
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
                     matches!(
                         a.to_ascii_lowercase().as_str(),
@@ -9636,7 +9676,7 @@ where
             (Method::POST, ["statistics"]) => async {
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let cogs = open_query_urls(&engine, &pq.urls).await?;
-                let db = cogs[0].index.full_res().samples_per_pixel;
+                let db = data_band_count(cogs[0].index.full_res());
                 let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
                 if body_bytes.is_empty() {
                     let json = compute_statistics_with_options(

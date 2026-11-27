@@ -4670,27 +4670,78 @@ impl PolygonMask {
         let wrap_hi = self.bbox[2] > 180.0;
         let wrap_lo = self.bbox[0] < -180.0;
         if !self.polygons.is_empty() {
+            let is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
+            let is_merc = matches!(
+                dst_crs,
+                cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator
+            );
+            let project_pt = |lon: f64, lat: f64, lon_shift: f64| -> (f64, f64) {
+                let (ax, ay) = if lon_shift != 0.0 && is_geo {
+                    (lon + lon_shift, lat)
+                } else {
+                    dst_crs.from_lonlat_deg(lon + lon_shift, lat)
+                };
+                ((ax - bbox[0]) / dlx, (bbox[3] - ay) / dly)
+            };
             let mut polys_px: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(self.polygons.len());
             let mut push_poly = |poly: &Vec<Vec<(f64, f64)>>, lon_shift: f64| {
                 let mut rings_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(poly.len());
-                for ring in poly {
+                for (ring_idx, ring) in poly.iter().enumerate() {
                     let mut rpx: Vec<(f64, f64)> = Vec::with_capacity(ring.len());
-                    for &(lon, lat) in ring {
-                        let (ax, ay) = if lon_shift != 0.0
-                            && matches!(dst_crs, cogzilla_proj::CrsModel::Geographic)
-                        {
-                            (lon + lon_shift, lat)
-                        } else {
-                            dst_crs.from_lonlat_deg(lon + lon_shift, lat)
-                        };
-                        let px = (ax - bbox[0]) / dlx;
-                        let py = (bbox[3] - ay) / dly;
-                        if px.is_finite() && py.is_finite() {
-                            rpx.push((px, py));
+                    if is_geo {
+                        for &(lon, lat) in ring {
+                            let (px, py) = project_pt(lon, lat, lon_shift);
+                            if px.is_finite() && py.is_finite() {
+                                rpx.push((px, py));
+                            }
+                        }
+                    } else if ring.len() >= 3 {
+                        // Adaptive midpoint densification for curved projected CRSs (Polar Stereo,
+                        // LCC, LAEA, Albers, wide UTM) so straight lon/lat chords stay within 0.15 px.
+                        fn push_densified(
+                            a: (f64, f64),
+                            pa: (f64, f64),
+                            b: (f64, f64),
+                            pb: (f64, f64),
+                            depth: u8,
+                            project: &impl Fn(f64, f64) -> (f64, f64),
+                            out: &mut Vec<(f64, f64)>,
+                        ) {
+                            if depth < 6 {
+                                let mid = (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+                                let pm = project(mid.0, mid.1);
+                                if pm.0.is_finite() && pm.1.is_finite() {
+                                    let lin_x = 0.5 * (pa.0 + pb.0);
+                                    let lin_y = 0.5 * (pa.1 + pb.1);
+                                    let err2 = (pm.0 - lin_x).powi(2) + (pm.1 - lin_y).powi(2);
+                                    if err2 > 0.0225 {
+                                        push_densified(a, pa, mid, pm, depth + 1, project, out);
+                                        out.push(pm);
+                                        push_densified(mid, pm, b, pb, depth + 1, project, out);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        let proj = |lon: f64, lat: f64| project_pt(lon, lat, lon_shift);
+                        for i in 0..ring.len() {
+                            let a = ring[i];
+                            let b = ring[(i + 1) % ring.len()];
+                            let pa = proj(a.0, a.1);
+                            let pb = proj(b.0, b.1);
+                            if pa.0.is_finite() && pa.1.is_finite() {
+                                rpx.push(pa);
+                                if pb.0.is_finite() && pb.1.is_finite() {
+                                    push_densified(a, pa, b, pb, 0, &proj, &mut rpx);
+                                }
+                            }
                         }
                     }
                     if rpx.len() >= 3 {
                         rings_px.push(rpx);
+                    } else if ring_idx == 0 {
+                        // Never promote a hole ring to exterior when the outer ring is clipped away.
+                        return;
                     }
                 }
                 if !rings_px.is_empty() {
@@ -4699,11 +4750,11 @@ impl PolygonMask {
             };
             for poly in &self.polygons {
                 push_poly(poly, 0.0);
-                if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) {
-                    if bbox[2] > 180.0 || wrap_lo {
+                if is_geo || is_merc {
+                    if (is_geo && bbox[2] > 180.0) || wrap_lo {
                         push_poly(poly, 360.0);
                     }
-                    if bbox[0] < -180.0 || wrap_hi {
+                    if (is_geo && bbox[0] < -180.0) || wrap_hi {
                         push_poly(poly, -360.0);
                     }
                 }
@@ -5543,13 +5594,22 @@ async fn render_bbox_impl(
             )));
         }
     }
-    if let BandRequest::MultiBand { bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
-    {
-        return Err(EngineError::BadRequest(format!(
-            "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
-            bands_1based.len()
-        )));
+    if !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64) {
+        match bands {
+            BandRequest::MultiBand { bands_1based } => {
+                return Err(EngineError::BadRequest(format!(
+                    "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
+                    bands_1based.len()
+                )));
+            }
+            BandRequest::CustomExprMulti { progs } => {
+                return Err(EngineError::BadRequest(format!(
+                    "unsupported expression count {} for visual image output (expected 1 or 3; use .tif, .npy, or .f32)",
+                    progs.len()
+                )));
+            }
+            _ => {}
+        }
     }
     // Exact f64 data path for wide sample types (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`)
     // on unstyled `.npy` / `.tif` requests: bypasses `f32` quantization while leaving the hot
@@ -7503,6 +7563,7 @@ async fn render_mixed_grid_bbox(
     };
     let mut expr_valid_mask: Option<Vec<bool>> = None;
     let mut expr_rgb_masks: [Option<Vec<bool>>; 3] = [None, None, None];
+    let mut expr_multi_masks: Vec<Option<Vec<bool>>> = Vec::new();
     match bands {
         BandRequest::CustomExpr { prog, .. } if prog_needs_mask(prog) => {
             let slots: Vec<usize> = if prog.used_bands.is_empty() {
@@ -7603,6 +7664,65 @@ async fn render_mixed_grid_bbox(
                     single_cog_masks.push((slot, mask_vec));
                 }
                 expr_rgb_masks[c_idx] = Some(combined);
+            }
+        }
+        BandRequest::CustomExprMulti { progs } => {
+            expr_multi_masks.resize_with(progs.len(), || None);
+            for (p_idx, prog) in progs.iter().enumerate() {
+                if !prog_needs_mask(prog) {
+                    continue;
+                }
+                let slots: Vec<usize> = if prog.used_bands.is_empty() {
+                    vec![0]
+                } else {
+                    let mut s = Vec::new();
+                    for &b in &prog.used_bands {
+                        let idx = (b - 1) as usize;
+                        if !s.contains(&idx) {
+                            s.push(idx);
+                        }
+                    }
+                    s
+                };
+                let mut combined = vec![false; w * h];
+                for slot in slots {
+                    if let Some((_, cached)) = single_cog_masks.iter().find(|(k, _)| *k == slot) {
+                        for (dst, &v) in combined.iter_mut().zip(cached.iter()) {
+                            *dst |= v;
+                        }
+                        continue;
+                    }
+                    let single_cog = [cogs[slot].clone()];
+                    let raw = Box::pin(render_bbox_impl(
+                        engine,
+                        &single_cog,
+                        eff_bbox,
+                        eff_crs,
+                        false,
+                        w as u32,
+                        h as u32,
+                        poly_mask,
+                        &mask_band,
+                        ResampleMode::Nearest,
+                        OutputFormat::RawF32,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                    ))
+                    .await?;
+                    let mask_vec: Vec<bool> = raw
+                        .chunks_exact(4)
+                        .take(w * h)
+                        .map(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_nan())
+                        .collect();
+                    for (dst, &v) in combined.iter_mut().zip(mask_vec.iter()) {
+                        *dst |= v;
+                    }
+                    single_cog_masks.push((slot, mask_vec));
+                }
+                expr_multi_masks[p_idx] = Some(combined);
             }
         }
         _ => {}
@@ -7738,13 +7858,17 @@ async fn render_mixed_grid_bbox(
                 3
             }
             BandRequest::CustomExprMulti { progs } => {
-                for prog in progs {
+                for (p_idx, prog) in progs.iter().enumerate() {
                     let p_refs: Vec<&[f32]> =
                         prog.used_bands.iter().map(|&b| get_plane(b)).collect();
                     let mut vals = [0.0f32; 16];
                     let k = p_refs.len().min(16);
                     for i in 0..npix {
-                        if expr_valid_mask.as_ref().is_some_and(|m| !m[i]) {
+                        if expr_multi_masks
+                            .get(p_idx)
+                            .and_then(|m| m.as_ref())
+                            .is_some_and(|m| !m[i])
+                        {
                             out.put_slice(&f32::NAN.to_le_bytes());
                             continue;
                         }
