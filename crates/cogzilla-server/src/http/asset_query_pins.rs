@@ -404,9 +404,11 @@ const PINS: &[(&str, &str)] = &[
         "assets=red|expression=|expression=b2",
         "assets=[\"red\"] bidx=[] exprs=[(\"red\", \"b2\")] as_band=false top_bidx=[] errors=[]",
     ),
+    // Changed 2026-11-27: an asset asked for twice keeps the band math of each time, as
+    // rio-tiler reads each (it was the last of them for both).
     (
         "assets=red|expression=b1&assets=red|expression=b2",
-        "assets=[\"red\", \"red\"] bidx=[] exprs=[(\"red\", \"b2\")] as_band=false top_bidx=[] errors=[]",
+        "assets=[\"red\", \"red\"] bidx=[] exprs=[(\"red\", \"b1\"), (\"red\", \"b2\")] as_band=false top_bidx=[] errors=[]",
     ),
     (
         "assets=red|expression=b1&assets=nir|expression=b1*2",

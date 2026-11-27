@@ -1484,6 +1484,14 @@ def main() -> int:
         o.check("item preview, band math on one asset", "image", f"{it}/preview.png?assets=red%7Cexpression=b1*2&rescale=0,6000")
         o.check("item preview, band math on two assets", "image",
                 f"{it}/preview.png?assets=red%7Cexpression=b1*2&assets=nir%7Cexpression=b1&expression=(b2-b1)/(b2%2Bb1)&rescale=-1,1")
+        o.check("item preview of two assets, every band of each", "image", f"{it}/preview.npy?assets=visual&assets=red&max_size=64")
+        o.check("item preview, band math over the stack of two assets", "image",
+                f"{it}/preview.npy?assets=visual&assets=red&max_size=64&expression=b1;b4*2")
+        o.check("item preview, an asset's band math past its first band beside another", "image",
+                f"{it}/preview.npy?assets=visual%7Cexpression=b1%2Bb2;b3&assets=red%7Cexpression=b1*2&max_size=64")
+        o.check("item preview, bands chosen on one of two assets", "image", f"{it}/preview.npy?assets=visual%7Cbidx=3,1&assets=red&max_size=64")
+        o.check("item preview, an asset asked for twice", "image",
+                f"{it}/preview.npy?assets=red%7Cexpression=b1*2&assets=red%7Cexpression=b1*3&max_size=64")
         o.check("item point, band math on each of two assets", "json",
                 f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual%7Cexpression=b1%2Bb2;b3&assets=red%7Cexpression=b1*2&expression=b1/b3")
         o.check("item statistics, band math on one asset's own bands", "stats", f"{it}/statistics?assets=visual%7Cexpression=b1%2Bb2;b3&max_size=64")

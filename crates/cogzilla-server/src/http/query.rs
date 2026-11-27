@@ -412,6 +412,7 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                         pq.assets.push(asset_name.to_string());
                     }
                     let mut parsed = Vec::new();
+                    let mut entry_expr: Option<&str> = None;
                     for opt in parts {
                         if let Some(bidx_str) = opt
                             .strip_prefix("bidx=")
@@ -425,17 +426,15 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                             }
                         } else if let Some(expr_str) = opt.strip_prefix("expression=") {
                             let expr_str = expr_str.trim();
-                            if !asset_name.is_empty() && !expr_str.is_empty() {
-                                if let Some((_, existing)) =
-                                    pq.asset_exprs.iter_mut().find(|(n, _)| n == asset_name)
-                                {
-                                    *existing = expr_str.to_string();
-                                } else {
-                                    pq.asset_exprs
-                                        .push((asset_name.to_string(), expr_str.to_string()));
-                                }
+                            if !expr_str.is_empty() {
+                                entry_expr = Some(expr_str);
                             }
                         }
+                    }
+                    // One per `assets=` entry, the last `|expression=` of it: an asset asked
+                    // for twice keeps both.
+                    if let Some(expr_str) = entry_expr.filter(|_| !asset_name.is_empty()) {
+                        pq.asset_exprs.push((asset_name.to_string(), expr_str.to_string()));
                     }
                     if !asset_name.is_empty() && !parsed.is_empty() {
                         if let Some((_, existing)) =
