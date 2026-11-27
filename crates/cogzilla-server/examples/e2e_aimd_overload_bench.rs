@@ -357,6 +357,7 @@ async fn run_http_storm(
 
 fn make_engine(cog_path: &std::path::Path, use_gpu: bool, aimd: AimdLimiter) -> Arc<TileEngine> {
     let store = Arc::new(CogStore::new(512 * 1024 * 1024));
+    #[allow(unused_mut)]
     let mut engine = TileEngine::with_store_and_tile_cache(store, 0).with_aimd(aimd);
     #[cfg(feature = "gpu")]
     if !use_gpu {

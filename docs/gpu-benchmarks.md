@@ -91,7 +91,7 @@ Traffic mix in Scenarios 1–3: **40%** `512×512` RGB Lanczos3 JPEG (`q=85`), *
 
 ## Chaos, Torture & Hard-Limit Testing
 
-Adversarial stress testing via [gpu_torture_test.rs](../crates/cogzilla-server/examples/gpu_torture_test.rs), [gpu_breaking_point_test.rs](../crates/cogzilla-server/examples/gpu_breaking_point_test.rs), and [gpu_torture_round3.rs](../crates/cogzilla-server/examples/gpu_torture_round3.rs) surfaced **5 real production failure modes** (fixed in PRs #345 and #348) and established hard operational limits on both Metal (M5) and Vulkan (RTX 3090 Ti):
+Adversarial stress testing via [gpu_torture_test.rs](../crates/cogzilla-server/examples/gpu_torture_test.rs) (plus breaking-point and round-3 stress suites run in PRs #345, #348, and #349) surfaced **5 real production failure modes** and established hard operational limits on both Metal (M5) and Vulkan (RTX 3090 Ti):
 
 ### Failure Modes Caught & Fixed
 1. **Coalescer staging-buffer crash on concurrent `4096²` bursts** *(fixed in PR #348)*: `16` concurrent `4096²` RawRgba jobs (`1 GiB`) exceeded `wgpu`'s `512 MiB` `max_buffer_size` inside `cogzilla-gpu-coalescer`, panicking the background worker thread permanently. Fixed via `CoalescedJob::estimated_staging_and_slot_bytes()`, per-job rejection to CPU, and 1-slot `deferred` batch splitting capped at `min(max_buffer_size/2, 256 MiB)` (all `16/16` now complete in `1.00–1.19 s` with the coalescer alive).

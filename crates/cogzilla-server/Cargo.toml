@@ -30,115 +30,11 @@ tracing-subscriber.workspace = true
 reqwest.workspace = true
 
 [[example]]
-name = "server_gpu_bench"
+name = "e2e_realistic_workload_bench"
 required-features = ["gpu"]
 
 [[example]]
-name = "crop_gpu_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "expr_server_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "titiler_bbox_gpu_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "mosaic_server_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "scientific_f32_gpu_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "spectral_server_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "batch_server_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "sar_rgb_server_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "concurrent_coalesce_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "continuous_ring_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "multi_cog_stac_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "lut_formula_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "expr_rgb_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "multiband_npy_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "gpu_jpeg_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "fused_render_jpeg_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "gpu_stats_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "titiler_stats_gpu_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "fused_expr_stats_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "nearest_and_fused_stats_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "cold_slab_upload_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "e2e_titiler_fused_stats_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "e2e_dem_spectral_cog_stats_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "e2e_coalesced_cog_stats_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "e2e_separable_bbox_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "e2e_utm_grid2d_bbox_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "e2e_weighted_zonal_gpu_bench"
+name = "gpu_torture_test"
 required-features = ["gpu"]
 
 [dev-dependencies]
