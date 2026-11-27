@@ -587,6 +587,27 @@ pub fn get_colormap_image(
             rgba[o + 3] = a;
         }
     }
+    if matches!(format, cogzilla_kernel::OutputFormat::Npy) {
+        let mut dict = format!(
+            "{{'descr': '|u1', 'fortran_order': False, 'shape': (4, {h}, {w}), }}"
+        );
+        while (10 + dict.len() + 1) % 64 != 0 {
+            dict.push(' ');
+        }
+        dict.push('\n');
+        let hlen = dict.len() as u16;
+        let pixels = w * h;
+        let mut out = Vec::with_capacity(10 + dict.len() + 4 * pixels);
+        out.extend_from_slice(b"\x93NUMPY\x01\x00");
+        out.extend_from_slice(&hlen.to_le_bytes());
+        out.extend_from_slice(dict.as_bytes());
+        for ch in 0..4usize {
+            for p in 0..pixels {
+                out.push(rgba[p * 4 + ch]);
+            }
+        }
+        return Ok(Bytes::from(out));
+    }
     Ok(crate::titiler::encode_rgba_output(w, h, &rgba, format, false))
 }
 

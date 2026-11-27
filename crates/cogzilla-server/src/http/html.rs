@@ -11,16 +11,102 @@ use serde_json::Value;
 pub(crate) fn offers_html(path: &str) -> bool {
     let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
-        ["tileMatrixSets"] | ["tileMatrixSets", _] | ["colorMaps"] | ["algorithms"] | ["algorithms", _] | ["conformance"] => true,
+        ["tileMatrixSets"]
+        | ["tileMatrixSets", _]
+        | ["colorMaps"]
+        | ["colorMaps", _]
+        | ["algorithms"]
+        | ["algorithms", _]
+        | ["conformance"] => true,
         [.., "tiles"] => segs.len() > 1,
         [.., "tiles", tms] => segs.len() > 2 && !tms.contains('.'),
         _ => false,
     }
 }
 
-/// Whether a query asks for `f=html`.
-pub(crate) fn wants_html(query: &str) -> bool {
-    query.split('&').any(|kv| kv.split_once('=').is_some_and(|(k, v)| k == "f" && v.eq_ignore_ascii_case("html")))
+/// The explicit `f=` query parameter value, if present.
+pub(crate) fn explicit_format(query: &str) -> Option<&str> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "f")
+        .map(|(_, v)| v)
+}
+
+/// Whether an `Accept` header prefers `text/html` over `application/json` (RFC 9110 §12.5.1).
+/// Wildcards (`*/*`, `text/*`) do not trigger HTML so API clients (`curl`, etc.) keep JSON.
+pub(crate) fn accepts_html(accept: &str) -> bool {
+    let mut best_html: Option<(f32, usize)> = None;
+    let mut best_json: Option<(f32, usize)> = None;
+    for (idx, item) in accept.split(',').enumerate() {
+        let mut parts = item.split(';');
+        let Some(media_type) = parts.next().map(str::trim) else {
+            continue;
+        };
+        let is_html = media_type.eq_ignore_ascii_case("text/html");
+        let is_json = media_type.eq_ignore_ascii_case("application/json");
+        if !is_html && !is_json {
+            continue;
+        }
+        let mut q = 1.0f32;
+        for param in parts {
+            if let Some((k, v)) = param.split_once('=')
+                && k.trim().eq_ignore_ascii_case("q")
+            {
+                if let Ok(parsed) = v.trim().parse::<f32>()
+                    && parsed.is_finite()
+                {
+                    q = parsed.clamp(0.0, 1.0);
+                } else {
+                    q = 0.0;
+                }
+            }
+        }
+        let slot = if is_html { &mut best_html } else { &mut best_json };
+        if slot.is_none_or(|(prev_q, _)| q > prev_q) {
+            *slot = Some((q, idx));
+        }
+    }
+    let Some((q_html, pos_html)) = best_html else {
+        return false;
+    };
+    if q_html <= 0.0 {
+        return false;
+    }
+    match best_json {
+        Some((q_json, pos_json)) => q_html > q_json || (q_html == q_json && pos_html < pos_json),
+        None => true,
+    }
+}
+
+/// Whether a request asks for HTML: explicit `?f=` always wins over the `Accept` header.
+pub(crate) fn wants_html(query: &str, accept: Option<&str>) -> bool {
+    match explicit_format(query) {
+        Some(f) => f.eq_ignore_ascii_case("html"),
+        None => accept.is_some_and(accepts_html),
+    }
+}
+
+/// Ensure `Vary` includes `Accept` without duplicating it or clobbering existing tokens.
+pub(crate) fn append_vary_accept(headers: &mut hyper::HeaderMap) {
+    if let Some(existing) = headers
+        .get(hyper::header::VARY)
+        .and_then(|v| v.to_str().ok())
+    {
+        let has_accept = existing
+            .split(',')
+            .any(|tok| tok.trim().eq_ignore_ascii_case("accept"));
+        if !has_accept
+            && let Ok(hv) = hyper::header::HeaderValue::from_str(&format!("{existing}, Accept"))
+        {
+            headers.insert(hyper::header::VARY, hv);
+        }
+    } else {
+        headers.insert(
+            hyper::header::VARY,
+            hyper::header::HeaderValue::from_static("Accept"),
+        );
+    }
 }
 
 /// A query with `f` set to `format` in place of whatever it was.
@@ -219,18 +305,25 @@ mod tests {
             "/tileMatrixSets",
             "/tileMatrixSets/WebMercatorQuad",
             "/colorMaps",
+            "/colorMaps/viridis",
             "/algorithms",
             "/algorithms/hillshade",
             "/conformance",
         ] {
             assert!(offers_html(path), "{path}");
         }
-        for path in ["/cog/tiles/WebMercatorQuad/1/2/3", "/cog/tiles/1/2/3.png", "/tiles", "/colorMaps/viridis", "/cog/info", "/cog/tiles/x.png"] {
+        for path in ["/cog/tiles/WebMercatorQuad/1/2/3", "/cog/tiles/1/2/3.png", "/tiles", "/cog/info", "/cog/tiles/x.png"] {
             assert!(!offers_html(path), "{path}");
         }
-        assert!(wants_html("url=a&f=html"));
-        assert!(!wants_html("url=a&f=json"));
-        assert!(!wants_html("format=html"));
+        assert!(wants_html("url=a&f=html", None));
+        assert!(!wants_html("url=a&f=json", Some("text/html,application/xhtml+xml,*/*;q=0.8")));
+        assert!(!wants_html("format=html", None));
+        assert!(wants_html("", Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")));
+        assert!(!wants_html("", Some("application/json")));
+        assert!(!wants_html("", Some("*/*")));
+        assert!(!wants_html("", Some("application/json, text/html;q=0.9")));
+        assert!(!wants_html("", Some("text/html;q=0, */*;q=0.8")));
+        assert!(wants_html("", Some("text/html;q=0.9, application/json;q=0.5")));
     }
 
     #[test]
@@ -254,6 +347,6 @@ mod tests {
         assert!(page.contains("<a href=\"../cog\">Cog</a>"));
         // A templated link stays as it is.
         assert_eq!(html_href("http://h/cog/tiles/WebMercatorQuad/{z}/{x}/{y}"), "http://h/cog/tiles/WebMercatorQuad/{z}/{x}/{y}");
-        assert_eq!(html_href("http://h/colorMaps/viridis"), "http://h/colorMaps/viridis");
+        assert_eq!(html_href("http://h/colorMaps/viridis"), "http://h/colorMaps/viridis?f=html");
     }
 }
