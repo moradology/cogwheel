@@ -2,8 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use cogzilla_io::{CogStore, DiskBlockCache};
-use cogzilla_server::{TileEngine, handle_bytes_request, load_catalog_json_file};
+use cogzilla_server::{EngineBootConfig, TileEngine, handle_bytes_request, load_catalog_json_file};
 use lambda_http::{
     Body, Error, Request, RequestExt, Response, request::RequestContext, run, service_fn,
 };
@@ -16,38 +15,16 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn build_engine_from_env() -> Arc<TileEngine> {
-    let cache_mb = env_usize("COGZILLA_CACHE_MB", 256);
-    let tile_cache_mb = env_usize("COGZILLA_TILE_CACHE_MB", 0);
-    let disk_cache_mb = env_usize("COGZILLA_DISK_CACHE_MB", 0) as u64;
-
-    let mut store = CogStore::new(cache_mb * 1024 * 1024);
-    if disk_cache_mb > 0 {
-        let dir = std::env::var("COGZILLA_DISK_CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/cogzilla-disk-cache"));
-        match DiskBlockCache::open(&dir, disk_cache_mb * 1024 * 1024) {
-            Ok(dc) => {
-                tracing::info!(
-                    dir = %dir.display(),
-                    disk_cache_mb,
-                    "enabled tier-2 compressed-block disk cache on Lambda /tmp"
-                );
-                store = store.with_disk_cache(dc);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    dir = %dir.display(),
-                    error = %e,
-                    "failed to open Lambda disk cache; continuing with tier 2 disabled"
-                );
-            }
-        }
-    }
-
-    let engine = Arc::new(TileEngine::with_store_and_tile_cache(
-        Arc::new(store),
-        tile_cache_mb * 1024 * 1024,
-    ));
+    let engine = TileEngine::boot(EngineBootConfig {
+        cache_mb: env_usize("COGZILLA_CACHE_MB", 256),
+        tile_cache_mb: env_usize("COGZILLA_TILE_CACHE_MB", 0),
+        disk_cache_mb: env_usize("COGZILLA_DISK_CACHE_MB", 0) as u64,
+        disk_cache_dir: Some(
+            std::env::var("COGZILLA_DISK_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp/cogzilla-disk-cache")),
+        ),
+    });
 
     match engine.attach_pgstac_from_env() {
         Ok(true) => tracing::info!("pgSTAC database configured; serving /searches"),

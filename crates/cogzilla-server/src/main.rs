@@ -1,10 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
-use cogzilla_io::{CogStore, DiskBlockCache};
-use cogzilla_server::{TileEngine, load_catalog_json_file, serve};
+use cogzilla_server::{EngineBootConfig, TileEngine, load_catalog_json_file, serve};
 
 #[derive(Parser, Debug)]
 #[command(name = "cogzilla-server", about = "Ultra-fast COG & STAC tile server")]
@@ -52,34 +50,12 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let mut store = CogStore::new(args.cache_mb.saturating_mul(1024 * 1024));
-    if args.disk_cache_mb > 0 {
-        let dir = args
-            .disk_cache_dir
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("cogzilla-disk-cache"));
-        match DiskBlockCache::open(&dir, args.disk_cache_mb.saturating_mul(1024 * 1024)) {
-            Ok(dc) => {
-                tracing::info!(
-                    dir = %dir.display(),
-                    disk_cache_mb = args.disk_cache_mb,
-                    "enabled tier-2 compressed-block disk cache"
-                );
-                store = store.with_disk_cache(dc);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    dir = %dir.display(),
-                    error = %e,
-                    "failed to open disk cache directory; continuing with tier 2 disabled"
-                );
-            }
-        }
-    }
-    let engine = Arc::new(TileEngine::with_store_and_tile_cache(
-        Arc::new(store),
-        args.tile_cache_mb.saturating_mul(1024 * 1024),
-    ));
+    let engine = TileEngine::boot(EngineBootConfig {
+        cache_mb: args.cache_mb,
+        tile_cache_mb: args.tile_cache_mb,
+        disk_cache_mb: args.disk_cache_mb,
+        disk_cache_dir: args.disk_cache_dir.clone(),
+    });
 
     match engine.attach_pgstac_from_env() {
         Ok(true) => tracing::info!("pgSTAC database configured; serving /searches"),

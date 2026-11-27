@@ -516,7 +516,7 @@ pub fn build_cog_validate(
     }))
 }
 
-const SUPPORTED_ALGORITHMS: &[&str] = &[
+pub const SUPPORTED_ALGORITHMS: &[&str] = &[
     "hillshade",
     "slope",
     "aspect",
@@ -537,6 +537,15 @@ const SUPPORTED_ALGORITHMS: &[&str] = &[
     "bitonal",
     "contours",
 ];
+
+/// Returns true if `name` (case-insensitive) matches any supported TiTiler algorithm or alias.
+pub fn is_supported_algorithm(name: &str) -> bool {
+    name.eq_ignore_ascii_case("terrain-rgb")
+        || name.eq_ignore_ascii_case("mapbox")
+        || SUPPORTED_ALGORITHMS
+            .iter()
+            .any(|alg| alg.eq_ignore_ascii_case(name))
+}
 
 /// TiTiler 2.4 `AlgorithmFactory` `GET /algorithms` response.
 pub fn list_algorithms_json(host: &str) -> serde_json::Value {
@@ -1811,7 +1820,7 @@ pub(crate) fn percentile_key(p: f64) -> String {
     }
 }
 
-fn format_category_key(v: f64) -> String {
+pub(crate) fn format_category_key(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
