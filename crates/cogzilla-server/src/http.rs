@@ -8328,8 +8328,15 @@ where
                 let entry_opts = stac_entry_options(&pq, &names);
                 // One plain asset's band math reads its bands as they are; with its own band
                 // math or bands chosen, the request's is over those, as over several assets.
-                let single_asset_expr =
-                    names.len() == 1 && rewritten_expr.is_some() && entry_opts.iter().all(|(own, sel)| own.is_none() && sel.is_none());
+                // One asset's band pick under band math: every band is read, and the expression
+                // is read over the pick as the statistics read it (`bN` the Nth chosen).
+                let single_pick: Option<Vec<u16>> = match entry_opts.as_slice() {
+                    [(None, Some(sel))] if rewritten_expr.is_some() => Some(sel.clone()),
+                    _ => None,
+                };
+                let single_asset_expr = names.len() == 1
+                    && rewritten_expr.is_some()
+                    && (single_pick.is_some() || entry_opts.iter().all(|(own, sel)| own.is_none() && sel.is_none()));
                 // Band math over several assets reads every band of each, stacked as rio-tiler
                 // stacks them (or the bands each `|bidx=` picks); `asset_as_band` reads one.
                 let single_band_per_asset = pq.asset_as_band;
@@ -8461,6 +8468,23 @@ where
                             })
                         })?)
                     }
+                    Some(expr) if single_pick.is_some() => {
+                        let sel = single_pick.as_deref().unwrap_or_default();
+                        let read: &[String] = if stac_prefix == "stac" { &asset_names } else { &[] };
+                        Some(crate::stac::rewrite_stac_expr_with(
+                            expr,
+                            read,
+                            |_, _, band| Ok(band.unwrap_or_else(|| sel.first().map_or(1, |&b| usize::from(b)))),
+                            |k| match sel.get(k.wrapping_sub(1)) {
+                                Some(&b) => Ok(Some(usize::from(b))),
+                                None => Err(EngineError::BadRequest(format!(
+                                    "band {k} out of range for asset '{}' ({} bands chosen)",
+                                    asset_names[0],
+                                    sel.len()
+                                ))),
+                            },
+                        )?)
+                    }
                     _ => rewritten_expr,
                 };
                 let band_names: Vec<String> =
@@ -8478,13 +8502,15 @@ where
                 };
                 apply_point_filters(&mut pt_json, rewritten_expr.as_deref(), point_bidx)?;
                 // Band math is described, as TiTiler describes it, in the names of the stacked
-                // bands (an asset named in it stays as written).
-                if let Some(request) = pq.expr_raw.as_deref() {
+                // bands (an asset named in it, on `/stac`, stays as written); over one asset's
+                // pick, from the bands it reads.
+                let describe = if single_pick.is_some() { rewritten_expr.as_deref() } else { pq.expr_raw.as_deref() };
+                if let Some(request) = describe {
                     let described: Vec<serde_json::Value> = expression_parts(request)
                         .map(|part| {
                             serde_json::json!(substitute_band_tokens(part, |k| {
                                 let token = format!("b{k}");
-                                if asset_names.contains(&token) {
+                                if single_pick.is_none() && stac_prefix == "stac" && asset_names.contains(&token) {
                                     return None;
                                 }
                                 stack_names.get(k.wrapping_sub(1)).cloned()
