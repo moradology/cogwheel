@@ -187,21 +187,28 @@ fn map_params() -> Vec<Value> {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct FamilyCaps {
+    assets: bool,
+    mosaic: bool,
+    viewer: bool,
+    ogc_maps: bool,
+}
+
 fn add_family_routes(
     paths: &mut Map<String, Value>,
     prefix: &str,
     tag: &str,
     url_desc: &str,
-    is_stac: bool,
-    is_mosaic: bool,
+    caps: FamilyCaps,
 ) {
     let url_p = q_str("url", true, url_desc);
     let extra_family = || -> Vec<Value> {
         let mut v = vec![url_p.clone()];
-        if is_stac {
+        if caps.assets {
             v.extend(stac_asset_params());
         }
-        if is_mosaic {
+        if caps.mosaic {
             v.push(q_str("pixel_selection", false, "Mosaic pixel selection method (first, highest, lowest, mean, median, stdev, lastbandlow, lastbandhigh, count)"));
         }
         v
@@ -225,10 +232,12 @@ fn add_family_routes(
             format!("{prefix}/bounds"),
             json!({ "get": op(tag, &format!("{tag} WGS84 bounds"), bp, "application/json") }),
         );
-        paths.insert(
-            format!("{prefix}/viewer"),
-            json!({ "get": op(tag, &format!("{tag} interactive viewer"), vec![], "text/html") }),
-        );
+        if caps.viewer {
+            paths.insert(
+                format!("{prefix}/viewer"),
+                json!({ "get": op(tag, &format!("{tag} interactive viewer"), vec![], "text/html") }),
+            );
+        }
     }
 
     // OGC Tilesets
@@ -464,8 +473,8 @@ fn add_family_routes(
         );
     }
 
-    // Preview + OGC Maps + Statistics (COG & STAC)
-    if !is_mosaic {
+    // Preview + OGC Maps + Statistics (COG, STAC & Zarr)
+    if !caps.mosaic {
         let prev_q = || -> Vec<Value> {
             let mut v = extra_family();
             v.extend(common_band_render_params());
@@ -498,13 +507,15 @@ fn add_family_routes(
             json!({ "get": op(tag, &format!("Render sized {tag} preview"), pwh, "image/png") }),
         );
 
-        let mut mp = extra_family();
-        mp.extend(common_band_render_params());
-        mp.extend(map_params());
-        paths.insert(
-            format!("{prefix}/map"),
-            json!({ "get": op(tag, &format!("{tag} OGC API Maps"), mp, "image/png") }),
-        );
+        if caps.ogc_maps {
+            let mut mp = extra_family();
+            mp.extend(common_band_render_params());
+            mp.extend(map_params());
+            paths.insert(
+                format!("{prefix}/map"),
+                json!({ "get": op(tag, &format!("{tag} OGC API Maps"), mp, "image/png") }),
+            );
+        }
 
         let mut sp = extra_family();
         sp.extend(common_band_render_params());
@@ -597,7 +608,18 @@ pub fn build_openapi_spec() -> Value {
     );
 
     // COG family + COG-specific routes
-    add_family_routes(&mut paths, "/cog", "Cloud Optimized GeoTIFF", "Dataset URL", false, false);
+    add_family_routes(
+        &mut paths,
+        "/cog",
+        "Cloud Optimized GeoTIFF",
+        "Dataset URL",
+        FamilyCaps {
+            assets: false,
+            mosaic: false,
+            viewer: true,
+            ogc_maps: true,
+        },
+    );
     paths.insert(
         "/cog/validate".into(),
         json!({ "get": op("Cloud Optimized GeoTIFF", "Validate COG structure and layout", vec![
@@ -628,7 +650,18 @@ pub fn build_openapi_spec() -> Value {
     );
 
     // STAC family + STAC-specific routes
-    add_family_routes(&mut paths, "/stac", "SpatioTemporal Asset Catalog", "STAC Item URL", true, false);
+    add_family_routes(
+        &mut paths,
+        "/stac",
+        "SpatioTemporal Asset Catalog",
+        "STAC Item URL",
+        FamilyCaps {
+            assets: true,
+            mosaic: false,
+            viewer: true,
+            ogc_maps: true,
+        },
+    );
     paths.insert(
         "/stac/assets".into(),
         json!({ "get": op("SpatioTemporal Asset Catalog", "List STAC Item raster assets", vec![q_str("url", true, "STAC Item URL")], "application/json") }),
@@ -656,7 +689,18 @@ pub fn build_openapi_spec() -> Value {
     );
 
     // MosaicJSON family + MosaicJSON-specific routes
-    add_family_routes(&mut paths, "/mosaicjson", "MosaicJSON", "MosaicJSON document URL", false, true);
+    add_family_routes(
+        &mut paths,
+        "/mosaicjson",
+        "MosaicJSON",
+        "MosaicJSON document URL",
+        FamilyCaps {
+            assets: false,
+            mosaic: true,
+            viewer: true,
+            ogc_maps: false,
+        },
+    );
     paths.insert(
         "/mosaicjson/".into(),
         json!({ "get": op("MosaicJSON", "Read MosaicJSON document", vec![q_str("url", true, "MosaicJSON document URL")], "application/json") }),
@@ -697,7 +741,18 @@ pub fn build_openapi_spec() -> Value {
     );
 
     // Zarr family + Zarr-specific introspection & validation routes
-    add_family_routes(&mut paths, "/zarr", "Zarr", "Zarr store URL", false, false);
+    add_family_routes(
+        &mut paths,
+        "/zarr",
+        "Zarr",
+        "Zarr store URL",
+        FamilyCaps {
+            assets: false,
+            mosaic: false,
+            viewer: false,
+            ogc_maps: false,
+        },
+    );
     paths.insert(
         "/zarr/validate".into(),
         json!({ "get": op("Zarr", "Validate Zarr v2/v3 structure, codecs, sharding, regularity and CRS", vec![
@@ -848,5 +903,78 @@ mod tests {
         assert!(tile_params.iter().any(|p| p["name"] == "url"));
         assert!(tile_params.iter().any(|p| p["name"] == "rescale"));
         assert!(tile_params.iter().any(|p| p["name"] == "colormap_name"));
+    }
+
+    fn fill_path_params(path: &str) -> String {
+        let mut out = path.to_string();
+        for (pat, val) in [
+            ("{tileMatrixSetId}", "WebMercatorQuad"),
+            ("{z}", "0"),
+            ("{x}", "0"),
+            ("{y}", "0"),
+            ("{scale}", "1"),
+            ("{format}", "png"),
+            ("{lon}", "0"),
+            ("{lat}", "0"),
+            ("{minx}", "0"),
+            ("{miny}", "0"),
+            ("{maxx}", "1"),
+            ("{maxy}", "1"),
+            ("{width}", "64"),
+            ("{height}", "64"),
+            ("{algorithmId}", "hillshade"),
+            ("{colorMapId}", "viridis"),
+            ("{render_id}", "default"),
+            ("{name}", "x"),
+        ] {
+            out = out.replace(pat, val);
+        }
+        assert!(
+            !out.contains('{') && !out.contains('}'),
+            "unhandled path placeholder in {path} -> {out}"
+        );
+        out
+    }
+
+    #[tokio::test]
+    async fn every_documented_path_is_routed() {
+        use std::sync::Arc;
+
+        use http_body_util::Full;
+        use hyper::{Method, Request, StatusCode};
+
+        let engine = Arc::new(crate::engine::TileEngine::new(8 * 1024 * 1024));
+        let spec = build_openapi_spec();
+        let paths = spec["paths"].as_object().unwrap();
+
+        let mut unrouted = Vec::new();
+        for (path, item) in paths {
+            let concrete = fill_path_params(path);
+            for method_str in item.as_object().unwrap().keys() {
+                let method = match method_str.as_str() {
+                    "get" => Method::GET,
+                    "post" => Method::POST,
+                    "put" => Method::PUT,
+                    "delete" => Method::DELETE,
+                    other => panic!("unexpected HTTP method {other} for {path}"),
+                };
+                let req = Request::builder()
+                    .method(method)
+                    .uri(&concrete)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                let resp = crate::http::handle_request(Arc::clone(&engine), req)
+                    .await
+                    .unwrap();
+                if resp.status() == StatusCode::NOT_FOUND {
+                    unrouted.push(format!("{} {} (via {})", method_str.to_uppercase(), path, concrete));
+                }
+            }
+        }
+        assert!(
+            unrouted.is_empty(),
+            "OpenAPI advertises unrouted paths returning 404:\n{}",
+            unrouted.join("\n")
+        );
     }
 }
