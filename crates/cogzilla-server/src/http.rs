@@ -951,33 +951,9 @@ fn apply_array_asked(
         ArrayAsked::Typed(rule, _, expression, mask, stages) => {
             let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
             let kind = match &stages {
-                // numpy stacks the assets' results in one array, of the widest of their
-                // types, before the request expression is worked out over it.
-                // Each asset's results in their own type, from its own raster's, promoted
-                // together; whole arithmetic over a stack of numexpr's `int` keeps it, which a
-                // raster of int32 does not (`band_math_type`).
-                Some((own, request)) if own.len() == reads.len() => own
-                    .iter()
-                    .zip(&reads)
-                    .map(|(own, read)| match own {
-                        Some(own) => rule.kind(&[*read], Some(own)),
-                        None => array_type::ArrayRule::Data { unscale: rule.unscales(), resampled: false }.kind(&[*read], None),
-                    })
-                    .reduce(|a, b| Some(array_type::wider_type(a?, b?)))
-                    .flatten()
-                    .map(|stacked| {
-                    use cogzilla_tiff::SampleType;
-                    if request.is_empty() {
-                        return stacked;
-                    }
-                    let request: Vec<String> = request.split(';').map(str::to_string).collect();
-                    let whole = array_type::band_math_type(request.iter(), SampleType::Uint16) == SampleType::Int32;
-                    if stacked == SampleType::Int32 && whole {
-                        SampleType::Int32
-                    } else {
-                        array_type::band_math_type(request.iter(), stacked)
-                    }
-                }),
+                Some((own, request)) if own.len() == reads.len() => {
+                    rule.staged_kind(&reads, own, request)
+                }
                 _ => rule.kind(&reads, expression_override.or(expression.as_deref())),
             };
             let rounding = kind.and_then(|kind| rule.rounding(kind));
@@ -4991,9 +4967,10 @@ where
                     }
                     // Each asset's band math on a preview or the statistics: one expression
                     // over the stacked bands, read whole.
-                    let has_asset_math = !pq.asset_exprs.is_empty() || raw_query.contains("expression");
+                    let pairs = pgstac::query_pairs(&raw_query);
+                    let has_asset_math = pgstac::asset_math_asked(&pairs);
                     let math = if has_asset_math {
-                        pgstac::item_asset_math(rest, &pgstac::query_pairs(&raw_query))
+                        pgstac::item_asset_math(rest, &pairs)
                     } else {
                         Ok(None)
                     };
@@ -5001,7 +4978,7 @@ where
                         Err(message) => return Ok(pgstac::bad_request(message)),
                         Ok(Some((expression, _))) => {
                             item_asset_math = true;
-                            pq.asset_math_stages = pgstac::item_asset_math_stages(rest, &pgstac::query_pairs(&raw_query));
+                            pq.asset_math_stages = pgstac::item_asset_math_stages(rest, &pairs);
                             if let Some(names) = pgstac::asset_entry_names(&raw_query) {
                                 pq.assets = names;
                             }
@@ -5015,10 +4992,7 @@ where
                     // Each asset's band math on a point is applied by `pgstac::item_fixup` to
                     // every band of the asset, named as such; `asset_as_band` names them there.
                     if matches!(rest, ["point", _]) && has_asset_math {
-                        let pairs = pgstac::query_pairs(&raw_query);
-                        if pgstac::asset_math_asked(&pairs) {
-                            pgstac::point_asset_math_reads(&mut pq, &raw_query);
-                        }
+                        pgstac::point_asset_math_reads(&mut pq, &raw_query);
                     }
                     if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
                         pq.bidx.clear();
